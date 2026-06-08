@@ -8,6 +8,8 @@ pub mod scan;
 pub mod score;
 pub mod ingest;
 pub mod cache;
+pub mod search;
+pub mod index;
 
 pub use model::Message;
 pub use scan::{Hits, Scanner};

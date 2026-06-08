@@ -11,6 +11,8 @@ anyhow = { workspace = true }
 rayon = { workspace = true }
 aho-corasick = { workspace = true }
 chrono = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
 # bundled => compiles SQLite from C source (needs cl.exe under the MSVC toolchain on Windows).
 # Used by the opencode sqlite adapter (per-build chat stores live in *.db files).
 rusqlite = { version = "0.32", features = ["bundled"] }

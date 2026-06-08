@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use tilt_core::cache;
+use tilt_core::index::{self, Index};
 use tilt_core::ingest;
 use tilt_core::model::Message;
 use tilt_core::scan::Scanner;
@@ -30,6 +32,21 @@ enum Cmd {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         cache: bool,
     },
+    /// Ingest transcripts and write data/messages.jsonl (the input the embed step consumes).
+    Index {
+        /// Which agent to ingest: claude | codex | opencode | antigravity | all.
+        #[arg(long, default_value = "all")]
+        agent: String,
+    },
+    /// Semantic search over the embedding index (requires the embed step to have run).
+    Search {
+        /// The query text. Informational only here — the actual vector is data/query.f32,
+        /// which the embed step produces from this same text.
+        query: String,
+        /// How many hits to return.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+    },
 }
 
 #[derive(Default)]
@@ -48,6 +65,8 @@ fn main() -> anyhow::Result<()> {
             min_msgs,
             cache,
         } => scan(&agent, min_msgs, cache),
+        Cmd::Index { agent } => index_cmd(&agent),
+        Cmd::Search { query, k } => search_cmd(&query, k),
     }
 }
 
@@ -204,6 +223,122 @@ fn scan(agent: &str, min_msgs: u64, cache_on: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `tilt index` — ingest and (re)write data/messages.jsonl, the row source the embed step reads.
+/// The embeddings themselves are produced by the Python sidecar, so we just refresh the cache and
+/// print the next step.
+fn index_cmd(agent: &str) -> anyhow::Result<()> {
+    let t0 = Instant::now();
+    let msgs = ingest_agent(agent)?;
+    let n = msgs.len();
+    let path = PathBuf::from("data").join("messages.jsonl");
+    cache::write_messages(&msgs, &path)?;
+    println!(
+        "  indexed {} messages -> {} ({:.0}ms)",
+        n,
+        path.display(),
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    println!("  next: run `tilt embed` (Python sidecar) to write data/embeddings.f32 + data/embeddings.ids");
+    Ok(())
+}
+
+/// `tilt search <query>` — brute-force cosine over data/embeddings.f32, joined back to the message
+/// text in data/messages.jsonl. The query *vector* comes from data/query.f32, which the embed step
+/// writes from the query text; this command does not embed anything itself.
+fn search_cmd(query: &str, k: usize) -> anyhow::Result<()> {
+    let data = PathBuf::from("data");
+    let mat_path = data.join("embeddings.f32");
+    let query_path = data.join("query.f32");
+
+    // Both artifacts are produced by the embed step. Missing -> a clear hint, not a panic.
+    if !mat_path.exists() || !query_path.exists() {
+        let missing = if !mat_path.exists() {
+            "data/embeddings.f32"
+        } else {
+            "data/query.f32"
+        };
+        println!("  no semantic index: {missing} is missing.");
+        println!("  run the embed step first:");
+        println!("    1. tilt index                 # writes data/messages.jsonl");
+        println!("    2. tilt embed                 # Python sidecar -> embeddings.f32 + .ids");
+        println!("    3. tilt embed --query \"{}\"   # writes data/query.f32", trunc(query, 40));
+        println!("  then re-run: tilt search \"{}\"", trunc(query, 40));
+        return Ok(());
+    }
+
+    let q = index::load_query(&query_path, index::DIM)?;
+    let idx = Index::open(&data)?;
+    let hits = idx.search(&q, k);
+
+    // Join hits back onto message metadata/text via the id -> (project, agent, text) map.
+    let meta = load_message_meta(&data.join("messages.jsonl"))?;
+
+    println!("\n  tilt search · \"{}\"  ({} rows indexed)", query, idx.rows());
+    if hits.is_empty() {
+        println!("  no hits.");
+        return Ok(());
+    }
+    println!("  rank  score  agent/project                 snippet");
+    for (rank, (id, score)) in hits.iter().enumerate() {
+        match meta.get(id) {
+            Some((project, agent, text)) => {
+                let ap = format!("{}/{}", agent, project);
+                println!(
+                    "  {:>4}  {:>5.3}  {:<28}  {}",
+                    rank + 1,
+                    score,
+                    trunc(&ap, 28),
+                    snippet(text, 80)
+                );
+            }
+            None => {
+                // id present in the index but not in messages.jsonl (stale cache).
+                println!(
+                    "  {:>4}  {:>5.3}  {:<28}  [id {} not in messages.jsonl]",
+                    rank + 1,
+                    score,
+                    "?",
+                    id
+                );
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// Load data/messages.jsonl into an id -> (project, agent, text) map for search result join.
+fn load_message_meta(
+    path: &Path,
+) -> anyhow::Result<HashMap<String, (String, String, String)>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("opening {} ({e}); run `tilt index` first", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut map = HashMap::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&line)?;
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let project = v["project"].as_str().unwrap_or_default().to_string();
+        let agent = v["agent"].as_str().unwrap_or_default().to_string();
+        let text = v["text"].as_str().unwrap_or_default().to_string();
+        map.insert(id, (project, agent, text));
+    }
+    Ok(map)
+}
+
+/// One-line snippet: collapse all whitespace runs to single spaces, then truncate to `n` chars.
+fn snippet(s: &str, n: usize) -> String {
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    trunc(&collapsed, n)
 }
 
 fn tag_idx(t: Tag) -> usize {
