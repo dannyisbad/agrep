@@ -181,4 +181,42 @@ mod tests {
         // query/dim mismatch -> empty, no panic.
         assert!(top_k(&[1.0], &[1.0, 0.0], 2, 5).is_empty());
     }
+
+    /// In-process latency of the brute-force kernel over a few corpus sizes. Ignored by default
+    /// (it's a benchmark, not a correctness gate). Run with:
+    ///   cargo test -p tilt-core --release -- --ignored --nocapture bench_top_k_latency
+    #[test]
+    #[ignore]
+    fn bench_top_k_latency() {
+        use std::time::Instant;
+        let dim = 256;
+        for &rows in &[200usize, 50_000, 200_000] {
+            let mut matrix = Vec::with_capacity(rows * dim);
+            for r in 0..rows {
+                let mut row = vec_at(r, dim);
+                l2_normalize(&mut row);
+                matrix.extend_from_slice(&row);
+            }
+            let mut query = vec_at(rows / 2, dim);
+            l2_normalize(&mut query);
+
+            // Warm up (rayon thread pool spin-up, page-in) so we time steady state.
+            let _ = top_k(&query, &matrix, dim, 5);
+
+            let iters = 50;
+            let t0 = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..iters {
+                let hits = top_k(&query, &matrix, dim, 5);
+                sink ^= hits.len();
+            }
+            let per = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            // Sanity: planted row must still win, so the bench isn't measuring a no-op.
+            let hits = top_k(&query, &matrix, dim, 5);
+            assert_eq!(hits[0].0, rows / 2);
+            println!(
+                "bench top_k: rows={rows:>7} dim={dim} k=5 -> {per:.4} ms/search  (sink={sink})"
+            );
+        }
+    }
 }
