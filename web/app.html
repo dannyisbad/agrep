@@ -819,17 +819,21 @@ $("groupSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.group=b
 $("sortSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.sort=b.dataset.s;$("sortSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
 document.addEventListener("keydown",e=>{if(e.key==="/"&&document.activeElement!==$("q")&&document.activeElement!==$("find")){e.preventDefault();$("find").focus();}});
 
-// hover-intent prefetch: delegated on the list so it survives every re-render. A short
-// delay means a fast scroll-past doesn't fire a fetch; settling on a row warms its detail.
-let hoverTimer=null;
+// hover-intent prefetch: delegated on the list so it survives every re-render. Guarded on
+// the row's session (not raw mouseout) because mouseout fires on every child-to-child move
+// inside a row, which would otherwise cancel the pending fetch before it ever runs. A short
+// settle delay means a fast scroll-past doesn't fire; pausing on a row warms its detail.
+let hoverTimer=null, hoverSes=null;
 $("list").addEventListener("mouseover",e=>{
   const ci=e.target.closest(".ci[data-s]");
   const s=ci&&ci.dataset.s;
-  if(!s||CHATCACHE.has(s))return;
+  if(!s||s===hoverSes)return;        // same row (or empty) -> ignore intra-row moves
+  hoverSes=s;
   clearTimeout(hoverTimer);
-  hoverTimer=setTimeout(()=>fetchChat(s),110);
+  if(CHATCACHE.has(s))return;        // already warm
+  hoverTimer=setTimeout(()=>fetchChat(s),90);
 });
-$("list").addEventListener("mouseout",()=>clearTimeout(hoverTimer));
+$("list").addEventListener("mouseleave",()=>{hoverSes=null;clearTimeout(hoverTimer);});
 
 // ============================ themes ============================
 // A theme isn't just a paint job: it carries its own vocabulary. Every visible
