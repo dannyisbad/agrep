@@ -528,14 +528,29 @@ function ciHTML(c){
 // ============================ chat detail ============================
 let CHATREQ=0; // guards against a slow request being overwritten by a newer click
 let LASTD=null; // last opened chat detail, so theme swaps re-render without a refetch
+
+// Hover-to-prefetch: hovering a chat row kicks off its /chat fetch (deduped + cached)
+// so the click renders from memory instead of waiting on the network. The cache holds
+// the in-flight promise, so a hover already underway is reused by the click.
+const CHATCACHE=new Map(); // session -> Promise<detail>
+function fetchChat(session){
+  let p=CHATCACHE.get(session);
+  if(p)return p;
+  p=J("/chat?session="+encodeURIComponent(session)).catch(e=>{CHATCACHE.delete(session);throw e;});
+  CHATCACHE.set(session,p);
+  if(CHATCACHE.size>40)CHATCACHE.delete(CHATCACHE.keys().next().value); // bound memory
+  return p;
+}
 async function openChat(session){
   STATE.sel=session;
   if(STATE.view!=="pulse")showExplore();           // ensure explore chrome is on (no setView recursion)
   $("list").querySelectorAll(".ci").forEach(el=>el.classList.toggle("sel",el.dataset.s===session));
-  const v=$("view");v.innerHTML=`<div class="spin" style="padding:40px 0">${C('opening')}</div>`;
+  const cached=CHATCACHE.has(session);
+  const v=$("view");
+  if(!cached)v.innerHTML=`<div class="spin" style="padding:40px 0">${C('opening')}</div>`; // prefetched => no flash
   $("main").scrollTop=0;
   const my=++CHATREQ;
-  let d;try{d=await J("/chat?session="+encodeURIComponent(session));}catch(e){if(my===CHATREQ)v.innerHTML=`<div class="empty">${C('chatErr')} (${esc(e.message)})</div>`;return;}
+  let d;try{d=await fetchChat(session);}catch(e){if(my===CHATREQ)v.innerHTML=`<div class="empty">${C('chatErr')} (${esc(e.message)})</div>`;return;}
   if(my!==CHATREQ)return;                            // a newer chat was opened; drop this stale render
   LASTD=d;
   v.innerHTML=detailHTML(d);
@@ -803,6 +818,18 @@ $("findx").onclick=()=>{$("find").value="";STATE.filter="";$("findx").style.disp
 $("groupSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.group=b.dataset.g;STATE.chip=null;$("groupSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
 $("sortSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.sort=b.dataset.s;$("sortSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
 document.addEventListener("keydown",e=>{if(e.key==="/"&&document.activeElement!==$("q")&&document.activeElement!==$("find")){e.preventDefault();$("find").focus();}});
+
+// hover-intent prefetch: delegated on the list so it survives every re-render. A short
+// delay means a fast scroll-past doesn't fire a fetch; settling on a row warms its detail.
+let hoverTimer=null;
+$("list").addEventListener("mouseover",e=>{
+  const ci=e.target.closest(".ci[data-s]");
+  const s=ci&&ci.dataset.s;
+  if(!s||CHATCACHE.has(s))return;
+  clearTimeout(hoverTimer);
+  hoverTimer=setTimeout(()=>fetchChat(s),110);
+});
+$("list").addEventListener("mouseout",()=>clearTimeout(hoverTimer));
 
 // ============================ themes ============================
 // A theme isn't just a paint job: it carries its own vocabulary. Every visible
