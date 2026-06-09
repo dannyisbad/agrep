@@ -168,16 +168,23 @@ def list_chats() -> list[dict]:
     chats that have an emotional arc to open."""
     vib = _vibe_index()
     concept = _session_concept()
+    msgs = _messages_by_session()
     out = []
     for o in _summaries():
         s = o["session"]
         v = vib.get(s)
+        rows = msgs.get(s, [])
+        last_ts = max((r.get("ts", 0) for r in rows), default=0)
+        # prefer the freshly-ingested project on the message rows (the inferred primary
+        # working dir) over the summary's stale cwd_project, so the rail reflects re-index.
+        project = (rows[0].get("project") if rows else "") or o.get("cwd_project", "")
         out.append({
             "session": s,
             "agent": o.get("agent", ""),
-            "project": o.get("cwd_project", ""),
+            "project": project,
             "concept": concept.get(s, ""),
             "n_msgs": o.get("n_msgs", 0),
+            "last_ts": last_ts,
             "summary": o.get("summary", ""),
             "tags": o.get("tags", []),
             "has_vibe": v is not None,
@@ -244,6 +251,55 @@ def chats_in_concept(concept_id: int) -> dict:
         "where": list(head.get("cwd_buckets", {}).keys())[:5],
         "chats": chats,
     }
+
+
+def _snip_at(text: str, start: int, end: int, pad: int = 80) -> str:
+    """A one-line window of `text` around [start,end), with ellipses + collapsed whitespace."""
+    a, b = max(0, start - pad), min(len(text), end + pad)
+    s = ("…" if a > 0 else "") + text[a:b] + ("…" if b < len(text) else "")
+    return " ".join(s.split())
+
+
+def _kw_pattern(q: str):
+    """Compile a search pattern where any run of space/hyphen/underscore in the query matches
+    any run (or none) of the same in the text — so "cyber filter" also finds "cyber-filter",
+    "cyber_filter", "cyberfilter". This mirrors a grep `cyber[\\s-]*filter` and is what makes
+    keyword search surface every real instance, not just the exact-spacing ones."""
+    import re
+    toks = [re.escape(t) for t in re.split(r"[\s\-_]+", q.strip()) if t]
+    if not toks:
+        return None
+    return re.compile(r"[\s\-_]*".join(toks), re.I)
+
+
+def keyword_search(q: str, k: int = 300) -> dict:
+    """Case-insensitive, separator-flexible substring search over the actual message AND
+    agent-reply text (not summaries). Returns EVERY hit (one row per matching turn/reply,
+    like grep), grouped by chat, so the UI surfaces all instances. Runs over the in-memory
+    caches (RAM scan), so it's fast even though it touches every message."""
+    pat = _kw_pattern(q)
+    if pat is None:
+        return {"hits": [], "total": 0, "chats": 0}
+    msgs = _messages_by_session()
+    reps = _replies_by_id()
+    concept = _session_concept()
+    hits = []
+    for session, rows in msgs.items():
+        for o in rows:
+            base = {"session": session, "agent": o.get("agent", ""),
+                    "project": o.get("project", ""), "concept": concept.get(session, ""),
+                    "turn": o.get("turn", 0)}
+            t = o.get("text", "") or ""
+            m = pat.search(t)
+            if m:
+                hits.append({**base, "who": "you", "snippet": _snip_at(t, m.start(), m.end())})
+            r = reps.get(o.get("id", ""), "")
+            if r:
+                m = pat.search(r)
+                if m:
+                    hits.append({**base, "who": "agent", "snippet": _snip_at(r, m.start(), m.end())})
+    hits.sort(key=lambda h: (h["session"], h["turn"], 0 if h["who"] == "you" else 1))
+    return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
 
 def get_vibe(session: str) -> dict | None:

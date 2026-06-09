@@ -82,6 +82,12 @@ window.__pre={
   .ci .ag{color:var(--dim)} .ci .pj{color:var(--faint)}
   .ci .dot{width:5px;height:5px;border-radius:50%;flex:none}
   .ci .heat{margin-left:auto;font-variant-numeric:tabular-nums}
+  .ci .ttl.snip{-webkit-line-clamp:3;font-size:11.5px;line-height:1.45;color:var(--dim)}
+  /* search hit highlight — amber reads on every theme (dark + light) */
+  mark{background:#ffd54a;color:#1a1205;border-radius:2px;padding:0 1px}
+  .grp.ksub{border-top:1px solid var(--line);color:var(--dim)}
+  .who{font-size:9px;text-transform:uppercase;letter-spacing:.4px;padding:1px 4px;border-radius:3px;background:var(--hair);color:var(--faint);margin-right:6px;vertical-align:1px}
+  .who.you{color:var(--ember)}
   .empty{padding:40px 16px;color:var(--faint);text-align:center;font-size:12px}
 
   /* ---- main pane ---- */
@@ -371,6 +377,7 @@ window.__pre={
         </div>
         <div class="seg" id="sortSeg" style="margin-left:auto">
           <button data-s="size" class="on" data-c="sSize">size</button>
+          <button data-s="recent" data-c="sRecent">recent</button>
           <button data-s="heat" data-c="sHeat">heat</button>
         </div>
       </div>
@@ -394,6 +401,39 @@ const fmt=n=>Number(n).toLocaleString();
 const J=async u=>{const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json();};
 // tidy a raw model id for display (drop trailing date stamps; leave the rest legible)
 const prettyModel=m=>String(m||"").replace(/[-_](\d{6,8})$/,"").trim();
+
+// active search terms + a separator-flexible regex (set by runSearch, cleared on exit). The
+// regex lets a multi-word term match across space/hyphen/underscore, matching the backend
+// keyword search so "cyber filter" highlights "cyber-filter" too.
+let HILITE=[], HILITE_RE=null;
+function buildHiRe(terms){
+  const parts=(terms||[]).map(t=>String(t).trim().split(/[\s\-_]+/).filter(Boolean)
+      .map(x=>x.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("[\\s\\-_]*"))
+      .filter(Boolean).sort((a,b)=>b.length-a.length);
+  if(!parts.length)return null;
+  try{return new RegExp("("+parts.join("|")+")","gi");}catch(e){return null;}
+}
+function hl(text,_terms){
+  const s=esc(text);
+  if(!HILITE_RE)return s;
+  return s.replace(HILITE_RE,"<mark>$1</mark>");
+}
+const matchesHi=s=>{if(!HILITE_RE)return false;HILITE_RE.lastIndex=0;return HILITE_RE.test(s||"");};
+
+// a home/desktop cwd carries no project signal (the agent just mkdir'd & cd'd, or never did),
+// so show the concept thread instead of yet another "Users/Danny". A dir is "generic" when
+// every one of its path segments is a home/container name.
+const GENERICSEG=new Set(["users","user","danny","desktop","documents","downloads","home","tmp","temp","appdata","onedrive","",".","·"]);
+function isGenericDir(p){
+  const segs=String(p||"").toLowerCase().split(/[\/\\]/).filter(Boolean);
+  return segs.length===0||segs.every(s=>GENERICSEG.has(s));
+}
+function dirOf(c){
+  const p=(c.project||"").trim();
+  if(p&&!isGenericDir(p))return p;
+  const k=(c.concept||"").trim();
+  return k?shortConcept(k):(p||"·");
+}
 
 // heat ramp: rage_raw (or mean) -> color along calm->warm->ember. Per-theme endpoints so
 // the mid-tone never lands on washed-out yellow over a light background.
@@ -447,35 +487,60 @@ function renderChips(){
 }
 function shortConcept(k){return k.split(",").slice(0,3).map(s=>s.trim()).join(" · ");}
 
-// ---- semantic search (the /search endpoint: bi-encoder recall + cross-encoder rerank) ----
+// ---- search: "quoted" => exact keyword over real message+reply text; else semantic ----
 async function runSearch(q){
   q=q.trim();if(!q){exitSearch();return;}
-  SEARCH={active:true,q,results:null,busy:true};
-  $("findicon").textContent="≈";
+  const quoted=q.length>=2&&q[0]=='"'&&q.endsWith('"');
+  const term=quoted?q.slice(1,-1).trim():q;
+  if(!term){exitSearch();return;}
+  HILITE=quoted?[term]:term.toLowerCase().split(/\s+/).filter(w=>w.length>2);
+  HILITE_RE=buildHiRe(HILITE);
+  SEARCH={active:true,q:term,results:null,busy:true,mode:quoted?"keyword":"semantic"};
+  $("findicon").textContent=quoted?"⌕":"≈";
   renderSearchList();
   try{
-    const o=await J("/search?level=chat&k=14&q="+encodeURIComponent(q));
-    SEARCH.results=o.results||[];SEARCH.busy=false;
+    const o=await J("/search?k=40&q="+encodeURIComponent(q)); // raw q (server detects quotes)
+    SEARCH.results=o.results||[];SEARCH.mode=o.mode||SEARCH.mode;
+    SEARCH.total=o.total;SEARCH.chats=o.chats;SEARCH.busy=false;
   }catch(e){SEARCH.results=[];SEARCH.busy=false;SEARCH.err=e.message;}
   renderSearchList();
 }
-function exitSearch(){SEARCH={active:false,q:"",results:null,busy:false};$("findicon").textContent="/";renderRail();}
+function exitSearch(){SEARCH={active:false,q:"",results:null,busy:false};HILITE=[];HILITE_RE=null;$("findicon").textContent="/";renderRail();}
 function renderSearchList(){
   $("chips").style.display="none";
   const list=$("list");
-  let head=`<div class="grp"><span>${C('searchHead')} · "${esc(SEARCH.q)}"</span><b id="searchback" style="cursor:pointer;color:var(--ember)">${C('searchExit')}</b></div>`;
+  const kw=SEARCH.mode==="keyword";
+  const label=kw?"exact match":C('searchHead');
+  let head=`<div class="grp"><span>${label} · "${esc(SEARCH.q)}"</span><b id="searchback" style="cursor:pointer;color:var(--ember)">${C('searchExit')}</b></div>`;
   if(SEARCH.busy){list.innerHTML=head+`<div class="empty"><span class="spin">${C('searchBusy')}</span></div>`;wireSearchBack();return;}
   const r=SEARCH.results||[];
   if(!r.length){list.innerHTML=head+`<div class="empty">${SEARCH.err?C('searchWarm'):C('searchEmpty')}</div>`;wireSearchBack();return;}
-  // search hits carry agent/project/summary; match back to a known session row when possible
+  if(kw){
+    // one row per matching turn/reply (every instance, like grep), grouped under its chat
+    const tot=SEARCH.total||r.length, nc=SEARCH.chats||1;
+    let html=`<div class="grp"><span>${tot} match${tot==1?"":"es"} in ${nc} chat${nc==1?"":"s"} · "${esc(SEARCH.q)}"</span><b id="searchback" style="cursor:pointer;color:var(--ember)">${C('searchExit')}</b></div>`;
+    let lastSes=null;
+    r.forEach(h=>{
+      if(h.session!==lastSes){lastSes=h.session;
+        html+=`<div class="grp ksub"><span>${esc(h.agent)} · ${esc(dirOf(h))}</span></div>`;}
+      html+=`<div class="ci hit" data-s="${esc(h.session)}">
+        <div class="ttl snip"><span class="who ${h.who==='you'?'you':''}">${h.who}</span>${hl(h.snippet,HILITE)}</div>
+        <div class="mt"><span class="pj">turn ${h.turn}</span></div></div>`;
+    });
+    if(tot>r.length)html+=`<div class="empty" style="padding:9px">showing first ${r.length} of ${tot}</div>`;
+    list.innerHTML=html;
+    list.querySelectorAll(".ci[data-s]").forEach(el=>el.onclick=()=>openChat(el.dataset.s));
+    wireSearchBack();return;
+  }
+  // semantic: hits carry agent/project/summary; match back to a known row when possible
   list.innerHTML=head+r.map((c,i)=>{
     const row=findRow(c);const ses=row?row.session:null;
     const ttl=chatTitle({summary:c.summary,tags:c.tags||[]});
     const heat=row&&row.has_vibe?`<span style="color:${heatColor((row.juice||0)/12)}">vibe ${row.juice.toFixed(1)}</span> · `:"";
     return `<div class="ci${ses?'':' nohit'}" data-s="${esc(ses||'')}" ${ses?'':'style="cursor:default;opacity:.78"'}>
-      <div class="ttl">${esc(ttl)}</div>
+      <div class="ttl">${hl(ttl,HILITE)}</div>
       <div class="mt"><span class="dot" style="background:#2a2f37"></span>
-        <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(c.project||'·')}</span>
+        <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(dirOf(c))}</span>
         <span class="heat">${heat}${c.n_msgs?fmt(c.n_msgs)+'t':''}</span></div></div>`;
   }).join("");
   list.querySelectorAll(".ci[data-s]:not(.nohit)").forEach(el=>{if(el.dataset.s)el.onclick=()=>openChat(el.dataset.s);});
@@ -493,7 +558,9 @@ function renderRail(){
   renderChips();
   let rows=CHATS.filter(c=>matches(c,STATE.filter));
   if(STATE.chip!=null)rows=rows.filter(c=>groupKey(c)===STATE.chip);
-  const sortFn=STATE.sort==="heat"?(a,b)=>(b.juice||0)-(a.juice||0):(a,b)=>b.n_msgs-a.n_msgs;
+  const sortFn=STATE.sort==="heat"?(a,b)=>(b.juice||0)-(a.juice||0)
+    :STATE.sort==="recent"?(a,b)=>(b.last_ts||0)-(a.last_ts||0)
+    :(a,b)=>b.n_msgs-a.n_msgs;
   const list=$("list");
   if(!rows.length){list.innerHTML=`<div class="empty">${C('emptyNoMatch')}</div>`;return;}
   let html="";
@@ -520,7 +587,7 @@ function ciHTML(c){
     <div class="ttl">${esc(chatTitle(c))}</div>
     <div class="mt">
       <span class="dot" style="background:${col}"></span>
-      <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(c.project||"·")}</span>
+      <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(dirOf(c))}</span>
       <span class="heat">${c.has_vibe?`<span style="color:${heatColor((c.juice||0)/12)}">vibe ${heat}</span> · `:""}${fmt(c.n_msgs)}t</span>
     </div></div>`;
 }
@@ -619,7 +686,13 @@ function arcSVG(t){
 let TXSTATE={turns:[],shown:0,onlyHot:false};
 function wireDetail(d){
   TXSTATE={turns:d.turns,shown:0,onlyHot:false,peak:d.vibe?d.vibe.peak_turn:-1};
+  // with a search active, render enough turns to include the first match, then jump to it
+  if(HILITE.length){
+    const hit=d.turns.findIndex(t=>matchesHi(t.text)||matchesHi(t.reply||""));
+    if(hit>=0)TXSTATE.shown=hit+6;
+  }
   renderTx();
+  if(HILITE.length){const mk=$("tx")&&$("tx").querySelector("mark");if(mk)mk.scrollIntoView({block:"center"});}
 }
 function renderTx(){
   const box=$("tx");if(!box)return;
@@ -635,11 +708,12 @@ function renderTx(){
     const cls="turn"+(t.hot?" h":"");
     const tg=(t.top||[]).slice(0,3).filter(x=>x!=="neutral").join(", ");
     const mdl=t.model?` · ${esc(prettyModel(t.model))}`:"";
-    const rtog=t.reply?`<button class="rtog" data-t="${t.turn}" aria-expanded="false">${C('replyLabel')}${mdl}</button>`:"";
-    const rbox=t.reply?`<div class="rep" id="rep${t.turn}" hidden>${esc(t.reply)}</div>`:"";
+    const replyHit=t.reply&&matchesHi(t.reply);  // auto-open a reply that contains a match
+    const rtog=t.reply?`<button class="rtog" data-t="${t.turn}" aria-expanded="${replyHit}">${C('replyLabel')}${mdl}</button>`:"";
+    const rbox=t.reply?`<div class="rep" id="rep${t.turn}" ${replyHit?"":"hidden"}>${hl(t.reply,HILITE)}</div>`:"";
     return `<div class="${cls}">
       <div class="n">${t.turn}<i style="background:${t.rage>0.05?col:'transparent'}"></i></div>
-      <div><div class="tt">${esc(t.text)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${rtog}${rbox}</div>
+      <div><div class="tt">${hl(t.text,HILITE)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${rtog}${rbox}</div>
     </div>`;
   }).join("");
   const more=TXSTATE.shown<all.length?`<button class="more" id="more">${C('txShow')} ${Math.min(step,all.length-TXSTATE.shown)} ${C('txMore')} · ${all.length-TXSTATE.shown} ${C('txLeft')}</button>`:"";
@@ -842,9 +916,9 @@ const COPY={
   forensic:{
     askPh:"ask across every chat:  which project did i rage in, what was the DRM work about…",
     askBtn:"ask", vExplore:"explore", vPulse:"pulse",
-    findPh:"filter chats…  enter = search meaning", findClear:"clear",
+    findPh:'filter…  enter = meaning · "quotes" = exact', findClear:"clear",
     groupLab:"group", gConcept:"concept", gAgent:"agent", gProject:"project", gNone:"flat",
-    sSize:"size", sHeat:"heat",
+    sSize:"size", sRecent:"recent", sHeat:"heat",
     heroLead:"every chat you've had with claude, codex, opencode and antigravity, in one place. pick one on the left to read it back with its emotional arc, or ask a question across all of them.",
     heroFootA:"chats indexed", heroFootB:"with a vibe-trace",
     statChats:"chats", statTurns:"turns", statVibes:"vibe-traces",
@@ -867,9 +941,9 @@ const COPY={
   kawaii:{
     askPh:"ask me anything about your chats~  ✿ which buddy made you poutiest?",
     askBtn:"ask ♡", vExplore:"wander", vPulse:"feelings",
-    findPh:"find a cozy chat~  ♡ enter to search by vibe", findClear:"clear ✕",
+    findPh:'find a chat~ ♡ enter = vibe · "quotes" = exact', findClear:"clear ✕",
     groupLab:"sort by", gConcept:"topic", gAgent:"buddy", gProject:"project", gNone:"all",
-    sSize:"biggest", sHeat:"poutiest",
+    sSize:"biggest", sRecent:"newest", sHeat:"poutiest",
     heroFootA:"chats tucked away ♡", heroFootB:"with a mood diary ✿",
     statChats:"chats ♡", statTurns:"messages", statVibes:"mood diaries",
     searchHead:"vibe search", searchExit:"nvm ♡", searchBusy:"peeking through every chat~",
@@ -890,9 +964,9 @@ const COPY={
   },
   web99:{
     askPh:"Search your conversations...", askBtn:"Search", vExplore:"Directory", vPulse:"Statistics",
-    findPh:"Find a chat:", findClear:"[clear]",
+    findPh:'Find:  enter = meaning, "quotes" = exact', findClear:"[clear]",
     groupLab:"Sort:", gConcept:"Topic", gAgent:"Program", gProject:"Folder", gNone:"All",
-    sSize:"Size", sHeat:"Heat",
+    sSize:"Size", sRecent:"Recent", sHeat:"Heat",
     heroFootA:"documents indexed.", heroFootB:"with mood charts.",
     statChats:"documents", statTurns:"messages", statVibes:"mood charts",
     searchHead:"Search results", searchExit:"[back]", searchBusy:"Searching the archive...",

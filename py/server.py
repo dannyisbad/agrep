@@ -91,16 +91,27 @@ class Handler(BaseHTTPRequestHandler):
                 k = int((qs.get("k") or ["10"])[0])
             except ValueError:
                 k = 10
-            # reuse ask.py's warm embedder + cross-encoder reranker; no recompute.
+            # A quoted query ("...") OR mode=keyword => exact substring search over the real
+            # message/reply text. Otherwise the warmed semantic search (bi-encoder + reranker).
+            mode = (qs.get("mode") or [""])[0]
+            quoted = len(query) >= 2 and query[0] == '"' and query[-1] == '"'
+            keyword = mode == "keyword" or quoted
+            term = query[1:-1].strip() if quoted else query
             try:
-                if level == "message":
-                    results = json.loads(ask.tool_search_messages(query, k=k))
+                if keyword:
+                    kr = explore.keyword_search(term, k=300)
+                    self._send(200, json.dumps({"query": term, "mode": "keyword",
+                                                "results": kr["hits"], "total": kr["total"],
+                                                "chats": kr["chats"]}))
                 else:
-                    level = "chat"
-                    results = json.loads(ask.tool_search_chats(query, k=k))
-                self._send(200, json.dumps({"query": query, "level": level, "results": results}))
+                    if level == "message":
+                        results = json.loads(ask.tool_search_messages(query, k=k))
+                    else:
+                        level = "chat"
+                        results = json.loads(ask.tool_search_chats(query, k=k))
+                    self._send(200, json.dumps({"query": query, "mode": "semantic", "level": level, "results": results}))
             except Exception as e:  # noqa: BLE001
-                self._send(500, json.dumps({"error": str(e), "query": query, "level": level}))
+                self._send(500, json.dumps({"error": str(e), "query": query}))
         elif path == "/chat":
             sess = (qs.get("session") or [""])[0]
             if not sess:
