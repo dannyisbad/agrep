@@ -1,16 +1,10 @@
-//! tilt-core — ingest, scan, score. The instant (lexical) tier lives entirely here;
-//! the GPU semantic layer is a separate Python sidecar that writes back into the cache.
+//! tilt-core — transcript ingest. Parses every agent's chat logs (claude, codex, opencode,
+//! antigravity) into normalized [`Message`]s and writes the cache the Python sidecar builds
+//! the search/affect/topic index from. The semantic + serving layers live in the sidecar; this
+//! crate is the fast, parallel front door that turns ~10k scattered log files into one stream.
 
-pub mod model;
-pub mod lexicon;
-pub mod simd;
-pub mod scan;
-pub mod score;
-pub mod ingest;
 pub mod cache;
-pub mod search;
-pub mod index;
+pub mod ingest;
+pub mod model;
 
 pub use model::Message;
-pub use scan::{Hits, Scanner};
-pub use score::{Score, Tag};
