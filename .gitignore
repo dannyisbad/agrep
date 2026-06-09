@@ -2,3 +2,7 @@
 /data
 /dist
 *.bin
+/web/shots
+/.playwright-mcp
+/py/.venv
+__pycache__/

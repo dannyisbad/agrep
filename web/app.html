@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tilt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=JetBrains+Mono:wght@400;500;700&family=Baloo+2:wght@500;700;800&family=Mochiy+Pop+One&family=Yomogi&display=swap" rel="stylesheet">
+<script>
+// Kick the index fetches the instant the document starts parsing — well before the main
+// script runs — so boot() has the chat list, concepts and dashboard already in flight (or
+// done). Each resolves to parsed JSON, or a safe empty value on any error.
+window.__pre={
+  chats:fetch('/chats').then(r=>r.ok?r.json():null).catch(()=>null),
+  concepts:fetch('/concepts').then(r=>r.ok?r.json():[]).catch(()=>[]),
+  data:fetch('/data').then(r=>r.ok?r.json():null).catch(()=>null),
+};
+</script>
+<style>
+  :root{
+    --bg:#0a0b0d;--panel:#101216;--panel2:#0e1014;--rail:#0c0d10;--line:#1e2228;--hair:#171a1f;
+    --ink:#d6dade;--dim:#838a93;--faint:#525861;--ghost:#373d45;
+    --calm:#3ad6c4;--warm:#ffb000;--ember:#ff4a2e;--hot:#ff2f1c;
+    --mono:"JetBrains Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;--disp:"Anton","Arial Narrow",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:13px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.04;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+  ::selection{background:#3a1810;color:#ffd9cc}
+  ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#1c2128;border:2px solid var(--bg)}::-webkit-scrollbar-track{background:transparent}
+  a{color:inherit}
+  button{font-family:var(--mono);cursor:pointer}
+
+  /* ---- shell: top bar + two-column body ---- */
+  .top{position:sticky;top:0;z-index:30;background:rgba(10,11,13,.93);backdrop-filter:blur(7px);border-bottom:1px solid var(--line)}
+  .topin{display:flex;align-items:center;gap:18px;padding:11px 22px}
+  .word{font-family:var(--disp);font-size:30px;line-height:.7;letter-spacing:.3px}.word b{color:var(--ember);font-weight:400}
+  .askbar{flex:1;display:flex;gap:0;border:1px solid var(--line);background:var(--panel)}
+  .askbar input{flex:1;background:transparent;border:0;color:var(--ink);font-family:var(--mono);font-size:13px;outline:none;padding:8px 12px}
+  .askbar input::placeholder{color:var(--faint)}
+  .askbar button{background:var(--ember);color:#140600;border:0;font-weight:700;padding:0 16px}
+  .askbar button:disabled{background:#3a2018;color:#7c5042}
+  .views{display:flex;gap:2px}
+  .views button{background:transparent;border:1px solid var(--line);color:var(--dim);padding:7px 13px;font-size:12px}
+  .views button.on{background:var(--panel);color:var(--ink);border-color:#2a2f37}
+  .views button:hover{color:var(--ink)}
+  .stat{color:var(--faint);font-size:11px;white-space:nowrap}.stat b{color:var(--ink);font-weight:500}
+
+  .body{display:grid;grid-template-columns:340px 1fr;min-height:calc(100vh - 53px);position:relative;z-index:1}
+  .body.solo{grid-template-columns:1fr}
+
+  /* ---- left rail: the organizer ---- */
+  .rail{border-right:1px solid var(--line);background:var(--rail);display:flex;flex-direction:column;height:calc(100vh - 53px);position:sticky;top:53px}
+  .filt{padding:13px 14px 10px;border-bottom:1px solid var(--hair)}
+  .find{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel);padding:6px 10px}
+  .find input{flex:1;background:transparent;border:0;outline:none;color:var(--ink);font-family:var(--mono);font-size:12px}
+  .find input::placeholder{color:var(--faint)}
+  .find .x{color:var(--faint);cursor:pointer;font-size:13px}.find .x:hover{color:var(--ink)}
+  .ctrls{display:flex;gap:6px;margin-top:9px;align-items:center;flex-wrap:wrap}
+  .ctrls label{color:var(--faint);font-size:11px}
+  .seg{display:flex;border:1px solid var(--line)}
+  .seg button{background:transparent;border:0;border-right:1px solid var(--line);color:var(--dim);padding:4px 9px;font-size:11px}
+  .seg button:last-child{border-right:0}.seg button.on{background:var(--panel);color:var(--ink)}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;padding:9px 14px 11px;border-bottom:1px solid var(--hair)}
+  .chip{border:1px solid var(--line);background:transparent;color:var(--dim);padding:3px 8px;font-size:11px;border-radius:0}
+  .chip:hover{color:var(--ink);border-color:#2a2f37}
+  .chip.on{background:#16100d;border-color:var(--ember);color:#ffb9a8}
+  .chip small{color:var(--faint);margin-left:5px}
+
+  .list{flex:1;overflow-y:auto}
+  .grp{padding:10px 14px 4px;color:var(--faint);font-size:10.5px;display:flex;justify-content:space-between;align-items:baseline;border-top:1px solid var(--hair)}
+  .grp:first-child{border-top:0}
+  .grp b{color:var(--dim);font-weight:500}
+  .ci{padding:9px 14px 10px;border-bottom:1px solid var(--hair);cursor:pointer;position:relative}
+  .ci:hover{background:#0f1115}
+  .ci.sel{background:#11140e;box-shadow:inset 2px 0 0 var(--ember)}
+  .ci .ttl{color:var(--ink);font-size:12px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .ci .mt{display:flex;gap:8px;align-items:center;color:var(--faint);font-size:10.5px;margin-top:5px}
+  .ci .ag{color:var(--dim)} .ci .pj{color:var(--faint)}
+  .ci .dot{width:5px;height:5px;border-radius:50%;flex:none}
+  .ci .heat{margin-left:auto;font-variant-numeric:tabular-nums}
+  .empty{padding:40px 16px;color:var(--faint);text-align:center;font-size:12px}
+
+  /* ---- main pane ---- */
+  .main{overflow-y:auto;height:calc(100vh - 53px);padding:0}
+  .pane{max-width:880px;margin:0 auto;padding:26px 30px 120px}
+
+  /* ask conversation overlay (lives at top of main) */
+  .conv{display:flex;flex-direction:column;gap:13px;margin-bottom:8px}
+  .conv:empty{display:none}
+  .q{color:var(--calm)}.q::before{content:"you  ";color:var(--faint)}
+  .a{background:var(--panel);border:1px solid var(--line);padding:12px 14px}
+  .a .ans{white-space:pre-wrap}
+  .a .think{color:var(--faint);font-size:11px;margin-bottom:8px}.a .think b{color:var(--dim)}
+  .cards{display:flex;flex-direction:column;gap:5px;margin-top:9px}
+  .card{border-top:1px solid var(--hair);padding:6px 0 2px;cursor:pointer}
+  .card:hover .s{color:#fff}
+  .card .h{color:var(--dim);font-size:11px}.card .h .ag{color:var(--ember)}
+  .card .s{color:var(--ink)}.card .t{color:var(--faint);font-size:11px}
+  .spin{color:var(--faint)}
+  .spin::after{content:"";animation:dots 1.4s steps(4,end) infinite}
+  @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+
+  /* placeholder when nothing open */
+  .ph{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:var(--faint);gap:14px;padding:60px 20px}
+  .ph .big{font-family:var(--disp);font-size:120px;line-height:.8;color:#15171b}
+  .ph p{max-width:420px}.ph kbd{color:var(--dim);border:1px solid var(--line);padding:1px 6px;background:var(--panel)}
+
+  /* chat detail */
+  .det h2{font-family:var(--mono);font-weight:500;font-size:15px;color:var(--ink);margin:0 0 7px;line-height:1.4}
+  .det .crumb{display:flex;flex-wrap:wrap;gap:7px 13px;align-items:center;color:var(--faint);font-size:11.5px;margin-bottom:14px}
+  .det .crumb .ag{color:var(--ember)}.det .crumb .pj{color:var(--dim)}
+  .det .crumb .cc{color:var(--dim);border:1px solid var(--line);padding:1px 7px}
+  .det .sum{color:var(--dim);border-left:2px solid var(--line);padding:2px 0 2px 12px;margin:0 0 14px}
+  .det .tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px}
+  .det .tag{color:var(--faint);font-size:11px;border:1px solid var(--hair);padding:2px 7px}
+  .det .tag::before{content:"#";color:var(--ghost)}
+
+  .arc{background:var(--panel);border:1px solid var(--line);padding:13px 16px 8px;margin-bottom:8px}
+  .arc .ah{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .arc .verdict{color:var(--dim)}.arc .verdict .m{color:var(--ember)}
+  .arc .ameta{color:var(--faint);font-size:11px}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .tp-label{fill:var(--dim);font-size:10px}.axislab{fill:var(--faint);font-size:9px}.ylab{fill:var(--faint);font-size:9px}
+  .legend{display:flex;gap:9px;align-items:center;color:var(--faint);font-size:10.5px;margin:7px 0 0}
+  .swatch{width:50px;height:7px;background:linear-gradient(90deg,var(--calm),var(--warm),var(--ember))}
+
+  .tx{margin-top:20px}
+  .txhead{display:flex;justify-content:space-between;align-items:center;color:var(--faint);font-size:11px;border-bottom:1px solid var(--line);padding-bottom:7px;margin-bottom:4px}
+  .txhead .seg button{padding:3px 8px}
+  .turn{display:grid;grid-template-columns:46px 1fr;gap:12px;padding:7px 0;border-bottom:1px solid var(--hair);align-items:start}
+  .turn .n{color:var(--ghost);font-size:11px;text-align:right;padding-top:1px;font-variant-numeric:tabular-nums;position:relative}
+  .turn .n i{position:absolute;right:-12px;top:0;bottom:0;width:2px}
+  .turn .tt{white-space:pre-wrap;word-break:break-word;color:var(--ink)}
+  .turn.h .tt{color:#ffd9cf}
+  .turn .tg{color:var(--faint);font-size:10.5px;margin-top:3px}
+  .turn.q .tt{color:var(--calm)}
+  .more{display:block;width:100%;text-align:center;background:transparent;border:1px solid var(--line);color:var(--dim);padding:8px;margin-top:10px;font-size:12px}
+  .more:hover{color:var(--ink);border-color:#2a2f37}
+
+  /* model chip in the chat header */
+  .det .crumb .mdl{color:var(--dim);border:1px solid var(--hair);padding:1px 7px;font-variant-numeric:tabular-nums}
+  .det .crumb .mdl::before{content:"◇ ";color:var(--faint)}
+
+  /* turning-point numbered dots + the list that decodes them */
+  .tp-num{fill:#fff;font-size:9px;font-weight:700;font-family:var(--mono)}
+  .tps{list-style:none;margin:11px 0 2px;padding:0;display:flex;flex-direction:column;gap:6px}
+  .tps li{display:grid;grid-template-columns:18px 64px 1fr;gap:10px;align-items:baseline}
+  .tps li b{color:#fff;background:var(--ember);width:17px;height:17px;border-radius:50%;
+    display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;align-self:start}
+  .tps .tpt{color:var(--faint);font-variant-numeric:tabular-nums;font-size:11px}
+  .tps .tpq{color:var(--dim);font-size:12px;line-height:1.45}
+
+  /* reveal the agent's reply for a turn */
+  .rtog{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:11px;padding:5px 0 0;cursor:pointer;display:inline-block}
+  .rtog:hover{color:var(--ink)}
+  .rtog::before{content:"▸ ";color:var(--faint)}
+  .rtog[aria-expanded="true"]::before{content:"▾ "}
+  .rep{margin-top:7px;padding:10px 13px;border-left:2px solid var(--line);background:var(--panel2);
+    color:var(--dim);white-space:pre-wrap;word-break:break-word;line-height:1.55}
+  .amodel{color:var(--faint);font-size:11px;margin-top:9px;text-align:right;font-style:italic}
+
+  /* ---- dashboard (pulse) view ---- */
+  .sec{display:flex;align-items:center;gap:11px;margin:34px 0 13px;color:var(--dim)}
+  .sec:first-child{margin-top:6px}
+  .sec .sq{width:7px;height:7px;background:var(--ember)}.sec .rule{flex:1;height:1px;background:var(--line)}.sec em{color:var(--faint);font-style:normal;font-size:11px}
+  .row{display:grid;grid-template-columns:130px 1fr 150px;align-items:center;gap:14px;padding:6px 0}
+  .row .nm{color:var(--ink)}.row .nm small{color:var(--faint)}
+  .bar{height:15px;background:#0e1014;border:1px solid var(--hair);position:relative;overflow:hidden}
+  .bar i{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#9a5a00,var(--ember))}
+  .row .v{text-align:right;color:var(--dim);font-size:12px}.row .v b{color:var(--ink);font-weight:700;font-size:14px}
+  .tl text{font-variant-numeric:tabular-nums}
+
+  /* ============================ themes ============================ */
+  .themebtn{background:transparent;border:1px solid var(--line);color:var(--dim);padding:7px 11px;font-size:12px}
+  .themebtn:hover{color:var(--ink);border-color:#2a2f37}
+
+  /* ---------- KAWAII (✿) ---------- */
+  html[data-theme="kawaii"]{
+    --bg:#fff0f7;--panel:#ffffff;--panel2:#fff6fb;--rail:#ffeaf4;--line:#ffd2e7;--hair:#ffe1ef;
+    --ink:#7c4a66;--dim:#b15c87;--faint:#c97fa6;--ghost:#e6b4ce;
+    --calm:#1f9e8e;--warm:#e0871f;--ember:#ff74ad;--hot:#ff4f97;
+    --mono:"Baloo 2",system-ui,sans-serif;--disp:"Mochiy Pop One","Baloo 2",sans-serif;
+  }
+  html[data-theme="kawaii"] body{font-weight:500}
+  html[data-theme="kawaii"] body::before{opacity:.6;background-image:
+    radial-gradient(circle at 14% 16%,#ffd9ec 0,transparent 22%),
+    radial-gradient(circle at 86% 28%,#e7d7ff 0,transparent 24%),
+    radial-gradient(circle at 50% 94%,#d4fff4 0,transparent 26%)}
+  html[data-theme="kawaii"] .top{background:rgba(255,240,247,.93);border-bottom:2px solid var(--line)}
+  html[data-theme="kawaii"] .word{color:#ff74ad;text-shadow:2px 2px 0 #ffd2e7}
+  html[data-theme="kawaii"] .word b{color:#ffb6d5}
+  html[data-theme="kawaii"] .word::after{content:" ✿";font-size:.55em;vertical-align:super}
+  html[data-theme="kawaii"] :is(.panel,.trace,.arc,.a,.card,.det .sum){border-radius:16px}
+  html[data-theme="kawaii"] :is(.askbar,.find){border-radius:18px;border:2px solid var(--ember);background:#fff}
+  html[data-theme="kawaii"] :is(.themebtn,.views button,.seg button,.chip,.askbar button){border-radius:13px}
+  html[data-theme="kawaii"] .askbar button{background:#ff74ad;color:#fff;font-weight:700}
+  html[data-theme="kawaii"] .views button.on{background:#fff;color:#ff4f97;border-color:#ff9cc6}
+  html[data-theme="kawaii"] .chip.on{background:#fff0f7;border-color:#ff74ad;color:#ff4f97}
+  html[data-theme="kawaii"] .bar{border-radius:9px;background:#ffe1ef;border:0}
+  html[data-theme="kawaii"] .bar i{background:linear-gradient(90deg,#e0871f,#ff74ad)}
+  html[data-theme="kawaii"] .sec .sq{border-radius:50%;box-shadow:0 0 0 3px #ffdbeb}
+  html[data-theme="kawaii"] .ci.sel{background:#fff0f7;box-shadow:inset 3px 0 0 #ff74ad}
+  html[data-theme="kawaii"] .ph .big{color:#ffdce9}
+  html[data-theme="kawaii"] ::-webkit-scrollbar-thumb{background:#ffb6d5;border-radius:6px;border:2px solid #fff0f7}
+
+  /* ---------- 1999 WEB (▦) — clean early-web, usable like og google ---------- */
+  html[data-theme="web99"]{
+    --bg:#ffffff;--panel:#ffffff;--panel2:#f6f6f6;--rail:#f3f3f3;--line:#bcbcbc;--hair:#dcdcdc;
+    --ink:#000000;--dim:#1a1a1a;--faint:#666666;--ghost:#9a9a9a;
+    --calm:#008000;--warm:#c07000;--ember:#cc0000;--hot:#cc0000;
+    --mono:"Times New Roman",Times,serif;--disp:"Times New Roman",Times,serif;
+  }
+  html[data-theme="web99"] body{font-size:14px;line-height:1.5;background:#fff}
+  html[data-theme="web99"] body::before{display:none}
+  html[data-theme="web99"] .top{background:#eaeaea;border-bottom:2px solid #999;box-shadow:inset 0 1px 0 #fff}
+  html[data-theme="web99"] .topin{gap:14px}
+  html[data-theme="web99"] .word{font-weight:700;font-size:30px;letter-spacing:-1px;line-height:1}
+  html[data-theme="web99"] .word .wl{text-shadow:1px 1px 0 #bdbdbd}
+  html[data-theme="web99"] .word .wl:nth-child(1){color:#0000cc}
+  html[data-theme="web99"] .word .wl:nth-child(2){color:#cc0000}
+  html[data-theme="web99"] .word .wl:nth-child(3){color:#e8a800}
+  html[data-theme="web99"] .word .wl:nth-child(4){color:#008000}
+  html[data-theme="web99"] .word b{font-size:0}
+  html[data-theme="web99"] .word b::after{content:"!";font-size:30px;color:#0000cc;text-shadow:1px 1px 0 #bdbdbd}
+  html[data-theme="web99"] .askbar{border:0;background:transparent;gap:5px}
+  html[data-theme="web99"] :is(.askbar input,.find input){border:2px inset #c0c0c0;background:#fff;color:#000;
+    font-family:"Times New Roman",serif;font-size:14px;padding:3px 6px;box-shadow:none}
+  html[data-theme="web99"] :is(button,.themebtn,.views button,.seg button,.chip,.askbar button,.more){
+    background:#c0c0c0;color:#000;border:2px outset #e4e4e4;border-radius:0;
+    font-family:Arial,Helvetica,sans-serif;font-size:12px;box-shadow:none;padding:3px 10px}
+  html[data-theme="web99"] :is(.views button.on,.seg button.on,.chip.on){border-style:inset;background:#aeaeae}
+  html[data-theme="web99"] :is(button:active,.askbar button:active){border-style:inset}
+  html[data-theme="web99"] .askbar button{font-weight:700}
+  html[data-theme="web99"] .rail{background:#f3f3f3;border-right:2px solid #999}
+  html[data-theme="web99"] .find{border:2px inset #c0c0c0;background:#fff;border-radius:0}
+  html[data-theme="web99"] .chip{padding:2px 7px}
+  html[data-theme="web99"] .ci{border-bottom:1px dotted #bbb}
+  html[data-theme="web99"] .ci .ttl{color:#0000ee;text-decoration:underline;font-family:"Times New Roman",serif;font-size:14px;-webkit-line-clamp:2}
+  html[data-theme="web99"] .ci:hover{background:#eef2ff}
+  html[data-theme="web99"] .ci:hover .ttl{color:#cc0000}
+  html[data-theme="web99"] .ci.sel{background:#000080;box-shadow:none}
+  html[data-theme="web99"] :is(.ci.sel .ttl,.ci.sel .mt,.ci.sel .ag,.ci.sel .pj,.ci.sel .heat){color:#fff}
+  html[data-theme="web99"] .grp{background:#e2e2e2;border-top:1px solid #cfcfcf;color:#333;
+    font-family:Arial,sans-serif;font-weight:700;font-size:11px}
+  html[data-theme="web99"] .grp b{color:#000}
+  html[data-theme="web99"] .det h2{font-family:"Times New Roman",serif;font-weight:700;font-size:23px;color:#0000cc}
+  html[data-theme="web99"] .det .crumb .ag{color:#cc0000}
+  html[data-theme="web99"] .det .crumb .cc{border:1px solid #aac}
+  html[data-theme="web99"] .det .sum{border-left:4px solid #cccccc;background:#f6f6f6;color:#000;padding:6px 10px}
+  html[data-theme="web99"] .det .tag{border:1px solid #99c;color:#0000cc}
+  html[data-theme="web99"] :is(.arc,.a,.card){border:2px ridge #d6d6d6;background:#fcfcfc;border-radius:0;box-shadow:none}
+  html[data-theme="web99"] .card .h .ag{color:#cc0000}
+  html[data-theme="web99"] .sec{color:#0000cc;font-family:Arial,sans-serif;font-weight:700;
+    border-bottom:2px solid #0000cc;padding-bottom:3px;margin:30px 0 12px}
+  html[data-theme="web99"] .sec .sq{background:#cc0000}
+  html[data-theme="web99"] .sec .rule{display:none}
+  html[data-theme="web99"] .sec em{color:#666;font-family:"Times New Roman",serif;font-style:italic}
+  html[data-theme="web99"] .bar{background:#fff;border:1px solid #000;border-radius:0}
+  html[data-theme="web99"] .bar i{background:#0000cc}
+  html[data-theme="web99"] .more{font-family:Arial,sans-serif}
+  html[data-theme="web99"] ::selection{background:#000080;color:#fff}
+  html[data-theme="web99"] ::-webkit-scrollbar-thumb{background:#c0c0c0;border:1px solid #808080}
+
+  /* ---------- per-theme wordmark letters + speaker prefix ---------- */
+  .word .wl{display:inline-block}
+  html[data-theme="kawaii"] .word .wl{color:#ff74ad}
+  .q::before{content:"you  ";color:var(--faint)}
+  html[data-theme="kawaii"] .q::before{content:"you ♡  ";color:#e493bb}
+  html[data-theme="web99"] .q::before{content:"You:  ";color:#cc0000}
+
+  /* ---------- kawaii: floating mascot, sparkle field, cozy home ---------- */
+  html[data-theme="kawaii"] body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.45;
+    background-image:radial-gradient(circle,#ffffff 1.1px,transparent 1.6px),radial-gradient(circle,#ffd0e8 1.1px,transparent 1.6px);
+    background-size:96px 96px,150px 150px;background-position:0 0,46px 64px}
+  html[data-theme="kawaii"] .kho{max-width:470px;margin:34px auto 0;text-align:center;display:flex;flex-direction:column;align-items:center;gap:13px;position:relative;z-index:1}
+  html[data-theme="kawaii"] .khomascot{width:128px;height:128px;animation:floaty 3.4s ease-in-out infinite;filter:drop-shadow(0 8px 10px #ffc6e0)}
+  @keyframes floaty{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-12px) rotate(2deg)}}
+  html[data-theme="kawaii"] .khohi{font-family:"Mochiy Pop One",sans-serif;font-size:25px;color:#ff5fa2}
+  html[data-theme="kawaii"] .kholead{color:#a8587c;font-family:"Yomogi","Baloo 2",cursive;font-size:15.5px;line-height:1.85;max-width:400px}
+  html[data-theme="kawaii"] .khofoot{color:#d484ab;font-size:13px}
+  html[data-theme="kawaii"] .khosparkle{font-size:19px;letter-spacing:10px;color:#ffa9d2;animation:twinkle 2.6s ease-in-out infinite}
+  @keyframes twinkle{0%,100%{opacity:.45}50%{opacity:1}}
+  html[data-theme="kawaii"] .ci .ttl{font-weight:600}
+  html[data-theme="kawaii"] .det h2{color:#ff5fa2}
+
+  /* ---------- web99: original-google homepage ---------- */
+  html[data-theme="web99"] .g99{max-width:560px;margin:48px auto 0;text-align:center;font-family:"Times New Roman",serif;position:relative;z-index:1}
+  html[data-theme="web99"] .g99logo{font-size:76px;font-weight:700;letter-spacing:-4px;line-height:1}
+  html[data-theme="web99"] .g99logo span:nth-child(1){color:#0000cc}
+  html[data-theme="web99"] .g99logo span:nth-child(2){color:#cc0000}
+  html[data-theme="web99"] .g99logo span:nth-child(3){color:#e8a800}
+  html[data-theme="web99"] .g99logo span:nth-child(4){color:#008000}
+  html[data-theme="web99"] .g99logo em{color:#0000cc;font-style:normal}
+  html[data-theme="web99"] .g99logo span,html[data-theme="web99"] .g99logo em{text-shadow:2px 2px 0 #c9c9c9}
+  html[data-theme="web99"] .g99tag{margin:16px 0 20px;font-size:15px;color:#000}
+  html[data-theme="web99"] .g99btns{display:flex;gap:11px;justify-content:center}
+  html[data-theme="web99"] .g99b{background:#c0c0c0;border:2px outset #e4e4e4;font-family:Arial,sans-serif;font-size:13px;padding:5px 15px;cursor:pointer}
+  html[data-theme="web99"] .g99b:active{border-style:inset}
+  html[data-theme="web99"] .g99meta{margin-top:24px;font-size:13px;color:#333}
+  html[data-theme="web99"] .g99hr{border:0;border-top:1px solid #cccccc;margin:24px 0 10px}
+  html[data-theme="web99"] .g99foot{display:flex;justify-content:space-between;gap:14px;font-size:11px;color:#777;font-family:Arial,sans-serif}
+  html[data-theme="web99"] .g99ctr i{font-family:"Courier New",monospace;background:#000;color:#33ff33;padding:1px 5px;letter-spacing:3px;font-style:normal}
+
+  /* ---------- readability fixes for the light themes ---------- */
+  /* hot-turn text was a near-white pink (#ffd9cf) tuned for the dark theme; on a light
+     background it vanishes. The hot turns are the disapproval/annoyance ones, so this is
+     exactly the text that needs to read. Recolor per theme. */
+  html[data-theme="kawaii"] .turn.h .tt{color:#d61e6b}
+  html[data-theme="kawaii"] .turn.q .tt{color:#0f8a7c}
+  html[data-theme="kawaii"] .turn .tg{color:#b15c87}
+  html[data-theme="kawaii"] .det .tag{color:#b15c87}
+  html[data-theme="web99"] .turn.h .tt{color:#b00000}
+  html[data-theme="web99"] .turn.q .tt{color:#006000}
+  html[data-theme="web99"] .turn .tg{color:#555}
+
+  /* ---------- model chip / reply / turning-points per theme ---------- */
+  html[data-theme="kawaii"] :is(.rep,.det .crumb .mdl){border-radius:11px}
+  html[data-theme="kawaii"] .rep{border-left:0;background:#fff6fb}
+  html[data-theme="kawaii"] .det .crumb .mdl::before{content:"✿ "}
+  html[data-theme="kawaii"] .rtog::before{content:"♡ "}
+  html[data-theme="kawaii"] .rtog[aria-expanded="true"]::before{content:"♥ "}
+
+  html[data-theme="web99"] .det .crumb .mdl{border:0;color:#008000;font-family:Arial,sans-serif;padding:0}
+  html[data-theme="web99"] .det .crumb .mdl::before{content:"("}
+  html[data-theme="web99"] .det .crumb .mdl::after{content:")"}
+  html[data-theme="web99"] .rtog{color:#0000ee;text-decoration:underline;font-family:Arial,sans-serif}
+  html[data-theme="web99"] .rtog::before{content:"» "}
+  html[data-theme="web99"] .rtog[aria-expanded="true"]::before{content:"« "}
+  html[data-theme="web99"] .rep{background:#fffff0;border:1px solid #ccc;border-left:4px solid #99c;color:#000}
+  html[data-theme="web99"] .amodel{font-style:normal;font-family:Arial,sans-serif;color:#666}
+  html[data-theme="web99"] .tps li b{background:#cc0000}
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div class="topin">
+    <div class="word" id="word"><span class="wl">t</span><span class="wl">i</span><span class="wl">l</span><span class="wl">t</span><b>.</b></div>
+    <div class="askbar">
+      <input id="q" data-cp="askPh" placeholder="ask across every chat:  which project did i rage in, what was the DRM work about…">
+      <button id="send" data-c="askBtn">ask</button>
+    </div>
+    <div class="views">
+      <button id="vExplore" class="on" data-c="vExplore">explore</button>
+      <button id="vPulse" data-c="vPulse">pulse</button>
+    </div>
+    <button id="theme" class="themebtn" title="cycle theme">◐ forensic</button>
+    <div class="stat" id="stat"></div>
+  </div>
+</div>
+
+<div class="body" id="bodyEl">
+  <aside class="rail" id="rail">
+    <div class="filt">
+      <div class="find">
+        <span style="color:var(--faint)" id="findicon">/</span>
+        <input id="find" data-cp="findPh" placeholder="filter chats…  enter = search meaning">
+        <span class="x" id="findx" data-c="findClear" style="display:none">clear</span>
+      </div>
+      <div class="ctrls">
+        <label data-c="groupLab">group</label>
+        <div class="seg" id="groupSeg">
+          <button data-g="concept" class="on" data-c="gConcept">concept</button>
+          <button data-g="agent" data-c="gAgent">agent</button>
+          <button data-g="project" data-c="gProject">project</button>
+          <button data-g="none" data-c="gNone">flat</button>
+        </div>
+        <div class="seg" id="sortSeg" style="margin-left:auto">
+          <button data-s="size" class="on" data-c="sSize">size</button>
+          <button data-s="heat" data-c="sHeat">heat</button>
+        </div>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="list" id="list"></div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="pane" id="pane">
+      <div class="conv" id="conv"></div>
+      <div id="view"></div>
+    </div>
+  </main>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const fmt=n=>Number(n).toLocaleString();
+const J=async u=>{const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json();};
+// tidy a raw model id for display (drop trailing date stamps; leave the rest legible)
+const prettyModel=m=>String(m||"").replace(/[-_](\d{6,8})$/,"").trim();
+
+// heat ramp: rage_raw (or mean) -> color along calm->warm->ember. Per-theme endpoints so
+// the mid-tone never lands on washed-out yellow over a light background.
+const HEAT_RAMP={
+  forensic:[[58,214,196],[255,176,0],[255,74,46]],  // teal -> amber -> ember (reads on charcoal)
+  kawaii:[[28,168,150],[214,92,52],[224,46,120]],   // deep teal -> burnt coral -> hot pink (reads on pink)
+  web99:[[0,120,0],[176,92,0],[200,0,0]],           // green -> dark amber -> red (reads on white)
+};
+function heatColor(v){ // v ~ 0..0.6
+  const r=HEAT_RAMP[document.documentElement.dataset.theme]||HEAT_RAMP.forensic;
+  const t=Math.max(0,Math.min(1,v/0.45));
+  if(t<.5){const k=t/.5;return mix(r[0],r[1],k);} // calm->warm
+  const k=(t-.5)/.5;return mix(r[1],r[2],k);       // warm->ember
+}
+function mix(a,b,k){return `rgb(${a.map((x,i)=>Math.round(x+(b[i]-x)*k)).join(',')})`;}
+
+let CHATS=[],CONCEPTS=[],STATE={group:"concept",sort:"size",filter:"",chip:null,sel:null,view:"explore"};
+let SEARCH={active:false,q:"",results:null,busy:false}; // semantic results override the grouped list
+const bySession={}; // session -> chat row, for enriching search hits
+
+// ============================ rail / organizer ============================
+function matches(c,f){
+  if(!f)return true;
+  const hay=(c.summary+" "+c.tags.join(" ")+" "+c.project+" "+c.agent+" "+c.concept).toLowerCase();
+  return f.split(/\s+/).every(w=>hay.includes(w));
+}
+function chatTitle(c){
+  // first sentence of summary, trimmed; fall back to tags
+  let s=(c.summary||"").trim();
+  if(s){const m=s.match(/^(.{0,110}?[.!?])(\s|$)/);return m?m[1]:s.slice(0,110)+(s.length>110?"…":"");}
+  return c.tags.length?c.tags.join(", "):"(untitled chat)";
+}
+function groupKey(c){
+  if(STATE.group==="agent")return c.agent||"?";
+  if(STATE.group==="project")return c.project||"?";
+  if(STATE.group==="concept")return c.concept||"(unclustered)";
+  return "all chats";
+}
+function renderChips(){
+  const el=$("chips");
+  if(STATE.group==="none"){el.style.display="none";return;}
+  el.style.display="flex";
+  const counts={};
+  CHATS.filter(c=>matches(c,STATE.filter)).forEach(c=>{const k=groupKey(c);counts[k]=(counts[k]||0)+1;});
+  const keys=Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
+  el.innerHTML=keys.map(k=>{
+    const lab=STATE.group==="concept"?shortConcept(k):k;
+    return `<button class="chip${STATE.chip===k?' on':''}" data-k="${esc(k)}">${esc(lab)}<small>${counts[k]}</small></button>`;
+  }).join("");
+  el.querySelectorAll(".chip").forEach(b=>b.onclick=()=>{STATE.chip=STATE.chip===b.dataset.k?null:b.dataset.k;renderRail();});
+}
+function shortConcept(k){return k.split(",").slice(0,3).map(s=>s.trim()).join(" · ");}
+
+// ---- semantic search (the /search endpoint: bi-encoder recall + cross-encoder rerank) ----
+async function runSearch(q){
+  q=q.trim();if(!q){exitSearch();return;}
+  SEARCH={active:true,q,results:null,busy:true};
+  $("findicon").textContent="≈";
+  renderSearchList();
+  try{
+    const o=await J("/search?level=chat&k=14&q="+encodeURIComponent(q));
+    SEARCH.results=o.results||[];SEARCH.busy=false;
+  }catch(e){SEARCH.results=[];SEARCH.busy=false;SEARCH.err=e.message;}
+  renderSearchList();
+}
+function exitSearch(){SEARCH={active:false,q:"",results:null,busy:false};$("findicon").textContent="/";renderRail();}
+function renderSearchList(){
+  $("chips").style.display="none";
+  const list=$("list");
+  let head=`<div class="grp"><span>${C('searchHead')} · "${esc(SEARCH.q)}"</span><b id="searchback" style="cursor:pointer;color:var(--ember)">${C('searchExit')}</b></div>`;
+  if(SEARCH.busy){list.innerHTML=head+`<div class="empty"><span class="spin">${C('searchBusy')}</span></div>`;wireSearchBack();return;}
+  const r=SEARCH.results||[];
+  if(!r.length){list.innerHTML=head+`<div class="empty">${SEARCH.err?C('searchWarm'):C('searchEmpty')}</div>`;wireSearchBack();return;}
+  // search hits carry agent/project/summary; match back to a known session row when possible
+  list.innerHTML=head+r.map((c,i)=>{
+    const row=findRow(c);const ses=row?row.session:null;
+    const ttl=chatTitle({summary:c.summary,tags:c.tags||[]});
+    const heat=row&&row.has_vibe?`<span style="color:${heatColor((row.juice||0)/12)}">vibe ${row.juice.toFixed(1)}</span> · `:"";
+    return `<div class="ci${ses?'':' nohit'}" data-s="${esc(ses||'')}" ${ses?'':'style="cursor:default;opacity:.78"'}>
+      <div class="ttl">${esc(ttl)}</div>
+      <div class="mt"><span class="dot" style="background:#2a2f37"></span>
+        <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(c.project||'·')}</span>
+        <span class="heat">${heat}${c.n_msgs?fmt(c.n_msgs)+'t':''}</span></div></div>`;
+  }).join("");
+  list.querySelectorAll(".ci[data-s]:not(.nohit)").forEach(el=>{if(el.dataset.s)el.onclick=()=>openChat(el.dataset.s);});
+  wireSearchBack();
+}
+function wireSearchBack(){const b=$("searchback");if(b)b.onclick=exitSearch;}
+function findRow(c){ // match a search result to a chat row (same agent+project+summary head)
+  if(c.session&&bySession[c.session])return bySession[c.session];
+  const head=(c.summary||"").slice(0,60);
+  return CHATS.find(x=>x.agent===c.agent&&x.project===c.project&&(x.summary||"").slice(0,60)===head)||null;
+}
+
+function renderRail(){
+  if(SEARCH.active){renderSearchList();return;}
+  renderChips();
+  let rows=CHATS.filter(c=>matches(c,STATE.filter));
+  if(STATE.chip!=null)rows=rows.filter(c=>groupKey(c)===STATE.chip);
+  const sortFn=STATE.sort==="heat"?(a,b)=>(b.juice||0)-(a.juice||0):(a,b)=>b.n_msgs-a.n_msgs;
+  const list=$("list");
+  if(!rows.length){list.innerHTML=`<div class="empty">${C('emptyNoMatch')}</div>`;return;}
+  let html="";
+  if(STATE.group==="none"){
+    html=rows.sort(sortFn).map(ciHTML).join("");
+  }else{
+    const groups={};rows.forEach(c=>{(groups[groupKey(c)]=groups[groupKey(c)]||[]).push(c);});
+    const keys=Object.keys(groups).sort((a,b)=>groups[b].length-groups[a].length);
+    for(const k of keys){
+      const g=groups[k].sort(sortFn);
+      const lab=STATE.group==="concept"?shortConcept(k):k;
+      html+=`<div class="grp"><span>${esc(lab)}</span><b>${g.length}</b></div>`+g.map(ciHTML).join("");
+    }
+  }
+  list.innerHTML=html;
+  list.querySelectorAll(".ci").forEach(el=>el.onclick=()=>openChat(el.dataset.s));
+  if(STATE.sel)list.querySelector(`.ci[data-s="${cssEsc(STATE.sel)}"]`)?.classList.add("sel");
+}
+function cssEsc(s){return String(s).replace(/["\\]/g,'\\$&');}
+function ciHTML(c){
+  const heat=c.juice?c.juice.toFixed(1):"";
+  const col=c.has_vibe?heatColor((c.juice||0)/12):"#2a2f37";
+  return `<div class="ci${STATE.sel===c.session?' sel':''}" data-s="${esc(c.session)}">
+    <div class="ttl">${esc(chatTitle(c))}</div>
+    <div class="mt">
+      <span class="dot" style="background:${col}"></span>
+      <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(c.project||"·")}</span>
+      <span class="heat">${c.has_vibe?`<span style="color:${heatColor((c.juice||0)/12)}">vibe ${heat}</span> · `:""}${fmt(c.n_msgs)}t</span>
+    </div></div>`;
+}
+
+// ============================ chat detail ============================
+let CHATREQ=0; // guards against a slow request being overwritten by a newer click
+let LASTD=null; // last opened chat detail, so theme swaps re-render without a refetch
+async function openChat(session){
+  STATE.sel=session;
+  if(STATE.view!=="pulse")showExplore();           // ensure explore chrome is on (no setView recursion)
+  $("list").querySelectorAll(".ci").forEach(el=>el.classList.toggle("sel",el.dataset.s===session));
+  const v=$("view");v.innerHTML=`<div class="spin" style="padding:40px 0">${C('opening')}</div>`;
+  $("main").scrollTop=0;
+  const my=++CHATREQ;
+  let d;try{d=await J("/chat?session="+encodeURIComponent(session));}catch(e){if(my===CHATREQ)v.innerHTML=`<div class="empty">${C('chatErr')} (${esc(e.message)})</div>`;return;}
+  if(my!==CHATREQ)return;                            // a newer chat was opened; drop this stale render
+  LASTD=d;
+  v.innerHTML=detailHTML(d);
+  wireDetail(d);
+}
+function detailHTML(d){
+  const arc=d.vibe?arcBlock(d.vibe):"";
+  const crumb=`<div class="crumb">
+    <span class="ag">${esc(d.agent)}</span>
+    ${d.model?`<span class="mdl">${esc(prettyModel(d.model))}</span>`:""}
+    <span class="pj">${esc(d.project||"·")}</span>
+    ${d.concept?`<span class="cc">${esc(shortConcept(d.concept))}</span>`:""}
+    <span>${fmt(d.n_msgs)} ${C('turnsWord')}</span>
+    <span style="color:${heatColor(d.hot_pct/100*0.45)}">${d.hot_pct}% ${C('hotWord')}</span>
+  </div>`;
+  const tags=d.tags.length?`<div class="tags">${d.tags.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>`:"";
+  const sum=d.summary?`<div class="sum">${esc(d.summary)}</div>`:"";
+  return `<div class="det">
+    <h2>${esc(chatTitle({summary:d.summary,tags:d.tags}))}</h2>
+    ${crumb}${sum}${tags}${arc}
+    <div class="tx" id="tx"></div>
+  </div>`;
+}
+function arcBlock(t){
+  return `<div class="arc">
+    <div class="ah">
+      <div class="verdict"><span class="m">&rsaquo;</span> ${esc(t.verdict||C('arcDefault'))}</div>
+      <div class="ameta">${t.n_turns} ${C('turnsWord')} · ${C('peakWord')} @ ${t.peak_turn}</div>
+    </div>
+    ${arcSVG(t)}
+    <div class="legend"><span class="swatch"></span><span>${C('arcLegend')}</span></div>
+    ${tpList(t)}
+  </div>`;
+}
+// turning points as a clean numbered list under the chart — the dots on the line are
+// numbered, and each number maps to its turn + the line that moved the mood.
+function tpList(t){
+  const tps=t.turning_points||[];
+  if(!tps.length)return"";
+  const items=tps.map((tp,j)=>{
+    const lab=(t.tp_labels&&t.tp_labels[tp])||"";
+    return `<li><b>${j+1}</b><span class="tpt">${C('tpTurn')} ${tp}</span>${lab?`<span class="tpq">${esc(lab)}</span>`:`<span class="tpq" style="color:var(--faint)">${C('tpShift')}</span>`}</li>`;
+  }).join("");
+  return `<ol class="tps">${items}</ol>`;
+}
+// reused arc renderer (from the original app) — hand-rolled SVG valence arc
+function arcSVG(t){
+  const W=820,H=180,pad=30,bot=H-28,vals=t.valence,n=vals.length;
+  const vmin=Math.min(-0.15,...vals),vmax=Math.max(0.15,...vals);
+  const X=i=>pad+i*(W-2*pad)/Math.max(1,n-1),Y=v=>pad+(vmax-v)/((vmax-vmin)||1)*(bot-pad);
+  let line="";vals.forEach((v,i)=>line+=(i?"L":"M")+X(i).toFixed(1)+","+Y(v).toFixed(1)+" ");
+  const area=line+`L${X(n-1).toFixed(1)},${bot} L${X(0).toFixed(1)},${bot} Z`,z=Y(0).toFixed(1);
+  const tps=(t.turning_points||[]).map((tp,j)=>{const x=X(tp).toFixed(1),y=Y(vals[tp]).toFixed(1);
+    return `<line x1="${x}" y1="${pad-6}" x2="${x}" y2="${bot}" stroke="#ff4a2e26" stroke-dasharray="2 3"/>`
+      +`<circle cx="${x}" cy="${y}" r="7" fill="#ff7a52"/>`
+      +`<text class="tp-num" x="${x}" y="${y}" text-anchor="middle" dy="3.3">${j+1}</text>`;}).join("");
+  const pk=t.peak_turn,peak=`<circle cx="${X(pk).toFixed(1)}" cy="${Y(vals[pk]).toFixed(1)}" r="4.5" fill="none" stroke="var(--hot)" stroke-width="1.5"/>`;
+  const g="g"+Math.abs([...t.session].reduce((h,c)=>(h*31+c.charCodeAt(0))|0,0))%99999;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><linearGradient id="${g}" x1="0" x2="0" y1="0" y2="1">
+    <stop offset="0" stop-color="#3ad6c4" stop-opacity=".26"/><stop offset=".52" stop-color="#ffb000" stop-opacity=".12"/><stop offset="1" stop-color="#ff4a2e" stop-opacity=".32"/></linearGradient></defs>
+    <text class="ylab" x="2" y="${pad+2}">${esc(C('calmWord'))}</text><text class="ylab" x="2" y="${bot}">${esc(C('hotWordY'))}</text>
+    <line x1="${pad}" y1="${z}" x2="${W-pad}" y2="${z}" stroke="var(--hair)" stroke-dasharray="3 4"/>
+    <path d="${area}" fill="url(#${g})"/><path d="${line}" fill="none" stroke="var(--ink)" stroke-width="1.6"/>${tps}${peak}
+    <text class="axislab" x="${pad}" y="${H-3}">turn 0</text><text class="axislab" x="${W-pad}" y="${H-3}" text-anchor="end">turn ${n-1}</text></svg>`;
+}
+let TXSTATE={turns:[],shown:0,onlyHot:false};
+function wireDetail(d){
+  TXSTATE={turns:d.turns,shown:0,onlyHot:false,peak:d.vibe?d.vibe.peak_turn:-1};
+  renderTx();
+}
+function renderTx(){
+  const box=$("tx");if(!box)return;
+  const all=TXSTATE.onlyHot?TXSTATE.turns.filter(t=>t.hot):TXSTATE.turns;
+  const step=80;TXSTATE.shown=Math.max(TXSTATE.shown,Math.min(step,all.length));
+  const slice=all.slice(0,TXSTATE.shown);
+  const head=`<div class="txhead">
+    <span>${C('txHead')} · ${all.length} ${C('txYours')}${TXSTATE.onlyHot?" ("+C('txHot').toLowerCase()+" only)":""}</span>
+    <div class="seg"><button data-h="0" class="${TXSTATE.onlyHot?'':'on'}">${C('txAll')}</button><button data-h="1" class="${TXSTATE.onlyHot?'on':''}">${C('txHot')}</button></div>
+  </div>`;
+  const rows=slice.map(t=>{
+    const col=heatColor(t.rage);
+    const cls="turn"+(t.hot?" h":"");
+    const tg=(t.top||[]).slice(0,3).filter(x=>x!=="neutral").join(", ");
+    const mdl=t.model?` · ${esc(prettyModel(t.model))}`:"";
+    const rtog=t.reply?`<button class="rtog" data-t="${t.turn}" aria-expanded="false">${C('replyLabel')}${mdl}</button>`:"";
+    const rbox=t.reply?`<div class="rep" id="rep${t.turn}" hidden>${esc(t.reply)}</div>`:"";
+    return `<div class="${cls}">
+      <div class="n">${t.turn}<i style="background:${t.rage>0.05?col:'transparent'}"></i></div>
+      <div><div class="tt">${esc(t.text)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${rtog}${rbox}</div>
+    </div>`;
+  }).join("");
+  const more=TXSTATE.shown<all.length?`<button class="more" id="more">${C('txShow')} ${Math.min(step,all.length-TXSTATE.shown)} ${C('txMore')} · ${all.length-TXSTATE.shown} ${C('txLeft')}</button>`:"";
+  box.innerHTML=head+rows+more;
+  box.querySelectorAll(".txhead .seg button").forEach(b=>b.onclick=()=>{TXSTATE.onlyHot=b.dataset.h==="1";TXSTATE.shown=0;renderTx();});
+  box.querySelectorAll(".rtog").forEach(b=>b.onclick=()=>{
+    const el=$("rep"+b.dataset.t);if(!el)return;
+    const willOpen=el.hidden;el.hidden=!willOpen;b.setAttribute("aria-expanded",willOpen?"true":"false");
+  });
+  const m=$("more");if(m)m.onclick=()=>{TXSTATE.shown+=80;renderTx();};
+}
+
+// ============================ ask ============================
+async function ask(){
+  const q=$("q").value.trim();if(!q)return;
+  $("q").value="";$("send").disabled=true;
+  if(STATE.view==="pulse"){showExplore();if(STATE.sel)openChat(STATE.sel);else showPlaceholder();}
+  const conv=$("conv");
+  conv.insertAdjacentHTML("afterbegin",`<div class="q">${esc(q)}</div>`);
+  const slot=document.createElement("div");slot.className="a";slot.innerHTML=`<span class="spin">${C('thinking')}</span>`;
+  conv.insertBefore(slot,conv.firstChild.nextSibling);
+  $("main").scrollTop=0;
+  try{
+    const o=await(await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:q})})).json();
+    const think=(o.steps||[]).map(s=>`<b>${esc(s.tool)}</b>(${esc(JSON.stringify(s.args).slice(1,-1))})`).join("  ·  ");
+    slot.innerHTML=(think?`<div class="think">${C('usedWord')} ${think}</div>`:"")+`<div class="ans">${esc(o.answer)}</div>`+(o.model?`<div class="amodel">${C('answeredBy')} ${esc(prettyModel(o.model))}</div>`:"")+(o.steps||[]).map(renderTool).join("");
+    wireAskCards(slot);
+  }catch(e){slot.innerHTML=`<div class="ans">${C('askErr')}: ${esc(e.message)}</div>`;}
+  $("send").disabled=false;
+}
+function renderTool(step){
+  let r;try{r=JSON.parse(step.result)}catch{r=null}
+  if(step.tool==="search_chats"&&Array.isArray(r))
+    return `<div class="cards">`+r.map(c=>`<div class="card" data-find="${esc((c.tags||[]).slice(0,2).join(' '))}"><div class="h"><span class="ag">${esc(c.agent)}</span> / ${esc(c.project)} · ${c.n_msgs} msgs</div><div class="s">${esc(c.summary)}</div><div class="t">${(c.tags||[]).map(esc).join(", ")}</div></div>`).join("")+`</div>`;
+  if(step.tool==="search_messages"&&Array.isArray(r))
+    return `<div class="cards">`+r.map(c=>`<div class="card"><div class="h"><span class="ag">${esc(c.agent)}</span> / ${esc(c.project)}</div><div class="s">${esc(c.text)}</div></div>`).join("")+`</div>`;
+  if(step.tool==="top_concepts"&&Array.isArray(r))
+    return `<div class="cards">`+r.map(c=>`<div class="card" data-find="${esc(c.concept.split(',')[0])}"><div class="s">${esc(c.concept)}</div><div class="t">${c.sessions} sessions · ${c.messages} msgs</div></div>`).join("")+`</div>`;
+  if(step.tool==="rage_ranking"&&Array.isArray(r)){const mx=Math.max(1,...r.map(x=>x.rage_per_1k));
+    return `<div class="cards">`+r.map(c=>`<div class="row"><div class="nm">${esc(c.name)}</div><div class="bar"><i style="width:${(c.rage_per_1k/mx*100).toFixed(0)}%"></i></div><div class="v">${c.rage_per_1k} · ${fmt(c.msgs)}</div></div>`).join("")+`</div>`;}
+  return "";
+}
+// clicking an ask result drops its terms into the rail filter to find the real chats
+function wireAskCards(slot){
+  slot.querySelectorAll(".card[data-find]").forEach(c=>c.onclick=()=>{
+    const f=c.dataset.find.trim();if(!f)return;
+    $("find").value=f;STATE.filter=f.toLowerCase();$("findx").style.display="";renderRail();
+  });
+}
+
+// ============================ pulse (dashboard) ============================
+let DASH=null;
+async function renderPulse(){
+  const v=$("view");
+  if(!DASH){
+    if(window.__pre&&window.__pre.data){try{DASH=await window.__pre.data;}catch(e){}}
+    if(!DASH){v.innerHTML=`<div class="spin" style="padding:40px 0">${C('loadingStats')}</div>`;
+      try{DASH=await J("/data");}catch(e){v.innerHTML=`<div class="empty">${C('noStats')} (${esc(e.message)})</div>`;return;}}}
+  const D=DASH;
+  v.innerHTML=`
+    <div class="sec"><span class="sq"></span><span>${C('secAgents')}</span><span class="rule"></span><em>${C('secAgentsEm')}</em></div>
+    <div id="d_agents"></div>
+    <div class="sec"><span class="sq"></span><span>${C('secProj')}</span><span class="rule"></span><em>${C('secProjEm')}</em></div>
+    <div id="d_proj"></div>
+    <div class="sec"><span class="sq"></span><span>${C('secTime')}</span><span class="rule"></span><em>${C('secTimeEm')}</em></div>
+    <div id="d_tl"></div>`;
+  bars($("d_agents"),D.agents);bars($("d_proj"),D.projects);timeline($("d_tl"),D.timeline);
+}
+function bars(el,rows){
+  if(!rows||!rows.length){el.innerHTML=`<div class="empty" style="padding:14px">${C('notEnough')}</div>`;return;}
+  const max=Math.max(1,...rows.map(r=>r.hot_pct));
+  el.innerHTML=rows.map(r=>`<div class="row">
+    <div class="nm">${esc(r.name)}${r.agent&&r.agent!==r.name?` <small>${esc(r.agent)}</small>`:''}</div>
+    <div class="bar"><i style="width:${(r.hot_pct/max*100).toFixed(1)}%"></i></div>
+    <div class="v"><b>${r.hot_pct}%</b> ${C('hotPctWord')} · ${fmt(r.msgs)}</div></div>`).join("");
+}
+function timeline(el,tl){
+  if(!tl||!tl.length){el.innerHTML="";return;}
+  const W=820,H=120,pad=24,bot=H-18;
+  const max=Math.max(5,...tl.map(t=>t.hot_pct));
+  const X=i=>pad+i*(W-2*pad)/Math.max(1,tl.length-1),Y=v=>pad+(1-v/max)*(bot-pad);
+  let line="";tl.forEach((t,i)=>line+=(i?"L":"M")+X(i).toFixed(1)+","+Y(t.hot_pct).toFixed(1)+" ");
+  const area=line+`L${X(tl.length-1).toFixed(1)},${bot} L${X(0).toFixed(1)},${bot} Z`;
+  el.innerHTML=`<svg class="tl" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="tg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ff4a2e" stop-opacity=".34"/><stop offset="1" stop-color="#ff4a2e" stop-opacity="0"/></linearGradient></defs>
+    <path d="${area}" fill="url(#tg)"/><path d="${line}" fill="none" stroke="#ff7a52" stroke-width="1.6"/>
+    <text class="axislab" x="${pad}" y="${H-3}">${esc(tl[0].week)}</text>
+    <text class="axislab" x="${W-pad}" y="${H-3}" text-anchor="end">${esc(tl[tl.length-1].week)}</text>
+    <text class="ylab" x="${pad}" y="${pad-6}">${max}% ${esc(C('hotPctWord'))}</text></svg>`;
+}
+
+// ============================ view switching + boot ============================
+// chrome only: set the explore/pulse toggle + rail visibility, no content side-effects.
+function showExplore(){
+  STATE.view="explore";
+  $("vExplore").classList.add("on");$("vPulse").classList.remove("on");
+  $("bodyEl").classList.remove("solo");$("rail").style.display="";$("conv").style.display="";
+}
+function setView(view){
+  if(view==="pulse"){
+    STATE.view="pulse";
+    $("vPulse").classList.add("on");$("vExplore").classList.remove("on");
+    $("bodyEl").classList.add("solo");$("rail").style.display="none";$("conv").style.display="none";
+    renderPulse();
+  }else{
+    showExplore();
+    if(STATE.sel)openChat(STATE.sel);else showPlaceholder();
+  }
+}
+function showPlaceholder(){
+  if($("conv").children.length)return; // keep ask answers visible
+  const n=CHATS.length, v=CHATS.filter(c=>c.has_vibe).length, t=curTheme();
+  if(t==="web99"){$("view").innerHTML=web99Home(n,v);wireHomeFocus();return;}
+  if(t==="kawaii"){$("view").innerHTML=kawaiiHome(n,v);return;}
+  $("view").innerHTML=`<div class="ph">
+    <div class="big">tilt.</div>
+    <p>${C('heroLead')}</p>
+    <p style="color:var(--ghost)">${n} ${C('heroFootA')} · ${v} ${C('heroFootB')}</p>
+  </div>`;
+}
+// kawaii cozy homepage: floating mascot + handwritten welcome
+function kawaiiHome(n,v){
+  return `<div class="kho">
+    <div class="khomascot">${MASCOT}</div>
+    <div class="khohi">welcome back ♡</div>
+    <p class="kholead">every little chat with your coding buddies, all tucked into one cozy place. tap one on the left to read its mood diary, or ask me anything about all of them~</p>
+    <p class="khofoot">${n} chats tucked away ♡  ${v} with a mood diary ✿</p>
+    <div class="khosparkle">✿ ⋆ ♡ ⋆ ✿</div>
+  </div>`;
+}
+// 1999 web homepage, styled after the original google front page
+function web99Home(n,v){
+  return `<div class="g99">
+    <div class="g99logo"><span>t</span><span>i</span><span>l</span><span>t</span><em>!</em></div>
+    <div class="g99tag">Search every conversation with your coding programs.</div>
+    <div class="g99btns">
+      <button class="g99b" id="g99search">tilt Search</button>
+      <button class="g99b" id="g99lucky">I'm Feeling Lucky</button>
+    </div>
+    <div class="g99meta">Indexing <b>${fmt(n)}</b> documents.&nbsp; <b>${fmt(v)}</b> with mood charts.</div>
+    <hr class="g99hr">
+    <div class="g99foot">
+      <span class="g99ctr">visitors: <i>${odometer(n)}</i></span>
+      <span>Best viewed in Netscape Navigator 4.0 at 800&times;600</span>
+    </div>
+  </div>`;
+}
+function odometer(n){return String(n).padStart(6,"0").split("").join("&#8202;");}
+function wireHomeFocus(){
+  const s=$("g99search");if(s)s.onclick=()=>$("q").focus();
+  const l=$("g99lucky");if(l)l.onclick=()=>{const pool=CHATS.filter(c=>c.has_vibe);const pick=(pool.length?pool:CHATS)[Math.floor(Math.random()*(pool.length?pool.length:CHATS.length))];if(pick)openChat(pick.session);};
+}
+const MASCOT=`<svg viewBox="0 0 120 120" width="128" height="128" xmlns="http://www.w3.org/2000/svg">
+  <ellipse cx="60" cy="108" rx="30" ry="5" fill="#ffc6e0"/>
+  <path d="M28 40 Q24 18 40 26 Q44 12 58 24 Q72 12 78 26 Q94 18 90 40 Q98 60 90 80 Q86 100 60 100 Q34 100 30 80 Q22 60 28 40Z" fill="#fff" stroke="#ffb3d4" stroke-width="2.5"/>
+  <circle cx="47" cy="58" r="4.4" fill="#5b3550"/>
+  <circle cx="73" cy="58" r="4.4" fill="#5b3550"/>
+  <circle cx="48.6" cy="56.4" r="1.3" fill="#fff"/>
+  <circle cx="74.6" cy="56.4" r="1.3" fill="#fff"/>
+  <ellipse cx="38" cy="66" rx="6" ry="3.6" fill="#ffb3d4" opacity=".75"/>
+  <ellipse cx="82" cy="66" rx="6" ry="3.6" fill="#ffb3d4" opacity=".75"/>
+  <path d="M53 66 Q60 73 67 66" fill="none" stroke="#5b3550" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M16 44 Q10 40 12 33" fill="none" stroke="#ffb3d4" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M104 44 Q110 40 108 33" fill="none" stroke="#ffb3d4" stroke-width="2.4" stroke-linecap="round"/>
+</svg>`;
+$("vExplore").onclick=()=>setView("explore");
+$("vPulse").onclick=()=>setView("pulse");
+$("send").onclick=ask;
+$("q").addEventListener("keydown",e=>{if(e.key==="Enter")ask();});
+$("find").addEventListener("input",e=>{
+  if(SEARCH.active)exitSearch();
+  STATE.filter=e.target.value.trim().toLowerCase();$("findx").style.display=e.target.value?"":"none";renderRail();
+});
+$("find").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();runSearch(e.target.value);}else if(e.key==="Escape"&&SEARCH.active){exitSearch();}});
+$("findx").onclick=()=>{$("find").value="";STATE.filter="";$("findx").style.display="none";exitSearch();};
+$("groupSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.group=b.dataset.g;STATE.chip=null;$("groupSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
+$("sortSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.sort=b.dataset.s;$("sortSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
+document.addEventListener("keydown",e=>{if(e.key==="/"&&document.activeElement!==$("q")&&document.activeElement!==$("find")){e.preventDefault();$("find").focus();}});
+
+// ============================ themes ============================
+// A theme isn't just a paint job: it carries its own vocabulary. Every visible
+// noun is keyed here, and the forensic map is the fallback any other can borrow from.
+const COPY={
+  forensic:{
+    askPh:"ask across every chat:  which project did i rage in, what was the DRM work about…",
+    askBtn:"ask", vExplore:"explore", vPulse:"pulse",
+    findPh:"filter chats…  enter = search meaning", findClear:"clear",
+    groupLab:"group", gConcept:"concept", gAgent:"agent", gProject:"project", gNone:"flat",
+    sSize:"size", sHeat:"heat",
+    heroLead:"every chat you've had with claude, codex, opencode and antigravity, in one place. pick one on the left to read it back with its emotional arc, or ask a question across all of them.",
+    heroFootA:"chats indexed", heroFootB:"with a vibe-trace",
+    statChats:"chats", statTurns:"turns", statVibes:"vibe-traces",
+    searchHead:"meaning search", searchExit:"exit", searchBusy:"searching every chat",
+    searchEmpty:"nothing close to that.", searchWarm:"the meaning search isn't warmed up yet.",
+    turnsWord:"turns", hotWord:"hot", peakWord:"hottest",
+    arcDefault:"emotional arc", calmWord:"calm", hotWordY:"hot",
+    arcLegend:"top = calm, bottom = hot · ring marks the hottest turn · numbered dots are the turning points, listed below",
+    tpTurn:"turn", tpShift:"mood shift", replyLabel:"agent reply", answeredBy:"answered by",
+    txHead:"transcript", txYours:"of your turns", txAll:"all", txHot:"hot",
+    txShow:"show", txMore:"more", txLeft:"left",
+    usedWord:"used", thinking:"thinking", askErr:"couldn't reach the model",
+    secAgents:"which agent ran hottest", secAgentsEm:"share of your messages that read frustrated",
+    secProj:"hottest projects", secProjEm:"at least 50 messages",
+    secTime:"heat over time", secTimeEm:"% of weekly messages that ran hot", hotPctWord:"hot",
+    emptyNoMatch:"no chats match.<br>loosen the filter.", emptyNoIndex:"the index isn't loaded yet.",
+    opening:"opening chat", chatErr:"couldn't load this chat", loadingStats:"loading rankings",
+    noStats:"no dashboard data", notEnough:"not enough data",
+  },
+  kawaii:{
+    askPh:"ask me anything about your chats~  ✿ which buddy made you poutiest?",
+    askBtn:"ask ♡", vExplore:"wander", vPulse:"feelings",
+    findPh:"find a cozy chat~  ♡ enter to search by vibe", findClear:"clear ✕",
+    groupLab:"sort by", gConcept:"topic", gAgent:"buddy", gProject:"project", gNone:"all",
+    sSize:"biggest", sHeat:"poutiest",
+    heroFootA:"chats tucked away ♡", heroFootB:"with a mood diary ✿",
+    statChats:"chats ♡", statTurns:"messages", statVibes:"mood diaries",
+    searchHead:"vibe search", searchExit:"nvm ♡", searchBusy:"peeking through every chat~",
+    searchEmpty:"hmm, nothing matches that ;;", searchWarm:"i need a little warm-up first~ ♡",
+    turnsWord:"messages", hotWord:"pouty", peakWord:"poutiest",
+    arcDefault:"mood diary", calmWord:"comfy", hotWordY:"pouty",
+    arcLegend:"top = comfy, bottom = pouty ♡ the ring is the poutiest moment · the numbered dots are mood wobbles, listed below",
+    tpTurn:"moment", tpShift:"mood wobble ♡", replyLabel:"what they said ♡", answeredBy:"answered by",
+    txHead:"everything you said", txYours:"messages ♡", txAll:"all", txHot:"pouty",
+    txShow:"show", txMore:"more", txLeft:"to go",
+    usedWord:"peeked at", thinking:"thinking hard~", askErr:"aw, couldn't reach me ;;",
+    secAgents:"which buddy made you poutiest", secAgentsEm:"how often your messages sounded grumpy",
+    secProj:"poutiest projects", secProjEm:"at least 50 messages",
+    secTime:"pouty over time", secTimeEm:"% of each week that got grumpy", hotPctWord:"pouty",
+    emptyNoMatch:"no cozy chats match ;;<br>try a softer filter ♡", emptyNoIndex:"nothing's here yet ♡<br>let me get cozy first~",
+    opening:"opening up~ ♡", chatErr:"aw, this one won't open ;;", loadingStats:"counting feelings~",
+    noStats:"no feelings to show yet ;;", notEnough:"not enough yet ♡",
+  },
+  web99:{
+    askPh:"Search your conversations...", askBtn:"Search", vExplore:"Directory", vPulse:"Statistics",
+    findPh:"Find a chat:", findClear:"[clear]",
+    groupLab:"Sort:", gConcept:"Topic", gAgent:"Program", gProject:"Folder", gNone:"All",
+    sSize:"Size", sHeat:"Heat",
+    heroFootA:"documents indexed.", heroFootB:"with mood charts.",
+    statChats:"documents", statTurns:"messages", statVibes:"mood charts",
+    searchHead:"Search results", searchExit:"[back]", searchBusy:"Searching the archive...",
+    searchEmpty:"No documents matched your query.", searchWarm:"The search index is warming up.",
+    turnsWord:"messages", hotWord:"heated", peakWord:"peak",
+    arcDefault:"Mood Chart", calmWord:"calm", hotWordY:"heated",
+    arcLegend:"Top = calm, bottom = heated. Circle marks the peak. Numbered dots mark the turning points, listed below.",
+    tpTurn:"Turn", tpShift:"Mood change", replyLabel:"View response", answeredBy:"Answered by",
+    txHead:"Transcript", txYours:"messages", txAll:"All", txHot:"Heated",
+    txShow:"Show", txMore:"more", txLeft:"remaining",
+    usedWord:"Consulted", thinking:"Searching...", askErr:"Connection failed. Please try again",
+    secAgents:"Heat by Program", secAgentsEm:"Percentage of messages that read frustrated",
+    secProj:"Heat by Folder", secProjEm:"Minimum 50 messages",
+    secTime:"Heat Over Time", secTimeEm:"Percent of weekly messages running hot", hotPctWord:"heated",
+    emptyNoMatch:"No documents match.<br>Try a broader filter.", emptyNoIndex:"Index not found.<br>Please start the server.",
+    opening:"Loading document...", chatErr:"Document could not be loaded", loadingStats:"Compiling statistics...",
+    noStats:"No statistics available", notEnough:"Insufficient data",
+  },
+};
+const THEMES=[["forensic","◐ forensic"],["kawaii","✿ kawaii"],["web99","▦ 1999"]];
+const curTheme=()=>document.documentElement.dataset.theme||"forensic";
+function C(k){const m=COPY[curTheme()];return (m&&m[k]!=null)?m[k]:(COPY.forensic[k]!=null?COPY.forensic[k]:k);}
+function applyCopy(){
+  document.querySelectorAll("[data-c]").forEach(el=>el.textContent=C(el.dataset.c));
+  document.querySelectorAll("[data-cp]").forEach(el=>el.placeholder=C(el.dataset.cp));
+}
+let BOOTED=false;
+function renderStat(){
+  if(!CHATS.length)return;
+  const turns=CHATS.reduce((s,c)=>s+c.n_msgs,0), hot=CHATS.filter(c=>c.has_vibe).length;
+  $("stat").innerHTML=`<b>${fmt(CHATS.length)}</b> ${C('statChats')} · <b>${fmt(turns)}</b> ${C('statTurns')} · <b>${hot}</b> ${C('statVibes')}`;
+}
+function rerenderView(){
+  if(STATE.view==="pulse"){renderPulse();return;}
+  if(STATE.sel&&LASTD){$("view").innerHTML=detailHTML(LASTD);wireDetail(LASTD);}
+  else{$("view").innerHTML="";showPlaceholder();}
+}
+function setTheme(t){
+  if(t==="win95")t="web99"; // migrate the old name
+  document.documentElement.dataset.theme=t;
+  $("theme").textContent=(THEMES.find(x=>x[0]===t)||THEMES[0])[1];
+  try{localStorage.setItem("tiltTheme",t);}catch(e){}
+  applyCopy();
+  if(BOOTED){renderStat();renderRail();rerenderView();}
+}
+$("theme").onclick=()=>{const i=THEMES.findIndex(x=>x[0]===curTheme());setTheme(THEMES[(i+1)%THEMES.length][0]);};
+setTheme((()=>{try{return localStorage.getItem("tiltTheme")||"forensic";}catch(e){return"forensic";}})());
+
+async function boot(){
+  const P=window.__pre||{};
+  try{
+    CHATS=(P.chats?await P.chats:null)||await J("/chats");
+    CONCEPTS=(P.concepts?await P.concepts:null)||await J("/concepts").catch(()=>[]);
+  }catch(e){$("list").innerHTML=`<div class="empty">${C('emptyNoIndex')}</div>`;return;}
+  CHATS.forEach(c=>bySession[c.session]=c);
+  BOOTED=true;
+  renderStat();
+  renderRail();showPlaceholder();
+}
+boot();
+</script>
+</body>
+</html>

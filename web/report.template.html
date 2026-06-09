@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tilt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0b0d; --panel:#101216; --line:#1e2228; --hair:#171a1f;
+    --ink:#d6dade; --dim:#838a93; --faint:#525861;
+    --calm:#3ad6c4; --warm:#ffb000; --ember:#ff4a2e; --hot:#ff2f1c;
+    --mono:"JetBrains Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+    --disp:"Anton","Arial Narrow",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--mono);font-size:13px;line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* film grain: subtle instrument texture, not a graph-paper grid */
+  body::before{
+    content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.04;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .wrap{position:relative;z-index:1;max-width:1000px;margin:0 auto;padding:56px 26px 140px}
+
+  /* masthead */
+  .mast{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;
+        border-bottom:1px solid var(--line);padding-bottom:22px}
+  .word{font-family:var(--disp);font-size:64px;line-height:.78;color:var(--ink)}
+  .word b{color:var(--ember);font-weight:400}
+  .tag{color:var(--dim);font-size:12px;text-align:right;max-width:280px}
+  .tag b{color:var(--ink);font-weight:500}
+
+  /* hero readout cluster */
+  .readout{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
+           border:1px solid var(--line);margin:30px 0 8px}
+  .stat{background:var(--bg);padding:20px 18px}
+  .stat .n{font-family:var(--disp);font-size:42px;line-height:.9;color:var(--ink)}
+  .stat .n.acc{color:var(--ember)}
+  .stat .l{color:var(--faint);font-size:11px;margin-top:7px}
+
+  /* section heading (no uppercase, no tracking) */
+  .sec{display:flex;align-items:center;gap:11px;margin:52px 0 16px;color:var(--dim);font-size:13px}
+  .sec .sq{width:7px;height:7px;background:var(--ember);flex:none}
+  .sec .rule{flex:1;height:1px;background:var(--line)}
+  .sec em{color:var(--faint);font-style:normal;font-size:11px}
+
+  /* agent ranking */
+  .row{display:grid;grid-template-columns:128px 1fr 150px;align-items:center;gap:16px;padding:7px 0}
+  .row .nm{color:var(--ink)}
+  .row .nm small{color:var(--faint)}
+  .bar{height:16px;background:#0e1014;border:1px solid var(--hair);position:relative;overflow:hidden}
+  .bar i{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#9a5a00,var(--ember))}
+  .row .v{text-align:right;color:var(--dim);font-size:12px}
+  .row .v b{color:var(--ink);font-weight:700;font-size:14px}
+
+  /* project table */
+  .pl{display:grid;grid-template-columns:1fr 78px 64px 70px;gap:12px;padding:6px 0;border-bottom:1px solid var(--hair);color:var(--dim)}
+  .pl.head{color:var(--faint);font-size:11px;border-bottom:1px solid var(--line)}
+  .pl .p{color:var(--ink)} .pl .p small{color:var(--faint)}
+  .pl b{color:var(--ink);font-weight:700}
+
+  /* vibe traces */
+  .legend{display:flex;gap:12px;align-items:center;color:var(--faint);font-size:11px;margin:-4px 0 18px}
+  .swatch{width:54px;height:8px;background:linear-gradient(90deg,var(--ember),var(--warm),var(--calm))}
+  .trace{background:var(--panel);border:1px solid var(--line);margin:14px 0;padding:15px 18px 12px}
+  .thead{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .tid{color:var(--ink);font-size:13px}
+  .tid .ag{color:var(--ember)}
+  .tmeta{color:var(--faint);font-size:11px}
+  .verdict{color:var(--dim);margin:9px 0 3px;font-size:13px}
+  .verdict .m{color:var(--ember)}
+  svg{display:block;width:100%;height:auto;margin-top:6px;overflow:visible}
+  .tp-label{fill:var(--dim);font-size:10px}
+  .axislab{fill:var(--faint);font-size:9px}
+  .foot{color:var(--faint);font-size:11px;margin-top:10px}
+
+  /* one orchestrated load: staggered fade-up */
+  .rise{opacity:0;transform:translateY(8px);animation:rise .5s cubic-bezier(.2,.7,.2,1) forwards}
+  @keyframes rise{to{opacity:1;transform:none}}
+  @media(prefers-reduced-motion:reduce){.rise{animation:none;opacity:1;transform:none}}
+  @media(max-width:640px){.readout{grid-template-columns:repeat(2,1fr)}.word{font-size:48px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="mast rise">
+    <div class="word">tilt<b>.</b></div>
+    <div class="tag" id="tag"></div>
+  </div>
+
+  <div class="readout rise" id="readout" style="animation-delay:.05s"></div>
+
+  <div class="sec rise" style="animation-delay:.10s"><span class="sq"></span><span>rage index, by agent</span><span class="rule"></span><em>cumulative rage / 1k msgs</em></div>
+  <div id="agents" class="rise" style="animation-delay:.12s"></div>
+
+  <div class="sec rise" style="animation-delay:.14s"><span class="sq"></span><span>rage index, by project</span><span class="rule"></span><em>min 25 msgs</em></div>
+  <div id="projects" class="rise" style="animation-delay:.16s"></div>
+
+  <div class="sec rise" style="animation-delay:.18s"><span class="sq"></span><span>vibe-traces</span><span class="rule"></span><em>where the chats went</em></div>
+  <div class="legend rise" style="animation-delay:.20s"><span class="swatch"></span><span>valence over turns. ember runs hot, cyan stays calm. ticks mark the shifts.</span></div>
+  <div id="traces"></div>
+  <div class="foot">arc: per-turn affect from a GoEmotions read. verdict and shift labels: local model. peak ring: hottest turn.</div>
+</div>
+
+<script>
+const DATA = /*__DATA__*/;
+const $=(id)=>document.getElementById(id);
+const esc=(s)=>String(s||"").replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const fmt=(n)=>n.toLocaleString();
+
+// hero
+const sumMsgs=DATA.agents.reduce((a,r)=>a+r.msgs,0)||1;
+const hotPct=(DATA.agents.reduce((a,r)=>a+r.msgs*r.hot_pct/100,0)/sumMsgs*100);
+const topAgent=DATA.agents[0]?DATA.agents[0].name:"-";
+$("tag").innerHTML=`affect telemetry over <b>${fmt(DATA.total)}</b> of your messages,<br>across <b>${DATA.agents.length}</b> coding agents`;
+$("readout").innerHTML=[
+  ["n",fmt(DATA.total),"messages scored"],
+  ["n acc",hotPct.toFixed(1)+"%","read as hot"],
+  ["n",esc(topAgent),"hottest agent"],
+  ["n",fmt(DATA.traces.length),"chats traced"],
+].map(([c,n,l])=>`<div class="stat"><div class="${c}">${n}</div><div class="l">${l}</div></div>`).join("");
+
+// agent bars
+const amax=Math.max(1,...DATA.agents.map(r=>r.rage_idx));
+$("agents").innerHTML=DATA.agents.map(r=>`
+  <div class="row">
+    <div class="nm">${esc(r.name)}</div>
+    <div class="bar"><i style="width:${(r.rage_idx/amax*100).toFixed(1)}%"></i></div>
+    <div class="v"><b>${r.rage_idx}</b> · ${r.hot_pct}% hot</div>
+  </div>`).join("");
+
+// project table
+$("projects").innerHTML=`<div class="pl head"><span>project</span><span>rage/1k</span><span>hot%</span><span>msgs</span></div>`
+  + DATA.projects.map(p=>`<div class="pl"><span class="p">${esc(p.name)} <small>${esc(p.agent)}</small></span>`
+    + `<span><b>${p.rage_idx}</b></span><span>${p.hot_pct}%</span><span>${fmt(p.msgs)}</span></div>`).join("");
+
+// ---- vibe-trace svg ----
+function hashStr(s){let h=0;for(let i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))|0;return h;}
+function trace(t){
+  const W=920,H=184,pad=30,bot=H-28;
+  const vals=t.valence,n=vals.length;
+  const vmin=Math.min(-0.15,...vals),vmax=Math.max(0.15,...vals);
+  const X=i=>pad+i*(W-2*pad)/Math.max(1,n-1);
+  const Y=v=>pad+(vmax-v)/((vmax-vmin)||1)*(bot-pad);
+  let line="";vals.forEach((v,i)=>line+=(i?"L":"M")+X(i).toFixed(1)+","+Y(v).toFixed(1)+" ");
+  const area=line+`L${X(n-1).toFixed(1)},${bot} L${X(0).toFixed(1)},${bot} Z`;
+  const z=Y(0).toFixed(1);
+  const tps=(t.turning_points||[]).map(tp=>{
+    const x=X(tp).toFixed(1),lab=(t.tp_labels&&t.tp_labels[tp])||"";
+    return `<line x1="${x}" y1="${pad-7}" x2="${x}" y2="${bot}" stroke="#ff4a2e30" stroke-dasharray="2 3"/>`
+      +`<circle cx="${x}" cy="${Y(vals[tp]).toFixed(1)}" r="3" fill="#ff7a52"/>`
+      +(lab?`<text class="tp-label" x="${x}" y="${bot+13}" text-anchor="middle">${esc(lab).slice(0,28)}</text>`:"");
+  }).join("");
+  const pk=t.peak_turn;
+  const peak=`<circle cx="${X(pk).toFixed(1)}" cy="${Y(vals[pk]).toFixed(1)}" r="4.5" fill="none" stroke="var(--hot)" stroke-width="1.5"/>`;
+  const g="g"+(Math.abs(hashStr(t.session))%99999);
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="${g}" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#3ad6c4" stop-opacity=".26"/>
+      <stop offset="52%" stop-color="#ffb000" stop-opacity=".12"/>
+      <stop offset="100%" stop-color="#ff4a2e" stop-opacity=".32"/></linearGradient></defs>
+    <line x1="${pad}" y1="${z}" x2="${W-pad}" y2="${z}" stroke="#262a31" stroke-dasharray="3 4"/>
+    <text class="axislab" x="${pad}" y="${(+z-5)}">neutral</text>
+    <path d="${area}" fill="url(#${g})"/>
+    <path d="${line}" fill="none" stroke="#eef1f4" stroke-width="1.6"/>
+    ${tps}${peak}
+    <text class="axislab" x="${pad}" y="${H-4}">turn 0</text>
+    <text class="axislab" x="${W-pad}" y="${H-4}" text-anchor="end">turn ${n-1}</text>
+  </svg>`;
+}
+$("traces").innerHTML=DATA.traces.map((t,i)=>`
+  <div class="trace rise" style="animation-delay:${(.22+i*.03).toFixed(2)}s">
+    <div class="thead">
+      <div class="tid"><span class="ag">${esc(t.agent)}</span> / ${esc(t.project)}</div>
+      <div class="tmeta">${t.n_turns} turns · peak @ ${t.peak_turn} · swing ${t.swing} · drift ${t.drift>=0?'+':''}${t.drift}</div>
+    </div>
+    ${t.verdict?`<div class="verdict"><span class="m">&rsaquo;</span> ${esc(t.verdict)}</div>`:""}
+    ${trace(t)}
+  </div>`).join("");
+</script>
+</body>
+</html>
