@@ -14,4 +14,9 @@ pub struct Message {
     pub turn: u32,
     /// The human-authored text (Danny's words). Wrappers/tool-results already stripped.
     pub text: String,
+    /// Model that produced the agent's side of this turn ("claude-opus-4-8",
+    /// "gpt-5.3-codex-spark", "gemini-3.1-pro-preview"). Empty when the source omits it.
+    pub model: String,
+    /// The agent's reply to this turn, trimmed for display. Empty if none was captured.
+    pub reply: String,
 }

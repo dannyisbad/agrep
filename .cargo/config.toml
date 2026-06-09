@@ -1,0 +1,6 @@
+# Build for THIS machine's CPU (Comet Lake i9-10850K: AVX2, FMA, BMI2). This lets the
+# compiler use the full native instruction set for the JSON/scan/vector-search hot paths
+# instead of the conservative x86-64 baseline. The binary is non-portable as a result,
+# which is fine: tilt is a personal tool that only ever runs here.
+[build]
+rustflags = ["-C", "target-cpu=native"]

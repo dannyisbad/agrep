@@ -36,6 +36,8 @@ const DB_FILES: &[&str] = &[
 #[derive(Deserialize)]
 struct MsgData {
     role: Option<String>,
+    #[serde(rename = "modelID")]
+    model_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,42 +113,64 @@ fn collect_db(path: &std::path::Path) -> Vec<Message> {
     // Per-session running turn index (rows are session-ordered).
     let mut cur_session = String::new();
     let mut turn = 0u32;
-    // Accumulator for the current message's surviving Danny-authored text parts.
+    // Accumulator for the current message's surviving text parts (user OR assistant).
     let mut cur_msg_id = String::new();
     let mut cur_dir = String::new();
     let mut cur_ts: i64 = 0;
     let mut cur_text = String::new();
+    let mut cur_role = String::new();
+    let mut cur_model = String::new();
     let mut have_msg = false;
 
-    // Flush the accumulated message into `out` if it carries real text.
-    let flush = |out: &mut Vec<Message>,
-                 turn: &mut u32,
-                 session: &str,
-                 dir: &str,
-                 ts: i64,
-                 text: &str| {
-        if text.trim().is_empty() || is_wrapper(text) {
-            return;
+    // Flush the accumulated message: a user turn becomes a new Message; an assistant
+    // turn is attached as the reply (+model) of the user turn it answers.
+    fn flush(
+        out: &mut Vec<Message>,
+        turn: &mut u32,
+        session: &str,
+        dir: &str,
+        ts: i64,
+        role: &str,
+        model: &str,
+        text: &str,
+    ) {
+        if role == "user" {
+            if text.trim().is_empty() || is_wrapper(text) {
+                return;
+            }
+            out.push(Message {
+                agent: "opencode",
+                project: project_name(dir),
+                session: session.to_string(),
+                ts,
+                turn: *turn,
+                text: text.to_string(),
+                model: String::new(),
+                reply: String::new(),
+            });
+            *turn += 1;
+        } else if role == "assistant" {
+            if let Some(last) = out.last_mut() {
+                crate::ingest::append_capped(&mut last.reply, text, 1600);
+                if last.model.is_empty() && !model.is_empty() {
+                    last.model = model.to_string();
+                }
+            }
         }
-        out.push(Message {
-            agent: "opencode",
-            project: project_name(dir),
-            session: session.to_string(),
-            ts,
-            turn: *turn,
-            text: text.to_string(),
-        });
-        *turn += 1;
-    };
+    }
 
     for row in rows.flatten() {
         let (session_id, directory, m_ts, m_id, m_data, p_data) = row;
 
-        // Only user-role messages.
-        let role = serde_json::from_str::<MsgData>(&m_data)
-            .ok()
-            .and_then(|d| d.role);
-        if role.as_deref() != Some("user") {
+        // Message role + model from the message envelope.
+        let md = serde_json::from_str::<MsgData>(&m_data).ok();
+        let role = md.as_ref().and_then(|d| d.role.clone()).unwrap_or_default();
+        let model = md
+            .as_ref()
+            .and_then(|d| d.model_id.clone())
+            .unwrap_or_default();
+        // We only care about the human and the assistant; skip system/other.
+        if role != "user" && role != "assistant" {
             continue;
         }
         // Only text parts with non-empty text.
@@ -161,15 +185,19 @@ fn collect_db(path: &std::path::Path) -> Vec<Message> {
             Some(t) if !t.trim().is_empty() => t,
             _ => continue,
         };
-        // Drop opencode-injected wrappers at the PART level (key correctness step).
-        if is_injected_part(&ptext) {
+        // Drop opencode-injected wrappers at the PART level — user turns only (the
+        // assistant's prose is what we want to keep verbatim as the reply).
+        if role == "user" && is_injected_part(&ptext) {
             continue;
         }
 
         // New session => reset turn counter (flush any pending message first).
         if session_id != cur_session {
             if have_msg {
-                flush(&mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_text);
+                flush(
+                    &mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_role, &cur_model,
+                    &cur_text,
+                );
             }
             cur_session = session_id.clone();
             turn = 0;
@@ -180,11 +208,16 @@ fn collect_db(path: &std::path::Path) -> Vec<Message> {
         // New message within the session => flush the previous one.
         if !have_msg || m_id != cur_msg_id {
             if have_msg {
-                flush(&mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_text);
+                flush(
+                    &mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_role, &cur_model,
+                    &cur_text,
+                );
             }
             cur_msg_id = m_id;
             cur_dir = directory;
             cur_ts = m_ts;
+            cur_role = role;
+            cur_model = model;
             cur_text.clear();
             have_msg = true;
         }
@@ -196,7 +229,9 @@ fn collect_db(path: &std::path::Path) -> Vec<Message> {
     }
     // Final pending message.
     if have_msg {
-        flush(&mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_text);
+        flush(
+            &mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_role, &cur_model, &cur_text,
+        );
     }
 
     out

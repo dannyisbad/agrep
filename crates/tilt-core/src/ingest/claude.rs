@@ -33,6 +33,7 @@ struct Line {
 struct Msg {
     role: Option<String>,
     content: Option<serde_json::Value>,
+    model: Option<String>,
 }
 
 /// Pull human text out of a `message.content` that may be a string or a block array.
@@ -66,7 +67,7 @@ fn parse_file(path: &Path) -> Vec<Message> {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut out: Vec<Message> = Vec::new();
     let mut turn = 0u32;
     for line in data.lines() {
         if line.is_empty() {
@@ -76,6 +77,26 @@ fn parse_file(path: &Path) -> Vec<Message> {
             Ok(l) => l,
             Err(_) => continue,
         };
+        // Assistant turn -> attach its text + model to the user message it answers.
+        if l.ty.as_deref() == Some("assistant") {
+            if let Some(m) = &l.message {
+                if m.role.as_deref() == Some("assistant") {
+                    if let Some(last) = out.last_mut() {
+                        if last.model.is_empty() {
+                            if let Some(md) = m.model.as_deref() {
+                                if !md.is_empty() {
+                                    last.model = md.to_string();
+                                }
+                            }
+                        }
+                        if let Some(txt) = m.content.as_ref().and_then(extract_text) {
+                            crate::ingest::append_capped(&mut last.reply, &txt, 1600);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if l.ty.as_deref() != Some("user") {
             continue;
         }
@@ -109,6 +130,8 @@ fn parse_file(path: &Path) -> Vec<Message> {
             ts: ts_millis(l.timestamp.as_deref()),
             turn,
             text,
+            model: String::new(),
+            reply: String::new(),
         });
         turn += 1;
     }

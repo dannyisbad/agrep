@@ -20,5 +20,7 @@ bytemuck = "1"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+lto = "fat"          # whole-program inlining across crates (ingest is the hot path)
+codegen-units = 1    # one unit -> best optimization, slower build (we build rarely)
+panic = "abort"      # no unwind tables: smaller + slightly faster (this is a batch CLI)
+strip = true         # drop debug symbols from the release binary

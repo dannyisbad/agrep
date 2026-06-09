@@ -116,9 +116,19 @@ fn parse_session(brain_dir: &Path) -> Vec<Message> {
         .map(|cwd| project_name(&cwd))
         .unwrap_or_else(|| "antigravity".to_string());
 
-    let mut out = Vec::new();
+    let mut out: Vec<Message> = Vec::new();
     let mut turn = 0u32;
     for e in &events {
+        // The model's prose turn (PLANNER_RESPONSE) -> attach as the reply to the
+        // user message it answers. Other MODEL events are tool actions; skip those.
+        if e.ty.as_deref() == Some("PLANNER_RESPONSE") && e.source.as_deref() == Some("MODEL") {
+            if let Some(txt) = e.content.as_ref().and_then(|c| c.as_str()) {
+                if let Some(last) = out.last_mut() {
+                    crate::ingest::append_capped(&mut last.reply, txt, 1600);
+                }
+            }
+            continue;
+        }
         // Danny's own typed input only.
         if e.ty.as_deref() != Some("USER_INPUT") || e.source.as_deref() != Some("USER_EXPLICIT") {
             continue;
@@ -141,6 +151,8 @@ fn parse_session(brain_dir: &Path) -> Vec<Message> {
             ts: ts_millis(e.created_at.as_deref()),
             turn,
             text,
+            model: String::new(),
+            reply: String::new(),
         });
         turn += 1;
     }

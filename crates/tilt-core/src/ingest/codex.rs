@@ -37,6 +37,8 @@ struct Payload {
     // session_meta fields
     id: Option<String>,
     cwd: Option<String>,
+    // turn_context carries the active model (e.g. "gpt-5.3-codex-spark").
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +54,29 @@ fn extract_text(blocks: &[Block]) -> Option<String> {
     for b in blocks {
         match b.ty.as_deref() {
             Some("input_text") | Some("text") => {
+                if let Some(t) = b.text.as_deref() {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Concatenate the assistant's visible prose blocks (`output_text`, also accept `text`).
+fn extract_assistant(blocks: &[Block]) -> Option<String> {
+    let mut out = String::new();
+    for b in blocks {
+        match b.ty.as_deref() {
+            Some("output_text") | Some("text") => {
                 if let Some(t) = b.text.as_deref() {
                     if !out.is_empty() {
                         out.push('\n');
@@ -115,10 +140,12 @@ fn parse_file(path: &Path) -> Vec<Message> {
         Err(_) => return Vec::new(),
     };
 
-    let mut out = Vec::new();
+    let mut out: Vec<Message> = Vec::new();
     let mut turn = 0u32;
     let mut project: Option<String> = None;
     let mut session: Option<String> = None;
+    // The active model, updated by each turn_context line and stamped onto turns.
+    let mut current_model = String::new();
 
     for line in data.lines() {
         if line.is_empty() {
@@ -143,6 +170,15 @@ fn parse_file(path: &Path) -> Vec<Message> {
             }
             continue;
         }
+        // turn_context announces the model in force for the turns that follow.
+        if l.ty.as_deref() == Some("turn_context") {
+            if let Some(md) = l.payload.as_ref().and_then(|p| p.model.as_deref()) {
+                if !md.is_empty() {
+                    current_model = md.to_string();
+                }
+            }
+            continue;
+        }
 
         if l.ty.as_deref() != Some("response_item") {
             continue;
@@ -155,14 +191,27 @@ fn parse_file(path: &Path) -> Vec<Message> {
         if payload.ty.as_deref() != Some("message") {
             continue;
         }
-        // Only the human; skip assistant / developer / system.
-        if payload.role.as_deref() != Some("user") {
-            continue;
-        }
         let blocks = match payload.content.as_deref() {
             Some(b) => b,
             None => continue,
         };
+
+        // Assistant prose -> attach to the user message it answers.
+        if payload.role.as_deref() == Some("assistant") {
+            if let Some(txt) = extract_assistant(blocks) {
+                if let Some(last) = out.last_mut() {
+                    crate::ingest::append_capped(&mut last.reply, &txt, 1600);
+                    if last.model.is_empty() && !current_model.is_empty() {
+                        last.model = current_model.clone();
+                    }
+                }
+            }
+            continue;
+        }
+        // Only the human past here; skip developer / system.
+        if payload.role.as_deref() != Some("user") {
+            continue;
+        }
         let text = match extract_text(blocks) {
             Some(t) => t,
             None => continue,
@@ -180,6 +229,8 @@ fn parse_file(path: &Path) -> Vec<Message> {
             ts: ts_millis(l.timestamp.as_deref()),
             turn,
             text,
+            model: current_model.clone(),
+            reply: String::new(),
         });
         turn += 1;
     }

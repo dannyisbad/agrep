@@ -90,7 +90,15 @@ fn ingest_agent(agent: &str) -> anyhow::Result<Vec<Message>> {
             );
         }
     };
-    Ok(msgs)
+    // Dedupe by (agent, session, turn): Codex resumes write a new rollout file that REPLAYS
+    // the earlier turns, so the same message gets ingested once per rollout file (seen up to
+    // 14x). Same tuple == identical message, so keep-first is correct.
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<Message> = msgs
+        .into_iter()
+        .filter(|m| seen.insert((m.agent, m.session.clone(), m.turn)))
+        .collect();
+    Ok(deduped)
 }
 
 fn scan(agent: &str, min_msgs: u64, cache_on: bool) -> anyhow::Result<()> {
@@ -234,11 +242,21 @@ fn index_cmd(agent: &str) -> anyhow::Result<()> {
     let n = msgs.len();
     let path = PathBuf::from("data").join("messages.jsonl");
     cache::write_messages(&msgs, &path)?;
+    let rpath = PathBuf::from("data").join("replies.jsonl");
+    cache::write_replies(&msgs, &rpath)?;
+    let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();
+    let with_reply = msgs.iter().filter(|m| !m.reply.trim().is_empty()).count();
     println!(
         "  indexed {} messages -> {} ({:.0}ms)",
         n,
         path.display(),
         t0.elapsed().as_secs_f64() * 1000.0
+    );
+    println!(
+        "  {} turns carry a model · {} carry an agent reply -> {}",
+        with_model,
+        with_reply,
+        rpath.display()
     );
     println!("  next: run `tilt embed` (Python sidecar) to write data/embeddings.f32 + data/embeddings.ids");
     Ok(())
@@ -268,7 +286,8 @@ fn search_cmd(query: &str, k: usize) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let q = index::load_query(&query_path, index::DIM)?;
+    let dim = index::read_dim(&data);
+    let q = index::load_query(&query_path, dim)?;
     let idx = Index::open(&data)?;
     let hits = idx.search(&q, k);
 

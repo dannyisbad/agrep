@@ -48,6 +48,24 @@ pub fn ts_millis(s: Option<&str>) -> i64 {
         .unwrap_or(0)
 }
 
+/// Append `t` to `buf` (space-joined), capping the result to `cap` characters (UTF-8 safe).
+/// Used to accumulate a trimmed agent reply across multiple blocks without unbounded growth.
+pub fn append_capped(buf: &mut String, t: &str, cap: usize) {
+    let t = t.trim();
+    if t.is_empty() || buf.chars().count() >= cap {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push(' ');
+    }
+    buf.push_str(t);
+    if buf.chars().count() > cap {
+        let kept: String = buf.chars().take(cap).collect();
+        *buf = kept;
+        buf.push('…');
+    }
+}
+
 /// Is this content a command/system wrapper rather than something Danny typed?
 pub fn is_wrapper(text: &str) -> bool {
     let t = text.trim_start();
@@ -61,4 +79,14 @@ pub fn is_wrapper(text: &str) -> bool {
         || t.starts_with("Caveat:")
         || (t.contains("<command-name>") && t.contains("</command-name>"))
         || t.starts_with("<system-reminder>")
+        // multi-agent orchestration chatter that isn't Danny typing (leaked into search):
+        || t.starts_with("<teammate-message")
+        || t.starts_with("<task-notification")
+        || t.starts_with("[SYSTEM NOTIFICATION")
+        || t.starts_with("<system-notification")
+        || (t.starts_with('{')
+            && (t.contains("\"idle_notification\"")
+                || t.contains("\"task_completed\"")
+                || t.contains("\"shutdown_request\"")
+                || t.contains("\"type\":\"idle\"")))
 }

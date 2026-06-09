@@ -19,8 +19,19 @@ use memmap2::Mmap;
 
 use crate::search;
 
-/// Embedding dimensionality fixed by the contract (Matryoshka truncation of Qwen3-Embedding-0.6B).
+/// Default embedding dimensionality if the index isn't self-describing (legacy fallback).
 pub const DIM: usize = 256;
+
+/// Read the embedding dim from `dir/embeddings.meta` (a plain integer written by the sidecar).
+/// Falls back to [`DIM`] if the file is missing or unparseable, so older indexes still open.
+pub fn read_dim(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("embeddings.meta"))
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&d| d > 0)
+        .unwrap_or(DIM)
+}
 
 /// A read-only, memory-mapped embedding matrix and its row-id sidecar.
 #[derive(Debug)]
@@ -35,10 +46,10 @@ pub struct Index {
 
 impl Index {
     /// Open the index living in `dir`: mmap `embeddings.f32`, read `embeddings.ids` (one id per
-    /// line), infer N from `file_len / (dim * 4)`, and assert `N == ids.len()`. `dim` defaults to
-    /// [`DIM`]; the file must be an exact multiple of the row stride.
+    /// line), infer N from `file_len / (dim * 4)`, and assert `N == ids.len()`. The dimension is
+    /// read from `embeddings.meta` (self-describing index), falling back to [`DIM`] for older indexes.
     pub fn open(dir: &Path) -> Result<Index> {
-        Self::open_with_dim(dir, DIM)
+        Self::open_with_dim(dir, read_dim(dir))
     }
 
     /// Same as [`Index::open`] but with an explicit dimension (used in tests / future contracts).

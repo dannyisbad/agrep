@@ -23,6 +23,10 @@ struct Record<'a> {
     ts: i64,
     turn: u32,
     text: &'a str,
+    /// Model on the agent's side of this turn ("" when unknown). Tiny, so it rides along
+    /// in the hot file; the bulky reply text goes to the replies sidecar instead.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    model: &'a str,
 }
 
 impl<'a> Record<'a> {
@@ -35,8 +39,17 @@ impl<'a> Record<'a> {
             ts: m.ts,
             turn: m.turn,
             text: &m.text,
+            model: &m.model,
         }
     }
+}
+
+/// One reply-sidecar row: `{id, reply}`. Kept out of `messages.jsonl` so the embed/affect
+/// streaming reads stay lean; only the chat-detail view joins these back in.
+#[derive(Serialize)]
+struct ReplyRecord<'a> {
+    id: String,
+    reply: &'a str,
 }
 
 /// Write `msgs` as JSON Lines to `path` (creating parent dirs as needed). One compact JSON object
@@ -59,6 +72,31 @@ pub fn write_messages(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write the agent replies as JSON Lines (`{id, reply}`) to `path`, skipping turns with no
+/// captured reply. Same stable `id` as `messages.jsonl`, so the detail view joins on it.
+pub fn write_replies(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let file = fs::File::create(path)?;
+    let mut w = BufWriter::new(file);
+    for m in msgs {
+        if m.reply.trim().is_empty() {
+            continue;
+        }
+        let rec = ReplyRecord {
+            id: format!("{}:{}:{}", m.agent, m.session, m.turn),
+            reply: &m.reply,
+        };
+        serde_json::to_writer(&mut w, &rec)?;
+        w.write_all(b"\n")?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +111,8 @@ mod tests {
                 ts: 1_700_000_000_000,
                 turn: 0,
                 text: "first".to_string(),
+                model: "claude-opus-4-8".to_string(),
+                reply: "an answer".to_string(),
             },
             Message {
                 agent: "opencode",
@@ -81,6 +121,8 @@ mod tests {
                 ts: 0,
                 turn: 7,
                 text: "with \"quotes\" and \n newline".to_string(),
+                model: String::new(),
+                reply: String::new(),
             },
         ];
         let mut path = std::env::temp_dir();
