@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 
 import common
 
 HOT_T = 0.15  # same threshold report.py uses: a message above this "reads hot"
+# Claude's compaction summary is logged as a user message; tag it as a "recap" rather than
+# treating it as something Danny wrote (it's machine-generated continuation context).
+RECAP_PREFIX = "This session is being continued from a previous conversation"
 
 
 # --------------------------------------------------------------------------- caches
@@ -154,10 +158,36 @@ def _replies_by_id() -> dict[str, str]:
     return out
 
 
+@functools.lru_cache(maxsize=1)
+def _kw_corpus() -> list[dict]:
+    """Flat, pre-lowercased search corpus: one entry per user turn AND per agent reply, with a
+    ready-made lowercase string. Keyword search scans these instead of lowercasing ~80 MB of
+    text on every keystroke, which is what makes live search-as-you-type instant. Built once."""
+    msgs = _messages_by_session()
+    reps = _replies_by_id()
+    concept = _session_concept()
+    out: list[dict] = []
+    for session, rows in msgs.items():
+        c = concept.get(session, "")
+        for o in rows:
+            t = o.get("text", "") or ""
+            if t:
+                out.append({"session": session, "turn": o.get("turn", 0), "agent": o.get("agent", ""),
+                            "project": o.get("project", ""), "concept": c,
+                            "who": "recap" if t.startswith(RECAP_PREFIX) else "you",
+                            "text": t, "low": t.lower()})
+            r = reps.get(o.get("id", ""), "")
+            if r:
+                out.append({"session": session, "turn": o.get("turn", 0), "agent": o.get("agent", ""),
+                            "project": o.get("project", ""), "concept": c,
+                            "who": "agent", "text": r, "low": r.lower()})
+    return out
+
+
 def warm_caches() -> None:
-    """Pre-build every read cache so even the first chat-open is instant (called at server boot)."""
+    """Pre-build every read cache so even the first chat-open / search is instant (server boot)."""
     _summaries(); _summary_by_session(); _session_concept()
-    _messages_by_session(); _emotions_by_id(); _replies_by_id()
+    _messages_by_session(); _emotions_by_id(); _replies_by_id(); _kw_corpus()
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -273,32 +303,30 @@ def _kw_pattern(q: str):
 
 
 def keyword_search(q: str, k: int = 300) -> dict:
-    """Case-insensitive, separator-flexible substring search over the actual message AND
-    agent-reply text (not summaries). Returns EVERY hit (one row per matching turn/reply,
-    like grep), grouped by chat, so the UI surfaces all instances. Runs over the in-memory
-    caches (RAM scan), so it's fast even though it touches every message."""
-    pat = _kw_pattern(q)
-    if pat is None:
+    """Case-insensitive, separator-flexible substring search over every user turn AND agent
+    reply. Returns EVERY hit (one row per match, like grep) grouped by chat. Scans the
+    pre-lowercased corpus, with a plain-substring fast path for single-token queries (the
+    common case while typing), so it's fast enough to run live on every keystroke."""
+    q = q.strip()
+    if not q:
         return {"hits": [], "total": 0, "chats": 0}
-    msgs = _messages_by_session()
-    reps = _replies_by_id()
-    concept = _session_concept()
+    corpus = _kw_corpus()
+    fields = ("session", "agent", "project", "concept", "turn", "who")
+    toks = [t for t in re.split(r"[\s\-_]+", q) if t]
     hits = []
-    for session, rows in msgs.items():
-        for o in rows:
-            base = {"session": session, "agent": o.get("agent", ""),
-                    "project": o.get("project", ""), "concept": concept.get(session, ""),
-                    "turn": o.get("turn", 0)}
-            t = o.get("text", "") or ""
-            m = pat.search(t)
+    if len(toks) <= 1:  # single token -> plain substring (fastest)
+        ql = q.lower()
+        for e in corpus:
+            i = e["low"].find(ql)
+            if i >= 0:
+                hits.append({**{f: e[f] for f in fields}, "snippet": _snip_at(e["text"], i, i + len(ql))})
+    else:  # multi-token -> separator-flexible regex (matches cyber-filter / cyber_filter)
+        pat = re.compile(r"[\s\-_]*".join(re.escape(t) for t in toks))
+        for e in corpus:
+            m = pat.search(e["low"])
             if m:
-                hits.append({**base, "who": "you", "snippet": _snip_at(t, m.start(), m.end())})
-            r = reps.get(o.get("id", ""), "")
-            if r:
-                m = pat.search(r)
-                if m:
-                    hits.append({**base, "who": "agent", "snippet": _snip_at(r, m.start(), m.end())})
-    hits.sort(key=lambda h: (h["session"], h["turn"], 0 if h["who"] == "you" else 1))
+                hits.append({**{f: e[f] for f in fields}, "snippet": _snip_at(e["text"], m.start(), m.end())})
+    hits.sort(key=lambda h: (h["session"], h["turn"], 0 if h["who"] != "agent" else 1))
     return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
 
@@ -326,16 +354,18 @@ def get_chat(session: str) -> dict:
         e = emo.get(o["id"], {})
         rage = float(e.get("rage_raw", 0.0))
         hype = float(e.get("hype_raw", 0.0))
+        txt = o.get("text", "")
         turns.append({
             "turn": o.get("turn", 0),
             "ts": o.get("ts", 0),
-            "text": o.get("text", ""),
+            "text": txt,
             "rage": round(rage, 4),
             "hype": round(hype, 4),
             "hot": rage > HOT_T,
             "top": e.get("top", []),
             "model": o.get("model", ""),
             "reply": rep.get(o["id"], ""),
+            "recap": txt.startswith(RECAP_PREFIX),
         })
     turns.sort(key=lambda t: t["turn"])
 

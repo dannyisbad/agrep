@@ -88,6 +88,10 @@ window.__pre={
   .grp.ksub{border-top:1px solid var(--line);color:var(--dim)}
   .who{font-size:9px;text-transform:uppercase;letter-spacing:.4px;padding:1px 4px;border-radius:3px;background:var(--hair);color:var(--faint);margin-right:6px;vertical-align:1px}
   .who.you{color:var(--ember)}
+  .who.recap{color:var(--warm)}
+  /* compaction-summary turn: machine-written recap, not your words — tag + dim it */
+  .recaptag{font-size:9px;text-transform:uppercase;letter-spacing:.4px;padding:1px 5px;border-radius:3px;border:1px solid var(--line);color:var(--warm)}
+  .turn.recap .tt{color:var(--faint)}
   .empty{padding:40px 16px;color:var(--faint);text-align:center;font-size:12px}
 
   /* ---- main pane ---- */
@@ -711,9 +715,10 @@ function renderTx(){
     const replyHit=t.reply&&matchesHi(t.reply);  // auto-open a reply that contains a match
     const rtog=t.reply?`<button class="rtog" data-t="${t.turn}" aria-expanded="${replyHit}">${C('replyLabel')}${mdl}</button>`:"";
     const rbox=t.reply?`<div class="rep" id="rep${t.turn}" ${replyHit?"":"hidden"}>${hl(t.reply,HILITE)}</div>`:"";
-    return `<div class="${cls}">
+    const tag=t.recap?`<span class="recaptag">recap</span> `:"";  // auto-generated compaction summary, not your words
+    return `<div class="${cls}${t.recap?' recap':''}">
       <div class="n">${t.turn}<i style="background:${t.rage>0.05?col:'transparent'}"></i></div>
-      <div><div class="tt">${hl(t.text,HILITE)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${rtog}${rbox}</div>
+      <div><div class="tt">${tag}${hl(t.text,HILITE)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${rtog}${rbox}</div>
     </div>`;
   }).join("");
   const more=TXSTATE.shown<all.length?`<button class="more" id="more">${C('txShow')} ${Math.min(step,all.length-TXSTATE.shown)} ${C('txMore')} · ${all.length-TXSTATE.shown} ${C('txLeft')}</button>`:"";
@@ -883,12 +888,35 @@ $("vExplore").onclick=()=>setView("explore");
 $("vPulse").onclick=()=>setView("pulse");
 $("send").onclick=ask;
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")ask();});
+// type = live keyword search (instant, no Enter). Enter = semantic "meaning" search.
+let liveTimer=null, liveReq=0;
+async function liveKeyword(term){
+  term=term.replace(/^"|"$/g,"").trim();
+  if(!term){exitSearch();return;}
+  HILITE=[term];HILITE_RE=buildHiRe(HILITE);
+  if(!SEARCH.active||SEARCH.mode!=="keyword"){$("findicon").textContent="⌕";}
+  SEARCH={active:true,q:term,results:SEARCH.results,busy:true,mode:"keyword"};
+  const my=++liveReq;
+  try{
+    const o=await J("/search?mode=keyword&k=150&q="+encodeURIComponent(term));
+    if(my!==liveReq)return;                                  // a newer keystroke superseded this
+    SEARCH={active:true,q:term,results:o.results||[],busy:false,mode:"keyword",total:o.total,chats:o.chats};
+    renderSearchList();
+    if(o.results&&o.results[0])fetchChat(o.results[0].session); // prefetch the top hit
+  }catch(e){if(my===liveReq){SEARCH={active:true,q:term,results:[],busy:false,mode:"keyword",err:e.message};renderSearchList();}}
+}
 $("find").addEventListener("input",e=>{
-  if(SEARCH.active)exitSearch();
-  STATE.filter=e.target.value.trim().toLowerCase();$("findx").style.display=e.target.value?"":"none";renderRail();
+  const v=e.target.value;$("findx").style.display=v?"":"none";
+  clearTimeout(liveTimer);
+  const q=v.trim();
+  if(q.length<2){liveReq++;exitSearch();return;}             // too short -> back to the organized list
+  liveTimer=setTimeout(()=>liveKeyword(q),110);
 });
-$("find").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();runSearch(e.target.value);}else if(e.key==="Escape"&&SEARCH.active){exitSearch();}});
-$("findx").onclick=()=>{$("find").value="";STATE.filter="";$("findx").style.display="none";exitSearch();};
+$("find").addEventListener("keydown",e=>{
+  if(e.key==="Enter"){e.preventDefault();clearTimeout(liveTimer);liveReq++;runSearch(e.target.value);} // escalate to meaning
+  else if(e.key==="Escape"){e.target.value="";$("findx").style.display="none";exitSearch();}
+});
+$("findx").onclick=()=>{$("find").value="";$("findx").style.display="none";clearTimeout(liveTimer);liveReq++;exitSearch();};
 $("groupSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.group=b.dataset.g;STATE.chip=null;$("groupSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
 $("sortSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.sort=b.dataset.s;$("sortSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
 document.addEventListener("keydown",e=>{if(e.key==="/"&&document.activeElement!==$("q")&&document.activeElement!==$("find")){e.preventDefault();$("find").focus();}});
@@ -916,7 +944,7 @@ const COPY={
   forensic:{
     askPh:"ask across every chat:  which project did i rage in, what was the DRM work about…",
     askBtn:"ask", vExplore:"explore", vPulse:"pulse",
-    findPh:'filter…  enter = meaning · "quotes" = exact', findClear:"clear",
+    findPh:'search content (live)…  enter = meaning', findClear:"clear",
     groupLab:"group", gConcept:"concept", gAgent:"agent", gProject:"project", gNone:"flat",
     sSize:"size", sRecent:"recent", sHeat:"heat",
     heroLead:"every chat you've had with claude, codex, opencode and antigravity, in one place. pick one on the left to read it back with its emotional arc, or ask a question across all of them.",
@@ -941,7 +969,7 @@ const COPY={
   kawaii:{
     askPh:"ask me anything about your chats~  ✿ which buddy made you poutiest?",
     askBtn:"ask ♡", vExplore:"wander", vPulse:"feelings",
-    findPh:'find a chat~ ♡ enter = vibe · "quotes" = exact', findClear:"clear ✕",
+    findPh:'peek inside chats~ ♡ enter = vibe', findClear:"clear ✕",
     groupLab:"sort by", gConcept:"topic", gAgent:"buddy", gProject:"project", gNone:"all",
     sSize:"biggest", sRecent:"newest", sHeat:"poutiest",
     heroFootA:"chats tucked away ♡", heroFootB:"with a mood diary ✿",
@@ -964,7 +992,7 @@ const COPY={
   },
   web99:{
     askPh:"Search your conversations...", askBtn:"Search", vExplore:"Directory", vPulse:"Statistics",
-    findPh:'Find:  enter = meaning, "quotes" = exact', findClear:"[clear]",
+    findPh:'Search content (live).  Enter = meaning.', findClear:"[clear]",
     groupLab:"Sort:", gConcept:"Topic", gAgent:"Program", gProject:"Folder", gNone:"All",
     sSize:"Size", sRecent:"Recent", sHeat:"Heat",
     heroFootA:"documents indexed.", heroFootB:"with mood charts.",
