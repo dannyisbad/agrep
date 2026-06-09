@@ -150,6 +150,14 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8732)
     ap.add_argument("--no-warm", action="store_true", help="skip pre-warming models (dashboard-only)")
     args = ap.parse_args()
+    # Parse the read tables once at boot so every /chat is a dict lookup, not a 50 MB scan.
+    # Cheap (one pass) and GPU-independent, so warm them even with --no-warm.
+    try:
+        common.log("warming read caches (messages / affect / replies) ...")
+        explore.warm_caches()
+        common.log("read caches warm.")
+    except Exception as e:  # noqa: BLE001
+        common.log(f"read-cache warm failed (endpoints lazy-load): {e}")
     if not args.no_warm:
         common.log("warming embedder + reranker ...")
         try:

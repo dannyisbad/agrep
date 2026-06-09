@@ -92,6 +92,74 @@ def _summary_by_session() -> dict[str, dict]:
     return {o["session"]: o for o in _summaries()}
 
 
+@functools.lru_cache(maxsize=1)
+def _messages_by_session() -> dict[str, list[dict]]:
+    """session -> its message rows, parsed once. get_chat used to scan all of messages.jsonl
+    (~50 MB / 25k lines) on every open; this loads it a single time so each open is a lookup."""
+    out: dict[str, list[dict]] = {}
+    p = common.MESSAGES_PATH
+    if p.exists():
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                s = o.get("session")
+                if s:
+                    out.setdefault(s, []).append(o)
+    return out
+
+
+@functools.lru_cache(maxsize=1)
+def _emotions_by_id() -> dict[str, dict]:
+    """message id -> affect row, parsed once (mirrors the messages cache)."""
+    out: dict[str, dict] = {}
+    p = common.DATA_DIR / "emotions.jsonl"
+    if p.exists():
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("id"):
+                    out[o["id"]] = o
+    return out
+
+
+@functools.lru_cache(maxsize=1)
+def _replies_by_id() -> dict[str, str]:
+    """message id -> agent reply text, parsed once."""
+    out: dict[str, str] = {}
+    p = common.DATA_DIR / "replies.jsonl"
+    if p.exists():
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("id"):
+                    out[o["id"]] = o.get("reply", "")
+    return out
+
+
+def warm_caches() -> None:
+    """Pre-build every read cache so even the first chat-open is instant (called at server boot)."""
+    _summaries(); _summary_by_session(); _session_concept()
+    _messages_by_session(); _emotions_by_id(); _replies_by_id()
+
+
 # --------------------------------------------------------------------------- endpoints
 
 def list_chats() -> list[dict]:
@@ -186,61 +254,33 @@ def get_vibe(session: str) -> dict | None:
 
 
 def get_chat(session: str) -> dict:
-    """Full detail for one chat: header + per-turn transcript annotated with affect, plus
-    the vibe arc if one was built. Streams messages.jsonl once and keeps only this
-    session's rows, so memory stays bounded even on the 4k-turn sessions."""
-    # affect lookup for this session's ids only (one pass over emotions.jsonl)
-    emo: dict[str, dict] = {}
-    ep = common.DATA_DIR / "emotions.jsonl"
-    if ep.exists():
-        with ep.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or session not in line:  # cheap prefilter before json.loads
-                    continue
-                o = json.loads(line)
-                if o["id"].split(":", 2)[1] == session:
-                    emo[o["id"]] = o
-
-    # agent replies for this session's ids (one pass over the replies sidecar)
-    rep: dict[str, str] = {}
-    rp = common.DATA_DIR / "replies.jsonl"
-    if rp.exists():
-        with rp.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or session not in line:  # cheap prefilter
-                    continue
-                o = json.loads(line)
-                if o["id"].split(":", 2)[1] == session:
-                    rep[o["id"]] = o.get("reply", "")
+    """Full detail for one chat: header + per-turn transcript annotated with affect, plus the
+    vibe arc if one was built. Reads from the in-process caches (messages-by-session, affect,
+    replies), so each open is a dict lookup over this session's rows rather than a scan of the
+    50 MB messages.jsonl (+ emotions + replies) on every request."""
+    emo = _emotions_by_id()
+    rep = _replies_by_id()
+    rows = _messages_by_session().get(session, [])
 
     turns = []
     agent = project = ""
-    with common.MESSAGES_PATH.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or session not in line:  # cheap prefilter
-                continue
-            o = json.loads(line)
-            if o.get("session") != session:
-                continue
-            agent = agent or o.get("agent", "")
-            project = project or o.get("project", "")
-            e = emo.get(o["id"], {})
-            rage = float(e.get("rage_raw", 0.0))
-            hype = float(e.get("hype_raw", 0.0))
-            turns.append({
-                "turn": o.get("turn", 0),
-                "ts": o.get("ts", 0),
-                "text": o.get("text", ""),
-                "rage": round(rage, 4),
-                "hype": round(hype, 4),
-                "hot": rage > HOT_T,
-                "top": e.get("top", []),
-                "model": o.get("model", ""),
-                "reply": rep.get(o["id"], ""),
-            })
+    for o in rows:
+        agent = agent or o.get("agent", "")
+        project = project or o.get("project", "")
+        e = emo.get(o["id"], {})
+        rage = float(e.get("rage_raw", 0.0))
+        hype = float(e.get("hype_raw", 0.0))
+        turns.append({
+            "turn": o.get("turn", 0),
+            "ts": o.get("ts", 0),
+            "text": o.get("text", ""),
+            "rage": round(rage, 4),
+            "hype": round(hype, 4),
+            "hot": rage > HOT_T,
+            "top": e.get("top", []),
+            "model": o.get("model", ""),
+            "reply": rep.get(o["id"], ""),
+        })
     turns.sort(key=lambda t: t["turn"])
 
     # the chat's headline model = the one most of its turns ran on
@@ -251,7 +291,7 @@ def get_chat(session: str) -> dict:
     session_model = max(mcount, key=mcount.get) if mcount else ""
 
     # header from the summary record if present
-    summ = next((o for o in _summaries() if o["session"] == session), None)
+    summ = _summary_by_session().get(session)
     hot_n = sum(1 for t in turns if t["hot"])
     return {
         "session": session,
