@@ -64,13 +64,13 @@ window.__pre={
   .seg{display:flex;border:1px solid var(--line)}
   .seg button{background:transparent;border:0;border-right:1px solid var(--line);color:var(--dim);padding:4px 9px;font-size:11px}
   .seg button:last-child{border-right:0}.seg button.on{background:var(--panel);color:var(--ink)}
-  .chips{display:flex;flex-wrap:wrap;gap:5px;padding:9px 14px 11px;border-bottom:1px solid var(--hair)}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;padding:9px 14px 11px;border-bottom:1px solid var(--hair);max-height:38vh;overflow-y:auto;flex:none}
   .chip{border:1px solid var(--line);background:transparent;color:var(--dim);padding:3px 8px;font-size:11px;border-radius:0}
   .chip:hover{color:var(--ink);border-color:#2a2f37}
   .chip.on{background:#16100d;border-color:var(--ember);color:#ffb9a8}
   .chip small{color:var(--faint);margin-left:5px}
 
-  .list{flex:1;overflow-y:auto}
+  .list{flex:1;overflow-y:auto;min-height:0}
   .grp{padding:10px 14px 4px;color:var(--faint);font-size:10.5px;display:flex;justify-content:space-between;align-items:baseline;border-top:1px solid var(--hair)}
   .grp:first-child{border-top:0}
   .grp b{color:var(--dim);font-weight:500}
