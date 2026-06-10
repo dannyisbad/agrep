@@ -197,7 +197,7 @@
                 font-family: inherit;
                 background: transparent;
                 border: 1px solid var(--hair);
-                border-radius: 9px;
+                border-radius: 0; /* match the square theme-switch button in noir */
                 padding: 2px 9px;
                 display: inline-flex;
                 align-items: center;
@@ -244,7 +244,7 @@
                 width: 268px;
                 background: var(--panel);
                 border: 1px solid var(--line);
-                border-radius: 10px;
+                border-radius: 0; /* noir is square; kawaii/web99 override below */
                 box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
                 padding: 11px 13px 10px;
                 cursor: default;
@@ -749,7 +749,7 @@
                 background: var(--panel);
             }
 
-            /* forensic home: wordmark + recent chats to resume */
+            /* noir home: wordmark + recent chats to resume */
             .home {
                 max-width: 560px;
                 margin: 48px auto 0;
@@ -1694,8 +1694,8 @@
                 white-space: nowrap;
             }
             .lrow .bd b {
-                color: var(--ink);
-                font-weight: 500;
+                color: var(--dim);
+                font-weight: 600;
             }
             .lrow .bd .src {
                 color: var(--faint);
@@ -1705,7 +1705,7 @@
                 white-space: normal;
             }
             .lrow.reply .bd {
-                color: var(--dim);
+                color: var(--ink);
                 white-space: normal;
             }
             .lrow.open .bd {
@@ -1776,8 +1776,8 @@
                 font-size: 0.96em;
             }
             .lz .lzn b {
-                color: var(--ink);
-                font-weight: 500;
+                color: var(--dim);
+                font-weight: 600;
             }
             .lz .zok {
                 color: var(--calm);
@@ -1815,8 +1815,77 @@
                 font-size: 1em;
             }
             .lz .lzr {
-                color: var(--dim);
+                color: var(--ink);
                 font-size: 0.96em;
+            }
+            /* rendered markdown in model replies (live previews + chat-detail reply) */
+            .md p {
+                margin: 0 0 0.5em;
+            }
+            .md p:last-child {
+                margin-bottom: 0;
+            }
+            .md code {
+                font-family: var(--mono);
+                background: var(--panel2);
+                border: 1px solid var(--hair);
+                padding: 0.02em 0.32em;
+                border-radius: 3px;
+                font-size: 0.9em;
+            }
+            .md pre {
+                background: var(--panel2);
+                border: 1px solid var(--hair);
+                border-radius: 6px;
+                padding: 8px 10px;
+                overflow: auto;
+                margin: 0.5em 0;
+            }
+            .md pre code {
+                background: none;
+                border: 0;
+                padding: 0;
+                font-size: 0.86em;
+                line-height: 1.45;
+            }
+            .md b,
+            .md strong {
+                color: var(--ink);
+                font-weight: 600;
+            }
+            .md a {
+                color: var(--calm);
+                text-decoration: underline;
+            }
+            .md ul,
+            .md ol {
+                margin: 0.3em 0 0.5em;
+                padding-left: 1.4em;
+            }
+            .md li {
+                margin: 0.12em 0;
+            }
+            .md .mdh {
+                color: var(--ink);
+                font-weight: 600;
+                margin: 0.5em 0 0.2em;
+            }
+            .md .mdq {
+                border-left: 2px solid var(--line);
+                padding-left: 0.7em;
+                color: var(--faint);
+                margin: 0.4em 0;
+            }
+            .md hr {
+                border: 0;
+                border-top: 1px solid var(--hair);
+                margin: 0.6em 0;
+            }
+            /* in the one-line live feed, keep inline md from forcing block breaks */
+            .lrow .bd .md,
+            .lz .lzr.md,
+            .lz .lzo.md {
+                display: inline;
             }
             .lz {
                 cursor: pointer;
@@ -2618,7 +2687,7 @@
                     ></div>
                 </div>
                 <button id="theme" class="themebtn" title="cycle theme">
-                    ◐ forensic
+                    ◐ noir
                 </button>
             </div>
         </div>
@@ -2784,6 +2853,120 @@
                 HILITE_RE.lastIndex = 0;
                 return HILITE_RE.test(s || "");
             };
+            // Minimal, safe markdown for MODEL REPLIES ONLY (never user text or tool I/O).
+            // Escapes first, then a compact subset. mdInline = no block elements (for the
+            // one-line live previews); mdHTML = full blocks (for the chat-detail reply).
+            function mdInline(t) {
+                t = esc(t);
+                t = t.replace(/`([^`]+)`/g, "<code>$1</code>");
+                t = t.replace(/\*\*([^*]+?)\*\*/g, "<b>$1</b>");
+                t = t.replace(/(^|[^*])\*([^*\n]+?)\*/g, "$1<i>$2</i>");
+                t = t.replace(
+                    /(^|[\s(])_([^_\n]+?)_(?=[\s).,!?]|$)/g,
+                    "$1<i>$2</i>",
+                );
+                t = t.replace(
+                    /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+                    '<a href="$2" target="_blank" rel="noopener">$1</a>',
+                );
+                return t;
+            }
+            function mdHTML(raw) {
+                if (!raw) return "";
+                const blk = [];
+                const src = String(raw).replace(
+                    /```[^\n]*\n?([\s\S]*?)```/g,
+                    (m, c) => {
+                        blk.push(esc(c.replace(/\s+$/, "")));
+                        return " B" + (blk.length - 1) + " ";
+                    },
+                );
+                const out = [];
+                let para = [],
+                    list = null;
+                const fp = () => {
+                    if (para.length) {
+                        out.push("<p>" + mdInline(para.join(" ")) + "</p>");
+                        para = [];
+                    }
+                };
+                const fl = () => {
+                    if (list) {
+                        out.push(
+                            "<" +
+                                list.t +
+                                ">" +
+                                list.i
+                                    .map((x) => "<li>" + mdInline(x) + "</li>")
+                                    .join("") +
+                                "</" +
+                                list.t +
+                                ">",
+                        );
+                        list = null;
+                    }
+                };
+                for (const ln of src.split(/\r?\n/)) {
+                    let m;
+                    if ((m = ln.match(/^ B(\d+) $/))) {
+                        fp();
+                        fl();
+                        out.push(
+                            "<pre><code>" + blk[+m[1]] + "</code></pre>",
+                        );
+                        continue;
+                    }
+                    if (!ln.trim()) {
+                        fp();
+                        fl();
+                        continue;
+                    }
+                    if ((m = ln.match(/^#{1,6}\s+(.+)$/))) {
+                        fp();
+                        fl();
+                        out.push('<div class="mdh">' + mdInline(m[1]) + "</div>");
+                        continue;
+                    }
+                    if (/^\s*>\s?/.test(ln)) {
+                        fp();
+                        out.push(
+                            '<div class="mdq">' +
+                                mdInline(ln.replace(/^\s*>\s?/, "")) +
+                                "</div>",
+                        );
+                        continue;
+                    }
+                    if ((m = ln.match(/^\s*[-*+]\s+(.+)$/))) {
+                        fp();
+                        if (!list || list.t !== "ul") {
+                            fl();
+                            list = { t: "ul", i: [] };
+                        }
+                        list.i.push(m[1]);
+                        continue;
+                    }
+                    if ((m = ln.match(/^\s*\d+[.)]\s+(.+)$/))) {
+                        fp();
+                        if (!list || list.t !== "ol") {
+                            fl();
+                            list = { t: "ol", i: [] };
+                        }
+                        list.i.push(m[1]);
+                        continue;
+                    }
+                    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(ln)) {
+                        fp();
+                        fl();
+                        out.push("<hr>");
+                        continue;
+                    }
+                    fl();
+                    para.push(ln.trim());
+                }
+                fp();
+                fl();
+                return out.join("");
+            }
 
             // a home/desktop cwd carries no project signal (the agent just mkdir'd & cd'd, or never did),
             // so show the concept thread instead of yet another "Users/<name>". A dir is "generic" when
@@ -2823,7 +3006,7 @@
             // heat ramp: rage_raw (or mean) -> color along calm->warm->ember. Per-theme endpoints so
             // the mid-tone never lands on washed-out yellow over a light background.
             const HEAT_RAMP = {
-                forensic: [
+                noir: [
                     [58, 214, 196],
                     [255, 176, 0],
                     [255, 74, 46],
@@ -2843,7 +3026,7 @@
                 // v ~ 0..0.6
                 const r =
                     HEAT_RAMP[document.documentElement.dataset.theme] ||
-                    HEAT_RAMP.forensic;
+                    HEAT_RAMP.noir;
                 const t = Math.max(0, Math.min(1, v / 0.45));
                 if (t < 0.5) {
                     const k = t / 0.5;
@@ -3647,7 +3830,7 @@
                             ? `<button class="rtog" data-t="${t.turn}" aria-expanded="${replyHit}">${C("replyLabel")}${mdl}</button>`
                             : "";
                         const rbox = t.reply
-                            ? `<div class="rep" id="rep${t.turn}" ${replyHit ? "" : "hidden"}>${hl(t.reply, HILITE)}</div>`
+                            ? `<div class="rep md" id="rep${t.turn}" ${replyHit ? "" : "hidden"}>${HILITE_RE ? hl(t.reply, HILITE) : mdHTML(t.reply)}</div>`
                             : "";
                         const tag = t.recap
                             ? `<span class="recaptag">recap</span> `
@@ -4308,19 +4491,22 @@
                     });
                 ensureStream();
                 const lvf = $("lvf");
+                LIVE.follow = true; // start pinned to the newest activity
                 lvf.onscroll = () => {
-                    // reaching the bottom by hand clears the backlog pill
-                    if (
-                        LIVE.unseen &&
+                    // follow the feed only while the user is at/near the bottom; scrolling
+                    // up to read history releases the auto-scroll until they return.
+                    const atBot =
                         lvf.scrollTop + lvf.clientHeight >=
-                            lvf.scrollHeight - 60
-                    ) {
+                        lvf.scrollHeight - 24;
+                    LIVE.follow = atBot;
+                    if (LIVE.unseen && atBot) {
                         LIVE.unseen = 0;
                         updatePill();
                     }
                 };
                 $("newpill").onclick = () => {
                     LIVE.unseen = 0;
+                    LIVE.follow = true;
                     lvf.scrollTop = lvf.scrollHeight;
                     updatePill();
                 };
@@ -4511,9 +4697,9 @@
                         } catch (e) {}
                         renderLive();
                     };
-                const atBottom =
-                    !keepScroll ||
-                    lvf.scrollTop + lvf.clientHeight >= lvf.scrollHeight - 60;
+                // follow the bottom while the user is pinned there (LIVE.follow), tracked
+                // by the scroll handler — robust to rapid rebuilds that reset scrollTop.
+                const atBottom = !keepScroll || LIVE.follow !== false;
                 const feed = LIVE.sel
                     ? LIVE.feed.filter((e) => lvKey(e) === LIVE.sel)
                     : LIVE.feed;
@@ -4593,6 +4779,19 @@
                 if (atBottom) {
                     lvf.scrollTop = lvf.scrollHeight;
                     LIVE.unseen = 0;
+                    LIVE.follow = true;
+                    // images load async and grow the feed AFTER this scroll; re-pin to the
+                    // bottom as each one lands (only while still following)
+                    lvf.querySelectorAll(".lvimg img").forEach((im) => {
+                        if (!im.complete)
+                            im.addEventListener(
+                                "load",
+                                () => {
+                                    if (LIVE.follow) lvf.scrollTop = lvf.scrollHeight;
+                                },
+                                { once: true },
+                            );
+                    });
                 }
                 updatePill();
             }
@@ -4632,7 +4831,9 @@
                 else if (e.type === "tool_done")
                     bd = `${src}<b>${esc(e.name || "?")}</b> ${err ? C("liveFail") : "✓"}${e.dur != null ? ` <span class="dur">${fmtDur(e.dur)}</span>` : ""} ${esc(e.output || "")}`;
                 else if (e.type === "subagent_result")
-                    bd = `${src}<b>${esc(e.name || "task")}</b> ${esc(e.output || "")}`;
+                    bd = `${src}<b>${esc(e.name || "task")}</b> <span class="md">${mdInline(e.output || "")}</span>`;
+                else if (e.type === "reply")
+                    bd = `${src}<span class="md">${mdInline(e.text || "")}</span>`;
                 else bd = `${src}${esc(e.text || "")}`;
                 return `<div class="lrow ${esc(e.type)}${err ? " err" : ""}${e.sub ? " sub" : ""}"><span class="lt">${t}</span><span class="ic">${ic}</span><span class="bd">${bd}${imgHTML(e)}</span></div>`;
             }
@@ -4667,11 +4868,11 @@
                             ? `<div class="lzo">→ ${esc(e.output)}</div>`
                             : "");
                 } else if (e.type === "subagent_result") {
-                    body = `<div class="lzn">⑂ <b>${esc(e.name || "task")}</b></div><div class="lzo">${esc(e.output || "")}</div>`;
+                    body = `<div class="lzn">⑂ <b>${esc(e.name || "task")}</b></div><div class="lzo md">${mdInline(e.output || "")}</div>`;
                 } else if (e.type === "user") {
                     body = `<div class="lzu">› ${esc(e.text || "")}</div>`;
                 } else {
-                    body = `<div class="lzr">‹ ${esc(e.text || "")}</div>`;
+                    body = `<div class="lzr md">‹ ${mdInline(e.text || "")}</div>`;
                 }
                 return `<div class="lz ${esc(e.type)}${err ? " err" : ""}${e.sub ? " sub" : ""}">${head}${body}</div>`;
             }
@@ -4806,6 +5007,9 @@
             function showPlaceholder() {
                 if ($("conv").children.length) return; // keep ask answers visible
                 const n = STATS ? STATS.n_sessions : CHATS.length,
+                    v = STATS
+                        ? STATS.n_vibes
+                        : CHATS.filter((c) => c.has_vibe).length,
                     t = curTheme();
                 if (t === "web99") {
                     $("view").innerHTML = web99Home(n);
@@ -4816,7 +5020,7 @@
                     $("view").innerHTML = kawaiiHome(n, v);
                     return;
                 }
-                // forensic: wordmark + the most recent chats, so the empty pane is a resume point
+                // noir: wordmark + the most recent chats, so the empty pane is a resume point
                 const recent = [...CHATS]
                     .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
                     .slice(0, 8);
@@ -5078,9 +5282,9 @@
 
             // ============================ themes ============================
             // A theme isn't just a paint job: it carries its own vocabulary. Every visible
-            // noun is keyed here, and the forensic map is the fallback any other can borrow from.
+            // noun is keyed here, and the noir map is the fallback any other can borrow from.
             const COPY = {
-                forensic: {
+                noir: {
                     askPh: "ask a question across every chat…",
                     askBtn: "ask",
                     vExplore: "explore",
@@ -5534,7 +5738,7 @@
                 },
             };
             const THEMES = [
-                ["forensic", "◐ forensic"],
+                ["noir", "◐ noir"],
                 ["kawaii", "✿ kawaii"],
                 ["web99", "▦ 1999"],
             ];
@@ -5544,8 +5748,8 @@
                 const m = COPY[curTheme()];
                 return m && m[k] != null
                     ? m[k]
-                    : COPY.forensic[k] != null
-                      ? COPY.forensic[k]
+                    : COPY.noir[k] != null
+                      ? COPY.noir[k]
                       : k;
             }
             function applyCopy() {
@@ -5780,6 +5984,7 @@
             }
             function setTheme(t) {
                 if (t === "win95") t = "web99"; // migrate the old name
+                if (t === "forensic") t = "noir"; // renamed
                 document.documentElement.dataset.theme = t;
                 $("theme").textContent = (THEMES.find((x) => x[0] === t) ||
                     THEMES[0])[1];
