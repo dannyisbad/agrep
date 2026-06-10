@@ -34,7 +34,9 @@ POLL_S = 0.7
 ACTIVE_WINDOW_S = 90          # session counts as "running" if its store moved within this
 STALL_S = 240                 # thinking/replying with no store write this long = dead turn
 TAIL_SEED = 64 * 1024         # on first sight, parse at most this many trailing bytes
-SNIP = 400                    # live events carry display snippets, not payloads
+SNIP = 400                    # tool I/O previews stay short (one-line collapsed view)
+MSG = 4000                    # reply/user MESSAGE text: carry enough to read in full on
+                              # click-to-expand, not just a 400-char teaser
 RING = 600                    # global recent-events ring
 PER_SESSION = 200
 
@@ -493,7 +495,7 @@ class LiveWatcher(threading.Thread):
                         self._claude_pending[ev["call_id"]] = ev
                     self._emit(ev)
                 elif bt == "text" and b.get("text", "").strip():
-                    self._emit({**base, "type": "reply", "text": _snip(b["text"])})
+                    self._emit({**base, "type": "reply", "text": _snip(b["text"], MSG)})
             # The final assistant message of a turn carries a terminal stop_reason
             # (tool_use = mid-turn). This is what flips the card off "replying".
             if not sub and msg.get("stop_reason") in ("end_turn", "stop_sequence", "max_tokens"):
@@ -522,13 +524,13 @@ class LiveWatcher(threading.Thread):
                 # typed messages with attachments arrive as text blocks, not a plain string
                 joined = "\n".join(t for t in texts if t.strip())
                 if not sub and joined and not _noise(joined):
-                    self._emit({**base, "type": "user", "text": _snip(joined)})
+                    self._emit({**base, "type": "user", "text": _snip(joined, MSG)})
             elif isinstance(content, str) and not sub:
                 if content.lstrip().startswith("[Request interrupted"):
                     # the turn is dead right now -- don't leave the card on "⚒ tool"
                     self._emit({**base, "type": "done", "why": "interrupted"})
                 elif not _noise(content):
-                    self._emit({**base, "type": "user", "text": _snip(content)})
+                    self._emit({**base, "type": "user", "text": _snip(content, MSG)})
 
     # ------------------------------------------------------------- codex
 
@@ -649,9 +651,9 @@ class LiveWatcher(threading.Thread):
             if not text.strip():
                 return
             if p.get("role") == "assistant":
-                self._emit({**base, "type": "reply", "text": _snip(text)})
+                self._emit({**base, "type": "reply", "text": _snip(text, MSG)})
             elif p.get("role") == "user" and not _noise(text):
-                self._emit({**base, "type": "user", "text": _snip(text)})
+                self._emit({**base, "type": "user", "text": _snip(text, MSG)})
 
     # ------------------------------------------------------------- opencode
 
@@ -751,9 +753,9 @@ class LiveWatcher(threading.Thread):
                 self._oc_part_st[pid] = "text"
                 t = pd["text"]
                 if role == "assistant":
-                    self._emit({**base, "type": "reply", "text": _snip(t)})
+                    self._emit({**base, "type": "reply", "text": _snip(t, MSG)})
                 elif role == "user" and not _noise(t):
-                    self._emit({**base, "type": "user", "text": _snip(t)})
+                    self._emit({**base, "type": "user", "text": _snip(t, MSG)})
         for sess, tu, mdata in mrows:
             self._oc_msg_wm[path] = max(self._oc_msg_wm[path], tu)
             try:
@@ -809,7 +811,7 @@ class LiveWatcher(threading.Thread):
                 q.append((tc.get("name", "?"), _snip(inp)))
             c = e.get("content")
             if isinstance(c, str) and c.strip():
-                self._emit({**base, "type": "reply", "text": _snip(c)})
+                self._emit({**base, "type": "reply", "text": _snip(c, MSG)})
             if not tcs:
                 # the planner answering without queueing any tool call IS the turn end
                 self._emit({**base, "type": "done"})
@@ -824,7 +826,7 @@ class LiveWatcher(threading.Thread):
             if o >= 0 and cl > o:
                 c = c[o + len("<USER_REQUEST>"):cl]
             if c.strip():
-                self._emit({**base, "type": "user", "text": _snip(c)})
+                self._emit({**base, "type": "user", "text": _snip(c, MSG)})
 
     def _agy_mailbox(self, brain_path: str, sess: str, now: float) -> None:
         mdir = os.path.join(brain_path, ".system_generated", "messages")
