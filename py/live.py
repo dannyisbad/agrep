@@ -92,6 +92,18 @@ def _image_files(v) -> list:
     return uniq
 
 
+def _img_records(imgs: list, cwd: str) -> list:
+    """{p: served-path, n: display-name} for each image. A relative path (the agent
+    referenced the file from its working dir, e.g. `audit_shots/x.png`) is resolved
+    against the session's cwd so /file can find it on disk; the display name keeps the
+    original basename."""
+    recs = []
+    for p in imgs:
+        ap = p if (os.path.isabs(p) or not cwd) else os.path.normpath(os.path.join(cwd, p))
+        recs.append({"p": ap, "n": os.path.basename(p)})
+    return recs
+
+
 def _summarize_input(v) -> str:
     if isinstance(v, dict):
         parts = []
@@ -203,6 +215,7 @@ class LiveWatcher(threading.Thread):
         self._partials: dict[str, str] = {}       # jsonl path -> trailing partial line
         self._codex_meta: dict[str, tuple[str, str]] = {}   # path -> (session, project)
         self._codex_model: dict[str, str] = {}              # path -> model (from turn_context)
+        self._codex_cwd: dict[str, str] = {}                # path -> cwd (for relative image paths)
         self._claude_pending: dict[str, dict] = {}          # call_id -> live tool event
         self._codex_pending: dict[str, dict] = {}
         self._agy_announced: dict[str, deque] = {}          # session -> queued (name, input)
@@ -472,7 +485,7 @@ class LiveWatcher(threading.Thread):
                           "call_id": b.get("id", "")}
                     imgs = _image_files(inp)
                     if imgs:
-                        ev["imgs"] = [{"p": p, "n": os.path.basename(p)} for p in imgs]
+                        ev["imgs"] = _img_records(imgs, cwd)
                         cap = inp.get("caption") if isinstance(inp, dict) else None
                         if isinstance(cap, str) and cap.strip():
                             ev["imgcap"] = _snip(cap, 200)
@@ -575,6 +588,7 @@ class LiveWatcher(threading.Thread):
             cwd = p.get("cwd") or ""
             if cwd:
                 self._codex_meta[path] = (sess0, _project_of(cwd) or proj0)
+                self._codex_cwd[path] = cwd
             if p.get("model"):
                 self._codex_model[path] = p["model"]
             return
@@ -608,7 +622,7 @@ class LiveWatcher(threading.Thread):
                   "call_id": p.get("call_id", "")}
             imgs = _image_files(argd)
             if imgs:
-                ev["imgs"] = [{"p": q, "n": os.path.basename(q)} for q in imgs]
+                ev["imgs"] = _img_records(imgs, self._codex_cwd.get(path, ""))
                 cap = argd.get("caption") if isinstance(argd, dict) else None
                 if isinstance(cap, str) and cap.strip():
                     ev["imgcap"] = _snip(cap, 200)
