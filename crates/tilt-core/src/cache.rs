@@ -217,11 +217,33 @@ fn safe_name(s: &str) -> String {
         .collect()
 }
 
+/// FNV-1a 64-bit of a byte slice. Used to detect whether a per-session event file's
+/// content changed since the last index, so unchanged files are skipped (see below).
+fn content_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// Write events as per-session JSON Lines files `dir/{agent}-{session}.jsonl`, each
-/// sorted by ts (stable, so same-ts events keep ingest order). Files for sessions that
-/// no longer exist are removed. Returns (n_files, n_events).
-pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usize)> {
+/// sorted by ts (stable, so same-ts events keep ingest order).
+///
+/// INCREMENTAL: rewriting all ~12k files every run was the dominant ingest cost (40s+ of
+/// Windows tmp+rename churn on 440MB). Instead each session's content is built in memory
+/// and hashed; a manifest (`.manifest`, fname -> hash) records what was last written, and
+/// a file is only rewritten when its hash changed or it's missing. So a typical run after
+/// one active session touches a handful of files, not all of them. Files for sessions that
+/// vanished are removed. Returns (n_files, n_events, n_rewritten).
+pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usize, usize)> {
     fs::create_dir_all(dir)?;
+    let manifest_path = dir.join(".manifest");
+    let manifest: std::collections::HashMap<String, u64> = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
 
     let mut by: BTreeMap<(&str, &str), Vec<&Event>> = BTreeMap::new();
     for e in events {
@@ -229,35 +251,47 @@ pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usiz
     }
 
     let mut live: HashSet<String> = HashSet::new();
+    let mut next_manifest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut n_events = 0usize;
+    let mut n_written = 0usize;
     for ((agent, session), mut evs) in by {
         if session.is_empty() {
             continue;
         }
         evs.sort_by_key(|e| e.ts);
         let fname = format!("{}-{}.jsonl", agent, safe_name(session));
-        write_atomic(&dir.join(&fname), |w| {
-            for e in &evs {
-                let rec = EventRecord {
-                    ts: e.ts,
-                    kind: e.kind,
-                    name: &e.name,
-                    input: &e.input,
-                    output: &e.output,
-                    ok: e.ok,
-                    call_id: &e.call_id,
-                    child: &e.child_session,
-                };
-                serde_json::to_writer(&mut *w, &rec)?;
-                w.write_all(b"\n")?;
-            }
-            Ok(())
-        })?;
+        // serialize this session's events to an in-memory buffer, then decide whether to write
+        let mut buf: Vec<u8> = Vec::new();
+        for e in &evs {
+            let rec = EventRecord {
+                ts: e.ts,
+                kind: e.kind,
+                name: &e.name,
+                input: &e.input,
+                output: &e.output,
+                ok: e.ok,
+                call_id: &e.call_id,
+                child: &e.child_session,
+            };
+            serde_json::to_writer(&mut buf, &rec)?;
+            buf.push(b'\n');
+        }
+        let h = content_hash(&buf);
+        let path = dir.join(&fname);
+        // write only when the content changed or the file is missing
+        if manifest.get(&fname) != Some(&h) || !path.exists() {
+            write_atomic(&path, |w| {
+                w.write_all(&buf)?;
+                Ok(())
+            })?;
+            n_written += 1;
+        }
+        next_manifest.insert(fname.clone(), h);
         n_events += evs.len();
         live.insert(fname);
     }
 
-    // Drop event files whose session vanished from the stores (renamed, pruned, test runs).
+    // Drop event files (and manifest entries) whose session vanished from the stores.
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -267,7 +301,12 @@ pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usiz
         }
     }
 
-    Ok((live.len(), n_events))
+    let body = serde_json::to_string(&next_manifest)?;
+    write_atomic(&manifest_path, |w| {
+        w.write_all(body.as_bytes())?;
+        Ok(())
+    })?;
+    Ok((live.len(), n_events, n_written))
 }
 
 /// Aggregate rollup for the pulse dashboard: per-agent call/fail counts, the tool mix,

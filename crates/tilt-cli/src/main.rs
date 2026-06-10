@@ -86,7 +86,7 @@ fn index_cmd(agent: &str) -> anyhow::Result<()> {
     let n_sessions =
         cache::write_session_index(&msgs, &PathBuf::from("data").join("sessions.jsonl"))?;
     let edir = PathBuf::from("data").join("events");
-    let (n_files, n_events) = cache::write_events(&evts, &edir)?;
+    let (n_files, n_events, n_rewritten) = cache::write_events(&evts, &edir)?;
     cache::write_event_stats(&evts, &PathBuf::from("data").join("event_stats.json"))?;
     let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();
     let with_reply = msgs.iter().filter(|m| !m.reply.trim().is_empty()).count();
@@ -104,10 +104,11 @@ fn index_cmd(agent: &str) -> anyhow::Result<()> {
         rpath.display()
     );
     println!(
-        "  {} tool/subagent events across {} sessions -> {}",
+        "  {} tool/subagent events across {} sessions -> {} ({} files rewritten)",
         n_events,
         n_files,
-        edir.display()
+        edir.display(),
+        n_rewritten
     );
     println!("  next: `python tilt.py reindex` to (re)build embeddings / affect / topics / arcs");
     Ok(())
