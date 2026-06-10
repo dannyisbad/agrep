@@ -5,13 +5,45 @@
 //! affect read, and writes back; the search index is built from the same rows. Each record carries
 //! a stable `id` (`agent:session:turn`) so the sidecar can join its results back onto the source.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use serde::Serialize;
 
-use crate::model::Message;
+use crate::model::{Event, Message};
+
+/// Write a file atomically: stream into `<path>.tmp`, flush, then rename over `path`.
+/// Rename is atomic within a filesystem on both Windows and Unix, so a concurrent reader
+/// (the server's auto-indexer reindexes while requests are served) always sees either the
+/// complete old file or the complete new one — never a half-written one.
+fn write_atomic<F>(path: &Path, f: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut BufWriter<fs::File>) -> anyhow::Result<()>,
+{
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension(format!(
+        "{}tmp",
+        path.extension().map(|e| format!("{}.", e.to_string_lossy()))
+            .unwrap_or_default()
+    ));
+    {
+        let mut w = BufWriter::new(fs::File::create(&tmp)?);
+        f(&mut w)?;
+        w.flush()?;
+    }
+    // On Windows, rename fails if the destination exists; remove it first. The tiny
+    // window between remove and rename is acceptable for a single-writer indexer.
+    #[cfg(windows)]
+    let _ = fs::remove_file(path);
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 /// One cached row. `id` is the stable join key the sidecar/index reference.
 #[derive(Serialize)]
@@ -55,45 +87,263 @@ struct ReplyRecord<'a> {
 /// Write `msgs` as JSON Lines to `path` (creating parent dirs as needed). One compact JSON object
 /// per line: `{id, agent, project, session, ts, turn, text}`. Overwrites any existing file.
 pub fn write_messages(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+    write_atomic(path, |w| {
+        for m in msgs {
+            let rec = Record::from_message(m);
+            // Compact (no pretty-print) so each record is exactly one line.
+            serde_json::to_writer(&mut *w, &rec)?;
+            w.write_all(b"\n")?;
         }
-    }
-    let file = fs::File::create(path)?;
-    let mut w = BufWriter::new(file);
-    for m in msgs {
-        let rec = Record::from_message(m);
-        // Compact (no pretty-print) so each record is exactly one line.
-        serde_json::to_writer(&mut w, &rec)?;
-        w.write_all(b"\n")?;
-    }
-    w.flush()?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Write the agent replies as JSON Lines (`{id, reply}`) to `path`, skipping turns with no
 /// captured reply. Same stable `id` as `messages.jsonl`, so the detail view joins on it.
 pub fn write_replies(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+    write_atomic(path, |w| {
+        for m in msgs {
+            if m.reply.trim().is_empty() {
+                continue;
+            }
+            let rec = ReplyRecord {
+                id: format!("{}:{}:{}", m.agent, m.session, m.turn),
+                reply: &m.reply,
+            };
+            serde_json::to_writer(&mut *w, &rec)?;
+            w.write_all(b"\n")?;
+        }
+        Ok(())
+    })
+}
+
+/// One row per session in `data/sessions.jsonl`: everything the explorer's rail needs
+/// (counts, span, label fallback) WITHOUT touching the ~50 MB messages.jsonl. This is
+/// what makes the directory near-instant on a cold server and right after a reindex.
+#[derive(Serialize)]
+struct SessionRecord<'a> {
+    session: &'a str,
+    agent: &'a str,
+    project: &'a str,
+    n: u32,
+    first_ts: i64,
+    last_ts: i64,
+    /// First real typed message (compaction recaps skipped), one line, capped.
+    first_text: String,
+}
+
+const RECAP_PREFIX: &str = "This session is being continued from a previous conversation";
+
+/// Write the per-session aggregate index. One pass over the already-deduped messages.
+pub fn write_session_index(msgs: &[Message], path: &Path) -> anyhow::Result<usize> {
+    struct Agg<'a> {
+        agent: &'a str,
+        project: &'a str,
+        n: u32,
+        first_ts: i64,
+        last_ts: i64,
+        first_text: String,
+    }
+    let mut by: BTreeMap<&str, Agg> = BTreeMap::new();
+    for m in msgs {
+        let a = by.entry(m.session.as_str()).or_insert(Agg {
+            agent: m.agent,
+            project: &m.project,
+            n: 0,
+            first_ts: i64::MAX,
+            last_ts: 0,
+            first_text: String::new(),
+        });
+        a.n += 1;
+        if m.ts > 0 {
+            a.first_ts = a.first_ts.min(m.ts);
+            a.last_ts = a.last_ts.max(m.ts);
+        }
+        if a.first_text.is_empty() && !m.text.trim().is_empty() && !m.text.starts_with(RECAP_PREFIX)
+        {
+            let one_line: String = m.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            a.first_text = one_line.chars().take(120).collect();
         }
     }
-    let file = fs::File::create(path)?;
-    let mut w = BufWriter::new(file);
-    for m in msgs {
-        if m.reply.trim().is_empty() {
+    let n = by.len();
+    write_atomic(path, |w| {
+        for (session, a) in by {
+            let rec = SessionRecord {
+                session,
+                agent: a.agent,
+                project: a.project,
+                n: a.n,
+                first_ts: if a.first_ts == i64::MAX { 0 } else { a.first_ts },
+                last_ts: a.last_ts,
+                first_text: a.first_text,
+            };
+            serde_json::to_writer(&mut *w, &rec)?;
+            w.write_all(b"\n")?;
+        }
+        Ok(())
+    })?;
+    Ok(n)
+}
+
+/// One event row inside a per-session file. The file name already carries agent+session,
+/// so rows hold only what varies per event; empty fields are omitted to keep lines lean.
+#[derive(Serialize)]
+struct EventRecord<'a> {
+    ts: i64,
+    kind: &'a str,
+    name: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    input: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    output: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    call_id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    child: &'a str,
+}
+
+/// Session ids are uuids/`ses_*` in practice, but never trust them as raw file names.
+fn safe_name(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Write events as per-session JSON Lines files `dir/{agent}-{session}.jsonl`, each
+/// sorted by ts (stable, so same-ts events keep ingest order). Files for sessions that
+/// no longer exist are removed. Returns (n_files, n_events).
+pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usize)> {
+    fs::create_dir_all(dir)?;
+
+    let mut by: BTreeMap<(&str, &str), Vec<&Event>> = BTreeMap::new();
+    for e in events {
+        by.entry((e.agent, e.session.as_str())).or_default().push(e);
+    }
+
+    let mut live: HashSet<String> = HashSet::new();
+    let mut n_events = 0usize;
+    for ((agent, session), mut evs) in by {
+        if session.is_empty() {
             continue;
         }
-        let rec = ReplyRecord {
-            id: format!("{}:{}:{}", m.agent, m.session, m.turn),
-            reply: &m.reply,
-        };
-        serde_json::to_writer(&mut w, &rec)?;
-        w.write_all(b"\n")?;
+        evs.sort_by_key(|e| e.ts);
+        let fname = format!("{}-{}.jsonl", agent, safe_name(session));
+        write_atomic(&dir.join(&fname), |w| {
+            for e in &evs {
+                let rec = EventRecord {
+                    ts: e.ts,
+                    kind: e.kind,
+                    name: &e.name,
+                    input: &e.input,
+                    output: &e.output,
+                    ok: e.ok,
+                    call_id: &e.call_id,
+                    child: &e.child_session,
+                };
+                serde_json::to_writer(&mut *w, &rec)?;
+                w.write_all(b"\n")?;
+            }
+            Ok(())
+        })?;
+        n_events += evs.len();
+        live.insert(fname);
     }
-    w.flush()?;
+
+    // Drop event files whose session vanished from the stores (renamed, pruned, test runs).
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".jsonl") && !live.contains(&name) {
+                fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+
+    Ok((live.len(), n_events))
+}
+
+/// Aggregate rollup for the pulse dashboard: per-agent call/fail counts, the tool mix,
+/// and subagent totals. Computed here (the events are already in memory at index time)
+/// so the dashboard never has to scan the ~0.5GB per-session event corpus per request.
+pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    #[derive(Default, Serialize)]
+    struct AgentStat {
+        calls: u64,
+        fails: u64,
+        /// Calls whose store actually RECORDED an outcome (ok true or false). Codex logs
+        /// raw output text with no exit status, so its fail rate is "not recorded", not
+        /// zero -- the dashboard derives rate from fails/known and hides unknowable rows.
+        known: u64,
+        subagents: u64,
+    }
+    let mut by_agent: HashMap<&str, AgentStat> = HashMap::new();
+    let mut by_tool: HashMap<String, (u64, u64)> = HashMap::new(); // name -> (n, fails)
+    let mut total = 0u64;
+    let mut fails = 0u64;
+    let mut subagents = 0u64;
+    for e in events {
+        let a = by_agent.entry(e.agent).or_default();
+        if e.kind == "tool" {
+            total += 1;
+            a.calls += 1;
+            let t = by_tool.entry(e.name.clone()).or_default();
+            t.0 += 1;
+            if e.ok.is_some() {
+                a.known += 1;
+            }
+            if e.ok == Some(false) {
+                fails += 1;
+                a.fails += 1;
+                t.1 += 1;
+            }
+        } else {
+            subagents += 1;
+            a.subagents += 1;
+        }
+    }
+    let mut tools: Vec<(String, (u64, u64))> = by_tool.into_iter().collect();
+    tools.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    tools.truncate(14);
+
+    #[derive(Serialize)]
+    struct Stats<'a> {
+        total: u64,
+        fails: u64,
+        subagents: u64,
+        by_agent: HashMap<&'a str, AgentStat>,
+        by_tool: Vec<ToolStat>,
+    }
+    #[derive(Serialize)]
+    struct ToolStat {
+        name: String,
+        n: u64,
+        fails: u64,
+    }
+    let stats = Stats {
+        total,
+        fails,
+        subagents,
+        by_agent,
+        by_tool: tools
+            .into_iter()
+            .map(|(name, (n, f))| ToolStat { name, n, fails: f })
+            .collect(),
+    };
+    let body = serde_json::to_string_pretty(&stats)?;
+    write_atomic(path, |w| {
+        w.write_all(body.as_bytes())?;
+        Ok(())
+    })?;
     Ok(())
 }
 

@@ -5,20 +5,21 @@
 //!
 //! Codex injects a large first "user" turn (AGENTS.md / environment / instructions) plus
 //! a stream of system-authored `role:user` notifications (turn_aborted, subagent_notification,
-//! goal_context, delegations, image-paste markers). None of those are Danny's words, so we
+//! goal_context, delegations, image-paste markers). None of those are the user's words, so we
 //! drop them and keep only what he actually typed. Prefer under-including over mislabeling.
 //!
 //! NOTE: only `~/.codex/sessions/` is walked. `~/.codex/.tmp/**` (plugin test fixtures),
 //! `~/.codex/history.jsonl`, and `~/.codex/archived_sessions/` are intentionally not read.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use crate::ingest::{is_wrapper, project_name, ts_millis};
-use crate::model::Message;
+use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
+use crate::model::{Event, Message};
 
 #[derive(Deserialize)]
 struct Line {
@@ -39,6 +40,16 @@ struct Payload {
     cwd: Option<String>,
     // turn_context carries the active model (e.g. "gpt-5.3-codex-spark").
     model: Option<String>,
+    // tool-call fields: function_call {name, arguments(JSON-string), call_id};
+    // function_call_output {call_id, output}; custom_tool_call {name, input, status};
+    // web_search_call {action:{query,...}}.
+    name: Option<String>,
+    arguments: Option<String>,
+    call_id: Option<String>,
+    output: Option<serde_json::Value>,
+    input: Option<String>,
+    status: Option<String>,
+    action: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -95,7 +106,7 @@ fn extract_assistant(blocks: &[Block]) -> Option<String> {
 }
 
 /// Codex-specific preambles and system-injected `role:user` notifications that are NOT
-/// something Danny typed. Checked in addition to the shared `is_wrapper`.
+/// something the user typed. Checked in addition to the shared `is_wrapper`.
 fn is_codex_injected(text: &str) -> bool {
     let t = text.trim_start();
     // Injected first-turn preamble (AGENTS.md / environment / instructions blocks).
@@ -114,7 +125,7 @@ fn is_codex_injected(text: &str) -> bool {
         || t.starts_with("<realtime_delegation")
         || t.starts_with("<user_action")
         // Image-paste marker wrapper; the typed text is entangled with it, so skip to
-        // avoid emitting the marker as Danny's words.
+        // avoid emitting the marker as the user's words.
         || t.starts_with("<image")
 }
 
@@ -134,13 +145,69 @@ fn session_from_filename(path: &Path) -> String {
     }
 }
 
-fn parse_file(path: &Path) -> Vec<Message> {
+/// The codex shell wrapper prints `Process exited with code N` into otherwise
+/// unstructured output text -- the only outcome record many codex tool calls have.
+fn sniff_exit_code(s: &str) -> Option<bool> {
+    const MARK: &str = "Process exited with code ";
+    let i = s.find(MARK)?;
+    let digits: String = s[i + MARK.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits == "0")
+    }
+}
+
+/// A function_call_output's `output`: usually a plain string, which is sometimes itself
+/// JSON `{"output": "...", "metadata": {"exit_code": 0}}`. Returns (text, ok-if-known).
+fn parse_call_output(v: &serde_json::Value) -> (String, Option<bool>) {
+    let from_obj = |o: &serde_json::Map<String, serde_json::Value>| {
+        let text = o
+            .get("output")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| serde_json::Value::Object(o.clone()).to_string());
+        let ok = o
+            .get("metadata")
+            .and_then(|m| m.get("exit_code"))
+            .and_then(|c| c.as_i64())
+            .map(|c| c == 0)
+            .or_else(|| sniff_exit_code(&text));
+        (text, ok)
+    };
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim_start();
+            if t.starts_with('{') {
+                if let Ok(serde_json::Value::Object(o)) = serde_json::from_str(t) {
+                    let (text, ok) = from_obj(&o);
+                    return (cap_str(&text, EVENT_CAP), ok);
+                }
+            }
+            (cap_str(s, EVENT_CAP), sniff_exit_code(s))
+        }
+        serde_json::Value::Object(o) => {
+            let (text, ok) = from_obj(o);
+            (cap_str(&text, EVENT_CAP), ok)
+        }
+        serde_json::Value::Null => (String::new(), None),
+        other => (cap_str(&other.to_string(), EVENT_CAP), None),
+    }
+}
+
+fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     let data = match fs::read_to_string(path) {
         Ok(d) => d,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Vec::new()),
     };
 
     let mut out: Vec<Message> = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
+    // call_id -> index into `events`, so the *_output line can pair up.
+    let mut pending: HashMap<String, usize> = HashMap::new();
     let mut turn = 0u32;
     let mut project: Option<String> = None;
     let mut session: Option<String> = None;
@@ -187,9 +254,94 @@ fn parse_file(path: &Path) -> Vec<Message> {
             Some(p) => p,
             None => continue,
         };
-        // Only chat messages; skip function_call / function_call_output / reasoning.
-        if payload.ty.as_deref() != Some("message") {
-            continue;
+        // Tool stream -> events. (Reasoning stays skipped.)
+        let sess = || {
+            session
+                .clone()
+                .unwrap_or_else(|| session_from_filename(path))
+        };
+        match payload.ty.as_deref() {
+            Some("function_call") | Some("custom_tool_call") => {
+                let name = payload.name.clone().unwrap_or_else(|| "?".to_string());
+                // function_call carries `arguments` as a JSON string; custom_tool_call
+                // carries `input` as a raw string (e.g. an apply_patch body).
+                let input = if let Some(args) = payload.arguments.as_deref() {
+                    serde_json::from_str::<serde_json::Value>(args)
+                        .map(|v| summarize_tool_input(&v))
+                        .unwrap_or_else(|_| cap_str(args, EVENT_CAP))
+                } else {
+                    payload
+                        .input
+                        .as_deref()
+                        .map(|s| cap_str(s, EVENT_CAP))
+                        .unwrap_or_default()
+                };
+                let ok = match payload.status.as_deref() {
+                    Some("completed") => Some(true),
+                    Some("failed") | Some("error") => Some(false),
+                    _ => None,
+                };
+                let call_id = payload.call_id.clone().unwrap_or_default();
+                if !call_id.is_empty() {
+                    pending.insert(call_id.clone(), events.len());
+                }
+                events.push(Event {
+                    agent: "codex",
+                    session: sess(),
+                    ts: ts_millis(l.timestamp.as_deref()),
+                    kind: "tool",
+                    name,
+                    input,
+                    output: String::new(),
+                    ok,
+                    call_id,
+                    child_session: String::new(),
+                });
+                continue;
+            }
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                if let Some(id) = payload.call_id.as_deref() {
+                    if let Some(&i) = pending.get(id) {
+                        let (text, ok) = payload
+                            .output
+                            .as_ref()
+                            .map(parse_call_output)
+                            .unwrap_or_default();
+                        events[i].output = text;
+                        if ok.is_some() {
+                            events[i].ok = ok;
+                        }
+                        // No fabricated Some(true) when the store records nothing: codex
+                        // output is raw text without exit codes, and "arrived" != "worked".
+                        // ok stays None => the stats layer reports it as not-recorded.
+                        pending.remove(id);
+                    }
+                }
+                continue;
+            }
+            Some("web_search_call") => {
+                let query = payload
+                    .action
+                    .as_ref()
+                    .and_then(|a| a.get("query"))
+                    .and_then(|q| q.as_str())
+                    .unwrap_or("");
+                events.push(Event {
+                    agent: "codex",
+                    session: sess(),
+                    ts: ts_millis(l.timestamp.as_deref()),
+                    kind: "tool",
+                    name: "web_search".to_string(),
+                    input: cap_str(query, EVENT_CAP),
+                    output: String::new(),
+                    ok: None,
+                    call_id: payload.call_id.clone().unwrap_or_default(),
+                    child_session: String::new(),
+                });
+                continue;
+            }
+            Some("message") => {}
+            _ => continue,
         }
         let blocks = match payload.content.as_deref() {
             Some(b) => b,
@@ -235,7 +387,7 @@ fn parse_file(path: &Path) -> Vec<Message> {
         turn += 1;
     }
 
-    out
+    (out, events)
 }
 
 /// Recursively collect rollout files under `~/.codex/sessions/` (YYYY/MM/DD nesting).
@@ -256,14 +408,18 @@ fn gather(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// Walk all session rollouts and collect Danny's Codex messages.
-pub fn collect() -> Vec<Message> {
+/// Walk all session rollouts and collect the user's Codex messages + tool events.
+pub fn collect() -> (Vec<Message>, Vec<Event>) {
     let root = crate::ingest::home().join(".codex").join("sessions");
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     gather(&root, &mut files);
 
-    files
-        .par_iter()
-        .flat_map(|p| parse_file(p))
-        .collect()
+    let pairs: Vec<(Vec<Message>, Vec<Event>)> = files.par_iter().map(|p| parse_file(p)).collect();
+    let mut msgs = Vec::new();
+    let mut evts = Vec::new();
+    for (m, e) in pairs {
+        msgs.extend(m);
+        evts.extend(e);
+    }
+    (msgs, evts)
 }

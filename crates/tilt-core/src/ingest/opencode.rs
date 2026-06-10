@@ -9,21 +9,21 @@
 //!   message(id, session_id, data JSON {role}, time_created ms)
 //!   part(message_id, session_id, data JSON {type,text}, time_created)
 //!
-//! Danny's text = concat of part.data.text for type=="text" parts whose message
-//! has role=="user". But opencode bundles non-Danny content into the SAME user
+//! the user's text = concat of part.data.text for type=="text" parts whose message
+//! has role=="user". But opencode bundles non-the user content into the SAME user
 //! message as extra "text" parts: tool-call narration ("Called the <X> tool with
 //! the following input: {...}"), tool results ("Image read successfully"), and
 //! file attachments (`<path>...</path><type>file</type><content>...`). 106 user
 //! messages mix these with a genuine typed part, so filtering is done per PART
 //! (drop injected wrappers, then concatenate survivors) — never per message.
-//! We under-include rather than risk labeling agent/system text as Danny's.
+//! We under-include rather than risk labeling agent/system text as the user's.
 
 use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 
-use crate::ingest::{is_wrapper, project_name};
-use crate::model::Message;
+use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, EVENT_CAP};
+use crate::model::{Event, Message};
 
 /// The four live DB filenames. `.bak*`/`.corrupted` siblings are intentionally absent.
 const DB_FILES: &[&str] = &[
@@ -47,7 +47,7 @@ struct PartData {
     text: Option<String>,
 }
 
-/// True for opencode-injected "text" parts that are NOT something Danny typed:
+/// True for opencode-injected "text" parts that are NOT something the user typed:
 /// tool-call narration, tool results, and file-attachment payloads. These appear
 /// as `type:"text"` parts inside user messages alongside the real typed prompt.
 fn is_injected_part(text: &str) -> bool {
@@ -64,7 +64,7 @@ fn is_injected_part(text: &str) -> bool {
         || is_wrapper(text)
 }
 
-/// Pull Danny's messages out of one opencode DB. Returns empty on any failure.
+/// Pull the user's messages out of one opencode DB. Returns empty on any failure.
 fn collect_db(path: &std::path::Path) -> Vec<Message> {
     let path_str = match path.to_str() {
         Some(s) => s,
@@ -237,17 +237,149 @@ fn collect_db(path: &std::path::Path) -> Vec<Message> {
     out
 }
 
-/// Open each live opencode DB read-only and collect Danny's typed messages.
-pub fn collect() -> Vec<Message> {
+/// One DB's tool-call parts + subagent (child) sessions -> events.
+fn collect_db_events(path: &std::path::Path) -> Vec<Event> {
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let uri = format!("file:{}?mode=ro&immutable=1", path_str.replace('\\', "/"));
+    let conn = match Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut events: Vec<Event> = Vec::new();
+
+    // Tool parts: data = {type:"tool", tool, callID, state:{status,input,output}}.
+    // LIKE prefilters; the JSON parse below is the real type check.
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT m.session_id, p.time_created, p.id, p.data \
+         FROM part p JOIN message m ON p.message_id = m.id \
+         WHERE p.data LIKE '%\"type\":\"tool\"%' \
+         ORDER BY m.session_id, p.time_created, p.id",
+    ) {
+        #[derive(Deserialize)]
+        struct ToolPart {
+            #[serde(rename = "type")]
+            ty: Option<String>,
+            tool: Option<String>,
+            #[serde(rename = "callID")]
+            call_id: Option<String>,
+            state: Option<ToolState>,
+        }
+        #[derive(Deserialize)]
+        struct ToolState {
+            status: Option<String>,
+            input: Option<serde_json::Value>,
+            output: Option<serde_json::Value>,
+        }
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(), // session_id
+                row.get::<_, i64>(1).unwrap_or(0),           // part time_created (ms)
+                row.get::<_, String>(2).unwrap_or_default(), // part id
+                row.get::<_, String>(3).unwrap_or_default(), // part.data JSON
+            ))
+        });
+        if let Ok(rows) = rows {
+            for (session, ts, part_id, data) in rows.flatten() {
+                let p: ToolPart = match serde_json::from_str(&data) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if p.ty.as_deref() != Some("tool") {
+                    continue;
+                }
+                let state = p.state.as_ref();
+                let input = state
+                    .and_then(|s| s.input.as_ref())
+                    .map(summarize_tool_input)
+                    .unwrap_or_default();
+                let output = state
+                    .and_then(|s| s.output.as_ref())
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => cap_str(s, EVENT_CAP),
+                        other => cap_str(&other.to_string(), EVENT_CAP),
+                    })
+                    .unwrap_or_default();
+                let ok = match state.and_then(|s| s.status.as_deref()) {
+                    Some("completed") => Some(true),
+                    Some("error") => Some(false),
+                    _ => None,
+                };
+                events.push(Event {
+                    agent: "opencode",
+                    session,
+                    ts,
+                    kind: "tool",
+                    name: p.tool.unwrap_or_else(|| "?".to_string()),
+                    input,
+                    output,
+                    ok,
+                    call_id: p.call_id.unwrap_or(part_id),
+                    child_session: String::new(),
+                });
+            }
+        }
+    }
+
+    // Subagent sessions: a child session (parent_id set) becomes a subagent_start event
+    // in the parent. The child is independently viewable, so just link it.
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, parent_id, COALESCE(title,''), time_created \
+         FROM session WHERE parent_id IS NOT NULL AND parent_id != ''",
+    ) {
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+                row.get::<_, i64>(3).unwrap_or(0),
+            ))
+        });
+        if let Ok(rows) = rows {
+            for (child, parent, title, ts) in rows.flatten() {
+                events.push(Event {
+                    agent: "opencode",
+                    session: parent,
+                    ts,
+                    kind: "subagent_start",
+                    name: if title.is_empty() {
+                        "subagent".to_string()
+                    } else {
+                        cap_str(&title, 200)
+                    },
+                    input: String::new(),
+                    output: String::new(),
+                    ok: None,
+                    call_id: child.clone(),
+                    child_session: child,
+                });
+            }
+        }
+    }
+
+    events
+}
+
+/// Open each live opencode DB read-only and collect the user's typed messages + tool events.
+pub fn collect() -> (Vec<Message>, Vec<Event>) {
     let dir = crate::ingest::home()
         .join(".local")
         .join("share")
         .join("opencode");
 
-    DB_FILES
-        .par_iter()
+    let paths: Vec<std::path::PathBuf> = DB_FILES
+        .iter()
         .map(|name| dir.join(name))
         .filter(|p| p.exists())
-        .flat_map(|p| collect_db(&p))
-        .collect()
+        .collect();
+
+    let msgs: Vec<Message> = paths.par_iter().flat_map(|p| collect_db(p)).collect();
+    let evts: Vec<Event> = paths.par_iter().flat_map(|p| collect_db_events(p)).collect();
+    (msgs, evts)
 }
