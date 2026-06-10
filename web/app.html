@@ -4806,12 +4806,9 @@
             function showPlaceholder() {
                 if ($("conv").children.length) return; // keep ask answers visible
                 const n = STATS ? STATS.n_sessions : CHATS.length,
-                    v = STATS
-                        ? STATS.n_vibes
-                        : CHATS.filter((c) => c.has_vibe).length,
                     t = curTheme();
                 if (t === "web99") {
-                    $("view").innerHTML = web99Home(n, v);
+                    $("view").innerHTML = web99Home(n);
                     wireHomeFocus();
                     return;
                 }
@@ -4854,7 +4851,7 @@
   </div>`;
             }
             // 1999 web homepage, styled after the original google front page
-            function web99Home(n, v) {
+            function web99Home(n) {
                 return `<div class="g99">
     <div class="g99logo"><span>t</span><span>i</span><span>l</span><span>t</span><em>!</em></div>
     <div class="g99tag">Search every conversation with your coding programs.</div>
@@ -4862,7 +4859,7 @@
       <button class="g99b" id="g99search">tilt Search</button>
       <button class="g99b" id="g99lucky">I'm Feeling Lucky</button>
     </div>
-    <div class="g99meta">Indexing <b>${fmt(n)}</b> documents.</div>
+    <div class="g99meta">Indexing <b>${fmt(n)}</b> conversations</div>
     <hr class="g99hr">
     <div class="g99foot">
       <span class="g99ctr">visitors: <i>${odometer(n)}</i></span>
@@ -5197,6 +5194,7 @@
                     stKeywordOnly: "keyword only",
                     stNoAffect: "affect off",
                     spIndex: "index",
+                    spCorpus: "corpus",
                     spSearch: "search",
                     spEnrich: "enrichment",
                     spLive: "live",
@@ -5346,6 +5344,7 @@
                     stKeywordOnly: "simple search~",
                     stNoAffect: "no feelings yet~",
                     spIndex: "memories",
+                    spCorpus: "collection",
                     spSearch: "search",
                     spEnrich: "sparkles",
                     spLive: "live now",
@@ -5496,6 +5495,7 @@
                     stKeywordOnly: "keyword only",
                     stNoAffect: "affect off",
                     spIndex: "Index",
+                    spCorpus: "Indexed",
                     spSearch: "Search",
                     spEnrich: "Enrichment",
                     spLive: "Live",
@@ -5539,7 +5539,7 @@
                 ["web99", "▦ 1999"],
             ];
             const curTheme = () =>
-                document.documentElement.dataset.theme || "forensic";
+                document.documentElement.dataset.theme || "web99";
             function C(k) {
                 const m = COPY[curTheme()];
                 return m && m[k] != null
@@ -5686,6 +5686,7 @@
                 const noBin = idx.available === false;
                 const rows = [
                     `<div class="sp-row"><span class="sp-k">${C("spIndex")}</span><span class="sp-v">${esc(head)}</span></div>`,
+                    `<div class="sp-row"><span class="sp-k">${C("spCorpus")}</span><span class="sp-v">${fmt(s.n_sessions)} ${C("statChats")} · ${fmt(s.n_msgs)} ${C("statTurns")}</span></div>`,
                     `<div class="sp-row${semoff ? " off" : ""}"><span class="sp-k">${C("spSearch")}</span><span class="sp-v">${esc(semv)}</span></div>`,
                     `<div class="sp-row${cov.emotions ? "" : " off"}"><span class="sp-k">${C("spEnrich")}</span><span class="sp-v">${enr}` +
                         (cov.emotions
@@ -5799,9 +5800,9 @@
             setTheme(
                 (() => {
                     try {
-                        return localStorage.getItem("tiltTheme") || "forensic";
+                        return localStorage.getItem("tiltTheme") || "web99";
                     } catch (e) {
-                        return "forensic";
+                        return "web99";
                     }
                 })(),
             );
