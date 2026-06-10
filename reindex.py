@@ -10,9 +10,10 @@ Each stage runs as its OWN process so a model's VRAM is released before the next
 stage loads its model (important on the 10GB GPU). Stages, in order:
 
     cargo build (release)         -> the tilt binary
-    tilt index                    -> data/messages.jsonl + data/replies.jsonl
+    tilt index                    -> data/messages.jsonl + data/replies.jsonl + data/events/
     embed.py                      -> data/embeddings.{f32,ids}        (incremental)
     emotion.py                    -> data/emotions.jsonl              (incremental)
+    judge.py                      -> LLM verdicts onto gate-routed rows (incremental)
     summarize.py                  -> data/summaries.jsonl             (incremental)
     embed_summaries.py            -> data/summary_emb.*               (incremental)
     concepts.py --source summary  -> data/concepts.json + session_concepts.jsonl
@@ -44,20 +45,30 @@ PY = str(VENV_PY if VENV_PY.exists() else sys.executable)
 TILT = ROOT / "target" / "release" / ("tilt.exe" if WIN else "tilt")
 
 
-def run(desc: str, cmd: list[str]) -> None:
+def run(desc: str, cmd: list[str], optional: bool = False) -> bool:
     print(f"\n=== {desc} ===", flush=True)
     t = time.perf_counter()
     r = subprocess.run(cmd, cwd=str(ROOT))
     if r.returncode != 0:
+        if optional:
+            # ML/LLM stages are enhancements, not requirements: a machine without the
+            # py deps / GPU / ollama still gets a fully usable explorer (browse, keyword
+            # search, events, live view) straight from the Rust ingest.
+            print(f"  ! {desc} failed (exit {r.returncode}); skipping -- the explorer "
+                  f"works without this stage.", flush=True)
+            return False
         print(f"  ! {desc} failed (exit {r.returncode}); stopping.", flush=True)
         sys.exit(r.returncode)
     print(f"  ({time.perf_counter() - t:.1f}s)", flush=True)
+    return True
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="rebuild the tilt index")
     ap.add_argument("--full", action="store_true",
                     help="recompute every stage instead of incrementally")
+    ap.add_argument("--judge", action="store_true",
+                    help="run the LLM affect judge over gate-routed rows (slow, optional)")
     ap.add_argument("--no-build", action="store_true", help="skip cargo build")
     args = ap.parse_args()
     full = ["--full"] if args.full else []
@@ -81,13 +92,27 @@ def main() -> int:
         print("  (pass --full to rebuild embeddings/affect/topics/arcs anyway.)")
         return 0
 
-    run("embed messages", [PY, "py/embed.py", *full])
-    run("affect gate", [PY, "py/emotion.py", *full])
-    run("summarize sessions", [PY, "py/summarize.py", *full])
-    run("embed summaries", [PY, "py/embed_summaries.py", *full])
-    run("cluster concepts", [PY, "py/concepts.py", "--source", "summary"])
-    run("name concepts", [PY, "py/label_concepts.py"])
-    run("vibe arcs", [PY, "py/vibe.py"])
+    # Everything below is an ENHANCEMENT layer (GPU embeddings, affect, LLM summaries,
+    # arcs). Each is optional: failures warn and skip, because the explorer is already
+    # fully usable from the Rust ingest alone. Stages also respect their own
+    # incrementality, and vibe arcs self-detect staleness (sig over the affect series),
+    # so affect changes propagate automatically on the next run.
+    ok_emb = run("embed messages", [PY, "py/embed.py", *full], optional=True)
+    ok_emo = run("affect gate", [PY, "py/emotion.py", *full], optional=True)
+    if ok_emo:
+        if args.judge:  # correction layer on the affect gate; opt-in, it's slow
+            run("affect judge (LLM, routed msgs)", [PY, "py/judge.py"], optional=True)
+    ok_sum = run("summarize sessions", [PY, "py/summarize.py", *full], optional=True)
+    if ok_sum and ok_emb:
+        run("embed summaries", [PY, "py/embed_summaries.py", *full], optional=True)
+        run("cluster concepts", [PY, "py/concepts.py", "--source", "summary"], optional=True)
+        run("name concepts", [PY, "py/label_concepts.py"], optional=True)
+    if ok_sum:
+        run("backfill titles", [PY, "py/titles.py"], optional=True)
+    if ok_emo:
+        # arcs for every substantive session, not a top-24 leaderboard: the explorer
+        # shows a vibe-trace on any chat that has one, so coverage beats curation.
+        run("vibe arcs", [PY, "py/vibe.py", "--top", "999", "--min-turns", "8"], optional=True)
 
     if sig:  # record what we just fully processed, so an unchanged re-run is instant
         sig_file.write_text(sig, encoding="utf-8")

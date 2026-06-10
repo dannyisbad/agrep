@@ -1,7 +1,7 @@
 """Concept threads: cluster SESSIONS by semantic content, independent of cwd.
 
 Fixes the cwd-bucketing problem: agents `mkdir x && cd x`, so generic buckets
-(Desktop, Users/Danny) lump hundreds of unrelated threads together while one real
+(Desktop, Users/<you>) lump hundreds of unrelated threads together while one real
 effort scatters across many cwds. We regroup by what each session is actually ABOUT.
 
 Pipeline:
@@ -297,7 +297,8 @@ def cluster_centroids(args) -> int:
         print(f"  {r['n_messages']:>6} {r['n_sessions']:>5}  {r['label'][:42]:<42}  {buckets[:40]}")
     print()
     # show the cwd-fix concretely: how a generic bucket fragments across concepts
-    for generic in ("Users/Danny", "Desktop"):
+    from pathlib import Path
+    for generic in (f"Users/{Path.home().name}", "Desktop"):
         spread = [r for r in records if generic in r["cwd_buckets"]]
         if spread:
             print(f"  '{generic}' cwd-bucket is spread across {len(spread)} distinct concepts "

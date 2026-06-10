@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tilt</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='Arial Narrow,sans-serif' font-weight='bold' font-size='24' fill='%23ff4a2e' transform='rotate(-8 16 16)'%3Et%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Anton&family=JetBrains+Mono:wght@400;500;700&family=Baloo+2:wght@500;700;800&family=Mochiy+Pop+One&family=Yomogi&display=swap" rel="stylesheet">
@@ -15,6 +16,7 @@ window.__pre={
   chats:fetch('/chats').then(r=>r.ok?r.json():null).catch(()=>null),
   concepts:fetch('/concepts').then(r=>r.ok?r.json():[]).catch(()=>[]),
   data:fetch('/data').then(r=>r.ok?r.json():null).catch(()=>null),
+  stats:fetch('/stats').then(r=>r.ok?r.json():null).catch(()=>null),
 };
 </script>
 <style>
@@ -48,9 +50,21 @@ window.__pre={
   .views button.on{background:var(--panel);color:var(--ink);border-color:#2a2f37}
   .views button:hover{color:var(--ink)}
   .stat{color:var(--faint);font-size:11px;white-space:nowrap}.stat b{color:var(--ink);font-weight:500}
+  .statuschip{color:var(--ghost);font-size:10.5px;white-space:nowrap;cursor:default;
+    border:1px solid var(--hair);border-radius:9px;padding:1px 8px;display:inline-flex;
+    align-items:center;gap:5px}
+  .statuschip.clickable{cursor:pointer}
+  .statuschip.clickable:hover{color:var(--dim);border-color:var(--line)}
+  .statuschip.warn{color:var(--warm);border-color:var(--warm)}
+  .statuschip.err{color:var(--ember);border-color:var(--ember)}
+  .statuschip .sdot{width:6px;height:6px;border-radius:50%;background:var(--warm);
+    animation:lpulse 1.1s ease-in-out infinite}
 
-  .body{display:grid;grid-template-columns:340px 1fr;min-height:calc(100vh - 53px);position:relative;z-index:1}
+  .body{display:grid;grid-template-columns:var(--railw,340px) 5px 1fr;min-height:calc(100vh - 53px);position:relative;z-index:1}
   .body.solo{grid-template-columns:1fr}
+  .body.solo .gutter{display:none}
+  .gutter{cursor:col-resize;background:transparent;position:relative;z-index:5}
+  .gutter:hover,.gutter.drag{background:var(--line)}
 
   /* ---- left rail: the organizer ---- */
   .rail{border-right:1px solid var(--line);background:var(--rail);display:flex;flex-direction:column;height:calc(100vh - 53px);position:sticky;top:53px}
@@ -59,7 +73,8 @@ window.__pre={
   .find input{flex:1;background:transparent;border:0;outline:none;color:var(--ink);font-family:var(--mono);font-size:12px}
   .find input::placeholder{color:var(--faint)}
   .find .x{color:var(--faint);cursor:pointer;font-size:13px}.find .x:hover{color:var(--ink)}
-  .ctrls{display:flex;gap:6px;margin-top:9px;align-items:center;flex-wrap:wrap}
+  .ctrls{display:flex;gap:6px;margin-top:7px;align-items:center;flex-wrap:wrap}
+  .ctrls label{min-width:34px}
   .ctrls label{color:var(--faint);font-size:11px}
   .seg{display:flex;border:1px solid var(--line)}
   .seg button{background:transparent;border:0;border-right:1px solid var(--line);color:var(--dim);padding:4px 9px;font-size:11px}
@@ -77,6 +92,7 @@ window.__pre={
   .ci{padding:9px 14px 10px;border-bottom:1px solid var(--hair);cursor:pointer;position:relative}
   .ci:hover{background:#0f1115}
   .ci.sel{background:#11140e;box-shadow:inset 2px 0 0 var(--ember)}
+  .ci.thin .ttl{color:var(--dim)}  /* unsummarized session: first-message title, dimmed */
   .ci .ttl{color:var(--ink);font-size:12px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .ci .mt{display:flex;gap:8px;align-items:center;color:var(--faint);font-size:10.5px;margin-top:5px}
   .ci .ag{color:var(--dim)} .ci .pj{color:var(--faint)}
@@ -97,6 +113,8 @@ window.__pre={
   /* ---- main pane ---- */
   .main{overflow-y:auto;height:calc(100vh - 53px);padding:0}
   .pane{max-width:880px;margin:0 auto;padding:26px 30px 120px}
+  /* the live monitor wants width, not a reading column */
+  .pane.wide{max-width:96vw;padding:18px 24px 40px}
 
   /* ask conversation overlay (lives at top of main) */
   .conv{display:flex;flex-direction:column;gap:13px;margin-bottom:8px}
@@ -119,6 +137,34 @@ window.__pre={
   .ph .big{font-family:var(--disp);font-size:120px;line-height:.8;color:#15171b}
   .ph p{max-width:420px}.ph kbd{color:var(--dim);border:1px solid var(--line);padding:1px 6px;background:var(--panel)}
 
+  /* forensic home: wordmark + recent chats to resume */
+  .home{max-width:560px;margin:48px auto 0}
+  .home .big{font-family:var(--disp);font-size:96px;line-height:.8;color:#15171b;text-align:center}
+  .home .lead{color:var(--faint);text-align:center;margin:18px auto 30px;max-width:430px}
+  .home .rh{display:flex;align-items:center;gap:11px;color:var(--dim);font-size:11px;margin-bottom:4px}
+  .home .rh .rule{flex:1;height:1px;background:var(--line)}
+  .home .ri{display:grid;grid-template-columns:1fr auto;gap:12px;padding:8px 2px;border-bottom:1px solid var(--hair);cursor:pointer;align-items:baseline}
+  .home .ri:hover .rt{color:#fff}
+  .home .ri .rt{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .home .ri .rm{color:var(--faint);font-size:11px;white-space:nowrap}
+  .home .ri .rm .ag{color:var(--dim)}
+
+  /* timestamps in rows + crumbs */
+  .when{color:var(--faint);font-variant-numeric:tabular-nums}
+
+  /* match navigation pill (search active in a transcript) */
+  .mnav{display:inline-flex;align-items:center;gap:7px;color:var(--dim)}
+  .mnav b{color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums}
+  .mnav button{background:transparent;border:1px solid var(--line);color:var(--dim);padding:1px 7px;font-size:12px}
+  .mnav button:hover{color:var(--ink);border-color:#2a2f37}
+  .turn.mfocus{box-shadow:inset 2px 0 0 var(--warm)}
+  .keyhint{color:var(--ghost);font-size:10px;margin-left:6px}
+
+  /* clear control for the ask conversation */
+  .convbar{display:flex;justify-content:flex-end}
+  .convbar button{background:transparent;border:0;color:var(--faint);font-size:11px;padding:0}
+  .convbar button:hover{color:var(--ink)}
+
   /* chat detail */
   .det h2{font-family:var(--mono);font-weight:500;font-size:15px;color:var(--ink);margin:0 0 7px;line-height:1.4}
   .det .crumb{display:flex;flex-wrap:wrap;gap:7px 13px;align-items:center;color:var(--faint);font-size:11.5px;margin-bottom:14px}
@@ -136,7 +182,11 @@ window.__pre={
   svg{display:block;width:100%;height:auto;overflow:visible}
   .tp-label{fill:var(--dim);font-size:10px}.axislab{fill:var(--faint);font-size:9px}.ylab{fill:var(--faint);font-size:9px}
   .legend{display:flex;gap:9px;align-items:center;color:var(--faint);font-size:10.5px;margin:7px 0 0}
-  .swatch{width:50px;height:7px;background:linear-gradient(90deg,var(--calm),var(--warm),var(--ember))}
+  .legend .sw{width:22px;height:7px;border-radius:2px}
+  .archit{cursor:pointer}
+  .tpdot{cursor:pointer}
+  .tps li.tpjump{cursor:pointer}
+  .tps li.tpjump:hover .tpq{color:var(--ink)}
 
   .tx{margin-top:20px}
   .txhead{display:flex;justify-content:space-between;align-items:center;color:var(--faint);font-size:11px;border-bottom:1px solid var(--line);padding-bottom:7px;margin-bottom:4px}
@@ -162,7 +212,9 @@ window.__pre={
   .tps li b{color:#fff;background:var(--ember);width:17px;height:17px;border-radius:50%;
     display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;align-self:start}
   .tps .tpt{color:var(--faint);font-variant-numeric:tabular-nums;font-size:11px}
-  .tps .tpq{color:var(--dim);font-size:12px;line-height:1.45}
+  .tps .tpq{color:var(--dim);font-size:12px;line-height:1.45;display:flex;flex-direction:column;gap:1px;min-width:0}
+  .tps .tpm{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .tps li.pk b{background:transparent;color:var(--hot);border:1.5px solid var(--hot);font-size:11px}
 
   /* reveal the agent's reply for a turn */
   .rtog{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:11px;padding:5px 0 0;cursor:pointer;display:inline-block}
@@ -183,6 +235,151 @@ window.__pre={
   .bar i{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#9a5a00,var(--ember))}
   .row .v{text-align:right;color:var(--dim);font-size:12px}.row .v b{color:var(--ink);font-weight:700;font-size:14px}
   .tl text{font-variant-numeric:tabular-nums}
+  /* pulse v2: vitals strip + card grid over the event corpus */
+  .pane.mid{max-width:1150px}
+  .vitals{display:flex;gap:34px;flex-wrap:wrap;padding:8px 2px 4px}
+  .vitals .vi b{display:block;font-size:23px;color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums;line-height:1.15}
+  .vitals .vi span{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+  .pgrid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-top:16px}
+  .pcard{border:1px solid var(--line);background:var(--panel);padding:13px 16px 11px;min-width:0}
+  .pcard.wide{grid-column:1/-1}
+  .pcard h3{margin:0 0 10px;font-size:10.5px;color:var(--dim);font-weight:500;letter-spacing:.5px;text-transform:uppercase;display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+  .pcard h3 em{color:var(--faint);font-style:normal;text-transform:none;letter-spacing:0;font-size:10.5px}
+  .prow{display:grid;grid-template-columns:108px 1fr 96px;gap:10px;align-items:center;padding:2.5px 0;font-size:11.5px}
+  .prow .nm{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .prow .pb{height:10px;background:var(--panel2);border:1px solid var(--hair);position:relative;overflow:hidden}
+  .prow .pb i{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#9a5a00,var(--ember))}
+  .prow .v{text-align:right;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .prow .v b{color:var(--ink);font-weight:500}
+  .prow .pna{color:var(--ghost);font-size:10.5px}
+  .plead{display:grid;grid-template-columns:40px 1fr auto;gap:10px;align-items:baseline;padding:4px 0;border-top:1px solid var(--hair);cursor:pointer;font-size:11.5px}
+  .plead:first-of-type{border-top:0}
+  .plead:hover .pt1{color:#fff}
+  .plead .pj1{font-variant-numeric:tabular-nums;font-weight:700}
+  .plead .pt1{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .plead .pa1{color:var(--faint);font-size:10.5px}
+  @media (max-width:980px){.pgrid{grid-template-columns:1fr}}
+
+  /* ---- event tree (tool calls / subagents inside a turn) ---- */
+  .evtog{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:11px;padding:4px 0 0;cursor:pointer;display:inline-block}
+  .evtog:hover{color:var(--ink)}
+  .evtog::before{content:"▸ ";color:var(--ghost)}
+  .evtog[aria-expanded="true"]::before{content:"▾ "}
+  .evtog .bad{color:var(--ember)}
+  .evtree{margin:6px 0 2px;border-left:2px solid var(--hair);padding-left:10px;display:flex;flex-direction:column;gap:1px}
+  .ev{display:grid;grid-template-columns:16px 1fr auto;gap:8px;align-items:baseline;padding:2px 4px;cursor:pointer;font-size:11.5px}
+  .ev:hover{background:var(--panel2)}
+  .ev .ic{color:var(--faint)}
+  .ev.err .ic,.ev.err .nm{color:var(--ember)}
+  .ev.sub .ic{color:var(--warm)}
+  .ev .nm{color:var(--dim);white-space:nowrap}
+  .ev .in{color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ev .ok{color:var(--faint);font-size:10px}
+  .ev .ok.bad{color:var(--ember)}
+  .evgrp{color:var(--faint);font-size:11.5px;padding:2px 4px;cursor:pointer}
+  .evgrp:hover{color:var(--dim)}
+  .evgrp::before{content:"▸ ";color:var(--ghost)}
+  .evgrp[aria-expanded="true"]::before{content:"▾ "}
+  .evx{grid-column:1/-1;background:var(--panel2);border:1px solid var(--hair);padding:8px 10px;margin:3px 0 5px;font-size:11.5px;cursor:default}
+  .evx .lbl{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.4px;margin:6px 0 2px}
+  .evx .lbl:first-child{margin-top:0}
+  .evx pre{margin:0;white-space:pre-wrap;word-break:break-word;color:var(--dim);max-height:300px;overflow-y:auto;font-family:var(--mono);font-size:11px}
+  .evx .full{background:transparent;border:1px solid var(--line);color:var(--dim);font-size:10.5px;padding:2px 8px;margin-top:7px}
+  .evx .full:hover{color:var(--ink)}
+  .det .crumb .evn{color:var(--dim);border:1px solid var(--hair);padding:1px 7px}
+  .det .crumb .evn::before{content:"⚒ ";color:var(--faint)}
+
+  /* ---- live view ---- */
+  .ldot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--calm);margin-left:6px;vertical-align:1px;animation:lpulse 1.8s ease-in-out infinite}
+  @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .lv{display:grid;grid-template-columns:300px 1fr;gap:0;border:1px solid var(--line);min-height:60vh}
+  .lvs{border-right:1px solid var(--line);background:var(--rail);overflow-y:auto;max-height:78vh}
+  .lvcard{padding:10px 12px;border-bottom:1px solid var(--hair);cursor:pointer}
+  .lvcard:hover{background:var(--panel2)}
+  .lvcard.sel{background:var(--panel);box-shadow:inset 2px 0 0 var(--ember)}
+  .lvcard.idle{opacity:.5}
+  /* past-sessions archive: an auto-closed fold beneath the active cards */
+  .lvarch{border-top:1px solid var(--line)}
+  .lvarchh{display:flex;align-items:center;gap:7px;padding:8px 12px;cursor:pointer;
+    color:var(--faint);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;user-select:none}
+  .lvarchh:hover{color:var(--dim)}
+  .lvarchh .cv{font-size:9px;width:9px}
+  .lvarchh .n{color:var(--ghost);font-variant-numeric:tabular-nums;text-transform:none;letter-spacing:0}
+  .lvarchl .lvcard{opacity:.62}
+  .lvarchl .lvcard:hover{opacity:1}
+  .lvcard .l1{display:flex;gap:8px;align-items:baseline}
+  .lvcard .ag{color:var(--ember);font-size:11px}
+  .lvcard .pj{color:var(--ink);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lvcard .when{margin-left:auto;font-size:10.5px}
+  .lvcard .st{color:var(--dim);font-size:11px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lvcard .st .mdl{color:var(--warm);font-size:10px;margin-left:8px;opacity:.85}
+  .lvcard .ti{color:var(--faint);font-size:10.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .resume{margin-top:7px;background:transparent;border:1px solid var(--line);color:var(--dim);font-size:10.5px;padding:2px 9px}
+  .resume:hover{color:var(--ink);border-color:var(--ember)}
+  .resume:disabled{opacity:.7;cursor:default}
+  .det .crumb .resumebtn{background:transparent;border:1px solid var(--line);color:var(--dim);font-size:11px;padding:1px 9px}
+  .det .crumb .resumebtn:hover{color:var(--ink);border-color:var(--ember)}
+  .det .crumb .resumebtn::before{content:"⏵ ";color:var(--ember)}
+  /* feed sizes are em so the size slider scales everything: #lvf carries the base px */
+  .lvf{overflow-y:auto;max-height:78vh;padding:6px 0;font-size:12px}
+  .lrow{display:grid;grid-template-columns:4.4em 1.4em 1fr;gap:.7em;padding:.28em 14px;font-size:.96em;align-items:baseline}
+  .lrow:hover{background:var(--panel2)}
+  .lrow .lt{color:var(--ghost);font-size:.85em;font-variant-numeric:tabular-nums;text-align:right}
+  .lrow .ic{color:var(--faint)}
+  .lrow.err .ic{color:var(--ember)}
+  .lrow .bd{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lrow .bd b{color:var(--ink);font-weight:500}
+  .lrow .bd .src{color:var(--faint)}
+  .lrow.user .bd{color:var(--calm);white-space:normal}
+  .lrow.reply .bd{color:var(--dim);white-space:normal}
+  .lrow.open .bd{white-space:normal;word-break:break-word}
+  .lrow.sub,.lz.sub{opacity:.62}
+  .lvhead{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--hair);color:var(--faint);font-size:11px;position:sticky;top:0;background:var(--panel);z-index:2}
+  .lvhead .opentx{background:transparent;border:1px solid var(--line);color:var(--dim);font-size:11px;padding:2px 9px}
+  .lvhead .opentx:hover{color:var(--ink)}
+  .lvhead input[type=range]{width:86px;accent-color:var(--ember)}
+  .lvempty{padding:50px 20px;text-align:center;color:var(--faint)}
+  /* cozy feed density: events that breathe */
+  .lz{padding:.9em 16px 1em;border-bottom:1px solid var(--hair)}
+  .lz.err{box-shadow:inset 2.5px 0 0 var(--ember)}
+  .lz .lz1{display:flex;justify-content:space-between;gap:10px;margin-bottom:.25em}
+  .lz .zsrc{color:var(--faint);font-size:.88em}
+  .lz .lt{color:var(--ghost);font-size:.85em;font-variant-numeric:tabular-nums}
+  .lz .lzn{color:var(--dim);font-size:.96em}
+  .lz .lzn b{color:var(--ink);font-weight:500}
+  .lz .zok{color:var(--calm)} .lz .zbad{color:var(--ember);font-weight:700} .lz .zrun{color:var(--warm)}
+  .lz .lzi{color:var(--dim);font-size:.96em;margin-top:.2em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lz .lzo{color:var(--faint);font-size:.92em;margin-top:.2em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lz.open .lzi,.lz.open .lzo{white-space:pre-wrap;word-break:break-word}
+  .lz .lzu{color:var(--calm);font-size:1em}
+  .lz .lzr{color:var(--dim);font-size:.96em}
+  .lz{cursor:pointer}
+  /* images the agent touched, rendered inline (served full-res from disk); batches wrap side-by-side */
+  .lvimgs{display:flex;flex-wrap:wrap;gap:8px;margin:.4em 0 .25em;white-space:normal}
+  .lvimg{display:block;text-decoration:none;max-width:100%}
+  .lvimg img{display:block;max-width:100%;max-height:220px;border:1px solid var(--hair);border-radius:5px}
+  .lvimg:hover img{border-color:var(--ember)}
+  .lvimgn{display:block;color:var(--faint);font-size:10px;font-family:var(--mono);margin-top:2px;
+    max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lvimgcap{color:var(--dim);font-size:.92em;margin:.1em 0 .35em;white-space:normal;line-height:1.4}
+  /* instrument layer: elapsed tickers, durations, turn blocks, backlog pill */
+  .elap{color:var(--warm);font-variant-numeric:tabular-nums;font-size:.9em;white-space:nowrap}
+  .dur{color:var(--faint);font-variant-numeric:tabular-nums;font-size:.9em}
+  .lvcard .st .elap{margin-left:6px}
+  .lvcard .errb{color:var(--ember);font-size:10px;margin-left:8px;font-weight:700}
+  .lvcard .inp{color:var(--faint);font-size:10.5px;margin-top:2px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lvcard .qd{color:var(--warm);font-size:10.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lvturn{border-left:2px solid var(--hair);margin:.8em 10px 1.1em;padding:2px 0}
+  .lvturn.live{border-left-color:var(--warm)}
+  .lvturn .tuser{color:var(--calm);padding:.3em 14px .4em;white-space:pre-wrap;word-break:break-word}
+  .lvturn .tuser.ghost{color:var(--faint);font-size:.85em;text-transform:uppercase;letter-spacing:.4px}
+  .lvturn .tfoot{color:var(--faint);font-size:.85em;padding:.35em 14px 0;font-variant-numeric:tabular-nums}
+  .lv{position:relative}
+  .newpill{position:absolute;right:22px;bottom:14px;z-index:3;background:var(--panel2);border:1px solid var(--warm);color:var(--warm);padding:3px 11px;font-size:11px;cursor:pointer}
+  .newpill:hover{color:var(--ink)}
+  .lvhead .ntf{background:transparent;border:1px solid var(--line);color:var(--faint);font-size:10.5px;padding:2px 8px}
+  .lvhead .ntf.on{color:var(--warm);border-color:var(--warm)}
+  .lvhead .recon{color:var(--ember);font-size:10.5px;animation:lpulse 1.2s ease-in-out infinite}
 
   /* ============================ themes ============================ */
   .themebtn{background:transparent;border:1px solid var(--line);color:var(--dim);padding:7px 11px;font-size:12px}
@@ -350,16 +547,15 @@ window.__pre={
 <div class="top">
   <div class="topin">
     <div class="word" id="word"><span class="wl">t</span><span class="wl">i</span><span class="wl">l</span><span class="wl">t</span><b>.</b></div>
-    <div class="askbar">
-      <input id="q" data-cp="askPh" placeholder="ask across every chat:  which project did i rage in, what was the DRM work about…">
-      <button id="send" data-c="askBtn">ask</button>
-    </div>
     <div class="views">
       <button id="vExplore" class="on" data-c="vExplore">explore</button>
+      <button id="vLive">live</button>
       <button id="vPulse" data-c="vPulse">pulse</button>
     </div>
-    <button id="theme" class="themebtn" title="cycle theme">◐ forensic</button>
+    <div style="flex:1"></div>
     <div class="stat" id="stat"></div>
+    <span class="statuschip" id="statuschip" style="display:none"></span>
+    <button id="theme" class="themebtn" title="cycle theme">◐ forensic</button>
   </div>
 </div>
 
@@ -374,14 +570,18 @@ window.__pre={
       <div class="ctrls">
         <label data-c="groupLab">group</label>
         <div class="seg" id="groupSeg">
-          <button data-g="concept" class="on" data-c="gConcept">concept</button>
+          <button data-g="date" data-c="gDate">date</button>
+          <button data-g="concept" data-c="gConcept">concept</button>
           <button data-g="agent" data-c="gAgent">agent</button>
           <button data-g="project" data-c="gProject">project</button>
           <button data-g="none" data-c="gNone">flat</button>
         </div>
-        <div class="seg" id="sortSeg" style="margin-left:auto">
-          <button data-s="size" class="on" data-c="sSize">size</button>
+      </div>
+      <div class="ctrls">
+        <label data-c="sortLab">sort</label>
+        <div class="seg" id="sortSeg">
           <button data-s="recent" data-c="sRecent">recent</button>
+          <button data-s="size" data-c="sSize">size</button>
           <button data-s="heat" data-c="sHeat">heat</button>
         </div>
       </div>
@@ -389,6 +589,7 @@ window.__pre={
     <div class="chips" id="chips"></div>
     <div class="list" id="list"></div>
   </aside>
+  <div class="gutter" id="gutter" title="drag"></div>
 
   <main class="main" id="main">
     <div class="pane" id="pane">
@@ -405,6 +606,32 @@ const fmt=n=>Number(n).toLocaleString();
 const J=async u=>{const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json();};
 // tidy a raw model id for display (drop trailing date stamps; leave the rest legible)
 const prettyModel=m=>String(m||"").replace(/[-_](\d{6,8})$/,"").trim();
+
+// compact relative/absolute timestamp: "now" / "3h" / "2d" / "may 28" / "jan 3 '25"
+const MON=["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+function ago(ts){
+  if(!ts)return"";
+  const d=new Date(ts),now=Date.now(),s=(now-ts)/1000;
+  if(s<90)return"now";
+  if(s<3600)return Math.round(s/60)+"m";
+  if(s<86400)return Math.round(s/3600)+"h";
+  if(s<86400*7)return Math.round(s/86400)+"d";
+  const lab=MON[d.getMonth()]+" "+d.getDate();
+  return d.getFullYear()===new Date(now).getFullYear()?lab:lab+" '"+String(d.getFullYear()).slice(2);
+}
+// date bucket for group-by-date (ordered; renderers respect this order, not counts)
+const DBUCKETS=["dToday","dYest","dWeek","dMonth","dOlder"];
+function dateBucket(ts){
+  if(!ts)return"dOlder";
+  const d=new Date(ts),n=new Date();
+  const day=x=>Math.floor((x-new Date(x).getTimezoneOffset()*60000)/86400000);
+  const dd=day(n.getTime())-day(ts);
+  if(dd<=0)return"dToday";
+  if(dd===1)return"dYest";
+  if(dd<7)return"dWeek";
+  if(dd<31)return"dMonth";
+  return"dOlder";
+}
 
 // active search terms + a separator-flexible regex (set by runSearch, cleared on exit). The
 // regex lets a multi-word term match across space/hyphen/underscore, matching the backend
@@ -425,9 +652,10 @@ function hl(text,_terms){
 const matchesHi=s=>{if(!HILITE_RE)return false;HILITE_RE.lastIndex=0;return HILITE_RE.test(s||"");};
 
 // a home/desktop cwd carries no project signal (the agent just mkdir'd & cd'd, or never did),
-// so show the concept thread instead of yet another "Users/Danny". A dir is "generic" when
-// every one of its path segments is a home/container name.
-const GENERICSEG=new Set(["users","user","danny","desktop","documents","downloads","home","tmp","temp","appdata","onedrive","",".","·"]);
+// so show the concept thread instead of yet another "Users/<name>". A dir is "generic" when
+// every one of its path segments is a home/container name. The username segment arrives
+// with /stats (the server knows whose home this is); it's merged in at boot.
+const GENERICSEG=new Set(["users","user","desktop","documents","downloads","home","tmp","temp","appdata","onedrive","",".","·"]);
 function isGenericDir(p){
   const segs=String(p||"").toLowerCase().split(/[\/\\]/).filter(Boolean);
   return segs.length===0||segs.every(s=>GENERICSEG.has(s));
@@ -454,26 +682,37 @@ function heatColor(v){ // v ~ 0..0.6
 }
 function mix(a,b,k){return `rgb(${a.map((x,i)=>Math.round(x+(b[i]-x)*k)).join(',')})`;}
 
-let CHATS=[],CONCEPTS=[],STATE={group:"concept",sort:"size",filter:"",chip:null,sel:null,view:"explore"};
+const PREF=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+let CHATS=[],CONCEPTS=[],STATE={
+  group:PREF("tiltGroup")||"date",sort:PREF("tiltSort")||"recent",
+  filter:"",chip:null,sel:null,view:"explore"};
+function syncSegs(){
+  $("groupSeg").querySelectorAll("button").forEach(b=>b.classList.toggle("on",b.dataset.g===STATE.group));
+  $("sortSeg").querySelectorAll("button").forEach(b=>b.classList.toggle("on",b.dataset.s===STATE.sort));
+}
 let SEARCH={active:false,q:"",results:null,busy:false}; // semantic results override the grouped list
 const bySession={}; // session -> chat row, for enriching search hits
 
 // ============================ rail / organizer ============================
 function matches(c,f){
   if(!f)return true;
-  const hay=(c.summary+" "+c.tags.join(" ")+" "+c.project+" "+c.agent+" "+c.concept).toLowerCase();
+  const hay=((c.title||"")+" "+c.summary+" "+c.tags.join(" ")+" "+c.project+" "+c.agent+" "+c.concept).toLowerCase();
   return f.split(/\s+/).every(w=>hay.includes(w));
 }
 function chatTitle(c){
-  // first sentence of summary, trimmed; fall back to tags
+  if(c.title)return c.title;                 // the generated scannable title, when built
+  // fallback: first sentence of summary, trimmed; then tags
   let s=(c.summary||"").trim();
   if(s){const m=s.match(/^(.{0,110}?[.!?])(\s|$)/);return m?m[1]:s.slice(0,110)+(s.length>110?"…":"");}
-  return c.tags.length?c.tags.join(", "):"(untitled chat)";
+  return (c.tags||[]).length?c.tags.join(", "):"(untitled chat)";
 }
 function groupKey(c){
   if(STATE.group==="agent")return c.agent||"?";
-  if(STATE.group==="project")return c.project||"?";
+  // home-dir cwds ("Users/<you>", "<you>/Desktop") are one no-project bucket, not
+  // two confusing pseudo-projects
+  if(STATE.group==="project"){const p=c.project||"?";return isGenericDir(p)?"~":p;}
   if(STATE.group==="concept")return c.concept||"(unclustered)";
+  if(STATE.group==="date")return dateBucket(c.last_ts);
   return "all chats";
 }
 function renderChips(){
@@ -482,9 +721,11 @@ function renderChips(){
   el.style.display="flex";
   const counts={};
   CHATS.filter(c=>matches(c,STATE.filter)).forEach(c=>{const k=groupKey(c);counts[k]=(counts[k]||0)+1;});
-  const keys=Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
+  const keys=STATE.group==="date"
+    ?DBUCKETS.filter(k=>counts[k])
+    :Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
   el.innerHTML=keys.map(k=>{
-    const lab=STATE.group==="concept"?shortConcept(k):k;
+    const lab=STATE.group==="concept"?shortConcept(k):STATE.group==="date"?C(k):k;
     return `<button class="chip${STATE.chip===k?' on':''}" data-k="${esc(k)}">${esc(lab)}<small>${counts[k]}</small></button>`;
   }).join("");
   el.querySelectorAll(".chip").forEach(b=>b.onclick=()=>{STATE.chip=STATE.chip===b.dataset.k?null:b.dataset.k;renderRail();});
@@ -492,15 +733,16 @@ function renderChips(){
 function shortConcept(k){return k.split(",").slice(0,3).map(s=>s.trim()).join(" · ");}
 
 // ---- search: "quoted" => exact keyword over real message+reply text; else semantic ----
-async function runSearch(q){
-  q=q.trim();if(!q){exitSearch();return;}
+async function runSearch(q,fromHash){
+  q=q.trim();if(!q){exitSearch(fromHash);return;}
   const quoted=q.length>=2&&q[0]=='"'&&q.endsWith('"');
   const term=quoted?q.slice(1,-1).trim():q;
-  if(!term){exitSearch();return;}
+  if(!term){exitSearch(fromHash);return;}
   HILITE=quoted?[term]:term.toLowerCase().split(/\s+/).filter(w=>w.length>2);
   HILITE_RE=buildHiRe(HILITE);
   SEARCH={active:true,q:term,results:null,busy:true,mode:quoted?"keyword":"semantic"};
   $("findicon").textContent=quoted?"⌕":"≈";
+  if(!fromHash)writeHash();
   renderSearchList();
   try{
     const o=await J("/search?k=40&q="+encodeURIComponent(q)); // raw q (server detects quotes)
@@ -509,7 +751,7 @@ async function runSearch(q){
   }catch(e){SEARCH.results=[];SEARCH.busy=false;SEARCH.err=e.message;}
   renderSearchList();
 }
-function exitSearch(){SEARCH={active:false,q:"",results:null,busy:false};HILITE=[];HILITE_RE=null;$("findicon").textContent="/";renderRail();}
+function exitSearch(fromHash){SEARCH={active:false,q:"",results:null,busy:false};HILITE=[];HILITE_RE=null;$("findicon").textContent="/";if(!fromHash)writeHash();renderRail();}
 function renderSearchList(){
   $("chips").style.display="none";
   const list=$("list");
@@ -526,31 +768,69 @@ function renderSearchList(){
     let lastSes=null;
     r.forEach(h=>{
       if(h.session!==lastSes){lastSes=h.session;
-        html+=`<div class="grp ksub"><span>${esc(h.agent)} · ${esc(dirOf(h))}</span></div>`;}
+        const row=bySession[h.session];
+        const head=row?chatTitle(row):`${h.agent} · ${dirOf(h)}`;
+        html+=`<div class="grp ksub"><span>${esc(head)}</span><b class="when">${esc(h.agent)}</b></div>`;}
+      const when=ago(h.ts);
       html+=`<div class="ci hit" data-s="${esc(h.session)}">
         <div class="ttl snip"><span class="who ${h.who==='you'?'you':''}">${h.who}</span>${hl(h.snippet,HILITE)}</div>
-        <div class="mt"><span class="pj">turn ${h.turn}</span></div></div>`;
+        <div class="mt"><span class="pj">turn ${h.turn}</span>${when?`<span class="when">${when}</span>`:""}</div></div>`;
     });
     if(tot>r.length)html+=`<div class="empty" style="padding:9px">showing first ${r.length} of ${tot}</div>`;
     list.innerHTML=html;
     list.querySelectorAll(".ci[data-s]").forEach(el=>el.onclick=()=>openChat(el.dataset.s));
     wireSearchBack();return;
   }
-  // semantic: hits carry agent/project/summary; match back to a known row when possible
+  // semantic: hits now carry their session id (and title) directly; fall back to the
+  // summary-head match only for results from an older index.
   list.innerHTML=head+r.map((c,i)=>{
-    const row=findRow(c);const ses=row?row.session:null;
-    const ttl=chatTitle({summary:c.summary,tags:c.tags||[]});
+    const ses=c.session||(findRow(c)||{}).session||null;
+    const row=ses?bySession[ses]:null;
+    const ttl=chatTitle({title:c.title,summary:c.summary,tags:c.tags||[]});
     const heat=row&&row.has_vibe?`<span style="color:${heatColor((row.juice||0)/12)}">vibe ${row.juice.toFixed(1)}</span> · `:"";
+    const when=row?ago(row.last_ts):"";
     return `<div class="ci${ses?'':' nohit'}" data-s="${esc(ses||'')}" ${ses?'':'style="cursor:default;opacity:.78"'}>
       <div class="ttl">${hl(ttl,HILITE)}</div>
       <div class="mt"><span class="dot" style="background:#2a2f37"></span>
         <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(dirOf(c))}</span>
-        <span class="heat">${heat}${c.n_msgs?fmt(c.n_msgs)+'t':''}</span></div></div>`;
+        <span class="heat">${heat}${c.n_msgs?fmt(c.n_msgs)+'t':''}${when?` · <span class="when">${when}</span>`:""}</span></div></div>`;
   }).join("");
   list.querySelectorAll(".ci[data-s]:not(.nohit)").forEach(el=>{if(el.dataset.s)el.onclick=()=>openChat(el.dataset.s);});
   wireSearchBack();
 }
-function wireSearchBack(){const b=$("searchback");if(b)b.onclick=exitSearch;}
+function wireSearchBack(){const b=$("searchback");if(b)b.onclick=()=>exitSearch();}
+
+// ---- url state: #chat=<id> &/or #q=<query>, or #view=pulse ----
+// written on commit-level actions (open chat, Enter-search, view switch), so refresh
+// restores the screen and back/forward walk through chats. Live keystrokes don't spam it.
+let HASHME="";
+function writeHash(){
+  const parts=[];
+  if(STATE.view==="pulse")parts.push("view=pulse");
+  else if(STATE.view==="live")parts.push("view=live");
+  else{
+    if(SEARCH.active&&SEARCH.q)parts.push("q="+encodeURIComponent(SEARCH.mode==="keyword"?'"'+SEARCH.q+'"':SEARCH.q));
+    if(STATE.sel)parts.push("chat="+encodeURIComponent(STATE.sel));
+  }
+  const h=parts.length?"#"+parts.join("&"):"";
+  if(location.hash===h)return;
+  HASHME=h;
+  if(h)location.hash=h;
+  else history.pushState(null,"",location.pathname+location.search);
+}
+function applyHash(){
+  const p=new URLSearchParams(location.hash.replace(/^#/,""));
+  if(p.get("view")==="pulse"){setView("pulse",true);return;}
+  if(p.get("view")==="live"){setView("live",true);return;}
+  if(STATE.view!=="explore")showExplore();
+  const q=p.get("q")||"";
+  if(q){$("find").value=q;$("findx").style.display="";runSearch(q,true);}
+  else if(SEARCH.active){$("find").value="";$("findx").style.display="none";exitSearch(true);}
+  const c=p.get("chat");
+  if(c)openChat(c,true);
+  else if(!q){STATE.sel=null;$("view").innerHTML="";showPlaceholder();renderRail();}
+}
+window.addEventListener("hashchange",()=>{if(location.hash!==HASHME){applyHash();}HASHME=location.hash;});
 function findRow(c){ // match a search result to a chat row (same agent+project+summary head)
   if(c.session&&bySession[c.session])return bySession[c.session];
   const head=(c.summary||"").slice(0,60);
@@ -559,6 +839,12 @@ function findRow(c){ // match a search result to a chat row (same agent+project+
 
 function renderRail(){
   if(SEARCH.active){renderSearchList();return;}
+  // fresh install: nothing indexed at all is a different situation than a filter
+  // matching nothing — say what to run, not "loosen the filter"
+  if(!CHATS.length){
+    $("list").innerHTML=`<div class="empty">${C('emptyZero')}</div>`;
+    return;
+  }
   renderChips();
   let rows=CHATS.filter(c=>matches(c,STATE.filter));
   if(STATE.chip!=null)rows=rows.filter(c=>groupKey(c)===STATE.chip);
@@ -572,10 +858,12 @@ function renderRail(){
     html=rows.sort(sortFn).map(ciHTML).join("");
   }else{
     const groups={};rows.forEach(c=>{(groups[groupKey(c)]=groups[groupKey(c)]||[]).push(c);});
-    const keys=Object.keys(groups).sort((a,b)=>groups[b].length-groups[a].length);
+    const keys=STATE.group==="date"
+      ?DBUCKETS.filter(k=>groups[k])
+      :Object.keys(groups).sort((a,b)=>groups[b].length-groups[a].length);
     for(const k of keys){
       const g=groups[k].sort(sortFn);
-      const lab=STATE.group==="concept"?shortConcept(k):k;
+      const lab=STATE.group==="concept"?shortConcept(k):STATE.group==="date"?C(k):k;
       html+=`<div class="grp"><span>${esc(lab)}</span><b>${g.length}</b></div>`+g.map(ciHTML).join("");
     }
   }
@@ -587,12 +875,15 @@ function cssEsc(s){return String(s).replace(/["\\]/g,'\\$&');}
 function ciHTML(c){
   const heat=c.juice?c.juice.toFixed(1):"";
   const col=c.has_vibe?heatColor((c.juice||0)/12):"#2a2f37";
-  return `<div class="ci${STATE.sel===c.session?' sel':''}" data-s="${esc(c.session)}">
+  const when=ago(c.last_ts);
+  const liveNow=c.live_ts&&Date.now()-c.live_ts<90000;
+  return `<div class="ci${STATE.sel===c.session?' sel':''}${c.thin?' thin':''}" data-s="${esc(c.session)}">
     <div class="ttl">${esc(chatTitle(c))}</div>
     <div class="mt">
       <span class="dot" style="background:${col}"></span>
       <span class="ag">${esc(c.agent)}</span><span class="pj">${esc(dirOf(c))}</span>
-      <span class="heat">${c.has_vibe?`<span style="color:${heatColor((c.juice||0)/12)}">vibe ${heat}</span> · `:""}${fmt(c.n_msgs)}t</span>
+      <span class="heat">${c.has_vibe?`<span style="color:${heatColor((c.juice||0)/12)}">vibe ${heat}</span> · `:""}${fmt(c.n_msgs)}t${when?` · <span class="when">${when}</span>`:""}</span>
+      ${liveNow?`<span class="ldot" title="${C('vLive')}"></span>`:""}
     </div></div>`;
 }
 
@@ -612,9 +903,16 @@ function fetchChat(session){
   if(CHATCACHE.size>40)CHATCACHE.delete(CHATCACHE.keys().next().value); // bound memory
   return p;
 }
-async function openChat(session){
+async function openChat(session,fromHash){
+  const lo=bySession[session];
+  if(lo&&lo.live_only){ // not indexed yet: the live view IS its transcript
+    LIVE.sel=lo.agent+":"+session;
+    setView("live");
+    return;
+  }
   STATE.sel=session;
   if(STATE.view!=="pulse")showExplore();           // ensure explore chrome is on (no setView recursion)
+  if(!fromHash)writeHash();
   $("list").querySelectorAll(".ci").forEach(el=>el.classList.toggle("sel",el.dataset.s===session));
   const cached=CHATCACHE.has(session);
   const v=$("view");
@@ -629,18 +927,25 @@ async function openChat(session){
 }
 function detailHTML(d){
   const arc=d.vibe?arcBlock(d.vibe):"";
+  const span=d.first_ts&&d.last_ts&&(ago(d.first_ts)!==ago(d.last_ts))
+    ?`${ago(d.first_ts)} → ${ago(d.last_ts)}`:ago(d.last_ts);
+  const mdls=(d.models&&d.models.length?d.models:(d.model?[{name:d.model}]:[]))
+    .map(m=>`<span class="mdl" ${m.n?`title="${m.n} ${C('turnsWord')}"`:""}>${esc(prettyModel(m.name))}</span>`).join("");
+  const pj=dirOf(d); // never a bare home dir; falls back to the concept thread
   const crumb=`<div class="crumb">
     <span class="ag">${esc(d.agent)}</span>
-    ${d.model?`<span class="mdl">${esc(prettyModel(d.model))}</span>`:""}
-    <span class="pj">${esc(d.project||"·")}</span>
-    ${d.concept?`<span class="cc">${esc(shortConcept(d.concept))}</span>`:""}
+    ${mdls}
+    <span class="pj">${esc(pj||"·")}</span>
+    ${d.concept&&shortConcept(d.concept)!==pj?`<span class="cc">${esc(shortConcept(d.concept))}</span>`:""}
     <span>${fmt(d.n_msgs)} ${C('turnsWord')}</span>
+    ${span?`<span class="when">${span}</span>`:""}
     <span style="color:${heatColor(d.hot_pct/100*0.45)}">${d.hot_pct}% ${C('hotWord')}</span>
+    <button class="resumebtn" data-ag="${esc(d.agent)}" data-se="${esc(d.session)}">${C('detResume')}</button>
   </div>`;
   const tags=d.tags.length?`<div class="tags">${d.tags.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>`:"";
   const sum=d.summary?`<div class="sum">${esc(d.summary)}</div>`:"";
   return `<div class="det">
-    <h2>${esc(chatTitle({summary:d.summary,tags:d.tags}))}</h2>
+    <h2>${esc(chatTitle(d))}</h2>
     ${crumb}${sum}${tags}${arc}
     <div class="tx" id="tx"></div>
   </div>`;
@@ -652,122 +957,256 @@ function arcBlock(t){
       <div class="ameta">${t.n_turns} ${C('turnsWord')} · ${C('peakWord')} @ ${t.peak_turn}</div>
     </div>
     ${arcSVG(t)}
-    <div class="legend"><span class="swatch"></span><span>${C('arcLegend')}</span></div>
+    <div class="legend">
+      <span class="sw" style="background:var(--ember)"></span><span>${C('arcRage')}</span>
+      <span class="sw" style="background:var(--calm)"></span><span>${C('arcHype')}</span>
+      <span style="margin-left:auto;color:var(--ghost)">${C('arcClick')}</span>
+    </div>
     ${tpList(t)}
   </div>`;
 }
-// turning points as a clean numbered list under the chart — the dots on the line are
-// numbered, and each number maps to its turn + the line that moved the mood.
+// the moments under the chart: every turning point + the peak, each shown as the actual
+// message — the quote IS the label. Clicking a row (or its dot on the chart) jumps to
+// that turn in the transcript.
 function tpList(t){
   const tps=t.turning_points||[];
-  if(!tps.length)return"";
-  const items=tps.map((tp,j)=>{
-    const lab=(t.tp_labels&&t.tp_labels[tp])||"";
-    return `<li><b>${j+1}</b><span class="tpt">${C('tpTurn')} ${tp}</span>${lab?`<span class="tpq">${esc(lab)}</span>`:`<span class="tpq" style="color:var(--faint)">${C('tpShift')}</span>`}</li>`;
+  const snips=t.snippets||[];
+  const rows=tps.map((tp,j)=>({turn:tp,mark:String(j+1)}));
+  // the peak is the headline moment; give it a row unless it's already a turning point
+  if(Number.isInteger(t.peak_turn)&&!tps.includes(t.peak_turn))
+    rows.push({turn:t.peak_turn,mark:"◉",peak:true});
+  rows.sort((a,b)=>a.turn-b.turn);
+  if(!rows.length)return"";
+  const items=rows.map(r=>{
+    const q=snips[r.turn]||"";
+    return `<li class="tpjump${r.peak?' pk':''}" data-turn="${r.turn}">
+      <b>${r.mark}</b><span class="tpt">${C('tpTurn')} ${r.turn}</span>
+      <span class="tpq">${q?`<span class="tpm">&ldquo;${esc(q)}&rdquo;</span>`:""}</span>
+    </li>`;
   }).join("");
   return `<ol class="tps">${items}</ol>`;
 }
-// reused arc renderer (from the original app) — hand-rolled SVG valence arc
+// the mood chart: two intensity series rising from the floor — frustration (ember) and
+// hype (calm). No inverted axis, no abstract "valence": red mountain = mad, teal
+// mountain = stoked. Every turn is hoverable (message snippet) and clickable (jumps to
+// that turn in the transcript below).
 function arcSVG(t){
-  const W=820,H=180,pad=30,bot=H-28,vals=t.valence,n=vals.length;
-  const vmin=Math.min(-0.15,...vals),vmax=Math.max(0.15,...vals);
-  const X=i=>pad+i*(W-2*pad)/Math.max(1,n-1),Y=v=>pad+(vmax-v)/((vmax-vmin)||1)*(bot-pad);
-  let line="";vals.forEach((v,i)=>line+=(i?"L":"M")+X(i).toFixed(1)+","+Y(v).toFixed(1)+" ");
-  const area=line+`L${X(n-1).toFixed(1)},${bot} L${X(0).toFixed(1)},${bot} Z`,z=Y(0).toFixed(1);
-  const tps=(t.turning_points||[]).map((tp,j)=>{const x=X(tp).toFixed(1),y=Y(vals[tp]).toFixed(1);
-    return `<line x1="${x}" y1="${pad-6}" x2="${x}" y2="${bot}" stroke="#ff4a2e26" stroke-dasharray="2 3"/>`
-      +`<circle cx="${x}" cy="${y}" r="7" fill="#ff7a52"/>`
-      +`<text class="tp-num" x="${x}" y="${y}" text-anchor="middle" dy="3.3">${j+1}</text>`;}).join("");
-  const pk=t.peak_turn,peak=`<circle cx="${X(pk).toFixed(1)}" cy="${Y(vals[pk]).toFixed(1)}" r="4.5" fill="none" stroke="var(--hot)" stroke-width="1.5"/>`;
-  const g="g"+Math.abs([...t.session].reduce((h,c)=>(h*31+c.charCodeAt(0))|0,0))%99999;
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><linearGradient id="${g}" x1="0" x2="0" y1="0" y2="1">
-    <stop offset="0" stop-color="#3ad6c4" stop-opacity=".26"/><stop offset=".52" stop-color="#ffb000" stop-opacity=".12"/><stop offset="1" stop-color="#ff4a2e" stop-opacity=".32"/></linearGradient></defs>
-    <text class="ylab" x="2" y="${pad+2}">${esc(C('calmWord'))}</text><text class="ylab" x="2" y="${bot}">${esc(C('hotWordY'))}</text>
-    <line x1="${pad}" y1="${z}" x2="${W-pad}" y2="${z}" stroke="var(--hair)" stroke-dasharray="3 4"/>
-    <path d="${area}" fill="url(#${g})"/><path d="${line}" fill="none" stroke="var(--ink)" stroke-width="1.6"/>${tps}${peak}
-    <text class="axislab" x="${pad}" y="${H-3}">turn 0</text><text class="axislab" x="${W-pad}" y="${H-3}" text-anchor="end">turn ${n-1}</text></svg>`;
+  const W=820,H=190,pad=30,bot=H-28,topy=22,n=(t.rage||[]).length;
+  if(!n)return"";
+  const rage=t.rage, hype=t.valence.map((v,i)=>Math.max(0,v+rage[i]));
+  const ymax=Math.max(0.6,...rage,...hype);
+  const X=i=>pad+i*(W-2*pad)/Math.max(1,n-1), Y=v=>bot-(Math.max(0,v)/ymax)*(bot-topy);
+  const path=(arr)=>{let d="";arr.forEach((v,i)=>d+=(i?"L":"M")+X(i).toFixed(1)+","+Y(v).toFixed(1)+" ");return d;};
+  const area=(arr)=>path(arr)+`L${X(n-1).toFixed(1)},${bot} L${X(0).toFixed(1)},${bot} Z`;
+  const snips=t.snippets||[];
+  // invisible per-turn hit strips: hover = snippet tooltip, click = jump to the turn
+  const step=(W-2*pad)/Math.max(1,n-1);
+  const hits=Array.from({length:n},(_,i)=>{
+    const tip=`${C('tpTurn')} ${i}${snips[i]?` — ${snips[i]}`:""}`;
+    return `<rect class="archit" data-turn="${i}" x="${(X(i)-step/2).toFixed(1)}" y="0" width="${step.toFixed(2)}" height="${H}" fill="transparent"><title>${esc(tip)}</title></rect>`;
+  }).join("");
+  const tps=(t.turning_points||[]).map((tp,j)=>{
+    if(tp>=n)return"";
+    const x=X(tp).toFixed(1),y=Y(Math.max(rage[tp],hype[tp])).toFixed(1);
+    return `<line x1="${x}" y1="${topy-6}" x2="${x}" y2="${bot}" stroke="var(--ghost)" stroke-dasharray="2 3" opacity=".55"/>`
+      +`<circle class="tpdot" data-turn="${tp}" cx="${x}" cy="${y}" r="7.5" fill="var(--ember)"/>`
+      +`<text class="tp-num" x="${x}" y="${y}" text-anchor="middle" dy="3.3" pointer-events="none">${j+1}</text>`;}).join("");
+  const pk=t.peak_turn<n?t.peak_turn:0;
+  const peak=`<circle cx="${X(pk).toFixed(1)}" cy="${Y(rage[pk]).toFixed(1)}" r="4.5" fill="none" stroke="var(--hot)" stroke-width="1.6"/>`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line x1="${pad}" y1="${bot}" x2="${W-pad}" y2="${bot}" stroke="var(--hair)"/>
+    <path d="${area(rage)}" fill="var(--ember)" opacity=".16"/>
+    <path d="${area(hype)}" fill="var(--calm)" opacity=".16"/>
+    <path d="${path(rage)}" fill="none" stroke="var(--ember)" stroke-width="1.6" opacity=".9"/>
+    <path d="${path(hype)}" fill="none" stroke="var(--calm)" stroke-width="1.6"/>
+    ${tps}${peak}${hits}
+    <text class="axislab" x="${pad}" y="${H-3}">${C('tpTurn')} 0</text>
+    <text class="axislab" x="${W-pad}" y="${H-3}" text-anchor="end">${C('tpTurn')} ${n-1}</text></svg>`;
+}
+// jump from the chart / turning-point list into the transcript at a given turn
+function jumpToTurn(turn){
+  turn=+turn;
+  if(TXSTATE.onlyHot)TXSTATE.onlyHot=false;
+  TXSTATE.shown=Math.max(TXSTATE.shown,turn+8);
+  renderTx();
+  const el=$("tx")&&$("tx").querySelector(`.turn[data-i="${turn}"]`);
+  if(el){
+    el.scrollIntoView({block:"center"});
+    el.classList.add("mfocus");
+    setTimeout(()=>el.classList.remove("mfocus"),1800);
+  }
 }
 let TXSTATE={turns:[],shown:0,onlyHot:false};
+// per-chat tool/subagent events, fetched lazily and bucketed onto turns by timestamp:
+// an event belongs to the latest turn whose ts <= event ts (i.e. the turn it answers).
+let EVDATA=null; // {agent,session,byTurn:{turn:[ev,...]},n,errs}
+async function loadEvents(d){
+  EVDATA=null;
+  if(!d.has_events||!d.agent)return;
+  let evs;try{evs=(await J(`/events?agent=${encodeURIComponent(d.agent)}&session=${encodeURIComponent(d.session)}`)).events||[];}catch(e){return;}
+  if(!evs.length)return;
+  const turns=[...d.turns].sort((a,b)=>(a.ts||0)-(b.ts||0)).filter(t=>t.ts);
+  const byTurn={};let errs=0;
+  for(const e of evs){
+    let owner=turns.length?turns[0].turn:0;
+    for(const t of turns){if(t.ts<=e.ts)owner=t.turn;else break;}
+    (byTurn[owner]=byTurn[owner]||[]).push(e);
+    if(e.ok===false)errs++;
+  }
+  EVDATA={agent:d.agent,session:d.session,byTurn,n:evs.length,errs};
+  // chip in the crumb + re-render the transcript with the trees in place
+  const crumb=document.querySelector(".det .crumb");
+  if(crumb&&!crumb.querySelector(".evn"))
+    crumb.insertAdjacentHTML("beforeend",`<span class="evn">${fmt(EVDATA.n)} ${C('evWord')}${errs?` · <span style="color:var(--ember)">${errs} ${C('evErrWord')}</span>`:""}</span>`);
+  renderTx();
+}
 function wireDetail(d){
-  TXSTATE={turns:d.turns,shown:0,onlyHot:false,peak:d.vibe?d.vibe.peak_turn:-1};
+  TXSTATE={turns:d.turns,shown:0,onlyHot:false,mi:0,peak:d.vibe?d.vibe.peak_turn:-1};
   // with a search active, render enough turns to include the first match, then jump to it
   if(HILITE.length){
     const hit=d.turns.findIndex(t=>matchesHi(t.text)||matchesHi(t.reply||""));
     if(hit>=0)TXSTATE.shown=hit+6;
   }
   renderTx();
+  loadEvents(d);
+  const rb=document.querySelector(".det .crumb .resumebtn");
+  if(rb)rb.onclick=()=>nativeResume(rb);
+  // mood chart + turning-point list jump into the transcript
+  document.querySelectorAll(".archit,.tpdot,.tpjump").forEach(el=>el.onclick=()=>jumpToTurn(el.dataset.turn));
   if(HILITE.length){const mk=$("tx")&&$("tx").querySelector("mark");if(mk)mk.scrollIntoView({block:"center"});}
 }
 function renderTx(){
   const box=$("tx");if(!box)return;
   const all=TXSTATE.onlyHot?TXSTATE.turns.filter(t=>t.hot):TXSTATE.turns;
+  // indices (into `all`) of turns whose text or reply matches the active search
+  const mts=HILITE_RE?all.map((t,i)=>(matchesHi(t.text)||matchesHi(t.reply||""))?i:-1).filter(i=>i>=0):[];
+  TXSTATE.matches=mts;
+  if(!Number.isInteger(TXSTATE.mi)||TXSTATE.mi>=mts.length)TXSTATE.mi=0;
   const step=80;TXSTATE.shown=Math.max(TXSTATE.shown,Math.min(step,all.length));
+  if(mts.length)TXSTATE.shown=Math.max(TXSTATE.shown,mts[TXSTATE.mi]+1);
   const slice=all.slice(0,TXSTATE.shown);
+  const mpill=mts.length?`<span class="mnav"><button id="mprev" title="previous match (N)">‹</button><b>${TXSTATE.mi+1}/${mts.length}</b><button id="mnext" title="next match (n)">›</button><span class="keyhint">n/N</span></span>`:"";
   const head=`<div class="txhead">
     <span>${C('txHead')} · ${all.length} ${C('txYours')}${TXSTATE.onlyHot?" ("+C('txHot').toLowerCase()+" only)":""}</span>
+    ${mpill}
     <div class="seg"><button data-h="0" class="${TXSTATE.onlyHot?'':'on'}">${C('txAll')}</button><button data-h="1" class="${TXSTATE.onlyHot?'on':''}">${C('txHot')}</button></div>
   </div>`;
-  const rows=slice.map(t=>{
+  const cur=mts.length?mts[TXSTATE.mi]:-1;
+  const rows=slice.map((t,i)=>{
     const col=heatColor(t.rage);
-    const cls="turn"+(t.hot?" h":"");
+    const cls="turn"+(t.hot?" h":"")+(i===cur?" mfocus":"");
     const tg=(t.top||[]).slice(0,3).filter(x=>x!=="neutral").join(", ");
     const mdl=t.model?` · ${esc(prettyModel(t.model))}`:"";
     const replyHit=t.reply&&matchesHi(t.reply);  // auto-open a reply that contains a match
     const rtog=t.reply?`<button class="rtog" data-t="${t.turn}" aria-expanded="${replyHit}">${C('replyLabel')}${mdl}</button>`:"";
     const rbox=t.reply?`<div class="rep" id="rep${t.turn}" ${replyHit?"":"hidden"}>${hl(t.reply,HILITE)}</div>`:"";
     const tag=t.recap?`<span class="recaptag">recap</span> `:"";  // auto-generated compaction summary, not your words
-    return `<div class="${cls}${t.recap?' recap':''}">
+    const evs=EVDATA&&EVDATA.byTurn[t.turn];
+    const everr=evs?evs.filter(e=>e.ok===false).length:0;
+    const evb=evs?`<button class="evtog" data-t="${t.turn}" aria-expanded="false">⚒ ${evs.length} ${C('evWord')}${everr?` · <span class="bad">${everr} ${C('evErrWord')}</span>`:""}</button><div class="evtree" id="evt${t.turn}" hidden></div>`:"";
+    return `<div class="${cls}${t.recap?' recap':''}" data-i="${i}">
       <div class="n">${t.turn}<i style="background:${t.rage>0.05?col:'transparent'}"></i></div>
-      <div><div class="tt">${tag}${hl(t.text,HILITE)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${rtog}${rbox}</div>
+      <div><div class="tt">${tag}${hl(t.text,HILITE)}</div>${tg?`<div class="tg">${esc(tg)}</div>`:""}${evb}${rtog}${rbox}</div>
     </div>`;
   }).join("");
   const more=TXSTATE.shown<all.length?`<button class="more" id="more">${C('txShow')} ${Math.min(step,all.length-TXSTATE.shown)} ${C('txMore')} · ${all.length-TXSTATE.shown} ${C('txLeft')}</button>`:"";
   box.innerHTML=head+rows+more;
-  box.querySelectorAll(".txhead .seg button").forEach(b=>b.onclick=()=>{TXSTATE.onlyHot=b.dataset.h==="1";TXSTATE.shown=0;renderTx();});
+  box.querySelectorAll(".txhead .seg button").forEach(b=>b.onclick=()=>{TXSTATE.onlyHot=b.dataset.h==="1";TXSTATE.shown=0;TXSTATE.mi=0;renderTx();});
   box.querySelectorAll(".rtog").forEach(b=>b.onclick=()=>{
     const el=$("rep"+b.dataset.t);if(!el)return;
     const willOpen=el.hidden;el.hidden=!willOpen;b.setAttribute("aria-expanded",willOpen?"true":"false");
   });
+  const mp=$("mprev"),mn=$("mnext");
+  if(mp)mp.onclick=()=>txMatchNav(-1);
+  if(mn)mn.onclick=()=>txMatchNav(1);
   const m=$("more");if(m)m.onclick=()=>{TXSTATE.shown+=80;renderTx();};
-}
-
-// ============================ ask ============================
-async function ask(){
-  const q=$("q").value.trim();if(!q)return;
-  $("q").value="";$("send").disabled=true;
-  if(STATE.view==="pulse"){showExplore();if(STATE.sel)openChat(STATE.sel);else showPlaceholder();}
-  const conv=$("conv");
-  conv.insertAdjacentHTML("afterbegin",`<div class="q">${esc(q)}</div>`);
-  const slot=document.createElement("div");slot.className="a";slot.innerHTML=`<span class="spin">${C('thinking')}</span>`;
-  conv.insertBefore(slot,conv.firstChild.nextSibling);
-  $("main").scrollTop=0;
-  try{
-    const o=await(await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:q})})).json();
-    const think=(o.steps||[]).map(s=>`<b>${esc(s.tool)}</b>(${esc(JSON.stringify(s.args).slice(1,-1))})`).join("  ·  ");
-    slot.innerHTML=(think?`<div class="think">${C('usedWord')} ${think}</div>`:"")+`<div class="ans">${esc(o.answer)}</div>`+(o.model?`<div class="amodel">${C('answeredBy')} ${esc(prettyModel(o.model))}</div>`:"")+(o.steps||[]).map(renderTool).join("");
-    wireAskCards(slot);
-  }catch(e){slot.innerHTML=`<div class="ans">${C('askErr')}: ${esc(e.message)}</div>`;}
-  $("send").disabled=false;
-}
-function renderTool(step){
-  let r;try{r=JSON.parse(step.result)}catch{r=null}
-  if(step.tool==="search_chats"&&Array.isArray(r))
-    return `<div class="cards">`+r.map(c=>`<div class="card" data-find="${esc((c.tags||[]).slice(0,2).join(' '))}"><div class="h"><span class="ag">${esc(c.agent)}</span> / ${esc(c.project)} · ${c.n_msgs} msgs</div><div class="s">${esc(c.summary)}</div><div class="t">${(c.tags||[]).map(esc).join(", ")}</div></div>`).join("")+`</div>`;
-  if(step.tool==="search_messages"&&Array.isArray(r))
-    return `<div class="cards">`+r.map(c=>`<div class="card"><div class="h"><span class="ag">${esc(c.agent)}</span> / ${esc(c.project)}</div><div class="s">${esc(c.text)}</div></div>`).join("")+`</div>`;
-  if(step.tool==="top_concepts"&&Array.isArray(r))
-    return `<div class="cards">`+r.map(c=>`<div class="card" data-find="${esc(c.concept.split(',')[0])}"><div class="s">${esc(c.concept)}</div><div class="t">${c.sessions} sessions · ${c.messages} msgs</div></div>`).join("")+`</div>`;
-  if(step.tool==="rage_ranking"&&Array.isArray(r)){const mx=Math.max(1,...r.map(x=>x.rage_per_1k));
-    return `<div class="cards">`+r.map(c=>`<div class="row"><div class="nm">${esc(c.name)}</div><div class="bar"><i style="width:${(c.rage_per_1k/mx*100).toFixed(0)}%"></i></div><div class="v">${c.rage_per_1k} · ${fmt(c.msgs)}</div></div>`).join("")+`</div>`;}
-  return "";
-}
-// clicking an ask result drops its terms into the rail filter to find the real chats
-function wireAskCards(slot){
-  slot.querySelectorAll(".card[data-find]").forEach(c=>c.onclick=()=>{
-    const f=c.dataset.find.trim();if(!f)return;
-    $("find").value=f;STATE.filter=f.toLowerCase();$("findx").style.display="";renderRail();
+  box.querySelectorAll(".evtog").forEach(b=>b.onclick=()=>{
+    const el=$("evt"+b.dataset.t);if(!el)return;
+    if(el.hidden&&!el.dataset.built){el.innerHTML=evTreeHTML(EVDATA.byTurn[b.dataset.t]||[]);el.dataset.built="1";wireEvTree(el);}
+    el.hidden=!el.hidden;b.setAttribute("aria-expanded",el.hidden?"false":"true");
   });
 }
+
+// ---- the event tree inside a turn: runs of the same tool collapse to one row, errors
+// always stay visible, every row expands to its capped input/output, and "full" pulls
+// the uncapped payload straight from the agent's own store (/event_raw).
+function evTreeHTML(evs){
+  let html="",i=0;
+  while(i<evs.length){
+    let j=i;
+    while(j<evs.length&&evs[j].name===evs[i].name&&evs[j].kind==="tool"&&evs[j].ok!==false)j++;
+    const run=j-i;
+    if(run>=4){
+      html+=`<div class="evgrp" data-a="${i}" data-b="${j}" aria-expanded="false">⚒ ${esc(evs[i].name)} ×${run}</div><div class="evgrpbody" hidden data-a="${i}" data-b="${j}"></div>`;
+      i=j;
+    }else{
+      html+=evRowHTML(evs[i],i);i++;
+    }
+  }
+  return html;
+}
+function evRowHTML(e,idx){
+  const sub=e.kind&&e.kind.startsWith("subagent");
+  const ic=sub?"⑂":"⚒";
+  const err=e.ok===false;
+  const okm=e.ok==null?"":err?`<span class="ok bad">✗</span>`:`<span class="ok">✓</span>`;
+  return `<div class="ev${err?" err":""}${sub?" sub":""}" data-i="${idx}">
+    <span class="ic">${ic}</span>
+    <span class="bd" style="display:flex;gap:8px;min-width:0"><span class="nm">${esc(e.name||"?")}</span><span class="in">${esc(e.input||e.output||"")}</span></span>
+    ${okm}</div>`;
+}
+function wireEvTree(root){
+  const evs=()=>EVDATA.byTurn[root.id.slice(3)]||[];
+  root.querySelectorAll(".evgrp").forEach(g=>g.onclick=()=>{
+    const body=root.querySelector(`.evgrpbody[data-a="${g.dataset.a}"]`);
+    if(body.hidden&&!body.dataset.built){
+      const list=evs().slice(+g.dataset.a,+g.dataset.b);
+      body.innerHTML=list.map((e,k)=>evRowHTML(e,+g.dataset.a+k)).join("");
+      body.dataset.built="1";wireEvRows(body,evs);
+    }
+    body.hidden=!body.hidden;g.setAttribute("aria-expanded",body.hidden?"false":"true");
+  });
+  wireEvRows(root,evs);
+}
+function wireEvRows(scope,evs){
+  scope.querySelectorAll(".ev").forEach(r=>r.onclick=ev=>{
+    ev.stopPropagation();
+    let x=r.nextElementSibling;
+    if(x&&x.classList.contains("evx")){x.remove();return;}
+    const e=evs()[+r.dataset.i];if(!e)return;
+    r.insertAdjacentHTML("afterend",`<div class="evx">
+      ${e.input?`<div class="lbl">${C('evIn')}</div><pre>${esc(e.input)}</pre>`:""}
+      ${e.output?`<div class="lbl">${C('evOut')} ${e.ok===false?`<span style="color:var(--ember)">✗</span>`:""}</div><pre>${esc(e.output)}</pre>`:""}
+      ${e.child?`<button class="full" data-child="${esc(e.child)}">${C('evChild')}</button> `:""}
+      ${e.call_id?`<button class="full" data-cid="${esc(e.call_id)}">${C('evFull')}</button>`:""}
+    </div>`);
+    const x2=r.nextElementSibling;
+    x2.onclick=ev2=>ev2.stopPropagation();
+    const fb=x2.querySelector(".full[data-cid]");
+    if(fb)fb.onclick=async()=>{
+      fb.disabled=true;fb.textContent=C('evFetching');
+      try{
+        const raw=await J(`/event_raw?agent=${encodeURIComponent(EVDATA.agent)}&session=${encodeURIComponent(EVDATA.session)}&call_id=${encodeURIComponent(fb.dataset.cid)}`);
+        x2.innerHTML=`${raw.input?`<div class="lbl">${C('evIn')}</div><pre>${esc(raw.input)}</pre>`:""}
+          ${raw.output?`<div class="lbl">${C('evOut')}</div><pre>${esc(raw.output)}</pre>`:""}
+          ${raw.error?`<div class="lbl" style="color:var(--ember)">${esc(raw.error)}</div>`:""}`;
+        x2.onclick=ev2=>ev2.stopPropagation();
+      }catch(err){fb.textContent=C('evFullErr');fb.disabled=false;}
+    };
+    const cb=x2.querySelector(".full[data-child]");
+    if(cb)cb.onclick=()=>{setView("explore");openChat(cb.dataset.child);};
+  });
+}
+function txMatchNav(d){
+  const mts=TXSTATE.matches||[];if(!mts.length)return;
+  TXSTATE.mi=(TXSTATE.mi+d+mts.length)%mts.length;
+  renderTx();
+  const el=$("tx")&&$("tx").querySelector(".turn.mfocus");
+  if(el)el.scrollIntoView({block:"center"});
+}
+
+// The bundled "ask agent" (Gemma over top-k hits) was cut: search shows receipts and is
+// instant; cross-chat synthesis belongs to a real agent pointed at this server's endpoints.
 
 // ============================ pulse (dashboard) ============================
 let DASH=null;
@@ -777,15 +1216,61 @@ async function renderPulse(){
     if(window.__pre&&window.__pre.data){try{DASH=await window.__pre.data;}catch(e){}}
     if(!DASH){v.innerHTML=`<div class="spin" style="padding:40px 0">${C('loadingStats')}</div>`;
       try{DASH=await J("/data");}catch(e){v.innerHTML=`<div class="empty">${C('noStats')} (${esc(e.message)})</div>`;return;}}}
-  const D=DASH;
+  const D=DASH,E=D.events||{},BA=E.by_agent||{};
+  // affect data is the optional GPU tier — a stdlib-only install has none, and dead
+  // "0% hot" cards would just look broken. Hide the affect surfaces instead.
+  const hasAffect=(D.vibe_top||[]).length>0||(D.overall_hot||0)>0
+    ||(D.agents||[]).some(a=>(a.hot_pct||0)>0);
+  // ---- vitals strip
+  const nAgents=Object.keys(BA).length||D.agents.length;
+  const vit=[[fmt(STATS?STATS.n_msgs:D.total),C('pvTurns')],
+             [fmt(E.total||0),C('pvCalls')],
+             ...(hasAffect?[[(D.overall_hot||0)+"%",C('pvHot')]]:[]),
+             [nAgents,C('pvAgents')],
+             [fmt(E.subagents||0),C('pvSubs')]];
+  // ---- reliability: only stores that RECORD outcomes get a rate; codex logs raw
+  // text with no exit status, so it reads "not recorded" instead of a fake 0%.
+  // a rate needs real coverage: >=200 recorded outcomes AND outcomes for most calls
+  // (codex records status on only ~8% of its calls — that's "not recorded", not 0%)
+  const rel=Object.entries(BA).map(([name,a])=>({name,calls:a.calls,
+      rate:(a.known>=200&&a.known/a.calls>=0.5)?+(a.fails/a.known*100).toFixed(1):null,fails:a.fails}))
+    .sort((x,y)=>(y.rate??-1)-(x.rate??-1));
+  const relMax=Math.max(1,...rel.map(r=>r.rate||0));
+  const relRows=rel.map(r=>r.rate==null
+    ?`<div class="prow"><div class="nm">${esc(r.name)}</div><div class="pna">${C('relNA')}</div><div class="v">${fmt(r.calls)}</div></div>`
+    :`<div class="prow"><div class="nm">${esc(r.name)}</div><div class="pb"><i style="width:${(r.rate/relMax*100).toFixed(1)}%;background:${heatColor(r.rate/100*0.5)}"></i></div><div class="v"><b>${r.rate}%</b> · ${fmt(r.calls)}</div></div>`).join("");
+  // ---- tool mix
+  const tools=(E.by_tool||[]).slice(0,10);
+  const tMax=Math.max(1,...tools.map(t=>t.n));
+  const toolRows=tools.map(t=>`<div class="prow"><div class="nm" title="${esc(t.name)}">${esc(t.name)}</div>
+    <div class="pb"><i style="width:${(t.n/tMax*100).toFixed(1)}%"></i></div>
+    <div class="v"><b>${fmt(t.n)}</b>${t.fails?` · <span style="color:var(--ember)">${fmt(t.fails)}✗</span>`:""}</div></div>`).join("");
+  // ---- hottest sessions leaderboard (click -> open the chat)
+  const leadRows=(D.vibe_top||[]).map(s=>{
+    const row=bySession[s.session];
+    const ttl=row?chatTitle(row):(s.verdict||s.project||s.session.slice(0,12));
+    return `<div class="plead" data-s="${esc(s.session)}">
+      <span class="pj1" style="color:${heatColor((s.juice||0)/12)}">${(s.juice||0).toFixed(1)}</span>
+      <span class="pt1">${esc(ttl)}</span>
+      <span class="pa1">${esc(s.agent||"")}</span></div>`;}).join("");
+  // ---- agent heat (existing metric, card-sized)
+  const aMax=Math.max(1,...D.agents.map(r=>r.hot_pct));
+  const heatRows=D.agents.map(r=>`<div class="prow"><div class="nm">${esc(r.name)}</div>
+    <div class="pb"><i style="width:${(r.hot_pct/aMax*100).toFixed(1)}%;background:${heatColor(r.hot_pct/100*0.45)}"></i></div>
+    <div class="v"><b>${r.hot_pct}%</b> · ${fmt(r.msgs)}</div></div>`).join("");
+
   v.innerHTML=`
-    <div class="sec"><span class="sq"></span><span>${C('secAgents')}</span><span class="rule"></span><em>${C('secAgentsEm')}</em></div>
-    <div id="d_agents"></div>
-    <div class="sec"><span class="sq"></span><span>${C('secProj')}</span><span class="rule"></span><em>${C('secProjEm')}</em></div>
-    <div id="d_proj"></div>
-    <div class="sec"><span class="sq"></span><span>${C('secTime')}</span><span class="rule"></span><em>${C('secTimeEm')}</em></div>
-    <div id="d_tl"></div>`;
-  bars($("d_agents"),D.agents);bars($("d_proj"),D.projects);timeline($("d_tl"),D.timeline);
+    <div class="vitals">${vit.map(x=>`<div class="vi"><b>${x[0]}</b><span>${x[1]}</span></div>`).join("")}</div>
+    <div class="pgrid">
+      ${hasAffect?`<div class="pcard"><h3>${C('pcHeat')}<em>${C('pcHeatEm')}</em></h3>${heatRows||`<div class="empty">${C('notEnough')}</div>`}</div>`:""}
+      <div class="pcard"><h3>${C('pcRel')}<em>${C('pcRelEm')}</em></h3>${relRows||`<div class="empty">${C('notEnough')}</div>`}</div>
+      <div class="pcard"><h3>${C('pcTools')}<em>${fmt(E.total||0)} ${C('pvCalls')}</em></h3>${toolRows||`<div class="empty">${C('notEnough')}</div>`}</div>
+      ${hasAffect?`<div class="pcard"><h3>${C('pcHot')}<em>${C('pcHotEm')}</em></h3>${leadRows||`<div class="empty">${C('notEnough')}</div>`}</div>`:""}
+      <div class="pcard wide"><h3>${C('secTime')}<em>${C('secTimeEm')}</em></h3><div id="d_tl"></div></div>
+      <div class="pcard wide"><h3>${C('secProj')}<em>${C('secProjEm')}</em></h3><div id="d_proj"></div></div>
+    </div>`;
+  bars($("d_proj"),D.projects);timeline($("d_tl"),D.timeline);
+  v.querySelectorAll(".plead").forEach(el=>el.onclick=()=>{setView("explore");openChat(el.dataset.s);});
 }
 function bars(el,rows){
   if(!rows||!rows.length){el.innerHTML=`<div class="empty" style="padding:14px">${C('notEnough')}</div>`;return;}
@@ -810,34 +1295,418 @@ function timeline(el,tl){
     <text class="ylab" x="${pad}" y="${pad-6}">${max}% ${esc(C('hotPctWord'))}</text></svg>`;
 }
 
+// ============================ live (passive store tailing) ============================
+// The server tails every agent's own on-disk store (no hooks) and streams events over
+// SSE. This view = active sessions on the left, the event feed on the right.
+const EVICON={tool:"⚒",tool_done:"⚒",subagent_start:"⑂",subagent_result:"⑂",user:"›",reply:"‹"};
+let LIVE={es:null,sessions:{},feed:[],sel:null,timer:null,tick:null,unseen:0,connlost:false,
+  dense:PREF("tiltLiveDensity")||"cozy",
+  scale:Math.max(80,Math.min(180,+(PREF("tiltLiveScale")||100))),
+  notify:PREF("tiltLiveNotify")==="1",
+  archOpen:PREF("tiltLiveArch")==="1"};   // past sessions: collapsed by default
+// a session is "live" while a tool is running / it's thinking, or its store moved in the
+// last 90s; everything older drops into the (auto-closed) archive below.
+function lvIsLive(s,now){
+  if(s.state&&(s.state[0]==="⚒"||s.state==="thinking"||s.state==="replying"))return true;
+  return (now-(s.last_ts||0))<=90000;
+}
+const lvKey=e=>e.agent+":"+e.session;
+const fmtDur=ms=>{
+  if(ms==null||ms<0)return"";
+  if(ms<9500)return(ms/1000).toFixed(1)+"s";
+  const s=Math.round(ms/1000);
+  return s<60?s+"s":Math.floor(s/60)+"m"+String(s%60).padStart(2,"0");
+};
+// event bursts (16 parallel tool results) collapse into ≤1 render per ~90ms
+let LVRENDERED=0,LVPEND=null;
+function schedLive(){
+  if(STATE.view!=="live")return;
+  const now=Date.now();
+  if(now-LVRENDERED>90){LVRENDERED=now;renderLive(true);return;}
+  if(LVPEND)return;
+  LVPEND=setTimeout(()=>{LVPEND=null;LVRENDERED=Date.now();if(STATE.view==="live")renderLive(true);},95);
+}
+// 1s ticker: update elapsed counters in place, no re-render
+function lvTick(){
+  if(STATE.view!=="live")return;
+  document.querySelectorAll(".elap[data-t0]").forEach(el=>{
+    const t0=+el.dataset.t0;
+    if(t0)el.textContent="· "+fmtDur(Date.now()-t0);
+  });
+}
+function maybeNotify(s,ev){
+  if(!LIVE.notify||typeof Notification==="undefined"||Notification.permission!=="granted")return;
+  if(!document.hidden)return; // only when the user is elsewhere — that's the point
+  const st=ev.sstate==="interrupted"?C('liveInt'):C('liveDone');
+  try{new Notification(`${s.agent} · ${lvName(s)}`,{body:st,tag:lvKey(ev)});}catch(e){}
+}
+// a session's display name: real project dir, else its title, else the id stub —
+// never a bare home-dir path ("Users/<you>" / "<you>/Desktop" carry no signal)
+const lvName=s=>{
+  const p=(s.project||"").trim();
+  if(p&&!isGenericDir(p))return p;
+  return (s.title||"").trim()||p||s.session.slice(0,12);
+};
+const lvProj=e=>e.project&&!isGenericDir(e.project)?e.project:"";
+// server state strings -> theme copy ("⚒ Bash +2" passes through untouched)
+const LVSTATES={"thinking":"liveThink","user typed":"liveUser","replying":"liveReply",
+  "done":"liveDone","interrupted":"liveInt","stalled":"liveStalled"};
+const lvState=st=>LVSTATES[st]?C(LVSTATES[st]):st;
+// The stream is ALWAYS on (started at boot): the live view renders from it, and the
+// explore rail overlays it so chats update the moment an agent writes -- no reindex wait.
+function ensureStream(){
+  if(LIVE.es)return;
+  LIVE.es=new EventSource("/live/stream");
+  LIVE.es.onopen=()=>{if(LIVE.connlost){LIVE.connlost=false;schedLive();}};
+  LIVE.es.onerror=()=>{LIVE.connlost=true;schedLive();}; // EventSource auto-retries
+  LIVE.es.onmessage=m=>{
+    let ev;try{ev=JSON.parse(m.data);}catch(e){return;}
+    if(ev.type==="hello"){if(LIVE.connlost){LIVE.connlost=false;}return;}
+    LIVE.connlost=false;
+    const k=lvKey(ev);
+    const s=LIVE.sessions[k]||(LIVE.sessions[k]={agent:ev.agent,session:ev.session,project:"",title:"",last_ts:0,state:"",recent:[]});
+    if(ev.project&&(ev.project!=="~"||!s.project))s.project=ev.project;
+    if(ev.title)s.title=ev.title;
+    if(ev.sub_session)s.sub=true;
+    if(ev.smodel)s.model=ev.smodel;
+    s.last_ts=Math.max(s.last_ts,ev.ts||Date.now());
+    s.active=true;
+    // the server resolves state (pending-tool aware) and ships it on every event
+    if(ev.sstate&&!ev.sub){s.state=ev.sstate;if(ev.sts)s.state_ts=ev.sts;}
+    railLiveUpdate(ev);
+    if(ev.type==="queued"){s.queued=ev.squeued||0;s.queued_text=ev.squeued_text||"";schedLive();return;}
+    (s.recent=s.recent||[]).push(ev);if(s.recent.length>80)s.recent.splice(0,s.recent.length-80);
+    if(ev.type==="done"){maybeNotify(s,ev);schedLive();return;} // state-only, no feed row
+    if(STATE.view==="live"){
+      const lvf=$("lvf");
+      if(lvf&&lvf.scrollTop+lvf.clientHeight<lvf.scrollHeight-60)LIVE.unseen++;
+    }
+    LIVE.feed.push(ev);if(LIVE.feed.length>600)LIVE.feed.splice(0,LIVE.feed.length-600);
+    schedLive();
+  };
+}
+// overlay live activity onto the rail: bump rows in place, add brand-new sessions
+// as thin rows (clicking one opens the live transcript -- it isn't indexed yet)
+function railLiveUpdate(ev){
+  if(ev.sub)return;
+  let row=bySession[ev.session];
+  if(!row){
+    if(ev.type!=="user")return; // a chat earns a rail row once a real prompt exists
+    row=bySession[ev.session]={session:ev.session,agent:ev.agent,
+      project:(ev.project&&ev.project!=="~")?ev.project:"",concept:"",
+      n_msgs:0,last_ts:0,title:(ev.text||"").slice(0,90),summary:"",tags:[],
+      thin:true,live_only:true,has_vibe:false,juice:null,verdict:""};
+    CHATS.push(row);
+  }
+  if(ev.type==="user")row.n_msgs=(row.n_msgs||0)+1;
+  row.last_ts=Math.max(row.last_ts||0,ev.ts||Date.now());
+  if(ev.project&&(ev.project!=="~"||!row.project))row.project=ev.project;
+  row.live_ts=Date.now();
+  schedRail();
+}
+let RAILR=0,RAILP=null;
+function schedRail(){ // rail refresh ≤1 per 1.5s, scroll preserved, only when visible
+  if(STATE.view!=="explore"||SEARCH.active||!BOOTED)return;
+  const go=()=>{const l=$("list");const st=l?l.scrollTop:0;renderRail();const l2=$("list");if(l2)l2.scrollTop=st;};
+  const now=Date.now();
+  if(now-RAILR>1500){RAILR=now;go();return;}
+  if(RAILP)return;
+  RAILP=setTimeout(()=>{RAILP=null;RAILR=Date.now();if(STATE.view==="explore"&&!SEARCH.active)go();},1600);
+}
+function startLive(){
+  stopLive(); // never stack refresh timers across re-entries
+  $("view").innerHTML=`<div class="lv">
+    <div class="lvs" id="lvs"><div class="lvempty">${C('liveScan')}</div></div>
+    <div class="lvf" id="lvf"><div class="lvempty">${C('liveQuiet')}</div></div>
+    <button id="newpill" class="newpill" style="display:none"></button>
+  </div>`;
+  LIVE.feed=[];LIVE.unseen=0;
+  J("/live/state").then(s=>{
+    s.sessions.forEach(x=>{LIVE.sessions[x.agent+":"+x.session]=x;});
+    // seed the feed from the per-session recents, merged by time
+    LIVE.feed=s.sessions.flatMap(x=>x.recent||[]).sort((a,b)=>(a.ts||0)-(b.ts||0)).slice(-400);
+    renderLive();
+  }).catch(()=>{$("lvs").innerHTML=`<div class="lvempty">${C('liveErr')}</div>`;});
+  ensureStream();
+  const lvf=$("lvf");
+  lvf.onscroll=()=>{ // reaching the bottom by hand clears the backlog pill
+    if(LIVE.unseen&&lvf.scrollTop+lvf.clientHeight>=lvf.scrollHeight-60){LIVE.unseen=0;updatePill();}
+  };
+  $("newpill").onclick=()=>{LIVE.unseen=0;lvf.scrollTop=lvf.scrollHeight;updatePill();};
+  // periodic re-render so "ago" labels + active fade stay honest even when quiet.
+  // keepScroll: a background refresh must never yank someone reading history.
+  LIVE.timer=setInterval(()=>{if(STATE.view==="live")renderLive(true);},20000);
+  LIVE.tick=setInterval(lvTick,1000);
+}
+function updatePill(){
+  const p=$("newpill");if(!p)return;
+  p.style.display=LIVE.unseen?"":"none";
+  if(LIVE.unseen)p.textContent=`↓ ${LIVE.unseen} ${C('liveNew')}`;
+}
+function stopLive(){ // leaves the stream itself running -- the rail overlay needs it
+  if(LIVE.timer){clearInterval(LIVE.timer);LIVE.timer=null;}
+  if(LIVE.tick){clearInterval(LIVE.tick);LIVE.tick=null;}
+}
+function lvCard(s,now){
+  const k=s.agent+":"+s.session;
+  const idle=(now-(s.last_ts||0))>90000;
+  const nm=lvName(s);
+  const busy=s.state&&(s.state.startsWith("⚒")||s.state==="thinking"||s.state==="replying");
+  const elap=busy&&s.state_ts?` <span class="elap" data-t0="${s.state_ts}">· ${fmtDur(now-s.state_ts)}</span>`:"";
+  // what the running tool is actually doing, not just its name
+  let inp="";
+  if(s.state&&s.state.startsWith("⚒")){
+    const evs=s.recent||[];
+    for(let i=evs.length-1;i>=0;i--){
+      const e=evs[i];
+      if(e.type==="tool"&&!e.sub){inp=e.input||"";break;}
+      if(e.type==="user")break;
+    }
+  }
+  // failures in the current turn get a badge you can't lose in the feed
+  const evs=s.recent||[];
+  const tn=evs.length?evs[evs.length-1].tn:null;
+  const errs=evs.filter(e=>e.ok===false&&(tn==null||e.tn===tn)).length;
+  return `<div class="lvcard${LIVE.sel===k?' sel':''}${idle?' idle':''}" data-k="${esc(k)}">
+    <div class="l1"><span class="ag">${s.sub?"⑂ ":""}${esc(s.agent)}</span><span class="pj">${esc(nm)}</span><span class="when">${ago(s.last_ts)||"·"}</span></div>
+    <div class="st">${esc(lvState(s.state)||"·")}${elap}${errs?`<span class="errb">${errs}✗</span>`:""}${s.model?`<span class="mdl">${esc(prettyModel(s.model))}</span>`:""}</div>
+    ${inp?`<div class="inp">${esc(inp)}</div>`:""}
+    ${s.queued?`<div class="qd">⧗ ${s.queued} ${C('liveQueued')}${s.queued_text?` · ${esc(s.queued_text)}`:""}</div>`:""}
+    ${s.title&&s.title!==nm?`<div class="ti">${esc(s.title)}</div>`:""}
+    <button class="resume" data-ag="${esc(s.agent)}" data-se="${esc(s.session)}">${C('liveResume')}</button>
+  </div>`;
+}
+// selected-session feed: events grouped under the prompt that caused them
+function turnsHTML(feed,selS){
+  const render=LIVE.dense==="cozy"?lrowCozy:lrowHTML;
+  const groups=[];let g=null;
+  feed.forEach(e=>{
+    const tn=e.tn==null?-1:e.tn;
+    if(!g||g.tn!==tn){g={tn,evs:[]};groups.push(g);}
+    g.evs.push(e);
+  });
+  const doneIds=new Set(feed.filter(e=>e.type==="tool_done"&&e.call_id).map(e=>e.call_id));
+  const now=Date.now();
+  const midTurn=selS&&selS.state&&selS.state!=="done"&&selS.state!=="interrupted";
+  return groups.map((gr,gi)=>{
+    const last=gi===groups.length-1;
+    const user=gr.evs.find(e=>e.type==="user");
+    const rows=gr.evs.filter(e=>e!==user).map(e=>{
+      let h=render(e);
+      if(last&&e.type==="tool"&&e.call_id&&!doneIds.has(e.call_id)&&e.ts)
+        h=h.replace(/<\/div>$/,` <span class="elap" data-t0="${e.ts}">· ${fmtDur(now-e.ts)}</span></div>`);
+      return h;
+    }).join("");
+    const head=user?`<div class="tuser">› ${esc(user.text||"")}</div>`
+                   :`<div class="tuser ghost">${C('liveTurn')}${gr.tn>0?" "+gr.tn:""}</div>`;
+    let foot="";
+    if(!last||!midTurn){ // a finished turn gets its receipt
+      const tools=gr.evs.filter(e=>e.type==="tool_done").length;
+      const fails=gr.evs.filter(e=>e.ok===false).length;
+      const ts=gr.evs.map(e=>e.ts).filter(Boolean);
+      const span=ts.length>1?fmtDur(Math.max(...ts)-Math.min(...ts)):"";
+      if(tools||span)foot=`<div class="tfoot">${tools} ${C('evWord')}${fails?` · <span class="zbad">${fails} ${C('evErrWord')}</span>`:""}${span?` · ${span}`:""}</div>`;
+    }
+    return `<div class="lvturn${last&&midTurn?' live':''}">${head}${rows}${foot}</div>`;
+  }).join("");
+}
+function renderLive(keepScroll){
+  const lvs=$("lvs"),lvf=$("lvf");if(!lvs||!lvf)return;
+  const now=Date.now();
+  const rows=Object.values(LIVE.sessions).sort((a,b)=>(b.last_ts||0)-(a.last_ts||0));
+  const liveR=rows.filter(s=>lvIsLive(s,now)), pastR=rows.filter(s=>!lvIsLive(s,now));
+  let shtml=liveR.length?liveR.map(s=>lvCard(s,now)).join(""):`<div class="lvempty">${C('liveNone')}</div>`;
+  // past sessions fold into an auto-closed archive below the active ones, newest first
+  if(pastR.length)shtml+=`<div class="lvarch${LIVE.archOpen?' open':''}">`
+    +`<div class="lvarchh" id="lvarchh"><span class="cv">${LIVE.archOpen?'▾':'▸'}</span>${C('liveArchive')}<span class="n">${pastR.length}</span></div>`
+    +(LIVE.archOpen?`<div class="lvarchl">${pastR.map(s=>lvCard(s,now)).join("")}</div>`:"")
+    +`</div>`;
+  lvs.innerHTML=shtml;
+  lvs.querySelectorAll(".lvcard").forEach(el=>el.onclick=e=>{
+    if(e.target.closest(".resume"))return;            // resume button handles itself
+    LIVE.sel=LIVE.sel===el.dataset.k?null:el.dataset.k;renderLive();
+  });
+  lvs.querySelectorAll(".resume").forEach(b=>b.onclick=e=>{e.stopPropagation();nativeResume(b);});
+  const ah=lvs.querySelector("#lvarchh");
+  if(ah)ah.onclick=()=>{LIVE.archOpen=!LIVE.archOpen;
+    try{localStorage.setItem("tiltLiveArch",LIVE.archOpen?"1":"0");}catch(e){}renderLive();};
+  const atBottom=!keepScroll||lvf.scrollTop+lvf.clientHeight>=lvf.scrollHeight-60;
+  const feed=LIVE.sel?LIVE.feed.filter(e=>lvKey(e)===LIVE.sel):LIVE.feed;
+  const selS=LIVE.sel?LIVE.sessions[LIVE.sel]:null;
+  const head=`<div class="lvhead"><span>${LIVE.sel?esc((selS&&lvName(selS))||C('liveFeed')):C('liveAll')}</span>
+    <span>${feed.length}</span>
+    ${LIVE.connlost?`<span class="recon">${C('liveReconnect')}</span>`:""}
+    <div class="seg" style="margin-left:auto">
+      <button data-d="compact" class="${LIVE.dense==='compact'?'on':''}">${C('liveCompact')}</button>
+      <button data-d="cozy" class="${LIVE.dense==='cozy'?'on':''}">${C('liveCozy')}</button>
+    </div>
+    <input type="range" id="lvscale" min="80" max="180" step="5" value="${LIVE.scale}" title="${C('liveSize')}: ${LIVE.scale}%">
+    <button class="ntf${LIVE.notify?' on':''}" id="lvntf">${C('liveNotify')}</button>
+    ${LIVE.sel&&selS&&bySession[selS.session]?`<button class="opentx" data-s="${esc(selS.session)}">${C('liveOpen')}</button>`:""}</div>`;
+  const render=LIVE.dense==="cozy"?lrowCozy:lrowHTML;
+  lvf.style.fontSize=(12*LIVE.scale/100)+"px";
+  const body=!feed.length?`<div class="lvempty">${C('liveQuiet')}</div>`
+    :LIVE.sel?turnsHTML(feed,selS):feed.map(render).join("");
+  lvf.innerHTML=head+body;
+  const ob=lvf.querySelector(".opentx");if(ob)ob.onclick=()=>{setView("explore");openChat(ob.dataset.s);};
+  lvf.querySelectorAll(".lvhead .seg button").forEach(b=>b.onclick=()=>{
+    LIVE.dense=b.dataset.d;try{localStorage.setItem("tiltLiveDensity",LIVE.dense);}catch(e){}renderLive();});
+  const sc=lvf.querySelector("#lvscale");
+  if(sc)sc.oninput=()=>{ // live-applies via the em cascade; no re-render needed
+    LIVE.scale=+sc.value;sc.title=`${C('liveSize')}: ${LIVE.scale}%`;
+    lvf.style.fontSize=(12*LIVE.scale/100)+"px";
+    try{localStorage.setItem("tiltLiveScale",String(LIVE.scale));}catch(e){}};
+  const nb=lvf.querySelector("#lvntf");
+  if(nb)nb.onclick=()=>{
+    LIVE.notify=!LIVE.notify;
+    if(LIVE.notify&&typeof Notification!=="undefined"&&Notification.permission==="default")
+      Notification.requestPermission();
+    try{localStorage.setItem("tiltLiveNotify",LIVE.notify?"1":"0");}catch(e){}
+    renderLive();
+  };
+  lvf.querySelectorAll(".lrow,.lz").forEach(el=>el.onclick=()=>el.classList.toggle("open"));
+  if(atBottom){lvf.scrollTop=lvf.scrollHeight;LIVE.unseen=0;}
+  updatePill();
+}
+// images the agent touched — a Read of one png, or a SendUserFile batch of five — render
+// as the actual pictures, full-res from disk, not "[image] foo.png" stubs. Batches sit
+// side-by-side; the SendUserFile caption (if any) shows beneath. Each links to the original.
+function imgHTML(e){
+  if(!e.imgs||!e.imgs.length)return"";
+  const pics=e.imgs.map(im=>{
+    const u="/file?p="+encodeURIComponent(im.p);
+    return `<a class="lvimg" href="${u}" target="_blank" rel="noopener" title="${esc(im.p)}">`
+      +`<img loading="lazy" src="${u}" alt="${esc(im.n||"image")}">`
+      +`<span class="lvimgn">${esc(im.n||"")}</span></a>`;
+  }).join("");
+  return `<div class="lvimgs">${pics}</div>`
+    +(e.imgcap?`<div class="lvimgcap">${esc(e.imgcap)}</div>`:"");
+}
+function lrowHTML(e){
+  const t=e.ts?new Date(e.ts).toTimeString().slice(0,8):"";
+  const ic=e.sub?"⑂":(EVICON[e.type]||"·");
+  const err=e.ok===false;
+  const pj=lvProj(e);
+  const src=LIVE.sel?"":`<span class="src">${esc(e.agent)}${pj?"/"+esc(pj):""}</span> `;
+  let bd="";
+  if(e.type==="tool")bd=`${src}<b>${esc(e.name||"?")}</b> ${esc(e.input||"")}`;
+  else if(e.type==="tool_done")bd=`${src}<b>${esc(e.name||"?")}</b> ${err?C('liveFail'):"✓"}${e.dur!=null?` <span class="dur">${fmtDur(e.dur)}</span>`:""} ${esc(e.output||"")}`;
+  else if(e.type==="subagent_result")bd=`${src}<b>${esc(e.name||"task")}</b> ${esc(e.output||"")}`;
+  else bd=`${src}${esc(e.text||"")}`;
+  return `<div class="lrow ${esc(e.type)}${err?" err":""}${e.sub?" sub":""}"><span class="lt">${t}</span><span class="ic">${ic}</span><span class="bd">${bd}${imgHTML(e)}</span></div>`;
+}
+// cozy density: each event breathes — header line (who · when), tool name with outcome,
+// input in mono, output preview dimmed beneath. Errors get the red left bar you can't miss.
+function lrowCozy(e){
+  const t=e.ts?new Date(e.ts).toTimeString().slice(0,8):"";
+  const err=e.ok===false;
+  const pj=lvProj(e);
+  const who=LIVE.sel?"":`<span class="zsrc">${e.sub?"⑂ ":""}${esc(e.agent)}${pj?" · "+esc(pj):""}</span>`;
+  const head=`<div class="lz1">${who}<span class="lt">${t}</span></div>`;
+  let body="";
+  if(e.type==="tool"||e.type==="tool_done"){
+    const mark=e.type==="tool"?`<span class="zrun">…</span>`
+      :(err?`<span class="zbad">${C('liveFail')}</span>`:`<span class="zok">✓</span>`)
+       +(e.dur!=null?` <span class="dur">${fmtDur(e.dur)}</span>`:"");
+    body=`<div class="lzn">${e.sub?"⑂ ":""}${EVICON[e.type]} <b>${esc(e.name||"?")}</b> ${mark}</div>`
+        +(e.input?`<div class="lzi">${esc(e.input)}</div>`:"")
+        +imgHTML(e)
+        +(e.output?`<div class="lzo">→ ${esc(e.output)}</div>`:"");
+  }else if(e.type==="subagent_result"){
+    body=`<div class="lzn">⑂ <b>${esc(e.name||"task")}</b></div><div class="lzo">${esc(e.output||"")}</div>`;
+  }else if(e.type==="user"){
+    body=`<div class="lzu">› ${esc(e.text||"")}</div>`;
+  }else{
+    body=`<div class="lzr">‹ ${esc(e.text||"")}</div>`;
+  }
+  return `<div class="lz ${esc(e.type)}${err?" err":""}${e.sub?" sub":""}">${head}${body}</div>`;
+}
+// resume a session in its native CLI: POST /open_native, reflect the outcome on the button.
+async function nativeResume(btn){
+  const agent=btn.dataset.ag,session=btn.dataset.se;
+  const old=btn.textContent;btn.disabled=true;btn.textContent=C('liveResuming');
+  try{
+    const r=await(await fetch("/open_native",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({agent,session})})).json();
+    if(r.ok){btn.textContent=C('liveResumed');btn.title=r.cmd+"  ("+r.cwd+")";}
+    else{btn.textContent=C('liveResumeErr');btn.title=r.error||"";btn.disabled=false;}
+  }catch(e){btn.textContent=C('liveResumeErr');btn.disabled=false;}
+  setTimeout(()=>{btn.textContent=old;btn.disabled=false;btn.title="";},3200);
+}
+
+// status badge on the live button: a pulsing dot + count while agents are actually working
+async function liveBadge(){
+  try{
+    const s=await J("/live/state");
+    const act=(s.sessions||[]).filter(x=>x.active);
+    $("vLive").innerHTML=act.length?`${C('vLive')}<span class="ldot"></span>${act.length}`:C('vLive');
+    // seed the rail overlay: sessions already running before this page loaded
+    let dirty=false;
+    act.forEach(x=>{
+      let row=bySession[x.session];
+      if(!row){
+        const firstUser=(x.recent||[]).find(e=>e.type==="user"&&!e.sub);
+        row=bySession[x.session]={session:x.session,agent:x.agent,
+          project:(x.project&&x.project!=="~")?x.project:"",concept:"",
+          n_msgs:(x.recent||[]).filter(e=>e.type==="user"&&!e.sub).length||1,
+          last_ts:x.last_ts||0,title:(firstUser&&firstUser.text||x.title||"").slice(0,90)||x.session.slice(0,12),
+          summary:"",tags:[],thin:true,live_only:true,has_vibe:false,juice:null,verdict:""};
+        CHATS.push(row);dirty=true;
+      }
+      if(!row.live_ts)dirty=true;
+      row.live_ts=Date.now();
+      row.last_ts=Math.max(row.last_ts||0,x.last_ts||0);
+    });
+    if(dirty)schedRail();
+  }catch(e){$("vLive").textContent=C('vLive');}
+}
+
 // ============================ view switching + boot ============================
-// chrome only: set the explore/pulse toggle + rail visibility, no content side-effects.
+// chrome only: set the explore/live/pulse toggle + rail visibility, no content side-effects.
+function viewBtns(on){
+  ["vExplore","vLive","vPulse"].forEach(id=>$(id).classList.toggle("on",id===on));
+}
 function showExplore(){
+  if(STATE.view==="live")stopLive();
   STATE.view="explore";
-  $("vExplore").classList.add("on");$("vPulse").classList.remove("on");
+  viewBtns("vExplore");
+  $("pane").classList.remove("wide","mid");
   $("bodyEl").classList.remove("solo");$("rail").style.display="";$("conv").style.display="";
 }
-function setView(view){
-  if(view==="pulse"){
-    STATE.view="pulse";
-    $("vPulse").classList.add("on");$("vExplore").classList.remove("on");
+function setView(view,fromHash){
+  $("pane").classList.toggle("wide",view==="live");
+  $("pane").classList.toggle("mid",view==="pulse");
+  if(view==="pulse"||view==="live"){
+    if(STATE.view==="live"&&view!=="live")stopLive();
+    STATE.view=view;
+    viewBtns(view==="pulse"?"vPulse":"vLive");
     $("bodyEl").classList.add("solo");$("rail").style.display="none";$("conv").style.display="none";
-    renderPulse();
+    if(!fromHash)writeHash();
+    view==="pulse"?renderPulse():startLive();
   }else{
     showExplore();
-    if(STATE.sel)openChat(STATE.sel);else showPlaceholder();
+    if(!fromHash)writeHash();
+    if(STATE.sel)openChat(STATE.sel,true);else showPlaceholder();
   }
 }
 function showPlaceholder(){
   if($("conv").children.length)return; // keep ask answers visible
-  const n=CHATS.length, v=CHATS.filter(c=>c.has_vibe).length, t=curTheme();
+  const n=STATS?STATS.n_sessions:CHATS.length, v=STATS?STATS.n_vibes:CHATS.filter(c=>c.has_vibe).length, t=curTheme();
   if(t==="web99"){$("view").innerHTML=web99Home(n,v);wireHomeFocus();return;}
   if(t==="kawaii"){$("view").innerHTML=kawaiiHome(n,v);return;}
-  $("view").innerHTML=`<div class="ph">
+  // forensic: wordmark + the most recent chats, so the empty pane is a resume point
+  const recent=[...CHATS].sort((a,b)=>(b.last_ts||0)-(a.last_ts||0)).slice(0,8);
+  const rows=recent.map(c=>`<div class="ri" data-s="${esc(c.session)}">
+      <span class="rt">${esc(chatTitle(c))}</span>
+      <span class="rm"><span class="ag">${esc(c.agent)}</span> · ${esc(ago(c.last_ts)||"·")}</span>
+    </div>`).join("");
+  $("view").innerHTML=`<div class="home">
     <div class="big">tilt.</div>
-    <p>${C('heroLead')}</p>
-    <p style="color:var(--ghost)">${n} ${C('heroFootA')} · ${v} ${C('heroFootB')}</p>
+    <p class="lead">${C('heroLead')}</p>
+    ${recent.length?`<div class="rh"><span>${C('recentHead')}</span><span class="rule"></span></div>${rows}`:""}
+    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C('heroFootA')} · ${v} ${C('heroFootB')}</p>
   </div>`;
+  $("view").querySelectorAll(".ri").forEach(el=>el.onclick=()=>openChat(el.dataset.s));
 }
 // kawaii cozy homepage: floating mascot + handwritten welcome
 function kawaiiHome(n,v){
@@ -868,7 +1737,7 @@ function web99Home(n,v){
 }
 function odometer(n){return String(n).padStart(6,"0").split("").join("&#8202;");}
 function wireHomeFocus(){
-  const s=$("g99search");if(s)s.onclick=()=>$("q").focus();
+  const s=$("g99search");if(s)s.onclick=()=>$("find").focus();
   const l=$("g99lucky");if(l)l.onclick=()=>{const pool=CHATS.filter(c=>c.has_vibe);const pick=(pool.length?pool:CHATS)[Math.floor(Math.random()*(pool.length?pool.length:CHATS.length))];if(pick)openChat(pick.session);};
 }
 const MASCOT=`<svg viewBox="0 0 120 120" width="128" height="128" xmlns="http://www.w3.org/2000/svg">
@@ -885,9 +1754,8 @@ const MASCOT=`<svg viewBox="0 0 120 120" width="128" height="128" xmlns="http://
   <path d="M104 44 Q110 40 108 33" fill="none" stroke="#ffb3d4" stroke-width="2.4" stroke-linecap="round"/>
 </svg>`;
 $("vExplore").onclick=()=>setView("explore");
+$("vLive").onclick=()=>setView("live");
 $("vPulse").onclick=()=>setView("pulse");
-$("send").onclick=ask;
-$("q").addEventListener("keydown",e=>{if(e.key==="Enter")ask();});
 // type = live keyword search (instant, no Enter). Enter = semantic "meaning" search.
 let liveTimer=null, liveReq=0;
 async function liveKeyword(term){
@@ -917,9 +1785,28 @@ $("find").addEventListener("keydown",e=>{
   else if(e.key==="Escape"){e.target.value="";$("findx").style.display="none";exitSearch();}
 });
 $("findx").onclick=()=>{$("find").value="";$("findx").style.display="none";clearTimeout(liveTimer);liveReq++;exitSearch();};
-$("groupSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.group=b.dataset.g;STATE.chip=null;$("groupSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
-$("sortSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.sort=b.dataset.s;$("sortSeg").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderRail();});
-document.addEventListener("keydown",e=>{if(e.key==="/"&&document.activeElement!==$("q")&&document.activeElement!==$("find")){e.preventDefault();$("find").focus();}});
+$("groupSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.group=b.dataset.g;STATE.chip=null;try{localStorage.setItem("tiltGroup",STATE.group);}catch(e){}syncSegs();renderRail();});
+$("sortSeg").querySelectorAll("button").forEach(b=>b.onclick=()=>{STATE.sort=b.dataset.s;try{localStorage.setItem("tiltSort",STATE.sort);}catch(e){}syncSegs();renderRail();});
+
+// keyboard: "/" focus search · j/k walk the list · n/N cycle matches in the open transcript
+function listNav(d){
+  if(STATE.view!=="explore")return;
+  const items=[...$("list").querySelectorAll(".ci[data-s]")].filter(el=>el.dataset.s);
+  if(!items.length)return;
+  let i=items.findIndex(el=>el.dataset.s===STATE.sel);
+  i=i<0?(d>0?0:items.length-1):Math.max(0,Math.min(items.length-1,i+d));
+  items[i].scrollIntoView({block:"nearest"});
+  openChat(items[i].dataset.s);
+}
+document.addEventListener("keydown",e=>{
+  const typing=/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+  if(e.key==="/"&&!typing){e.preventDefault();$("find").focus();return;}
+  if(typing||e.ctrlKey||e.metaKey||e.altKey)return;
+  if(e.key==="j"){e.preventDefault();listNav(1);}
+  else if(e.key==="k"){e.preventDefault();listNav(-1);}
+  else if(e.key==="n"){txMatchNav(1);}
+  else if(e.key==="N"||e.key==="p"){txMatchNav(-1);}
+});
 
 // hover-intent prefetch: delegated on the list so it survives every re-render. Guarded on
 // the row's session (not raw mouseout) because mouseout fires on every child-to-child move
@@ -942,19 +1829,21 @@ $("list").addEventListener("mouseleave",()=>{hoverSes=null;clearTimeout(hoverTim
 // noun is keyed here, and the forensic map is the fallback any other can borrow from.
 const COPY={
   forensic:{
-    askPh:"ask across every chat:  which project did i rage in, what was the DRM work about…",
+    askPh:"ask a question across every chat…",
     askBtn:"ask", vExplore:"explore", vPulse:"pulse",
     findPh:'search content (live)…  enter = meaning', findClear:"clear",
-    groupLab:"group", gConcept:"concept", gAgent:"agent", gProject:"project", gNone:"flat",
-    sSize:"size", sRecent:"recent", sHeat:"heat",
-    heroLead:"every chat you've had with claude, codex, opencode and antigravity, in one place. pick one on the left to read it back with its emotional arc, or ask a question across all of them.",
+    groupLab:"group", gDate:"date", gConcept:"concept", gAgent:"agent", gProject:"project", gNone:"flat",
+    sortLab:"sort", sSize:"size", sRecent:"recent", sHeat:"heat",
+    dToday:"today", dYest:"yesterday", dWeek:"this week", dMonth:"this month", dOlder:"older",
+    recentHead:"recent", convClear:"clear",
+    heroLead:"every chat with claude, codex, opencode and antigravity in one place. pick one on the left, search, or ask across all of them.",
     heroFootA:"chats indexed", heroFootB:"with a vibe-trace",
     statChats:"chats", statTurns:"turns", statVibes:"vibe-traces",
-    searchHead:"meaning search", searchExit:"exit", searchBusy:"searching every chat",
-    searchEmpty:"nothing close to that.", searchWarm:"the meaning search isn't warmed up yet.",
+    searchHead:"meaning search", searchExit:"exit", searchBusy:"searching…",
+    searchEmpty:"no matches.", searchWarm:"semantic index not built yet — keyword search (quoted) still works.",
     turnsWord:"turns", hotWord:"hot", peakWord:"hottest",
     arcDefault:"emotional arc", calmWord:"calm", hotWordY:"hot",
-    arcLegend:"top = calm, bottom = hot · ring marks the hottest turn · numbered dots are the turning points, listed below",
+    arcRage:"frustration", arcHype:"hype", arcClick:"hover for the message · click to jump to that turn",
     tpTurn:"turn", tpShift:"mood shift", replyLabel:"agent reply", answeredBy:"answered by",
     txHead:"transcript", txYours:"of your turns", txAll:"all", txHot:"hot",
     txShow:"show", txMore:"more", txLeft:"left",
@@ -963,22 +1852,45 @@ const COPY={
     secProj:"hottest projects", secProjEm:"at least 50 messages",
     secTime:"heat over time", secTimeEm:"% of weekly messages that ran hot", hotPctWord:"hot",
     emptyNoMatch:"no chats match.<br>loosen the filter.", emptyNoIndex:"the index isn't loaded yet.",
+    emptyZero:"nothing indexed yet.<br><br>run <b>python up.py</b> to scan your agent stores (claude · codex · opencode · antigravity).<br><br>chats appear here the moment an agent writes one.",
     opening:"opening chat", chatErr:"couldn't load this chat", loadingStats:"loading rankings",
     noStats:"no dashboard data", notEnough:"not enough data",
+    vLive:"live", evWord:"tool calls", evErrWord:"failed", evIn:"input", evOut:"output",
+    evFull:"full payload ⤢", evFullErr:"couldn't fetch", evFetching:"fetching…", evChild:"open subagent chat →",
+    liveScan:"connecting…", liveQuiet:"no events yet.",
+    liveErr:"live watcher unreachable.", liveNone:"no active sessions.",
+    liveFeed:"feed", liveAll:"all sessions", liveOpen:"open transcript →",
+    liveThink:"thinking", liveUser:"you typed", liveReply:"replying", liveFail:"✗",
+    liveDone:"done", liveInt:"interrupted", liveSize:"text size",
+    liveTurn:"turn", liveNew:"new", liveNotify:"notify", liveReconnect:"reconnecting…",
+    liveStalled:"stalled", liveQueued:"queued", liveArchive:"archive",
+    stSynced:"synced", stIndexing:"indexing…", stNoIndex:"no index",
+    stIndexErr:"index error", stKeywordOnly:"keyword only", stNoAffect:"no affect data",
+    stIndexingFull:"rebuilding the index…", stClickRefresh:"click to reindex now",
+    liveResume:"resume in cli →", liveResuming:"opening…", liveResumed:"opened ✓",
+    liveResumeErr:"couldn't open", detResume:"resume in cli",
+    liveCompact:"compact", liveCozy:"cozy",
+    pvTurns:"turns", pvCalls:"tool calls", pvHot:"ran hot", pvAgents:"agents", pvSubs:"subagent runs",
+    pcHeat:"heat by agent", pcHeatEm:"share of your turns that read frustrated",
+    pcRel:"reliability", pcRelEm:"tool-call failure rate",
+    pcTools:"tool mix", pcHot:"hottest sessions", pcHotEm:"by juice · click to open",
+    relNA:"not recorded by this agent's store",
   },
   kawaii:{
     askPh:"ask me anything about your chats~  ✿ which buddy made you poutiest?",
     askBtn:"ask ♡", vExplore:"wander", vPulse:"feelings",
     findPh:'peek inside chats~ ♡ enter = vibe', findClear:"clear ✕",
-    groupLab:"sort by", gConcept:"topic", gAgent:"buddy", gProject:"project", gNone:"all",
-    sSize:"biggest", sRecent:"newest", sHeat:"poutiest",
+    groupLab:"group by", gDate:"when", gConcept:"topic", gAgent:"buddy", gProject:"project", gNone:"all",
+    sortLab:"sort by", sSize:"biggest", sRecent:"newest", sHeat:"poutiest",
+    dToday:"today ♡", dYest:"yesterday", dWeek:"this week", dMonth:"this month", dOlder:"a while ago ;;",
+    recentHead:"fresh chats ♡", convClear:"all done ♡",
     heroFootA:"chats tucked away ♡", heroFootB:"with a mood diary ✿",
     statChats:"chats ♡", statTurns:"messages", statVibes:"mood diaries",
     searchHead:"vibe search", searchExit:"nvm ♡", searchBusy:"peeking through every chat~",
     searchEmpty:"hmm, nothing matches that ;;", searchWarm:"i need a little warm-up first~ ♡",
     turnsWord:"messages", hotWord:"pouty", peakWord:"poutiest",
     arcDefault:"mood diary", calmWord:"comfy", hotWordY:"pouty",
-    arcLegend:"top = comfy, bottom = pouty ♡ the ring is the poutiest moment · the numbered dots are mood wobbles, listed below",
+    arcRage:"pouty", arcHype:"happy ♡", arcClick:"hover to peek · tap to hop to that moment~",
     tpTurn:"moment", tpShift:"mood wobble ♡", replyLabel:"what they said ♡", answeredBy:"answered by",
     txHead:"everything you said", txYours:"messages ♡", txAll:"all", txHot:"pouty",
     txShow:"show", txMore:"more", txLeft:"to go",
@@ -987,21 +1899,44 @@ const COPY={
     secProj:"poutiest projects", secProjEm:"at least 50 messages",
     secTime:"pouty over time", secTimeEm:"% of each week that got grumpy", hotPctWord:"pouty",
     emptyNoMatch:"no cozy chats match ;;<br>try a softer filter ♡", emptyNoIndex:"nothing's here yet ♡<br>let me get cozy first~",
+    emptyZero:"no chats yet ♡<br><br>run <b>python up.py</b> and i'll gather everything~<br><br>(claude · codex · opencode · antigravity)",
     opening:"opening up~ ♡", chatErr:"aw, this one won't open ;;", loadingStats:"counting feelings~",
     noStats:"no feelings to show yet ;;", notEnough:"not enough yet ♡",
+    vLive:"right now ♡", evWord:"little chores", evErrWord:"oopsies", evIn:"they tried", evOut:"it said",
+    evFull:"the whole thing ⤢", evFullErr:"couldn't grab it ;;", evFetching:"grabbing~", evChild:"peek at the helper →",
+    liveScan:"peeking around~", liveQuiet:"all quiet ♡ chores show up as your buddies work~",
+    liveErr:"can't see right now ;;", liveNone:"nobody's working yet ♡",
+    liveFeed:"busy feed", liveAll:"all buddies", liveOpen:"read the chat →",
+    liveThink:"thinking~", liveUser:"you said", liveReply:"answering ♡", liveFail:"✗",
+    liveDone:"all done ♡", liveInt:"paused ;;", liveSize:"size~",
+    liveTurn:"moment", liveNew:"new ♡", liveNotify:"tell me~", liveReconnect:"reconnecting ;;",
+    liveStalled:"fell asleep ;;", liveQueued:"waiting ♡", liveArchive:"past chats ♡",
+    stSynced:"fresh ♡", stIndexing:"gathering…", stNoIndex:"no memories yet ;;",
+    stIndexErr:"index owie ;;", stKeywordOnly:"simple search only~", stNoAffect:"no feelings data yet~",
+    stIndexingFull:"gathering your chats~ ♡", stClickRefresh:"tap to refresh me ♡",
+    liveResume:"hop back in →", liveResuming:"opening~", liveResumed:"there you go ♡",
+    liveResumeErr:"couldn't open ;;", detResume:"hop back in",
+    liveCompact:"tiny", liveCozy:"cozy ♡",
+    pvTurns:"messages", pvCalls:"little chores", pvHot:"got pouty", pvAgents:"buddies", pvSubs:"helper runs",
+    pcHeat:"pouty meter", pcHeatEm:"how often each buddy made you grumpy",
+    pcRel:"oopsie rate", pcRelEm:"chores that went wrong",
+    pcTools:"chore mix", pcHot:"spiciest chats", pcHotEm:"tap to peek ♡",
+    relNA:"this buddy doesn't tell ;;",
   },
   web99:{
     askPh:"Search your conversations...", askBtn:"Search", vExplore:"Directory", vPulse:"Statistics",
     findPh:'Search content (live).  Enter = meaning.', findClear:"[clear]",
-    groupLab:"Sort:", gConcept:"Topic", gAgent:"Program", gProject:"Folder", gNone:"All",
-    sSize:"Size", sRecent:"Recent", sHeat:"Heat",
+    groupLab:"Group:", gDate:"Date", gConcept:"Topic", gAgent:"Program", gProject:"Folder", gNone:"All",
+    sortLab:"Sort:", sSize:"Size", sRecent:"Recent", sHeat:"Heat",
+    dToday:"Today", dYest:"Yesterday", dWeek:"This Week", dMonth:"This Month", dOlder:"Older",
+    recentHead:"What's New", convClear:"[clear]",
     heroFootA:"documents indexed.", heroFootB:"with mood charts.",
     statChats:"documents", statTurns:"messages", statVibes:"mood charts",
     searchHead:"Search results", searchExit:"[back]", searchBusy:"Searching the archive...",
     searchEmpty:"No documents matched your query.", searchWarm:"The search index is warming up.",
     turnsWord:"messages", hotWord:"heated", peakWord:"peak",
     arcDefault:"Mood Chart", calmWord:"calm", hotWordY:"heated",
-    arcLegend:"Top = calm, bottom = heated. Circle marks the peak. Numbered dots mark the turning points, listed below.",
+    arcRage:"Heat", arcHype:"Positive", arcClick:"Hover for the message. Click to jump to that turn.",
     tpTurn:"Turn", tpShift:"Mood change", replyLabel:"View response", answeredBy:"Answered by",
     txHead:"Transcript", txYours:"messages", txAll:"All", txHot:"Heated",
     txShow:"Show", txMore:"more", txLeft:"remaining",
@@ -1010,8 +1945,29 @@ const COPY={
     secProj:"Heat by Folder", secProjEm:"Minimum 50 messages",
     secTime:"Heat Over Time", secTimeEm:"Percent of weekly messages running hot", hotPctWord:"heated",
     emptyNoMatch:"No documents match.<br>Try a broader filter.", emptyNoIndex:"Index not found.<br>Please start the server.",
+    emptyZero:"No documents in the index.<br><br>Run <b>python up.py</b> to import your agent history.<br><br>Supported: Claude Code, Codex, opencode, Antigravity.",
     opening:"Loading document...", chatErr:"Document could not be loaded", loadingStats:"Compiling statistics...",
     noStats:"No statistics available", notEnough:"Insufficient data",
+    vLive:"Live", evWord:"operations", evErrWord:"failed", evIn:"Input", evOut:"Output",
+    evFull:"View full record", evFullErr:"Retrieval failed", evFetching:"Retrieving...", evChild:"Open sub-process →",
+    liveScan:"Scanning...", liveQuiet:"No activity. Operations appear as programs run.",
+    liveErr:"Monitor unavailable.", liveNone:"No active programs detected.",
+    liveFeed:"Activity log", liveAll:"All programs", liveOpen:"Open transcript →",
+    liveThink:"Processing", liveUser:"User input", liveReply:"Responding", liveFail:"FAILED",
+    liveDone:"Idle", liveInt:"Interrupted", liveSize:"Text size",
+    liveTurn:"Turn", liveNew:"new", liveNotify:"Alerts", liveReconnect:"Reconnecting...",
+    liveStalled:"Stalled", liveQueued:"queued", liveArchive:"Archive",
+    stSynced:"Synced", stIndexing:"Indexing…", stNoIndex:"No index",
+    stIndexErr:"Index error", stKeywordOnly:"keyword search only", stNoAffect:"no mood data",
+    stIndexingFull:"Rebuilding the index…", stClickRefresh:"Click to reindex now",
+    liveResume:"Resume in CLI →", liveResuming:"Launching...", liveResumed:"Launched ✓",
+    liveResumeErr:"Launch failed", detResume:"Resume in CLI",
+    liveCompact:"Compact", liveCozy:"Comfortable",
+    pvTurns:"Messages", pvCalls:"Operations", pvHot:"Ran heated", pvAgents:"Programs", pvSubs:"Sub-processes",
+    pcHeat:"Heat by Program", pcHeatEm:"Share of messages that read frustrated",
+    pcRel:"Reliability", pcRelEm:"Operation failure rate",
+    pcTools:"Operation Mix", pcHot:"Most Heated Documents", pcHotEm:"Click to open",
+    relNA:"Not recorded",
   },
 };
 const THEMES=[["forensic","◐ forensic"],["kawaii","✿ kawaii"],["web99","▦ 1999"]];
@@ -1021,14 +1977,72 @@ function applyCopy(){
   document.querySelectorAll("[data-c]").forEach(el=>el.textContent=C(el.dataset.c));
   document.querySelectorAll("[data-cp]").forEach(el=>el.placeholder=C(el.dataset.cp));
 }
-let BOOTED=false;
+let BOOTED=false,STATS=null,STATUS=null,REIDXING=false;
+// honest, self-driving status chip. It reflects what the server is doing — "indexing…"
+// while the auto-indexer runs, "synced 2m ago" when idle — and clicking it forces a
+// refresh. No "go run a command": the running app indexes itself.
+async function refreshStatus(){
+  const el=$("statuschip");if(!el)return;
+  let s;try{s=await J("/status");}catch(e){el.style.display="none";return;}
+  STATUS=s;
+  const idx=s.indexer||{},age=s.index_age_s;
+  const rel=age==null?null:ago(Date.now()-age*1000);
+  const werr=idx.last_err||(s.watcher&&s.watcher.last_err)||"";
+  let label,cls="";
+  if(idx.phase==="indexing"||REIDXING){label=`<span class="sdot"></span>${C('stIndexing')}`;}
+  else if(idx.phase==="error"||werr){label=C('stIndexErr');cls=" err";}
+  else if(age==null){label=C('stNoIndex');}
+  else{label=`${C('stSynced')} ${rel}`;if(age>86400)cls=" warn";}
+  const sem=s.semantic==="off"?` · ${C('stKeywordOnly')}`:"";
+  el.innerHTML=label+sem;
+  el.className="statuschip clickable"+cls;
+  // newly-indexed sessions land in the rail: if a run just finished, pull fresh chats
+  if(STATUS_PREV&&STATUS_PREV.phase==="indexing"&&idx.phase!=="indexing")reloadChats();
+  STATUS_PREV=idx;
+  el.title=[
+    age==null?C('stNoIndex'):`${C('stSynced')} ${rel} · ${fmt(s.n_sessions)} ${C('statChats')} · ${fmt(s.n_msgs)} ${C('statTurns')}`,
+    idx.phase==="indexing"?C('stIndexingFull'):C('stClickRefresh'),
+    `semantic: ${s.semantic}`,
+    `arcs ${fmt(s.coverage.vibes)} · summaries ${fmt(s.coverage.summaries)}`+(s.coverage.emotions?"":` · ${C('stNoAffect')}`),
+    werr?`! ${werr}`:"",
+  ].filter(Boolean).join("\n");
+  el.style.display="";
+  el.onclick=forceReindex;
+}
+let STATUS_PREV=null;
+async function forceReindex(){
+  if(REIDXING||(STATUS&&STATUS.indexer&&STATUS.indexer.phase==="indexing"))return;
+  if(STATUS&&STATUS.indexer&&STATUS.indexer.available===false)return; // no binary to run
+  REIDXING=true;refreshStatus();
+  try{await fetch("/reindex",{method:"POST"});}catch(e){}
+  // poll until the run completes, then let refreshStatus pick up the result
+  setTimeout(function chk(){J("/status").then(s=>{
+    REIDXING=false;STATUS=s;refreshStatus();
+    if(s.indexer&&s.indexer.phase==="indexing")setTimeout(chk,2000);
+  }).catch(()=>{REIDXING=false;});},1500);
+}
+// after an index run, refresh the rail's chat list in place (preserve scroll/selection)
+async function reloadChats(){
+  try{
+    const fresh=await J("/chats");
+    CHATS=fresh;CHATS.forEach(c=>bySession[c.session]=c);CHATCACHE.clear();CHATSAT=Date.now();
+    if(STATE.view==="explore"&&!SEARCH.active){const l=$("list"),st=l?l.scrollTop:0;renderRail();const l2=$("list");if(l2)l2.scrollTop=st;}
+    renderStat();
+  }catch(e){}
+}
 function renderStat(){
+  // corpus size only — pipeline-internal subsets (summarized / vibe counts) are noise here
+  if(STATS){
+    $("stat").innerHTML=`<b>${fmt(STATS.n_sessions)}</b> ${C('statChats')} · <b>${fmt(STATS.n_msgs)}</b> ${C('statTurns')}`;
+    return;
+  }
   if(!CHATS.length)return;
-  const turns=CHATS.reduce((s,c)=>s+c.n_msgs,0), hot=CHATS.filter(c=>c.has_vibe).length;
-  $("stat").innerHTML=`<b>${fmt(CHATS.length)}</b> ${C('statChats')} · <b>${fmt(turns)}</b> ${C('statTurns')} · <b>${hot}</b> ${C('statVibes')}`;
+  const turns=CHATS.reduce((s,c)=>s+c.n_msgs,0);
+  $("stat").innerHTML=`<b>${fmt(CHATS.length)}</b> ${C('statChats')} · <b>${fmt(turns)}</b> ${C('statTurns')}`;
 }
 function rerenderView(){
   if(STATE.view==="pulse"){renderPulse();return;}
+  if(STATE.view==="live"){startLive();return;}
   if(STATE.sel&&LASTD){$("view").innerHTML=detailHTML(LASTD);wireDetail(LASTD);}
   else{$("view").innerHTML="";showPlaceholder();}
 }
@@ -1048,13 +2062,56 @@ async function boot(){
   try{
     CHATS=(P.chats?await P.chats:null)||await J("/chats");
     CONCEPTS=(P.concepts?await P.concepts:null)||await J("/concepts").catch(()=>[]);
+    STATS=(P.stats?await P.stats:null);
   }catch(e){$("list").innerHTML=`<div class="empty">${C('emptyNoIndex')}</div>`;return;}
   CHATS.forEach(c=>bySession[c.session]=c);
+  if(STATS&&STATS.user_seg)GENERICSEG.add(STATS.user_seg); // whoever runs tilt
   BOOTED=true;
+  syncSegs();
   renderStat();
-  renderRail();showPlaceholder();
+  renderRail();
+  if(location.hash){HASHME=location.hash;applyHash();}
+  else showPlaceholder();
+  liveBadge();setInterval(liveBadge,45000); // live-activity dot on the view toggle
+  refreshStatus();setInterval(refreshStatus,60000); // index-age / tier chip
+  ensureStream(); // rail overlay: chats bump/appear the moment any agent works
 }
 boot();
+
+// ---- draggable rail width, persisted ----
+(()=>{
+  const w=+(PREF("tiltRailW")||0);
+  if(w)document.documentElement.style.setProperty("--railw",Math.max(240,Math.min(640,w))+"px");
+  const g=$("gutter");if(!g)return;
+  g.onmousedown=e=>{
+    e.preventDefault();g.classList.add("drag");
+    document.body.style.userSelect="none";
+    const move=ev=>document.documentElement.style.setProperty(
+      "--railw",Math.max(240,Math.min(640,ev.clientX))+"px");
+    const up=ev=>{
+      document.removeEventListener("mousemove",move);
+      document.removeEventListener("mouseup",up);
+      g.classList.remove("drag");document.body.style.userSelect="";
+      try{localStorage.setItem("tiltRailW",String(Math.max(240,Math.min(640,ev.clientX))));}catch(e2){}
+    };
+    document.addEventListener("mousemove",move);
+    document.addEventListener("mouseup",up);
+  };
+})();
+
+// A tab left open across a reindex would keep stale rows forever: refetch the rail when
+// the window regains focus and the list is >2 min old. Cheap (one gzipped /chats), and
+// CHATCACHE drops too so reopened chats reflect the new index.
+let CHATSAT=Date.now();
+window.addEventListener("focus",async()=>{
+  if(!BOOTED||Date.now()-CHATSAT<120000)return;
+  CHATSAT=Date.now();
+  try{
+    const fresh=await J("/chats");
+    CHATS=fresh;CHATS.forEach(c=>bySession[c.session]=c);CHATCACHE.clear();
+    if(STATE.view==="explore"&&!SEARCH.active)renderRail();
+  }catch(e){}
+});
 </script>
 </body>
 </html>

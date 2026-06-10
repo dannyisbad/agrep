@@ -30,7 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-import numpy as np
+# numpy is needed ONLY by the embedding helpers below. Imported lazily inside them so
+# the read-only server stack (explore/report/live/native/rawfetch) runs on pure stdlib
+# -- a fresh clone can `tilt index` + serve immediately, before any ML deps exist.
 
 # --- Layout ---------------------------------------------------------------
 
@@ -129,6 +131,8 @@ def l2_normalize(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     vector has cosine 0 against everything, which is the sane fallback for an
     empty/degenerate message.
     """
+    import numpy as np  # lazy: embedding-contract helpers only
+
     mat = np.asarray(mat, dtype=np.float32)
     if mat.ndim == 1:
         mat = mat[None, :]
@@ -146,6 +150,8 @@ def matryoshka_truncate(mat: np.ndarray, dim: int = EMBED_DIM) -> np.ndarray:
     embedding once renormalized. If the model already emits <= dim columns we
     just renormalize the whole thing.
     """
+    import numpy as np  # lazy: embedding-contract helpers only
+
     mat = np.asarray(mat, dtype=np.float32)
     if mat.ndim == 1:
         mat = mat[None, :]
@@ -191,6 +197,8 @@ def write_embeddings(
     silently coercing, so a contract mismatch fails loudly here instead of in
     the Rust reader.
     """
+    import numpy as np  # lazy: embedding-contract helpers only
+
     embeddings = np.ascontiguousarray(embeddings, dtype="<f4")  # little-endian f32
     if embeddings.ndim != 2 or embeddings.shape[1] != dim:
         raise ValueError(
@@ -226,6 +234,8 @@ def write_embeddings(
 
 def write_query(vec: np.ndarray, dim: int = EMBED_DIM, query_path: Path = QUERY_PATH) -> None:
     """Write a single D-dim L2-normalized query vector to data/query.f32."""
+    import numpy as np  # lazy: embedding-contract helpers only
+
     vec = np.asarray(vec, dtype=np.float32).reshape(-1)
     if vec.shape[0] > dim:
         vec = vec[:dim]
@@ -246,6 +256,8 @@ def read_embeddings(
 ) -> tuple[list[str], np.ndarray]:
     """Read back the (ids, matrix) pair. Mirror of the Rust reader; handy for
     sanity-checking the contract from Python."""
+    import numpy as np  # lazy: embedding-contract helpers only
+
     ids = ids_path.read_text(encoding="utf-8").splitlines()
     raw = np.fromfile(embeddings_path, dtype="<f4")
     if raw.size % dim != 0:

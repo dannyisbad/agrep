@@ -28,7 +28,9 @@ SYS = ("You summarize a developer's chat session with an AI coding agent. Be spe
        "NOT begin with 'The developer', 'The user', 'The session', or 'This session'. No preamble, "
        "no hedging, no generic filler.")
 PROMPT = ("Below are the developer's messages from one session, in order. Summarize what they "
-          "were actually building or debugging in 1-2 specific sentences, then a final line "
+          "were actually building or debugging in 1-2 specific sentences, then a line "
+          "'Title: ...' with a scannable 3-8 word noun-phrase title (name the actual tech/project; "
+          "no filler like 'AI assistant' or 'session about'), then a final line "
           "'Tags: a, b, c' of 3-6 short lowercase topic tags (concrete tech/project nouns).\n\n"
           "MESSAGES:\n{body}")
 
@@ -99,7 +101,13 @@ def parse(text):
         tagline = tail.splitlines()[0] if tail.strip() else ""
         tags = [t.strip().lstrip("-*# ").lower() for t in tagline.split(",") if t.strip()]
         summary = text[:idx].strip()
-    return summary.strip(), tags
+    title = ""
+    tidx = summary.lower().rfind("title:")
+    if tidx != -1:
+        tail = summary[tidx + 6:]
+        title = (tail.splitlines()[0] if tail.strip() else "").strip().strip('"*# ').strip()
+        summary = summary[:tidx].strip()
+    return summary.strip(), title, tags
 
 
 def main() -> int:
@@ -138,14 +146,14 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             text = ""
             common.log(f"  warn: gen failed for {s[:12]}: {e}")
-        summary, tags = parse(text)
+        summary, title, tags = parse(text)
         if not summary:  # never write empty: fall back to first substantive line
             summary = next((" ".join(m.split())[:200] for m in msgs if len(m.split()) > 4), "(no summary)")
         rec = {"session": s, "agent": agent[s], "cwd_project": cwd[s],
-               "n_msgs": len(msgs), "summary": summary, "tags": tags}
+               "n_msgs": len(msgs), "title": title, "summary": summary, "tags": tags}
         done += 1
         if args.smoke:
-            print(f"\n[{agent[s]} · {cwd[s]} · {len(msgs)} msgs]\n  {summary}\n  tags: {', '.join(tags)}")
+            print(f"\n[{agent[s]} · {cwd[s]} · {len(msgs)} msgs]\n  {title}\n  {summary}\n  tags: {', '.join(tags)}")
         else:
             f_out.write(json.dumps(rec) + "\n")
             if done % 25 == 0:

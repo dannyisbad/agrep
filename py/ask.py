@@ -28,7 +28,7 @@ import common
 from embed import CANDIDATES as EMB_CANDIDATES, build_loader, is_qwen, QWEN_QUERY_INSTRUCTION
 
 OLLAMA_URL = "http://localhost:11434"
-# tool-capable models, primary first. gemma4 e4b (Apache-2.0, ungated, has tools) per Danny;
+# tool-capable models, primary first. gemma4 e4b (Apache-2.0, ungated, has tools) per the user;
 # qwen2.5 kept as a reliable tool-calling fallback.
 LLM_MODELS = ["gemma4:e4b-it-qat", "gemma4:e4b", "qwen2.5:3b-instruct", "qwen2.5:7b-instruct"]
 
@@ -85,8 +85,10 @@ def tool_search_chats(query: str, k: int = 5) -> str:
     order = np.argsort(-np.asarray(scores))[:k]
     import explore
     sc = explore._session_concept()
-    out = [{"concept": sc.get(cand[i][0], ""), "project": cand[i][1].get("cwd_project", ""),
-            "agent": cand[i][1].get("agent", ""), "summary": cand[i][1].get("summary", ""),
+    out = [{"session": cand[i][0], "concept": sc.get(cand[i][0], ""),
+            "project": cand[i][1].get("cwd_project", ""),
+            "agent": cand[i][1].get("agent", ""), "title": cand[i][1].get("title", ""),
+            "summary": cand[i][1].get("summary", ""),
             "tags": cand[i][1].get("tags", []), "n_msgs": cand[i][1].get("n_msgs", 0)} for i in order]
     return json.dumps(out)
 
@@ -198,7 +200,11 @@ def ask(question: str, model: str | None = None) -> dict:
     msgs = [
         {"role": "system", "content": "You are tilt, an assistant over the user's own coding-chat history. "
          "Use the tools to look things up before answering. Be concise and factual. Cite project/agent names. "
-         "Prefer the concept/topic name over a generic folder name like 'Users/Danny'."},
+         "Prefer the concept/topic name over a generic folder name like 'Users/<you>'. "
+         "Chain tools before answering: a ranking or list tells you WHICH, not WHY — when the "
+         "question asks why/what-happened/what-about, follow up with search_chats or "
+         "search_messages on the top result instead of answering that the data doesn't say. "
+         "Never claim the data lacks detail until a search tool has come back empty."},
         {"role": "user", "content": question},
     ]
     steps = []

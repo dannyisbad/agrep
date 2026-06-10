@@ -14,12 +14,24 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 import common
 
 HOT_T = 0.15          # ~p90 of rage_raw; above this a message "reads hot"
 MIN_AGENT = 500       # gate: agents need this many msgs to rank (kills tiny-sample noise)
 MIN_PROJECT = 50
+
+# A home/desktop cwd carries no project signal (mirrors the explorer's isGenericDir):
+# a bare "Users/<name>" topping the hottest-projects chart is a bucketing artifact.
+_USER_SEG = Path.home().name.lower()
+_GENERIC_SEG = {"users", "user", _USER_SEG, "desktop", "documents", "downloads", "home",
+                "tmp", "temp", "appdata", "onedrive", "", ".", "·", "?", "unknown"}
+
+
+def is_generic_dir(name: str) -> bool:
+    segs = [s for s in str(name or "").lower().replace("\\", "/").split("/") if s]
+    return not segs or all(s in _GENERIC_SEG for s in segs)
 
 
 def _emotions() -> dict[str, dict]:
@@ -73,7 +85,7 @@ def build_data() -> dict:
         return sorted(out, key=lambda r: r["hot_pct"], reverse=True)
 
     agents = rows(per_agent, MIN_AGENT)
-    projects = rows(per_proj, MIN_PROJECT)[:16]
+    projects = [r for r in rows(per_proj, MIN_PROJECT) if not is_generic_dir(r["name"])][:16]
     timeline = [{"week": w, **weeks[w]} for w in sorted(weeks)]
     timeline = [{"week": t["week"], "msgs": t["msgs"], "hot_pct": round(t["hot"] / t["msgs"] * 100, 1)}
                 for t in timeline if t["msgs"] >= 10]
@@ -88,7 +100,29 @@ def build_data() -> dict:
                 traces.append(json.loads(p.read_text(encoding="utf-8")))
 
     overall_hot = round(sum(a["hot_pct"] * a["msgs"] for a in agents) / max(1, sum(a["msgs"] for a in agents)), 1)
+
+    # Event rollup (tool mix, per-agent reliability) -- materialized by the Rust indexer
+    # at `tilt index` time so this stays a single small file read.
+    events = {}
+    ep = common.DATA_DIR / "event_stats.json"
+    if ep.exists():
+        try:
+            events = json.loads(ep.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            events = {}
+
+    # Hottest-sessions leaderboard: the vibe index already ranks by juice and is tiny;
+    # the full traces (with per-turn arrays) stay out of this payload.
+    vibe_top = []
+    if idx.exists():
+        try:
+            rows_v = json.loads(idx.read_text(encoding="utf-8"))
+            vibe_top = sorted(rows_v, key=lambda r: -r.get("juice", 0))[:10]
+        except json.JSONDecodeError:
+            pass
+
     return {"agents": agents, "projects": projects, "timeline": timeline, "traces": traces,
+            "events": events, "vibe_top": vibe_top,
             "total": total, "overall_hot": overall_hot, "hottest": agents[0]["name"] if agents else "-"}
 
 

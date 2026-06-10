@@ -2,13 +2,18 @@
 
 This is the cheap, always-on first pass that decides how each message "reads"
 emotionally and which messages are ambiguous enough to escalate. It uses a
-GoEmotions text-classification model (multi-label, 28 emotions + neutral).
+GoEmotions-label text-classification model (multi-label, 28 emotions + neutral).
 
-  PRIMARY  : cirimus/modernbert-base-go-emotions
-  FALLBACK : SamLowe/roberta-base-go_emotions
+  PRIMARY  : alex-shvets/roberta-large-emopillars-contextless-goemotions
+  FALLBACKS: cirimus/modernbert-base-go-emotions, SamLowe/roberta-base-go_emotions
 
-Both expose the standard 28 GoEmotions labels, so the rage/hype groupings below
-are identical regardless of which one loads.
+Why Emo Pillars first: models fine-tuned only on GoEmotions (Reddit comments)
+degrade badly out-of-domain -- a 2026 human-validation study measured a vanilla
+RoBERTa-GoEmotions at 33.6% F1 on real-world comments. Dev-chat is far out of
+that domain. Emo Pillars (arXiv:2504.16856) distills from LLM-generated diverse
+contexts specifically to survive domain shift, then this checkpoint maps back to
+the standard 28 GoEmotions labels -- so it slots into the same rage/hype
+groupings with no downstream change.
 
 For each message we emit one line of data/emotions.jsonl:
   {
@@ -56,8 +61,8 @@ from pathlib import Path
 
 import common
 
-PRIMARY = "cirimus/modernbert-base-go-emotions"
-FALLBACKS = ["SamLowe/roberta-base-go_emotions"]
+PRIMARY = "alex-shvets/roberta-large-emopillars-contextless-goemotions"
+FALLBACKS = ["cirimus/modernbert-base-go-emotions", "SamLowe/roberta-base-go_emotions"]
 CANDIDATES = [PRIMARY] + FALLBACKS
 
 # GoEmotions groupings the tilt scoring layer expects. Label spellings match the
@@ -149,13 +154,34 @@ def build_loader(device: str, max_len: int = 256):
     return loader
 
 
+# The canonical 28-label GoEmotions order. The Emo Pillars checkpoints ship a bare
+# numeric id2label ("0".."27"), so we translate indices to names here (verified
+# against the model card's example code -- same order as the original dataset).
+GOEMOTIONS_ORDER = (
+    "admiration", "amusement", "anger", "annoyance", "approval", "caring",
+    "confusion", "curiosity", "desire", "disappointment", "disapproval", "disgust",
+    "embarrassment", "excitement", "fear", "gratitude", "grief", "joy", "love",
+    "nervousness", "optimism", "pride", "realization", "relief", "remorse",
+    "sadness", "surprise", "neutral",
+)
+
+
 def score_to_dict(scored) -> dict[str, float]:
     """Normalize one pipeline output (list of {label,score}) to {label: score}.
 
-    With top_k=None the pipeline returns, per input, a list of dicts. We lower
-    the label so RAGE_LABELS/HYPE_LABELS match regardless of model casing.
+    With top_k=None the pipeline returns, per input, a list of dicts. Labels are
+    lowered so RAGE_LABELS/HYPE_LABELS match regardless of model casing; bare
+    numeric labels ("3" / "LABEL_3") are mapped through GOEMOTIONS_ORDER.
     """
-    return {item["label"].lower(): float(item["score"]) for item in scored}
+    out: dict[str, float] = {}
+    for item in scored:
+        lbl = str(item["label"]).lower()
+        if lbl.startswith("label_"):
+            lbl = lbl[6:]
+        if lbl.isdigit() and int(lbl) < len(GOEMOTIONS_ORDER):
+            lbl = GOEMOTIONS_ORDER[int(lbl)]
+        out[lbl] = float(item["score"])
+    return out
 
 
 def group_sum(scores: dict[str, float], labels: tuple[str, ...]) -> float:

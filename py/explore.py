@@ -8,6 +8,7 @@ file read over the already-built index, so the explorer is instant:
   chats_in_concept(cid)  -> the summarized chats that belong to one concept thread
   get_chat(session)      -> one chat's full detail: summary + per-turn transcript w/ affect
   get_vibe(session)      -> the on-demand vibe-trace arc, or None
+  stats()                -> honest corpus totals (all sessions/msgs, not just summarized)
 
 Built on: data/summaries.jsonl, data/emotions.jsonl, data/messages.jsonl,
 data/concepts.json, data/session_concepts.jsonl, data/vibe/*.json.
@@ -18,18 +19,50 @@ from __future__ import annotations
 import functools
 import json
 import re
+from pathlib import Path
 
 import common
 
 HOT_T = 0.15  # same threshold report.py uses: a message above this "reads hot"
+EVENTS_DIR_NAME = "events"
 # Claude's compaction summary is logged as a user message; tag it as a "recap" rather than
-# treating it as something Danny wrote (it's machine-generated continuation context).
+# treating it as something the user wrote (it's machine-generated continuation context).
 RECAP_PREFIX = "This session is being continued from a previous conversation"
 
 
 # --------------------------------------------------------------------------- caches
 # The index is static between rebuilds; cache the parsed tables so repeat requests
-# (every chat the user opens) don't re-read 58 MB of messages.jsonl.
+# (every chat the user opens) don't re-read 58 MB of messages.jsonl. BUT the server
+# is long-lived and reindexes happen under it, so every public entry point first
+# checks a generation stamp (mtime+size of the index files) and drops all caches
+# when the index moved -- otherwise the explorer serves week-old rows until restart.
+
+_GEN_FILES = ("messages.jsonl", "summaries.jsonl", "emotions.jsonl", "replies.jsonl",
+              "concepts.json", "session_concepts.jsonl", "vibe/index.json",
+              "sessions.jsonl")
+_GEN: tuple | None = None
+
+
+def _freshen() -> None:
+    global _GEN
+    gen = []
+    for name in _GEN_FILES:
+        try:
+            st = (common.DATA_DIR / name).stat()
+            gen.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            gen.append(None)
+    gen = tuple(gen)
+    if gen == _GEN:
+        return
+    if _GEN is not None:  # first call just records; later changes invalidate
+        for fn in (_vibe_index, _summaries, _concept_names, _session_concept,
+                   _concept_sessions, _summary_by_session, _messages_by_session,
+                   _emotions_by_id, _replies_by_id, _kw_corpus, _event_sessions,
+                   _session_index):
+            fn.cache_clear()
+    _GEN = gen
+
 
 @functools.lru_cache(maxsize=1)
 def _vibe_index() -> dict[str, dict]:
@@ -94,6 +127,33 @@ def _concept_sessions() -> dict[int, list[dict]]:
 @functools.lru_cache(maxsize=1)
 def _summary_by_session() -> dict[str, dict]:
     return {o["session"]: o for o in _summaries()}
+
+
+@functools.lru_cache(maxsize=1)
+def _session_index() -> dict[str, dict]:
+    """session -> tiny aggregate {agent, project, n, first_ts, last_ts, first_text}.
+    Materialized by `tilt index` (data/sessions.jsonl, ~2 MB) precisely so the rail
+    never has to parse the ~50 MB messages.jsonl. Falls back to deriving the same
+    shape from the big file for indexes built before sessions.jsonl existed."""
+    p = common.DATA_DIR / "sessions.jsonl"
+    out: dict[str, dict] = {}
+    if p.exists():
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    o = json.loads(line)
+                    out[o["session"]] = o
+        return out
+    for s, rows in _messages_by_session().items():
+        first = next((r.get("text", "") for r in sorted(rows, key=lambda r: r.get("turn", 0))
+                      if r.get("text", "").strip()
+                      and not r["text"].startswith(RECAP_PREFIX)), "")
+        out[s] = {"session": s, "agent": rows[0].get("agent", ""),
+                  "project": rows[0].get("project", ""), "n": len(rows),
+                  "first_ts": min((r.get("ts", 0) for r in rows if r.get("ts", 0)), default=0),
+                  "last_ts": max((r.get("ts", 0) for r in rows), default=0),
+                  "first_text": " ".join(first.split())[:120]}
+    return out
 
 
 @functools.lru_cache(maxsize=1)
@@ -172,13 +232,15 @@ def _kw_corpus() -> list[dict]:
         for o in rows:
             t = o.get("text", "") or ""
             if t:
-                out.append({"session": session, "turn": o.get("turn", 0), "agent": o.get("agent", ""),
+                out.append({"session": session, "turn": o.get("turn", 0), "ts": o.get("ts", 0),
+                            "agent": o.get("agent", ""),
                             "project": o.get("project", ""), "concept": c,
                             "who": "recap" if t.startswith(RECAP_PREFIX) else "you",
                             "text": t, "low": t.lower()})
             r = reps.get(o.get("id", ""), "")
             if r:
-                out.append({"session": session, "turn": o.get("turn", 0), "agent": o.get("agent", ""),
+                out.append({"session": session, "turn": o.get("turn", 0), "ts": o.get("ts", 0),
+                            "agent": o.get("agent", ""),
                             "project": o.get("project", ""), "concept": c,
                             "who": "agent", "text": r, "low": r.lower()})
     return out
@@ -186,40 +248,66 @@ def _kw_corpus() -> list[dict]:
 
 def warm_caches() -> None:
     """Pre-build every read cache so even the first chat-open / search is instant (server boot)."""
-    _summaries(); _summary_by_session(); _session_concept()
+    _session_index(); _summaries(); _summary_by_session(); _session_concept()
     _messages_by_session(); _emotions_by_id(); _replies_by_id(); _kw_corpus()
 
 
 # --------------------------------------------------------------------------- endpoints
 
 def list_chats() -> list[dict]:
-    """One row per summarized session, newest-feeling first (by message count desc as a
-    proxy for substance; the client re-sorts). Carries the vibe flag so the list can mark
-    chats that have an emotional arc to open."""
+    """Every session worth a rail row, newest-feeling first (the client re-sorts).
+
+    Summarized sessions carry their title/summary/tags/vibe. UNSUMMARIZED sessions are
+    included too (>= 2 messages -- the 14k one-shot throwaways stay reachable through
+    keyword search), titled by their first typed message and flagged `thin` so the UI
+    can dim them. This is what makes a fresh install useful immediately: the rail fills
+    straight from `tilt index`, before any LLM stage has ever run. When NO summaries
+    exist yet, even 1-message sessions are listed rather than an empty rail."""
+    _freshen()
     vib = _vibe_index()
     concept = _session_concept()
-    msgs = _messages_by_session()
+    idx = _session_index()
     out = []
+    seen = set()
     for o in _summaries():
         s = o["session"]
         v = vib.get(s)
-        rows = msgs.get(s, [])
-        last_ts = max((r.get("ts", 0) for r in rows), default=0)
-        # prefer the freshly-ingested project on the message rows (the inferred primary
-        # working dir) over the summary's stale cwd_project, so the rail reflects re-index.
-        project = (rows[0].get("project") if rows else "") or o.get("cwd_project", "")
+        row = idx.get(s) or {}
+        seen.add(s)
         out.append({
             "session": s,
             "agent": o.get("agent", ""),
-            "project": project,
+            # prefer the freshly-ingested project (the inferred most-worked-in dir)
+            # over the summary's stale cwd_project, so the rail reflects re-index.
+            "project": row.get("project") or o.get("cwd_project", ""),
             "concept": concept.get(s, ""),
             "n_msgs": o.get("n_msgs", 0),
-            "last_ts": last_ts,
+            "last_ts": row.get("last_ts", 0),
+            "title": o.get("title", ""),
             "summary": o.get("summary", ""),
             "tags": o.get("tags", []),
             "has_vibe": v is not None,
             "juice": round(v["juice"], 2) if v else None,
             "verdict": v.get("verdict", "") if v else "",
+        })
+    floor = 2 if out else 1
+    for s, row in idx.items():
+        if s in seen or row.get("n", 0) < floor:
+            continue
+        out.append({
+            "session": s,
+            "agent": row.get("agent", ""),
+            "project": row.get("project", ""),
+            "concept": concept.get(s, ""),
+            "n_msgs": row.get("n", 0),
+            "last_ts": row.get("last_ts", 0),
+            "title": row.get("first_text", "")[:90],
+            "summary": "",
+            "tags": [],
+            "thin": True,
+            "has_vibe": False,
+            "juice": None,
+            "verdict": "",
         })
     out.sort(key=lambda r: r["n_msgs"], reverse=True)
     return out
@@ -227,6 +315,7 @@ def list_chats() -> list[dict]:
 
 def list_concepts(k: int = 40) -> list[dict]:
     """Concept threads (already ranked by n_messages in concepts.json)."""
+    _freshen()
     p = common.DATA_DIR / "concepts.json"
     if not p.exists():
         return []
@@ -247,6 +336,7 @@ def chats_in_concept(concept_id: int) -> dict:
     concept' view: the spine that fixes the cwd-bucketing problem. Each chat row is the
     session_concepts record, enriched with its summary/tags + vibe flag when those exist
     (most sessions are too small to have a summary, so those fields are just empty)."""
+    _freshen()
     recs = json.loads((common.DATA_DIR / "concepts.json").read_text(encoding="utf-8"))
     head = next((r for r in recs if r["concept_id"] == concept_id), None)
     if head is None:
@@ -307,11 +397,12 @@ def keyword_search(q: str, k: int = 300) -> dict:
     reply. Returns EVERY hit (one row per match, like grep) grouped by chat. Scans the
     pre-lowercased corpus, with a plain-substring fast path for single-token queries (the
     common case while typing), so it's fast enough to run live on every keystroke."""
+    _freshen()
     q = q.strip()
     if not q:
         return {"hits": [], "total": 0, "chats": 0}
     corpus = _kw_corpus()
-    fields = ("session", "agent", "project", "concept", "turn", "who")
+    fields = ("session", "agent", "project", "concept", "turn", "ts", "who")
     toks = [t for t in re.split(r"[\s\-_]+", q) if t]
     hits = []
     if len(toks) <= 1:  # single token -> plain substring (fastest)
@@ -330,6 +421,24 @@ def keyword_search(q: str, k: int = 300) -> dict:
     return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
 
+def stats() -> dict:
+    """Honest corpus totals. The rail lists only summarized sessions, but keyword search
+    reaches every message of every session — these numbers describe that full corpus so
+    the UI never undersells (or oversells) what's actually indexed."""
+    _freshen()
+    idx = _session_index()
+    return {
+        "n_sessions": len(idx),
+        "n_msgs": sum(r.get("n", 0) for r in idx.values()),
+        "n_summarized": len(_summaries()),
+        "n_summarized_msgs": sum(o.get("n_msgs", 0) for o in _summaries()),
+        "n_vibes": len(_vibe_index()),
+        # the username path segment, so the web client can treat "Users/<name>" as a
+        # generic container — whoever runs tilt, without hardcoding anyone's name
+        "user_seg": Path.home().name.lower(),
+    }
+
+
 def get_vibe(session: str) -> dict | None:
     p = common.DATA_DIR / "vibe" / f"{session}.json"
     if not p.exists():
@@ -337,11 +446,55 @@ def get_vibe(session: str) -> dict | None:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+# --------------------------------------------------------------------------- events
+
+def _safe_name(s: str) -> str:
+    """Mirror of the Rust ingest's file-name sanitizer (cache.rs safe_name)."""
+    return "".join(c if (c.isascii() and c.isalnum()) or c in "-_." else "_" for c in s)
+
+
+def events_path(agent: str, session: str):
+    return common.DATA_DIR / EVENTS_DIR_NAME / f"{agent}-{_safe_name(session)}.jsonl"
+
+
+@functools.lru_cache(maxsize=1)
+def _event_sessions() -> set[str]:
+    """Set of '{agent}-{safe_session}' stems that have an event file. One scandir,
+    cached — lets list/detail rows say has_events without touching 12k files."""
+    d = common.DATA_DIR / EVENTS_DIR_NAME
+    if not d.exists():
+        return set()
+    return {p.name[:-6] for p in d.iterdir() if p.name.endswith(".jsonl")}
+
+
+def has_events(agent: str, session: str) -> bool:
+    return f"{agent}-{_safe_name(session)}" in _event_sessions()
+
+
+def get_events(agent: str, session: str) -> list[dict]:
+    """The tool/subagent event stream for one session, in ts order (as ingested).
+    Read per-request from the per-session file — small, and deliberately NOT a global
+    cache (the full corpus is ~450MB)."""
+    p = events_path(agent, session)
+    if not p.exists():
+        return []
+    out = []
+    with p.open(encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if not line.strip():
+                continue
+            o = json.loads(line)
+            o["i"] = i
+            out.append(o)
+    return out
+
+
 def get_chat(session: str) -> dict:
     """Full detail for one chat: header + per-turn transcript annotated with affect, plus the
     vibe arc if one was built. Reads from the in-process caches (messages-by-session, affect,
     replies), so each open is a dict lookup over this session's rows rather than a scan of the
     50 MB messages.jsonl (+ emotions + replies) on every request."""
+    _freshen()
     emo = _emotions_by_id()
     rep = _replies_by_id()
     rows = _messages_by_session().get(session, [])
@@ -369,12 +522,16 @@ def get_chat(session: str) -> dict:
         })
     turns.sort(key=lambda t: t["turn"])
 
-    # the chat's headline model = the one most of its turns ran on
+    # every model the chat ran on, most-used first. "<synthetic>" is claude's placeholder
+    # on harness-fabricated turns (API-error retries etc.), not a model anyone picked.
     mcount: dict[str, int] = {}
     for t in turns:
-        if t.get("model"):
-            mcount[t["model"]] = mcount.get(t["model"], 0) + 1
-    session_model = max(mcount, key=mcount.get) if mcount else ""
+        m = t.get("model", "")
+        if m and m != "<synthetic>":
+            mcount[m] = mcount.get(m, 0) + 1
+    models = [{"name": m, "n": n}
+              for m, n in sorted(mcount.items(), key=lambda kv: -kv[1])]
+    session_model = models[0]["name"] if models else ""
 
     # header from the summary record if present
     summ = _summary_by_session().get(session)
@@ -384,12 +541,17 @@ def get_chat(session: str) -> dict:
         "agent": agent or (summ.get("agent", "") if summ else ""),
         "project": project or (summ.get("cwd_project", "") if summ else ""),
         "model": session_model,
+        "models": models,
+        "first_ts": min((t["ts"] for t in turns if t["ts"]), default=0),
+        "last_ts": max((t["ts"] for t in turns if t["ts"]), default=0),
         "concept": _session_concept().get(session, ""),
+        "title": summ.get("title", "") if summ else "",
         "summary": summ.get("summary", "") if summ else "",
         "tags": summ.get("tags", []) if summ else [],
         "n_msgs": len(turns),
         "hot_n": hot_n,
         "hot_pct": round(hot_n / max(1, len(turns)) * 100, 1),
+        "has_events": has_events(agent or (summ.get("agent", "") if summ else ""), session),
         "turns": turns,
         "vibe": get_vibe(session),
     }
