@@ -1,0 +1,15 @@
+# Normalize line endings in the repo to LF, so shell scripts and source files work on
+# macOS/Linux regardless of who committed them. Windows batch files keep CRLF.
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# the unix launcher must stay LF (its shebang breaks with CRLF)
+tilt text eol=lf
+
+*.png binary
+*.jpg binary
+*.bin binary
+*.f32 binary
+*.ids binary
