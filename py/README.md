@@ -5,16 +5,20 @@ that `tilt scan` produces into (a) semantic embeddings for similarity search and
 (b) a graded affect read per message. The Rust core (`crates/tilt-core`) reads
 the files written here.
 
-A `uv` venv is expected at `py/.venv`. Use its interpreter for everything:
+A venv is expected at `py/.venv` (see the repo-root `requirements.txt`). Use its
+interpreter for the ML stages:
 
 ```
-# Windows + bash
-C:/Users/Danny/Desktop/tilt/py/.venv/Scripts/python.exe embed.py
+# Windows
+py/.venv/Scripts/python embed.py
+# macOS / Linux
+py/.venv/bin/python embed.py
 ```
 
 Requirements: `transformers>=4.51.0` (needed for Qwen3), `sentence-transformers`,
-`torch`, `numpy`. GPU target is an RTX 3080 (10GB); everything also runs on CPU
-(slower), and the code auto-detects which.
+`torch`, `numpy`, `scikit-learn`. A CUDA GPU speeds embeddings/affect up; everything
+also runs on CPU (slower), and the code auto-detects which. None of this is needed for
+the core explorer — see the repo-root README's tier table.
 
 ---
 

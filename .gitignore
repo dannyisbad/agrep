@@ -1,8 +1,24 @@
+# build output
 /target
-/data
 /dist
 *.bin
-/web/shots
-/.playwright-mcp
+
+# the built index — your entire chat history lives here. NEVER commit this.
+/data
+
+# python
 /py/.venv
 __pycache__/
+*.pyc
+
+# local scratch/debug helper
+py/_check.py
+
+# tooling / scratch
+/web/shots
+/.playwright-mcp
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
