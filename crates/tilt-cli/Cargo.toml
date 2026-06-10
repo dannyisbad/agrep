@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The ingest engine. Named distinctly from the `tilt` CLI (tilt.py) that drives it:
+# users run `tilt index`, which shells out to this `tilt-rs` binary.
 [[bin]]
-name = "tilt"
+name = "tilt-rs"
 path = "src/main.rs"
 
 [dependencies]

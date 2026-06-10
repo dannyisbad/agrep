@@ -10,12 +10,15 @@ data — it only reads. Everything stays on your machine.
 
 ```
 git clone <repo> tilt && cd tilt
-python up.py
+python tilt.py up
 ```
 
 That builds the indexer (needs [Rust](https://rustup.rs)), scans your agent stores,
 starts a local server, and opens the app. New chats show up the moment an agent writes
 one; the index keeps itself current while the server runs.
+
+Not sure what's installed? `python tilt.py doctor` reports which tiers are live and the
+exact command to unlock each missing one.
 
 ---
 
@@ -64,15 +67,16 @@ and Linux.
 ## Commands
 
 ```
-python up.py                 # index what's new, serve, open the browser (the default)
-python up.py --no-open        # serve without launching a browser
-python up.py --no-index       # serve the existing index as-is
-
-python reindex.py             # full pipeline: ingest + embeddings + affect + topics + arcs
-python reindex.py --full      # recompute every stage from scratch
-
-python py/server.py --port N  # just the server (auto-indexes in the background)
+python tilt.py up            # index what's new, serve, open the browser (the default)
+python tilt.py up --no-open   # serve without launching a browser
+python tilt.py doctor         # what's installed + what each tier needs (--fix does setup)
+python tilt.py index          # rebuild the base index only (fast, no models)
+python tilt.py reindex        # full pipeline: embeddings + affect + topics + arcs
+python tilt.py reindex --full # recompute every stage from scratch
+python tilt.py serve --port N # just the server (auto-indexes in the background)
 ```
+
+On Unix you can run `./tilt up` (a thin wrapper); on Windows, `tilt up` via `tilt.cmd`.
 
 While the server runs it re-indexes automatically after new agent activity settles. The
 status chip in the app shows when it's indexing and surfaces any errors; click it to force

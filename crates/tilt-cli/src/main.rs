@@ -109,6 +109,6 @@ fn index_cmd(agent: &str) -> anyhow::Result<()> {
         n_files,
         edir.display()
     );
-    println!("  next: run `python reindex.py` to (re)build embeddings / affect / topics / arcs");
+    println!("  next: `python tilt.py reindex` to (re)build embeddings / affect / topics / arcs");
     Ok(())
 }

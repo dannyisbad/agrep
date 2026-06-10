@@ -9,8 +9,8 @@ everything from scratch.
 Each stage runs as its OWN process so a model's VRAM is released before the next
 stage loads its model (important on the 10GB GPU). Stages, in order:
 
-    cargo build (release)         -> the tilt binary
-    tilt index                    -> data/messages.jsonl + data/replies.jsonl + data/events/
+    cargo build (release)         -> the tilt-rs ingest binary
+    tilt-rs index                 -> data/messages.jsonl + data/replies.jsonl + data/events/
     embed.py                      -> data/embeddings.{f32,ids}        (incremental)
     emotion.py                    -> data/emotions.jsonl              (incremental)
     judge.py                      -> LLM verdicts onto gate-routed rows (incremental)
@@ -42,7 +42,7 @@ WIN = sys.platform == "win32"
 # the venv that has torch/sentence-transformers/sklearn; fall back to whatever ran us
 VENV_PY = ROOT / "py" / ".venv" / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
 PY = str(VENV_PY if VENV_PY.exists() else sys.executable)
-TILT = ROOT / "target" / "release" / ("tilt.exe" if WIN else "tilt")
+TILT = ROOT / "target" / "release" / ("tilt-rs.exe" if WIN else "tilt-rs")
 
 
 def run(desc: str, cmd: list[str], optional: bool = False) -> bool:
