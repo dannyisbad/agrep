@@ -189,23 +189,27 @@
             .statuswrap {
                 position: relative;
             }
+            /* the status pill must read as a sibling of the theme-switch button in every
+               theme: identical box (font/padding/border/hover), with the dot added. Per
+               theme, .statuschip is included in the same :is(...) lists that style
+               .themebtn, so it inherits each theme's button look (web99 retro bevel, etc.) */
             .statuschip {
                 color: var(--dim);
-                font-size: 10.5px;
+                font-size: 12px;
                 white-space: nowrap;
                 cursor: pointer;
                 font-family: inherit;
                 background: transparent;
-                border: 1px solid var(--hair);
-                border-radius: 0; /* match the square theme-switch button in noir */
-                padding: 2px 9px;
+                border: 1px solid var(--line);
+                border-radius: 0;
+                padding: 7px 11px;
                 display: inline-flex;
                 align-items: center;
                 gap: 6px;
             }
             .statuschip:hover {
                 color: var(--ink);
-                border-color: var(--line);
+                border-color: #2a2f37;
             }
             .statuschip.open {
                 color: var(--ink);
@@ -343,9 +347,6 @@
                 opacity: 0.55;
                 cursor: default;
             }
-            html[data-theme="kawaii"] .statuschip {
-                border-radius: 13px;
-            }
             html[data-theme="kawaii"] .statuspop {
                 border-radius: 16px;
                 border: 2px solid var(--line);
@@ -355,15 +356,17 @@
                 border-color: var(--ember);
                 color: var(--ember);
             }
-            html[data-theme="web99"] .statuschip {
-                border-radius: 0;
-            }
             html[data-theme="web99"] .statuspop {
                 border-radius: 0;
                 box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.25);
             }
             html[data-theme="web99"] .sp-reidx {
                 border-radius: 0;
+            }
+            /* web99: the pill is a retro button too; pressing it (popover open) inset-bevels it */
+            html[data-theme="web99"] .statuschip.open {
+                border-style: inset;
+                background: #c0c0c0;
             }
 
             .body {
@@ -1712,6 +1715,10 @@
                 white-space: normal;
                 word-break: break-word;
             }
+            .lrow.reply.open .bd,
+            .lrow.user.open .bd {
+                white-space: pre-wrap; /* preserve the message's own line breaks */
+            }
             .lrow.sub,
             .lz.sub {
                 opacity: 0.62;
@@ -1814,6 +1821,22 @@
                 color: var(--calm);
                 font-size: 1em;
             }
+            /* replies + user prompts: a few-line preview that keeps line breaks; click the
+               row to read the whole message (now carried in full, not a 400-char teaser) */
+            .lz .lzr,
+            .lz .lzu {
+                white-space: pre-wrap;
+                word-break: break-word;
+                display: -webkit-box;
+                -webkit-line-clamp: 4;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+            }
+            .lz.open .lzr,
+            .lz.open .lzu {
+                -webkit-line-clamp: unset;
+                overflow: visible;
+            }
             .lz .lzr {
                 color: var(--ink);
                 font-size: 0.96em;
@@ -1881,9 +1904,9 @@
                 border-top: 1px solid var(--hair);
                 margin: 0.6em 0;
             }
-            /* in the one-line live feed, keep inline md from forcing block breaks */
+            /* in the one-line live feed, keep inline md from forcing block breaks.
+               (.lzr is excluded — it needs -webkit-box for the clamp/expand) */
             .lrow .bd .md,
-            .lz .lzr.md,
             .lz .lzo.md {
                 display: inline;
             }
@@ -2112,6 +2135,7 @@
             html[data-theme="kawaii"]
                 :is(
                     .themebtn,
+                    .statuschip,
                     .views button,
                     .seg button,
                     .chip,
@@ -2242,6 +2266,7 @@
                 :is(
                     button,
                     .themebtn,
+                    .statuschip,
                     .views button,
                     .seg button,
                     .chip,
