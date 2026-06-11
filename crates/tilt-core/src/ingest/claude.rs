@@ -3,37 +3,70 @@
 //! Keeps real human turns: type=user, not meta/sidechain, userType external|absent,
 //! string or text-block content, not a command/system wrapper.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use memchr::memmem;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
 use crate::model::{Event, Message};
 
+// Borrowed deserialization: scalar fields are Cow (borrow from the line when escape-free,
+// allocate only when JSON-escaped) and `content` stays a RawValue slice, parsed into a
+// DOM only by the lines that actually need one. Most lines fail a filter long before
+// that, so the old per-line cost (full Value DOM + owned Strings, then discarded)
+// disappears.
 #[derive(Deserialize)]
-struct Line {
-    #[serde(rename = "type")]
-    ty: Option<String>,
+struct Line<'a> {
+    #[serde(rename = "type", borrow)]
+    ty: Option<Cow<'a, str>>,
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
     #[serde(rename = "isSidechain")]
     is_sidechain: Option<bool>,
-    #[serde(rename = "userType")]
-    user_type: Option<String>,
-    message: Option<Msg>,
-    timestamp: Option<String>,
-    cwd: Option<String>,
-    #[serde(rename = "sessionId")]
-    session_id: Option<String>,
+    #[serde(rename = "userType", borrow)]
+    user_type: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    message: Option<Msg<'a>>,
+    #[serde(borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(rename = "sessionId", borrow)]
+    session_id: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
-struct Msg {
-    role: Option<String>,
-    content: Option<serde_json::Value>,
-    model: Option<String>,
+struct Msg<'a> {
+    #[serde(borrow)]
+    role: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    content: Option<&'a RawValue>,
+    #[serde(borrow)]
+    model: Option<Cow<'a, str>>,
+}
+
+/// Extract the raw (still-escaped) bytes of the JSON string value that follows `finder`'s
+/// `"key":"` needle. The escaped form is fine for project-histogram keys: segmentation
+/// splits on both slash kinds and drops empty segments, so `C:\\Users` (escaped) and
+/// `C:\Users` bucket to the same project root.
+///
+/// SOUNDNESS of raw-byte key needles, here and in the prefilters: inside any JSON string
+/// value a quote is escaped to `\"`, so the byte sequence `"key":` can only occur as a
+/// real object key — string contents can never produce a false match on it.
+fn raw_str_value<'a>(finder: &memmem::Finder, bytes: &'a [u8]) -> Option<&'a str> {
+    let start = finder.find(bytes)? + finder.needle().len();
+    let mut j = start;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return std::str::from_utf8(&bytes[start..j]).ok(),
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 /// Pull human text out of a `message.content` that may be a string or a block array.
@@ -185,30 +218,46 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     let mut first_cwd = String::new();
     let mut cwd_counts: HashMap<String, usize> = HashMap::new();
     let mut tool_paths: Vec<String> = Vec::new();
+    // Raw-byte key needles (sound per raw_str_value's doc). `"message":` admits exactly
+    // the user/assistant lines; progress / summary / file-history-snapshot lines skip
+    // serde entirely. cwd is histogrammed from EVERY line via raw extraction, preserving
+    // the project-attribution semantics for the lines serde never sees.
+    let f_msg = memmem::Finder::new(b"\"message\":");
+    let f_cwd = memmem::Finder::new(b"\"cwd\":\"");
+    let f_toolres = memmem::Finder::new(b"\"tool_result\"");
     for line in data.lines() {
         if line.is_empty() {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if let Some(c) = raw_str_value(&f_cwd, bytes) {
+            if first_cwd.is_empty() {
+                first_cwd = c.to_string();
+            }
+            *cwd_counts.entry(c.to_string()).or_insert(0) += 1;
+        }
+        if f_msg.find(bytes).is_none() {
             continue;
         }
         let l: Line = match serde_json::from_str(line) {
             Ok(l) => l,
             Err(_) => continue,
         };
-        if let Some(c) = l.cwd.as_deref() {
-            if first_cwd.is_empty() {
-                first_cwd = c.to_string();
-            }
-            *cwd_counts.entry(c.to_string()).or_insert(0) += 1;
-        }
         let session = l
             .session_id
-            .clone()
-            .unwrap_or_else(|| file_session.clone());
+            .as_deref()
+            .unwrap_or(file_session.as_str())
+            .to_string();
         // Assistant turn -> attach its text + model to the user message it answers, and note
         // the files it touched (to infer the real working dir at the end).
         if l.ty.as_deref() == Some("assistant") {
             if let Some(m) = &l.message {
                 if m.role.as_deref() == Some("assistant") {
-                    if let Some(content) = &m.content {
+                    // Assistant content is always needed (tool paths, events, reply text):
+                    // parse the RawValue into a DOM once.
+                    let content_val: Option<serde_json::Value> =
+                        m.content.and_then(|r| serde_json::from_str(r.get()).ok());
+                    if let Some(content) = &content_val {
                         collect_tool_paths(content, &mut tool_paths);
                         // tool_use blocks -> events (sidechain lines too: a subagent's
                         // internal calls carry the same sessionId and belong in the stream).
@@ -256,13 +305,13 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
                     }
                     if let Some(last) = out.last_mut() {
                         if last.model.is_empty() {
-                            if let Some(md) = m.model.as_deref() {
+                            if let Some(md) = l.message.as_ref().and_then(|m| m.model.as_deref()) {
                                 if !md.is_empty() {
                                     last.model = md.to_string();
                                 }
                             }
                         }
-                        if let Some(txt) = m.content.as_ref().and_then(extract_text) {
+                        if let Some(txt) = content_val.as_ref().and_then(extract_text) {
                             crate::ingest::append_capped(&mut last.reply, &txt, 1600);
                         }
                     }
@@ -273,23 +322,30 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
         if l.ty.as_deref() != Some("user") {
             continue;
         }
+        // User content parses lazily: the tool_result pairing only runs when the raw line
+        // contains the marker, and lines that fail the human filters never build a DOM.
+        let raw_content = l.message.as_ref().and_then(|m| m.content);
+        let mut content_val: Option<serde_json::Value> = None;
         // tool_result blocks arrive in user-typed lines (userType external, isMeta null),
         // so pair them BEFORE the human-turn filters would drop the line.
-        if let Some(serde_json::Value::Array(blocks)) =
-            l.message.as_ref().and_then(|m| m.content.as_ref())
-        {
-            for b in blocks {
-                if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-                    continue;
-                }
-                let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                if let Some(&i) = pending.get(id) {
-                    let ev = &mut events[i];
-                    if let Some(c) = b.get("content") {
-                        ev.output = tool_result_text(c);
+        if f_toolres.find(bytes).is_some() {
+            if content_val.is_none() {
+                content_val = raw_content.and_then(|r| serde_json::from_str(r.get()).ok());
+            }
+            if let Some(serde_json::Value::Array(blocks)) = &content_val {
+                for b in blocks {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                        continue;
                     }
-                    ev.ok = Some(b.get("is_error").and_then(|v| v.as_bool()) != Some(true));
-                    pending.remove(id);
+                    let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(&i) = pending.get(id) {
+                        let ev = &mut events[i];
+                        if let Some(c) = b.get("content") {
+                            ev.output = tool_result_text(c);
+                        }
+                        ev.ok = Some(b.get("is_error").and_then(|v| v.as_bool()) != Some(true));
+                        pending.remove(id);
+                    }
                 }
             }
         }
@@ -308,7 +364,10 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
         if msg.role.as_deref() != Some("user") {
             continue;
         }
-        let text = match msg.content.as_ref().and_then(extract_text) {
+        if content_val.is_none() {
+            content_val = raw_content.and_then(|r| serde_json::from_str(r.get()).ok());
+        }
+        let text = match content_val.as_ref().and_then(extract_text) {
             Some(t) if !t.trim().is_empty() => t,
             _ => continue,
         };

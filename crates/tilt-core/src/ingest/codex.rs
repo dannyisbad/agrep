@@ -11,55 +11,77 @@
 //! NOTE: only `~/.codex/sessions/` is walked. `~/.codex/.tmp/**` (plugin test fixtures),
 //! `~/.codex/history.jsonl`, and `~/.codex/archived_sessions/` are intentionally not read.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use memchr::memmem;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
 use crate::model::{Event, Message};
 
+// Borrowed deserialization (see claude.rs for the soundness argument): Cow scalars
+// borrow from the line, RawValue defers the output/action DOMs until a call actually
+// pairs up. The lines that dominate rollout bytes (reasoning items with encrypted
+// blobs) never reach serde at all — parse_file's prefilter rejects them at memchr speed.
 #[derive(Deserialize)]
-struct Line {
-    #[serde(rename = "type")]
-    ty: Option<String>,
-    timestamp: Option<String>,
-    payload: Option<Payload>,
+struct Line<'a> {
+    #[serde(rename = "type", borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    payload: Option<Payload<'a>>,
 }
 
 #[derive(Deserialize)]
-struct Payload {
-    #[serde(rename = "type")]
-    ty: Option<String>,
-    role: Option<String>,
-    content: Option<Vec<Block>>,
+struct Payload<'a> {
+    #[serde(rename = "type", borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    role: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    content: Option<Vec<Block<'a>>>,
     // session_meta fields
-    id: Option<String>,
-    cwd: Option<String>,
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    cwd: Option<Cow<'a, str>>,
     // turn_context carries the active model (e.g. "gpt-5.3-codex-spark").
-    model: Option<String>,
+    #[serde(borrow)]
+    model: Option<Cow<'a, str>>,
     // tool-call fields: function_call {name, arguments(JSON-string), call_id};
     // function_call_output {call_id, output}; custom_tool_call {name, input, status};
     // web_search_call {action:{query,...}}.
-    name: Option<String>,
-    arguments: Option<String>,
-    call_id: Option<String>,
-    output: Option<serde_json::Value>,
-    input: Option<String>,
-    status: Option<String>,
-    action: Option<serde_json::Value>,
+    #[serde(borrow)]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    arguments: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    call_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    output: Option<&'a RawValue>,
+    #[serde(borrow)]
+    input: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    status: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    action: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
-struct Block {
-    #[serde(rename = "type")]
-    ty: Option<String>,
-    text: Option<String>,
+struct Block<'a> {
+    #[serde(rename = "type", borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    text: Option<Cow<'a, str>>,
 }
 
 /// Concatenate the human-authored text blocks (`input_text`, also accept `text`).
-fn extract_text(blocks: &[Block]) -> Option<String> {
+fn extract_text(blocks: &[Block<'_>]) -> Option<String> {
     let mut out = String::new();
     for b in blocks {
         match b.ty.as_deref() {
@@ -82,7 +104,7 @@ fn extract_text(blocks: &[Block]) -> Option<String> {
 }
 
 /// Concatenate the assistant's visible prose blocks (`output_text`, also accept `text`).
-fn extract_assistant(blocks: &[Block]) -> Option<String> {
+fn extract_assistant(blocks: &[Block<'_>]) -> Option<String> {
     let mut out = String::new();
     for b in blocks {
         match b.ty.as_deref() {
@@ -213,8 +235,28 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     // The active model, updated by each turn_context line and stamped onto turns.
     let mut current_model = String::new();
 
+    // Raw-byte prefilter (sound for the quoted key needles — see claude.rs
+    // raw_str_value doc). Every line kind we consume is admitted by one of these:
+    // messages carry `"role":`, tool calls/outputs carry `"call_id":`, plus the two
+    // meta line types (and web_search_call, whose call_id is not guaranteed). The
+    // reasoning items that dominate rollout bytes match none and are skipped without
+    // touching serde; an unquoted-needle false positive just costs one wasted parse.
+    let f_role = memmem::Finder::new(b"\"role\":");
+    let f_callid = memmem::Finder::new(b"\"call_id\":");
+    let f_meta = memmem::Finder::new(b"session_meta");
+    let f_turnctx = memmem::Finder::new(b"turn_context");
+    let f_websearch = memmem::Finder::new(b"web_search_call");
     for line in data.lines() {
         if line.is_empty() {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if f_role.find(bytes).is_none()
+            && f_callid.find(bytes).is_none()
+            && f_meta.find(bytes).is_none()
+            && f_turnctx.find(bytes).is_none()
+            && f_websearch.find(bytes).is_none()
+        {
             continue;
         }
         let l: Line = match serde_json::from_str(line) {
@@ -261,7 +303,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
         };
         match payload.ty.as_deref() {
             Some("function_call") | Some("custom_tool_call") => {
-                let name = payload.name.clone().unwrap_or_else(|| "?".to_string());
+                let name = payload.name.as_deref().unwrap_or("?").to_string();
                 // function_call carries `arguments` as a JSON string; custom_tool_call
                 // carries `input` as a raw string (e.g. an apply_patch body).
                 let input = if let Some(args) = payload.arguments.as_deref() {
@@ -280,7 +322,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
                     Some("failed") | Some("error") => Some(false),
                     _ => None,
                 };
-                let call_id = payload.call_id.clone().unwrap_or_default();
+                let call_id = payload.call_id.as_deref().unwrap_or_default().to_string();
                 if !call_id.is_empty() {
                     pending.insert(call_id.clone(), events.len());
                 }
@@ -303,8 +345,8 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
                     if let Some(&i) = pending.get(id) {
                         let (text, ok) = payload
                             .output
-                            .as_ref()
-                            .map(parse_call_output)
+                            .and_then(|r| serde_json::from_str::<serde_json::Value>(r.get()).ok())
+                            .map(|v| parse_call_output(&v))
                             .unwrap_or_default();
                         events[i].output = text;
                         if ok.is_some() {
@@ -319,8 +361,10 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
                 continue;
             }
             Some("web_search_call") => {
-                let query = payload
+                let action_val = payload
                     .action
+                    .and_then(|r| serde_json::from_str::<serde_json::Value>(r.get()).ok());
+                let query = action_val
                     .as_ref()
                     .and_then(|a| a.get("query"))
                     .and_then(|q| q.as_str())
@@ -334,7 +378,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
                     input: cap_str(query, EVENT_CAP),
                     output: String::new(),
                     ok: None,
-                    call_id: payload.call_id.clone().unwrap_or_default(),
+                    call_id: payload.call_id.as_deref().unwrap_or_default().to_string(),
                     child_session: String::new(),
                 });
                 continue;

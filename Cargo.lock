@@ -547,6 +547,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "chrono",
+ "memchr",
  "rayon",
  "rusqlite",
  "serde",
