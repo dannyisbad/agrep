@@ -32,8 +32,12 @@ import argparse
 import gzip
 import json
 import os
+import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import common
@@ -43,6 +47,7 @@ import rawfetch
 import native
 import live
 import indexer
+import setupjobs
 
 # `ask` (the semantic search machinery) pulls numpy/torch/sentence-transformers.
 # Imported lazily so the explorer works on a fresh clone with NOTHING but stdlib:
@@ -260,6 +265,9 @@ class Handler(BaseHTTPRequestHandler):
             # called on demand only
             import doctor
             self._json(doctor.probe)
+        elif path == "/setup/state":
+            # progress of the running (or last) one-click install job
+            self._json(setupjobs.state)
         elif path == "/live/state":
             self._json(lambda: live.watcher().snapshot())
         elif path == "/live/stream":
@@ -323,12 +331,56 @@ class Handler(BaseHTTPRequestHandler):
             idx.trigger()
             self._send(200, json.dumps({"ok": True, "phase": idx.status()["phase"]}))
             return
+        if self.path == "/setup/run":
+            # one-click install: {"step": "smart"|"named"} -> background job,
+            # progress at GET /setup/state
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:  # noqa: BLE001
+                body = {}
+            self._json(lambda: setupjobs.start(str(body.get("step", ""))))
+            return
+        if self.path == "/setup/restart":
+            # relaunch this server under the venv python so freshly installed deps
+            # actually load (the failed `import ask` is cached for the process life)
+            self._send(200, json.dumps({"ok": True}))
+            threading.Thread(target=_restart_self, name="tilt-restart").start()
+            return
         # (the bundled /ask agent was removed: search shows receipts and is instant;
         # cross-chat synthesis belongs to a real agent calling these endpoints)
         self._send(404, "{}")
 
     def log_message(self, *a):  # quiet
         pass
+
+
+_SRV: ThreadingHTTPServer | None = None
+
+
+def _restart_self() -> None:
+    """Swap this process for a fresh server under the venv python. Shut the listener
+    down first so the port is free, spawn the replacement detached (it must outlive
+    us), then exit. The page survives in the browser; its polls fail for a second or
+    two and then land on the new process."""
+    time.sleep(0.4)  # let the /setup/restart response reach the browser
+    py = str(setupjobs.VENV_PY if setupjobs.VENV_PY.exists() else sys.executable)
+    argv = [py, str(Path(__file__).resolve()), *sys.argv[1:]]
+    common.log(f"setup: restarting server under {py}")
+    try:
+        if _SRV:
+            _SRV.shutdown()
+            _SRV.server_close()
+    except Exception:  # noqa: BLE001
+        pass
+    logf = (common.DATA_DIR / "server.log").open("ab")
+    kw: dict = {"stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf}
+    if sys.platform == "win32":
+        kw["creationflags"] = 0x00000208  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen(argv, cwd=str(common.REPO_ROOT), **kw)
+    os._exit(0)
 
 
 def main() -> int:
@@ -367,7 +419,9 @@ def main() -> int:
     if not args.no_autoindex:
         indexer.start(w)  # keep the materialized index current as agents work
     common.log(f"tilt server -> http://localhost:{args.port}")
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    global _SRV
+    _SRV = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    _SRV.serve_forever()
     return 0
 
 

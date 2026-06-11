@@ -2325,12 +2325,97 @@
                 color: var(--ink);
                 border-color: var(--ember);
             }
+            .sc .act {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                margin-top: 10px;
+            }
+            .sc .su-go {
+                background: transparent;
+                border: 1px solid var(--calm);
+                color: var(--ink);
+                font-family: var(--mono);
+                font-size: 12px;
+                padding: 7px 18px;
+                cursor: pointer;
+            }
+            .sc .su-go:hover:not(:disabled) {
+                background: var(--panel2);
+            }
+            .sc .su-go:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            .sc .prog {
+                height: 6px;
+                background: var(--panel2);
+                border: 1px solid var(--hair);
+                margin-top: 10px;
+                position: relative;
+                overflow: hidden;
+            }
+            .sc .prog i {
+                position: absolute;
+                top: 0;
+                bottom: 0;
+                left: 0;
+                width: var(--p, 30%);
+                background: var(--calm);
+                transition: width 0.4s;
+            }
+            .sc .prog.indet i {
+                width: 30%;
+                animation: suslide 1.3s linear infinite;
+            }
+            @keyframes suslide {
+                from {
+                    left: -30%;
+                }
+                to {
+                    left: 100%;
+                }
+            }
+            .sc .plog {
+                font-family: var(--mono);
+                font-size: 11px;
+                color: var(--faint);
+                margin-top: 6px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .sc .suerr {
+                color: var(--hot);
+                font-size: 11.5px;
+                margin-top: 7px;
+                line-height: 1.5;
+                word-break: break-word;
+            }
+            .sc details {
+                margin-top: 8px;
+            }
+            .sc details summary {
+                color: var(--ghost);
+                font-size: 11px;
+                cursor: pointer;
+                font-family: var(--mono);
+            }
             html[data-theme="kawaii"] .sc {
                 border-radius: 16px;
                 border-width: 2px;
             }
             html[data-theme="kawaii"] .sc .cmd code {
                 border-radius: 10px;
+            }
+            html[data-theme="kawaii"] .sc .su-go {
+                border-radius: 11px;
+                border-width: 2px;
+                font-weight: 700;
+            }
+            html[data-theme="kawaii"] .sc .prog {
+                border-radius: 8px;
+                height: 8px;
             }
             html[data-theme="web99"] .sc {
                 border: 2px ridge #d6d6d6;
@@ -2340,6 +2425,19 @@
                 border: 2px inset #c0c0c0;
                 background: #fff;
                 font-family: "Courier New", monospace;
+            }
+            html[data-theme="web99"] .sc .su-go {
+                border: 2px outset #d6d6d6;
+                background: #d4d0c8;
+                color: #000;
+            }
+            html[data-theme="web99"] .sc .prog {
+                border: 2px inset #c0c0c0;
+                background: #fff;
+                height: 14px;
+            }
+            html[data-theme="web99"] .sc .prog i {
+                background: #000080;
             }
 
             /* ============================ themes ============================ */
@@ -6416,7 +6514,7 @@
             const SETUPC = {
                 noir: {
                     title: "setup",
-                    sub: "tilt works in tiers. the core is already running; each layer below is one command and stays optional.",
+                    sub: "tilt works in tiers. the core is already running; each layer below installs itself with one click and stays optional.",
                     core: "core",
                     smart: "smart",
                     named: "named",
@@ -6424,9 +6522,9 @@
                     smartWhat: "semantic search · topic clustering · mood arcs",
                     namedWhat: "generated titles · summaries · concept names",
                     smartHow:
-                        "one command — creates py/.venv and installs requirements (pulls torch, ~2GB). then reindex to build the new layers.",
+                        "semantic everything, computed locally. downloads python deps into py/.venv (~2.5GB, mostly torch); nothing global. the server restarts itself and rebuilds the index after.",
                     namedHow:
-                        "install ollama and pull a small model; the next reindex generates titles and summaries.",
+                        "a small local llm writes the titles. installs ollama if needed, pulls qwen2.5 3b (~1.9GB), then reindexes. fully local.",
                     storesNone: "no agent stores found under ~ — run an agent first.",
                     indexed: "indexed",
                     recheck: "recheck",
@@ -6435,20 +6533,30 @@
                     copied: "copied ✓",
                     back: "← back",
                     on: "on",
-                    cta: "finish setup — semantic search & mood arcs are one command away",
+                    install: "install",
+                    working: "installing…",
+                    retry: "retry",
+                    failed: "failed",
+                    orSelf: "or run it yourself",
+                    restarting: "deps installed — restarting the server to load them…",
+                    rebuilt: "installed — rebuilding the index so the new layers appear.",
+                    modelBtn: "pull the model (~1.9GB)",
+                    linuxOllama: "ollama's installer needs sudo, so it stays manual here:",
+                    cta: "finish setup — semantic search & mood arcs are one click away",
                 },
                 kawaii: {
                     title: "set me up ✿",
-                    sub: "i work in little layers~ the cozy core is already on; each one below is just one command ♡",
+                    sub: "i work in little layers~ the cozy core is already on; the rest install themselves with one tap ♡",
                     core: "cozy core",
                     smart: "smart ♡",
                     named: "named ✿",
                     coreWhat: "browse · peek search · right now · hop back in",
                     smartWhat: "vibe search · topic bundles · mood diaries",
-                    namedWhat: "pretty titles · little summaries",
                     smartHow:
-                        "one command~ (it pulls torch, ~2GB, be patient ;;) then refresh me to grow the new layers ♡",
-                    namedHow: "install ollama + pull a tiny model, then refresh me~",
+                        "downloads my thinking bits into py/.venv (~2.5GB, mostly torch, be patient ;;) nothing global~ i restart and rebuild all by myself after ♡",
+                    namedWhat: "pretty titles · little summaries",
+                    namedHow:
+                        "a tiny local llm names your chats ♡ grabs ollama + a smol model (~1.9GB), then i refresh myself~",
                     storesNone: "no chats found yet ;; run a coding buddy first ♡",
                     indexed: "tucked away",
                     recheck: "peek again ♡",
@@ -6457,11 +6565,20 @@
                     copied: "got it ♡",
                     back: "← back",
                     on: "on ♡",
-                    cta: "finish setting me up? vibe search is one command away ♡",
+                    install: "install ♡",
+                    working: "installing~ ♡",
+                    retry: "try again ♡",
+                    failed: "oh no ;;",
+                    orSelf: "diy corner ♡",
+                    restarting: "got my brain! restarting myself real quick~ ♡",
+                    rebuilt: "all installed ♡ rebuilding so the new layers show up~",
+                    modelBtn: "fetch the smol model ♡",
+                    linuxOllama: "this one needs sudo so i can't do it for you ;;",
+                    cta: "finish setting me up? vibe search is one tap away ♡",
                 },
                 web99: {
                     title: "Setup",
-                    sub: "tilt works in tiers. The core is already running; each tier below is one command and stays optional.",
+                    sub: "tilt works in tiers. The core is already running; each tier below installs with one click and stays optional.",
                     core: "Core",
                     smart: "Smart",
                     named: "Named",
@@ -6469,9 +6586,9 @@
                     smartWhat: "Semantic search, topic clustering, mood charts.",
                     namedWhat: "Generated titles, summaries, topic names.",
                     smartHow:
-                        "One command. Creates py/.venv and installs requirements (downloads torch, approx. 2GB). Then reindex.",
+                        "Downloads Python packages into py/.venv (approx. 2.5GB, mostly torch). Nothing is installed globally. The server restarts itself and rebuilds the index afterward.",
                     namedHow:
-                        "Install Ollama and pull a small model. The next reindex generates titles and summaries.",
+                        "A small local LLM generates the titles. Installs Ollama if needed, downloads qwen2.5 3B (approx. 1.9GB), then reindexes. Fully local.",
                     storesNone: "No agent stores were found. Run a coding agent first.",
                     indexed: "Indexed",
                     recheck: "Recheck",
@@ -6480,7 +6597,16 @@
                     copied: "Copied",
                     back: "← Back",
                     on: "Installed",
-                    cta: "Finish setup — semantic search and mood charts are one command away",
+                    install: "Install",
+                    working: "Installing...",
+                    retry: "Retry",
+                    failed: "Failed",
+                    orSelf: "Or run it yourself",
+                    restarting: "Packages installed. Restarting the server to load them...",
+                    rebuilt: "Installed. Rebuilding the index so the new tiers appear.",
+                    modelBtn: "Download model (approx. 1.9GB)",
+                    linuxOllama: "Ollama's installer requires sudo, so run it manually:",
+                    cta: "Finish setup — semantic search and mood charts are one click away",
                 },
             };
             const SK = (k) => (SETUPC[curTheme()] || SETUPC.noir)[k] ?? SETUPC.noir[k];
@@ -6505,15 +6631,48 @@
             function cmdRow(cmd) {
                 return `<div class="cmd"><code>${esc(cmd)}</code><button data-cmd="${esc(cmd)}">${SK("copy")}</button></div>`;
             }
-            // Ollama has no auto-install; give the one-liner for THIS machine's OS.
+            // Ollama has no auto-install; give the one-liner for the SERVER's OS
+            // (/setup/state reports it — the install runs there, not in the browser).
             // The pull target must be a model summarize.py's MODELS list accepts.
-            function ollamaInstallCmd() {
-                const ua = navigator.userAgent;
-                if (ua.includes("Windows")) return "winget install Ollama.Ollama";
-                if (ua.includes("Mac")) return "brew install ollama";
+            function ollamaInstallCmd(platform) {
+                const p = platform || (navigator.userAgent.includes("Mac") ? "darwin" : "win32");
+                if (p === "win32") return "winget install Ollama.Ollama";
+                if (p === "darwin") return "brew install ollama";
                 return "curl -fsSL https://ollama.com/install.sh | sh";
             }
-            function setupHTML(d) {
+            // The card's live half while a job runs: progress bar (real % when the
+            // tool reports one, indeterminate slide otherwise) + the tool's last line.
+            function jobUI(step, job) {
+                if (job.step !== step) return null;
+                if (job.phase === "restarting")
+                    return `<div class="prog indet"><i></i></div><div class="plog">${esc(SK("restarting"))}</div>`;
+                if (job.phase === "running") {
+                    const pct = job.pct;
+                    return (
+                        `<div class="prog${pct == null ? " indet" : ""}"><i style="--p:${pct == null ? 30 : pct}%"></i></div>` +
+                        `<div class="plog">${esc((job.label ? job.label + " — " : "") + (job.line || "…"))}${pct != null ? ` · ${pct}%` : ""}</div>`
+                    );
+                }
+                if (job.phase === "err")
+                    return `<div class="suerr">${esc(SK("failed"))}: ${esc(job.err || "?")}</div>`;
+                return null;
+            }
+            function installUI(step, job, label, fallbackRows) {
+                const j = jobUI(step, job);
+                const busy = job.phase === "running" || job.phase === "restarting";
+                const mine = job.step === step;
+                const btn =
+                    mine && busy
+                        ? ""
+                        : `<div class="act"><button class="su-go" data-step="${step}"${busy ? " disabled" : ""}>${esc(mine && job.phase === "err" ? SK("retry") : label)}</button></div>`;
+                return (
+                    (j || "") +
+                    btn +
+                    `<details><summary>${esc(SK("orSelf"))}</summary>${fallbackRows}</details>`
+                );
+            }
+            function setupHTML(d, job) {
+                job = job || {};
                 const core = d.core || {},
                     smart = d.smart || {},
                     named = d.named || {};
@@ -6527,6 +6686,23 @@
                 const missing = Object.entries(smart.deps || {})
                     .filter(([, v]) => !v)
                     .map(([k]) => k);
+                // named tier: ollama up but model missing = small pull; nothing = full
+                // install. linux can't be one-click (sudo), so it keeps the commands.
+                const canOllama = job.can_install_ollama !== false;
+                const namedBody = named.live
+                    ? `<div class="det2">${esc(SK("on"))} — ${esc((named.models || []).join(", "))}</div>`
+                    : `<div class="det2">${esc(SK("namedHow"))}${named.ollama ? "" : ` — <a href="https://ollama.com" target="_blank" rel="noopener" style="color:var(--calm)">ollama.com</a>`}</div>` +
+                      (named.ollama || canOllama
+                          ? installUI(
+                                "named",
+                                job,
+                                named.ollama ? SK("modelBtn") : SK("install"),
+                                (named.ollama ? "" : cmdRow(ollamaInstallCmd(job.platform))) +
+                                    cmdRow("ollama pull qwen2.5:3b-instruct"),
+                            )
+                          : `<div class="det2">${esc(SK("linuxOllama"))}</div>` +
+                            cmdRow(ollamaInstallCmd(job.platform)) +
+                            cmdRow("ollama pull qwen2.5:3b-instruct"));
                 return `<div class="setup">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">
       <h2 style="margin:0;font-family:var(--mono);font-weight:600;font-size:15px;color:var(--ink)">${esc(SK("title"))}</h2>
@@ -6547,36 +6723,44 @@
           smart.live
               ? `<div class="det2">${esc(SK("on"))} — ${esc(Object.keys(smart.deps || {}).join(" · "))}</div>`
               : `<div class="det2">${esc(SK("smartHow"))}${missing.length ? ` (missing: ${esc(missing.join(", "))})` : ""}</div>` +
-                cmdRow("python tilt.py doctor --fix") +
-                cmdRow("python tilt.py reindex")
+                installUI(
+                    "smart",
+                    job,
+                    SK("install"),
+                    cmdRow("python tilt.py doctor --fix") +
+                        cmdRow("python tilt.py reindex"),
+                )
       }
     </div>
     <div class="sc${named.live ? "" : " off"}">
       <div class="sch"><span class="tdot"></span><span class="nm">${esc(SK("named"))}</span><span class="what">${esc(SK("namedWhat"))}</span></div>
-      ${
-          named.live
-              ? `<div class="det2">${esc(SK("on"))} — ${esc((named.models || []).join(", "))}</div>`
-              : `<div class="det2">${esc(SK("namedHow"))}${named.ollama ? "" : ` — <a href="https://ollama.com" target="_blank" rel="noopener" style="color:var(--calm)">ollama.com</a>`}</div>` +
-                (named.ollama ? "" : cmdRow(ollamaInstallCmd())) +
-                cmdRow("ollama pull qwen2.5:3b-instruct")
-      }
+      ${namedBody}
     </div>
   </div>`;
             }
-            async function showSetup() {
-                if (STATE.view !== "explore") showExplore();
-                STATE.sel = null;
+
+            // ---- one-click flow: POST /setup/run -> poll /setup/state -> rerender;
+            //      smart additionally restarts the server, then kicks a full reindex.
+            let SUDOC = null, // last /doctor payload
+                SUJOB = null, // last /setup/state payload (or synthetic "restarting")
+                SUTIMER = 0;
+            function setupOpen() {
                 const v = $("view");
-                v.innerHTML = `<div class="setup"><div class="spin" style="padding:30px 0">${esc(SK("checking"))}</div></div>`;
-                $("main").scrollTop = 0;
-                let d;
-                try {
-                    d = await J("/doctor");
-                } catch (e) {
-                    v.innerHTML = `<div class="empty">${esc(String(e.message || e))}</div>`;
-                    return;
-                }
-                v.innerHTML = setupHTML(d);
+                return v && v.querySelector(".setup");
+            }
+            function renderSetup() {
+                if (!setupOpen() || !SUDOC) return;
+                const v = $("view");
+                const open = new Set(
+                    [...v.querySelectorAll(".sc details[open]")].map((x, i) => i),
+                );
+                v.innerHTML = setupHTML(SUDOC, SUJOB || {});
+                [...v.querySelectorAll(".sc details")].forEach((x, i) => {
+                    if (open.has(i)) x.open = true;
+                });
+                wireSetup(v);
+            }
+            function wireSetup(v) {
                 v.querySelectorAll(".cmd button").forEach(
                     (b) =>
                         (b.onclick = async () => {
@@ -6587,14 +6771,107 @@
                             } catch (e) {}
                         }),
                 );
+                v.querySelectorAll(".su-go[data-step]").forEach(
+                    (b) => (b.onclick = () => runSetupStep(b.dataset.step)),
+                );
                 const r = $("surecheck");
                 if (r) r.onclick = showSetup;
                 const bk = $("suback");
                 if (bk)
                     bk.onclick = () => {
+                        clearTimeout(SUTIMER);
                         $("view").innerHTML = "";
                         showPlaceholder();
                     };
+            }
+            async function runSetupStep(step) {
+                try {
+                    await fetch("/setup/run", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ step }),
+                    });
+                    SUJOB = await J("/setup/state");
+                } catch (e) {}
+                renderSetup();
+                schedSetupPoll();
+            }
+            function schedSetupPoll() {
+                clearTimeout(SUTIMER);
+                SUTIMER = setTimeout(setupTick, 900);
+            }
+            async function setupTick() {
+                if (!setupOpen()) return;
+                let st;
+                try {
+                    st = await J("/setup/state");
+                } catch (e) {
+                    schedSetupPoll();
+                    return;
+                }
+                const prev = SUJOB;
+                SUJOB = st;
+                if (st.phase === "running") {
+                    renderSetup();
+                    schedSetupPoll();
+                    return;
+                }
+                if (st.phase === "ok" && prev && prev.phase === "running") {
+                    if (st.restart_needed) return setupRestart();
+                    // named finished: the server already kicked the indexer; refetch
+                    // the tier checks so the card flips live, and let the status chip
+                    // narrate the rebuild.
+                    try {
+                        SUDOC = await J("/doctor");
+                    } catch (e) {}
+                    refreshStatus();
+                }
+                renderSetup();
+            }
+            async function setupRestart() {
+                SUJOB = { step: "smart", phase: "restarting" };
+                renderSetup();
+                try {
+                    fetch("/setup/restart", { method: "POST" });
+                } catch (e) {}
+                for (let i = 0; i < 120; i++) {
+                    await new Promise((r) => setTimeout(r, 1000));
+                    if (!setupOpen()) return;
+                    try {
+                        await J("/status");
+                        // back up under the venv: build the layers the deps unlock
+                        fetch("/reindex", { method: "POST" }).catch(() => {});
+                        refreshStatus();
+                        return showSetup();
+                    } catch (e) {}
+                }
+                SUJOB = {
+                    step: "smart",
+                    phase: "err",
+                    err: "server did not come back — start it by hand: python tilt.py serve",
+                };
+                renderSetup();
+            }
+            async function showSetup() {
+                if (STATE.view !== "explore") showExplore();
+                STATE.sel = null;
+                const v = $("view");
+                v.innerHTML = `<div class="setup"><div class="spin" style="padding:30px 0">${esc(SK("checking"))}</div></div>`;
+                $("main").scrollTop = 0;
+                try {
+                    [SUDOC, SUJOB] = await Promise.all([
+                        J("/doctor"),
+                        J("/setup/state").catch(() => null),
+                    ]);
+                } catch (e) {
+                    v.innerHTML = `<div class="empty">${esc(String(e.message || e))}</div>`;
+                    return;
+                }
+                renderSetup();
+                if (SUJOB && SUJOB.phase === "running") schedSetupPoll();
+                // a smart install finished while the panel was closed: finish the job
+                else if (SUJOB && SUJOB.phase === "ok" && SUJOB.restart_needed)
+                    setupRestart();
             }
 
             // ============================ command palette (ctrl+k) ============================
