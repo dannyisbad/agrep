@@ -38,6 +38,7 @@ PROMPT = ("Below are the developer's messages from one session, in order. Summar
 def load_sessions(min_msgs: int):
     rows = defaultdict(list)
     agent, cwd = {}, {}
+    last_ts = defaultdict(int)  # epoch ms of each session's latest message
     with common.MESSAGES_PATH.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -51,7 +52,12 @@ def load_sessions(min_msgs: int):
             rows[s].append(o.get("text", ""))
             agent.setdefault(s, o.get("agent", ""))
             cwd.setdefault(s, o.get("project", ""))
-    sel = [(s, m) for s, m in rows.items() if len(m) >= min_msgs]
+            ts = o.get("ts") or 0
+            if isinstance(ts, (int, float)) and ts > last_ts[s]:
+                last_ts[s] = int(ts)
+    # newest sessions first, so a capped run (--max-new) titles recent work, not 2024
+    sel = sorted(((s, m) for s, m in rows.items() if len(m) >= min_msgs),
+                 key=lambda x: last_ts[x[0]], reverse=True)
     return sel, agent, cwd
 
 
@@ -117,6 +123,9 @@ def main() -> int:
     ap.add_argument("--full", action="store_true",
                     help="Re-summarize every session. Default is incremental: only "
                          "summarize sessions not already in summaries.jsonl.")
+    ap.add_argument("--max-new", type=int, default=None,
+                    help="Cap this run at N sessions (newest first). Lets the UI reindex "
+                         "button make bounded progress instead of grinding a huge backlog.")
     args = ap.parse_args()
 
     model = pick_model()
@@ -134,6 +143,9 @@ def main() -> int:
         if not sel:
             print(f"  summaries already up to date (0 new) -> {out_path}")
             return 0
+    if args.max_new is not None and len(sel) > args.max_new:
+        common.log(f"capping at {args.max_new} newest of {len(sel)} pending")
+        sel = sel[: args.max_new]
 
     common.log(f"model={model} sessions={len(sel)} (min_msgs={args.min_msgs})")
     f_out = None if args.smoke else out_path.open("a" if incremental else "w", encoding="utf-8")
@@ -156,6 +168,7 @@ def main() -> int:
             print(f"\n[{agent[s]} · {cwd[s]} · {len(msgs)} msgs]\n  {title}\n  {summary}\n  tags: {', '.join(tags)}")
         else:
             f_out.write(json.dumps(rec) + "\n")
+            f_out.flush()  # a killed/timed-out run keeps everything generated so far
             if done % 25 == 0:
                 common.log(f"  ... {done}/{len(sel)} ({done/(time.perf_counter()-t0):.2f}/s)")
     if f_out:

@@ -27,11 +27,13 @@ import common
 
 WIN = sys.platform == "win32"
 TILT = common.REPO_ROOT / "target" / "release" / ("tilt-rs.exe" if WIN else "tilt-rs")
+REINDEX = common.REPO_ROOT / "reindex.py"
 
 CHECK_S = 20        # how often the thread wakes to check the gates (cheap)
 QUIET_S = 90        # reindex once live activity has been quiet this long
 MIN_GAP_S = 300     # at most one automatic run per this interval
 MAX_STALE_S = 1800  # force a run mid-activity if the last index is older than this
+FULL_MAX_NEW = 150  # summaries generated per forced run -- bounds one click to minutes
 
 
 class AutoIndexer(threading.Thread):
@@ -70,7 +72,13 @@ class AutoIndexer(threading.Thread):
         while True:
             forced = self._force.wait(timeout=CHECK_S)
             self._force.clear()
-            if forced or self._should_run():
+            if forced:
+                # The UI button runs the WHOLE pipeline (embeddings/affect/titles/arcs),
+                # capped so one click is minutes, not a multi-hour backlog grind.
+                # Automatic runs stay rust-only: they fire mid-work-session, where a
+                # surprise GPU+LLM load would fight the user's actual job.
+                self._index(full=True)
+            elif self._should_run():
                 self._index()
 
     def _should_run(self) -> bool:
@@ -85,7 +93,7 @@ class AutoIndexer(threading.Thread):
             return False
         return (now - activity) >= QUIET_S or gap >= MAX_STALE_S
 
-    def _index(self) -> None:
+    def _index(self, full: bool = False) -> None:
         with self._lock:
             if self.state["phase"] == "indexing":
                 return
@@ -95,10 +103,17 @@ class AutoIndexer(threading.Thread):
         self._last_index_wall = time.time()
         t = time.perf_counter()
         err = ""
+        if full and REINDEX.exists():
+            # reindex.py self-selects py/.venv for the heavy stages, so any python works
+            cmd = [sys.executable, str(REINDEX), "--no-build",
+                   "--max-new", str(FULL_MAX_NEW)]
+            timeout = 3600
+        else:
+            cmd = [str(TILT), "index", "--agent", "all"]
+            timeout = 1800
         try:
-            r = subprocess.run([str(TILT), "index", "--agent", "all"],
-                               cwd=str(common.REPO_ROOT),
-                               capture_output=True, text=True, timeout=1800)
+            r = subprocess.run(cmd, cwd=str(common.REPO_ROOT),
+                               capture_output=True, text=True, timeout=timeout)
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "ingest failed").strip()[-300:]
         except Exception as e:  # noqa: BLE001 -- surface anything to the status chip

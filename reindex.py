@@ -70,6 +70,9 @@ def main() -> int:
     ap.add_argument("--judge", action="store_true",
                     help="run the LLM affect judge over gate-routed rows (slow, optional)")
     ap.add_argument("--no-build", action="store_true", help="skip cargo build")
+    ap.add_argument("--max-new", type=int, default=None,
+                    help="cap summarize at N sessions this run (newest first); used by the "
+                         "UI reindex button so one click is bounded, not a multi-hour grind")
     args = ap.parse_args()
     full = ["--full"] if args.full else []
 
@@ -103,7 +106,8 @@ def main() -> int:
     if ok_emo:
         if args.judge:  # correction layer on the affect gate; opt-in, it's slow
             run("affect judge (LLM, routed msgs)", [PY, "py/judge.py"], optional=True)
-    ok_sum = run("summarize sessions", [PY, "py/summarize.py", *full], optional=True)
+    cap = ["--max-new", str(args.max_new)] if args.max_new else []
+    ok_sum = run("summarize sessions", [PY, "py/summarize.py", *full, *cap], optional=True)
     if ok_sum and ok_emb:
         run("embed summaries", [PY, "py/embed_summaries.py", *full], optional=True)
         run("cluster concepts", [PY, "py/concepts.py", "--source", "summary"], optional=True)
@@ -115,7 +119,10 @@ def main() -> int:
         # shows a vibe-trace on any chat that has one, so coverage beats curation.
         run("vibe arcs", [PY, "py/vibe.py", "--top", "999", "--min-turns", "8"], optional=True)
 
-    if sig:  # record what we just fully processed, so an unchanged re-run is instant
+    # Record what we just fully processed, so an unchanged re-run is instant. A capped
+    # run (--max-new) may have left summaries pending, so don't stamp it complete —
+    # the next run must reach the summarize stage again to drain the backlog.
+    if sig and not args.max_new:
         sig_file.write_text(sig, encoding="utf-8")
 
     print(f"\n  reindex complete in {time.perf_counter() - t0:.0f}s.")

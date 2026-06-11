@@ -135,13 +135,13 @@ def report() -> dict:
     models = _ollama_models()
     if models is None:
         _row("ollama", OPT, "not running (install: https://ollama.com)")
-        fixes.append("named tier: install Ollama, then `ollama pull gemma2:2b`")
+        fixes.append("named tier: install Ollama, then `ollama pull qwen2.5:3b-instruct`")
     else:
         _row("ollama", OK, "reachable")
         _row("a model pulled", OK if models else OPT,
-             ", ".join(models[:3]) if models else "none (e.g. `ollama pull gemma2:2b`)")
+             ", ".join(models[:3]) if models else "none (e.g. `ollama pull qwen2.5:3b-instruct`)")
         if not models:
-            fixes.append("named tier: ollama pull gemma2:2b")
+            fixes.append("named tier: ollama pull qwen2.5:3b-instruct")
 
     print("\nindex")
     sj = common.DATA_DIR / "sessions.jsonl"
@@ -191,7 +191,7 @@ def fix() -> int:
                   "build for your platform from https://pytorch.org, then re-run.")
             return 1
     print("\ndone. re-run `python tilt.py doctor` to confirm the smart tier is live.")
-    print("for the named tier: install Ollama (https://ollama.com) and `ollama pull gemma2:2b`.")
+    print("for the named tier: install Ollama (https://ollama.com) and `ollama pull qwen2.5:3b-instruct`.")
     return 0
 
 

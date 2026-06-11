@@ -6505,6 +6505,14 @@
             function cmdRow(cmd) {
                 return `<div class="cmd"><code>${esc(cmd)}</code><button data-cmd="${esc(cmd)}">${SK("copy")}</button></div>`;
             }
+            // Ollama has no auto-install; give the one-liner for THIS machine's OS.
+            // The pull target must be a model summarize.py's MODELS list accepts.
+            function ollamaInstallCmd() {
+                const ua = navigator.userAgent;
+                if (ua.includes("Windows")) return "winget install Ollama.Ollama";
+                if (ua.includes("Mac")) return "brew install ollama";
+                return "curl -fsSL https://ollama.com/install.sh | sh";
+            }
             function setupHTML(d) {
                 const core = d.core || {},
                     smart = d.smart || {},
@@ -6549,7 +6557,8 @@
           named.live
               ? `<div class="det2">${esc(SK("on"))} — ${esc((named.models || []).join(", "))}</div>`
               : `<div class="det2">${esc(SK("namedHow"))}${named.ollama ? "" : ` — <a href="https://ollama.com" target="_blank" rel="noopener" style="color:var(--calm)">ollama.com</a>`}</div>` +
-                cmdRow("ollama pull gemma2:2b")
+                (named.ollama ? "" : cmdRow(ollamaInstallCmd())) +
+                cmdRow("ollama pull qwen2.5:3b-instruct")
       }
     </div>
   </div>`;
