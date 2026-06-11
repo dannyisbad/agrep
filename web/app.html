@@ -2228,6 +2228,29 @@
                 font-family: Arial, sans-serif;
             }
 
+            /* home setup CTA: a real button, shown only while a tier is missing */
+            .setupcta {
+                margin: 20px auto 0;
+                display: block;
+                background: transparent;
+                border: 1px solid var(--ember);
+                color: var(--ink);
+                font-family: var(--mono);
+                font-size: 12.5px;
+                padding: 9px 18px;
+                cursor: pointer;
+            }
+            .setupcta:hover {
+                background: var(--panel);
+            }
+            html[data-theme="kawaii"] .setupcta {
+                border-radius: 13px;
+                border-width: 2px;
+                background: #fff;
+                color: #ff4f97;
+                font-weight: 700;
+            }
+
             /* ---- setup panel (tiers): what each unlocks, then the command ---- */
             .setup {
                 max-width: 760px;
@@ -5339,7 +5362,8 @@
     <div class="big">tilt.</div>
     <p class="lead">${C("heroLead")}</p>
     ${recent.length ? `<div class="rh"><span>${C("recentHead")}</span><span class="rule"></span></div>${rows}` : ""}
-    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")} · ${v} ${C("heroFootB")} · <a id="homesetup" style="cursor:pointer;color:var(--dim)">${esc(SK("title"))} →</a></p>
+    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")} · ${v} ${C("heroFootB")}</p>
+    ${setupCta()}
   </div>`;
                 $("view")
                     .querySelectorAll(".ri")
@@ -5356,7 +5380,7 @@
     <div class="khohi">welcome back ♡</div>
     <p class="kholead">every little chat with your coding buddies, all tucked into one cozy place. tap one on the left to read its mood diary, or ask me anything about all of them~</p>
     <p class="khofoot">${n} chats tucked away ♡  ${v} with a mood diary ✿</p>
-    <p class="khofoot" id="khsetup" style="cursor:pointer;text-decoration:underline">${esc(SK("title"))} →</p>
+    ${setupCta().replace('id="homesetup"', 'id="khsetup"')}
     <div class="khosparkle">✿ ⋆ ♡ ⋆ ✿</div>
   </div>`;
             }
@@ -5368,7 +5392,7 @@
     <div class="g99btns">
       <button class="g99b" id="g99search">tilt Search</button>
       <button class="g99b" id="g99lucky">I'm Feeling Lucky</button>
-      <button class="g99b" id="g99setup">${esc(SK("title"))}</button>
+      ${setupNeeded() ? `<button class="g99b" id="g99setup">${esc(SK("cta"))}</button>` : ""}
     </div>
     <div class="g99meta">Indexing <b>${fmt(n)}</b> conversations</div>
     <hr class="g99hr">
@@ -6142,7 +6166,19 @@
                     idx.phase !== "indexing"
                 )
                     reloadChats();
+                const firstStatus = STATUS_PREV === null;
                 STATUS_PREV = idx;
+                // the home CTA keys off /status; re-render home once it first arrives
+                if (
+                    firstStatus &&
+                    BOOTED &&
+                    STATE.view === "explore" &&
+                    !STATE.sel &&
+                    !SEARCH.active
+                ) {
+                    $("view").innerHTML = "";
+                    showPlaceholder();
+                }
                 if (STATUSOPEN) renderStatusPop();
                 // poll fast while a reindex is running (so "indexing" clears the moment it's done),
                 // slowly otherwise. this is why it no longer looks stuck.
@@ -6361,6 +6397,7 @@
                     copied: "copied ✓",
                     back: "← back",
                     on: "on",
+                    cta: "finish setup — semantic search & mood arcs are one command away",
                 },
                 kawaii: {
                     title: "set me up ✿",
@@ -6382,6 +6419,7 @@
                     copied: "got it ♡",
                     back: "← back",
                     on: "on ♡",
+                    cta: "finish setting me up? vibe search is one command away ♡",
                 },
                 web99: {
                     title: "Add or Remove Programs",
@@ -6404,9 +6442,27 @@
                     copied: "Copied",
                     back: "← Back",
                     on: "Installed",
+                    cta: "Upgrade to Professional Edition…",
                 },
             };
             const SK = (k) => (SETUPC[curTheme()] || SETUPC.noir)[k] ?? SETUPC.noir[k];
+
+            // Show the home-screen setup CTA only while something is actually missing.
+            // /status is the cheap signal the app already has — but `semantic` alone
+            // reads "off" while the search index warms after a server start, so a
+            // machine that has ever produced enrichment data (arcs/summaries exist)
+            // counts as set up. A fully-set-up machine gets no CTA — the popover's
+            // `setup →` link and the palette remain the deliberate ways in.
+            const setupNeeded = () => {
+                if (!STATUS) return false;
+                const cov = STATUS.coverage || {};
+                const everEnriched = (cov.vibes || 0) > 0 || (cov.summaries || 0) > 0;
+                return STATUS.semantic === "off" && !everEnriched;
+            };
+            const setupCta = () =>
+                setupNeeded()
+                    ? `<button class="setupcta" id="homesetup">${esc(SK("cta"))}</button>`
+                    : "";
 
             function cmdRow(cmd) {
                 return `<div class="cmd"><code>${esc(cmd)}</code><button data-cmd="${esc(cmd)}">${SK("copy")}</button></div>`;
