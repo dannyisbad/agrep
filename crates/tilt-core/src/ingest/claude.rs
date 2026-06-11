@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
@@ -337,7 +336,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
 }
 
 /// Walk all real project dirs and collect the user's Claude messages + tool events.
-pub fn collect() -> (Vec<Message>, Vec<Event>) {
+pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
     let root = crate::ingest::home().join(".claude").join("projects");
     let dirs = match fs::read_dir(&root) {
         Ok(d) => d,
@@ -366,12 +365,6 @@ pub fn collect() -> (Vec<Message>, Vec<Event>) {
         }
     }
 
-    let pairs: Vec<(Vec<Message>, Vec<Event>)> = files.par_iter().map(|p| parse_file(p)).collect();
-    let mut msgs = Vec::new();
-    let mut evts = Vec::new();
-    for (m, e) in pairs {
-        msgs.extend(m);
-        evts.extend(e);
-    }
-    (msgs, evts)
+    let pass = crate::ingest_cache::collect_cached(cache, &root, &files, parse_file);
+    (pass.messages, pass.events)
 }

@@ -76,7 +76,8 @@ def main() -> int:
     t0 = time.perf_counter()
     if not args.no_build:
         run("build rust (release)", ["cargo", "build", "--release"])
-    run("ingest transcripts (rust)", [str(TILT), "index", "--agent", "all"])
+    # --full also bypasses the Rust per-file parse cache (clean re-parse of every store file)
+    run("ingest transcripts (rust)", [str(TILT), "index", "--agent", "all", *full])
 
     # Fast path: if ingest produced byte-identical messages (no new chats since last
     # run), the whole downstream pipeline would reproduce what's already on disk, so

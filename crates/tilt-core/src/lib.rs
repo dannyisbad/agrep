@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod ingest;
+pub mod ingest_cache;
 pub mod model;
 
 pub use model::Message;

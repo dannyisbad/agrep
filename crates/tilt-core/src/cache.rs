@@ -231,13 +231,23 @@ fn content_hash(bytes: &[u8]) -> u64 {
 /// Write events as per-session JSON Lines files `dir/{agent}-{session}.jsonl`, each
 /// sorted by ts (stable, so same-ts events keep ingest order).
 ///
-/// INCREMENTAL: rewriting all ~12k files every run was the dominant ingest cost (40s+ of
-/// Windows tmp+rename churn on 440MB). Instead each session's content is built in memory
-/// and hashed; a manifest (`.manifest`, fname -> hash) records what was last written, and
-/// a file is only rewritten when its hash changed or it's missing. So a typical run after
-/// one active session touches a handful of files, not all of them. Files for sessions that
-/// vanished are removed. Returns (n_files, n_events, n_rewritten).
-pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usize, usize)> {
+/// INCREMENTAL on two axes:
+///  - content: each session's events are built in memory and hashed; a manifest
+///    (`.manifest`, fname -> hash) records the last-written hash and a file is rewritten
+///    only when its content changed or it's missing. (Rewriting all ~12k files every run
+///    was 40s+ of Windows tmp+rename churn over 440MB.)
+///  - coverage: `events` may cover only the sessions touched this run (the parse cache hands
+///    back events for changed sessions only). `keep` is the full set of live session fnames;
+///    unchanged sessions not in `events` keep their files AND their manifest hash (carried
+///    forward), and only files whose fname is absent from `keep` are deleted. Agent logs are
+///    append-only, so a re-parsed session always carries its complete event set.
+///
+/// Returns (n_files, n_events_written, n_rewritten).
+pub fn write_events(
+    events: &[Event],
+    dir: &Path,
+    keep: &HashSet<String>,
+) -> anyhow::Result<(usize, usize, usize)> {
     fs::create_dir_all(dir)?;
     let manifest_path = dir.join(".manifest");
     let manifest: std::collections::HashMap<String, u64> = fs::read_to_string(&manifest_path)
@@ -250,8 +260,9 @@ pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usiz
         by.entry((e.agent, e.session.as_str())).or_default().push(e);
     }
 
-    let mut live: HashSet<String> = HashSet::new();
-    let mut next_manifest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // carry forward the hashes of sessions still live but not touched this run
+    let mut next_manifest: std::collections::HashMap<String, u64> =
+        manifest.iter().filter(|(k, _)| keep.contains(*k)).map(|(k, v)| (k.clone(), *v)).collect();
     let mut n_events = 0usize;
     let mut n_written = 0usize;
     for ((agent, session), mut evs) in by {
@@ -260,7 +271,6 @@ pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usiz
         }
         evs.sort_by_key(|e| e.ts);
         let fname = format!("{}-{}.jsonl", agent, safe_name(session));
-        // serialize this session's events to an in-memory buffer, then decide whether to write
         let mut buf: Vec<u8> = Vec::new();
         for e in &evs {
             let rec = EventRecord {
@@ -278,7 +288,6 @@ pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usiz
         }
         let h = content_hash(&buf);
         let path = dir.join(&fname);
-        // write only when the content changed or the file is missing
         if manifest.get(&fname) != Some(&h) || !path.exists() {
             write_atomic(&path, |w| {
                 w.write_all(&buf)?;
@@ -288,25 +297,32 @@ pub fn write_events(events: &[Event], dir: &Path) -> anyhow::Result<(usize, usiz
         }
         next_manifest.insert(fname.clone(), h);
         n_events += evs.len();
-        live.insert(fname);
     }
 
-    // Drop event files (and manifest entries) whose session vanished from the stores.
+    // Drop event files (and manifest entries) whose session is no longer live.
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".jsonl") && !live.contains(&name) {
+            if name.ends_with(".jsonl") && !keep.contains(&name) {
                 fs::remove_file(entry.path()).ok();
+                next_manifest.remove(&name);
             }
         }
     }
 
+    let n_files = next_manifest.len();
     let body = serde_json::to_string(&next_manifest)?;
     write_atomic(&manifest_path, |w| {
         w.write_all(body.as_bytes())?;
         Ok(())
     })?;
-    Ok((live.len(), n_events, n_written))
+    Ok((n_files, n_events, n_written))
+}
+
+/// The per-session event filename for a session (agent + sanitized id). Lets the caller build
+/// the `keep` set passed to [`write_events`].
+pub fn event_fname(agent: &str, session: &str) -> String {
+    format!("{}-{}.jsonl", agent, safe_name(session))
 }
 
 /// Aggregate rollup for the pulse dashboard: per-agent call/fail counts, the tool mix,

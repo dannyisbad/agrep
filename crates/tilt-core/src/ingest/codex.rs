@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
@@ -409,17 +408,11 @@ fn gather(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
 }
 
 /// Walk all session rollouts and collect the user's Codex messages + tool events.
-pub fn collect() -> (Vec<Message>, Vec<Event>) {
+pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
     let root = crate::ingest::home().join(".codex").join("sessions");
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     gather(&root, &mut files);
 
-    let pairs: Vec<(Vec<Message>, Vec<Event>)> = files.par_iter().map(|p| parse_file(p)).collect();
-    let mut msgs = Vec::new();
-    let mut evts = Vec::new();
-    for (m, e) in pairs {
-        msgs.extend(m);
-        evts.extend(e);
-    }
-    (msgs, evts)
+    let pass = crate::ingest_cache::collect_cached(cache, &root, &files, parse_file);
+    (pass.messages, pass.events)
 }
