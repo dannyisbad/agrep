@@ -17,6 +17,20 @@ cargo), scans your agent stores, starts a local server, and opens the app. New c
 up the moment an agent writes one; the index keeps itself current while the server runs.
 Your index and any optional models install to a per-user data dir, not the package.
 
+True to the name, `agrep` greps your history straight from the shell — no app, no model:
+
+```
+agrep "race condition"          # every matching message across all four agents
+agrep deadlock --agent codex    # filter to one agent
+agrep -E 'TODO|FIXME'           # regex
+agrep -l auth                   # list matching chats, not every line (like grep -l)
+agrep "memory leak" --json      # one JSON object per hit, for piping
+agrep "fixing a flaky test" --semantic   # meaning search (needs a running server)
+```
+
+Keyword search is instant and needs nothing installed; it exits like grep (1 when nothing
+matched), so it composes in scripts and pipes.
+
 The heavier tiers (semantic search, generated titles) install on demand from the app's
 own setup panel — one click each. To get them up front, or to hack on tilt, clone instead:
 

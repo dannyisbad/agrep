@@ -1,14 +1,17 @@
 #!/usr/bin/env python
-"""tilt — one command for your cross-agent chat history.
+"""agrep — grep and explore your cross-agent chat history.
 
-  python tilt.py up         build the index, start the server, open the app  (default)
-  python tilt.py doctor     check what's installed and what each tier needs
-  python tilt.py index      just (re)build the index from your agent stores
-  python tilt.py reindex    full pipeline: index + embeddings + affect + topics + arcs
-  python tilt.py serve      just run the server (it auto-indexes in the background)
+  agrep "race condition"    grep your whole agent history; print matches  (the namesake)
+  agrep up                  build the index, start the server, open the app
+  agrep doctor              check what's installed and what each tier needs
+  agrep index               just (re)build the index from your agent stores
+  agrep reindex             full pipeline: index + embeddings + affect + topics + arcs
+  agrep serve               just run the server (it auto-indexes in the background)
+  agrep tail                follow live agent events as JSON lines
 
-(On Unix `./tilt <cmd>` works via the wrapper; on Windows `tilt <cmd>` via tilt.cmd.)
-Run `python tilt.py <command> --help` for a command's own options.
+A bare first argument that isn't a command is treated as a search, so `agrep deadlock`
+greps. Bare `agrep` opens the app. In a dev checkout the same commands run as
+`python tilt.py <cmd>`. Run `agrep <command> --help` for a command's own options.
 """
 
 from __future__ import annotations
@@ -121,9 +124,16 @@ def cmd_tail(a) -> int:
                           cwd=str(ROOT)).returncode
 
 
+def cmd_search(a) -> int:
+    # keyword search is core-tier (stdlib over the materialized corpus), so any python
+    # runs it; --semantic just queries a running server, no torch in this process.
+    return subprocess.run([sys.executable, str(ROOT / "py" / "search.py"), *a.rest],
+                          cwd=str(ROOT)).returncode
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
-        prog="tilt", description="one command for your cross-agent chat history")
+        prog="agrep", description="grep and explore your cross-agent chat history")
     sub = p.add_subparsers(dest="cmd")
 
     up = sub.add_parser("up", help="index, serve, and open the app (default)")
@@ -146,6 +156,18 @@ def main() -> int:
 
     ta = sub.add_parser("tail", help="follow live agent events as JSON lines (turn ends by default)")
     ta.set_defaults(fn=cmd_tail)
+
+    se = sub.add_parser("search", help="grep your chat history (keyword; --semantic for meaning)")
+    se.set_defaults(fn=cmd_search)
+
+    # The agrep promise: a bare pattern greps. If the first arg isn't a known verb
+    # (and isn't a global flag), treat the whole invocation as a search — so
+    # `agrep "rust simd"` works, while `agrep up` / `agrep serve --port N` still
+    # dispatch. `agrep` alone opens the app; `agrep -h` shows top-level help.
+    raw = sys.argv[1:]
+    verbs = set(sub.choices)
+    if raw and raw[0] not in verbs and raw[0] not in ("-h", "--help"):
+        return cmd_search(argparse.Namespace(rest=raw))
 
     # parse_known_args instead of REMAINDER positionals: REMAINDER errors on
     # leading optionals (`tilt serve --port N` never reached the server), and
