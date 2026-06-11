@@ -2228,6 +2228,95 @@
                 font-family: Arial, sans-serif;
             }
 
+            /* ---- setup panel (tiers): what each unlocks, then the command ---- */
+            .setup {
+                max-width: 760px;
+                margin: 24px auto 0;
+                display: flex;
+                flex-direction: column;
+                gap: 13px;
+            }
+            .sc {
+                border: 1px solid var(--line);
+                background: var(--panel);
+                padding: 14px 16px 13px;
+            }
+            .sc .sch {
+                display: flex;
+                gap: 10px;
+                align-items: baseline;
+            }
+            .sc .tdot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--calm);
+                flex: none;
+                align-self: center;
+            }
+            .sc.off .tdot {
+                background: var(--ghost);
+            }
+            .sc .nm {
+                color: var(--ink);
+                font-weight: 600;
+            }
+            .sc .what {
+                color: var(--dim);
+                font-size: 12px;
+            }
+            .sc .det2 {
+                color: var(--faint);
+                font-size: 11.5px;
+                margin-top: 5px;
+                line-height: 1.5;
+            }
+            .sc .cmd {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                margin-top: 8px;
+            }
+            .sc .cmd code {
+                flex: 1;
+                background: var(--panel2);
+                border: 1px solid var(--hair);
+                padding: 6px 10px;
+                font-size: 12px;
+                font-family: var(--mono);
+                overflow-x: auto;
+                white-space: nowrap;
+            }
+            .sc .cmd button {
+                background: transparent;
+                border: 1px solid var(--line);
+                color: var(--dim);
+                font-family: var(--mono);
+                font-size: 11px;
+                padding: 5px 11px;
+                flex: none;
+            }
+            .sc .cmd button:hover {
+                color: var(--ink);
+                border-color: var(--ember);
+            }
+            html[data-theme="kawaii"] .sc {
+                border-radius: 16px;
+                border-width: 2px;
+            }
+            html[data-theme="kawaii"] .sc .cmd code {
+                border-radius: 10px;
+            }
+            html[data-theme="web99"] .sc {
+                border: 2px ridge #d6d6d6;
+                background: #fcfcfc;
+            }
+            html[data-theme="web99"] .sc .cmd code {
+                border: 2px inset #c0c0c0;
+                background: #fff;
+                font-family: "Courier New", monospace;
+            }
+
             /* ============================ themes ============================ */
             .themebtn {
                 background: transparent;
@@ -5230,6 +5319,8 @@
                 }
                 if (t === "kawaii") {
                     $("view").innerHTML = kawaiiHome(n, v);
+                    const ks = $("khsetup");
+                    if (ks) ks.onclick = showSetup;
                     return;
                 }
                 // noir: wordmark + the most recent chats, so the empty pane is a resume point
@@ -5248,13 +5339,15 @@
     <div class="big">tilt.</div>
     <p class="lead">${C("heroLead")}</p>
     ${recent.length ? `<div class="rh"><span>${C("recentHead")}</span><span class="rule"></span></div>${rows}` : ""}
-    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")} · ${v} ${C("heroFootB")}</p>
+    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")} · ${v} ${C("heroFootB")} · <a id="homesetup" style="cursor:pointer;color:var(--dim)">${esc(SK("title"))} →</a></p>
   </div>`;
                 $("view")
                     .querySelectorAll(".ri")
                     .forEach(
                         (el) => (el.onclick = () => openChat(el.dataset.s)),
                     );
+                const hs = $("homesetup");
+                if (hs) hs.onclick = showSetup;
             }
             // kawaii cozy homepage: floating mascot + handwritten welcome
             function kawaiiHome(n, v) {
@@ -5263,6 +5356,7 @@
     <div class="khohi">welcome back ♡</div>
     <p class="kholead">every little chat with your coding buddies, all tucked into one cozy place. tap one on the left to read its mood diary, or ask me anything about all of them~</p>
     <p class="khofoot">${n} chats tucked away ♡  ${v} with a mood diary ✿</p>
+    <p class="khofoot" id="khsetup" style="cursor:pointer;text-decoration:underline">${esc(SK("title"))} →</p>
     <div class="khosparkle">✿ ⋆ ♡ ⋆ ✿</div>
   </div>`;
             }
@@ -5274,6 +5368,7 @@
     <div class="g99btns">
       <button class="g99b" id="g99search">tilt Search</button>
       <button class="g99b" id="g99lucky">I'm Feeling Lucky</button>
+      <button class="g99b" id="g99setup">${esc(SK("title"))}</button>
     </div>
     <div class="g99meta">Indexing <b>${fmt(n)}</b> conversations</div>
     <hr class="g99hr">
@@ -5289,6 +5384,8 @@
             function wireHomeFocus() {
                 const s = $("g99search");
                 if (s) s.onclick = () => $("find").focus();
+                const su = $("g99setup");
+                if (su) su.onclick = showSetup;
                 const l = $("g99lucky");
                 if (l)
                     l.onclick = () => {
@@ -6125,11 +6222,17 @@
                     `<div class="sph"><span class="sdot"></span>${esc(head)}</div>` +
                     rows +
                     `<div class="sp-div"></div>` +
-                    `<div class="sp-foot"><span>${C("spAuto")}</span>${reBtn}</div>`;
+                    `<div class="sp-foot"><span>${C("spAuto")} <a id="spSetup" style="color:var(--calm);cursor:pointer">${esc(SK("title"))} →</a></span>${reBtn}</div>`;
                 pop.className = "statuspop" + (st.cls ? " " + st.cls : "");
                 pop.style.display = "";
                 const rb = $("spReidx");
                 if (rb) rb.onclick = forceReindex;
+                const su = $("spSetup");
+                if (su)
+                    su.onclick = () => {
+                        closeStatus();
+                        showSetup();
+                    };
             }
             async function forceReindex() {
                 if (
@@ -6229,6 +6332,167 @@
                     }
                 })(),
             );
+
+            // ============================ setup (tiers) ============================
+            // The discoverable half of configuration (ctrl+k is the power half): tier
+            // cards that say what each layer UNLOCKS before showing the command, with
+            // copy buttons and a recheck. Backed by GET /doctor (the CLI doctor's
+            // checks, structured). Reached from the status popover, the home screens,
+            // and the palette.
+            const SETUPC = {
+                noir: {
+                    title: "setup",
+                    sub: "tilt works in tiers. the core is already running; each layer below is one command and stays optional.",
+                    core: "core",
+                    smart: "smart",
+                    named: "named",
+                    coreWhat: "browse · keyword search · live view · resume",
+                    smartWhat: "semantic search · topic clustering · mood arcs",
+                    namedWhat: "generated titles · summaries · concept names",
+                    smartHow:
+                        "one command — creates py/.venv and installs requirements (pulls torch, ~2GB). then reindex to build the new layers.",
+                    namedHow:
+                        "install ollama and pull a small model; the next reindex generates titles and summaries.",
+                    storesNone: "no agent stores found under ~ — run an agent first.",
+                    indexed: "indexed",
+                    recheck: "recheck",
+                    checking: "checking what's installed…",
+                    copy: "copy",
+                    copied: "copied ✓",
+                    back: "← back",
+                    on: "on",
+                },
+                kawaii: {
+                    title: "set me up ✿",
+                    sub: "i work in little layers~ the cozy core is already on; each one below is just one command ♡",
+                    core: "cozy core",
+                    smart: "smart ♡",
+                    named: "named ✿",
+                    coreWhat: "browse · peek search · right now · hop back in",
+                    smartWhat: "vibe search · topic bundles · mood diaries",
+                    namedWhat: "pretty titles · little summaries",
+                    smartHow:
+                        "one command~ (it pulls torch, ~2GB, be patient ;;) then refresh me to grow the new layers ♡",
+                    namedHow: "install ollama + pull a tiny model, then refresh me~",
+                    storesNone: "no chats found yet ;; run a coding buddy first ♡",
+                    indexed: "tucked away",
+                    recheck: "peek again ♡",
+                    checking: "peeking at what's installed~",
+                    copy: "copy ♡",
+                    copied: "got it ♡",
+                    back: "← back",
+                    on: "on ♡",
+                },
+                web99: {
+                    title: "Add or Remove Programs",
+                    sub: "tilt is sold in three editions. The Standard Edition is already installed; each upgrade below is one command.",
+                    core: "Standard Edition",
+                    smart: "Professional Edition",
+                    named: "Plus! Pack",
+                    coreWhat: "Browse, keyword search, live monitor, resume.",
+                    smartWhat: "Semantic search, topic clustering, mood charts.",
+                    namedWhat: "Generated titles, summaries, topic names.",
+                    smartHow:
+                        "One command. Creates py/.venv and installs requirements (downloads torch, approx. 2GB). Then reindex.",
+                    namedHow:
+                        "Install Ollama and pull a small model. The next reindex generates titles and summaries.",
+                    storesNone: "No agent stores were found. Run a coding program first.",
+                    indexed: "Indexed",
+                    recheck: "Refresh",
+                    checking: "Detecting installed components...",
+                    copy: "Copy",
+                    copied: "Copied",
+                    back: "← Back",
+                    on: "Installed",
+                },
+            };
+            const SK = (k) => (SETUPC[curTheme()] || SETUPC.noir)[k] ?? SETUPC.noir[k];
+
+            function cmdRow(cmd) {
+                return `<div class="cmd"><code>${esc(cmd)}</code><button data-cmd="${esc(cmd)}">${SK("copy")}</button></div>`;
+            }
+            function setupHTML(d) {
+                const core = d.core || {},
+                    smart = d.smart || {},
+                    named = d.named || {};
+                const stores = (core.stores || []).filter((s) => s.found);
+                const storeline = stores.length
+                    ? stores.map((s) => `${s.agent} ${fmt(s.found)}`).join(" · ")
+                    : SK("storesNone");
+                const idx = core.indexed
+                    ? ` — ${SK("indexed")} ${fmt(core.indexed.sessions)} · ${ago(Date.now() - core.indexed.age_s * 1000)}`
+                    : "";
+                const missing = Object.entries(smart.deps || {})
+                    .filter(([, v]) => !v)
+                    .map(([k]) => k);
+                return `<div class="setup">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">
+      <h2 style="margin:0;font-family:var(--mono);font-weight:600;font-size:15px;color:var(--ink)">${esc(SK("title"))}</h2>
+      <span style="display:flex;gap:8px">
+        <button class="sp-reidx" id="surecheck">${esc(SK("recheck"))}</button>
+        <button class="sp-reidx" id="suback">${esc(SK("back"))}</button>
+      </span>
+    </div>
+    <p style="margin:0;color:var(--dim)">${esc(SK("sub"))}</p>
+    <div class="sc${core.live ? "" : " off"}">
+      <div class="sch"><span class="tdot"></span><span class="nm">${esc(SK("core"))}</span><span class="what">${esc(SK("coreWhat"))}</span></div>
+      <div class="det2">${esc(storeline)}${esc(idx)}</div>
+      ${core.live ? "" : cmdRow("python tilt.py up")}
+    </div>
+    <div class="sc${smart.live ? "" : " off"}">
+      <div class="sch"><span class="tdot"></span><span class="nm">${esc(SK("smart"))}</span><span class="what">${esc(SK("smartWhat"))}</span></div>
+      ${
+          smart.live
+              ? `<div class="det2">${esc(SK("on"))} — ${esc(Object.keys(smart.deps || {}).join(" · "))}</div>`
+              : `<div class="det2">${esc(SK("smartHow"))}${missing.length ? ` (missing: ${esc(missing.join(", "))})` : ""}</div>` +
+                cmdRow("python tilt.py doctor --fix") +
+                cmdRow("python tilt.py reindex")
+      }
+    </div>
+    <div class="sc${named.live ? "" : " off"}">
+      <div class="sch"><span class="tdot"></span><span class="nm">${esc(SK("named"))}</span><span class="what">${esc(SK("namedWhat"))}</span></div>
+      ${
+          named.live
+              ? `<div class="det2">${esc(SK("on"))} — ${esc((named.models || []).join(", "))}</div>`
+              : `<div class="det2">${esc(SK("namedHow"))}${named.ollama ? "" : ` — <a href="https://ollama.com" target="_blank" rel="noopener" style="color:var(--calm)">ollama.com</a>`}</div>` +
+                cmdRow("ollama pull gemma2:2b")
+      }
+    </div>
+  </div>`;
+            }
+            async function showSetup() {
+                if (STATE.view !== "explore") showExplore();
+                STATE.sel = null;
+                const v = $("view");
+                v.innerHTML = `<div class="setup"><div class="spin" style="padding:30px 0">${esc(SK("checking"))}</div></div>`;
+                $("main").scrollTop = 0;
+                let d;
+                try {
+                    d = await J("/doctor");
+                } catch (e) {
+                    v.innerHTML = `<div class="empty">${esc(String(e.message || e))}</div>`;
+                    return;
+                }
+                v.innerHTML = setupHTML(d);
+                v.querySelectorAll(".cmd button").forEach(
+                    (b) =>
+                        (b.onclick = async () => {
+                            try {
+                                await navigator.clipboard.writeText(b.dataset.cmd);
+                                b.textContent = SK("copied");
+                                setTimeout(() => (b.textContent = SK("copy")), 1400);
+                            } catch (e) {}
+                        }),
+                );
+                const r = $("surecheck");
+                if (r) r.onclick = showSetup;
+                const bk = $("suback");
+                if (bk)
+                    bk.onclick = () => {
+                        $("view").innerHTML = "";
+                        showPlaceholder();
+                    };
+            }
 
             // ============================ command palette (ctrl+k) ============================
             // One box for every noun and verb: chats, live sessions, projects, views, theme,
@@ -6407,6 +6671,7 @@
                     { l: C("vExplore"), m: "view", f: () => setView("explore") },
                     { l: C("vLive"), m: "view", f: () => setView("live") },
                     { l: C("vPulse"), m: "view", f: () => setView("pulse") },
+                    { l: SK("title"), m: "tiers", f: () => showSetup() },
                     { l: C("spReindex"), m: "index", f: () => forceReindex() },
                     { l: "status", m: "index", f: () => toggleStatus() },
                     {

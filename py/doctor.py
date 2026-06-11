@@ -61,6 +61,35 @@ def _stores() -> list[tuple[str, Path, str]]:
     ]
 
 
+def probe() -> dict:
+    """Structured tier report for the in-app setup panel (GET /doctor). Same checks
+    as `report()`, no printing. The venv module probes spawn a python each, so this
+    costs ~1-2s — the UI calls it on demand (setup open / recheck), never on boot."""
+    has_cargo = shutil.which("cargo") is not None
+    has_bin = TILT_RS.exists()
+    has_venv = VENV_PY.exists()
+    deps = {m: (_venv_has(m) if has_venv else False)
+            for m in ("numpy", "torch", "sentence_transformers", "sklearn")}
+    models = _ollama_models()
+    stores = []
+    for agent, root, glob in _stores():
+        n = len(list(root.glob(glob))) if root.exists() else 0
+        stores.append({"agent": agent, "found": n})
+    sj = common.DATA_DIR / "sessions.jsonl"
+    indexed = None
+    if sj.exists():
+        import time
+        indexed = {"sessions": sum(1 for _ in sj.open(encoding="utf-8")),
+                   "age_s": int(time.time() - sj.stat().st_mtime)}
+    return {
+        "core": {"live": has_bin, "rust": has_cargo, "binary": has_bin,
+                 "stores": stores, "indexed": indexed},
+        "smart": {"live": all(deps.values()), "venv": has_venv, "deps": deps},
+        "named": {"live": bool(models), "ollama": models is not None,
+                  "models": (models or [])[:5]},
+    }
+
+
 def report() -> dict:
     fixes: list[str] = []
 

@@ -255,6 +255,11 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_image((qs.get("p") or [""])[0])
         elif path == "/status":
             self._json(_status)
+        elif path == "/doctor":
+            # structured tier checks for the setup panel; ~1-2s (venv module probes),
+            # called on demand only
+            import doctor
+            self._json(doctor.probe)
         elif path == "/live/state":
             self._json(lambda: live.watcher().snapshot())
         elif path == "/live/stream":
