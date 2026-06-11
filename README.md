@@ -9,16 +9,24 @@ No hooks, no agent-side install, no telemetry. tilt never modifies the agents or
 data — it only reads. Everything stays on your machine.
 
 ```
-git clone <repo> tilt && cd tilt
-python tilt.py up
+uvx agtilt          # or: pipx run agtilt
 ```
 
-That builds the indexer (needs [Rust](https://rustup.rs)), scans your agent stores,
-starts a local server, and opens the app. New chats show up the moment an agent writes
-one; the index keeps itself current while the server runs.
+That fetches a small prebuilt package (the rust ingest binary + the app — no clone, no
+cargo), scans your agent stores, starts a local server, and opens the app. New chats show
+up the moment an agent writes one; the index keeps itself current while the server runs.
+Your index and any optional models install to a per-user data dir, not the package.
 
-Not sure what's installed? `python tilt.py doctor` reports which tiers are live and the
-exact command to unlock each missing one.
+The heavier tiers (semantic search, generated titles) install on demand from the app's
+own setup panel — one click each. To get them up front, or to hack on tilt, clone instead:
+
+```
+git clone https://github.com/dannyisbad/tilt && cd tilt
+python tilt.py up      # builds the indexer; needs Rust (https://rustup.rs)
+```
+
+Not sure what's installed? `agtilt doctor` (or `python tilt.py doctor`) reports which
+tiers are live and the exact command to unlock each missing one.
 
 ---
 

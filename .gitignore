@@ -22,3 +22,6 @@ py/_check.py
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# prebuilt rust binary staged for wheel packaging (CI / local build)
+_bin/
