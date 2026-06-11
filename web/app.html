@@ -5450,9 +5450,6 @@
             function showPlaceholder() {
                 if ($("conv").children.length) return; // keep ask answers visible
                 const n = STATS ? STATS.n_sessions : CHATS.length,
-                    v = STATS
-                        ? STATS.n_vibes
-                        : CHATS.filter((c) => c.has_vibe).length,
                     t = curTheme();
                 if (t === "web99") {
                     $("view").innerHTML = web99Home(n);
@@ -5460,7 +5457,7 @@
                     return;
                 }
                 if (t === "kawaii") {
-                    $("view").innerHTML = kawaiiHome(n, v);
+                    $("view").innerHTML = kawaiiHome(n);
                     const ks = $("khsetup");
                     if (ks) ks.onclick = showSetup;
                     return;
@@ -5481,7 +5478,7 @@
     <div class="big">tilt.</div>
     <p class="lead">${C("heroLead")}</p>
     ${recent.length ? `<div class="rh"><span>${C("recentHead")}</span><span class="rule"></span></div>${rows}` : ""}
-    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")} · ${v} ${C("heroFootB")}</p>
+    <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")}</p>
     ${setupCta()}
   </div>`;
                 $("view")
@@ -5493,12 +5490,12 @@
                 if (hs) hs.onclick = showSetup;
             }
             // kawaii cozy homepage: floating mascot + handwritten welcome
-            function kawaiiHome(n, v) {
+            function kawaiiHome(n) {
                 return `<div class="kho">
     <div class="khomascot">${MASCOT}</div>
     <div class="khohi">welcome back ♡</div>
     <p class="kholead">every little chat with your coding buddies, all tucked into one cozy place. tap one on the left to read its mood diary, or search through all of them~</p>
-    <p class="khofoot">${n} chats tucked away ♡  ${v} with a mood diary ✿</p>
+    <p class="khofoot">${n} chats tucked away ♡</p>
     ${setupCta().replace('id="homesetup"', 'id="khsetup"')}
     <div class="khosparkle">✿ ⋆ ♡ ⋆ ✿</div>
   </div>`;
@@ -5769,7 +5766,6 @@
                     heroLead:
                         "every chat with claude, codex, opencode and antigravity in one place. pick one on the left, or search across all of them.",
                     heroFootA: "chats indexed",
-                    heroFootB: "with a vibe-trace",
                     statChats: "chats",
                     statTurns: "turns",
                     statVibes: "vibe-traces",
@@ -5920,7 +5916,6 @@
                     recentHead: "fresh chats ♡",
                     convClear: "all done ♡",
                     heroFootA: "chats tucked away ♡",
-                    heroFootB: "with a mood diary ✿",
                     statChats: "chats ♡",
                     statTurns: "messages",
                     statVibes: "mood diaries",
@@ -6072,7 +6067,6 @@
                     recentHead: "What's New",
                     convClear: "[clear]",
                     heroFootA: "documents indexed.",
-                    heroFootB: "with mood charts.",
                     statChats: "documents",
                     statTurns: "messages",
                     statVibes: "mood charts",

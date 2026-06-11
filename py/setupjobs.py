@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform as _platform
+import re
 import shutil
 import subprocess
 import sys
@@ -104,9 +106,126 @@ def _stream(cmd: list[str], label: str) -> None:
 
 # ---- smart tier --------------------------------------------------------------
 
-def _smart() -> None:
+def _probe_py(path: str, found: dict) -> None:
+    """Record path's (major, minor) if it's a working CPython outside our venv."""
+    try:
+        if Path(path).resolve().is_relative_to(VENV_DIR.resolve()):
+            return  # never build the venv from its own python
+    except (OSError, ValueError):
+        pass
+    try:
+        r = subprocess.run([path, "-c", "import sys;print(*sys.version_info[:2])"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            ma, mi = map(int, r.stdout.split())
+            found.setdefault((ma, mi), path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _find_pythons() -> list[tuple[tuple[int, int], str]]:
+    """Every CPython we can locate, newest first. Sources: whoever is running us,
+    the Windows py launcher's registry, PATH names, and uv-managed interpreters."""
+    found: dict[tuple[int, int], str] = {}
+    _probe_py(sys.executable, found)
+    if WIN:
+        try:
+            r = subprocess.run(["py", "-0p"], capture_output=True, text=True, timeout=10)
+            for ln in (r.stdout or "").splitlines():
+                m = re.match(r"\s*-V:(\d+\.\d+)(?:-\d+)?\s+\*?\s*(.+?)\s*$", ln)
+                if m:
+                    _probe_py(m.group(2), found)
+        except Exception:  # noqa: BLE001
+            pass
+        uv_roots = [Path(os.environ.get(k, "")) / "uv" / "python"
+                    for k in ("APPDATA", "LOCALAPPDATA")]
+    else:
+        for name in ("python3.14", "python3.13", "python3.12", "python3.11",
+                     "python3.10", "python3"):
+            w = shutil.which(name)
+            if w:
+                _probe_py(w, found)
+        uv_roots = [Path.home() / ".local" / "share" / "uv" / "python"]
+    for root in uv_roots:
+        if root.is_dir():
+            for p in root.glob("cpython-*/" + ("python.exe" if WIN else "bin/python3")):
+                _probe_py(str(p), found)
+    return sorted(found.items(), key=lambda kv: kv[0], reverse=True)
+
+
+def _torch_wheel_pys() -> set[tuple[int, int]] | None:
+    """(major, minor) CPythons the CURRENT torch release ships wheels for on this
+    platform -- live from PyPI, so there's no hardcoded version range to go stale.
+    None when PyPI is unreachable (the caller falls back to guessing)."""
+    try:
+        with urllib.request.urlopen("https://pypi.org/pypi/torch/json", timeout=10) as r:
+            files = json.loads(r.read()).get("urls", [])
+    except Exception:  # noqa: BLE001
+        return None
+    arm = _platform.machine().lower() in ("arm64", "aarch64")
+    plat = {"win32": "win_", "darwin": "macosx"}.get(sys.platform, "linux")
+    out = set()
+    for f in files:
+        name = f.get("filename", "")
+        if not name.endswith(".whl") or plat not in name:
+            continue
+        if (("arm64" in name or "aarch64" in name) != arm):
+            continue
+        m = re.search(r"-cp(\d)(\d+)-", name)
+        if m:
+            out.add((int(m.group(1)), int(m.group(2))))
+    return out or None
+
+
+def pick_python() -> tuple[tuple[int, int], str]:
+    """The interpreter that should own py/.venv: the newest installed CPython that
+    torch actually ships wheels for. A 3.14-only default would otherwise sail into
+    a cryptic 'no matching distribution' from pip. Shared with `doctor --fix`."""
+    pys = _find_pythons()
+    if not pys:
+        raise RuntimeError("no python found to build the venv with")
+    wheels = _torch_wheel_pys()
+    if not wheels:  # PyPI unreachable: pip would fail anyway, but try the newest
+        return pys[0]
+    for ver, path in pys:
+        if ver in wheels:
+            return ver, path
+    have = ", ".join(f"{a}.{b}" for (a, b), _ in pys)
+    want = ", ".join(f"{a}.{b}" for a, b in sorted(wheels, reverse=True))
+    raise RuntimeError(f"no installed python can run torch (installed: {have}; "
+                       f"torch ships wheels for: {want}) -- install one of those, "
+                       f"then retry")
+
+
+def _venv_version() -> tuple[int, int] | None:
     if not VENV_PY.exists():
-        _stream([sys.executable, "-m", "venv", str(VENV_DIR)], "creating py/.venv")
+        return None
+    try:
+        r = subprocess.run([str(VENV_PY), "-c", "import sys;print(*sys.version_info[:2])"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            ma, mi = map(int, r.stdout.split())
+            return (ma, mi)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _smart() -> None:
+    # A venv built from a python torch doesn't ship wheels for can never succeed --
+    # detect that and rebuild it from a compatible interpreter instead of letting
+    # pip fail the same cryptic way forever.
+    cur = _venv_version()
+    if cur:
+        wheels = _torch_wheel_pys()
+        if wheels and cur not in wheels:
+            _set(label=f"rebuilding py/.venv (python {cur[0]}.{cur[1]} has no torch wheels)",
+                 line="")
+            shutil.rmtree(VENV_DIR)
+    if not VENV_PY.exists():
+        (ma, mi), py = pick_python()
+        _stream([py, "-m", "venv", str(VENV_DIR)],
+                f"creating py/.venv (python {ma}.{mi})")
     _stream([str(VENV_PY), "-m", "pip", "install", "-r", "requirements.txt",
              "--progress-bar", "off"],
             "installing python deps (torch is the big one, ~2.5GB)")

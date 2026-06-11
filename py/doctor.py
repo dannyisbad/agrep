@@ -176,8 +176,17 @@ def fix() -> int:
     Deliberately does NOT touch torch/CUDA specifics or pull Ollama models - those
     are platform-specific and printed as instructions instead."""
     if not VENV_PY.exists():
-        print("creating py/.venv ...")
-        r = subprocess.run([sys.executable, "-m", "venv", str(ROOT / "py" / ".venv")])
+        # the venv must come from a python torch ships wheels for, not just whoever
+        # ran this script (a 3.14-only default would hit a cryptic pip failure)
+        py = sys.executable
+        try:
+            import setupjobs
+            (ma, mi), py = setupjobs.pick_python()
+            print(f"creating py/.venv (python {ma}.{mi}) ...")
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! python picker: {e}")
+            print("creating py/.venv (current python) ...")
+        r = subprocess.run([py, "-m", "venv", str(ROOT / "py" / ".venv")])
         if r.returncode != 0:
             print("  ! venv creation failed.")
             return 1
