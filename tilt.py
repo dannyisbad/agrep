@@ -2,6 +2,7 @@
 """agrep — grep and explore your cross-agent chat history.
 
   agrep "race condition"    grep your whole agent history; print matches  (the namesake)
+  agrep resume <id>         jump back into a past session in its agent, cd'd there
   agrep up                  build the index, start the server, open the app
   agrep doctor              check what's installed and what each tier needs
   agrep index               just (re)build the index from your agent stores
@@ -131,6 +132,13 @@ def cmd_search(a) -> int:
                           cwd=str(ROOT)).returncode
 
 
+def cmd_resume(a) -> int:
+    # imported and called in-process (not a subprocess) so the resumed agent is a direct
+    # child of this process and cleanly inherits the terminal.
+    import resume
+    return resume.main(a.rest)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="agrep", description="grep and explore your cross-agent chat history")
@@ -159,6 +167,9 @@ def main() -> int:
 
     se = sub.add_parser("search", help="grep your chat history (keyword; --semantic for meaning)")
     se.set_defaults(fn=cmd_search)
+
+    rs = sub.add_parser("resume", help="resume a past session in its own agent, cd'd there")
+    rs.set_defaults(fn=cmd_resume)
 
     # The agrep promise: a bare pattern greps. If the first arg isn't a known verb
     # (and isn't a global flag), treat the whole invocation as a search — so

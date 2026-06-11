@@ -130,6 +130,43 @@ def resolve_cwd(agent: str, session: str) -> str:
     return cwd if cwd and os.path.isdir(cwd) else ""
 
 
+def resume_argv(agent: str, session: str, cwd: str) -> list[str]:
+    """The exact resume command for an agent. opencode scopes sessions by project, so
+    it gets the directory as its positional (`opencode <dir> --session <id>`) — relying
+    on the process cwd alone was unreliable (the 'opencode resume is broken' bug).
+    The others find the session from cwd, set by the caller."""
+    exe, pre = _RESUME[agent]
+    if agent == "opencode" and cwd:
+        return [exe, cwd, *pre, session]
+    return [exe, *pre, session]
+
+
+def resume_in_place(agent: str, session: str) -> int:
+    """Run the agent's resume IN THE CURRENT terminal (cd'd to the session's dir), for
+    the `agrep resume` CLI. Unlike open_session this doesn't spawn a window — the agent
+    inherits this terminal and replaces the prompt until it exits. Returns its exit code
+    (127 if the agent CLI isn't on PATH)."""
+    if agent not in _RESUME:
+        print(f"unknown agent {agent!r}", file=sys.stderr)
+        return 2
+    cwd = resolve_cwd(agent, session) or HOME
+    exe = _RESUME[agent][0]
+    exe_path = shutil.which(exe)
+    if not exe_path:
+        print(f"the {agent} CLI ('{exe}') isn't on your PATH — install it to resume here.",
+              file=sys.stderr)
+        return 127
+    argv = resume_argv(agent, session, cwd)
+    argv[0] = exe_path  # resolved (handles .cmd/.exe shims on Windows)
+    print(f"\033[2m↻ resuming {agent} · {os.path.basename(cwd)} · {cwd}\033[0m",
+          file=sys.stderr)
+    try:
+        return subprocess.run(argv, cwd=cwd).returncode
+    except OSError as e:
+        print(f"couldn't launch {agent}: {e}", file=sys.stderr)
+        return 1
+
+
 def _spawn_windows(argv: list[str], cwd: str) -> str:
     # cmd /k: run the resume command and KEEP the shell open in `cwd` afterwards —
     # exiting the agent should leave you in a usable shell already cd'd into the
@@ -181,9 +218,8 @@ def open_session(agent: str, session: str) -> dict:
         return {"ok": False, "error": f"unknown agent {agent!r}"}
     if not _ID_RE.match(session or ""):
         return {"ok": False, "error": "invalid session id"}
-    exe, pre = _RESUME[agent]
     cwd = resolve_cwd(agent, session) or HOME
-    argv = [exe, *pre, session]
+    argv = resume_argv(agent, session, cwd)
     try:
         if sys.platform == "win32":
             via = _spawn_windows(argv, cwd)

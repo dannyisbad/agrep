@@ -62,6 +62,34 @@ def _hl_regex(q: str, regex: bool) -> re.Pattern | None:
         return None
 
 
+def _is_word_char(c: str) -> bool:
+    return c.isalnum() or c == "_"
+
+
+def _word_scan(q: str, k: int) -> dict:
+    """Whole-word search, the fast way: a C-level substring `.find` prefilter, then a
+    boundary check only on the (few) entries that contain the word. Far cheaper than a
+    `\\bword\\b` regex over the whole corpus — that regex walks every entry char by char;
+    this only pays the boundary check where the substring already hit."""
+    ql = q.lower()
+    n = len(ql)
+    fields = ("session", "agent", "project", "concept", "turn", "ts", "who")
+    hits = []
+    for e in explore._kw_corpus():
+        low = e["low"]
+        i = low.find(ql)
+        while i >= 0:
+            j = i + n
+            if (i == 0 or not _is_word_char(low[i - 1])) and \
+               (j >= len(low) or not _is_word_char(low[j])):
+                hits.append({**{f: e[f] for f in fields},
+                             "snippet": explore._snip_at(e["text"], i, j)})
+                break  # one hit per entry, like keyword_search
+            i = low.find(ql, i + 1)
+    hits.sort(key=lambda h: (h["session"], h["turn"], 0 if h["who"] != "agent" else 1))
+    return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
+
+
 def _regex_scan(pattern: str, k: int) -> dict:
     """Regex search over the same corpus keyword_search uses (-E mode). Same hit shape."""
     try:
@@ -247,8 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sem_used = True
     if not sem_used:
-        if args.word:  # whole-word -> boundary-anchored regex over the corpus
-            res = _regex_scan(r"\b" + re.escape(q) + r"\b", big)
+        if args.word:  # whole-word: substring prefilter + boundary check (fast)
+            res = _word_scan(q, big)
         elif args.regex:
             res = _regex_scan(q, big)
         else:
