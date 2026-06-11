@@ -167,10 +167,13 @@ where
     F: Fn(&Path) -> (Vec<Message>, Vec<Event>) + Sync,
 {
     let root_key = root.to_string_lossy().to_string();
+    let t_stat = std::time::Instant::now();
     let stats: Vec<(PathBuf, String, i64, u64)> = files
         .par_iter()
         .filter_map(|p| file_stat(p).map(|(mt, sz)| (p.clone(), p.to_string_lossy().to_string(), mt, sz)))
         .collect();
+    let stat_ms = t_stat.elapsed().as_millis();
+    let t_parse = std::time::Instant::now();
     let present: HashSet<String> = stats.iter().map(|(_, k, _, _)| k.clone()).collect();
 
     // split into cache hits and misses (changed/new)
@@ -262,5 +265,14 @@ where
         .entries
         .retain(|k, _| !k.starts_with(&root_key) || present.contains(k));
 
+    println!(
+        "  [{}] {} files: stat {}ms · parse+materialize {}ms ({} changed, {} siblings)",
+        root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        files.len(),
+        stat_ms,
+        t_parse.elapsed().as_millis(),
+        misses.len(),
+        siblings.len()
+    );
     Pass { messages, events, parsed: misses.len() + siblings.len() }
 }

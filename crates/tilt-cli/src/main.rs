@@ -82,21 +82,35 @@ fn ingest_agent(agent: &str, cache: &mut IngestCache) -> anyhow::Result<(Vec<Mes
 /// affect, topics, and arcs are produced by the Python sidecar (`python reindex.py`).
 fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let t0 = Instant::now();
+    // Per-phase wall clock, printed at the end. Last round's lesson, kept as a fixture:
+    // optimize from this line, not from intuition (the serde rewrite was a measured wash
+    // because the floor was never where it looked like it was).
+    let mut phases: Vec<(&'static str, u128)> = Vec::new();
+    let mut mark = Instant::now();
+    macro_rules! lap {
+        ($name:expr) => {{
+            phases.push(($name, mark.elapsed().as_millis()));
+            mark = Instant::now();
+        }};
+    }
     let cache_path = PathBuf::from("data").join(".ingest_cache.bin");
     let mut pcache = if full {
         IngestCache::cold()
     } else {
         IngestCache::load(&cache_path)
     };
+    lap!("load-cache");
     // a complete parse (cold cache or --full) yields the full event set; a warm/incremental
     // run only carries touched sessions' events, so the pulse rollup is left as-is until the
     // next complete run (its aggregates over ~480k events don't move on a handful of new ones).
     let complete = full || !pcache.warm;
     let (msgs, evts) = ingest_agent(agent, &mut pcache)?;
+    lap!("ingest+dedupe");
     // persist the refreshed parse cache for the next run (ignored on load if schema bumps)
     if let Err(e) = pcache.save(&cache_path) {
         eprintln!("  ! parse-cache save failed (next run re-parses): {e}");
     }
+    lap!("save-cache");
     let n = msgs.len();
     let path = PathBuf::from("data").join("messages.jsonl");
     cache::write_messages(&msgs, &path)?;
@@ -104,14 +118,23 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     cache::write_replies(&msgs, &rpath)?;
     let n_sessions =
         cache::write_session_index(&msgs, &PathBuf::from("data").join("sessions.jsonl"))?;
-    // keep = every live session's event filename, so unchanged event files aren't deleted
+    lap!("write-msgs");
+    // keep = every live session's event filename, so unchanged event files aren't deleted.
+    // The delete sweep is scoped to the agents actually ingested this run — keep covers
+    // only their sessions, so an unscoped sweep on `--agent opencode` would wipe the
+    // claude/codex event files.
     let keep: std::collections::HashSet<String> =
         msgs.iter().map(|m| cache::event_fname(m.agent, &m.session)).collect();
+    let run_agents: Vec<&str> = match agent {
+        "all" => vec!["claude", "codex", "opencode", "antigravity"],
+        one => vec![one],
+    };
     let edir = PathBuf::from("data").join("events");
-    let (n_files, n_events, n_rewritten) = cache::write_events(&evts, &edir, &keep)?;
+    let (n_files, n_events, n_rewritten) = cache::write_events(&evts, &edir, &keep, &run_agents)?;
     if complete {
         cache::write_event_stats(&evts, &PathBuf::from("data").join("event_stats.json"))?;
     }
+    lap!("write-events");
     let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();
     let with_reply = msgs.iter().filter(|m| !m.reply.trim().is_empty()).count();
     println!(
@@ -134,6 +157,8 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         n_rewritten,
         n_events
     );
+    let breakdown: Vec<String> = phases.iter().map(|(k, ms)| format!("{k} {ms}ms")).collect();
+    println!("  phases: {}", breakdown.join(" · "));
     println!("  next: `python tilt.py reindex` to (re)build embeddings / affect / topics / arcs");
     Ok(())
 }

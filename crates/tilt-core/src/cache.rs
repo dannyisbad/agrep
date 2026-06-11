@@ -242,11 +242,17 @@ fn content_hash(bytes: &[u8]) -> u64 {
 ///    forward), and only files whose fname is absent from `keep` are deleted. Agent logs are
 ///    append-only, so a re-parsed session always carries its complete event set.
 ///
+/// `agents` scopes the DELETE pass: `keep` is built from this run's messages, so on a
+/// single-agent run it contains only that agent's sessions — an unscoped sweep would
+/// silently delete every other agent's event files (it did). Only files whose
+/// `{agent}-` prefix belongs to an adapter actually ingested this run are eligible.
+///
 /// Returns (n_files, n_events_written, n_rewritten).
 pub fn write_events(
     events: &[Event],
     dir: &Path,
     keep: &HashSet<String>,
+    agents: &[&str],
 ) -> anyhow::Result<(usize, usize, usize)> {
     fs::create_dir_all(dir)?;
     let manifest_path = dir.join(".manifest");
@@ -299,11 +305,14 @@ pub fn write_events(
         n_events += evs.len();
     }
 
-    // Drop event files (and manifest entries) whose session is no longer live.
+    // Drop event files (and manifest entries) whose session is no longer live — but only
+    // for the agents this run actually ingested (see the doc comment: an unscoped sweep
+    // on a single-agent run deletes every other agent's files).
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".jsonl") && !keep.contains(&name) {
+            let ours = agents.iter().any(|a| name.starts_with(&format!("{a}-")));
+            if name.ends_with(".jsonl") && ours && !keep.contains(&name) {
                 fs::remove_file(entry.path()).ok();
                 next_manifest.remove(&name);
             }
