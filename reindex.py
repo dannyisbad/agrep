@@ -39,10 +39,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
+sys.path.insert(0, str(ROOT / "py"))
+import common  # noqa: E402  -- single source for binary / venv / data paths
+
 # the venv that has torch/sentence-transformers/sklearn; fall back to whatever ran us
-VENV_PY = ROOT / "py" / ".venv" / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
-PY = str(VENV_PY if VENV_PY.exists() else sys.executable)
-TILT = ROOT / "target" / "release" / ("tilt-rs.exe" if WIN else "tilt-rs")
+PY = common.venv_python()
+TILT = common.tilt_rs_bin()
 
 
 def run(desc: str, cmd: list[str], optional: bool = False) -> bool:

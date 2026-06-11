@@ -25,6 +25,7 @@ which is exactly what the Rust AVX2 brute-force kernel computes.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,10 +37,81 @@ from typing import Iterable, Iterator, Sequence
 
 # --- Layout ---------------------------------------------------------------
 
-# This file lives in <repo>/py/. Data lives in <repo>/data/.
+# This file lives in <repo>/py/ (dev) or <site-packages>/agtilt/py/ (installed).
 PY_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PY_DIR.parent
-DATA_DIR = REPO_ROOT / "data"
+WIN = sys.platform == "win32"
+
+
+def _is_dev_checkout() -> bool:
+    """A real source tree, not an installed wheel: has the rust crate / git dir
+    alongside. In dev we keep the index in <repo>/data (Danny's whole history is
+    already there); installed, REPO_ROOT is read-only site-packages so it can't be."""
+    return (REPO_ROOT / "Cargo.toml").exists() or (REPO_ROOT / ".git").exists()
+
+
+def _user_data_dir() -> Path:
+    """Per-OS writable home for the index when tilt is installed as a package.
+    Stdlib only (no platformdirs dep): XDG on linux, Application Support on mac,
+    LOCALAPPDATA on windows."""
+    if WIN:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = str(Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "agtilt"
+
+
+# $TILT_DATA_DIR wins (lets the wheel launcher point anywhere, and lets a dev
+# override too); else <repo>/data in a checkout; else the per-user dir.
+_env_data = os.environ.get("TILT_DATA_DIR")
+if _env_data:
+    DATA_DIR = Path(_env_data).expanduser()
+elif _is_dev_checkout():
+    DATA_DIR = REPO_ROOT / "data"
+else:
+    DATA_DIR = _user_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _venv_dir() -> Path:
+    """Where the smart-tier venv lives. Dev: <repo>/py/.venv (Danny's already has
+    torch). Installed: under the user data dir, because the package dir is read-only
+    site-packages and the in-app 'install smart tier' button writes a venv there."""
+    if os.environ.get("TILT_VENV_DIR"):
+        return Path(os.environ["TILT_VENV_DIR"]).expanduser()
+    if _is_dev_checkout():
+        return REPO_ROOT / "py" / ".venv"
+    return DATA_DIR / ".venv"
+
+
+VENV_DIR = _venv_dir()
+VENV_PY = VENV_DIR / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
+
+
+def venv_python() -> str:
+    """The python the server/pipeline should run under: the smart-tier venv when it
+    exists (it has numpy/torch, so semantic search works), else whatever's running us
+    (core tier — browse/keyword/live all run on stdlib)."""
+    return str(VENV_PY) if VENV_PY.exists() else sys.executable
+
+
+def tilt_rs_bin() -> Path:
+    """Path to the Rust ingest binary, in resolution order:
+      1. $TILT_RS_BIN            (the wheel launcher sets this to the bundled copy)
+      2. <package>/_bin/tilt-rs  (binary shipped inside an installed wheel)
+      3. <repo>/target/release/  (a dev cargo build)
+    The path may not exist yet (a dev checkout before `cargo build`); callers that
+    require it already check .exists() and fall back to building."""
+    exe = "tilt-rs.exe" if WIN else "tilt-rs"
+    env = os.environ.get("TILT_RS_BIN")
+    if env:
+        return Path(env)
+    bundled = PY_DIR.parent / "_bin" / exe
+    if bundled.exists():
+        return bundled
+    return REPO_ROOT / "target" / "release" / exe
 
 MESSAGES_PATH = DATA_DIR / "messages.jsonl"
 EMBEDDINGS_PATH = DATA_DIR / "embeddings.f32"

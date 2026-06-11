@@ -33,8 +33,8 @@ import common
 
 ROOT = common.REPO_ROOT
 WIN = sys.platform == "win32"
-VENV_DIR = ROOT / "py" / ".venv"
-VENV_PY = VENV_DIR / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
+VENV_DIR = common.VENV_DIR
+VENV_PY = common.VENV_PY
 PULL_MODEL = "qwen2.5:3b-instruct"  # smallest entry in summarize.MODELS -- keep in sync
 OLLAMA_TAGS = "http://localhost:11434/api/tags"
 OLLAMA_PULL = "http://localhost:11434/api/pull"

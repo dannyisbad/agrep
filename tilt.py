@@ -23,17 +23,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
-TILT_RS = ROOT / "target" / "release" / ("tilt-rs.exe" if WIN else "tilt-rs")
-VENV_PY = ROOT / "py" / ".venv" / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
+sys.path.insert(0, str(ROOT / "py"))
+import common  # noqa: E402  -- single source for binary / venv / data paths
+
+TILT_RS = common.tilt_rs_bin()
 
 
 def _server_python() -> str:
     """The python the SERVER runs under. Semantic search needs the smart tier's
-    deps (numpy/torch/...), which live in py/.venv — launching the server with
+    deps (numpy/torch/...), which live in the venv — launching the server with
     whatever python invoked tilt.py silently downgrades every 'meaning' search
     to keyword when that python lacks them (it logs one line and carries on).
     Prefer the venv whenever it exists; plain interpreters still run the core."""
-    return str(VENV_PY) if VENV_PY.exists() else sys.executable
+    return common.venv_python()
 
 
 def _ensure_binary() -> bool:

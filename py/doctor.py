@@ -20,8 +20,8 @@ import common
 
 ROOT = common.REPO_ROOT
 WIN = sys.platform == "win32"
-VENV_PY = ROOT / "py" / ".venv" / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
-TILT_RS = ROOT / "target" / "release" / ("tilt-rs.exe" if WIN else "tilt-rs")
+VENV_PY = common.VENV_PY
+TILT_RS = common.tilt_rs_bin()
 HOME = Path.home()
 
 OK, MISS, OPT = "ok", "MISSING", "--"
@@ -101,8 +101,12 @@ def report() -> dict:
         fixes.append("install Rust: https://rustup.rs")
 
     has_bin = TILT_RS.exists()
+    try:
+        bin_disp = str(TILT_RS.relative_to(ROOT))  # dev: target/release/...
+    except ValueError:
+        bin_disp = str(TILT_RS)                     # bundled / $TILT_RS_BIN: outside the tree
     _row("ingest binary", OK if has_bin else MISS,
-         str(TILT_RS.relative_to(ROOT)) if has_bin else "build it: python tilt.py index")
+         bin_disp if has_bin else "build it: python tilt.py index")
     if not has_bin and has_cargo:
         fixes.append("build the ingest binary: cargo build --release")
 
