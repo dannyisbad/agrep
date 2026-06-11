@@ -24,8 +24,9 @@ import urllib.request
 import common
 import explore
 
-# bold red match (what grep --color uses), dim metadata
-_C = {"m": "\033[1;31m", "d": "\033[2m", "a": "\033[36m", "r": "\033[0m"}
+# bold red match (what grep --color uses), bold-cyan chat header, dim metadata
+_C = {"m": "\033[1;31m", "hd": "\033[1;36m", "d": "\033[2m", "a": "\033[36m",
+      "y": "\033[33m", "r": "\033[0m"}
 
 
 def _color_on(when: str) -> bool:
@@ -117,37 +118,59 @@ def _filtered(hits: list[dict], agent: str | None, project: str | None,
     return out
 
 
-def _print_hits(hits, pat, color, total, shown_cap):
+def _group(hits):
+    """hits -> OrderedDict[session] = list of hits, preserving first-seen order."""
+    from collections import OrderedDict
+    g = OrderedDict()
+    for h in hits:
+        g.setdefault(h["session"], []).append(h)
+    return g
+
+
+def _chat_head(hs0, n, color):
+    """A chat's header line: agent · project · «topic»   sess8 · N hits."""
+    label = hs0.get("concept") or _proj(hs0["project"])
+    crumbs = f"{hs0['agent']} · {_proj(hs0['project'])}"
+    if label and label != _proj(hs0["project"]):
+        crumbs += f" · {label}"
+    sess, cnt = hs0["session"][:8], f"{n} hit{'s' if n != 1 else ''}"
+    if color:
+        return f"{_C['hd']}{crumbs}{_C['r']}  {_C['d']}{sess} · {cnt}{_C['r']}"
+    return f"{crumbs}  [{sess} · {cnt}]"
+
+
+def _emit_grouped(hits, pat, color):
+    """ripgrep-style: a header per chat, its matching turns indented beneath."""
+    for i, (_, hs) in enumerate(_group(hits).items()):
+        if i:
+            print()
+        print(_chat_head(hs[0], len(hs), color))
+        for h in hs:
+            turn = h.get("turn")
+            tn = str(turn) if turn is not None else "·"
+            who = h.get("who")
+            mark = "→" if who == "agent" else "›" if who else " "
+            snip = _hl(h["snippet"], pat, color)
+            if color:
+                print(f"  {_C['y']}{tn:>4}{_C['r']} {_C['d']}{mark}{_C['r']} {snip}")
+            else:
+                print(f"  {tn:>4} {mark} {snip}")
+
+
+def _emit_flat(hits, pat, color):
+    """One TAB-separated row per hit for piping: session, agent, project, turn, who,
+    snippet. Stable columns so awk/cut compose; this is the default when piped."""
     for h in hits:
         turn = h.get("turn")
-        loc = f"{h['session'][:8]}:{turn}" if turn is not None else h["session"][:8]
-        meta = f"{h['agent']} · {_proj(h['project'])} · {loc}"
-        snip = _hl(h["snippet"], pat, color)
-        who = h.get("who")
-        mark = (" → " if who == "agent" else " › ") if who else " "  # side, when known
-        if color:
-            print(f"{_C['a']}{meta}{_C['r']}{_C['d']}{mark}{_C['r']}{snip}")
-        else:
-            print(f"{meta}\t{snip}")
+        print("\t".join([h["session"], h["agent"], _proj(h["project"]),
+                         "" if turn is None else str(turn), h.get("who") or "",
+                         _hl(h["snippet"], pat, color)]))
 
 
-def _print_chats(hits, color):
-    """One line per matching chat (like grep -l), with hit counts."""
-    from collections import Counter, OrderedDict
-    by = OrderedDict()
-    for h in hits:
-        s = h["session"]
-        if s not in by:
-            by[s] = {"agent": h["agent"], "project": h["project"], "n": 0,
-                     "first": h["snippet"]}
-        by[s]["n"] += 1
-    for s, c in by.items():
-        meta = f"{c['agent']} · {_proj(c['project'])} · {s[:8]}"
-        cnt = f"({c['n']} hit{'s' if c['n'] != 1 else ''})"
-        if color:
-            print(f"{_C['a']}{meta}{_C['r']}  {_C['d']}{cnt}{_C['r']}")
-        else:
-            print(f"{meta}\t{cnt}")
+def _emit_chats(hits, color):
+    """One line per matching chat (grep -l), with topic + hit count."""
+    for _, hs in _group(hits).items():
+        print(_chat_head(hs[0], len(hs), color))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,13 +183,31 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     ap = argparse.ArgumentParser(
-        prog="agrep", description="grep your cross-agent chat history")
+        prog="agrep", description="grep your cross-agent chat history",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  agrep \"race condition\"            grep every agent for a phrase\n"
+               "  agrep deadlock --agent codex       just codex\n"
+               "  agrep -w leak                      whole word only\n"
+               "  agrep -E 'TODO|FIXME' --who agent  regex, agent turns only\n"
+               "  agrep -l auth                      which chats mention it\n"
+               "  agrep -c oom                       just the count\n"
+               "  agrep \"flaky test\" -s              meaning search (needs a server)\n"
+               "  agrep memory --json | jq .         pipe structured hits\n"
+               "\nsearch is case-insensitive. exit: 0 found, 1 none, 2 no index yet.")
     ap.add_argument("pattern", nargs="+", help="text to search for (joined with spaces)")
     ap.add_argument("-n", "--max", type=int, default=40, metavar="N",
-                    help="show at most N hits (default 40)")
+                    help="show at most N hits (default 40; 0 = no limit)")
     ap.add_argument("-E", "--regex", action="store_true", help="treat pattern as a regex")
+    ap.add_argument("-w", "--word", action="store_true", help="match whole words only")
+    ap.add_argument("-i", "--ignore-case", action="store_true",
+                    help="(default; search is always case-insensitive)")
     ap.add_argument("-l", "--chats", action="store_true",
-                    help="list matching chats with counts, not every line")
+                    help="list matching chats, not every line (like grep -l)")
+    ap.add_argument("-c", "--count", action="store_true",
+                    help="print only the match count (like grep -c)")
+    ap.add_argument("--flat", action="store_true",
+                    help="one tab-separated row per hit (the default when piped)")
     ap.add_argument("--agent", help="only this agent (claude/codex/opencode/antigravity)")
     ap.add_argument("--project", help="only chats whose project path contains this")
     ap.add_argument("--who", choices=("user", "agent"), help="only your turns or only the agent's")
@@ -178,10 +219,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     args = ap.parse_args(argv)
 
-    q = " ".join(args.pattern)
+    q = " ".join(args.pattern).strip()
+    if not q:
+        common.log("empty pattern — give me something to grep for.")
+        return 2
     color = _color_on(args.color)
-    # over-fetch so post-filtering still has material, then trim to --max
-    big = max(args.max * 10, 500)
+    filters = bool(args.agent or args.project or args.who)
+    # Fetch enough to be accurate. Counting, --max 0, or post-filtering all need the
+    # FULL match set; otherwise over-fetch a bounded window and trust the engine's
+    # true totals (keyword/regex report total/chats computed before the display cap).
+    big = 10_000_000 if (args.count or args.max == 0 or filters) else max(args.max * 10, 500)
 
     # Fresh install / never indexed: a silent "no matches" would be baffling. Point at
     # the fix. (--semantic hits the server, which has its own empty-index handling.)
@@ -200,26 +247,51 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sem_used = True
     if not sem_used:
-        res = _regex_scan(q, big) if args.regex else explore.keyword_search(q, big)
+        if args.word:  # whole-word -> boundary-anchored regex over the corpus
+            res = _regex_scan(r"\b" + re.escape(q) + r"\b", big)
+        elif args.regex:
+            res = _regex_scan(q, big)
+        else:
+            res = explore.keyword_search(q, big)
 
-    hits = _filtered(res["hits"], args.agent, args.project, args.who)
-    n_total = len(hits)
-    hits = hits[: args.max]
-    pat = None if sem_used else _hl_regex(q, args.regex)
+    filtered = _filtered(res["hits"], args.agent, args.project, args.who)
+    # true totals: the engine reports them pre-cap; with filters we fetched everything
+    if filters:
+        n_total = len(filtered)
+        n_chats = len({h["session"] for h in filtered})
+    else:
+        n_total = res.get("total", len(filtered))
+        n_chats = res.get("chats", len({h["session"] for h in filtered}))
+    hits = filtered if args.max == 0 else filtered[: args.max]
 
-    if args.json:
+    # highlight pattern mirrors the search mode (none for semantic chat titles)
+    if sem_used:
+        pat = None
+    elif args.word:
+        pat = re.compile(r"\b" + re.escape(q) + r"\b", re.I)
+    else:
+        pat = _hl_regex(q, args.regex)
+
+    # output: count -> json -> chats -> grouped(tty) / flat(pipe or --flat)
+    if args.count:
+        print(f"{n_total}")
+    elif args.json:
         for h in hits:
             print(json.dumps(h, ensure_ascii=False))
     elif args.chats:
-        _print_chats(hits, color)
+        _emit_chats(hits, color)
+    elif args.flat or not color:
+        # flat TSV is the machine default (piped, or --color never, or --flat)
+        _emit_flat(hits, pat, color)
     else:
-        _print_hits(hits, pat, color, n_total, args.max)
+        _emit_grouped(hits, pat, color)
 
-    if not args.json and sys.stderr.isatty():
-        n_chats = len({h["session"] for h in hits})
-        more = f" (showing {args.max} of {n_total})" if n_total > args.max else ""
-        mode = "semantic" if sem_used else ("regex" if args.regex else "keyword")
-        common.log(f"{n_total} hit{'s' if n_total != 1 else ''} in {n_chats} "
+    if not args.json and not args.count and sys.stderr.isatty():
+        more = f", showing {args.max}" if args.max and n_total > args.max else ""
+        mode = "semantic" if sem_used else "regex" if args.regex else \
+            "word" if args.word else "keyword"
+        kind = "chat" if sem_used else "hit"
+        common.log(f"{n_total} {kind}{'s' if n_total != 1 else ''} in {n_chats} "
                    f"chat{'s' if n_chats != 1 else ''} · {mode}{more}")
     return 0 if hits else 1  # grep convention: exit 1 when nothing matched
 
