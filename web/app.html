@@ -3,7 +3,7 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>tilt</title>
+        <title>agrep</title>
         <link
             rel="icon"
             href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='Arial Narrow,sans-serif' font-weight='bold' font-size='24' fill='%23ff4a2e' transform='rotate(-8 16 16)'%3Et%3C/text%3E%3C/svg%3E"
@@ -2930,10 +2930,13 @@
                 color: #e8a800;
             }
             html[data-theme="web99"] .g99logo span:nth-child(4) {
+                color: #0000cc;
+            }
+            html[data-theme="web99"] .g99logo span:nth-child(5) {
                 color: #008000;
             }
             html[data-theme="web99"] .g99logo em {
-                color: #0000cc;
+                color: #cc0000;
                 font-style: normal;
             }
             html[data-theme="web99"] .g99logo span,
@@ -3476,8 +3479,8 @@
             let CHATS = [],
                 CONCEPTS = [],
                 STATE = {
-                    group: PREF("tiltGroup") || "date",
-                    sort: PREF("tiltSort") || "recent",
+                    group: PREF("agrepGroup") || "date",
+                    sort: PREF("agrepSort") || "recent",
                     filter: "",
                     chip: null,
                     sel: null,
@@ -4672,13 +4675,13 @@
                 tick: null,
                 unseen: 0,
                 connlost: false,
-                dense: PREF("tiltLiveDensity") || "cozy",
+                dense: PREF("agrepLiveDensity") || "cozy",
                 scale: Math.max(
                     80,
-                    Math.min(180, +(PREF("tiltLiveScale") || 100)),
+                    Math.min(180, +(PREF("agrepLiveScale") || 100)),
                 ),
-                notify: PREF("tiltLiveNotify") === "1",
-                archOpen: PREF("tiltLiveArch") === "1",
+                notify: PREF("agrepLiveNotify") === "1",
+                archOpen: PREF("agrepLiveArch") === "1",
             }; // past sessions: collapsed by default
             // a session is "live" while a tool is running / it's thinking, or its store moved in the
             // last 90s; everything older drops into the (auto-closed) archive below.
@@ -5134,7 +5137,7 @@
                         LIVE.archOpen = !LIVE.archOpen;
                         try {
                             localStorage.setItem(
-                                "tiltLiveArch",
+                                "agrepLiveArch",
                                 LIVE.archOpen ? "1" : "0",
                             );
                         } catch (e) {}
@@ -5177,7 +5180,7 @@
                             LIVE.dense = b.dataset.d;
                             try {
                                 localStorage.setItem(
-                                    "tiltLiveDensity",
+                                    "agrepLiveDensity",
                                     LIVE.dense,
                                 );
                             } catch (e) {}
@@ -5193,7 +5196,7 @@
                         lvf.style.fontSize = (12 * LIVE.scale) / 100 + "px";
                         try {
                             localStorage.setItem(
-                                "tiltLiveScale",
+                                "agrepLiveScale",
                                 String(LIVE.scale),
                             );
                         } catch (e) {}
@@ -5210,7 +5213,7 @@
                             Notification.requestPermission();
                         try {
                             localStorage.setItem(
-                                "tiltLiveNotify",
+                                "agrepLiveNotify",
                                 LIVE.notify ? "1" : "0",
                             );
                         } catch (e) {}
@@ -5475,7 +5478,7 @@
                     )
                     .join("");
                 $("view").innerHTML = `<div class="home">
-    <div class="big">tilt.</div>
+    <div class="big">agrep.</div>
     <p class="lead">${C("heroLead")}</p>
     ${recent.length ? `<div class="rh"><span>${C("recentHead")}</span><span class="rule"></span></div>${rows}` : ""}
     <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")}</p>
@@ -5503,10 +5506,10 @@
             // 1999 web homepage, styled after the original google front page
             function web99Home(n) {
                 return `<div class="g99">
-    <div class="g99logo"><span>t</span><span>i</span><span>l</span><span>t</span><em>!</em></div>
+    <div class="g99logo"><span>a</span><span>g</span><span>r</span><span>e</span><span>p</span><em>!</em></div>
     <div class="g99tag">Search every conversation with your coding programs.</div>
     <div class="g99btns">
-      <button class="g99b" id="g99search">tilt Search</button>
+      <button class="g99b" id="g99search">agrep Search</button>
       <button class="g99b" id="g99lucky">I'm Feeling Lucky</button>
       ${setupNeeded() ? `<button class="g99b" id="g99setup">${esc(SK("cta"))}</button>` : ""}
     </div>
@@ -5649,7 +5652,7 @@
                             STATE.group = b.dataset.g;
                             STATE.chip = null;
                             try {
-                                localStorage.setItem("tiltGroup", STATE.group);
+                                localStorage.setItem("agrepGroup", STATE.group);
                             } catch (e) {}
                             syncSegs();
                             renderRail();
@@ -5662,7 +5665,7 @@
                         (b.onclick = () => {
                             STATE.sort = b.dataset.s;
                             try {
-                                localStorage.setItem("tiltSort", STATE.sort);
+                                localStorage.setItem("agrepSort", STATE.sort);
                             } catch (e) {}
                             syncSegs();
                             renderRail();
@@ -5809,7 +5812,7 @@
                     emptyNoMatch: "no chats match.<br>loosen the filter.",
                     emptyNoIndex: "the index isn't loaded yet.",
                     emptyZero:
-                        "nothing indexed yet.<br><br>run <b>python tilt.py up</b> to scan your agent stores (claude · codex · opencode · antigravity).<br><br>chats appear here the moment an agent writes one.",
+                        "nothing indexed yet.<br><br>run <b>{CLI} up</b> to scan your agent stores (claude · codex · opencode · antigravity).<br><br>chats appear here the moment an agent writes one.",
                     opening: "opening chat",
                     chatErr: "couldn't load this chat",
                     loadingStats: "loading rankings",
@@ -5851,7 +5854,7 @@
                     stIndexErr: "index error",
                     stKeywordOnly: "keyword only",
                     stDegraded: "degraded — semantic offline",
-                    stDegradedSub: "index present, stack failed to load. restart: python tilt.py serve",
+                    stDegradedSub: "index present, stack failed to load. restart: {CLI} serve",
                     stNoAffect: "affect off",
                     spIndex: "index",
                     spCorpus: "corpus",
@@ -5959,7 +5962,7 @@
                     emptyNoIndex:
                         "nothing's here yet ♡<br>let me get cozy first~",
                     emptyZero:
-                        "no chats yet ♡<br><br>run <b>python tilt.py up</b> and i'll gather everything~<br><br>(claude · codex · opencode · antigravity)",
+                        "no chats yet ♡<br><br>run <b>{CLI} up</b> and i'll gather everything~<br><br>(claude · codex · opencode · antigravity)",
                     opening: "opening up~ ♡",
                     chatErr: "aw, this one won't open ;;",
                     loadingStats: "counting feelings~",
@@ -6002,7 +6005,7 @@
                     stIndexErr: "index owie ;;",
                     stKeywordOnly: "simple search~",
                     stDegraded: "deep search is napping ;;",
-                    stDegradedSub: "my memories are here but the brain won't wake ;; restart me: python tilt.py serve",
+                    stDegradedSub: "my memories are here but the brain won't wake ;; restart me: {CLI} serve",
                     stNoAffect: "no feelings yet~",
                     spIndex: "memories",
                     spCorpus: "collection",
@@ -6111,7 +6114,7 @@
                     emptyNoIndex:
                         "Index not found.<br>Please start the server.",
                     emptyZero:
-                        "No documents in the index.<br><br>Run <b>python tilt.py up</b> to import your agent history.<br><br>Supported: Claude Code, Codex, opencode, Antigravity.",
+                        "No documents in the index.<br><br>Run <b>{CLI} up</b> to import your agent history.<br><br>Supported: Claude Code, Codex, opencode, Antigravity.",
                     opening: "Loading document...",
                     chatErr: "Document could not be loaded",
                     loadingStats: "Compiling statistics...",
@@ -6154,7 +6157,7 @@
                     stIndexErr: "Index error",
                     stKeywordOnly: "keyword only",
                     stDegraded: "Degraded — semantic search offline",
-                    stDegradedSub: "Index present; search components failed to load. Restart: python tilt.py serve",
+                    stDegradedSub: "Index present; search components failed to load. Restart: {CLI} serve",
                     stNoAffect: "affect off",
                     spIndex: "Index",
                     spCorpus: "Indexed",
@@ -6202,13 +6205,28 @@
             ];
             const curTheme = () =>
                 document.documentElement.dataset.theme || "web99";
+            // The invocation to print in instructions: `agrep` when running from an
+            // installed package, `python tilt.py` from a dev checkout. The server
+            // reports which (it knows via common._is_dev_checkout); default to the
+            // dev form until /status lands.
+            function CLI() {
+                return (STATUS && STATUS.cli) || "python tilt.py";
+            }
+            function cliCmd(rest) {
+                return rest ? `${CLI()} ${rest}` : CLI();
+            }
             function C(k) {
                 const m = COPY[curTheme()];
-                return m && m[k] != null
-                    ? m[k]
-                    : COPY.noir[k] != null
-                      ? COPY.noir[k]
-                      : k;
+                const v =
+                    m && m[k] != null
+                        ? m[k]
+                        : COPY.noir[k] != null
+                          ? COPY.noir[k]
+                          : k;
+                // copy strings embed {CLI} so a single source decides agrep vs tilt.py
+                return typeof v === "string" && v.indexOf("{CLI}") !== -1
+                    ? v.split("{CLI}").join(CLI())
+                    : v;
             }
             function applyCopy() {
                 document
@@ -6476,7 +6494,7 @@
                 $("theme").textContent = (THEMES.find((x) => x[0] === t) ||
                     THEMES[0])[1];
                 try {
-                    localStorage.setItem("tiltTheme", t);
+                    localStorage.setItem("agrepTheme", t);
                 } catch (e) {}
                 applyCopy();
                 if (BOOTED) {
@@ -6492,7 +6510,7 @@
             setTheme(
                 (() => {
                     try {
-                        return localStorage.getItem("tiltTheme") || "web99";
+                        return localStorage.getItem("agrepTheme") || "web99";
                     } catch (e) {
                         return "web99";
                     }
@@ -6508,7 +6526,7 @@
             const SETUPC = {
                 noir: {
                     title: "setup",
-                    sub: "tilt works in tiers. the core is already running; each layer below installs itself with one click and stays optional.",
+                    sub: "agrep works in tiers. the core is already running; each layer below installs itself with one click and stays optional.",
                     core: "core",
                     smart: "smart",
                     named: "named",
@@ -6572,7 +6590,7 @@
                 },
                 web99: {
                     title: "Setup",
-                    sub: "tilt works in tiers. The core is already running; each tier below installs with one click and stays optional.",
+                    sub: "agrep works in tiers. The core is already running; each tier below installs with one click and stays optional.",
                     core: "Core",
                     smart: "Smart",
                     named: "Named",
@@ -6709,7 +6727,7 @@
     <div class="sc${core.live ? "" : " off"}">
       <div class="sch"><span class="tdot"></span><span class="nm">${esc(SK("core"))}</span><span class="what">${esc(SK("coreWhat"))}</span></div>
       <div class="det2">${esc(storeline)}${esc(idx)}</div>
-      ${core.live ? "" : cmdRow("python tilt.py up")}
+      ${core.live ? "" : cmdRow(cliCmd("up"))}
     </div>
     <div class="sc${smart.live ? "" : " off"}">
       <div class="sch"><span class="tdot"></span><span class="nm">${esc(SK("smart"))}</span><span class="what">${esc(SK("smartWhat"))}</span></div>
@@ -6721,8 +6739,8 @@
                     "smart",
                     job,
                     SK("install"),
-                    cmdRow("python tilt.py doctor --fix") +
-                        cmdRow("python tilt.py reindex"),
+                    cmdRow(cliCmd("doctor --fix")) +
+                        cmdRow(cliCmd("reindex")),
                 )
       }
     </div>
@@ -6842,7 +6860,7 @@
                 SUJOB = {
                     step: "smart",
                     phase: "err",
-                    err: "server did not come back — start it by hand: python tilt.py serve",
+                    err: `server did not come back — start it by hand: ${cliCmd("serve")}`,
                 };
                 renderSetup();
             }
@@ -7063,7 +7081,7 @@
                 const setDense = (d) => {
                     LIVE.dense = d;
                     try {
-                        localStorage.setItem("tiltLiveDensity", d);
+                        localStorage.setItem("agrepLiveDensity", d);
                     } catch (e) {}
                     if (STATE.view === "live") renderLive();
                 };
@@ -7076,14 +7094,14 @@
                     )
                         Notification.requestPermission();
                     try {
-                        localStorage.setItem("tiltLiveNotify", on ? "1" : "0");
+                        localStorage.setItem("agrepLiveNotify", on ? "1" : "0");
                     } catch (e) {}
                     if (STATE.view === "live") renderLive();
                 };
                 const setScale = (d) => {
                     LIVE.scale = Math.max(80, Math.min(180, LIVE.scale + d));
                     try {
-                        localStorage.setItem("tiltLiveScale", String(LIVE.scale));
+                        localStorage.setItem("agrepLiveScale", String(LIVE.scale));
                     } catch (e) {}
                     const lvf = $("lvf");
                     if (lvf) lvf.style.fontSize = (12 * LIVE.scale) / 100 + "px";
@@ -7130,7 +7148,7 @@
                 // A missing tier's row carries its exact unlock command — enter copies it.
                 if (STATUS) {
                     const sem = STATUS.semantic;
-                    const unlock = "python tilt.py doctor --fix";
+                    const unlock = cliCmd("doctor --fix");
                     items.push(
                         sem === "off"
                             ? {
@@ -7395,7 +7413,7 @@
 
             // ---- draggable rail width, persisted ----
             (() => {
-                const w = +(PREF("tiltRailW") || 0);
+                const w = +(PREF("agrepRailW") || 0);
                 if (w)
                     document.documentElement.style.setProperty(
                         "--railw",
@@ -7419,7 +7437,7 @@
                         document.body.style.userSelect = "";
                         try {
                             localStorage.setItem(
-                                "tiltRailW",
+                                "agrepRailW",
                                 String(
                                     Math.max(240, Math.min(640, ev.clientX)),
                                 ),
