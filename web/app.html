@@ -6258,7 +6258,9 @@
                     `<div class="sph"><span class="sdot"></span>${esc(head)}</div>` +
                     rows +
                     `<div class="sp-div"></div>` +
-                    `<div class="sp-foot"><span>${C("spAuto")} <a id="spSetup" style="color:var(--calm);cursor:pointer">${esc(SK("title"))} →</a></span>${reBtn}</div>`;
+                    `<div class="sp-foot"><span>${C("spAuto")}</span>` +
+                    `<span style="display:flex;gap:6px;flex:none">` +
+                    `<button class="sp-reidx" id="spSetup">${esc(SK("title"))}</button>${reBtn}</span></div>`;
                 pop.className = "statuspop" + (st.cls ? " " + st.cls : "");
                 pop.style.display = "";
                 const rb = $("spReidx");
