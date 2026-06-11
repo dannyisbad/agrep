@@ -170,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--agent", help="only this agent (claude/codex/opencode/antigravity)")
     ap.add_argument("--project", help="only chats whose project path contains this")
     ap.add_argument("--who", choices=("user", "agent"), help="only your turns or only the agent's")
-    ap.add_argument("--semantic", action="store_true",
+    ap.add_argument("-s", "--semantic", action="store_true",
                     help="meaning search: most relevant CHATS via a running server "
                          "(keyword greps message lines; falls back to keyword if no server)")
     ap.add_argument("--port", type=int, default=8732, help="server port for --semantic")
