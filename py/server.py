@@ -421,6 +421,17 @@ def main() -> int:
     w = live.watcher()  # start tailing the agent stores (passive, hook-free)
     if not args.no_autoindex:
         indexer.start(w)  # keep the materialized index current as agents work
+    # Drop a portfile so CLI commands (agrep search links, --semantic) find THIS server
+    # without being told the port. Best-effort; a stale file is harmless (the CLI probes
+    # reachability before trusting it).
+    portfile = common.DATA_DIR / ".server"
+    try:
+        portfile.write_text(json.dumps({"port": args.port, "pid": os.getpid()}),
+                            encoding="utf-8")
+        import atexit
+        atexit.register(lambda: portfile.unlink(missing_ok=True))
+    except OSError:
+        pass
     common.log(f"tilt server -> http://localhost:{args.port}")
     global _SRV
     _SRV = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

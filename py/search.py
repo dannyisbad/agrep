@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -35,6 +36,60 @@ def _color_on(when: str) -> bool:
     if when == "never":
         return False
     return sys.stdout.isatty()
+
+
+def _osc8_ok() -> bool:
+    """Does this terminal render OSC 8 hyperlinks? There's no query for it, so use a
+    conservative allowlist of terminals known to support them — unknown terminals get
+    plain text (a dead-looking link is more annoying than no link). Apple's Terminal.app
+    explicitly does NOT support OSC 8. Opt out with AGREP_NO_HYPERLINKS=1."""
+    env = os.environ
+    if env.get("AGREP_NO_HYPERLINKS"):
+        return False
+    tp = env.get("TERM_PROGRAM", "")
+    if tp == "Apple_Terminal":
+        return False
+    if any(env.get(k) for k in ("WT_SESSION", "KITTY_WINDOW_ID", "WEZTERM_PANE",
+                                "KONSOLE_VERSION", "GHOSTTY_RESOURCES_DIR")):
+        return True
+    if tp in ("iTerm.app", "WezTerm", "vscode", "Hyper", "ghostty", "rio", "tabby"):
+        return True
+    vte = env.get("VTE_VERSION", "")
+    return vte.isdigit() and int(vte) >= 5000  # VTE 0.50+ (gnome-terminal, tilix, …)
+
+
+def _reachable(port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _server_port() -> int | None:
+    """The port of a RUNNING server, from the portfile it drops, verified reachable.
+    None if no server is up. Lets the CLI find the server without being told the port."""
+    pf = common.DATA_DIR / ".server"
+    try:
+        port = int(json.loads(pf.read_text(encoding="utf-8"))["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return port if _reachable(port) else None
+
+
+def _osc8(url: str, text: str) -> str:
+    return f"\033]8;;{url}\a{text}\033]8;;\a"
+
+
+def _linker(port: int | None):
+    """Returns session -> clickable-URL when links should be emitted (a reachable server
+    AND an OSC-8-capable terminal), else None. The URL deep-links the web app to the
+    chat (#chat=<id>), so a click opens that conversation in the browser."""
+    if not port or not _osc8_ok():
+        return None
+    base = f"http://127.0.0.1:{port}/#chat="
+    return lambda session: base + urllib.parse.quote(session)
 
 
 def _proj(p: str) -> str:
@@ -155,24 +210,27 @@ def _group(hits):
     return g
 
 
-def _chat_head(hs0, n, color):
-    """A chat's header line: agent · project · «topic»   sess8 · N hits."""
+def _chat_head(hs0, n, color, link=None):
+    """A chat's header line: agent · project · «topic»   sess8 · N hits. When `link` is
+    given, the whole header becomes an OSC 8 hyperlink to that chat in the web app."""
     label = hs0.get("concept") or _proj(hs0["project"])
     crumbs = f"{hs0['agent']} · {_proj(hs0['project'])}"
     if label and label != _proj(hs0["project"]):
         crumbs += f" · {label}"
     sess, cnt = hs0["session"][:8], f"{n} hit{'s' if n != 1 else ''}"
     if color:
-        return f"{_C['hd']}{crumbs}{_C['r']}  {_C['d']}{sess} · {cnt}{_C['r']}"
-    return f"{crumbs}  [{sess} · {cnt}]"
+        s = f"{_C['hd']}{crumbs}{_C['r']}  {_C['d']}{sess} · {cnt}{_C['r']}"
+    else:
+        s = f"{crumbs}  [{sess} · {cnt}]"
+    return _osc8(link(hs0["session"]), s) if link else s
 
 
-def _emit_grouped(hits, pat, color):
+def _emit_grouped(hits, pat, color, link=None):
     """ripgrep-style: a header per chat, its matching turns indented beneath."""
     for i, (_, hs) in enumerate(_group(hits).items()):
         if i:
             print()
-        print(_chat_head(hs[0], len(hs), color))
+        print(_chat_head(hs[0], len(hs), color, link))
         for h in hs:
             turn = h.get("turn")
             tn = str(turn) if turn is not None else "·"
@@ -195,10 +253,10 @@ def _emit_flat(hits, pat, color):
                          _hl(h["snippet"], pat, color)]))
 
 
-def _emit_chats(hits, color):
+def _emit_chats(hits, color, link=None):
     """One line per matching chat (grep -l), with topic + hit count."""
     for _, hs in _group(hits).items():
-        print(_chat_head(hs[0], len(hs), color))
+        print(_chat_head(hs[0], len(hs), color, link))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -242,7 +300,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-s", "--semantic", action="store_true",
                     help="meaning search: most relevant CHATS via a running server "
                          "(keyword greps message lines; falls back to keyword if no server)")
-    ap.add_argument("--port", type=int, default=8732, help="server port for --semantic")
+    ap.add_argument("--port", type=int, default=None,
+                    help="server port for --semantic / links (default: auto-detect a "
+                         "running server, else 8732)")
     ap.add_argument("--json", action="store_true", help="one JSON object per hit (for piping)")
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     args = ap.parse_args(argv)
@@ -266,11 +326,14 @@ def main(argv: list[str] | None = None) -> int:
                    f"agent stores, then search.")
         return 2
 
+    # find a running server once: powers --semantic's default port AND clickable links
+    running = _server_port()
     sem_used = False
     if args.semantic:
-        res = _semantic(q, big, args.port)
+        sem_port = args.port or running or 8732
+        res = _semantic(q, big, sem_port)
         if res is None:
-            common.log(f"no server on :{args.port} — using keyword search "
+            common.log(f"no server on :{sem_port} — using keyword search "
                        f"(start one with `agrep serve` for --semantic)")
         else:
             sem_used = True
@@ -306,13 +369,17 @@ def main(argv: list[str] | None = None) -> int:
     elif args.json:
         for h in hits:
             print(json.dumps(h, ensure_ascii=False))
-    elif args.chats:
-        _emit_chats(hits, color)
-    elif args.flat or not color:
-        # flat TSV is the machine default (piped, or --color never, or --flat)
-        _emit_flat(hits, pat, color)
     else:
-        _emit_grouped(hits, pat, color)
+        # clickable headers only when a server is up AND the terminal supports OSC 8 AND
+        # we're rendering for humans (color) — never on piped/flat output.
+        link_port = args.port if (args.port and _reachable(args.port)) else running
+        link = _linker(link_port) if color else None
+        if args.chats:
+            _emit_chats(hits, color, link)
+        elif args.flat or not color:
+            _emit_flat(hits, pat, color)  # flat TSV machine default (piped/--color never)
+        else:
+            _emit_grouped(hits, pat, color, link)
 
     if not args.json and not args.count and sys.stderr.isatty():
         more = f", showing {args.max}" if args.max and n_total > args.max else ""

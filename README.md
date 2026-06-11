@@ -29,7 +29,10 @@ agrep "fixing a flaky test" --semantic   # meaning search (needs a running serve
 ```
 
 Keyword search is instant and needs nothing installed; it exits like grep (1 when nothing
-matched), so it composes in scripts and pipes.
+matched), so it composes in scripts and pipes. `agrep resume <id>` (any id from the output —
+the 8-char prefix works) drops you back into that session in its own agent, cd'd to where
+it ran. When a server is running and your terminal supports it, each result header is a
+clickable link that opens the chat in the app (set `AGREP_NO_HYPERLINKS=1` to disable).
 
 The heavier tiers (semantic search, generated titles) install on demand from the app's
 own setup panel — one click each. To get them up front, or to hack on tilt, clone instead:
