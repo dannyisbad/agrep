@@ -24,6 +24,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
 TILT_RS = ROOT / "target" / "release" / ("tilt-rs.exe" if WIN else "tilt-rs")
+VENV_PY = ROOT / "py" / ".venv" / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "python")
+
+
+def _server_python() -> str:
+    """The python the SERVER runs under. Semantic search needs the smart tier's
+    deps (numpy/torch/...), which live in py/.venv — launching the server with
+    whatever python invoked tilt.py silently downgrades every 'meaning' search
+    to keyword when that python lacks them (it logs one line and carries on).
+    Prefer the venv whenever it exists; plain interpreters still run the core."""
+    return str(VENV_PY) if VENV_PY.exists() else sys.executable
 
 
 def _ensure_binary() -> bool:
@@ -67,7 +77,7 @@ def cmd_up(a) -> int:
         _index()
     url = f"http://127.0.0.1:{a.port}"
     print(f"=== serving {url} ===", flush=True)
-    srv = subprocess.Popen([sys.executable, str(ROOT / "py" / "server.py"),
+    srv = subprocess.Popen([_server_python(), str(ROOT / "py" / "server.py"),
                             "--port", str(a.port)], cwd=str(ROOT))
     try:
         if not _wait_for(a.port):
@@ -95,7 +105,7 @@ def cmd_reindex(a) -> int:
 
 
 def cmd_serve(a) -> int:
-    return subprocess.run([sys.executable, str(ROOT / "py" / "server.py"), *a.rest],
+    return subprocess.run([_server_python(), str(ROOT / "py" / "server.py"), *a.rest],
                           cwd=str(ROOT)).returncode
 
 
@@ -121,25 +131,26 @@ def main() -> int:
     up.set_defaults(fn=cmd_up)
 
     di = sub.add_parser("doctor", help="check installed tiers; --fix does safe setup")
-    di.add_argument("rest", nargs=argparse.REMAINDER)
     di.set_defaults(fn=cmd_doctor)
 
     ix = sub.add_parser("index", help="rebuild the base index from your agent stores")
     ix.set_defaults(fn=cmd_index)
 
     rx = sub.add_parser("reindex", help="full pipeline (embeddings/affect/topics/arcs)")
-    rx.add_argument("rest", nargs=argparse.REMAINDER)
     rx.set_defaults(fn=cmd_reindex)
 
     sv = sub.add_parser("serve", help="run the server only (auto-indexes in background)")
-    sv.add_argument("rest", nargs=argparse.REMAINDER)
     sv.set_defaults(fn=cmd_serve)
 
     ta = sub.add_parser("tail", help="follow live agent events as JSON lines (turn ends by default)")
-    ta.add_argument("rest", nargs=argparse.REMAINDER)
     ta.set_defaults(fn=cmd_tail)
 
-    args = p.parse_args()
+    # parse_known_args instead of REMAINDER positionals: REMAINDER errors on
+    # leading optionals (`tilt serve --port N` never reached the server), and
+    # mixing it with parse_known_args scrambles token order. Unknown args pass
+    # through to the subcommand verbatim.
+    args, unknown = p.parse_known_args()
+    args.rest = unknown
     if not getattr(args, "fn", None):
         # bare `tilt` == `tilt up`, the common case
         return cmd_up(argparse.Namespace(port=8732, no_open=False, no_index=False))

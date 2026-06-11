@@ -1664,7 +1664,9 @@
             .lvf {
                 overflow-y: auto;
                 max-height: 78vh;
-                padding: 6px 0;
+                /* no top padding: the sticky header must sit flush — a gap leaves a
+                   sliver of feed scrolling visibly above it */
+                padding: 0 0 6px;
                 font-size: 12px;
             }
             .lrow {
@@ -5378,7 +5380,7 @@
                 return `<div class="kho">
     <div class="khomascot">${MASCOT}</div>
     <div class="khohi">welcome back ♡</div>
-    <p class="kholead">every little chat with your coding buddies, all tucked into one cozy place. tap one on the left to read its mood diary, or ask me anything about all of them~</p>
+    <p class="kholead">every little chat with your coding buddies, all tucked into one cozy place. tap one on the left to read its mood diary, or search through all of them~</p>
     <p class="khofoot">${n} chats tucked away ♡  ${v} with a mood diary ✿</p>
     ${setupCta().replace('id="homesetup"', 'id="khsetup"')}
     <div class="khosparkle">✿ ⋆ ♡ ⋆ ✿</div>
@@ -5648,7 +5650,7 @@
                     recentHead: "recent",
                     convClear: "clear",
                     heroLead:
-                        "every chat with claude, codex, opencode and antigravity in one place. pick one on the left, search, or ask across all of them.",
+                        "every chat with claude, codex, opencode and antigravity in one place. pick one on the left, or search across all of them.",
                     heroFootA: "chats indexed",
                     heroFootB: "with a vibe-trace",
                     statChats: "chats",
