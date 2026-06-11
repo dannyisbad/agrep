@@ -5,7 +5,7 @@ name: release
 # (any python 3.10+, one platform) — see hatch_build.py.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC): no API token in secrets. You must
-# first create the `agtilt` project's trusted publisher on PyPI pointing at this repo
+# first create the `agrep` project's trusted publisher on PyPI pointing at this repo
 # + workflow. Until then, a tag build still produces the wheels as artifacts.
 
 on:
@@ -40,7 +40,7 @@ jobs:
       - name: build wheel
         shell: bash
         env:
-          AGTILT_WHEEL_PLAT: ${{ matrix.plat }}
+          AGREP_WHEEL_PLAT: ${{ matrix.plat }}
         run: |
           python -m pip install -U build
           python -m build --wheel
@@ -61,7 +61,7 @@ jobs:
         run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
       - name: build + wheel
         env:
-          AGTILT_WHEEL_PLAT: manylinux_2_28_x86_64
+          AGREP_WHEEL_PLAT: manylinux_2_28_x86_64
         run: |
           source "$HOME/.cargo/env"
           cargo build --release

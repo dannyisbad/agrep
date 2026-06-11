@@ -9,7 +9,7 @@ No hooks, no agent-side install, no telemetry. tilt never modifies the agents or
 data — it only reads. Everything stays on your machine.
 
 ```
-uvx agtilt          # or: pipx run agtilt
+uvx agrep          # or: pipx run agrep
 ```
 
 That fetches a small prebuilt package (the rust ingest binary + the app — no clone, no
@@ -25,7 +25,7 @@ git clone https://github.com/dannyisbad/tilt && cd tilt
 python tilt.py up      # builds the indexer; needs Rust (https://rustup.rs)
 ```
 
-Not sure what's installed? `agtilt doctor` (or `python tilt.py doctor`) reports which
+Not sure what's installed? `agrep doctor` (or `python tilt.py doctor`) reports which
 tiers are live and the exact command to unlock each missing one.
 
 ---

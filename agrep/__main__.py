@@ -1,13 +1,13 @@
-"""Console entry for `agtilt` (and `python -m agtilt`).
+"""Console entry for `agrep` (and `python -m agrep`).
 
 The wheel installs the flat tilt tree as package data under this package:
 
-    site-packages/agtilt/
+    site-packages/agrep/
         tilt.py  reindex.py  py/*.py  web/app.html  _bin/tilt-rs[.exe]
 
 We point the code at the bundled rust binary (TILT_RS_BIN), put the bundled dirs on
 sys.path so the existing flat imports (`import common`, `import tilt`) resolve, then
-hand off to tilt.py's CLI. Bare `agtilt` == `agtilt up` (index, serve, open), same as
+hand off to tilt.py's CLI. Bare `agrep` == `agrep up` (index, serve, open), same as
 `python tilt.py`. Data and the smart-tier venv go to a per-user dir (see common.py),
 since site-packages is read-only.
 """

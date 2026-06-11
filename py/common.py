@@ -37,7 +37,7 @@ from typing import Iterable, Iterator, Sequence
 
 # --- Layout ---------------------------------------------------------------
 
-# This file lives in <repo>/py/ (dev) or <site-packages>/agtilt/py/ (installed).
+# This file lives in <repo>/py/ (dev) or <site-packages>/agrep/py/ (installed).
 PY_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PY_DIR.parent
 WIN = sys.platform == "win32"
@@ -60,7 +60,7 @@ def _user_data_dir() -> Path:
         base = str(Path.home() / "Library" / "Application Support")
     else:
         base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / "agtilt"
+    return Path(base) / "agrep"
 
 
 # $TILT_DATA_DIR wins (lets the wheel launcher point anywhere, and lets a dev
