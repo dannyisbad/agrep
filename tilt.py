@@ -104,6 +104,11 @@ def cmd_doctor(a) -> int:
                           cwd=str(ROOT)).returncode
 
 
+def cmd_tail(a) -> int:
+    return subprocess.run([sys.executable, str(ROOT / "py" / "tail.py"), *a.rest],
+                          cwd=str(ROOT)).returncode
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="tilt", description="one command for your cross-agent chat history")
@@ -129,6 +134,10 @@ def main() -> int:
     sv = sub.add_parser("serve", help="run the server only (auto-indexes in background)")
     sv.add_argument("rest", nargs=argparse.REMAINDER)
     sv.set_defaults(fn=cmd_serve)
+
+    ta = sub.add_parser("tail", help="follow live agent events as JSON lines (turn ends by default)")
+    ta.add_argument("rest", nargs=argparse.REMAINDER)
+    ta.set_defaults(fn=cmd_tail)
 
     args = p.parse_args()
     if not getattr(args, "fn", None):
