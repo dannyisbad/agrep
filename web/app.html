@@ -6442,6 +6442,14 @@
                     } catch (e) {}
                     if (STATE.view === "live") renderLive();
                 };
+                const setScale = (d) => {
+                    LIVE.scale = Math.max(80, Math.min(180, LIVE.scale + d));
+                    try {
+                        localStorage.setItem("tiltLiveScale", String(LIVE.scale));
+                    } catch (e) {}
+                    const lvf = $("lvf");
+                    if (lvf) lvf.style.fontSize = (12 * LIVE.scale) / 100 + "px";
+                };
                 const cur = curTheme();
                 const items = [
                     ...THEMES.map(([t, lab]) => ({
@@ -6465,7 +6473,70 @@
                         run: () => setNotify(!LIVE.notify),
                         keep: true,
                     },
+                    {
+                        icon: ":",
+                        label: `${C("liveSize")} +`,
+                        meta: LIVE.scale + "%",
+                        run: () => setScale(10),
+                        keep: true,
+                    },
+                    {
+                        icon: ":",
+                        label: `${C("liveSize")} −`,
+                        meta: LIVE.scale + "%",
+                        run: () => setScale(-10),
+                        keep: true,
+                    },
                 ];
+                // Setup rows: the tier story, read from the same /status blob the pill uses.
+                // A missing tier's row carries its exact unlock command — enter copies it.
+                if (STATUS) {
+                    const sem = STATUS.semantic;
+                    const unlock = "python tilt.py doctor --fix";
+                    items.push(
+                        sem === "off"
+                            ? {
+                                  icon: "!",
+                                  label: `${C("spSearch")} · ${C("stKeywordOnly")} — ${unlock}`,
+                                  meta: "copy",
+                                  run: () => {
+                                      try {
+                                          navigator.clipboard.writeText(unlock);
+                                      } catch (e) {}
+                                  },
+                                  keep: true,
+                              }
+                            : {
+                                  icon: ":",
+                                  label: `${C("spSearch")} · ${sem === "loading" ? C("spSemLoad") : C("spSemFull")}`,
+                                  meta: "✓",
+                                  run: () => toggleStatus(),
+                                  keep: true,
+                              },
+                    );
+                    const cov = STATUS.coverage || {};
+                    items.push({
+                        icon: cov.emotions ? ":" : "!",
+                        label: `${C("spEnrich")} · ${fmt(cov.vibes || 0)} ${C("spArcs")} · ${fmt(cov.summaries || 0)} ${C("spSumm")}`,
+                        meta: cov.emotions ? "✓" : C("stNoAffect"),
+                        run: () => toggleStatus(),
+                        keep: true,
+                    });
+                    const idx = STATUS.indexer || {};
+                    items.push({
+                        icon: idx.last_err ? "!" : ":",
+                        label: `${C("spLast")} · ${
+                            idx.last_err
+                                ? String(idx.last_err).slice(0, 60)
+                                : idx.last_run
+                                  ? `${ago(idx.last_run * 1000)} · ${idx.last_dur || 0}s`
+                                  : C("spNever")
+                        }`,
+                        meta: C("spReindex"),
+                        run: () => forceReindex(),
+                        keep: true,
+                    });
+                }
                 return pkRank(items, q, cap);
             }
 
