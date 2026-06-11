@@ -2070,7 +2070,7 @@
                 inset: 0;
                 background: rgba(0, 0, 0, 0.45);
             }
-            .pk {
+            .pkbox {
                 position: absolute;
                 left: 50%;
                 top: 11vh;
@@ -2083,7 +2083,7 @@
             .pk-title {
                 display: none;
             }
-            .pk input {
+            .pkbox input {
                 width: 100%;
                 box-sizing: border-box;
                 background: transparent;
@@ -2095,7 +2095,7 @@
                 padding: 13px 16px;
                 border-bottom: 1px solid var(--line);
             }
-            .pk input::placeholder {
+            .pkbox input::placeholder {
                 color: var(--faint);
             }
             .pk-list {
@@ -2162,7 +2162,7 @@
                 font-weight: 500;
             }
             /* kawaii: speech bubble */
-            html[data-theme="kawaii"] .pk {
+            html[data-theme="kawaii"] .pkbox {
                 border-radius: 18px;
                 border: 2px solid var(--ember);
                 overflow: hidden;
@@ -2172,7 +2172,7 @@
                 box-shadow: inset 3px 0 0 var(--ember);
             }
             /* web99: the palette IS the Run dialog */
-            html[data-theme="web99"] .pk {
+            html[data-theme="web99"] .pkbox {
                 border: 2px outset #e4e4e4;
                 background: #c0c0c0;
                 box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.35);
@@ -2197,7 +2197,7 @@
                 padding: 0 4px;
                 cursor: pointer;
             }
-            html[data-theme="web99"] .pk input {
+            html[data-theme="web99"] .pkbox input {
                 border: 2px inset #c0c0c0;
                 background: #fff;
                 margin: 8px;
@@ -2988,6 +2988,9 @@
                     <button id="vPulse" data-c="vPulse">pulse</button>
                 </div>
                 <div style="flex: 1"></div>
+                <button id="pkbtn" class="themebtn" title="command palette">
+                    ⌘
+                </button>
                 <div class="statuswrap" id="statuswrap">
                     <button
                         class="statuschip"
@@ -3066,7 +3069,7 @@
 
         <div id="cmdk">
             <div class="pk-scrim" id="pkscrim"></div>
-            <div class="pk">
+            <div class="pkbox">
                 <div class="pk-title">
                     <span id="pktitle">Run</span><span class="x" id="pkx">✕</span>
                 </div>
@@ -3917,6 +3920,15 @@
             // the moments under the chart: every turning point + the peak, each shown as the actual
             // message — the quote IS the label. Clicking a row (or its dot on the chart) jumps to
             // that turn in the transcript.
+            // A moment is colored by which series actually dominates it: a turning point
+            // can be a hype spike, and painting those ember misreads a happy moment as
+            // rage (the model's "peak" is the max-RAGE turn, but at that turn hype can
+            // still be the larger signal — show what the chart shows).
+            function tpHype(t, i) {
+                const r = (t.rage || [])[i] || 0;
+                const h = Math.max(0, ((t.valence || [])[i] || 0) + r);
+                return h > r;
+            }
             function tpList(t) {
                 const tps = t.turning_points || [];
                 const snips = t.snippets || [];
@@ -3932,8 +3944,12 @@
                 const items = rows
                     .map((r) => {
                         const q = snips[r.turn] || "";
+                        const col = tpHype(t, r.turn) ? "var(--calm)" : "var(--ember)";
+                        const bstyle = r.peak
+                            ? `style="color:${col};border-color:${col}"`
+                            : `style="background:${col}"`;
                         return `<li class="tpjump${r.peak ? " pk" : ""}" data-turn="${r.turn}">
-      <b>${r.mark}</b><span class="tpt">${C("tpTurn")} ${r.turn}</span>
+      <b ${bstyle}>${r.mark}</b><span class="tpt">${C("tpTurn")} ${r.turn}</span>
       <span class="tpq">${q ? `<span class="tpm">&ldquo;${esc(q)}&rdquo;</span>` : ""}</span>
     </li>`;
                     })
@@ -3985,15 +4001,18 @@
                         if (tp >= n) return "";
                         const x = X(tp).toFixed(1),
                             y = Y(Math.max(rage[tp], hype[tp])).toFixed(1);
+                        const col = hype[tp] > rage[tp] ? "var(--calm)" : "var(--ember)";
                         return (
                             `<line x1="${x}" y1="${topy - 6}" x2="${x}" y2="${bot}" stroke="var(--ghost)" stroke-dasharray="2 3" opacity=".55"/>` +
-                            `<circle class="tpdot" data-turn="${tp}" cx="${x}" cy="${y}" r="7.5" fill="var(--ember)"/>` +
+                            `<circle class="tpdot" data-turn="${tp}" cx="${x}" cy="${y}" r="7.5" fill="${col}"/>` +
                             `<text class="tp-num" x="${x}" y="${y}" text-anchor="middle" dy="3.3" pointer-events="none">${j + 1}</text>`
                         );
                     })
                     .join("");
                 const pk = t.peak_turn < n ? t.peak_turn : 0;
-                const peak = `<circle cx="${X(pk).toFixed(1)}" cy="${Y(rage[pk]).toFixed(1)}" r="4.5" fill="none" stroke="var(--hot)" stroke-width="1.6"/>`;
+                // ring the peak on whichever series is actually taller there, in its color
+                const pkcol = hype[pk] > rage[pk] ? "var(--calm)" : "var(--hot)";
+                const peak = `<circle cx="${X(pk).toFixed(1)}" cy="${Y(Math.max(rage[pk], hype[pk])).toFixed(1)}" r="4.5" fill="none" stroke="${pkcol}" stroke-width="1.6"/>`;
                 return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
     <line x1="${pad}" y1="${bot}" x2="${W - pad}" y2="${bot}" stroke="var(--hair)"/>
     <path d="${area(rage)}" fill="var(--ember)" opacity=".16"/>
@@ -5737,6 +5756,8 @@
                     stNoIndex: "no index",
                     stIndexErr: "index error",
                     stKeywordOnly: "keyword only",
+                    stDegraded: "degraded — semantic offline",
+                    stDegradedSub: "index present, stack failed to load. restart: python tilt.py serve",
                     stNoAffect: "affect off",
                     spIndex: "index",
                     spCorpus: "corpus",
@@ -5887,6 +5908,8 @@
                     stNoIndex: "no memories yet ;;",
                     stIndexErr: "index owie ;;",
                     stKeywordOnly: "simple search~",
+                    stDegraded: "deep search is napping ;;",
+                    stDegradedSub: "my memories are here but the brain won't wake ;; restart me: python tilt.py serve",
                     stNoAffect: "no feelings yet~",
                     spIndex: "memories",
                     spCorpus: "collection",
@@ -6038,6 +6061,8 @@
                     stNoIndex: "No index",
                     stIndexErr: "Index error",
                     stKeywordOnly: "keyword only",
+                    stDegraded: "Degraded — semantic search offline",
+                    stDegradedSub: "Index present; search components failed to load. Restart: python tilt.py serve",
                     stNoAffect: "affect off",
                     spIndex: "Index",
                     spCorpus: "Indexed",
@@ -6111,19 +6136,26 @@
             let STATUS_PREV = null,
                 STATUSOPEN = false;
             function stState(s) {
-                // -> {cls, busy} from the /status blob
+                // -> {cls, busy, degraded} from the /status blob
                 const idx = s.indexer || {},
                     werr =
                         idx.last_err || (s.watcher && s.watcher.last_err) || "";
+                // the semantic INDEX exists but the server couldn't load the stack
+                // (wrong interpreter / missing deps): every "meaning" search is
+                // silently keyword. That's degraded service, not a missing tier —
+                // it must show on the pill, not hide in a log line.
+                const degraded =
+                    !!(s.coverage && s.coverage.embeddings) && s.semantic === "off";
                 if (idx.phase === "indexing" || REIDXING)
-                    return { cls: "busy", busy: true, werr };
+                    return { cls: "busy", busy: true, werr, degraded };
                 if (idx.phase === "error" || werr)
-                    return { cls: "err", busy: false, werr };
+                    return { cls: "err", busy: false, werr, degraded };
+                if (degraded) return { cls: "warn", busy: false, werr, degraded };
                 if (s.index_age_s == null)
-                    return { cls: "warn", busy: false, werr };
+                    return { cls: "warn", busy: false, werr, degraded };
                 if (s.index_age_s > 86400)
-                    return { cls: "warn", busy: false, werr };
-                return { cls: "", busy: false, werr };
+                    return { cls: "warn", busy: false, werr, degraded };
+                return { cls: "", busy: false, werr, degraded };
             }
             let STATUSTIMER = null;
             function scheduleStatus(ms) {
@@ -6151,9 +6183,11 @@
                     ? C("stIndexing")
                     : st.cls === "err"
                       ? C("stIndexErr")
-                      : age == null
-                        ? C("stNoIndex")
-                        : `${C("stSynced")} ${rel}`;
+                      : st.degraded
+                        ? C("stDegraded")
+                        : age == null
+                          ? C("stNoIndex")
+                          : `${C("stSynced")} ${rel}`;
                 el.innerHTML = `<span class="sdot"></span>${word}`;
                 el.className =
                     "statuschip" +
@@ -6244,7 +6278,7 @@
                 const rows = [
                     `<div class="sp-row"><span class="sp-k">${C("spIndex")}</span><span class="sp-v">${esc(head)}</span></div>`,
                     `<div class="sp-row"><span class="sp-k">${C("spCorpus")}</span><span class="sp-v">${fmt(s.n_sessions)} ${C("statChats")} · ${fmt(s.n_msgs)} ${C("statTurns")}</span></div>`,
-                    `<div class="sp-row${semoff ? " off" : ""}"><span class="sp-k">${C("spSearch")}</span><span class="sp-v">${esc(semv)}</span></div>`,
+                    `<div class="sp-row${st.degraded ? " bad" : semoff ? " off" : ""}"><span class="sp-k">${C("spSearch")}</span><span class="sp-v">${esc(st.degraded ? C("stDegraded") : semv)}${st.degraded ? `<span class="sub">${esc(C("stDegradedSub"))}</span>` : ""}</span></div>`,
                     `<div class="sp-row${cov.emotions ? "" : " off"}"><span class="sp-k">${C("spEnrich")}</span><span class="sp-v">${enr}` +
                         (cov.emotions
                             ? ""
@@ -6715,13 +6749,12 @@
                     .map(([k, n]) => ({
                         icon: "#",
                         label: k,
-                        meta: `${n}`,
+                        meta: `${n} ›`,
+                        keep: true,
                         run: () => {
-                            setView("explore");
-                            STATE.group = "project";
-                            STATE.chip = k;
-                            syncSegs();
-                            renderRail();
+                            PKMODE = { type: "project", key: k };
+                            $("pkin").value = "";
+                            PKSEL = 0;
                         },
                     }));
                 return pkRank(items, q, cap);
@@ -6867,6 +6900,35 @@
 
             // ---- assemble result groups for a query ----
             function pkResults(q) {
+                if (PKMODE && PKMODE.type === "project") {
+                    const k = PKMODE.key;
+                    const items = CHATS.filter((c) => c.project === k).map((c) => ({
+                        icon: "·",
+                        label: chatTitle(c),
+                        meta: `${c.agent} · ${ago(c.last_ts) || ""}`,
+                        run: () => openChat(c.session),
+                        alt: () => pkResume(c.agent, c.session),
+                        altName: PK("resume"),
+                        _ts: c.last_ts || 0,
+                    }));
+                    const ranked = q.trim()
+                        ? pkRank(items, q, 14)
+                        : items.toSorted((a, b) => b._ts - a._ts).slice(0, 14);
+                    // last row: apply the project as the rail filter instead
+                    ranked.push({
+                        icon: "#",
+                        label: `${PK("proj")} → ${k}`,
+                        meta: "rail",
+                        run: () => {
+                            setView("explore");
+                            STATE.group = "project";
+                            STATE.chip = k;
+                            syncSegs();
+                            renderRail();
+                        },
+                    });
+                    return [["#" + k, ranked]];
+                }
                 if (q.startsWith(">")) return [[PK("cmds"), pkCommands(q.slice(1), 12)]];
                 if (q.startsWith("@")) return [[PK("sess"), pkSessions(q.slice(1), 12)]];
                 if (q.startsWith("#")) return [[PK("proj"), pkProjects(q.slice(1), 14)]];
@@ -6908,7 +6970,10 @@
             // ---- palette state + render ----
             let PKOPEN = false,
                 PKSEL = 0,
-                PKROWS = [];
+                PKROWS = [],
+                // submenu: a picked project scopes the palette to its chats
+                // (esc pops back to the top level before closing)
+                PKMODE = null;
             function pkRender() {
                 // theme can change from inside the palette (settings rows keep it open)
                 $("pkin").placeholder = PK("ph");
@@ -6965,6 +7030,7 @@
             function pkOpen(prefill) {
                 PKOPEN = true;
                 PKSEL = 0;
+                PKMODE = null;
                 $("cmdk").classList.add("open");
                 $("pktitle").textContent = PK("title");
                 const inp = $("pkin");
@@ -6980,6 +7046,11 @@
             }
             $("pkscrim").onclick = pkClose;
             $("pkx").onclick = pkClose;
+            // discoverability: the palette exists as a visible top-bar chip too
+            $("pkbtn").textContent = /mac/i.test(navigator.platform)
+                ? "⌘K"
+                : "ctrl+K";
+            $("pkbtn").onclick = () => (PKOPEN ? pkClose() : pkOpen());
             $("pkin").addEventListener("input", () => {
                 PKSEL = 0;
                 pkRender();
@@ -7000,6 +7071,10 @@
                     e.preventDefault();
                     if ($("pkin").value) {
                         $("pkin").value = "";
+                        PKSEL = 0;
+                        pkRender();
+                    } else if (PKMODE) {
+                        PKMODE = null;
                         PKSEL = 0;
                         pkRender();
                     } else pkClose();
