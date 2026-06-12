@@ -18,7 +18,6 @@
 //! PART (drop injected wrappers, then concatenate survivors) — never per message.
 //! We under-include rather than risk labeling agent/system text as the user's.
 
-use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, EVENT_CAP};
@@ -76,7 +75,11 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     ) {
         Ok(c) => c,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(e) => {
+            // the file exists (callers filter on that), so a failed open is real news
+            eprintln!("  ! opencode: cannot open {}: {e}", path.display());
+            return (Vec::new(), Vec::new());
+        }
     };
 
     // One pass over text + tool parts. The LIKE pair is a cheap byte-scan prefilter (it
@@ -149,7 +152,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         Err(_) => return (Vec::new(), Vec::new()),
     };
 
-    let mut out: Vec<Message> = Vec::new();
+    let mut out: Vec<crate::model::RawMessage> = Vec::new();
     // Per-session running turn index (rows are session-ordered).
     let mut cur_session = String::new();
     let mut turn = 0u32;
@@ -165,7 +168,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
     // Flush the accumulated message: a user turn becomes a new Message; an assistant
     // turn is attached as the reply (+model) of the user turn it answers.
     fn flush(
-        out: &mut Vec<Message>,
+        out: &mut Vec<crate::model::RawMessage>,
         turn: &mut u32,
         session: &str,
         dir: &str,
@@ -178,7 +181,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
             if text.trim().is_empty() || is_wrapper(text) {
                 return;
             }
-            out.push(Message {
+            out.push(crate::model::RawMessage {
                 agent: "opencode",
                 project: project_name(dir),
                 session: session.to_string(),
@@ -353,11 +356,15 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         }
     }
 
-    (out, events)
+    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), events)
 }
 
 /// Open each live opencode DB read-only and collect the user's typed messages + tool events.
-pub fn collect() -> (Vec<Message>, Vec<Event>) {
+/// Cache-driven like claude/codex: a DB whose (mtime, size) hasn't moved is served from the
+/// parse cache instead of a full table scan. The immutable=1 open means this reader only
+/// ever sees checkpointed content, and checkpoints touch the main DB file's mtime, so the
+/// stat is a sound staleness key for exactly what collect_db can observe.
+pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
     let dir = crate::ingest::home()
         .join(".local")
         .join("share")
@@ -369,12 +376,6 @@ pub fn collect() -> (Vec<Message>, Vec<Event>) {
         .filter(|p| p.exists())
         .collect();
 
-    let results: Vec<(Vec<Message>, Vec<Event>)> = paths.par_iter().map(|p| collect_db(p)).collect();
-    let mut msgs: Vec<Message> = Vec::new();
-    let mut evts: Vec<Event> = Vec::new();
-    for (m, e) in results {
-        msgs.extend(m);
-        evts.extend(e);
-    }
-    (msgs, evts)
+    let pass = crate::ingest_cache::collect_cached(cache, &dir, &paths, collect_db);
+    (pass.messages, pass.events)
 }

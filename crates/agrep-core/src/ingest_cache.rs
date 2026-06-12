@@ -30,13 +30,13 @@ const CACHE_VERSION: u32 = 2;
 #[derive(Serialize, Deserialize, Clone)]
 struct CMsg {
     agent: String,
-    project: String,
-    session: String,
+    project: std::sync::Arc<str>,
+    session: std::sync::Arc<str>,
     ts: i64,
     turn: u32,
-    text: String,
-    model: String,
-    reply: String,
+    text: std::sync::Arc<str>,
+    model: std::sync::Arc<str>,
+    reply: std::sync::Arc<str>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct Entry {
@@ -68,6 +68,8 @@ fn intern_agent(s: &str) -> &'static str {
 }
 
 impl CMsg {
+    // both directions are refcount bumps (Arc fields), not string copies — on a warm
+    // run every cached message round-trips through here, so this is the hot edge
     fn from(m: &Message) -> Self {
         CMsg {
             agent: m.agent.to_string(),
@@ -197,7 +199,7 @@ where
 
     // sessions touched: from the fresh parses AND from the OLD cache entries of changed files
     // (so a session that moved between files is fully refreshed)
-    let mut affected: HashSet<String> = HashSet::new();
+    let mut affected: HashSet<std::sync::Arc<str>> = HashSet::new();
     for (_, _, _, m, _) in &miss_parsed {
         for msg in m {
             affected.insert(msg.session.clone());

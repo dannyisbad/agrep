@@ -222,10 +222,13 @@ fn parse_call_output(v: &serde_json::Value) -> (String, Option<bool>) {
 fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     let data = match fs::read_to_string(path) {
         Ok(d) => d,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(e) => {
+            eprintln!("  ! codex: cannot read {}: {e}", path.display());
+            return (Vec::new(), Vec::new());
+        }
     };
 
-    let mut out: Vec<Message> = Vec::new();
+    let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     // call_id -> index into `events`, so the *_output line can pair up.
     let mut pending: HashMap<String, usize> = HashMap::new();
@@ -415,7 +418,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
             continue;
         }
 
-        out.push(Message {
+        out.push(crate::model::RawMessage {
             agent: "codex",
             project: project.clone().unwrap_or_else(|| "unknown".to_string()),
             session: session
@@ -430,7 +433,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
         turn += 1;
     }
 
-    (out, events)
+    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), events)
 }
 
 /// Recursively collect rollout files under `~/.codex/sessions/` (YYYY/MM/DD nesting).

@@ -8,7 +8,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 memchr = "2"
 bincode = "1"

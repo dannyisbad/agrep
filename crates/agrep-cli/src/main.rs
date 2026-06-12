@@ -45,24 +45,29 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Ingest one named adapter (or all of them concatenated), then dedupe. The claude/codex
-/// adapters (the 9GB+ bulk) re-parse only files changed since the last index via `cache`;
-/// opencode/antigravity are small and always full-parse.
+/// Ingest one named adapter (or all of them concatenated), then dedupe. claude/codex/
+/// opencode re-parse only sources changed since the last index via `cache`; antigravity
+/// (small, many tiny per-session files) always full-parses, so it runs concurrently
+/// with the cache-driven chain instead of after it.
 fn ingest_agent(agent: &str, cache: &mut IngestCache) -> anyhow::Result<(Vec<Message>, Vec<Event>)> {
     let (msgs, evts) = match agent {
         "claude" => ingest::claude::collect(cache),
         "codex" => ingest::codex::collect(cache),
-        "opencode" => ingest::opencode::collect(),
+        "opencode" => ingest::opencode::collect(cache),
         "antigravity" => ingest::antigravity::collect(),
         "all" => {
-            let (mut m, mut e) = ingest::claude::collect(cache);
-            let (m2, e2) = ingest::codex::collect(cache);
-            m.extend(m2);
-            e.extend(e2);
-            for (m3, e3) in [ingest::opencode::collect(), ingest::antigravity::collect()] {
+            let ((m4, e4), (mut m, mut e)) = rayon::join(ingest::antigravity::collect, || {
+                let (mut m, mut e) = ingest::claude::collect(cache);
+                let (m2, e2) = ingest::codex::collect(cache);
+                m.extend(m2);
+                e.extend(e2);
+                let (m3, e3) = ingest::opencode::collect(cache);
                 m.extend(m3);
                 e.extend(e3);
-            }
+                (m, e)
+            });
+            m.extend(m4);
+            e.extend(e4);
             (m, e)
         }
         other => {

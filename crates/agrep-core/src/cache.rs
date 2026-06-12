@@ -146,7 +146,7 @@ pub fn write_session_index(msgs: &[Message], path: &Path) -> anyhow::Result<usiz
     }
     let mut by: BTreeMap<&str, Agg> = BTreeMap::new();
     for m in msgs {
-        let a = by.entry(m.session.as_str()).or_insert(Agg {
+        let a = by.entry(&*m.session).or_insert(Agg {
             agent: m.agent,
             project: &m.project,
             n: 0,
@@ -351,7 +351,8 @@ pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {
         subagents: u64,
     }
     let mut by_agent: HashMap<&str, AgentStat> = HashMap::new();
-    let mut by_tool: HashMap<String, (u64, u64)> = HashMap::new(); // name -> (n, fails)
+    // names borrow from `events`: this loop covers the full corpus on complete runs
+    let mut by_tool: HashMap<&str, (u64, u64)> = HashMap::new(); // name -> (n, fails)
     let mut total = 0u64;
     let mut fails = 0u64;
     let mut subagents = 0u64;
@@ -360,7 +361,7 @@ pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {
         if e.kind == "tool" {
             total += 1;
             a.calls += 1;
-            let t = by_tool.entry(e.name.clone()).or_default();
+            let t = by_tool.entry(&e.name).or_default();
             t.0 += 1;
             if e.ok.is_some() {
                 a.known += 1;
@@ -375,7 +376,7 @@ pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {
             a.subagents += 1;
         }
     }
-    let mut tools: Vec<(String, (u64, u64))> = by_tool.into_iter().collect();
+    let mut tools: Vec<(&str, (u64, u64))> = by_tool.into_iter().collect();
     tools.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     tools.truncate(14);
 
@@ -385,11 +386,11 @@ pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {
         fails: u64,
         subagents: u64,
         by_agent: HashMap<&'a str, AgentStat>,
-        by_tool: Vec<ToolStat>,
+        by_tool: Vec<ToolStat<'a>>,
     }
     #[derive(Serialize)]
-    struct ToolStat {
-        name: String,
+    struct ToolStat<'a> {
+        name: &'a str,
         n: u64,
         fails: u64,
     }
@@ -420,23 +421,23 @@ mod tests {
         let msgs = vec![
             Message {
                 agent: "claude",
-                project: "myproj".to_string(),
-                session: "sess-1".to_string(),
+                project: "myproj".into(),
+                session: "sess-1".into(),
                 ts: 1_700_000_000_000,
                 turn: 0,
-                text: "first".to_string(),
-                model: "claude-opus-4-8".to_string(),
-                reply: "an answer".to_string(),
+                text: "first".into(),
+                model: "claude-opus-4-8".into(),
+                reply: "an answer".into(),
             },
             Message {
                 agent: "opencode",
-                project: "myproj".to_string(),
-                session: "sess-2".to_string(),
+                project: "myproj".into(),
+                session: "sess-2".into(),
                 ts: 0,
                 turn: 7,
-                text: "with \"quotes\" and \n newline".to_string(),
-                model: String::new(),
-                reply: String::new(),
+                text: "with \"quotes\" and \n newline".into(),
+                model: "".into(),
+                reply: "".into(),
             },
         ];
         let mut path = std::env::temp_dir();

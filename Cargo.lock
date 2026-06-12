@@ -23,6 +23,7 @@ dependencies = [
  "agrep-core",
  "anyhow",
  "clap",
+ "rayon",
  "serde_json",
 ]
 

@@ -209,6 +209,11 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>) {
         .join("transcript.jsonl");
     let data = match fs::read_to_string(&transcript) {
         Ok(d) => d,
+        // missing transcript is normal (empty/new session dirs); only report real reads
+        Err(e) if transcript.exists() => {
+            eprintln!("  ! antigravity: cannot read {}: {e}", transcript.display());
+            return (Vec::new(), Vec::new());
+        }
         Err(_) => return (Vec::new(), Vec::new()),
     };
 
@@ -223,7 +228,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>) {
         .map(|cwd| project_name(&cwd))
         .unwrap_or_else(|| "antigravity".to_string());
 
-    let mut out: Vec<Message> = Vec::new();
+    let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut evts: Vec<Event> = Vec::new();
     // PLANNER_RESPONSE announces tool calls (name+args); the matching action event
     // (RUN_COMMAND/VIEW_FILE/...) follows with the output. Pair them FIFO.
@@ -319,7 +324,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>) {
         if is_wrapper(&text) {
             continue;
         }
-        out.push(Message {
+        out.push(crate::model::RawMessage {
             agent: "antigravity",
             project: project.clone(),
             session: session.clone(),
@@ -333,7 +338,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>) {
     }
 
     collect_mailbox(brain_dir, &session, &mut evts);
-    (out, evts)
+    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), evts)
 }
 
 /// Walk every `brain/<uuid>/` session and collect the user's Antigravity prompts + events.

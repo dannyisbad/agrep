@@ -203,13 +203,18 @@ fn tool_result_text(content: &serde_json::Value) -> String {
 fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     let data = match fs::read_to_string(path) {
         Ok(d) => d,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(e) => {
+            // a present-but-unreadable file is a real problem; silence here made a
+            // permissions break look identical to "no history"
+            eprintln!("  ! claude: cannot read {}: {e}", path.display());
+            return (Vec::new(), Vec::new());
+        }
     };
     let file_session = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mut out: Vec<Message> = Vec::new();
+    let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     // tool_use id -> index into `events`, so the later tool_result line can pair up.
     let mut pending: HashMap<String, usize> = HashMap::new();
@@ -373,7 +378,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
         if is_wrapper(&text) {
             continue;
         }
-        out.push(Message {
+        out.push(crate::model::RawMessage {
             agent: "claude",
             project: String::new(), // filled once per session below
             session,
@@ -390,7 +395,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     for m in &mut out {
         m.project = project.clone();
     }
-    (out, events)
+    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), events)
 }
 
 /// Walk all real project dirs and collect the user's Claude messages + tool events.
