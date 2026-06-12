@@ -141,8 +141,11 @@ and `./tilt` / `tilt.cmd` is shorthand for `agrep ui` — type `tilt`, get the e
 ## Privacy
 
 Everything is local. agrep makes no network calls except to a local Ollama if you opt
-into that tier. Your index lives in a per-user data dir (in a dev checkout: the
-**gitignored** `data/`) and is never committed. The server binds to `127.0.0.1` only.
+into that tier; the one exception is the web explorer, which loads its fonts from
+Google Fonts (none of your data goes with it — and the app works fine offline on
+system-font fallbacks). Your index lives in a per-user data dir (in a dev checkout:
+the **gitignored** `data/`) and is never committed. The server binds to `127.0.0.1`
+only.
 
 ## How it's built
 

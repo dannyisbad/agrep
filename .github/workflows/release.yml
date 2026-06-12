@@ -1,6 +1,6 @@
 name: release
 
-# Build one platform-tagged wheel per OS/arch (each carries the prebuilt tilt-rs
+# Build one platform-tagged wheel per OS/arch (each carries the prebuilt agrep-rs
 # binary), plus an sdist, and publish to PyPI on a v* tag. The wheel is py3-none-<plat>
 # (any python 3.10+, one platform) — see hatch_build.py.
 #
@@ -21,22 +21,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: win-x64,   os: windows-latest, plat: win_amd64 }
-          - { name: mac-x64,   os: macos-13,       plat: macosx_10_12_x86_64 }
-          - { name: mac-arm64, os: macos-14,       plat: macosx_11_0_arm64 }
+          - { name: win-x64,   os: windows-latest, plat: win_amd64,            rustflags: "-C target-cpu=x86-64-v2" }
+          - { name: mac-x64,   os: macos-13,       plat: macosx_10_12_x86_64,  rustflags: "-C target-cpu=x86-64-v2" }
+          - { name: mac-arm64, os: macos-14,       plat: macosx_11_0_arm64,    rustflags: "" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: build ingest binary
-        run: cargo build --release
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          # .cargo/config.toml pins target-cpu=native, which is right for build-where-you-run
+          # but poison for distributed wheels (SIGILL on older CPUs). Build portable here:
+          # x86-64-v2 floor on x64, default baseline on arm64.
+          rm -f .cargo/config.toml
+          cargo build --release
       - name: stage binary
         shell: bash
         run: |
           mkdir -p _bin
-          if [ "${{ runner.os }}" = "Windows" ]; then cp target/release/tilt-rs.exe _bin/;
-          else cp target/release/tilt-rs _bin/; fi
+          if [ "${{ runner.os }}" = "Windows" ]; then cp target/release/agrep-rs.exe _bin/;
+          else cp target/release/agrep-rs _bin/; fi
       - name: build wheel
         shell: bash
         env:
@@ -62,10 +70,12 @@ jobs:
       - name: build + wheel
         env:
           AGREP_WHEEL_PLAT: manylinux_2_28_x86_64
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: |
           source "$HOME/.cargo/env"
+          rm -f .cargo/config.toml  # drop target-cpu=native; see the wheels job
           cargo build --release
-          mkdir -p _bin && cp target/release/tilt-rs _bin/
+          mkdir -p _bin && cp target/release/agrep-rs _bin/
           PYBIN=/opt/python/cp312-cp312/bin
           "$PYBIN/pip" install -U build
           "$PYBIN/python" -m build --wheel

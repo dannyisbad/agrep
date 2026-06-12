@@ -1,6 +1,7 @@
 # build output
 /target
 /dist
+/dist-test
 *.bin
 
 # the built index — your entire chat history lives here. NEVER commit this.

@@ -163,7 +163,7 @@ def cmd_status(a) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001 -- not a reconfigurable stream (piped oddly)
             pass
-    cli = common.cli_name()  # `python tilt.py` in a dev checkout, `agrep` once installed
+    cli = common.cli_name()  # `python cli.py` in a dev checkout, `agrep` once installed
     print("agrep — grep and explore your cross-agent chat history\n")
     for line in _status_lines(cli):
         print(line)

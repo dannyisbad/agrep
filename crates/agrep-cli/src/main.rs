@@ -18,7 +18,7 @@ use agrep_core::ingest_cache::IngestCache;
 use agrep_core::model::{Event, Message};
 
 #[derive(Parser)]
-#[command(name = "tilt", version, about = "ingest agent chat transcripts into the tilt index")]
+#[command(name = "agrep-rs", version, about = "ingest agent chat transcripts into the agrep index")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

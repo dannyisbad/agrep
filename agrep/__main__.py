@@ -6,7 +6,7 @@ The wheel installs the flat tilt tree as package data under this package:
         cli.py  reindex.py  py/*.py  web/app.html  _bin/agrep-rs[.exe]
 
 We point the code at the bundled rust binary (AGREP_RS_BIN), put the bundled dirs on
-sys.path so the existing flat imports (`import common`, `import tilt`) resolve, then
+sys.path so the existing flat imports (`import common`, `import cli`) resolve, then
 hand off to cli.py. Bare `agrep` prints status + usage and exits (the explorer
 is `agrep ui`), same as `python cli.py`. Data and the smart-tier venv go to a per-user
 dir (see common.py), since site-packages is read-only.
