@@ -1,6 +1,16 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Where the index lands: $AGREP_DATA_DIR (or the pre-rename $TILT_DATA_DIR), else
+/// ./data — the python side always exports the env when it spawns us, so installed
+/// wheels never depend on this process's cwd.
+fn data_dir() -> PathBuf {
+    std::env::var_os("AGREP_DATA_DIR")
+        .or_else(|| std::env::var_os("TILT_DATA_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"))
+}
+
 use clap::{Parser, Subcommand};
 use agrep_core::cache;
 use agrep_core::ingest;
@@ -93,7 +103,7 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
             mark = Instant::now();
         }};
     }
-    let cache_path = PathBuf::from("data").join(".ingest_cache.bin");
+    let cache_path = data_dir().join(".ingest_cache.bin");
     let mut pcache = if full {
         IngestCache::cold()
     } else {
@@ -112,12 +122,12 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     }
     lap!("save-cache");
     let n = msgs.len();
-    let path = PathBuf::from("data").join("messages.jsonl");
+    let path = data_dir().join("messages.jsonl");
     cache::write_messages(&msgs, &path)?;
-    let rpath = PathBuf::from("data").join("replies.jsonl");
+    let rpath = data_dir().join("replies.jsonl");
     cache::write_replies(&msgs, &rpath)?;
     let n_sessions =
-        cache::write_session_index(&msgs, &PathBuf::from("data").join("sessions.jsonl"))?;
+        cache::write_session_index(&msgs, &data_dir().join("sessions.jsonl"))?;
     lap!("write-msgs");
     // keep = every live session's event filename, so unchanged event files aren't deleted.
     // The delete sweep is scoped to the agents actually ingested this run — keep covers
@@ -129,10 +139,10 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         "all" => vec!["claude", "codex", "opencode", "antigravity"],
         one => vec![one],
     };
-    let edir = PathBuf::from("data").join("events");
+    let edir = data_dir().join("events");
     let (n_files, n_events, n_rewritten) = cache::write_events(&evts, &edir, &keep, &run_agents)?;
     if complete {
-        cache::write_event_stats(&evts, &PathBuf::from("data").join("event_stats.json"))?;
+        cache::write_event_stats(&evts, &data_dir().join("event_stats.json"))?;
     }
     lap!("write-events");
     let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();
@@ -159,6 +169,6 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     );
     let breakdown: Vec<String> = phases.iter().map(|(k, ms)| format!("{k} {ms}ms")).collect();
     println!("  phases: {}", breakdown.join(" · "));
-    println!("  next: `python tilt.py reindex` to (re)build embeddings / affect / topics / arcs");
+    println!("  next: `agrep reindex` to (re)build embeddings / affect / topics / arcs");
     Ok(())
 }

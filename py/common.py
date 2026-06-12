@@ -75,6 +75,10 @@ elif _is_dev_checkout():
 else:
     DATA_DIR = _user_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Export the RESOLVED dir so every child agrees with us — the rust ingest, reindex
+# stages, and spawned servers all read this env. Without it the binary falls back to
+# cwd-relative ./data, which installed means read-only-ish site-packages, not here.
+os.environ["AGREP_DATA_DIR"] = str(DATA_DIR)
 
 
 def _venv_dir() -> Path:
