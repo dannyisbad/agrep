@@ -420,7 +420,7 @@ mod tests {
         let msgs = vec![
             Message {
                 agent: "claude",
-                project: "tilt".to_string(),
+                project: "myproj".to_string(),
                 session: "sess-1".to_string(),
                 ts: 1_700_000_000_000,
                 turn: 0,
@@ -430,7 +430,7 @@ mod tests {
             },
             Message {
                 agent: "opencode",
-                project: "tilt".to_string(),
+                project: "myproj".to_string(),
                 session: "sess-2".to_string(),
                 ts: 0,
                 turn: 7,
@@ -440,7 +440,7 @@ mod tests {
             },
         ];
         let mut path = std::env::temp_dir();
-        path.push(format!("tilt-cache-test-{}.jsonl", std::process::id()));
+        path.push(format!("agrep-cache-test-{}.jsonl", std::process::id()));
         write_messages(&msgs, &path).unwrap();
 
         let data = std::fs::read_to_string(&path).unwrap();
@@ -450,7 +450,7 @@ mod tests {
         let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(v0["id"], "claude:sess-1:0");
         assert_eq!(v0["agent"], "claude");
-        assert_eq!(v0["project"], "tilt");
+        assert_eq!(v0["project"], "myproj");
         assert_eq!(v0["session"], "sess-1");
         assert_eq!(v0["ts"], 1_700_000_000_000i64);
         assert_eq!(v0["turn"], 0);

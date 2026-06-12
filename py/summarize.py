@@ -2,7 +2,7 @@
 
 A specific 1-2 sentence summary + concept tags per session. These are the chat-level
 signal behind chat search and the concept map. Thresholded: only sessions with
->= --min-msgs real messages. Run AFTER `tilt index`.
+>= --min-msgs real messages. Run AFTER `agrep index`.
 
 Usage:
   python summarize.py --smoke 6

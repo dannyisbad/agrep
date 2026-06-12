@@ -1,5 +1,4 @@
 //! Per-agent transcript adapters. Each yields normalized `Message`s (the user's words only).
-//! Implemented: claude. Next: codex, opencode, antigravity, gemini.
 
 pub mod claude;
 pub mod codex;
@@ -18,7 +17,7 @@ pub fn home() -> PathBuf {
 
 /// Lowercased last segment of the home dir (the username). Paths under home start with
 /// container segments (`Users/<name>/Desktop/...`); the username must never read as a
-/// project name, whoever runs tilt.
+/// project name, whoever runs the ingest.
 pub fn home_leaf() -> &'static str {
     use std::sync::OnceLock;
     static LEAF: OnceLock<String> = OnceLock::new();

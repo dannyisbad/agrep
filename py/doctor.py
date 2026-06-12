@@ -22,12 +22,12 @@ import common
 ROOT = common.REPO_ROOT
 WIN = sys.platform == "win32"
 VENV_PY = common.VENV_PY
-TILT_RS = common.ingest_bin()
+INGEST_BIN = common.ingest_bin()
 HOME = Path.home()
 
 OK, MISS, OPT = "ok", "MISSING", "--"
 
-# what to type to re-run this CLI: `python tilt.py` from a dev checkout, `agrep` once installed.
+# what to type to re-run this CLI: `python cli.py` from a dev checkout, `agrep` once installed.
 CLI = common.cli_name()
 
 
@@ -70,7 +70,7 @@ def probe() -> dict:
     as `report()`, no printing. The venv module probes spawn a python each, so this
     costs ~1-2s — the UI calls it on demand (setup open / recheck), never on boot."""
     has_cargo = shutil.which("cargo") is not None
-    has_bin = TILT_RS.exists()
+    has_bin = INGEST_BIN.exists()
     has_venv = VENV_PY.exists()
     deps = {m: (_venv_has(m) if has_venv else False)
             for m in ("numpy", "torch", "sentence_transformers", "sklearn")}
@@ -104,11 +104,11 @@ def report() -> dict:
     if not has_cargo:
         fixes.append("install Rust: https://rustup.rs")
 
-    has_bin = TILT_RS.exists()
+    has_bin = INGEST_BIN.exists()
     try:
-        bin_disp = str(TILT_RS.relative_to(ROOT))  # dev: target/release/...
+        bin_disp = str(INGEST_BIN.relative_to(ROOT))  # dev: target/release/...
     except ValueError:
-        bin_disp = str(TILT_RS)                     # bundled / $AGREP_RS_BIN: outside the tree
+        bin_disp = str(INGEST_BIN)                     # bundled / $AGREP_RS_BIN: outside the tree
     _row("ingest binary", OK if has_bin else MISS,
          bin_disp if has_bin else f"not built — `{CLI} index` compiles it")
     if not has_bin and has_cargo:

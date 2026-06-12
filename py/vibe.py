@@ -211,7 +211,7 @@ def main() -> int:
             continue
         val = np.array(val)
         rage = np.array(rage)
-        hype = np.array([v + r for v, r in zip(val, rage)])  # hype = valence + rage
+        hype = np.array([v + r for v, r in zip(val, rage)])
         peak_turn = int(rage.argmax())
         tps = find_spikes(rage, hype, peak_turn, args.turning)
         arcs.append({

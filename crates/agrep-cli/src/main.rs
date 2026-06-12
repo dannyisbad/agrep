@@ -88,13 +88,11 @@ fn ingest_agent(agent: &str, cache: &mut IngestCache) -> anyhow::Result<(Vec<Mes
     Ok((deduped, ededuped))
 }
 
-/// `tilt index` — ingest and (re)write data/messages.jsonl + data/replies.jsonl. The embeddings,
+/// `agrep index` — ingest and (re)write data/messages.jsonl + data/replies.jsonl. The embeddings,
 /// affect, topics, and arcs are produced by the Python sidecar (`python reindex.py`).
 fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let t0 = Instant::now();
-    // Per-phase wall clock, printed at the end. Last round's lesson, kept as a fixture:
-    // optimize from this line, not from intuition (the serde rewrite was a measured wash
-    // because the floor was never where it looked like it was).
+    // Per-phase wall clock, printed at the end: optimize from these numbers, not intuition.
     let mut phases: Vec<(&'static str, u128)> = Vec::new();
     let mut mark = Instant::now();
     macro_rules! lap {

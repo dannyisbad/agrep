@@ -6,7 +6,7 @@
     94-message agent can't top the chart on noise
 Used by both the static report (build()) and the live server (server.py).
 
-Run after: tilt index, emotion.py, vibe.py.
+Run after: agrep index, emotion.py, vibe.py.
 """
 
 from __future__ import annotations

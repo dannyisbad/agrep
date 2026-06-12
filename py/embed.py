@@ -1,7 +1,7 @@
 """Embed every message in data/messages.jsonl into data/embeddings.f32 + .ids.
 
 Resolve-or-fallback the model, embed all texts as PASSAGES (no query instruction),
-Matryoshka-truncate to D=256, L2-normalize, write the contract pair.
+truncate to common.EMBED_DIM, L2-normalize, write the contract pair.
 
 The asymmetric-instruction contract per candidate (embed_query.py MUST mirror it):
   Qwen/Qwen3-Embedding-0.6B (primary, 1024-d)  last-token pooling + LEFT padding
@@ -33,7 +33,7 @@ CANDIDATES = [PRIMARY] + FALLBACKS
 QWEN_QUERY_INSTRUCTION = "Retrieve developer-chat messages relevant to the query"
 
 # Dev chat includes whole-file pastes; one 26k-token message batch-padded to its
-# length OOMs a 10GB GPU (64 x 26k x 1024 x 4B ~= 6.9 GiB). 2048 keeps nearly all
+# length OOMs a ~10GB GPU (64 x 26k x 1024 x 4B ~= 6.9 GiB). 2048 keeps nearly all
 # messages whole while batch=32 x 2048 costs ~270 MB. --max-seq-len overrides.
 DEFAULT_MAX_SEQ = 2048
 
@@ -61,7 +61,7 @@ def build_loader(device: str, max_seq_len: int = DEFAULT_MAX_SEQ):
 
         model_kwargs = {}
         if device == "cuda":
-            # fp16 weights on GPU; the 3080 has 10GB and a 0.6B model fits easily.
+            # fp16 weights on GPU; a 0.6B model fits easily in any CUDA card's VRAM.
             model_kwargs["torch_dtype"] = torch.float16
 
         model = SentenceTransformer(
@@ -94,9 +94,9 @@ def build_loader(device: str, max_seq_len: int = DEFAULT_MAX_SEQ):
 def embed_passages(model, texts: list[str], device: str, token_budget: int = 6144) -> np.ndarray:
     """Embed texts as PASSAGES (no instruction prefix), at the model's native dim.
 
-    LENGTH-AWARE TOKEN-BUDGET BATCHING. On this Windows/torch build, SDPA uses the
-    math backend, which materializes the full batch x heads x seq^2 attention
-    matrix — so a fixed batch_size OOMs whenever a batch contains long messages
+    LENGTH-AWARE TOKEN-BUDGET BATCHING. When SDPA falls back to the math backend
+    (common on Windows torch builds), it materializes the full batch x heads x
+    seq^2 attention matrix, so a fixed batch_size OOMs whenever a batch contains long messages
     (one 2048-token batch of 32 ~= 8.6 GiB). We instead bound `batch_count *
     max_seq_in_batch <= token_budget`, so attention memory stays ~constant
     (~token_budget x heads x seq x 2B) no matter the length mix: long messages get

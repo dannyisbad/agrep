@@ -46,8 +46,8 @@ WIN = sys.platform == "win32"
 
 def _is_dev_checkout() -> bool:
     """A real source tree, not an installed wheel: has the rust crate / git dir
-    alongside. In dev we keep the index in <repo>/data (Danny's whole history is
-    already there); installed, REPO_ROOT is read-only site-packages so it can't be."""
+    alongside. In dev the index lives in <repo>/data; installed, REPO_ROOT is
+    read-only site-packages so it can't be."""
     return (REPO_ROOT / "Cargo.toml").exists() or (REPO_ROOT / ".git").exists()
 
 
@@ -82,9 +82,9 @@ os.environ["AGREP_DATA_DIR"] = str(DATA_DIR)
 
 
 def _venv_dir() -> Path:
-    """Where the smart-tier venv lives. Dev: <repo>/py/.venv (Danny's already has
-    torch). Installed: under the user data dir, because the package dir is read-only
-    site-packages and the in-app 'install smart tier' button writes a venv there."""
+    """Where the smart-tier venv lives. Dev: <repo>/py/.venv. Installed: under the
+    user data dir, because the package dir is read-only site-packages and the in-app
+    'install smart tier' button writes a venv there."""
     env = os.environ.get("AGREP_VENV_DIR") or os.environ.get("TILT_VENV_DIR")
     if env:
         return Path(env).expanduser()

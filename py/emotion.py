@@ -83,7 +83,7 @@ def build_loader(device: str, max_len: int = 256):
 
     `max_len` caps the tokenizer so a giant pasted message can't blow up the
     attention matrix (ModernBERT's native max is 8192; one long message in a
-    batch OOMs a 10GB GPU). Emotion lives in the gist, so 256 tokens is plenty.
+    batch OOMs a ~10GB GPU). Emotion lives in the gist, so 256 tokens is plenty.
     """
     from transformers import pipeline  # local import: heavy
 

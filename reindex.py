@@ -7,7 +7,7 @@ after a few new chats takes seconds instead of minutes. Pass --full to recompute
 everything from scratch.
 
 Each stage runs as its OWN process so a model's VRAM is released before the next
-stage loads its model (important on the 10GB GPU). Stages, in order:
+stage loads its model (matters on consumer-VRAM GPUs). Stages, in order:
 
     cargo build (release)         -> the agrep-rs ingest binary
     agrep-rs index                -> data/messages.jsonl + data/replies.jsonl + data/events/

@@ -32,7 +32,7 @@ RECAP_PREFIX = "This session is being continued from a previous conversation"
 
 # --------------------------------------------------------------------------- caches
 # The index is static between rebuilds; cache the parsed tables so repeat requests
-# (every chat the user opens) don't re-read 58 MB of messages.jsonl. BUT the server
+# (every chat the user opens) don't re-read all of messages.jsonl. BUT the server
 # is long-lived and reindexes happen under it, so every public entry point first
 # checks a generation stamp (mtime+size of the index files) and drops all caches
 # when the index moved -- otherwise the explorer serves week-old rows until restart.
@@ -132,8 +132,8 @@ def _summary_by_session() -> dict[str, dict]:
 @functools.lru_cache(maxsize=1)
 def _session_index() -> dict[str, dict]:
     """session -> tiny aggregate {agent, project, n, first_ts, last_ts, first_text}.
-    Materialized by `tilt index` (data/sessions.jsonl, ~2 MB) precisely so the rail
-    never has to parse the ~50 MB messages.jsonl. Falls back to deriving the same
+    Materialized by `agrep index` (data/sessions.jsonl, small) precisely so the rail
+    never has to parse the much larger messages.jsonl. Falls back to deriving the same
     shape from the big file for indexes built before sessions.jsonl existed."""
     p = common.DATA_DIR / "sessions.jsonl"
     out: dict[str, dict] = {}
@@ -159,7 +159,7 @@ def _session_index() -> dict[str, dict]:
 @functools.lru_cache(maxsize=1)
 def _messages_by_session() -> dict[str, list[dict]]:
     """session -> its message rows, parsed once. get_chat used to scan all of messages.jsonl
-    (~50 MB / 25k lines) on every open; this loads it a single time so each open is a lookup."""
+    on every open; this loads it a single time so each open is a lookup."""
     out: dict[str, list[dict]] = {}
     p = common.MESSAGES_PATH
     if p.exists():
@@ -258,10 +258,10 @@ def list_chats() -> list[dict]:
     """Every session worth a rail row, newest-feeling first (the client re-sorts).
 
     Summarized sessions carry their title/summary/tags/vibe. UNSUMMARIZED sessions are
-    included too (>= 2 messages -- the 14k one-shot throwaways stay reachable through
+    included too (>= 2 messages -- one-shot throwaways stay reachable through
     keyword search), titled by their first typed message and flagged `thin` so the UI
     can dim them. This is what makes a fresh install useful immediately: the rail fills
-    straight from `tilt index`, before any LLM stage has ever run. When NO summaries
+    straight from `agrep index`, before any LLM stage has ever run. When NO summaries
     exist yet, even 1-message sessions are listed rather than an empty rail."""
     _freshen()
     vib = _vibe_index()
@@ -575,7 +575,7 @@ def has_events(agent: str, session: str) -> bool:
 def get_events(agent: str, session: str) -> list[dict]:
     """The tool/subagent event stream for one session, in ts order (as ingested).
     Read per-request from the per-session file — small, and deliberately NOT a global
-    cache (the full corpus is ~450MB)."""
+    cache (the full event corpus can run to hundreds of MB)."""
     p = events_path(agent, session)
     if not p.exists():
         return []

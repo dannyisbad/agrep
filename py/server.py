@@ -350,8 +350,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}))
             threading.Thread(target=_restart_self, name="tilt-restart").start()
             return
-        # (the bundled /ask agent was removed: search shows receipts and is instant;
-        # cross-chat synthesis belongs to a real agent calling these endpoints)
         self._send(404, "{}")
 
     def log_message(self, *a):  # quiet

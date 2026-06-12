@@ -11,8 +11,8 @@ Pipeline:
   4. label each cluster by top c-TF-IDF terms of its messages
   5. write data/concepts.json + data/session_concepts.jsonl, print a summary
 
-Run AFTER `tilt embed`. No LLM here (that's the optional summary pass); this is the
-instant, centroid-based concept layer.
+Runs inside `agrep reindex`, after the embed stage. No LLM here (that's the optional
+summary pass); this is the instant, centroid-based concept layer.
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ def cluster_summaries(args) -> int:
     """Cluster the per-session SUMMARY embeddings into topic threads.
 
     The message-centroid path (below) averages every message vector of a session, so long
-    coding sessions all collapse toward one generic centroid and pile into a vague catch-all
-    ("Opencode Workflow Engineering", ~109 chats of unrelated work). Each session summary is
+    coding sessions all collapse toward one generic centroid and pile into a vague
+    catch-all topic of unrelated work. Each session summary is
     instead a single clean topic sentence, so clustering `summary_emb.*` groups by what the
     chat was actually about. We partition (Ward, fixed K) rather than HDBSCAN so every
     browsable chat lands in a coherent topic instead of a giant "misc" noise bin.

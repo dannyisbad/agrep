@@ -33,7 +33,7 @@ WIN = sys.platform == "win32"
 sys.path.insert(0, str(ROOT / "py"))
 import common  # noqa: E402  -- single source for binary / venv / data paths
 
-TILT_RS = common.ingest_bin()
+INGEST_BIN = common.ingest_bin()
 
 
 def _version() -> str:
@@ -56,7 +56,7 @@ def _server_python() -> str:
 
 
 def _ensure_binary() -> bool:
-    if TILT_RS.exists():
+    if INGEST_BIN.exists():
         return True
     import shutil
     if not shutil.which("cargo"):
@@ -66,7 +66,7 @@ def _ensure_binary() -> bool:
         return False
     print("=== first run: building the ingest binary (cargo build --release) ===", flush=True)
     return subprocess.run(["cargo", "build", "--release"], cwd=str(ROOT)).returncode == 0 \
-        and TILT_RS.exists()
+        and INGEST_BIN.exists()
 
 
 def _index() -> bool:
@@ -299,7 +299,7 @@ def main() -> int:
         return cmd_search(argparse.Namespace(rest=raw))
 
     # parse_known_args instead of REMAINDER positionals: REMAINDER errors on
-    # leading optionals (`tilt serve --port N` never reached the server), and
+    # leading optionals (`agrep serve --port N` never reached the server), and
     # mixing it with parse_known_args scrambles token order. Unknown args pass
     # through to the subcommand verbatim.
     args, unknown = p.parse_known_args()

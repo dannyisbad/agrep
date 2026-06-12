@@ -118,7 +118,7 @@ fn collect_tool_paths(content: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Reduce a directory to its project ROOT bucket: strip the home prefix and any
 /// container segments (`Users/<name>/Desktop/...`), keep the first real segment.
-/// `~/Desktop/tilt/py` -> Some("tilt"); a bare home dir -> None (no signal).
+/// `~/Desktop/myproj/src` -> Some("myproj"); a bare home dir -> None (no signal).
 fn project_root(dir: &str) -> Option<String> {
     let d = dir.replace('\\', "/");
     let home = crate::ingest::home()
@@ -147,10 +147,9 @@ fn project_root(dir: &str) -> Option<String> {
 
 /// The project a session actually worked in: a histogram over EVERY line's cwd (Claude
 /// updates it as the session cd's around) plus the parent dir of every file its tools
-/// touched, reduced to project roots. The most-worked-in root wins. Sessions launched
-/// from home that evolve into a real project ("i start A LOT of sessions in home dirs
-/// that evolve into completely different shit") land on where the work went, not where
-/// the terminal happened to open.
+/// touched, reduced to project roots. The most-worked-in root wins, so sessions launched
+/// from a home dir that evolve into a real project land on where the work went, not
+/// where the terminal happened to open.
 fn primary_project(cwd_counts: &HashMap<String, usize>, paths: &[String], first_cwd: &str) -> String {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (c, n) in cwd_counts {
