@@ -130,10 +130,10 @@ EMBED_DIM = 1024
 
 
 def cli_name() -> str:
-    """How the user invokes us in prose/help: `python tilt.py` in a dev checkout,
+    """How the user invokes us in prose/help: `python cli.py` in a dev checkout,
     `agrep` once installed. Single source so every message names the command the
     same way (status banner, doctor, the auto-index notices)."""
-    return "python tilt.py" if _is_dev_checkout() else "agrep"
+    return "python cli.py" if _is_dev_checkout() else "agrep"
 
 
 def _refresh_corpusdb() -> None:

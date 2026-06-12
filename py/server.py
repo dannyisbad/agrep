@@ -104,7 +104,7 @@ def _status() -> dict:
                                   if (now * 1000 - s["last_ts"]) <= 90 * 1000)},
         # what to TELL the user to type: `agrep` from an installed package, the dev
         # form in a checkout. Drives every command string the UI prints.
-        "cli": "python tilt.py" if common._is_dev_checkout() else "agrep",
+        "cli": common.cli_name(),
     }
 
 

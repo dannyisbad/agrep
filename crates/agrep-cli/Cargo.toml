@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The ingest engine. `agrep index` (tilt.py) shells out to this `agrep-rs` binary.
+# The ingest engine. `agrep index` (cli.py) shells out to this `agrep-rs` binary.
 [[bin]]
 name = "agrep-rs"
 path = "src/main.rs"

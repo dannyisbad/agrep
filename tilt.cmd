@@ -1,1 +1,1 @@
-@python "%~dp0tilt.py" %*
+@python "%~dp0cli.py" ui %*

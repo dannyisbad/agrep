@@ -6195,7 +6195,7 @@
             // reports which (it knows via common._is_dev_checkout); default to the
             // dev form until /status lands.
             function CLI() {
-                return (STATUS && STATUS.cli) || "python tilt.py";
+                return (STATUS && STATUS.cli) || "python cli.py";
             }
             function cliCmd(rest) {
                 return rest ? `${CLI()} ${rest}` : CLI();

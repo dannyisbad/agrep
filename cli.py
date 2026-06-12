@@ -13,7 +13,7 @@
 
 A bare first argument that isn't a command is treated as a search, so `agrep deadlock`
 greps. Bare `agrep` prints status + usage (it never starts a server). In a dev checkout
-the same commands run as `python tilt.py <cmd>`. Run `agrep <command> --help` for a
+the same commands run as `python cli.py <cmd>`. Run `agrep <command> --help` for a
 command's own options.
 """
 
@@ -49,7 +49,7 @@ def _version() -> str:
 def _server_python() -> str:
     """The python the SERVER runs under. Semantic search needs the smart tier's
     deps (numpy/torch/...), which live in the venv — launching the server with
-    whatever python invoked tilt.py silently downgrades every 'meaning' search
+    whatever python invoked us silently downgrades every 'meaning' search
     to keyword when that python lacks them (it logs one line and carries on).
     Prefer the venv whenever it exists; plain interpreters still run the core."""
     return common.venv_python()
@@ -61,7 +61,7 @@ def _ensure_binary() -> bool:
     import shutil
     if not shutil.which("cargo"):
         print("  ! no ingest binary and no cargo on PATH.")
-        print("    install Rust (https://rustup.rs) and re-run, or `python tilt.py serve` "
+        print(f"    install Rust (https://rustup.rs) and re-run, or `{common.cli_name()} serve` "
               "to view an existing index.")
         return False
     print("=== first run: building the ingest binary (cargo build --release) ===", flush=True)

@@ -1,2 +1,2 @@
 #!/bin/sh
-exec python3 "$(dirname "$0")/tilt.py" "$@"
+exec python3 "$(dirname "$0")/cli.py" ui "$@"

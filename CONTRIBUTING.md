@@ -3,11 +3,11 @@
 ## Layout
 
 ```
-tilt.py                the CLI front door (search / resume / up / doctor / index / reindex / serve / tail)
+cli.py                 the CLI front door (search / around / resume / ui / doctor / index / reindex / serve / tail)
 agrep/                 the PyPI package shim: maps this flat tree into a wheel (see pyproject)
 crates/agrep-core/     Rust: read each agent's store, normalize, write the index
   src/ingest/          one adapter per agent (claude, codex, opencode, antigravity)
-crates/agrep-cli/      the `agrep-rs` ingest binary (driven by `tilt.py index`)
+crates/agrep-cli/      the `agrep-rs` ingest binary (driven by `cli.py index`)
 py/                    read-only server + the optional ML/LLM pipeline
   server.py            the HTTP server (stdlib only; serves web/app.html)
   explore.py           read layer over the index (browse/search/detail)
@@ -27,12 +27,12 @@ only thing the base experience needs; the Python ML scripts are optional enhance
 ## Running it
 
 ```
-python tilt.py up            # build + index + serve + open
-python tilt.py reindex        # also run the smart/named tiers (needs the deps)
-python tilt.py doctor         # what's installed; --fix creates the venv + installs deps
+python cli.py ui             # build + index + serve + open
+python cli.py reindex         # also run the smart/named tiers (needs the deps)
+python cli.py doctor          # what's installed; --fix creates the venv + installs deps
 ```
 
-`tilt.py up` and `serve` need only Python stdlib + the Rust binary. Editing `web/app.html`
+`cli.py ui` and `serve` need only Python stdlib + the Rust binary. Editing `web/app.html`
 needs no rebuild — the server re-reads it on each request.
 
 ## Adding an agent adapter
