@@ -3,7 +3,7 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>agrep</title>
+        <title>tilt — the agrep explorer</title>
         <link
             rel="icon"
             href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='Arial Narrow,sans-serif' font-weight='bold' font-size='24' fill='%23ff4a2e' transform='rotate(-8 16 16)'%3Et%3C/text%3E%3C/svg%3E"
@@ -5463,7 +5463,7 @@
                     )
                     .join("");
                 $("view").innerHTML = `<div class="home">
-    <div class="big">agrep.</div>
+    <div class="big">tilt.</div>
     <p class="lead">${C("heroLead")}</p>
     ${recent.length ? `<div class="rh"><span>${C("recentHead")}</span><span class="rule"></span></div>${rows}` : ""}
     <p class="lead" style="color:var(--ghost);margin-top:26px">${fmt(n)} ${C("heroFootA")}</p>
@@ -5494,7 +5494,7 @@
     <div class="g99logo"><span>a</span><span>g</span><span>r</span><span>e</span><span>p</span><em>!</em></div>
     <div class="g99tag">Search every conversation with your coding programs.</div>
     <div class="g99btns">
-      <button class="g99b" id="g99search">agrep Search</button>
+      <button class="g99b" id="g99search">tilt Search</button>
       <button class="g99b" id="g99lucky">I'm Feeling Lucky</button>
       ${setupNeeded() ? `<button class="g99b" id="g99setup">${esc(SK("cta"))}</button>` : ""}
     </div>
