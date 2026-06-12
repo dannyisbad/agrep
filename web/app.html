@@ -2799,6 +2799,9 @@
             }
 
             /* ---------- per-theme wordmark letters + speaker prefix ---------- */
+            .word {
+                cursor: pointer;
+            }
             .word .wl {
                 display: inline-block;
             }
@@ -5491,7 +5494,7 @@
             // 1999 web homepage, styled after the original google front page
             function web99Home(n) {
                 return `<div class="g99">
-    <div class="g99logo"><span>a</span><span>g</span><span>r</span><span>e</span><span>p</span><em>!</em></div>
+    <div class="g99logo"><span>t</span><span>i</span><span>l</span><span>t</span><em>!</em></div>
     <div class="g99tag">Search every conversation with your coding programs.</div>
     <div class="g99btns">
       <button class="g99b" id="g99search">tilt Search</button>
@@ -5540,6 +5543,19 @@
   <path d="M16 44 Q10 40 12 33" fill="none" stroke="#ffb3d4" stroke-width="2.4" stroke-linecap="round"/>
   <path d="M104 44 Q110 40 108 33" fill="none" stroke="#ffb3d4" stroke-width="2.4" stroke-linecap="round"/>
 </svg>`;
+            // the wordmark is the home button: explore view, search cleared, nothing
+            // selected -- same end state as landing on a bare url.
+            $("word").onclick = () => {
+                if (SEARCH.active) {
+                    $("find").value = "";
+                    $("findx").style.display = "none";
+                    exitSearch(true);
+                }
+                STATE.sel = null;
+                $("view").innerHTML = "";
+                setView("explore");
+                renderRail();
+            };
             $("vExplore").onclick = () => setView("explore");
             $("vLive").onclick = () => setView("live");
             $("vPulse").onclick = () => setView("pulse");
@@ -6511,7 +6527,7 @@
             const SETUPC = {
                 noir: {
                     title: "setup",
-                    sub: "agrep works in tiers. the core is already running; each layer below installs itself with one click and stays optional.",
+                    sub: "tilt works in tiers. the core is already running; each layer below installs itself with one click and stays optional.",
                     core: "core",
                     smart: "smart",
                     named: "named",
@@ -6575,7 +6591,7 @@
                 },
                 web99: {
                     title: "Setup",
-                    sub: "agrep works in tiers. The core is already running; each tier below installs with one click and stays optional.",
+                    sub: "tilt works in tiers. The core is already running; each tier below installs with one click and stays optional.",
                     core: "Core",
                     smart: "Smart",
                     named: "Named",
