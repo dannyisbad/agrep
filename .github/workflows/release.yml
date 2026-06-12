@@ -22,7 +22,9 @@ jobs:
       matrix:
         include:
           - { name: win-x64,   os: windows-latest, plat: win_amd64,            rustflags: "-C target-cpu=x86-64-v2" }
-          - { name: mac-x64,   os: macos-13,       plat: macosx_10_12_x86_64,  rustflags: "-C target-cpu=x86-64-v2" }
+          # macos-13 (the old intel image) is retired; macos-15-intel is the last
+          # x86_64 image GitHub will ever host (gone Aug 2027 — drop this wheel then).
+          - { name: mac-x64,   os: macos-15-intel, plat: macosx_10_12_x86_64,  rustflags: "-C target-cpu=x86-64-v2" }
           - { name: mac-arm64, os: macos-14,       plat: macosx_11_0_arm64,    rustflags: "" }
     steps:
       - uses: actions/checkout@v4
