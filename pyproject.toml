@@ -10,7 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 keywords = ["claude", "codex", "opencode", "agent", "chat", "history", "semantic-search", "cli"]
-authors = [{ name = "Danny" }]
+authors = [{ name = "mundy" }]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
