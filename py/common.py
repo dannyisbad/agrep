@@ -134,9 +134,14 @@ EMBED_DIM = 1024
 
 
 def cli_name() -> str:
-    """How the user invokes us in prose/help: `python cli.py` in a dev checkout,
-    `agrep` once installed. Single source so every message names the command the
-    same way (status banner, doctor, the auto-index notices)."""
+    """How the user invokes us in prose/help: `agrep` when installed OR when they came
+    in through a shim that says so ($AGREP_CLI_NAME, set by agrep.cmd / tilt); bare
+    `python cli.py` only when actually run that way in a checkout. Single source so
+    every message names the command the same way (status banner, doctor, the
+    auto-index notices)."""
+    env = os.environ.get("AGREP_CLI_NAME")
+    if env:
+        return env
     return "python cli.py" if _is_dev_checkout() else "agrep"
 
 
