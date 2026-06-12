@@ -1,0 +1,12 @@
+{
+  "name": "agrep",
+  "version": "0.1.0",
+  "description": "grep your AI coding agents' chat history (Claude Code, Codex, opencode, Antigravity) — npm shim that runs the real package via uv/pipx",
+  "bin": { "agrep": "bin.js" },
+  "files": ["bin.js", "README.md"],
+  "engines": { "node": ">=16" },
+  "keywords": ["claude", "codex", "opencode", "agent", "chat", "history", "grep", "cli"],
+  "repository": { "type": "git", "url": "git+https://github.com/dannyisbad/tilt.git" },
+  "homepage": "https://github.com/dannyisbad/tilt#readme",
+  "license": "MIT"
+}
