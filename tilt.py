@@ -4,7 +4,7 @@
   agrep "race condition"    grep your whole agent history; print matches  (the namesake)
   agrep around <id> <turn>  show the conversation around a search hit, tools inline
   agrep resume <id>         jump back into a past session in its agent, cd'd there
-  agrep up                  build the index, start the server, open the app
+  agrep ui                  the explorer (tilt): index, serve, and open the app
   agrep doctor              check what's installed and what each tier needs
   agrep index               just (re)build the index from your agent stores
   agrep reindex             full pipeline: index + embeddings + affect + topics + arcs
@@ -12,13 +12,15 @@
   agrep tail                follow live agent events as JSON lines
 
 A bare first argument that isn't a command is treated as a search, so `agrep deadlock`
-greps. Bare `agrep` opens the app. In a dev checkout the same commands run as
-`python tilt.py <cmd>`. Run `agrep <command> --help` for a command's own options.
+greps. Bare `agrep` prints status + usage (it never starts a server). In a dev checkout
+the same commands run as `python tilt.py <cmd>`. Run `agrep <command> --help` for a
+command's own options.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import subprocess
 import sys
@@ -68,17 +70,14 @@ def _ensure_binary() -> bool:
 
 
 def _index() -> bool:
+    # the ingest invocation + derived-db refresh live in common.build_index() (shared
+    # with the auto-index-on-first-search path); here we just wrap it with progress.
     print("=== indexing transcripts ===", flush=True)
     t = time.perf_counter()
-    r = subprocess.run([str(TILT_RS), "index", "--agent", "all"], cwd=str(ROOT))
-    if r.returncode == 0:
+    ok = common.build_index()
+    if ok:
         print(f"  ({time.perf_counter() - t:.1f}s)", flush=True)
-        # refresh the derived search db now so the first `agrep <pattern>` doesn't pay it
-        import corpusdb
-        db = corpusdb.connect(quiet=True)
-        if db:
-            db.close()
-    return r.returncode == 0
+    return ok
 
 
 def _wait_for(port: int, timeout: float = 30.0) -> bool:
@@ -90,6 +89,94 @@ def _wait_for(port: int, timeout: float = 30.0) -> bool:
         except OSError:
             time.sleep(0.25)
     return False
+
+
+# --- status (bare `agrep`) ------------------------------------------------
+
+def _fmt_age(seconds: float) -> str:
+    """Compact human age: '3s', '12m', '5h', '2d' ago. Coarse on purpose — the
+    status line wants a glance, not a stopwatch."""
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def _status_lines(cli: str) -> list[str]:
+    """Cheap index summary for the bare-`agrep` banner. Reads sessions.jsonl (one
+    line per chat, with the per-chat message count `n` and `agent`) — never parses
+    messages.jsonl, which is ~50 MB. mtime of messages.jsonl dates the last index;
+    corpus.db's presence + size says whether keyword search is ready; the smart-tier
+    venv's existence says whether meaning search is installed."""
+    sessions = common.DATA_DIR / "sessions.jsonl"
+    out: list[str] = []
+    if not sessions.exists():
+        out.append(f"  no index yet — any search will build it on first run, "
+                   f"or run `{cli} index`.")
+        return out
+
+    n_sessions = n_messages = 0
+    agents: set[str] = set()
+    with sessions.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            n_sessions += 1
+            n_messages += int(o.get("n", 0))
+            a = o.get("agent")
+            if a:
+                agents.add(a)
+
+    ag = ", ".join(sorted(agents)) if agents else "—"
+    out.append(f"  {n_messages:,} messages · {n_sessions:,} sessions · "
+               f"{len(agents)} agent{'s' if len(agents) != 1 else ''} ({ag})")
+
+    msgs = common.MESSAGES_PATH
+    if msgs.exists():
+        out.append(f"  last indexed {_fmt_age(time.time() - msgs.stat().st_mtime)} ago")
+
+    db = common.DATA_DIR / "corpus.db"
+    ready = db.exists() and db.stat().st_size > 0
+    out.append(f"  search index: {'ready' if ready else 'missing (builds on first search)'}")
+
+    smart = "installed" if Path(common.venv_python()) != Path(sys.executable) else \
+        f"not installed (keyword only; `{cli} doctor` to add meaning search)"
+    out.append(f"  smart tier: {smart}")
+    return out
+
+
+def cmd_status(a) -> int:
+    """Bare `agrep`: print where the index stands and how to drive the tool, then exit.
+    Deliberately does NOT start a server — the explorer is `agrep ui`."""
+    # the banner carries em-dashes / middots; windows consoles default to cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 -- not a reconfigurable stream (piped oddly)
+            pass
+    cli = common.cli_name()  # `python tilt.py` in a dev checkout, `agrep` once installed
+    print("agrep — grep and explore your cross-agent chat history\n")
+    for line in _status_lines(cli):
+        print(line)
+    print("\ntry:")
+    print(f'  {cli} "race condition"        grep every agent for a phrase')
+    print(f"  {cli} deadlock --agent codex  filter to one agent")
+    print(f"  {cli} -E 'TODO|FIXME'         regex search")
+    print(f"  {cli} -l auth                 which chats mention it")
+    print(f"  {cli} around <id> <turn>      the conversation around a hit")
+    print(f"  {cli} resume <id>             reopen a past session in its agent")
+    print(f"  {cli} ui                      the explorer: index, serve, open the app")
+    print(f"\n{cli} <command> -h for a command's own options.")
+    return 0
 
 
 # --- subcommands ----------------------------------------------------------
@@ -167,11 +254,16 @@ def main() -> int:
     p.add_argument("-V", "--version", action="version", version=f"agrep {_version()}")
     sub = p.add_subparsers(dest="cmd")
 
-    up = sub.add_parser("up", help="index, serve, and open the app (default)")
-    up.add_argument("--port", type=int, default=8732)
-    up.add_argument("--no-open", action="store_true", help="don't open the browser")
-    up.add_argument("--no-index", action="store_true", help="serve the existing index as-is")
-    up.set_defaults(fn=cmd_up)
+    # `ui` is the explorer (tilt): index + serve + open. `up` is a kept-working alias
+    # (it lives in scripts / muscle memory) but only `ui` is advertised — a subparser
+    # added without help= is omitted from the command listing, so `up` stays hidden.
+    for name in ("ui", "up"):
+        kw = {"help": "index, serve, and open the explorer (tilt)"} if name == "ui" else {}
+        u = sub.add_parser(name, **kw)
+        u.add_argument("--port", type=int, default=8732)
+        u.add_argument("--no-open", action="store_true", help="don't open the browser")
+        u.add_argument("--no-index", action="store_true", help="serve the existing index as-is")
+        u.set_defaults(fn=cmd_up)
 
     di = sub.add_parser("doctor", help="check installed tiers; --fix does safe setup")
     di.set_defaults(fn=cmd_doctor)
@@ -199,8 +291,8 @@ def main() -> int:
 
     # The agrep promise: a bare pattern greps. If the first arg isn't a known verb
     # (and isn't a global flag), treat the whole invocation as a search — so
-    # `agrep "rust simd"` works, while `agrep up` / `agrep serve --port N` still
-    # dispatch. `agrep` alone opens the app; `agrep -h` shows top-level help.
+    # `agrep "rust simd"` works, while `agrep ui` / `agrep serve --port N` still
+    # dispatch. `agrep` alone prints status + usage; `agrep -h` shows top-level help.
     raw = sys.argv[1:]
     verbs = set(sub.choices)
     if raw and raw[0] not in verbs and raw[0] not in ("-h", "--help", "-V", "--version"):
@@ -213,8 +305,8 @@ def main() -> int:
     args, unknown = p.parse_known_args()
     args.rest = unknown
     if not getattr(args, "fn", None):
-        # bare `tilt` == `tilt up`, the common case
-        return cmd_up(argparse.Namespace(port=8732, no_open=False, no_index=False))
+        # bare `agrep` prints status + usage and exits — the explorer is `agrep ui`.
+        return cmd_status(args)
     return args.fn(args)
 
 

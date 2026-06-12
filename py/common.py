@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +124,62 @@ EMOTIONS_PATH = DATA_DIR / "emotions.jsonl"
 # Bumped 256 -> 1024 (full Qwen3-Embedding width) for better recall. The Rust reader
 # is self-describing (reads embeddings.meta), so this stays in sync automatically.
 EMBED_DIM = 1024
+
+
+def cli_name() -> str:
+    """How the user invokes us in prose/help: `python tilt.py` in a dev checkout,
+    `agrep` once installed. Single source so every message names the command the
+    same way (status banner, doctor, the auto-index notices)."""
+    return "python tilt.py" if _is_dev_checkout() else "agrep"
+
+
+def _refresh_corpusdb() -> None:
+    """Rebuild the derived FTS db now so the next search doesn't pay for it. Wrapped
+    broadly: a derived-db hiccup must never fail an otherwise-good ingest."""
+    try:
+        import corpusdb  # lazy: only the CLI keyword paths reach here, and it imports us
+        db = corpusdb.connect(quiet=True)
+        if db:
+            db.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def build_index() -> bool:
+    """Run the Rust ingest over every agent store, then refresh the derived FTS db.
+
+    The single ingest invocation shared by `agrep index`/`ui` (a forced rebuild) and
+    ensure_index() (build-on-first-use). Assumes the binary exists — callers that
+    might not have it check tilt_rs_bin().exists() first. Returns True on success.
+    """
+    r = subprocess.run([str(tilt_rs_bin()), "index", "--agent", "all"], cwd=str(REPO_ROOT))
+    if r.returncode != 0 or not MESSAGES_PATH.exists():
+        return False
+    _refresh_corpusdb()
+    return True
+
+
+def ensure_index(auto: bool = True) -> bool:
+    """Make sure data/messages.jsonl exists, building it on first use if we can.
+
+    Returns True when the materialized corpus is present (already there, or freshly
+    ingested), False when it's missing and we couldn't build it. The CLI's keyword
+    paths call this so a fresh clone's first `agrep <pattern>` indexes itself instead
+    of dead-ending on "no index yet". `auto=False` (the --no-auto flag) skips the
+    build and just reports presence, preserving the old script-friendly behavior.
+    """
+    if MESSAGES_PATH.exists():
+        return True
+    cli = cli_name()
+    if not auto:
+        log(f"no index yet — run `{cli} index` to scan your agent stores, then search.")
+        return False
+    if not tilt_rs_bin().exists():
+        log(f"no index yet, and no ingest binary to build one — run `{cli} index` "
+            f"(install Rust from https://rustup.rs if cargo is missing), then search.")
+        return False
+    log("first run — indexing your agent stores (one-time)…")
+    return build_index()
 
 
 # --- Message loading ------------------------------------------------------

@@ -1,12 +1,13 @@
 """tilt doctor - what's installed, what each tier needs, and how to fix gaps.
 
-The CLI twin of the in-app status chip. tilt works in tiers: a stdlib-only clone
+The CLI twin of the in-app status chip. agrep works in tiers: a stdlib-only clone
 browses, keyword-searches, watches live sessions, and resumes; the smart tier adds
 semantic search + topics + mood arcs; the named tier adds generated titles/summaries.
-This prints which tiers are live and the exact command to unlock each missing one.
+This prints which tiers are live and, for every gap, the exact command to unlock it —
+no state leaves the reader guessing what to run next.
 
-  python tilt.py doctor          # report
-  python tilt.py doctor --fix    # do the safe setup steps (venv + pip install)
+  agrep doctor          # report
+  agrep doctor --fix    # do the safe setup steps (venv + pip install)
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ TILT_RS = common.tilt_rs_bin()
 HOME = Path.home()
 
 OK, MISS, OPT = "ok", "MISSING", "--"
+
+# what to type to re-run this CLI: `python tilt.py` from a dev checkout, `agrep` once installed.
+CLI = common.cli_name()
 
 
 def _row(name: str, status: str, detail: str = "") -> None:
@@ -106,9 +110,9 @@ def report() -> dict:
     except ValueError:
         bin_disp = str(TILT_RS)                     # bundled / $TILT_RS_BIN: outside the tree
     _row("ingest binary", OK if has_bin else MISS,
-         bin_disp if has_bin else "build it: python tilt.py index")
+         bin_disp if has_bin else f"not built — `{CLI} index` compiles it")
     if not has_bin and has_cargo:
-        fixes.append("build the ingest binary: cargo build --release")
+        fixes.append(f"build the ingest binary: `{CLI} index`")
 
     pyok = sys.version_info >= (3, 10)
     _row("python >= 3.10", OK if pyok else MISS,
@@ -121,31 +125,32 @@ def report() -> dict:
             found_stores.append(agent)
     _row("agent stores", OK if found_stores else MISS,
          ", ".join(found_stores) if found_stores
-         else "none found under ~ (run an agent first)")
+         else "none under ~ — start a Claude/Codex/opencode session, then re-run doctor")
 
     print("\nsmart tier - semantic search, topics, mood arcs (optional)")
     has_venv = VENV_PY.exists()
     _row("python venv", OK if has_venv else OPT,
-         str(VENV_PY.relative_to(ROOT)) if has_venv else "py/.venv")
+         str(VENV_PY.relative_to(ROOT)) if has_venv else f"none yet — `{CLI} doctor --fix` creates it")
     deps = {m: (_venv_has(m) if has_venv else False)
             for m in ("numpy", "torch", "sentence_transformers", "sklearn")}
     for m, present in deps.items():
-        _row(m, OK if present else OPT, "" if present else "not installed")
+        _row(m, OK if present else OPT,
+             "" if present else f"not installed — `{CLI} doctor --fix`")
     if not all(deps.values()):
-        fixes.append("smart tier: python tilt.py doctor --fix  "
+        fixes.append(f"smart tier: `{CLI} doctor --fix`  "
                      "(creates py/.venv, installs requirements.txt)")
 
     print("\nnamed tier - generated titles & summaries (optional)")
     models = _ollama_models()
     if models is None:
-        _row("ollama", OPT, "not running (install: https://ollama.com)")
+        _row("ollama", OPT, "not running — install from https://ollama.com, then re-run doctor")
         fixes.append("named tier: install Ollama, then `ollama pull qwen2.5:3b-instruct`")
     else:
         _row("ollama", OK, "reachable")
         _row("a model pulled", OK if models else OPT,
-             ", ".join(models[:3]) if models else "none (e.g. `ollama pull qwen2.5:3b-instruct`)")
+             ", ".join(models[:3]) if models else "none — `ollama pull qwen2.5:3b-instruct`")
         if not models:
-            fixes.append("named tier: ollama pull qwen2.5:3b-instruct")
+            fixes.append("named tier: `ollama pull qwen2.5:3b-instruct`")
 
     print("\nindex")
     sj = common.DATA_DIR / "sessions.jsonl"
@@ -153,10 +158,10 @@ def report() -> dict:
         import time
         n = sum(1 for _ in sj.open(encoding="utf-8"))
         age = int(time.time() - sj.stat().st_mtime)
-        _row("built", OK, f"{n} sessions, updated {age // 60}m ago")
+        _row("built", OK, f"{n} sessions, updated {age // 60}m ago "
+                          f"(refresh anytime: `{CLI} index`)")
     else:
-        _row("built", MISS, "none yet - run: python tilt.py up")
-        fixes.append("build the index: python tilt.py up")
+        _row("built", OPT, f"none yet — your first `{CLI} <pattern>` builds it automatically")
 
     tiers = []
     if has_bin or has_cargo:
@@ -165,11 +170,13 @@ def report() -> dict:
         tiers.append("smart")
     if models:
         tiers.append("named")
-    print(f"\ntiers available: {', '.join(tiers) or 'none - install Rust first'}")
+    print(f"\ntiers available: {', '.join(tiers) or 'none — install Rust first (https://rustup.rs)'}")
     if fixes:
         print("\nto unlock more:")
         for f in dict.fromkeys(fixes):  # dedupe, keep order
             print(f"  - {f}")
+    print(f"\nnext: `{CLI} <pattern>` to search (auto-builds the index the first time), "
+          f"`{CLI}` for this status, `{CLI} ui` to open the explorer.")
     print()
     return {"tiers": tiers, "fixes": fixes, "has_cargo": has_cargo,
             "has_venv": has_venv, "deps": deps}
@@ -203,8 +210,8 @@ def fix() -> int:
             print("  ! pip install failed. If it's a torch/CUDA wheel issue, install the "
                   "build for your platform from https://pytorch.org, then re-run.")
             return 1
-    print("\ndone. re-run `python tilt.py doctor` to confirm the smart tier is live.")
-    print("for the named tier: install Ollama (https://ollama.com) and `ollama pull qwen2.5:3b-instruct`.")
+    print(f"\ndone. re-run `{CLI} doctor` to confirm the smart tier is live.")
+    print("for the named tier: install Ollama (https://ollama.com), then `ollama pull qwen2.5:3b-instruct`.")
     return 0
 
 

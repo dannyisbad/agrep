@@ -7,9 +7,9 @@ The wheel installs the flat tilt tree as package data under this package:
 
 We point the code at the bundled rust binary (TILT_RS_BIN), put the bundled dirs on
 sys.path so the existing flat imports (`import common`, `import tilt`) resolve, then
-hand off to tilt.py's CLI. Bare `agrep` == `agrep up` (index, serve, open), same as
-`python tilt.py`. Data and the smart-tier venv go to a per-user dir (see common.py),
-since site-packages is read-only.
+hand off to tilt.py's CLI. Bare `agrep` prints status + usage and exits (the explorer
+is `agrep ui`), same as `python tilt.py`. Data and the smart-tier venv go to a per-user
+dir (see common.py), since site-packages is read-only.
 """
 
 from __future__ import annotations

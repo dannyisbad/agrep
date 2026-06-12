@@ -124,14 +124,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--who", choices=("you", "agent"), help="only your turns or only replies")
     ap.add_argument("--json", action="store_true",
                     help="one JSON object per message/event (for piping)")
+    ap.add_argument("--no-auto", action="store_true",
+                    help="don't auto-build a missing index")
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     args = ap.parse_args(argv)
 
     sess_q, center = _parse_target(args.session, args.turn)
+    # build the index on first use rather than dead-ending; ensure_index logs an
+    # actionable message and we exit 2 when it can't (or with --no-auto).
     if not common.MESSAGES_PATH.exists():
-        cli = "python tilt.py" if common._is_dev_checkout() else "agrep"
-        common.log(f"no index yet — run `{cli} index` first.")
-        return 2
+        if not common.ensure_index(auto=not args.no_auto):
+            return 2
 
     cands = explore.resolve_session(sess_q)
     if not cands:

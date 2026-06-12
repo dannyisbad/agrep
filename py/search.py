@@ -305,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="server port for --semantic / links (default: auto-detect a "
                          "running server, else 8732)")
     ap.add_argument("--json", action="store_true", help="one JSON object per hit (for piping)")
+    ap.add_argument("--no-auto", action="store_true",
+                    help="don't auto-build a missing index")
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     args = ap.parse_args(argv)
 
@@ -319,13 +321,13 @@ def main(argv: list[str] | None = None) -> int:
     # true totals (keyword/regex report total/chats computed before the display cap).
     big = 10_000_000 if (args.count or args.max == 0 or filters) else max(args.max * 10, 500)
 
-    # Fresh install / never indexed: a silent "no matches" would be baffling. Point at
-    # the fix. (--semantic hits the server, which has its own empty-index handling.)
+    # Fresh install / never indexed: build it on first use rather than dead-ending. On a
+    # success we fall through into the normal keyword path; ensure_index logs an actionable
+    # message and we exit 2 when it can't. (--semantic hits the server, which has its own
+    # empty-index handling, so skip the local build there.)
     if not args.semantic and not common.MESSAGES_PATH.exists():
-        cli = "python tilt.py" if common._is_dev_checkout() else "agrep"
-        common.log(f"no index yet — run `{cli} index` (or `{cli} up`) to scan your "
-                   f"agent stores, then search.")
-        return 2
+        if not common.ensure_index(auto=not args.no_auto):
+            return 2
 
     # find a running server once: powers --semantic's default port AND clickable links
     running = _server_port()

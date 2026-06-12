@@ -99,8 +99,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = _sessions()
     if not rows:
-        cli = "python tilt.py" if common._is_dev_checkout() else "agrep"
-        common.log(f"no index yet — run `{cli} index` first.")
+        common.log(f"no index yet — run `{common.cli_name()} index` first.")
         return 2
 
     if args.list:
