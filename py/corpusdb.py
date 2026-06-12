@@ -46,13 +46,33 @@ def _stamp() -> str:
     return json.dumps(gen)
 
 
+_TRIGRAM_OK: bool | None = None
+
+
 def _trigram_ok() -> bool:
-    try:
-        db = sqlite3.connect(":memory:")
-        db.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='trigram')")
-        return True
-    except sqlite3.OperationalError:
-        return False
+    # probed once per process: the answer is a property of the linked sqlite,
+    # and the throwaway :memory: FTS table isn't free on the cold-search path
+    global _TRIGRAM_OK
+    if _TRIGRAM_OK is None:
+        try:
+            db = sqlite3.connect(":memory:")
+            db.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='trigram')")
+            _TRIGRAM_OK = True
+        except sqlite3.OperationalError:
+            _TRIGRAM_OK = False
+    return _TRIGRAM_OK
+
+
+def _open(path) -> sqlite3.Connection:
+    """Connect for reading with pragmas sized for a corpus-scale db: default
+    cache (~2 MB) and no mmap make the first cold query pay random-read I/O."""
+    db = sqlite3.connect(path)
+    db.executescript("""
+        PRAGMA mmap_size=268435456;
+        PRAGMA cache_size=-65536;
+        PRAGMA temp_store=MEMORY;
+    """)
+    return db
 
 
 def _build(dst) -> None:
@@ -143,7 +163,7 @@ def connect(quiet: bool = False) -> sqlite3.Connection | None:
     stamp = _stamp()
     if DB_PATH.exists():
         try:
-            db = sqlite3.connect(DB_PATH)
+            db = _open(DB_PATH)
             if db.execute("SELECT value FROM meta WHERE key='stamp'").fetchone()[0] == stamp:
                 return db
             db.close()
@@ -159,8 +179,8 @@ def connect(quiet: bool = False) -> sqlite3.Connection | None:
         import os
         os.replace(tmp, DB_PATH)
     except OSError:
-        return sqlite3.connect(tmp)
-    return sqlite3.connect(DB_PATH)
+        return _open(tmp)
+    return _open(DB_PATH)
 
 
 # ------------------------------------------------------------------ query engines
@@ -245,13 +265,42 @@ def word(db: sqlite3.Connection, q: str, k: int) -> dict:
     return _pack(hits, k)
 
 
+def _required_literal(pattern: str) -> str | None:
+    """Longest ASCII literal every match must contain, or None. Only top-level
+    LITERAL runs count: alternations, classes, groups, and repeats break the run,
+    so `TODO|FIXME` correctly yields None (no single literal is required) while
+    `memory leak.*free` yields "memory leak". Sound = may return None when a
+    literal exists, never returns one a match could lack."""
+    try:
+        import re._parser as sre  # 3.11+
+    except ImportError:  # 3.10
+        import sre_parse as sre
+    try:
+        seq = sre.parse(pattern)
+    except Exception:  # noqa: BLE001 -- bad pattern; let re.compile report it
+        return None
+    best, run = "", ""
+    for op, arg in seq:
+        name = str(op)
+        if name == "LITERAL" and isinstance(arg, int) and 0x20 <= arg < 0x7F:
+            run += chr(arg)
+        elif name == "AT":  # zero-width anchor (\b, ^, $): transparent
+            continue
+        else:
+            best, run = max(best, run, key=len), ""
+    best = max(best, run, key=len)
+    return best if len(best) >= 3 else None
+
+
 def regex(db: sqlite3.Connection, pattern: str, k: int) -> dict:
-    """Regex can't use the index, but streaming rows out of sqlite still skips the
-    jsonl parse + per-entry dict building that made the legacy path slow."""
+    """Regex can't use the index directly, but when the pattern demands a literal
+    (most real ones do) the trigram FTS narrows candidates first; otherwise stream
+    the table, which still skips the jsonl parse the legacy path paid."""
     rx = re.compile(pattern, re.I)
     hits = []
-    cur = db.execute(
-        "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs")
+    lit = _required_literal(pattern)
+    cur = (_candidates(db, [lit.lower()]) if lit else db.execute(
+        "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs"))
     for row in cur:
         m = rx.search(row[7])
         if m:

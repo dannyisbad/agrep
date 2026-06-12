@@ -229,16 +229,17 @@ def cmd_tail(a) -> int:
 
 
 def cmd_search(a) -> int:
-    # keyword search is core-tier (stdlib over the materialized corpus), so any python
-    # runs it; --semantic just queries a running server, no torch in this process.
-    return subprocess.run([sys.executable, str(ROOT / "py" / "search.py"), *a.rest],
-                          cwd=str(ROOT)).returncode
+    # in-process (stdlib-only, like resume): spawning a second interpreter doubled
+    # the cold-start cost of the single hottest command. --semantic just queries a
+    # running server, so no torch in this process either way.
+    import search
+    return search.main(a.rest)
 
 
 def cmd_around(a) -> int:
-    # core-tier like search: stdlib over the materialized index, any python runs it.
-    return subprocess.run([sys.executable, str(ROOT / "py" / "around.py"), *a.rest],
-                          cwd=str(ROOT)).returncode
+    # core-tier like search: stdlib over the materialized index, runs in-process.
+    import around
+    return around.main(a.rest)
 
 
 def cmd_resume(a) -> int:
