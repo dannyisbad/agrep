@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 
 import common
+import corpusdb
 import explore
 
 # bold red match (what grep --color uses), bold-cyan chat header, dim metadata
@@ -338,12 +339,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sem_used = True
     if not sem_used:
+        # indexed engine when the corpus db is available (cold calls skip the 50 MB
+        # jsonl parse entirely); identical hit shape, legacy scans as fallback.
+        db = corpusdb.connect()
         if args.word:  # whole-word: substring prefilter + boundary check (fast)
-            res = _word_scan(q, big)
+            res = corpusdb.word(db, q, big) if db else _word_scan(q, big)
         elif args.regex:
-            res = _regex_scan(q, big)
+            try:
+                re.compile(q, re.I)
+            except re.error as e:
+                common.log(f"bad regex: {e}")
+                return 2
+            res = corpusdb.regex(db, q, big) if db else _regex_scan(q, big)
         else:
-            res = explore.keyword_search(q, big)
+            res = corpusdb.keyword(db, q, big) if db else explore.keyword_search(q, big)
 
     filtered = _filtered(res["hits"], args.agent, args.project, args.who)
     # true totals: the engine reports them pre-cap; with filters we fetched everything

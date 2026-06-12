@@ -2,6 +2,7 @@
 """agrep — grep and explore your cross-agent chat history.
 
   agrep "race condition"    grep your whole agent history; print matches  (the namesake)
+  agrep around <id> <turn>  show the conversation around a search hit, tools inline
   agrep resume <id>         jump back into a past session in its agent, cd'd there
   agrep up                  build the index, start the server, open the app
   agrep doctor              check what's installed and what each tier needs
@@ -72,6 +73,11 @@ def _index() -> bool:
     r = subprocess.run([str(TILT_RS), "index", "--agent", "all"], cwd=str(ROOT))
     if r.returncode == 0:
         print(f"  ({time.perf_counter() - t:.1f}s)", flush=True)
+        # refresh the derived search db now so the first `agrep <pattern>` doesn't pay it
+        import corpusdb
+        db = corpusdb.connect(quiet=True)
+        if db:
+            db.close()
     return r.returncode == 0
 
 
@@ -142,6 +148,12 @@ def cmd_search(a) -> int:
                           cwd=str(ROOT)).returncode
 
 
+def cmd_around(a) -> int:
+    # core-tier like search: stdlib over the materialized index, any python runs it.
+    return subprocess.run([sys.executable, str(ROOT / "py" / "around.py"), *a.rest],
+                          cwd=str(ROOT)).returncode
+
+
 def cmd_resume(a) -> int:
     # imported and called in-process (not a subprocess) so the resumed agent is a direct
     # child of this process and cleanly inherits the terminal.
@@ -178,6 +190,9 @@ def main() -> int:
 
     se = sub.add_parser("search", help="grep your chat history (keyword; --semantic for meaning)")
     se.set_defaults(fn=cmd_search)
+
+    ar = sub.add_parser("around", help="show the conversation around one turn of a chat")
+    ar.set_defaults(fn=cmd_around)
 
     rs = sub.add_parser("resume", help="resume a past session in its own agent, cd'd there")
     rs.set_defaults(fn=cmd_resume)

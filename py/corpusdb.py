@@ -1,0 +1,267 @@
+"""Derived sqlite/FTS5 index over the search corpus — why cold CLI calls are fast.
+
+The materialized jsonl stays the source of truth (debuggable, the server's warm caches
+still read it). This module mirrors it into data/corpus.db with a trigram FTS5 index,
+so a cold `agrep <pattern>` is an indexed lookup instead of a parse of ~50 MB of jsonl
+plus a linear scan. Staleness is checked against the source files' (mtime, size) every
+connect; a stale db rebuilds in one shot and swaps in atomically.
+
+Search semantics are IDENTICAL to the legacy scans (explore.keyword_search and
+search.py's word/regex paths): FTS narrows to candidate rows, then the same python
+matchers confirm and place snippets. Trigram needs >=3-char tokens — shorter ones fall
+back to an indexed-table LIKE scan, still no jsonl parse. sqlite without trigram
+support returns None from connect() and callers use the legacy path.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+
+import common
+
+DB_PATH = common.DATA_DIR / "corpus.db"
+# corpus inputs; a change in any (mtime_ns, size) invalidates the db
+_SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json")
+RECAP_PREFIX = "This session is being continued from a previous conversation"
+_FIELDS = ("session", "agent", "project", "concept", "turn", "ts", "who")
+
+
+def _snip_at(text: str, start: int, end: int, pad: int = 80) -> str:
+    """Same one-line window explore._snip_at produces (kept local: explore imports us)."""
+    a, b = max(0, start - pad), min(len(text), end + pad)
+    s = ("…" if a > 0 else "") + text[a:b] + ("…" if b < len(text) else "")
+    return " ".join(s.split())
+
+
+def _stamp() -> str:
+    gen = []
+    for name in _SOURCES:
+        try:
+            st = (common.DATA_DIR / name).stat()
+            gen.append([st.st_mtime_ns, st.st_size])
+        except OSError:
+            gen.append(None)
+    return json.dumps(gen)
+
+
+def _trigram_ok() -> bool:
+    try:
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='trigram')")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def _build(dst) -> None:
+    """One-shot rebuild: stream the jsonl sources into msgs + its FTS mirror. Mirrors
+    explore._kw_corpus row-for-row (one row per user turn, one per agent reply) so
+    every engine reports identical hits."""
+    db = sqlite3.connect(dst)
+    db.executescript("""
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE msgs(
+            id INTEGER PRIMARY KEY,
+            session TEXT NOT NULL, turn INTEGER, ts INTEGER,
+            agent TEXT, project TEXT, concept TEXT,
+            who TEXT, text TEXT);
+        CREATE INDEX msgs_session ON msgs(session, turn);
+        CREATE VIRTUAL TABLE msgs_fts USING fts5(
+            text, content='msgs', content_rowid='id', tokenize='trigram');
+    """)
+
+    names: dict[int, str] = {}
+    p = common.DATA_DIR / "concepts.json"
+    if p.exists():
+        for r in json.loads(p.read_text(encoding="utf-8")):
+            names[int(r["concept_id"])] = (r.get("name") or r.get("label") or "").strip()
+    concept: dict[str, str] = {}
+    p = common.DATA_DIR / "session_concepts.jsonl"
+    if p.exists():
+        for line in p.open(encoding="utf-8"):
+            if line.strip():
+                o = json.loads(line)
+                concept[o["session"]] = (names.get(int(o.get("concept_id", -1)))
+                                         or o.get("label", ""))
+
+    reps: dict[str, str] = {}
+    p = common.DATA_DIR / "replies.jsonl"
+    if p.exists():
+        for line in p.open(encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if o.get("id"):
+                reps[o["id"]] = o.get("reply", "")
+
+    ins = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, who, text) "
+           "VALUES(?,?,?,?,?,?,?,?)")
+    rows = []
+    with common.MESSAGES_PATH.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            s = o.get("session")
+            if not s:
+                continue
+            base = (s, o.get("turn", 0), o.get("ts", 0), o.get("agent", ""),
+                    o.get("project", ""), concept.get(s, ""))
+            t = o.get("text", "") or ""
+            if t:
+                rows.append((*base, "recap" if t.startswith(RECAP_PREFIX) else "you", t))
+            r = reps.get(o.get("id", ""), "")
+            if r:
+                rows.append((*base, "agent", r))
+            if len(rows) >= 5000:
+                db.executemany(ins, rows)
+                rows = []
+    if rows:
+        db.executemany(ins, rows)
+    db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+    db.execute("INSERT INTO meta VALUES('stamp', ?)", (_stamp(),))
+    db.commit()
+    db.close()
+
+
+def connect(quiet: bool = False) -> sqlite3.Connection | None:
+    """A connection to a FRESH corpus db, building/rebuilding first if the sources
+    moved. None when there's nothing to index yet or sqlite lacks trigram fts5."""
+    if not common.MESSAGES_PATH.exists() or not _trigram_ok():
+        return None
+    stamp = _stamp()
+    if DB_PATH.exists():
+        try:
+            db = sqlite3.connect(DB_PATH)
+            if db.execute("SELECT value FROM meta WHERE key='stamp'").fetchone()[0] == stamp:
+                return db
+            db.close()
+        except (sqlite3.DatabaseError, TypeError):
+            pass  # corrupt/half-written/old schema -> rebuild
+    if not quiet:
+        common.log("(re)building search index — one-time after each reindex…")
+    tmp = DB_PATH.with_suffix(".db.tmp")
+    tmp.unlink(missing_ok=True)
+    _build(tmp)
+    # atomic swap; a reader holding the old file on windows just makes us retry next run
+    try:
+        import os
+        os.replace(tmp, DB_PATH)
+    except OSError:
+        return sqlite3.connect(tmp)
+    return sqlite3.connect(DB_PATH)
+
+
+# ------------------------------------------------------------------ query engines
+
+def _fts_quote(tok: str) -> str:
+    return '"' + tok.replace('"', '""') + '"'
+
+
+def _like_quote(tok: str) -> str:
+    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _candidates(db: sqlite3.Connection, toks: list[str]):
+    """Rows that contain every token, via the cheapest applicable index: trigram FTS
+    for >=3-char tokens, indexed LIKE for the stubs. Yields msgs rows."""
+    fts = [t for t in toks if len(t) >= 3]
+    likes = [t for t in toks if len(t) < 3]
+    sel = "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs"
+    if fts:
+        where = ["id IN (SELECT rowid FROM msgs_fts WHERE msgs_fts MATCH ?)"]
+        params: list = [" AND ".join(_fts_quote(t) for t in fts)]
+    else:
+        where, params = [], []
+    for t in likes:
+        where.append("text LIKE ? ESCAPE '\\'")
+        params.append(_like_quote(t))
+    q = sel + (" WHERE " + " AND ".join(where) if where else "")
+    return db.execute(q, params)
+
+
+def _hit(row, start: int, end: int) -> dict:
+    h = dict(zip(_FIELDS, row[:7]))
+    h["snippet"] = _snip_at(row[7], start, end)
+    return h
+
+
+def _pack(hits: list[dict], k: int) -> dict:
+    hits.sort(key=lambda h: (h["session"], h["turn"], 0 if h["who"] != "agent" else 1))
+    return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
+
+
+def keyword(db: sqlite3.Connection, q: str, k: int) -> dict:
+    """Separator-flexible keyword search, same semantics as explore.keyword_search:
+    FTS candidates (superset: tokens anywhere in the row), then the exact matcher
+    confirms adjacency and places the snippet."""
+    toks = [t for t in re.split(r"[\s\-_]+", q.strip()) if t]
+    if not toks:
+        return {"hits": [], "total": 0, "chats": 0}
+    hits = []
+    if len(toks) == 1:  # no separators in q, so the token IS the query
+        ql = q.strip().lower()
+        for row in _candidates(db, [ql]):
+            i = row[7].lower().find(ql)
+            if i >= 0:
+                hits.append(_hit(row, i, i + len(ql)))
+    else:
+        pat = re.compile(r"[\s\-_]*".join(re.escape(t) for t in toks), re.I)
+        for row in _candidates(db, toks):
+            m = pat.search(row[7])
+            if m:
+                hits.append(_hit(row, m.start(), m.end()))
+    return _pack(hits, k)
+
+
+def word(db: sqlite3.Connection, q: str, k: int) -> dict:
+    """Whole-word search: FTS prefilter, boundary check only on candidates."""
+    ql = q.lower()
+    n = len(ql)
+    wc = re.compile(r"[\w]")
+    hits = []
+    for row in _candidates(db, [q]):
+        low = row[7].lower()
+        i = low.find(ql)
+        while i >= 0:
+            j = i + n
+            if (i == 0 or not wc.match(low[i - 1])) and \
+               (j >= len(low) or not wc.match(low[j])):
+                hits.append(_hit(row, i, j))
+                break
+            i = low.find(ql, i + 1)
+    return _pack(hits, k)
+
+
+def regex(db: sqlite3.Connection, pattern: str, k: int) -> dict:
+    """Regex can't use the index, but streaming rows out of sqlite still skips the
+    jsonl parse + per-entry dict building that made the legacy path slow."""
+    rx = re.compile(pattern, re.I)
+    hits = []
+    cur = db.execute(
+        "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs")
+    for row in cur:
+        m = rx.search(row[7])
+        if m:
+            hits.append(_hit(row, m.start(), m.end()))
+    return _pack(hits, k)
+
+
+def session_rows(db: sqlite3.Connection, session: str) -> list[dict]:
+    """One session's rows in turn order, for explore.get_window's fast path."""
+    cur = db.execute(
+        "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs "
+        "WHERE session = ? ORDER BY turn", (session,))
+    return [dict(zip((*_FIELDS, "text"), row)) for row in cur]

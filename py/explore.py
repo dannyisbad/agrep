@@ -421,6 +421,107 @@ def keyword_search(q: str, k: int = 300) -> dict:
     return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
 
+def resolve_session(q: str) -> list[str]:
+    """Resolve a session id query to full ids: exact match wins, else prefix (covers the
+    8-char short ids search/around print). Same semantics resume uses, shared here so
+    every verb that takes an id accepts the same spellings."""
+    _freshen()
+    q = q.strip()
+    idx = _session_index()
+    if q in idx:
+        return [q]
+    return [s for s in idx if s.startswith(q)]
+
+
+def _db_session_rows(session: str) -> list[dict] | None:
+    """One session's turns from the derived corpus db — the fast path that keeps
+    `agrep around` from parsing 50 MB of jsonl. The db stores user text and agent
+    replies as separate rows; merge them back to one row per turn. None when the db
+    is unavailable (caller falls back to the in-memory caches)."""
+    import corpusdb  # late: corpusdb is optional and this module is imported by the server
+    db = corpusdb.connect()
+    if db is None:
+        return None
+    merged: dict[int, dict] = {}
+    for o in corpusdb.session_rows(db, session):
+        t = o["turn"]
+        m = merged.setdefault(t, {"turn": t, "ts": o["ts"], "agent": o["agent"],
+                                  "project": o["project"], "who": "you",
+                                  "text": "", "reply": ""})
+        if o["who"] == "agent":
+            m["reply"] = o["text"]
+        else:
+            m["text"] = o["text"]
+            m["who"] = o["who"]
+    db.close()
+    return [merged[t] for t in sorted(merged)]
+
+
+def get_window(session: str, center: int, n: int = 4) -> dict:
+    """A contiguous window of one chat: turns [center-n, center+n] with replies, plus the
+    tool/subagent events that happened during each of those turns. This is the middle
+    tier between a search snippet and the whole transcript — callers (around CLI, agents)
+    pull the local story of a hit for a few KB instead of re-reading a 50 MB session.
+
+    Events carry only a ts, so they're attributed to the latest turn whose user message
+    precedes them; the window's event range extends to the next turn AFTER the window
+    (or forever on the last turn), since turn N's tool work happens before turn N+1."""
+    _freshen()
+    rows = _db_session_rows(session)
+    if rows is None:  # no corpus db -> legacy in-memory path (parses messages.jsonl)
+        rep = _replies_by_id()
+        rows = []
+        for o in sorted(_messages_by_session().get(session, []),
+                        key=lambda o: o.get("turn", 0)):
+            txt = o.get("text", "")
+            rows.append({"turn": o.get("turn", 0), "ts": o.get("ts", 0),
+                         "agent": o.get("agent", ""), "project": o.get("project", ""),
+                         "who": "recap" if txt.startswith(RECAP_PREFIX) else "you",
+                         "text": txt, "reply": rep.get(o.get("id", ""), "")})
+    if not rows:
+        return {"error": f"session {session} not found"}
+    turn_nums = [o["turn"] for o in rows]
+    center = max(turn_nums[0], min(center, turn_nums[-1]))  # clamp, never error
+    lo, hi = center - n, center + n
+
+    turns = [{"turn": o["turn"], "ts": o["ts"], "text": o["text"], "who": o["who"],
+              "reply": o["reply"]} for o in rows if lo <= o["turn"] <= hi]
+
+    agent = rows[0].get("agent", "")
+    events = []
+    if turns and has_events(agent, session):
+        # ts boundaries: [first selected turn's msg, next turn after the window's msg)
+        starts = {o.get("turn", 0): o.get("ts", 0) for o in rows}
+        t0 = turns[0]["ts"]
+        after = [starts[t] for t in turn_nums if t > turns[-1]["turn"] and starts.get(t)]
+        t1 = min(after) if after else float("inf")
+        sel = [t["turn"] for t in turns]
+        for e in get_events(agent, session):
+            ts = e.get("ts", 0)
+            if t0 <= ts < t1:
+                owner = max((t for t in sel if starts.get(t, 0) <= ts), default=sel[0])
+                out = e.get("output", "") or ""
+                events.append({"turn": owner, "ts": ts, "kind": e.get("kind", "tool"),
+                               "name": e.get("name", ""), "input": e.get("input", ""),
+                               "ok": e.get("ok", True), "output": out,
+                               "output_chars": len(out)})
+
+    summ = _summary_by_session().get(session)
+    return {
+        "session": session,
+        "agent": agent,
+        "project": rows[0].get("project", ""),
+        "concept": _session_concept().get(session, ""),
+        "title": summ.get("title", "") if summ else "",
+        "n_msgs": len(rows),
+        "first_turn": turn_nums[0],
+        "last_turn": turn_nums[-1],
+        "center": center,
+        "turns": turns,
+        "events": events,
+    }
+
+
 def stats() -> dict:
     """Honest corpus totals. The rail lists only summarized sessions, but keyword search
     reaches every message of every session — these numbers describe that full corpus so
