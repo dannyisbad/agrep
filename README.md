@@ -1,83 +1,108 @@
-# tilt
+# agrep
 
 Every AI coding agent you run writes its full history to disk — Claude Code, Codex,
-opencode, Antigravity. tilt reads those stores directly and gives you one place to
-browse, search, and watch them: a single local web app over your entire cross-agent
-history, plus a live board of what's running right now.
+opencode, Antigravity. agrep reads those stores directly and makes your entire
+cross-agent history greppable from the shell, with a local web explorer (**tilt**) on
+top for browsing, organizing, and live-watching everything.
 
-No hooks, no agent-side install, no telemetry. tilt never modifies the agents or their
-data — it only reads. Everything stays on your machine.
-
-```
-uvx agrep          # or: pipx run agrep
-```
-
-That fetches a small prebuilt package (the rust ingest binary + the app — no clone, no
-cargo), scans your agent stores, starts a local server, and opens the app. New chats show
-up the moment an agent writes one; the index keeps itself current while the server runs.
-Your index and any optional models install to a per-user data dir, not the package.
-
-True to the name, `agrep` greps your history straight from the shell — no app, no model:
+No hooks, no agent-side install, no telemetry. agrep never modifies the agents or
+their data — it only reads. Everything stays on your machine.
 
 ```
-agrep "race condition"          # every matching message across all four agents
+uvx agrep "race condition"      # or: pipx run agrep "race condition"
+```
+
+That fetches a small prebuilt package (the rust ingest binary + the app — no clone,
+no cargo), indexes your agent stores on first run (one-time, ~30s for years of
+history), and greps. After that, searches are instant — a derived full-text index
+answers cold CLI calls in well under a second.
+
+```
 agrep deadlock --agent codex    # filter to one agent
 agrep -E 'TODO|FIXME'           # regex
 agrep -l auth                   # list matching chats, not every line (like grep -l)
 agrep "memory leak" --json      # one JSON object per hit, for piping
-agrep "fixing a flaky test" --semantic   # meaning search (needs a running server)
+agrep "flaky test" --semantic   # meaning search (needs a running server)
+agrep around 00da9752 144       # the conversation around a hit, tool calls inline
+agrep resume 00da9752           # reopen that session in its own agent, cd'd there
+agrep ui                        # tilt: the web explorer
 ```
 
-Keyword search is instant and needs nothing installed; it exits like grep (1 when nothing
-matched), so it composes in scripts and pipes. `agrep resume <id>` (any id from the output —
-the 8-char prefix works) drops you back into that session in its own agent, cd'd to where
-it ran. When a server is running and your terminal supports it, each result header is a
-clickable link that opens the chat in the app (set `AGREP_NO_HYPERLINKS=1` to disable).
+Bare `agrep` prints where your index stands and the commands that matter. Keyword
+search exits like grep (1 when nothing matched), so it composes in scripts and pipes.
+When a server is running and your terminal supports it, each result header is a
+clickable link that opens the chat in the app (`AGREP_NO_HYPERLINKS=1` to disable).
 
-The heavier tiers (semantic search, generated titles) install on demand from the app's
-own setup panel — one click each. To get them up front, or to hack on tilt, clone instead:
+## From a hit to the story: `around`
+
+Search tells you *which* session touched a thing. `around` tells you *what happened* —
+the local story of a hit (the error, the attempts, the fix) for a few KB instead of a
+whole transcript:
 
 ```
-git clone https://github.com/dannyisbad/tilt && cd tilt
-python tilt.py up      # builds the indexer; needs Rust (https://rustup.rs)
+agrep around 00da9752 144           # ±4 turns around turn 144 of that session
+agrep around 00da9752:144 -n 10     # wider window; colon form pastes from --json
+agrep around 00da9752 144 --full    # nothing truncated
+agrep around 00da9752 144 --json    # one object per message/event
 ```
 
-Not sure what's installed? `agrep doctor` (or `python tilt.py doctor`) reports which
-tiers are live and the exact command to unlock each missing one.
+Tool calls render inline (name, input, ok/failed) but never their output — the token
+bomb — unless you opt in with `--tool-output N`. Long messages are capped, and every
+truncation marker carries the exact command that prints the rest, so the follow-up
+never needs guessing.
 
----
+## Your agents can use it too
 
-## What you get
+An agent that solved a gnarly bug last week re-derives it from zero today — session
+context dies, transcripts don't. agrep makes that history queryable at the moment it's
+needed: `--json` everywhere, grep exit codes, stateless addressing (`session:turn`),
+and `around` defaults tuned for token budgets.
 
-- **One searchable history** across all four agents. Keyword search is exact and instant.
-  Semantic search and topic clustering light up if you install the optional model tier.
-- **A live view** of every running session — across all agents at once — with real state
-  (thinking, which tool is running, queued prompts, errors, durations) read straight from
-  the stores. No hooks: this works for sessions you started in any terminal, and for
-  subagents the agents spawn. Images an agent reads or sends render inline as they happen.
+One line in your agent's instructions does it:
+
+> Before deep-diving an unfamiliar error, `agrep "<the error string>" --json`; pull
+> context on a hot hit with `agrep around <session> <turn>`.
+
+The first search builds the index by itself, so this works on a box where nothing was
+ever set up (`--no-auto` opts out for strict scripts).
+
+## tilt: the explorer
+
+`agrep ui` opens the human surface — a single local web app over the same index:
+
+- **One searchable history** across all four agents. Keyword search is exact and
+  instant; semantic search and topic clustering light up with the optional model tier.
+- **A live board** of every running session — across all agents at once — with real
+  state (thinking, which tool is running, queued prompts, errors, durations) read
+  straight from the stores. No hooks: it sees sessions you started in any terminal,
+  and the subagents they spawn. Images an agent reads or sends render inline.
 - **Per-chat detail**: the full transcript with the tool/subagent event tree, and a
-  one-click "resume this session in its own CLI" button.
+  one-click "resume this session in its own CLI".
 - **Native resume**: jump back into any past session in its own agent, cd'd to the
   directory it ran in.
 
+While the server runs it re-indexes automatically after new agent activity settles;
+you never run a command to see new chats.
+
 ## The three tiers
 
-tilt is built so the core works on a bare clone and gets better as you add pieces. Nothing
-below the first tier is required.
+The core works on a bare install and gets better as you add pieces. Nothing past the
+first tier is required.
 
 | Tier | Needs | Unlocks |
 |---|---|---|
-| **Core** | Python 3.10+, Rust | Browse, exact keyword search, live view, event trees, native resume. Titles come from each chat's first message. |
-| **Smart** | `pip install -r requirements.txt` (torch et al.) | Semantic search, topic/concept clustering, mood arcs. |
+| **Core** | Python 3.10+ (Rust only if building from source) | Grep, `around`, resume, browse, live view, event trees. Titles come from each chat's first message. |
+| **Smart** | one click in the app's setup panel (torch et al.) | Semantic search, topic/concept clustering, mood arcs. |
 | **Named** | [Ollama](https://ollama.com) + a small local model | Clean generated titles, summaries, concept names, and arc verdicts instead of first-message fallbacks. |
 
-The model tiers run **only at index time** — a model loads, does its pass, and releases
-its memory. tilt never holds a model resident, and the server itself needs no GPU. If you
-can't run a model at all, the core tier is fully usable on its own.
+The model tiers run **only at index time** — a model loads, does its pass, releases
+its memory. Nothing stays resident, and the server itself needs no GPU. `agrep doctor`
+reports which tiers are live and the exact command to unlock each missing one
+(`--fix` does the safe setup itself).
 
 ## Where it reads
 
-tilt discovers sessions under your home directory. Read-only, always:
+agrep discovers sessions under your home directory. Read-only, always:
 
 | Agent | Store |
 |---|---|
@@ -86,40 +111,47 @@ tilt discovers sessions under your home directory. Read-only, always:
 | opencode | `~/.local/share/opencode/*.db` (SQLite) |
 | Antigravity | `~/.gemini/antigravity-cli/brain/<uuid>/` |
 
-Whichever of these exist get indexed; missing ones are skipped. Works on Windows, macOS,
-and Linux.
+Whichever of these exist get indexed; missing ones are skipped. Works on Windows,
+macOS, and Linux.
 
 ## Commands
 
 ```
-python tilt.py up            # index what's new, serve, open the browser (the default)
-python tilt.py up --no-open   # serve without launching a browser
-python tilt.py doctor         # what's installed + what each tier needs (--fix does setup)
-python tilt.py index          # rebuild the base index only (fast, no models)
-python tilt.py reindex        # full pipeline: embeddings + affect + topics + arcs
-python tilt.py reindex --full # recompute every stage from scratch
-python tilt.py serve --port N # just the server (auto-indexes in the background)
+agrep <pattern>          # grep your history (first run builds the index)
+agrep around <id> <turn> # the conversation around a hit
+agrep resume <id>        # reopen a past session in its own agent, cd'd there
+agrep ui                 # tilt: index, serve, open the app
+agrep doctor             # what's installed + what each tier needs (--fix does setup)
+agrep index              # rebuild the base index only (fast, no models)
+agrep reindex            # full pipeline: embeddings + affect + topics + arcs
+agrep serve --port N     # just the server (auto-indexes in the background)
 ```
 
-On Unix you can run `./tilt up` (a thin wrapper); on Windows, `tilt up` via `tilt.cmd`.
+To hack on it, clone and use the same commands as `python cli.py <cmd>`
+(needs Rust for the ingest binary — https://rustup.rs):
 
-While the server runs it re-indexes automatically after new agent activity settles. The
-status chip in the app shows when it's indexing and surfaces any errors; click it to force
-a refresh. You never need to run a command to see new chats.
+```
+git clone https://github.com/dannyisbad/tilt && cd tilt
+python cli.py ui
+```
+
+A dev checkout also has thin wrappers: `agrep.cmd` (Windows) forwards the full CLI,
+and `./tilt` / `tilt.cmd` is shorthand for `agrep ui` — type `tilt`, get the explorer.
 
 ## Privacy
 
-Everything is local. tilt has no network calls except to a local Ollama if you opt into
-that tier. Your indexed history lives in `data/`, which is **gitignored** — it is never
-committed. The server binds to `127.0.0.1` only.
+Everything is local. agrep makes no network calls except to a local Ollama if you opt
+into that tier. Your index lives in a per-user data dir (in a dev checkout: the
+**gitignored** `data/`) and is never committed. The server binds to `127.0.0.1` only.
 
 ## How it's built
 
-Rust ingest (`crates/`) reads the stores and writes a compact index to `data/`; a
-read-only Python server (`py/`) serves a single-file web app (`web/app.html`). The Rust
-ingest is the only required dependency for the core experience; the Python ML scripts are
-the optional enhancement layer. See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout and
-how to add an adapter for another agent.
+A Rust ingest (`crates/agrep-core` + `crates/agrep-cli`) reads the stores and writes a
+compact index; a sqlite FTS5 index derived from it makes cold CLI searches instant; a
+read-only Python server (`py/`) serves the single-file web app (`web/app.html`). The
+Rust ingest is the only required dependency for the core experience; the Python ML
+scripts are the optional enhancement layer. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the layout and how to add an adapter for another agent.
 
 ## License
 
