@@ -1,37 +1,16 @@
 """Embed every message in data/messages.jsonl into data/embeddings.f32 + .ids.
 
-Pipeline:
-  1. resolve-or-fallback the embedding model (Qwen3 primary, BGE/MiniLM fallback)
-  2. embed all message texts as PASSAGES (no query instruction)
-  3. Matryoshka-truncate to D=256, L2-normalize each row
-  4. write the contract pair (embeddings.f32 + embeddings.ids)
+Resolve-or-fallback the model, embed all texts as PASSAGES (no query instruction),
+Matryoshka-truncate to D=256, L2-normalize, write the contract pair.
 
-Model-specific handling, branched on which candidate actually loaded:
+The asymmetric-instruction contract per candidate (embed_query.py MUST mirror it):
+  Qwen/Qwen3-Embedding-0.6B (primary, 1024-d)  last-token pooling + LEFT padding
+      (sentence-transformers ships both); passages bare, queries via prompt_name="query".
+  BAAI/bge-base-en-v1.5 (768-d)                mean pooling; passages bare, queries get
+      the "Represent this sentence..." prefix.
+  all-MiniLM-L6-v2 (384-d)                     mean pooling; no prefix either side.
 
-  Qwen/Qwen3-Embedding-0.6B (PRIMARY, 1024-d):
-    - last-token pooling, LEFT padding (the EOS/last real token must be the
-      final position for last-token pooling to read the right hidden state)
-    - asymmetric instruction: PASSAGES get NO prefix; QUERIES (embed_query.py)
-      get an "Instruct: ...\nQuery: {q}" prefix.
-    Implemented via sentence-transformers, which ships the correct pooling
-    config for this model and exposes prompt_name="query" for the query side.
-
-  BAAI/bge-base-en-v1.5 (FALLBACK, 768-d):
-    - mean pooling (handled by sentence-transformers)
-    - passages: no prefix. queries: "Represent this sentence for searching
-      relevant passages: {q}" (applied in embed_query.py).
-
-  sentence-transformers/all-MiniLM-L6-v2 (FALLBACK, 384-d):
-    - mean pooling. NO prefix on either side.
-
-Usage:
-  python embed.py            # embed everything
-  python embed.py --smoke 8  # embed only the first 8 messages (quick check)
-
-Prints: model used, device, count, dim, elapsed, approx VRAM.
-
-NOTE: the affect gate lives in emotion.py; the LLM judge (Qwen3.5-4B) is a
-SEPARATE, LATER stage and is not invoked here.
+Usage: python embed.py [--smoke 8]
 """
 
 from __future__ import annotations
@@ -53,14 +32,9 @@ CANDIDATES = [PRIMARY] + FALLBACKS
 # embed_query.py applies this (must stay byte-identical there).
 QWEN_QUERY_INSTRUCTION = "Retrieve developer-chat messages relevant to the query"
 
-# Dev-chat messages include huge pastes (whole files, logs). Qwen3-Embedding's
-# native context is 32k; without a cap, one long message batch-padded to its
-# length OOMs a 10GB GPU (64 x 26k x 1024 x 4B ~= 6.9 GiB in a single fp32 tensor).
-# Peak memory is ~ batch x seq (linear), so a generous cap is nearly free with a
-# modest batch: 2048 tokens keeps the VAST majority of messages whole (only true
-# file-dumps get trimmed), preserving semantics, while batch=32 x 2048 ~= 270 MB.
-# Tunable via --max-seq-len. (A future option for huge messages: chunk + average
-# multiple vectors rather than truncate.)
+# Dev chat includes whole-file pastes; one 26k-token message batch-padded to its
+# length OOMs a 10GB GPU (64 x 26k x 1024 x 4B ~= 6.9 GiB). 2048 keeps nearly all
+# messages whole while batch=32 x 2048 costs ~270 MB. --max-seq-len overrides.
 DEFAULT_MAX_SEQ = 2048
 
 

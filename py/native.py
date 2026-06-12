@@ -1,22 +1,18 @@
 """Resume a session in its OWN native CLI, cd'd to the directory it ran in.
 
-The live view shows sessions across four agents; this is the "jump back into that one"
-button. Given (agent, session), it:
-  1. resolves the real working directory from that agent's store (each records its cwd),
-  2. builds the agent's documented resume command,
-  3. opens a NEW terminal there running it. Windows: Windows Terminal if present, else
-     `start`. macOS: Terminal.app via osascript. Linux: $TERMINAL or the first common
-     emulator found.
+Two paths: open_session() spawns a NEW terminal (the app's resume button — wt/start on
+Windows, Terminal.app via osascript on mac, $TERMINAL on linux); resume_in_place() runs
+the agent in the CURRENT terminal (`agrep resume`). Both resolve the real cwd from the
+agent's store and build the command via resume_argv().
 
 Resume commands (verified against each CLI's --help):
   claude    claude --resume <id>
   codex     codex resume <id>
-  opencode  opencode --session <id>
-  agy       agy --conversation <id>      (antigravity)
+  opencode  opencode <dir> --session <id>   (dir POSITIONAL — opencode scopes by project)
+  agy       agy --conversation <id>         (antigravity)
 
-This SPAWNS a process on the local machine. It's gated to: a known agent, a session id
-that matches a strict id pattern (no shell metacharacters), and a cwd read from the store
-(never from the client). The spawn is list-form (no shell) so nothing is interpolated.
+Spawn safety: known agent only, session id checked against a strict pattern (no shell
+metacharacters), cwd read from the store (never from the client), list-form spawn.
 """
 
 from __future__ import annotations

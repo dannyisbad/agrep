@@ -1,54 +1,19 @@
 """Affect GATE for tilt: per-message graded emotion scores -> data/emotions.jsonl.
 
-This is the cheap, always-on first pass that decides how each message "reads"
-emotionally and which messages are ambiguous enough to escalate. It uses a
-GoEmotions-label text-classification model (multi-label, 28 emotions + neutral).
+The cheap, always-on first pass. A GoEmotions multi-label classifier scores every
+message; per line we emit rage_raw (anger+annoyance+disapproval+disgust+disappointment),
+hype_raw (excitement+admiration+joy+approval+amusement), top-3 labels, and
+routed_to_judge. Scores are sigmoid probabilities summed per group, deliberately
+NOT clamped to [0,1] -- downstream math expects the raw sums.
 
-  PRIMARY  : alex-shvets/roberta-large-emopillars-contextless-goemotions
-  FALLBACKS: cirimus/modernbert-base-go-emotions, SamLowe/roberta-base-go_emotions
+Emo Pillars (arXiv:2504.16856) is the primary model because vanilla GoEmotions
+fine-tunes degrade badly out-of-domain, and dev-chat is far from Reddit.
 
-Why Emo Pillars first: models fine-tuned only on GoEmotions (Reddit comments)
-degrade badly out-of-domain -- a 2026 human-validation study measured a vanilla
-RoBERTa-GoEmotions at 33.6% F1 on real-world comments. Dev-chat is far out of
-that domain. Emo Pillars (arXiv:2504.16856) distills from LLM-generated diverse
-contexts specifically to survive domain shift, then this checkpoint maps back to
-the standard 28 GoEmotions labels -- so it slots into the same rage/hype
-groupings with no downstream change.
+routed_to_judge = profanity present AND the read is ambiguous (rage~hype, or both
+weak) -- "this is fucking brilliant" vs "this fucking sucks". Those rows get
+re-graded by judge.py (Ollama); vibe.py additionally judges any turn it cites.
 
-For each message we emit one line of data/emotions.jsonl:
-  {
-    "id": "<agent:session:turn>",
-    "rage_raw":  anger+annoyance+disapproval+disgust+disappointment,
-    "hype_raw":  excitement+admiration+joy+approval+amusement,
-    "top":       ["label", ...]   # top-3 emotion labels by score
-    "routed_to_judge": bool        # profanity present AND ambiguous
-  }
-
-Scores are the model's per-label sigmoid probabilities (graded, NOT argmax),
-summed within each group. They are intentionally NOT clamped to [0,1]; a hot
-message can score high on several rage labels at once, and downstream tilt math
-expects the raw sum.
-
-ROUTING: `routed_to_judge` marks messages the gate can't confidently read on
-its own, to be handed to the LLM judge. A message routes iff BOTH hold:
-  (a) profanity is present  -- swearing without clear affect is the classic
-      ambiguous case ("this is fucking brilliant" vs "this fucking sucks"); and
-  (b) the affect read is ambiguous -- rage and hype are close together, or both
-      are weak, so the gate can't tell rage from hype.
-Profanity can be supplied per-id by an upstream stage (see --profanity-ids) or
-recomputed here from a small built-in lexicon.
-
-================================ IMPORTANT ================================
-The LLM judge is the NEXT, SEPARATE stage. The plan is to feed the messages
-flagged with routed_to_judge=True to an LLM (Qwen3.5-4B) for a final graded
-affect verdict. That judge is NOT implemented in this file -- emotion.py only
-GATES and routes. Wiring up Qwen3.5-4B is later work.
-==========================================================================
-
-Usage:
-  python emotion.py
-  python emotion.py --smoke 16
-  python emotion.py --profanity-ids data/profanity.ids   # newline-delimited ids
+Usage: python emotion.py [--smoke 16] [--profanity-ids data/profanity.ids] [--full]
 """
 
 from __future__ import annotations
@@ -76,19 +41,10 @@ HYPE_LABELS = ("excitement", "admiration", "joy", "approval", "amusement")
 AMBIG_MARGIN = 0.15   # |rage_raw - hype_raw| <= this  => too close to call
 AMBIG_FLOOR = 0.30    # max(rage_raw, hype_raw) < this  => too weak to call
 
-# Minimal profanity lexicon used only when no upstream profanity set is given.
-# This is deliberately small (v0.5); the real signal is expected to come in via
-# --profanity-ids from tier-0.
-#
-# Two tiers, both case-insensitive:
-#   _PROFANITY_STEMS  match the stem at a left word boundary, allowing inflection
-#       suffixes on the right (\w*), so "fuck" hits "fucking"/"fucked"/"fucker".
-#       The left \b keeps "ass" out of "class"/"pass" since those have no
-#       boundary before the substring. Only stems that won't over-match in
-#       normal dev chat belong here.
-#   _PROFANITY_EXACT  whole-word matches only (\b...\b), for short/ambiguous
-#       tokens like "hell"/"damn" that would over-fire as prefixes
-#       ("hello", " damning praise" is rare enough to ignore at v0.5).
+# Small built-in profanity lexicon (--profanity-ids overrides). STEMS match at a
+# left word boundary with inflection suffixes allowed ("fuck" hits "fucking"; the
+# left \b keeps "ass" out of "class"). EXACT are whole-word only, for short tokens
+# like "hell"/"damn" that would over-fire as prefixes ("hello").
 _PROFANITY_STEMS = (
     "fuck", "shit", "bitch", "bastard", "dick", "bullshit", "goddamn", "asshole",
 )
@@ -309,8 +265,7 @@ def main() -> int:
         f"routed_to_judge={routed_count} | elapsed={elapsed:.2f}s | approx_vram={vram_str}"
     )
     common.log(f"wrote {common.EMOTIONS_PATH}")
-    common.log("note: messages with routed_to_judge=true go to the LLM judge "
-               "(Qwen3.5-4B) in a later, separate stage -- not run here.")
+    common.log("note: routed_to_judge=true rows get re-graded by judge.py (separate stage).")
     return 0
 
 

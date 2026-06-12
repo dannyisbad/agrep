@@ -1,10 +1,9 @@
-"""Vibe-trace: per-chat emotional arc + LLM-annotated turning points -> data/vibe/.
+"""Vibe-trace: per-chat emotional arc + verified markers + verdict -> data/vibe/.
 
-Reads per-message affect (emotions.jsonl) + messages.jsonl, builds each substantive
-session's valence/rage arc over its turns, ranks the juiciest chats (peak rage, widest
-swing, longest sustained-rage run), locates the turning points, and uses a small local
-LLM to write a dry one-line verdict + label what triggered each shift. The HTML renderer
-turns these JSONs into the vibe-trace.
+Builds each substantive session's valence/rage arc from emotions.jsonl, picks the
+markers (peak + frustration spikes), LLM-judges exactly those turns (the gate model
+over-scores mild dev chat, and the markers are the only per-turn claims the UI makes),
+and has a small local LLM write a dry one-line verdict for the top arcs.
 
 Run AFTER emotion.py. Usage: python vibe.py [--top 24] [--min-turns 8] [--turning 3]
 """
@@ -21,10 +20,6 @@ from collections import defaultdict
 import numpy as np
 
 import common
-
-# small local LLM for annotation. gemma 3n e4b is gated (needs HF auth) -> falls back to
-# the already-present Qwen2.5-3B if it can't load.
-LLM_CANDIDATES = ["google/gemma-3n-e4b-it", "Qwen/Qwen2.5-3B-Instruct"]
 
 
 def smooth(x: np.ndarray, w: int = 3) -> np.ndarray:
