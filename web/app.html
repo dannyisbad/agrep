@@ -1030,11 +1030,6 @@
             .turn.h .tt {
                 color: #ffd9cf;
             }
-            .turn .tg {
-                color: var(--faint);
-                font-size: 10.5px;
-                margin-top: 3px;
-            }
             .turn.q .tt {
                 color: var(--calm);
             }
@@ -3001,9 +2996,6 @@
             html[data-theme="kawaii"] .turn.q .tt {
                 color: #0f8a7c;
             }
-            html[data-theme="kawaii"] .turn .tg {
-                color: #b15c87;
-            }
             html[data-theme="kawaii"] .det .tag {
                 color: #b15c87;
             }
@@ -3012,9 +3004,6 @@
             }
             html[data-theme="web99"] .turn.q .tt {
                 color: #006000;
-            }
-            html[data-theme="web99"] .turn .tg {
-                color: #555;
             }
 
             /* ---------- model chip / reply / turning-points per theme ---------- */
@@ -4264,10 +4253,6 @@
                             "turn" +
                             (t.hot ? " h" : "") +
                             (i === cur ? " mfocus" : "");
-                        const tg = (t.top || [])
-                            .slice(0, 3)
-                            .filter((x) => x !== "neutral")
-                            .join(", ");
                         const mdl = t.model
                             ? ` · ${esc(prettyModel(t.model))}`
                             : "";
@@ -4290,7 +4275,7 @@
                             : "";
                         return `<div class="${cls}${t.recap ? " recap" : ""}" data-i="${i}">
       <div class="n">${t.turn}<i style="background:${t.rage > 0.05 ? col : "transparent"}"></i></div>
-      <div><div class="tt">${tag}${hl(t.text, HILITE)}</div>${tg ? `<div class="tg">${esc(tg)}</div>` : ""}${evb}${rtog}${rbox}</div>
+      <div><div class="tt">${tag}${hl(t.text, HILITE)}</div>${evb}${rtog}${rbox}</div>
     </div>`;
                     })
                     .join("");

@@ -76,6 +76,94 @@ def find_spikes(rage: np.ndarray, hype: np.ndarray, peak: int, k: int) -> list[i
     return sorted(picked)
 
 
+def arc_juice(rage: np.ndarray, val: np.ndarray) -> float:
+    return float(rage.max() * 2 + val.std() * 3 + (rage > 0.4).mean() * 2
+                 + longest_run(rage > 0.4) / max(len(rage), 1))
+
+
+# Compaction recaps are machine text quoting the user; they carry no live affect.
+_RECAP_PREFIX = "This session is being continued from a previous conversation"
+
+
+def verify_markers(top: list[dict], emo: dict[str, dict], k: int) -> None:
+    """LLM-judge the turns each top arc will cite (peak + spikes) and rebuild the
+    arc's markers from the corrected numbers.
+
+    Correcting a marker can move the peak / promote the next-loudest turn, so this
+    iterates: judge the current candidate set, recompute, repeat until the set is
+    stable (or 3 rounds). Judged rows are written back to emotions.jsonl exactly like
+    judge.py does (gate values preserved, judged=true), so reruns cost nothing and
+    every downstream reader sees the corrected read."""
+    try:
+        from judge import ask_judge
+        from summarize import pick_model
+        model = pick_model()
+    except Exception:  # noqa: BLE001 -- no ollama: markers keep the gate's read
+        common.log("vibe: judge model unavailable -- markers stay gate-scored.")
+        return
+    def flush() -> None:
+        tmp = common.EMOTIONS_PATH.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            for row in emo.values():
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        tmp.replace(common.EMOTIONS_PATH)
+
+    t0 = time.perf_counter()
+    judged = failed = unflushed = 0
+    for a in top:
+        ids, texts = a["_ids"], a["_texts"]
+        rage = np.array(a["rage"], dtype=float)
+        val = np.array(a["valence"], dtype=float)
+        attempted: set[int] = set()  # judge failures keep gate values but don't re-loop
+        for _ in range(3):
+            hype = val + rage
+            peak = int(rage.argmax())
+            tps = find_spikes(rage, hype, peak, k)
+            cand = [t for t in {peak, *tps}
+                    if t not in attempted and not emo.get(ids[t], {}).get("judged")]
+            if not cand:
+                break
+            for t in cand:
+                attempted.add(t)
+                row = emo.get(ids[t])
+                if row is None:
+                    continue
+                if texts[t].startswith(_RECAP_PREFIX):
+                    r_j, h_j = 0.0, 0.0  # machine text: no developer affect
+                else:
+                    v = ask_judge(model, texts[t])
+                    if v is None:
+                        failed += 1
+                        continue
+                    r_j, h_j = v
+                row["rage_gate"], row["hype_gate"] = row["rage_raw"], row["hype_raw"]
+                # same ×1.5 rescale as judge.py: judge grades 0..1, gate sums run ~0..2.5
+                row["rage_raw"], row["hype_raw"] = round(r_j * 1.5, 6), round(h_j * 1.5, 6)
+                row["judged"] = True
+                rage[t] = r_j * 1.5
+                val[t] = (h_j - r_j) * 1.5
+                judged += 1
+                unflushed += 1
+                if judged % 25 == 0:
+                    common.log(f"  ... {judged} marker turns judged "
+                               f"({judged / (time.perf_counter() - t0):.2f}/s)")
+                if unflushed >= 50:  # checkpoint: an interrupt loses <=50 verdicts, not all
+                    flush()
+                    unflushed = 0
+        hype = val + rage
+        a["peak_turn"] = int(rage.argmax())
+        a["turning_points"] = find_spikes(rage, hype, a["peak_turn"], k)
+        a["rage"] = [round(float(r), 4) for r in rage]
+        a["valence"] = [round(float(v), 4) for v in val]
+        a["swing"] = round(float(val.std()), 4)
+        a["drift"] = round(float(val[-3:].mean() - val[:3].mean()), 4)
+        a["juice"] = round(arc_juice(rage, val), 4)
+    if unflushed:
+        flush()
+    common.log(f"vibe: marker verification -- {judged} turns judged, {failed} judge "
+               f"failures, {time.perf_counter() - t0:.0f}s")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="build vibe-trace arcs")
     ap.add_argument("--top", type=int, default=24)
@@ -131,8 +219,6 @@ def main() -> int:
         hype = np.array([v + r for v, r in zip(val, rage)])  # hype = valence + rage
         peak_turn = int(rage.argmax())
         tps = find_spikes(rage, hype, peak_turn, args.turning)
-        juice = float(rage.max() * 2 + val.std() * 3 + (rage > 0.4).mean() * 2
-                      + longest_run(rage > 0.4) / max(len(rage), 1))
         arcs.append({
             "session": s, "agent": meta[s][0], "project": meta[s][1],
             "n_turns": len(val),
@@ -141,23 +227,39 @@ def main() -> int:
             "peak_turn": peak_turn,
             "swing": round(float(val.std()), 4),
             "drift": round(float(val[-3:].mean() - val[:3].mean()), 4),
-            "juice": round(juice, 4),
+            "juice": round(arc_juice(rage, val), 4),
             "turning_points": tps,
             "_texts": texts,
+            "_ids": ids,
         })
 
     arcs.sort(key=lambda a: a["juice"], reverse=True)
     top = arcs[: args.top]
+    top_set = {a["session"] for a in top}
 
-    # ---- automatic staleness: an arc's identity is its affect numbers. If the arc on
-    # disk was built from the SAME valence/rage series, its verdict/labels still apply
-    # and the LLM is skipped; if emotions.jsonl changed under it (new gate model, judge
-    # verdicts, new turns), the sig differs and that session re-annotates. So a plain
-    # reindex self-heals after any affect change -- no manual "vibe rebuild" step.
+    # Every arc file in data/vibe/ is served on its chat page regardless of today's top
+    # list, so a stale file keeps showing unverified markers forever. Refresh any on-disk
+    # arc that still qualifies this run: numbers + markers heal, the verdict is kept.
     vdir = common.DATA_DIR / "vibe"
     vdir.mkdir(exist_ok=True)
+    have = {p.stem for p in vdir.glob("*.json")} - {"index"}
+    refresh = [a for a in arcs[args.top:] if a["session"] in have]
+    keep = top + refresh
+
+    # The markers (peak + spikes) are the only per-turn affect claims the UI makes, and
+    # the gate model over-scores mild dev chat ("not able to bc of remote debugging flag"
+    # read as 0.88 rage). Verify exactly those turns with the LLM judge before publishing
+    # them; corrections persist to emotions.jsonl, so each turn is judged at most once.
+    if not args.no_llm:
+        verify_markers(keep, emo, args.turning)
+
+    # ---- automatic staleness: an arc's identity is its affect numbers. If a TOP arc on
+    # disk was built from the SAME valence/rage series, its verdict still applies and the
+    # LLM is skipped; if emotions.jsonl changed under it (new gate model, judge verdicts,
+    # new turns), the sig differs and that session re-annotates. Refresh-only arcs always
+    # keep their old verdict -- the verdict is impressionistic, the numbers are the claim.
     todo = []
-    for a in top:
+    for a in keep:
         a["sig"] = hashlib.md5(json.dumps([a["valence"], a["rage"]]).encode()).hexdigest()
         old = None
         p = vdir / f"{a['session']}.json"
@@ -166,30 +268,31 @@ def main() -> int:
                 old = json.loads(p.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 old = None
-        if old and old.get("sig") == a["sig"] and old.get("verdict"):
+        if old and old.get("verdict") and (old.get("sig") == a["sig"]
+                                           or a["session"] not in top_set):
             a["verdict"] = old["verdict"]
-        else:
+        elif a["session"] in top_set:
             todo.append(a)
-    common.log(f"{len(arcs)} arcs (>= {args.min_turns} turns); top {len(top)} kept; "
-               f"{len(todo)} stale/new need annotation ({len(top) - len(todo)} carried over)")
+    common.log(f"{len(arcs)} arcs (>= {args.min_turns} turns); top {len(top)} + "
+               f"{len(refresh)} refreshed; {len(todo)} need annotation")
 
     if not args.no_llm and todo:
         annotate(todo)
 
-    # write per-session arcs + an index
-    vdir = common.DATA_DIR / "vibe"
-    vdir.mkdir(exist_ok=True)
+    # write per-session arcs + an index (index = today's top only)
     index = []
-    for a in top:
+    for a in keep:
         texts = a.pop("_texts")
+        a.pop("_ids", None)
         # attach short per-turn snippets for the renderer tooltips
         a["snippets"] = [" ".join(t.split())[:140] for t in texts]
         (vdir / f"{a['session']}.json").write_text(json.dumps(a), encoding="utf-8")
-        index.append({k: a[k] for k in ("session", "agent", "project", "n_turns",
-                                        "peak_turn", "swing", "drift", "juice",
-                                        "verdict") if k in a})
+        if a["session"] in top_set:
+            index.append({k: a[k] for k in ("session", "agent", "project", "n_turns",
+                                            "peak_turn", "swing", "drift", "juice",
+                                            "verdict") if k in a})
     (vdir / "index.json").write_text(json.dumps(index, indent=1), encoding="utf-8")
-    print(f"\n  wrote {len(top)} vibe-traces -> {vdir}")
+    print(f"\n  wrote {len(keep)} vibe-traces ({len(top)} top + {len(refresh)} refreshed) -> {vdir}")
     for a in top[:10]:
         v = a.get("verdict", "")
         print(f"  juice {a['juice']:>5.2f}  {a['agent']}/{a['project'][:18]:<18}  {a['n_turns']:>3}t  {v[:70]}")

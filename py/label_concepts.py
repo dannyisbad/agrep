@@ -8,6 +8,7 @@ name from its keywords + sample chat summaries. Run after concepts.py + summariz
 from __future__ import annotations
 
 import json
+import re
 import urllib.request
 from collections import Counter, defaultdict
 
@@ -31,12 +32,15 @@ def gen(model, body):
     payload = {"model": model, "stream": False,
                "messages": [
                    {"role": "system", "content": "You name a cluster of a developer's coding chats. "
-                    "Reply with ONLY a 2 to 4 word Title Case label (a noun phrase). Name the SPECIFIC "
-                    "project, driver, tool, or subject (use the proper nouns in the keywords/folders: "
-                    "e.g. 'EFI Audit Pipeline', 'AMD Ryzen Driver', 'iMessage Automation'). AVOID generic "
-                    "filler words like Structural, Verification, System, Analysis, Workflow, Development, "
-                    "Configuration unless nothing more specific exists. No profanity, no persona names "
-                    "(jordan/marcus/kerry/candence), no quotes, no punctuation."},
+                    "Reply with ONLY a 2 to 4 word Title Case label (a noun phrase). The name must fit "
+                    "EVERY sample chat, not just one. If the folder line says one project dominates, use "
+                    "that project's proper noun (e.g. 'EFI Audit Pipeline', 'AMD Ryzen Driver'). If the "
+                    "chats span many different targets, name the shared ACTIVITY instead (e.g. 'Kernel "
+                    "Driver IDA Audits') -- NEVER promote one chat's filename or folder to the cluster "
+                    "name. AVOID generic filler words like Structural, Verification, System, Analysis, "
+                    "Workflow, Development, Configuration unless nothing more specific exists. No "
+                    "profanity, no persona names (jordan/marcus/kerry/candence), no quotes, no "
+                    "punctuation."},
                    {"role": "user", "content": body}],
                "options": {"num_ctx": 4096, "temperature": 0.2}}
     req = urllib.request.Request(OLLAMA, data=json.dumps(payload).encode(),
@@ -62,7 +66,7 @@ def main(top_n: int = 80) -> int:
         for line in sc.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 o = json.loads(line)
-                members[o["concept_id"]].append(o["session"])
+                members[o["concept_id"]].append(o)
 
     order = sorted(range(len(concepts)), key=lambda i: concepts[i].get("n_messages", 0), reverse=True)
     common.log(f"naming top {min(top_n, len(order))} concepts with {model}")
@@ -70,8 +74,22 @@ def main(top_n: int = 80) -> int:
     for i in order[:top_n]:
         c = concepts[i]
         terms = ", ".join(c.get("terms", [])[:8])
-        folders = ", ".join(list(c.get("cwd_buckets", {}).keys())[:4])
-        sums = [summ[s] for s in members.get(c["concept_id"], []) if summ.get(s)][:7]
+        mem = members.get(c["concept_id"], [])
+        # sample summaries ACROSS the cluster, not the first N -- a run of same-target
+        # chats at the front made a 20-target cluster look like one project
+        sums_all = [summ[m["session"]] for m in mem if summ.get(m["session"])]
+        step = max(1, len(sums_all) // 7)
+        sums = sums_all[::step][:7]
+        # tell the namer, deterministically, whether one project owns this cluster
+        projs = Counter(m.get("cwd_project", "") for m in mem if m.get("cwd_project"))
+        total = max(1, sum(projs.values()))
+        top_proj, top_cnt = projs.most_common(1)[0] if projs else ("", 0)
+        if projs and top_cnt / total >= 0.6:
+            folders = (f"one project dominates: '{top_proj}' "
+                       f"({top_cnt} of {total} chats) -- name that project")
+        else:
+            folders = (f"{len(projs)} distinct folders ({', '.join(list(projs)[:5])}) -- "
+                       "no shared project; name the common activity, not any one folder")
         body = ("keywords: " + terms + "\nfolders: " + folders + "\nsample chats:\n"
                 + "\n".join("- " + s[:200] for s in sums))
         try:
@@ -94,20 +112,47 @@ def main(top_n: int = 80) -> int:
     return 0
 
 
-def merge_duplicate_names(concepts: list[dict]) -> list[dict]:
-    """Collapse topics that the namer couldn't tell apart: if two clusters got the same
-    Title Case name, they're one topic to a human — merge them and remap session_concepts.
-    """
-    def key(c):
-        return (c.get("name") or c.get("label") or "").strip().lower()
+def _name_tokens(c: dict) -> frozenset[str]:
+    raw = (c.get("name") or c.get("label") or "").lower()
+    toks = re.findall(r"[a-z0-9]+", raw)
+    stop = {"the", "a", "an", "of", "and", "for"}
+    return frozenset(t[:-1] if len(t) > 3 and t.endswith("s") else t
+                     for t in toks if t not in stop)
 
-    groups: dict[str, list[dict]] = defaultdict(list)
-    for c in concepts:
-        groups[key(c)].append(c)
+
+def merge_duplicate_names(concepts: list[dict]) -> list[dict]:
+    """Collapse topics that the namer couldn't tell apart. Exact-name matching missed the
+    real failure mode: near-duplicates ('Kernel Driver Structural Audits' / 'Kernel Driver
+    IDA Audits', 'AI Agent Interaction' vs 'Interactions') that are one topic to a human.
+    Merge clusters whose stemmed name-token sets overlap by Jaccard >= 0.5 or subset
+    (union-find, so chains collapse), then remap session_concepts.
+    """
+    n = len(concepts)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    toks = [_name_tokens(c) for c in concepts]
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = toks[i], toks[j]
+            if not a or not b:
+                continue
+            inter = len(a & b)
+            if inter / len(a | b) >= 0.5 or inter == min(len(a), len(b)):
+                parent[find(i)] = find(j)
+
+    groups_by_root: dict[int, list[dict]] = defaultdict(list)
+    for i, c in enumerate(concepts):
+        groups_by_root[find(i)].append(c)
 
     remap: dict[int, int] = {}
     merged: list[dict] = []
-    for grp in groups.values():
+    for grp in groups_by_root.values():
         keeper = max(grp, key=lambda r: r.get("n_sessions", 0))
         kid = keeper["concept_id"]
         agents, cwds, terms = Counter(), Counter(), []
