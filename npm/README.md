@@ -10,7 +10,7 @@ and the shim runs it through [uv](https://docs.astral.sh/uv/) (or pipx). uv mana
 python itself, so this works even on a machine with no python installed.
 
 ```
-npm i -g agrep
+npm i -g agrep-cli
 agrep "race condition"     # first run indexes your agent stores, then greps
 ```
 
