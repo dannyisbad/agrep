@@ -4,6 +4,8 @@ pub mod claude;
 pub mod codex;
 pub mod opencode;
 pub mod antigravity;
+pub mod kimi;
+pub mod cline;
 
 use std::path::PathBuf;
 

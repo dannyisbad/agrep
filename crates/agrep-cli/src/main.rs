@@ -29,7 +29,7 @@ enum Cmd {
     /// Ingest transcripts and write data/messages.jsonl + data/replies.jsonl (the input the
     /// Python sidecar embeds/scores/clusters from).
     Index {
-        /// Which agent to ingest: claude | codex | opencode | antigravity | all.
+        /// Which agent to ingest: claude | codex | opencode | antigravity | kimi | cline | all.
         #[arg(long, default_value = "all")]
         agent: String,
         /// Ignore the per-file parse cache and re-parse every source file from scratch.
@@ -55,24 +55,39 @@ fn ingest_agent(agent: &str, cache: &mut IngestCache) -> anyhow::Result<(Vec<Mes
         "codex" => ingest::codex::collect(cache),
         "opencode" => ingest::opencode::collect(cache),
         "antigravity" => ingest::antigravity::collect(),
+        "kimi" => ingest::kimi::collect(),
+        "cline" => ingest::cline::collect(),
         "all" => {
-            let ((m4, e4), (mut m, mut e)) = rayon::join(ingest::antigravity::collect, || {
-                let (mut m, mut e) = ingest::claude::collect(cache);
-                let (m2, e2) = ingest::codex::collect(cache);
-                m.extend(m2);
-                e.extend(e2);
-                let (m3, e3) = ingest::opencode::collect(cache);
-                m.extend(m3);
-                e.extend(e3);
-                (m, e)
-            });
-            m.extend(m4);
-            e.extend(e4);
+            // the cacheless adapters (small stores, full-parse) overlap the cache-driven chain
+            let ((mut m4, mut e4), (mut m, mut e)) = rayon::join(
+                || {
+                    let (mut m, mut e) = ingest::antigravity::collect();
+                    let (m5, e5) = ingest::kimi::collect();
+                    m.extend(m5);
+                    e.extend(e5);
+                    let (m6, e6) = ingest::cline::collect();
+                    m.extend(m6);
+                    e.extend(e6);
+                    (m, e)
+                },
+                || {
+                    let (mut m, mut e) = ingest::claude::collect(cache);
+                    let (m2, e2) = ingest::codex::collect(cache);
+                    m.extend(m2);
+                    e.extend(e2);
+                    let (m3, e3) = ingest::opencode::collect(cache);
+                    m.extend(m3);
+                    e.extend(e3);
+                    (m, e)
+                },
+            );
+            m.append(&mut m4);
+            e.append(&mut e4);
             (m, e)
         }
         other => {
             anyhow::bail!(
-                "unknown agent `{other}` (have: claude, codex, opencode, antigravity, all)"
+                "unknown agent `{other}` (have: claude, codex, opencode, antigravity, kimi, cline, all)"
             );
         }
     };
@@ -139,7 +154,7 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let keep: std::collections::HashSet<String> =
         msgs.iter().map(|m| cache::event_fname(m.agent, &m.session)).collect();
     let run_agents: Vec<&str> = match agent {
-        "all" => vec!["claude", "codex", "opencode", "antigravity"],
+        "all" => vec!["claude", "codex", "opencode", "antigravity", "kimi", "cline"],
         one => vec![one],
     };
     let edir = data_dir().join("events");

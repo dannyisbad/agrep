@@ -295,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="print only the match count (like grep -c)")
     ap.add_argument("--flat", action="store_true",
                     help="one tab-separated row per hit (the default when piped)")
-    ap.add_argument("--agent", help="only this agent (claude/codex/opencode/antigravity)")
+    ap.add_argument("--agent", help="only this agent (claude/codex/opencode/antigravity/kimi/cline)")
     ap.add_argument("--project", help="only chats whose project path contains this")
     ap.add_argument("--who", choices=("user", "agent"), help="only your turns or only the agent's")
     ap.add_argument("-s", "--semantic", action="store_true",

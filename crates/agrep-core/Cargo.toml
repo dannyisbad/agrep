@@ -15,3 +15,6 @@ chrono = { workspace = true }
 # bundled => compiles SQLite from C source (needs cl.exe under the MSVC toolchain on Windows).
 # Used by the opencode sqlite adapter (per-build chat stores live in *.db files).
 rusqlite = { version = "0.32", features = ["bundled"] }
+# kimi-cli keys its per-workdir session dirs by md5(workdir path); ~/.kimi/kimi.json holds
+# the real paths, so we hash each registered path to find its sessions dir.
+md5 = "0.7"

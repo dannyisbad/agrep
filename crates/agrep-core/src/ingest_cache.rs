@@ -62,6 +62,8 @@ fn intern_agent(s: &str) -> &'static str {
         "codex" => "codex",
         "opencode" => "opencode",
         "antigravity" => "antigravity",
+        "kimi" => "kimi",
+        "cline" => "cline",
         "gemini" => "gemini",
         _ => "unknown",
     }

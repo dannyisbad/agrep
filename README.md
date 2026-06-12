@@ -1,9 +1,9 @@
 # agrep
 
 Every AI coding agent you run writes its full history to disk — Claude Code, Codex,
-opencode, Antigravity. agrep reads those stores directly and makes your entire
-cross-agent history greppable from the shell, with a local web explorer (**tilt**) on
-top for browsing, organizing, and live-watching everything.
+opencode, Antigravity, Kimi CLI, Cline. agrep reads those stores directly and makes
+your entire cross-agent history greppable from the shell, with a local web explorer
+(**tilt**) on top for browsing, organizing, and live-watching everything.
 
 No hooks, no agent-side install, no telemetry. agrep never modifies the agents or
 their data — it only reads. Everything stays on your machine.
@@ -70,12 +70,14 @@ ever set up (`--no-auto` opts out for strict scripts).
 
 `agrep ui` opens the human surface — a single local web app over the same index:
 
-- **One searchable history** across all four agents. Keyword search is exact and
+- **One searchable history** across every supported agent. Keyword search is exact and
   instant; semantic search and topic clustering light up with the optional model tier.
 - **A live board** of every running session — across all agents at once — with real
   state (thinking, which tool is running, queued prompts, errors, durations) read
   straight from the stores. No hooks: it sees sessions you started in any terminal,
   and the subagents they spawn. Images an agent reads or sends render inline.
+  (Live tailing and native resume cover claude/codex/opencode/antigravity today;
+  kimi and cline are search/browse-only so far.)
 - **Per-chat detail**: the full transcript with the tool/subagent event tree, and a
   one-click "resume this session in its own CLI".
 - **Native resume**: jump back into any past session in its own agent, cd'd to the
@@ -110,6 +112,8 @@ agrep discovers sessions under your home directory. Read-only, always:
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
 | opencode | `~/.local/share/opencode/*.db` (SQLite) |
 | Antigravity | `~/.gemini/antigravity-cli/brain/<uuid>/` |
+| Kimi CLI | `~/.kimi/sessions/<workdir-hash>/<uuid>/` |
+| Cline | each editor's `globalStorage/saoudrizwan.claude-dev/tasks/`, plus `~/.cline/data/` |
 
 Whichever of these exist get indexed; missing ones are skipped. Works on Windows,
 macOS, and Linux.

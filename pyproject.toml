@@ -5,11 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "agrep"
 dynamic = ["version"]
-description = "Search, browse, and watch your cross-agent coding chat history (Claude, Codex, opencode, Antigravity) in one place."
+description = "Search, browse, and watch your cross-agent coding chat history (Claude, Codex, opencode, Antigravity, Kimi, Cline) in one place."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-keywords = ["claude", "codex", "opencode", "agent", "chat", "history", "semantic-search", "cli"]
+keywords = ["claude", "codex", "opencode", "kimi", "cline", "agent", "chat", "history", "semantic-search", "cli"]
 authors = [{ name = "mundy" }]
 classifiers = [
     "Environment :: Console",

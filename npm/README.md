@@ -1,7 +1,7 @@
 # agrep
 
-grep your AI coding agents' chat history — Claude Code, Codex, opencode, Antigravity —
-straight from the shell. One searchable cross-agent history, a context-window command
+grep your AI coding agents' chat history — Claude Code, Codex, opencode, Antigravity,
+Kimi CLI, Cline — straight from the shell. One searchable cross-agent history, a context-window command
 (`agrep around`) built for agents and humans, native session resume, and a local web
 explorer (`agrep ui`).
 
