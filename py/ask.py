@@ -68,6 +68,25 @@ def _reranker():
     return _RR["model"]
 
 
+def models_loaded() -> bool:
+    return _EMB["model"] is not None or _RR["model"] is not None
+
+
+def release_models() -> None:
+    """Drop the embedder/reranker so a long-idle server stops holding gigabytes of
+    torch commit. The next semantic query rebuilds them (one slower query)."""
+    _EMB["model"], _EMB["id"] = None, None
+    _RR["model"] = None
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 -- cpu-only installs have nothing to release
+        pass
+
+
 def tool_search_chats(query: str, k: int = 5) -> str:
     qv = _embed_query(query)
     dim = int((common.DATA_DIR / "summary_emb.meta").read_text().strip())

@@ -53,11 +53,18 @@ import setupjobs
 # Imported lazily so the explorer works on a fresh clone with NOTHING but stdlib:
 # browse, keyword search, chat detail, events, live view and native resume all run
 # before any ML dependency is installed. Semantic search lights up when it loads.
-_ASK = {"mod": None, "err": None}
+_ASK = {"mod": None, "err": None, "loading": False}
+# wall time of the last semantic query (or model load). The idle reaper unloads the
+# models after SEM_IDLE_S without one: a long-lived background server shouldn't hold
+# gigabytes of torch commit for a feature used in bursts. The next query reloads.
+_SEM_USED = 0.0
+SEM_IDLE_S = 15 * 60
 
 
 def _ask_mod():
+    global _SEM_USED
     if _ASK["mod"] is None and _ASK["err"] is None:
+        _ASK["loading"] = True
         try:
             import ask as _a  # noqa: PLC0415
             _ASK["mod"] = _a
@@ -65,7 +72,37 @@ def _ask_mod():
             _ASK["err"] = f"{type(e).__name__}: {e}"
             common.log(f"semantic stack unavailable ({_ASK['err']}); "
                        "keyword search still works.")
+        finally:
+            _ASK["loading"] = False
+    if _ASK["mod"] is not None:
+        _SEM_USED = time.time()
     return _ASK["mod"]
+
+
+def _sem_deps_present() -> bool:
+    """Are the smart-tier deps importable, WITHOUT importing them (that's gigabytes)?
+    Used by /status so a lazy, not-yet-loaded stack still reports as available."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except Exception:  # noqa: BLE001 -- a broken venv reads as absent
+        return False
+
+
+def _sem_reaper() -> None:
+    """Unload the embedder/reranker after SEM_IDLE_S without a semantic query."""
+    while True:
+        time.sleep(60)
+        mod = _ASK["mod"]
+        if mod is None or not _SEM_USED:
+            continue
+        try:
+            if mod.models_loaded() and time.time() - _SEM_USED > SEM_IDLE_S:
+                mod.release_models()
+                common.log("semantic models idle; released "
+                           "(next semantic search reloads them)")
+        except Exception as e:  # noqa: BLE001 -- the reaper must never kill the server
+            common.log(f"semantic idle-release failed: {e}")
 
 def _status() -> dict:
     """One honest health blob: how old the index is, what coverage each optional tier
@@ -93,9 +130,11 @@ def _status() -> dict:
             "emotions": (common.DATA_DIR / "emotions.jsonl").exists(),
             "embeddings": (common.DATA_DIR / "embeddings.f32").exists(),
         },
-        # semantic: "ready" once warmed, "off" when deps absent, "loading" in between
+        # semantic: "ready" when the stack is loaded OR importable (it lazy-loads on
+        # the first semantic query), "loading" only mid-import, "off" when deps absent
         "semantic": ("off" if _ASK["err"] else
-                     "ready" if _ASK["mod"] else "loading"),
+                     "loading" if _ASK["loading"] else
+                     "ready" if (_ASK["mod"] or _sem_deps_present()) else "off"),
         # the auto-indexer: phase (idle/indexing/error), last run, whether it can run
         "indexer": idx.status() if idx else {"phase": "off", "available": False},
         "watcher": {"loops": w._n_loops, "tracked": len(w._offsets),
@@ -222,11 +261,13 @@ class Handler(BaseHTTPRequestHandler):
                         payload["note"] = "semantic search unavailable; showing exact matches"
                     self._send(200, json.dumps(payload))
                 else:
+                    global _SEM_USED
                     if level == "message":
                         results = json.loads(ask.tool_search_messages(query, k=k))
                     else:
                         level = "chat"
                         results = json.loads(ask.tool_search_chats(query, k=k))
+                    _SEM_USED = time.time()  # the idle reaper counts from the last query
                     self._send(200, json.dumps({"query": query, "mode": "semantic", "level": level, "results": results}))
             except Exception as e:  # noqa: BLE001
                 self._send(500, json.dumps({"error": str(e), "query": query}))
@@ -384,18 +425,49 @@ def _restart_self() -> None:
     os._exit(0)
 
 
+def _reap_superseded() -> None:
+    """If a previous agrep server is still alive (its terminal died, it didn't),
+    retire it: two servers means double the caches and double any loaded models.
+    The portfile carries its pid; only kill after its /status answers like ours."""
+    portfile = common.DATA_DIR / ".server"
+    try:
+        info = json.loads(portfile.read_text(encoding="utf-8"))
+        port, pid = int(info["port"]), int(info["pid"])
+    except (OSError, ValueError, KeyError):
+        return
+    if pid == os.getpid():
+        return
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=2) as r:
+            if "semantic" not in json.loads(r.read().decode("utf-8", "replace")):
+                return  # something else owns that port now; leave it alone
+    except Exception:  # noqa: BLE001 -- nothing listening: stale file, nothing to reap
+        return
+    try:
+        os.kill(pid, 15)
+        common.log(f"retired previous server (pid {pid}, port {port})")
+    except OSError:
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8732)
-    ap.add_argument("--no-warm", action="store_true", help="skip pre-warming models (dashboard-only)")
+    ap.add_argument("--warm", action="store_true",
+                    help="pre-load the semantic models at startup (default: lazy on first semantic search)")
+    ap.add_argument("--no-warm", action="store_true", help=argparse.SUPPRESS)  # pre-lazy-default flag, kept harmless
     ap.add_argument("--no-autoindex", action="store_true",
                     help="don't auto-rebuild the index on new activity (reindex by hand)")
     args = ap.parse_args()
+    _reap_superseded()
 
     # All warming happens BEHIND the bound port: the rail reads only the small
     # materialized files, so the browser gets its directory immediately while the
-    # 50 MB read tables (and the GPU models) load in the background. An endpoint
-    # hit before its cache is warm just lazy-loads it -- same code path, one wait.
+    # read tables load in the background. The semantic models are NOT loaded here by
+    # default -- they're gigabytes of commit for a burst-used feature, so they load
+    # on the first semantic query and the idle reaper releases them after SEM_IDLE_S.
+    # --warm restores eager loading for setups where the first-query wait matters.
     def _warm():
         try:
             common.log("warming read caches (messages / affect / replies) ...")
@@ -403,7 +475,7 @@ def main() -> int:
             common.log("read caches warm.")
         except Exception as e:  # noqa: BLE001
             common.log(f"read-cache warm failed (endpoints lazy-load): {e}")
-        if not args.no_warm:
+        if args.warm:
             common.log("warming embedder + reranker ...")
             try:
                 ask = _ask_mod()
@@ -416,6 +488,7 @@ def main() -> int:
                 common.log(f"warm failed (semantic lazy/disabled, rest works): {e}")
 
     threading.Thread(target=_warm, daemon=True, name="tilt-warm").start()
+    threading.Thread(target=_sem_reaper, daemon=True, name="tilt-sem-reaper").start()
     w = live.watcher()  # start tailing the agent stores (passive, hook-free)
     if not args.no_autoindex:
         indexer.start(w)  # keep the materialized index current as agents work
