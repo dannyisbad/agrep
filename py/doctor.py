@@ -22,7 +22,7 @@ import common
 ROOT = common.REPO_ROOT
 WIN = sys.platform == "win32"
 VENV_PY = common.VENV_PY
-TILT_RS = common.tilt_rs_bin()
+TILT_RS = common.ingest_bin()
 HOME = Path.home()
 
 OK, MISS, OPT = "ok", "MISSING", "--"
@@ -108,7 +108,7 @@ def report() -> dict:
     try:
         bin_disp = str(TILT_RS.relative_to(ROOT))  # dev: target/release/...
     except ValueError:
-        bin_disp = str(TILT_RS)                     # bundled / $TILT_RS_BIN: outside the tree
+        bin_disp = str(TILT_RS)                     # bundled / $AGREP_RS_BIN: outside the tree
     _row("ingest binary", OK if has_bin else MISS,
          bin_disp if has_bin else f"not built — `{CLI} index` compiles it")
     if not has_bin and has_cargo:

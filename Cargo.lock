@@ -3,6 +3,30 @@
 version = 4
 
 [[package]]
+name = "agrep-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "memchr",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agrep-ingest"
+version = "0.1.0"
+dependencies = [
+ "agrep-core",
+ "anyhow",
+ "clap",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -528,30 +552,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tilt"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde_json",
- "tilt-core",
-]
-
-[[package]]
-name = "tilt-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "chrono",
- "memchr",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
 ]
 
 [[package]]

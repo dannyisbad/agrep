@@ -2,7 +2,7 @@
 
 This directory is the Python side of tilt: it turns the developer-chat messages
 that `tilt scan` produces into (a) semantic embeddings for similarity search and
-(b) a graded affect read per message. The Rust core (`crates/tilt-core`) reads
+(b) a graded affect read per message. The Rust core (`crates/agrep-core`) reads
 the files written here.
 
 A venv is expected at `py/.venv` (see the repo-root `requirements.txt`). Use its

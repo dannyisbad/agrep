@@ -1,11 +1,11 @@
-"""Shared helpers for the tilt semantic sidecar.
+"""Shared helpers for the agrep python side.
 
 This module is the Python side of the EMBEDDING CONTRACT that the Rust reader
-(crates/tilt-core) and these scripts must agree on EXACTLY:
+(crates/agrep-core) and these scripts must agree on EXACTLY:
 
   data/messages.jsonl  one JSON object per line:
                          {id, agent, project, session, ts, turn, text}
-                       id == "agent:session:turn". Produced by `tilt scan`.
+                       id == "agent:session:turn". Produced by the ingest binary.
 
   data/embeddings.f32  raw little-endian float32, row-major, N rows x D cols.
                        Each ROW is L2-normalized. D == 256 (Matryoshka
@@ -64,9 +64,10 @@ def _user_data_dir() -> Path:
     return Path(base) / "agrep"
 
 
-# $TILT_DATA_DIR wins (lets the wheel launcher point anywhere, and lets a dev
-# override too); else <repo>/data in a checkout; else the per-user dir.
-_env_data = os.environ.get("TILT_DATA_DIR")
+# $AGREP_DATA_DIR wins (lets the wheel launcher point anywhere, and lets a dev
+# override too); else <repo>/data in a checkout; else the per-user dir. The TILT_*
+# spellings predate the agrep rename and stay honored so old shims keep working.
+_env_data = os.environ.get("AGREP_DATA_DIR") or os.environ.get("TILT_DATA_DIR")
 if _env_data:
     DATA_DIR = Path(_env_data).expanduser()
 elif _is_dev_checkout():
@@ -80,8 +81,9 @@ def _venv_dir() -> Path:
     """Where the smart-tier venv lives. Dev: <repo>/py/.venv (Danny's already has
     torch). Installed: under the user data dir, because the package dir is read-only
     site-packages and the in-app 'install smart tier' button writes a venv there."""
-    if os.environ.get("TILT_VENV_DIR"):
-        return Path(os.environ["TILT_VENV_DIR"]).expanduser()
+    env = os.environ.get("AGREP_VENV_DIR") or os.environ.get("TILT_VENV_DIR")
+    if env:
+        return Path(env).expanduser()
     if _is_dev_checkout():
         return REPO_ROOT / "py" / ".venv"
     return DATA_DIR / ".venv"
@@ -98,15 +100,16 @@ def venv_python() -> str:
     return str(VENV_PY) if VENV_PY.exists() else sys.executable
 
 
-def tilt_rs_bin() -> Path:
-    """Path to the Rust ingest binary, in resolution order:
-      1. $TILT_RS_BIN            (the wheel launcher sets this to the bundled copy)
-      2. <package>/_bin/tilt-rs  (binary shipped inside an installed wheel)
-      3. <repo>/target/release/  (a dev cargo build)
+def ingest_bin() -> Path:
+    """Path to the Rust ingest binary (agrep-rs), in resolution order:
+      1. $AGREP_RS_BIN            (the wheel launcher sets this to the bundled copy;
+                                   the pre-rename $TILT_RS_BIN spelling still works)
+      2. <package>/_bin/agrep-rs  (binary shipped inside an installed wheel)
+      3. <repo>/target/release/   (a dev cargo build)
     The path may not exist yet (a dev checkout before `cargo build`); callers that
     require it already check .exists() and fall back to building."""
-    exe = "tilt-rs.exe" if WIN else "tilt-rs"
-    env = os.environ.get("TILT_RS_BIN")
+    exe = "agrep-rs.exe" if WIN else "agrep-rs"
+    env = os.environ.get("AGREP_RS_BIN") or os.environ.get("TILT_RS_BIN")
     if env:
         return Path(env)
     bundled = PY_DIR.parent / "_bin" / exe
@@ -150,9 +153,9 @@ def build_index() -> bool:
 
     The single ingest invocation shared by `agrep index`/`ui` (a forced rebuild) and
     ensure_index() (build-on-first-use). Assumes the binary exists — callers that
-    might not have it check tilt_rs_bin().exists() first. Returns True on success.
+    might not have it check ingest_bin().exists() first. Returns True on success.
     """
-    r = subprocess.run([str(tilt_rs_bin()), "index", "--agent", "all"], cwd=str(REPO_ROOT))
+    r = subprocess.run([str(ingest_bin()), "index", "--agent", "all"], cwd=str(REPO_ROOT))
     if r.returncode != 0 or not MESSAGES_PATH.exists():
         return False
     _refresh_corpusdb()
@@ -174,7 +177,7 @@ def ensure_index(auto: bool = True) -> bool:
     if not auto:
         log(f"no index yet — run `{cli} index` to scan your agent stores, then search.")
         return False
-    if not tilt_rs_bin().exists():
+    if not ingest_bin().exists():
         log(f"no index yet, and no ingest binary to build one — run `{cli} index` "
             f"(install Rust from https://rustup.rs if cargo is missing), then search.")
         return False
@@ -187,7 +190,7 @@ def ensure_index(auto: bool = True) -> bool:
 
 @dataclass(frozen=True)
 class Message:
-    """One row from messages.jsonl. Mirrors crates/tilt-core/src/model.rs."""
+    """One row from messages.jsonl. Mirrors crates/agrep-core/src/model.rs."""
 
     id: str
     agent: str
@@ -207,7 +210,7 @@ def iter_messages(path: Path = MESSAGES_PATH, limit: int | None = None) -> Itera
     """
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found. Run `tilt scan` first to produce messages.jsonl."
+            f"{path} not found. Run `{cli_name()} index` first to produce messages.jsonl."
         )
 
     yielded = 0

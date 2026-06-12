@@ -9,8 +9,8 @@ everything from scratch.
 Each stage runs as its OWN process so a model's VRAM is released before the next
 stage loads its model (important on the 10GB GPU). Stages, in order:
 
-    cargo build (release)         -> the tilt-rs ingest binary
-    tilt-rs index                 -> data/messages.jsonl + data/replies.jsonl + data/events/
+    cargo build (release)         -> the agrep-rs ingest binary
+    agrep-rs index                -> data/messages.jsonl + data/replies.jsonl + data/events/
     embed.py                      -> data/embeddings.{f32,ids}        (incremental)
     emotion.py                    -> data/emotions.jsonl              (incremental)
     judge.py                      -> LLM verdicts onto gate-routed rows (incremental)
@@ -44,7 +44,7 @@ import common  # noqa: E402  -- single source for binary / venv / data paths
 
 # the venv that has torch/sentence-transformers/sklearn; fall back to whatever ran us
 PY = common.venv_python()
-TILT = common.tilt_rs_bin()
+TILT = common.ingest_bin()
 
 
 def run(desc: str, cmd: list[str], optional: bool = False) -> bool:

@@ -26,7 +26,7 @@ from pathlib import Path
 import common
 
 WIN = sys.platform == "win32"
-TILT = common.tilt_rs_bin()
+TILT = common.ingest_bin()
 REINDEX = common.REPO_ROOT / "reindex.py"
 
 CHECK_S = 20        # how often the thread wakes to check the gates (cheap)

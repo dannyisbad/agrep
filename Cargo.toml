@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tilt-core", "crates/tilt-cli"]
+members = ["crates/agrep-core", "crates/agrep-cli"]
 resolver = "2"
 
 [workspace.package]

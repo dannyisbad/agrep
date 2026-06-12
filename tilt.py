@@ -33,7 +33,7 @@ WIN = sys.platform == "win32"
 sys.path.insert(0, str(ROOT / "py"))
 import common  # noqa: E402  -- single source for binary / venv / data paths
 
-TILT_RS = common.tilt_rs_bin()
+TILT_RS = common.ingest_bin()
 
 
 def _version() -> str:

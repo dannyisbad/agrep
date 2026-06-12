@@ -5,9 +5,9 @@
 ```
 tilt.py                the CLI front door (search / resume / up / doctor / index / reindex / serve / tail)
 agrep/                 the PyPI package shim: maps this flat tree into a wheel (see pyproject)
-crates/tilt-core/      Rust: read each agent's store, normalize, write the index
+crates/agrep-core/     Rust: read each agent's store, normalize, write the index
   src/ingest/          one adapter per agent (claude, codex, opencode, antigravity)
-crates/tilt-cli/       the `tilt-rs` ingest binary (driven by `tilt.py index`)
+crates/agrep-cli/      the `agrep-rs` ingest binary (driven by `tilt.py index`)
 py/                    read-only server + the optional ML/LLM pipeline
   server.py            the HTTP server (stdlib only; serves web/app.html)
   explore.py           read layer over the index (browse/search/detail)
@@ -37,7 +37,7 @@ needs no rebuild — the server re-reads it on each request.
 
 ## Adding an agent adapter
 
-Each adapter in `crates/tilt-core/src/ingest/` turns one agent's on-disk store into two
+Each adapter in `crates/agrep-core/src/ingest/` turns one agent's on-disk store into two
 streams: `Message`s (the human turns + the agent's reply text) and `Event`s (tool calls
 and subagent activity). To add one:
 

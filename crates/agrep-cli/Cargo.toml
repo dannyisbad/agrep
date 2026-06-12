@@ -1,17 +1,16 @@
 [package]
-name = "tilt"
+name = "agrep-ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The ingest engine. Named distinctly from the `tilt` CLI (tilt.py) that drives it:
-# users run `tilt index`, which shells out to this `tilt-rs` binary.
+# The ingest engine. `agrep index` (tilt.py) shells out to this `agrep-rs` binary.
 [[bin]]
-name = "tilt-rs"
+name = "agrep-rs"
 path = "src/main.rs"
 
 [dependencies]
-tilt-core = { path = "../tilt-core" }
+agrep-core = { path = "../agrep-core" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

@@ -37,7 +37,7 @@ path = "agrep/__init__.py"
 # --- wheel contents -----------------------------------------------------------
 # The repo is a flat tree (tilt.py, reindex.py, py/, web/) plus a cargo target.
 # force-include maps those into the agrep/ package dir at build time WITHOUT moving
-# them in the repo, so dev keeps working unchanged. _bin/tilt-rs is dropped in by CI
+# them in the repo, so dev keeps working unchanged. _bin/agrep-rs is dropped in by CI
 # (or a local build) before packaging; it's gitignored.
 [tool.hatch.build.targets.wheel]
 packages = ["agrep"]

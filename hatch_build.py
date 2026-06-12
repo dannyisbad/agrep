@@ -38,7 +38,7 @@ class PlatformWheelHook(BuildHookInterface):
 
     def _ensure_binary(self) -> None:
         root = Path(self.root)
-        exe = "tilt-rs.exe" if sys.platform == "win32" else "tilt-rs"
+        exe = "agrep-rs.exe" if sys.platform == "win32" else "agrep-rs"
         staged = root / "_bin" / exe
         if staged.exists():
             return

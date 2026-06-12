@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use tilt_core::cache;
-use tilt_core::ingest;
-use tilt_core::ingest_cache::IngestCache;
-use tilt_core::model::{Event, Message};
+use agrep_core::cache;
+use agrep_core::ingest;
+use agrep_core::ingest_cache::IngestCache;
+use agrep_core::model::{Event, Message};
 
 #[derive(Parser)]
 #[command(name = "tilt", version, about = "ingest agent chat transcripts into the tilt index")]
