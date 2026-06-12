@@ -52,6 +52,17 @@ jobs:
         run: |
           python -m pip install -U build
           python -m build --wheel
+      - name: smoke test wheel
+        shell: bash
+        run: |
+          # Install the wheel we just built and actually run it: --version proves the
+          # entry point + bundled binary resolve; a search proves the rust ingest
+          # spawns, builds an (empty) index, and exits like grep. Exit 1 = no match
+          # on a storeless runner, which is correct; anything above 1 is a crash.
+          python -m pip install dist/*.whl
+          agrep --version
+          agrep "smoke-needle-$RANDOM" && rc=0 || rc=$?
+          if [ "$rc" -gt 1 ]; then echo "search crashed (exit $rc)"; exit 1; fi
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
@@ -79,6 +90,11 @@ jobs:
           PYBIN=/opt/python/cp312-cp312/bin
           "$PYBIN/pip" install -U build
           "$PYBIN/python" -m build --wheel
+          # same smoke as the matrix jobs (see above)
+          "$PYBIN/pip" install dist/*.whl
+          "$PYBIN/agrep" --version
+          "$PYBIN/agrep" "smoke-needle-$RANDOM" && rc=0 || rc=$?
+          if [ "$rc" -gt 1 ]; then echo "search crashed (exit $rc)"; exit 1; fi
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-linux-x64
