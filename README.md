@@ -131,7 +131,7 @@ To hack on it, clone and use the same commands as `python cli.py <cmd>`
 (needs Rust for the ingest binary — https://rustup.rs):
 
 ```
-git clone https://github.com/dannyisbad/tilt && cd tilt
+git clone https://github.com/dannyisbad/agrep && cd agrep
 python cli.py ui
 ```
 

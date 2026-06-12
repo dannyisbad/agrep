@@ -25,8 +25,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/dannyisbad/tilt"
-Repository = "https://github.com/dannyisbad/tilt"
+Homepage = "https://github.com/dannyisbad/agrep"
+Repository = "https://github.com/dannyisbad/agrep"
 
 [project.scripts]
 agrep = "agrep.__main__:main"

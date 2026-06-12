@@ -6,8 +6,8 @@
   "files": ["bin.js", "README.md"],
   "engines": { "node": ">=16" },
   "keywords": ["claude", "codex", "opencode", "agent", "chat", "history", "grep", "cli"],
-  "repository": { "type": "git", "url": "git+https://github.com/dannyisbad/tilt.git" },
-  "homepage": "https://github.com/dannyisbad/tilt#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/dannyisbad/agrep.git" },
+  "homepage": "https://github.com/dannyisbad/agrep#readme",
   "author": "mundy (https://mundy.sh)",
   "license": "MIT"
 }

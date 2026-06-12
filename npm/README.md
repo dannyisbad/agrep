@@ -16,4 +16,4 @@ agrep "race condition"     # first run indexes your agent stores, then greps
 
 Prefer the direct route? `uv tool install agrep` — same thing, no node in the middle.
 
-Full docs: https://github.com/dannyisbad/tilt
+Full docs: https://github.com/dannyisbad/agrep
