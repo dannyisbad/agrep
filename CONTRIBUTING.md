@@ -3,7 +3,8 @@
 ## Layout
 
 ```
-tilt.py                the CLI front door (up / doctor / index / reindex / serve)
+tilt.py                the CLI front door (search / resume / up / doctor / index / reindex / serve / tail)
+agrep/                 the PyPI package shim: maps this flat tree into a wheel (see pyproject)
 crates/tilt-core/      Rust: read each agent's store, normalize, write the index
   src/ingest/          one adapter per agent (claude, codex, opencode, antigravity)
 crates/tilt-cli/       the `tilt-rs` ingest binary (driven by `tilt.py index`)
@@ -11,6 +12,9 @@ py/                    read-only server + the optional ML/LLM pipeline
   server.py            the HTTP server (stdlib only; serves web/app.html)
   explore.py           read layer over the index (browse/search/detail)
   live.py              passive store-tailing watcher (the live view)
+  search.py            the terminal grep (`agrep <pattern>`)
+  resume.py            `agrep resume` — reopen a session in its own agent
+  native.py            per-agent launch/resume commands + cwd resolution
   indexer.py           background auto-reindex while the server runs
   embed/emotion/...    the optional smart-tier stages
 web/app.html           the entire frontend, one file

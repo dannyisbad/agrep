@@ -33,6 +33,16 @@ import common  # noqa: E402  -- single source for binary / venv / data paths
 TILT_RS = common.tilt_rs_bin()
 
 
+def _version() -> str:
+    """Single-sourced from agrep/__init__.py (pyproject reads the same file).
+    Resolves both installed (site-packages/agrep) and dev (repo root/agrep)."""
+    try:
+        from agrep import __version__
+        return __version__
+    except ImportError:
+        return "dev"
+
+
 def _server_python() -> str:
     """The python the SERVER runs under. Semantic search needs the smart tier's
     deps (numpy/torch/...), which live in the venv — launching the server with
@@ -142,6 +152,7 @@ def cmd_resume(a) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="agrep", description="grep and explore your cross-agent chat history")
+    p.add_argument("-V", "--version", action="version", version=f"agrep {_version()}")
     sub = p.add_subparsers(dest="cmd")
 
     up = sub.add_parser("up", help="index, serve, and open the app (default)")
@@ -177,7 +188,7 @@ def main() -> int:
     # dispatch. `agrep` alone opens the app; `agrep -h` shows top-level help.
     raw = sys.argv[1:]
     verbs = set(sub.choices)
-    if raw and raw[0] not in verbs and raw[0] not in ("-h", "--help"):
+    if raw and raw[0] not in verbs and raw[0] not in ("-h", "--help", "-V", "--version"):
         return cmd_search(argparse.Namespace(rest=raw))
 
     # parse_known_args instead of REMAINDER positionals: REMAINDER errors on

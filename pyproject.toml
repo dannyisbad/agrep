@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agrep"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Search, browse, and watch your cross-agent coding chat history (Claude, Codex, opencode, Antigravity) in one place."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,6 +30,9 @@ Repository = "https://github.com/dannyisbad/tilt"
 
 [project.scripts]
 agrep = "agrep.__main__:main"
+
+[tool.hatch.version]
+path = "agrep/__init__.py"
 
 # --- wheel contents -----------------------------------------------------------
 # The repo is a flat tree (tilt.py, reindex.py, py/, web/) plus a cargo target.
