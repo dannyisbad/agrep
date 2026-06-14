@@ -129,7 +129,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          package-manager-cache: false
       - uses: astral-sh/setup-uv@v5
       - uses: actions/download-artifact@v4
         with:
@@ -166,7 +165,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          package-manager-cache: false
       - run: npm install -g npm@latest && npm --version
       - name: verify npm token
         env:
@@ -204,7 +202,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          package-manager-cache: false
       - run: npm install -g npm@latest && npm --version
       - name: publish scoped package
         working-directory: npm
@@ -234,7 +231,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          package-manager-cache: false
       - run: npm install -g npm@latest && npm --version
       - name: verify npm token
         env:
