@@ -23,6 +23,7 @@ agrep -E 'TODO|FIXME'           # regex
 agrep -l auth                   # list matching chats, not every line (like grep -l)
 agrep "memory leak" --json      # one JSON object per hit, for piping
 agrep "flaky test" --semantic   # meaning search (needs a running server)
+agrep warm                      # keep semantic search hot
 agrep around 00da9752 144       # the conversation around a hit, tool calls inline
 agrep resume 00da9752           # reopen that session in its own agent, cd'd there
 agrep ui                        # tilt: the web explorer
@@ -68,7 +69,10 @@ ever set up (`--no-auto` opts out for strict scripts).
 
 ## tilt: the explorer
 
-`agrep ui` opens the human surface — a single local web app over the same index:
+`agrep ui` opens the human surface — a single local web app over the same index. It
+builds the base index only if one is missing; after that the page opens immediately
+and the server refreshes the index in the background. Use `agrep ui --force-index`
+when you explicitly want to rebuild before opening.
 
 - **One searchable history** across every supported agent. Keyword search is exact and
   instant; semantic search and topic clustering light up with the optional model tier.
@@ -84,7 +88,10 @@ ever set up (`--no-auto` opts out for strict scripts).
   directory it ran in.
 
 While the server runs it re-indexes automatically after new agent activity settles;
-you never run a command to see new chats.
+you never run a command to see new chats. `agrep warm` is the same server path with
+semantic models preloaded, so the first meaning search does not pay the model-load
+tax. The auto-indexer also refreshes the derived full-text database, so the next
+terminal search does not pay the sqlite rebuild after new activity.
 
 ## The three tiers
 
@@ -97,10 +104,12 @@ first tier is required.
 | **Smart** | one click in the app's setup panel (torch et al.) | Semantic search, topic/concept clustering, mood arcs. |
 | **Named** | [Ollama](https://ollama.com) + a small local model | Clean generated titles, summaries, concept names, and arc verdicts instead of first-message fallbacks. |
 
-The model tiers run **only at index time** — a model loads, does its pass, releases
-its memory. Nothing stays resident, and the server itself needs no GPU. `agrep doctor`
-reports which tiers are live and the exact command to unlock each missing one
-(`--fix` does the safe setup itself).
+The offline model passes for titles, summaries, concepts, and arcs run at index time:
+a model loads, does its pass, and releases its memory. Semantic search is different:
+the server loads the embedder/reranker on the first semantic query, or immediately
+with `agrep warm`, then releases them after an idle period. `agrep doctor` reports
+which tiers are live and the exact command to unlock each missing one (`--fix` does
+the safe setup itself).
 
 ## Where it reads
 
@@ -124,11 +133,13 @@ macOS, and Linux.
 agrep <pattern>          # grep your history (first run builds the index)
 agrep around <id> <turn> # the conversation around a hit
 agrep resume <id>        # reopen a past session in its own agent, cd'd there
-agrep ui                 # tilt: index, serve, open the app
+agrep ui                 # tilt: serve/open; builds the base index if missing
+agrep ui --force-index   # rebuild the base index before opening
 agrep doctor             # what's installed + what each tier needs (--fix does setup)
 agrep index              # rebuild the base index only (fast, no models)
 agrep reindex            # full pipeline: embeddings + affect + topics + arcs
 agrep serve --port N     # just the server (auto-indexes in the background)
+agrep warm               # server + preloaded semantic models
 ```
 
 To hack on it, clone and use the same commands as `python cli.py <cmd>`

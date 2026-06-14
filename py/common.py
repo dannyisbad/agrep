@@ -145,7 +145,7 @@ def cli_name() -> str:
     return "python cli.py" if _is_dev_checkout() else "agrep"
 
 
-def _refresh_corpusdb() -> None:
+def refresh_search_index() -> None:
     """Rebuild the derived FTS db now so the next search doesn't pay for it. Wrapped
     broadly: a derived-db hiccup must never fail an otherwise-good ingest."""
     try:
@@ -167,7 +167,7 @@ def build_index() -> bool:
     r = subprocess.run([str(ingest_bin()), "index", "--agent", "all"], cwd=str(REPO_ROOT))
     if r.returncode != 0 or not MESSAGES_PATH.exists():
         return False
-    _refresh_corpusdb()
+    refresh_search_index()
     return True
 
 

@@ -1,6 +1,6 @@
 """tilt server: the interactive explorer. Serves the app + read-only endpoints over
-your indexed chat history. Warms the embedder/reranker once at startup so semantic
-search is fast (no per-call model reload).
+your indexed chat history. Semantic search lazy-loads the embedder/reranker by
+default; pass --warm when the first semantic query must be fast.
 
   GET  /                 -> web/app.html
   GET  /data             -> report.build_data() (rankings, timeline, vibe-traces) [dashboard view]

@@ -10,10 +10,13 @@ and the shim runs it through [uv](https://docs.astral.sh/uv/) (or pipx). uv mana
 python itself, so this works even on a machine with no python installed.
 
 ```
-npm i -g agrep-cli
+npm i -g @mundy/agrep
+# or: npm i -g agrep-cli
 agrep "race condition"     # first run indexes your agent stores, then greps
 ```
 
-Prefer the direct route? `uv tool install agrep` — same thing, no node in the middle.
+The npm shim pins the matching PyPI version under the hood, so npm and PyPI releases
+do not drift. Prefer the direct route? `uv tool install agrep==0.1.1` — same thing,
+no node in the middle.
 
 Full docs: https://github.com/dannyisbad/agrep

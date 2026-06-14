@@ -4,11 +4,12 @@
   agrep "race condition"    grep your whole agent history; print matches  (the namesake)
   agrep around <id> <turn>  show the conversation around a search hit, tools inline
   agrep resume <id>         jump back into a past session in its agent, cd'd there
-  agrep ui                  the explorer (tilt): index, serve, and open the app
+  agrep ui                  the explorer (tilt): serve/open; builds index if missing
   agrep doctor              check what's installed and what each tier needs
   agrep index               just (re)build the index from your agent stores
   agrep reindex             full pipeline: index + embeddings + affect + topics + arcs
   agrep serve               just run the server (it auto-indexes in the background)
+  agrep warm                serve + preload semantic models for fast meaning search
   agrep tail                follow live agent events as JSON lines
 
 A bare first argument that isn't a command is treated as a search, so `agrep deadlock`
@@ -174,7 +175,8 @@ def cmd_status(a) -> int:
     print(f"  {cli} -l auth                 which chats mention it")
     print(f"  {cli} around <id> <turn>      the conversation around a hit")
     print(f"  {cli} resume <id>             reopen a past session in its agent")
-    print(f"  {cli} ui                      the explorer: index, serve, open the app")
+    print(f"  {cli} ui                      the explorer: serve/open, auto-refresh")
+    print(f"  {cli} warm                    keep semantic search warm in this terminal")
     print(f"\n{cli} <command> -h for a command's own options.")
     return 0
 
@@ -182,12 +184,22 @@ def cmd_status(a) -> int:
 # --- subcommands ----------------------------------------------------------
 
 def cmd_up(a) -> int:
-    if not a.no_index and _ensure_binary():
-        _index()
+    if not a.no_index:
+        need_index = not common.MESSAGES_PATH.exists()
+        if getattr(a, "force_index", False) or need_index:
+            if not _ensure_binary():
+                return 1
+            if not _index():
+                return 1
+        else:
+            print("=== using existing index; server will refresh in the background ===",
+                  flush=True)
     url = f"http://127.0.0.1:{a.port}"
     print(f"=== serving {url} ===", flush=True)
-    srv = subprocess.Popen([_server_python(), str(ROOT / "py" / "server.py"),
-                            "--port", str(a.port)], cwd=str(ROOT))
+    cmd = [_server_python(), str(ROOT / "py" / "server.py"), "--port", str(a.port)]
+    if getattr(a, "warm", False):
+        cmd.append("--warm")
+    srv = subprocess.Popen(cmd, cwd=str(ROOT))
     try:
         if not _wait_for(a.port):
             print("  ! server didn't come up within 30s; see the output above.")
@@ -213,8 +225,24 @@ def cmd_reindex(a) -> int:
                           cwd=str(ROOT)).returncode
 
 
+def _server_args(a, *, force_warm: bool = False) -> list[str]:
+    args = ["--port", str(a.port)]
+    if force_warm or getattr(a, "warm", False):
+        args.append("--warm")
+    if getattr(a, "no_autoindex", False):
+        args.append("--no-autoindex")
+    return [*args, *getattr(a, "rest", [])]
+
+
 def cmd_serve(a) -> int:
-    return subprocess.run([_server_python(), str(ROOT / "py" / "server.py"), *a.rest],
+    return subprocess.run([_server_python(), str(ROOT / "py" / "server.py"),
+                           *_server_args(a)],
+                          cwd=str(ROOT)).returncode
+
+
+def cmd_warm(a) -> int:
+    return subprocess.run([_server_python(), str(ROOT / "py" / "server.py"),
+                           *_server_args(a, force_warm=True)],
                           cwd=str(ROOT)).returncode
 
 
@@ -255,15 +283,20 @@ def main() -> int:
     p.add_argument("-V", "--version", action="version", version=f"agrep {_version()}")
     sub = p.add_subparsers(dest="cmd")
 
-    # `ui` is the explorer (tilt): index + serve + open. `up` is a kept-working alias
+    # `ui` is the explorer (tilt): serve + open, building the base index only when
+    # it is missing. `up` is a kept-working alias
     # (it lives in scripts / muscle memory) but only `ui` is advertised — a subparser
     # added without help= is omitted from the command listing, so `up` stays hidden.
     for name in ("ui", "up"):
-        kw = {"help": "index, serve, and open the explorer (tilt)"} if name == "ui" else {}
+        kw = {"help": "serve and open the explorer (tilt)"} if name == "ui" else {}
         u = sub.add_parser(name, **kw)
         u.add_argument("--port", type=int, default=8732)
+        u.add_argument("--warm", action="store_true",
+                       help="preload semantic models after opening the explorer")
         u.add_argument("--no-open", action="store_true", help="don't open the browser")
         u.add_argument("--no-index", action="store_true", help="serve the existing index as-is")
+        u.add_argument("--force-index", action="store_true",
+                       help="rebuild the base index before opening")
         u.set_defaults(fn=cmd_up)
 
     di = sub.add_parser("doctor", help="check installed tiers; --fix does safe setup")
@@ -276,7 +309,18 @@ def main() -> int:
     rx.set_defaults(fn=cmd_reindex)
 
     sv = sub.add_parser("serve", help="run the server only (auto-indexes in background)")
+    sv.add_argument("--port", type=int, default=8732)
+    sv.add_argument("--warm", action="store_true",
+                    help="pre-load semantic models at startup")
+    sv.add_argument("--no-autoindex", action="store_true",
+                    help="don't auto-rebuild the index on new activity")
     sv.set_defaults(fn=cmd_serve)
+
+    wm = sub.add_parser("warm", help="run the server and preload semantic models")
+    wm.add_argument("--port", type=int, default=8732)
+    wm.add_argument("--no-autoindex", action="store_true",
+                    help="don't auto-rebuild the index on new activity")
+    wm.set_defaults(fn=cmd_warm)
 
     ta = sub.add_parser("tail", help="follow live agent events as JSON lines (turn ends by default)")
     ta.set_defaults(fn=cmd_tail)
@@ -296,6 +340,18 @@ def main() -> int:
     # dispatch. `agrep` alone prints status + usage; `agrep -h` shows top-level help.
     raw = sys.argv[1:]
     verbs = set(sub.choices)
+    delegated = {
+        "doctor": cmd_doctor,
+        "reindex": cmd_reindex,
+        "resume": cmd_resume,
+        "search": cmd_search,
+        "tail": cmd_tail,
+        "around": cmd_around,
+    }
+    if (raw and raw[0] in delegated
+            and any(x in ("-h", "--help") for x in raw[1:])):
+        return delegated[raw[0]](argparse.Namespace(rest=raw[1:]))
+
     if raw and raw[0] not in verbs and raw[0] not in ("-h", "--help", "-V", "--version"):
         return cmd_search(argparse.Namespace(rest=raw))
 

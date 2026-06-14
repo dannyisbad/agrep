@@ -116,6 +116,11 @@ class AutoIndexer(threading.Thread):
                                capture_output=True, text=True, timeout=timeout)
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "ingest failed").strip()[-300:]
+            else:
+                # Keep the CLI's derived FTS index hot too. Otherwise the server
+                # does the ingest in the background, but the next `agrep <pattern>`
+                # pays the sqlite rebuild.
+                common.refresh_search_index()
         except Exception as e:  # noqa: BLE001 -- surface anything to the status chip
             err = f"{type(e).__name__}: {e}"[-300:]
         dur = time.perf_counter() - t

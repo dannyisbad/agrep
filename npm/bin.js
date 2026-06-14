@@ -8,8 +8,9 @@
 
 "use strict";
 const { spawnSync } = require("child_process");
+const { version } = require("./package.json");
 
-const SPEC = process.env.AGREP_PYPI_SPEC || "agrep";
+const SPEC = process.env.AGREP_PYPI_SPEC || `agrep==${version}`;
 const args = process.argv.slice(2);
 
 function has(cmd) {
@@ -28,7 +29,13 @@ function run(cmd, cmdArgs) {
 
 if (has("uv")) {
   // `uvx agrep` == `uv tool run agrep`; --from lets AGREP_PYPI_SPEC point anywhere
-  run("uv", ["tool", "run", "--from", SPEC, "agrep", ...args]);
+  run("uv", [
+    "tool", "run",
+    "--exclude-newer-package", "agrep=false",
+    "--from", SPEC,
+    "agrep",
+    ...args,
+  ]);
 } else if (has("pipx")) {
   run("pipx", ["run", "--spec", SPEC, "agrep", ...args]);
 } else {
@@ -38,7 +45,8 @@ if (has("uv")) {
     (process.platform === "win32"
       ? '  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"'
       : "  curl -LsSf https://astral.sh/uv/install.sh | sh") +
-    "\n\nthen `agrep` works. (or skip npm entirely: `uv tool install agrep`)"
+    `\n\nthen \`agrep\` works. This npm package runs PyPI agrep==${version}; ` +
+    `you can also install that directly with \`uv tool install agrep==${version}\`.`
   );
   process.exit(1);
 }

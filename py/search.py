@@ -301,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-s", "--semantic", action="store_true",
                     help="meaning search: most relevant CHATS via a running server "
                          "(keyword greps message lines; falls back to keyword if no server)")
+    ap.add_argument("--strict-semantic", action="store_true",
+                    help="with --semantic, exit instead of falling back to keyword search")
     ap.add_argument("--port", type=int, default=None,
                     help="server port for --semantic / links (default: auto-detect a "
                          "running server, else 8732)")
@@ -336,8 +338,11 @@ def main(argv: list[str] | None = None) -> int:
         sem_port = args.port or running or 8732
         res = _semantic(q, big, sem_port)
         if res is None:
-            common.log(f"no server on :{sem_port} — using keyword search "
-                       f"(start one with `agrep serve` for --semantic)")
+            msg = f"no server on :{sem_port} for --semantic; start one with `agrep warm`"
+            if args.strict_semantic:
+                common.log(msg)
+                return 2
+            common.log(msg + " — using keyword search instead")
         else:
             sem_used = True
     if not sem_used:

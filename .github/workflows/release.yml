@@ -112,8 +112,41 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: sdist, path: dist/*.tar.gz }
 
+  npm-smoke:
+    name: npm shim smoke
+    needs: [wheels-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-x64
+          path: dist
+      - name: version parity
+        shell: bash
+        run: |
+          py_ver=$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("agrep/__init__.py").read_text()
+          print(re.search(r'__version__ = "([^"]+)"', text).group(1))
+          PY
+          )
+          npm_ver=$(node -p "require('./npm/package.json').version")
+          test "$py_ver" = "$npm_ver" || {
+            echo "version mismatch: PyPI $py_ver vs npm $npm_ver"
+            exit 1
+          }
+      - name: run shim against built wheel
+        shell: bash
+        run: |
+          wheel=$(ls dist/*.whl | head -n1)
+          AGREP_PYPI_SPEC="$wheel" npm exec --yes --package ./npm -- agrep -- --version
+
   publish:
-    needs: [wheels, wheels-linux, sdist]
+    needs: [wheels, wheels-linux, sdist, npm-smoke]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
@@ -123,3 +156,28 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-npm:
+    needs: [publish]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: publish scoped package
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+      - name: publish unscoped alias
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          tmp=$(mktemp -d)
+          cp -R npm/. "$tmp/"
+          node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
+          npm publish --access public "$tmp"
