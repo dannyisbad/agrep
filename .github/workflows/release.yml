@@ -4,8 +4,8 @@ name: release
 # binary), plus an sdist, and publish to PyPI on a v* tag. The wheel is py3-none-<plat>
 # (any python 3.10+, one platform) — see hatch_build.py.
 #
-# Publishing uses PyPI and npm Trusted Publishing (OIDC): no registry tokens in
-# secrets. Configure PyPI and npm to trust this repo + workflow before tagging.
+# Publishing uses PyPI Trusted Publishing (OIDC). npm publishing uses the
+# `NPM_TOKEN` repository secret and still attaches provenance from GitHub Actions.
 
 on:
   push:
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       npm_only:
-        description: "Publish npm packages only from this ref using Trusted Publishing"
+        description: "Publish npm packages only from this ref"
         type: boolean
         default: false
 
@@ -157,8 +157,30 @@ jobs:
           npm install -g --prefix "$tmp" ./npm
           AGREP_PYPI_SPEC="$wheel" "$tmp/bin/agrep" --version
 
+  npm-auth:
+    name: npm auth preflight
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - run: npm install -g npm@latest && npm --version
+      - name: verify npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep-cli."
+            exit 1
+          fi
+          npm whoami
+
   publish:
-    needs: [wheels, wheels-linux, sdist, npm-smoke]
+    needs: [wheels, wheels-linux, sdist, npm-smoke, npm-auth]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
@@ -186,8 +208,12 @@ jobs:
       - run: npm install -g npm@latest && npm --version
       - name: publish scoped package
         working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
       - name: publish unscoped alias
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           tmp=$(mktemp -d)
@@ -210,6 +236,16 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
       - run: npm install -g npm@latest && npm --version
+      - name: verify npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN repository secret is required to publish @mundy/agrep and agrep-cli."
+            exit 1
+          fi
+          npm whoami
       - name: verify matching PyPI release exists
         shell: bash
         run: |
@@ -224,8 +260,12 @@ jobs:
           PY
       - name: publish scoped package
         working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
       - name: publish unscoped alias
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           tmp=$(mktemp -d)
