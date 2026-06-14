@@ -143,7 +143,9 @@ jobs:
         shell: bash
         run: |
           wheel=$(ls dist/*.whl | head -n1)
-          AGREP_PYPI_SPEC="$wheel" npm exec --yes --package ./npm -- agrep -- --version
+          tmp=$(mktemp -d)
+          npm install -g --prefix "$tmp" ./npm
+          AGREP_PYPI_SPEC="$wheel" "$tmp/bin/agrep" --version
 
   publish:
     needs: [wheels, wheels-linux, sdist, npm-smoke]
