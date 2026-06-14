@@ -17,6 +17,23 @@ no cargo), indexes your agent stores on first run (one-time, ~30s for years of
 history), and greps. After that, searches are instant — a derived full-text index
 answers cold CLI calls in well under a second.
 
+For a permanent `agrep` command, install it as a uv tool:
+
+```
+uv tool install agrep
+uv tool update-shell   # only needed if uv's tool bin is not already on PATH
+```
+
+The PyPI package already exposes the `agrep` console script; uv/pipx/pip decide
+where that script lands. npm users can install the shim globally instead:
+
+```
+npm i -g @mundy/agrep   # or: npm i -g agrep-cli
+```
+
+npm puts its `agrep` shim on PATH and, when uv is available, preinstalls the
+matching PyPI tool during global install so first run is already warm.
+
 ```
 agrep deadlock --agent codex    # filter to one agent
 agrep -E 'TODO|FIXME'           # regex

@@ -1,9 +1,12 @@
 {
   "name": "@mundy/agrep",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "grep your AI coding agents' chat history (Claude Code, Codex, opencode, Antigravity, Kimi, Cline) — npm shim that runs the real package via uv/pipx",
   "bin": { "agrep": "bin.js" },
-  "files": ["bin.js", "README.md"],
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "files": ["bin.js", "postinstall.js", "README.md"],
   "engines": { "node": ">=16" },
   "keywords": ["claude", "codex", "opencode", "kimi", "cline", "agent", "chat", "history", "grep", "cli"],
   "repository": { "type": "git", "url": "git+https://github.com/dannyisbad/agrep.git" },
