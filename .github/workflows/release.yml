@@ -6,7 +6,8 @@ name: release
 #
 # Publishing uses PyPI Trusted Publishing (OIDC): no API token in secrets. You must
 # first create the `agrep` project's trusted publisher on PyPI pointing at this repo
-# + workflow. npm publishing requires an `NPM_TOKEN` repository secret.
+# + workflow. npm publishing requires an `NPM_TOKEN` repository secret and publishes
+# with provenance from GitHub Actions.
 
 on:
   push:
@@ -119,7 +120,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with: { node-version: "24" }
       - uses: astral-sh/setup-uv@v5
       - uses: actions/download-artifact@v4
         with:
@@ -154,7 +155,7 @@ jobs:
     steps:
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
       - name: verify npm token
         env:
@@ -183,17 +184,20 @@ jobs:
     needs: [publish]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
       - name: publish scoped package
         working-directory: npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish --access public --provenance
       - name: publish unscoped alias
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -202,4 +206,4 @@ jobs:
           tmp=$(mktemp -d)
           cp -R npm/. "$tmp/"
           node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public "$tmp"
+          npm publish --access public --provenance "$tmp"
