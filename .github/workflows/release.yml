@@ -4,20 +4,24 @@ name: release
 # binary), plus an sdist, and publish to PyPI on a v* tag. The wheel is py3-none-<plat>
 # (any python 3.10+, one platform) — see hatch_build.py.
 #
-# Publishing uses PyPI Trusted Publishing (OIDC): no API token in secrets. You must
-# first create the `agrep` project's trusted publisher on PyPI pointing at this repo
-# + workflow. npm publishing requires an `NPM_TOKEN` repository secret and publishes
-# with provenance from GitHub Actions.
+# Publishing uses PyPI and npm Trusted Publishing (OIDC): no registry tokens in
+# secrets. Configure PyPI and npm to trust this repo + workflow before tagging.
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      npm_only:
+        description: "Publish npm packages only from this ref using Trusted Publishing"
+        type: boolean
+        default: false
 
 jobs:
   wheels:
     name: wheel ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.npm_only != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +80,7 @@ jobs:
   wheels-linux:
     name: wheel linux-x64
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.npm_only != true }}
     container: quay.io/pypa/manylinux_2_28_x86_64
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +110,7 @@ jobs:
 
   sdist:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.npm_only != true }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -117,10 +123,13 @@ jobs:
     name: npm shim smoke
     needs: [wheels-linux]
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.npm_only != true }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "24" }
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: astral-sh/setup-uv@v5
       - uses: actions/download-artifact@v4
         with:
@@ -148,28 +157,8 @@ jobs:
           npm install -g --prefix "$tmp" ./npm
           AGREP_PYPI_SPEC="$wheel" "$tmp/bin/agrep" --version
 
-  npm-auth:
-    name: npm auth preflight
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-      - name: verify npm token
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        shell: bash
-        run: |
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep-cli."
-            exit 1
-          fi
-          npm whoami
-
   publish:
-    needs: [wheels, wheels-linux, sdist, npm-smoke, npm-auth]
+    needs: [wheels, wheels-linux, sdist, npm-smoke]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
@@ -193,14 +182,50 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - run: npm install -g npm@latest && npm --version
       - name: publish scoped package
         working-directory: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
       - name: publish unscoped alias
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          tmp=$(mktemp -d)
+          cp -R npm/. "$tmp/"
+          node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
+          npm publish --access public --provenance "$tmp"
+
+  publish-npm-manual:
+    name: publish npm manually
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.npm_only == true }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - run: npm install -g npm@latest && npm --version
+      - name: verify matching PyPI release exists
+        shell: bash
+        run: |
+          version=$(node -p "require('./npm/package.json').version")
+          python - "$version" <<'PY'
+          import sys, urllib.request
+          version = sys.argv[1]
+          with urllib.request.urlopen(f"https://pypi.org/pypi/agrep/{version}/json") as response:
+              if response.status != 200:
+                  raise SystemExit(f"PyPI agrep {version} returned HTTP {response.status}")
+          print(f"PyPI agrep {version} exists")
+          PY
+      - name: publish scoped package
+        working-directory: npm
+        run: npm publish --access public --provenance
+      - name: publish unscoped alias
         shell: bash
         run: |
           tmp=$(mktemp -d)
