@@ -6,7 +6,7 @@ name: release
 #
 # Publishing uses PyPI Trusted Publishing (OIDC): no API token in secrets. You must
 # first create the `agrep` project's trusted publisher on PyPI pointing at this repo
-# + workflow. Until then, a tag build still produces the wheels as artifacts.
+# + workflow. npm publishing requires an `NPM_TOKEN` repository secret.
 
 on:
   push:
@@ -147,8 +147,28 @@ jobs:
           npm install -g --prefix "$tmp" ./npm
           AGREP_PYPI_SPEC="$wheel" "$tmp/bin/agrep" --version
 
+  npm-auth:
+    name: npm auth preflight
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: verify npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep-cli."
+            exit 1
+          fi
+          npm whoami
+
   publish:
-    needs: [wheels, wheels-linux, sdist, npm-smoke]
+    needs: [wheels, wheels-linux, sdist, npm-smoke, npm-auth]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
