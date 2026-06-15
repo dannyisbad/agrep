@@ -218,7 +218,7 @@ def main() -> int:
                 else:
                     common.log("embeddings already up to date (0 new).")
                 return 0
-        except Exception as e:  # noqa: BLE001 — corrupt/old index -> fall back to full
+        except Exception as e:  # noqa: BLE001 - corrupt/old index -> fall back to full
             common.log(f"incremental read failed ({e}); doing a full re-embed.")
             kept_ids, kept_mat = [], np.zeros((0, common.EMBED_DIM), dtype=np.float32)
 

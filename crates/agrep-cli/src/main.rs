@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Where the index lands: $AGREP_DATA_DIR (or the pre-rename $TILT_DATA_DIR), else
-/// ./data — the python side always exports the env when it spawns us, so installed
+/// ./data - the python side always exports the env when it spawns us, so installed
 /// wheels never depend on this process's cwd.
 fn data_dir() -> PathBuf {
     std::env::var_os("AGREP_DATA_DIR")
@@ -155,7 +157,7 @@ fn ingest_agent(
     // Dedupe by (agent, session, turn): Codex resumes write a new rollout file that REPLAYS the
     // earlier turns, so the same message gets ingested once per rollout file (seen up to 14x).
     // Same tuple == identical message, so keep-first is correct.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let deduped: Vec<Message> = msgs
         .into_iter()
         .filter(|m| seen.insert((m.agent, m.session.clone(), m.turn)))
@@ -166,10 +168,73 @@ fn ingest_agent(
         .into_iter()
         .filter(|e| eseen.insert((e.agent, e.session.clone(), e.call_id.clone())))
         .collect();
-    Ok((deduped, ededuped))
+    Ok((normalize_messages(deduped), ededuped))
 }
 
-/// `agrep index` — ingest and (re)write data/messages.jsonl + data/replies.jsonl. The embeddings,
+fn is_synthetic_turn(model: &str) -> bool {
+    model == "<synthetic>"
+}
+
+fn is_control_turn(text: &str) -> bool {
+    let t = text.trim();
+    t == "[Request interrupted by user]" || t == "Request interrupted by user"
+}
+
+fn normalize_messages(msgs: Vec<Message>) -> Vec<Message> {
+    let mut session_models: HashMap<(&'static str, Arc<str>), HashSet<Arc<str>>> = HashMap::new();
+    for m in &msgs {
+        let model = m.model.trim();
+        if model.is_empty() || is_synthetic_turn(model) || is_control_turn(&m.text) {
+            continue;
+        }
+        session_models
+            .entry((m.agent, m.session.clone()))
+            .or_default()
+            .insert(m.model.clone());
+    }
+
+    msgs.into_iter()
+        .map(|m| {
+            let raw_model = m.model.trim();
+            let synthetic = is_synthetic_turn(raw_model);
+            let control = !synthetic && is_control_turn(&m.text);
+            let (who, model, model_source): (&str, Arc<str>, &str) = if synthetic {
+                ("synthetic", Arc::from(""), "synthetic")
+            } else if control {
+                ("control", Arc::from(""), "control")
+            } else if !raw_model.is_empty() {
+                ("user", m.model.clone(), "explicit")
+            } else {
+                let models = session_models.get(&(m.agent, m.session.clone()));
+                match models.map(|s| s.len()).unwrap_or(0) {
+                    1 => {
+                        let model = models
+                            .and_then(|s| s.iter().next())
+                            .cloned()
+                            .unwrap_or_else(|| Arc::from(""));
+                        ("user", model, "session")
+                    }
+                    0 => ("user", Arc::from(""), "unknown"),
+                    _ => ("user", Arc::from(""), "ambiguous_session"),
+                }
+            };
+            Message {
+                agent: m.agent,
+                project: m.project,
+                session: m.session,
+                ts: m.ts,
+                turn: m.turn,
+                text: m.text,
+                who: who.into(),
+                model,
+                model_source: model_source.into(),
+                reply: m.reply,
+            }
+        })
+        .collect()
+}
+
+/// `agrep index` - ingest and (re)write data/messages.jsonl + data/replies.jsonl. The embeddings,
 /// affect, topics, and arcs are produced by the Python sidecar (`python reindex.py`).
 fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let t0 = Instant::now();
@@ -209,7 +274,7 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let n_sessions = cache::write_session_index(&msgs, &data_dir().join("sessions.jsonl"))?;
     lap!("write-msgs");
     // keep = every live session's event filename, so unchanged event files aren't deleted.
-    // The delete sweep is scoped to the agents actually ingested this run — keep covers
+    // The delete sweep is scoped to the agents actually ingested this run - keep covers
     // only their sessions, so an unscoped sweep on `--agent opencode` would wipe the
     // claude/codex event files.
     let keep: std::collections::HashSet<String> = msgs

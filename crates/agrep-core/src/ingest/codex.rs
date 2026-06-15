@@ -20,13 +20,15 @@ use memchr::memmem;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
+use crate::ingest::{
+    cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP,
+};
 use crate::model::{Event, Message};
 
 // Borrowed deserialization (see claude.rs for the soundness argument): Cow scalars
 // borrow from the line, RawValue defers the output/action DOMs until a call actually
 // pairs up. The lines that dominate rollout bytes (reasoning items with encrypted
-// blobs) never reach serde at all — parse_file's prefilter rejects them at memchr speed.
+// blobs) never reach serde at all - parse_file's prefilter rejects them at memchr speed.
 #[derive(Deserialize)]
 struct Line<'a> {
     #[serde(rename = "type", borrow)]
@@ -238,7 +240,7 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     // The active model, updated by each turn_context line and stamped onto turns.
     let mut current_model = String::new();
 
-    // Raw-byte prefilter (sound for the quoted key needles — see claude.rs
+    // Raw-byte prefilter (sound for the quoted key needles - see claude.rs
     // raw_str_value doc). Every line kind we consume is admitted by one of these:
     // messages carry `"role":`, tool calls/outputs carry `"call_id":`, plus the two
     // meta line types (and web_search_call, whose call_id is not guaranteed). The
@@ -433,7 +435,12 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
         turn += 1;
     }
 
-    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), events)
+    (
+        out.into_iter()
+            .map(crate::model::RawMessage::freeze)
+            .collect(),
+        events,
+    )
 }
 
 /// Recursively collect rollout files under `~/.codex/sessions/` (YYYY/MM/DD nesting).

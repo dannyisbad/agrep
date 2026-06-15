@@ -3,13 +3,13 @@
 //! Store layout: `~/.gemini/antigravity-cli/brain/<session-uuid>/`
 //!   - `.system_generated/messages/*.json` is the *inter-agent mailbox* (sender =
 //!     `<uuid>/task-N` task results, cross-uuid subagent `send_message`s, or
-//!     `system` notices) — NONE of these are the user, so we ignore that dir entirely.
+//!     `system` notices) - NONE of these are the user, so we ignore that dir entirely.
 //!   - `.system_generated/logs/transcript.jsonl` is the real conversation log. Each
 //!     line is an event `{type, source, content, created_at, tool_calls, ...}`.
 //!
 //! Discriminator for the user's own typed prompts (verified across all 3 non-empty
 //! sessions, 68 events): an event with `type == "USER_INPUT"` AND
-//! `source == "USER_EXPLICIT"`. This pairing is exact and exclusive — USER_INPUT
+//! `source == "USER_EXPLICIT"`. This pairing is exact and exclusive - USER_INPUT
 //! only ever appears with USER_EXPLICIT, and the model's own turns use
 //! `source == "MODEL"`, system text uses `source == "SYSTEM"`. The human's text is
 //! wrapped as `<USER_REQUEST>...</USER_REQUEST>` followed by injected
@@ -61,8 +61,9 @@ fn is_action_type(ty: &str) -> bool {
 /// Antigravity args values are JSON-encoded strings *inside* JSON ("\"git status\"").
 fn unq(v: &serde_json::Value) -> String {
     match v.as_str() {
-        Some(s) => serde_json::from_str::<String>(s)
-            .unwrap_or_else(|_| s.trim_matches('"').to_string()),
+        Some(s) => {
+            serde_json::from_str::<String>(s).unwrap_or_else(|_| s.trim_matches('"').to_string())
+        }
         None => v.to_string(),
     }
 }
@@ -70,7 +71,13 @@ fn unq(v: &serde_json::Value) -> String {
 /// Human-meaningful summary of an antigravity tool_call's args.
 fn summarize_agy_args(args: &serde_json::Value) -> String {
     if let Some(obj) = args.as_object() {
-        for k in ["CommandLine", "AbsolutePath", "Query", "SearchDirectory", "toolSummary"] {
+        for k in [
+            "CommandLine",
+            "AbsolutePath",
+            "Query",
+            "SearchDirectory",
+            "toolSummary",
+        ] {
             if let Some(v) = obj.get(k) {
                 let s = unq(v);
                 if !s.trim().is_empty() {
@@ -171,7 +178,11 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) {
             Some(serde_json::Value::String(s)) => ts_millis(Some(s)),
             Some(serde_json::Value::Number(n)) => {
                 let v = n.as_i64().unwrap_or(0);
-                if v > 0 && v < 100_000_000_000 { v * 1000 } else { v }
+                if v > 0 && v < 100_000_000_000 {
+                    v * 1000
+                } else {
+                    v
+                }
             }
             _ => 0,
         };
@@ -185,12 +196,22 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) {
             session: session.to_string(),
             ts,
             kind: "subagent_result",
-            name: if title.is_empty() { task.clone() } else { cap_str(title, 200) },
+            name: if title.is_empty() {
+                task.clone()
+            } else {
+                cap_str(title, 200)
+            },
             input: task,
-            output: m.content.as_deref().map(|c| cap_str(c, EVENT_CAP)).unwrap_or_default(),
+            output: m
+                .content
+                .as_deref()
+                .map(|c| cap_str(c, EVENT_CAP))
+                .unwrap_or_default(),
             ok: None,
             call_id: m.id.unwrap_or_else(|| {
-                p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+                p.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
             }),
             child_session: String::new(),
         });
@@ -338,7 +359,12 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>) {
     }
 
     collect_mailbox(brain_dir, &session, &mut evts);
-    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), evts)
+    (
+        out.into_iter()
+            .map(crate::model::RawMessage::freeze)
+            .collect(),
+        evts,
+    )
 }
 
 /// Walk every `brain/<uuid>/` session and collect the user's Antigravity prompts + events.

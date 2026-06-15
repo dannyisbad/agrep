@@ -1,4 +1,4 @@
-"""agrep's terminal search — grep your agent history from the shell.
+"""agrep's terminal search - grep your agent history from the shell.
 
     agrep "rust simd"            # every message across every agent that matches
     agrep deadlock --agent codex # filter to one agent
@@ -8,7 +8,7 @@
 
 Keyword is the default: instant, no model, runs straight off the materialized corpus
 (core tier, any python). --semantic upgrades to meaning-search through a running
-server. Output is grep-style and pipe-friendly — the match is highlighted only when
+server. Output is grep-style and pipe-friendly - the match is highlighted only when
 stdout is a TTY, a trailing count goes to stderr so stdout stays clean.
 """
 
@@ -41,7 +41,7 @@ def _color_on(when: str) -> bool:
 
 def _osc8_ok() -> bool:
     """Does this terminal render OSC 8 hyperlinks? There's no query for it, so use a
-    conservative allowlist of terminals known to support them — unknown terminals get
+    conservative allowlist of terminals known to support them - unknown terminals get
     plain text (a dead-looking link is more annoying than no link). Apple's Terminal.app
     explicitly does NOT support OSC 8. Opt out with AGREP_NO_HYPERLINKS=1."""
     env = os.environ
@@ -96,7 +96,7 @@ def _linker(port: int | None):
 def _proj(p: str) -> str:
     """Last path segment of a project dir, for compact display."""
     p = (p or "").rstrip("/\\")
-    return re.split(r"[/\\]", p)[-1] if p else "—"
+    return re.split(r"[/\\]", p)[-1] if p else "-"
 
 
 def _hl(snippet: str, pat: re.Pattern | None, color: bool) -> str:
@@ -125,11 +125,12 @@ def _is_word_char(c: str) -> bool:
 def _word_scan(q: str, k: int) -> dict:
     """Whole-word search, the fast way: a C-level substring `.find` prefilter, then a
     boundary check only on the (few) entries that contain the word. Far cheaper than a
-    `\\bword\\b` regex over the whole corpus — that regex walks every entry char by char;
+    `\\bword\\b` regex over the whole corpus - that regex walks every entry char by char;
     this only pays the boundary check where the substring already hit."""
     ql = q.lower()
     n = len(ql)
-    fields = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
+    fields = ("session", "agent", "project", "concept", "model", "model_source",
+              "turn", "ts", "who")
     hits = []
     for e in explore._kw_corpus():
         low = e["low"]
@@ -153,7 +154,8 @@ def _regex_scan(pattern: str, k: int) -> dict:
     except re.error as e:
         common.log(f"bad regex: {e}")
         raise SystemExit(2)
-    fields = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
+    fields = ("session", "agent", "project", "concept", "model", "model_source",
+              "turn", "ts", "who")
     hits = []
     for e in explore._kw_corpus():
         m = rx.search(e["low"]) or rx.search(e["text"])
@@ -166,7 +168,7 @@ def _regex_scan(pattern: str, k: int) -> dict:
 
 def _semantic(q: str, k: int, port: int) -> dict | None:
     """Meaning search via a running server (the model is warm there; loading it per
-    CLI call would cost seconds). Queries CHAT level — semantic search's useful unit is
+    CLI call would cost seconds). Queries CHAT level - semantic search's useful unit is
     the relevant chat, and that endpoint is rich (session/title/summary), unlike the
     sparse message level. Returns None if no server is reachable. The 30s timeout
     covers a cold server lazy-loading its embedder on the first call."""
@@ -189,7 +191,8 @@ def _semantic(q: str, k: int, port: int) -> dict | None:
         snip = o.get("title") or (o.get("summary") or "")[:140] or o.get("text", "")
         hits.append({"session": o.get("session", ""), "agent": o.get("agent", ""),
                      "project": o.get("project", "") or o.get("cwd_project", ""),
-                     "model": model, "turn": None, "ts": o.get("ts", 0), "who": "",
+                     "model": model, "model_source": "summary" if model else "unknown",
+                     "turn": None, "ts": o.get("ts", 0), "who": "",
                      "snippet": snip, "summary": o.get("summary", "")})
     return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
@@ -204,7 +207,7 @@ def _filtered(hits: list[dict], agent: str | None, project: str | None,
         pr = project.lower()
         out = [h for h in out if pr in (h.get("project") or "").lower()]
     if who:
-        out = [h for h in out if (h.get("who") == "agent") == (who == "agent")]
+        out = [h for h in out if h.get("who") == who]
     if model:
         needle = model.lower()
         if model_soft:
@@ -290,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
                "  agrep bug --model gpt-5            only turns from that exact model\n"
                "  agrep bug --model spark --soft     model contains spark\n"
                "  agrep -w leak                      whole word only\n"
-               "  agrep -E 'TODO|FIXME' --who agent  regex, agent turns only\n"
+               "  agrep -E 'TODO|FIXME' --who agent  regex, agent replies only\n"
                "  agrep -l auth                      which chats mention it\n"
                "  agrep -c oom                       just the count\n"
                "  agrep \"flaky test\" -s              meaning search (needs a server)\n"
@@ -314,7 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", help="only turns from this exact model name")
     ap.add_argument("--soft", "--model-soft", dest="model_soft", action="store_true",
                     help="with --model, substring-match the model name (like *model*)")
-    ap.add_argument("--who", choices=("user", "agent"), help="only your turns or only the agent's")
+    ap.add_argument("--who", choices=("user", "agent", "control", "synthetic", "recap"),
+                    help="only real user turns, agent replies, control markers, "
+                         "test traffic, or continuation recaps")
     ap.add_argument("-s", "--semantic", action="store_true",
                     help="meaning search: most relevant CHATS via a running server "
                          "(keyword greps message lines; falls back to keyword if no server)")
@@ -331,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
 
     q = " ".join(args.pattern).strip()
     if not q:
-        common.log("empty pattern — give me something to grep for.")
+        common.log("empty pattern - give me something to grep for.")
         return 2
     color = _color_on(args.color)
     filters = bool(args.agent or args.project or args.who or args.model)
@@ -359,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.strict_semantic:
                 common.log(msg)
                 return 2
-            common.log(msg + " — using keyword search instead")
+            common.log(msg + " - using keyword search instead")
         else:
             sem_used = True
     if not sem_used:
@@ -409,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(h, ensure_ascii=False))
     else:
         # clickable headers only when a server is up AND the terminal supports OSC 8 AND
-        # we're rendering for humans (color) — never on piped/flat output.
+        # we're rendering for humans (color) - never on piped/flat output.
         link_port = args.port if (args.port and _reachable(args.port)) else running
         link = _linker(link_port) if color else None
         if args.chats:

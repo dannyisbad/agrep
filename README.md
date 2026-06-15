@@ -1,20 +1,20 @@
 # agrep
 
-Every AI coding agent you run writes its full history to disk — Claude Code, Codex,
+Every AI coding agent you run writes its full history to disk - Claude Code, Codex,
 opencode, Antigravity, Kimi CLI, Cline. agrep reads those stores directly and makes
 your entire cross-agent history greppable from the shell, with a local web explorer
 (**tilt**) on top for browsing, organizing, and live-watching everything.
 
 No hooks, no agent-side install, no telemetry. agrep never modifies the agents or
-their data — it only reads. Everything stays on your machine.
+their data - it only reads. Everything stays on your machine.
 
 ```
 uvx agrep "race condition"      # or: pipx run agrep "race condition"
 ```
 
-That fetches a small prebuilt package (the rust ingest binary + the app — no clone,
+That fetches a small prebuilt package (the rust ingest binary + the app - no clone,
 no cargo), indexes your agent stores on first run (one-time, ~30s for years of
-history), and greps. After that, searches are instant — a derived full-text index
+history), and greps. After that, searches are instant - a derived full-text index
 answers cold CLI calls in well under a second.
 
 For a permanent `agrep` command, install it as a uv tool:
@@ -55,7 +55,7 @@ clickable link that opens the chat in the app (`AGREP_NO_HYPERLINKS=1` to disabl
 
 ## From a hit to the story: `around`
 
-Search tells you *which* session touched a thing. `around` tells you *what happened* —
+Search tells you *which* session touched a thing. `around` tells you *what happened* -
 the local story of a hit (the error, the attempts, the fix) for a few KB instead of a
 whole transcript:
 
@@ -66,14 +66,14 @@ agrep around 00da9752 144 --full    # nothing truncated
 agrep around 00da9752 144 --json    # one object per message/event
 ```
 
-Tool calls render inline (name, input, ok/failed) but never their output — the token
-bomb — unless you opt in with `--tool-output N`. Long messages are capped, and every
+Tool calls render inline (name, input, ok/failed) but never their output - the token
+bomb - unless you opt in with `--tool-output N`. Long messages are capped, and every
 truncation marker carries the exact command that prints the rest, so the follow-up
 never needs guessing.
 
 ## Your agents can use it too
 
-An agent that solved a gnarly bug last week re-derives it from zero today — session
+An agent that solved a gnarly bug last week re-derives it from zero today - session
 context dies, transcripts don't. agrep makes that history queryable at the moment it's
 needed: `--json` everywhere, grep exit codes, stateless addressing (`session:turn`),
 and `around` defaults tuned for token budgets.
@@ -88,14 +88,14 @@ ever set up (`--no-auto` opts out for strict scripts).
 
 ## tilt: the explorer
 
-`agrep ui` opens the human surface — a single local web app over the same index. It
+`agrep ui` opens the human surface - a single local web app over the same index. It
 builds the base index only if one is missing; after that the page opens immediately
 and the server refreshes the index in the background. Use `agrep ui --force-index`
 when you explicitly want to rebuild before opening.
 
 - **One searchable history** across every supported agent. Keyword search is exact and
   instant; semantic search and topic clustering light up with the optional model tier.
-- **A live board** of every running session — across all agents at once — with real
+- **A live board** of every running session - across all agents at once - with real
   state (thinking, which tool is running, queued prompts, errors, durations) read
   straight from the stores. No hooks: it sees sessions you started in any terminal,
   and the subagents they spawn. Images an agent reads or sends render inline.
@@ -146,6 +146,28 @@ agrep discovers sessions under your home directory. Read-only, always:
 Whichever of these exist get indexed; missing ones are skipped. Works on Windows,
 macOS, and Linux.
 
+## Normalized schema
+
+`agrep index` flattens every adapter into one user-side row shape in
+`messages.jsonl`:
+
+```
+{id, agent, project, session, ts, turn, who, text, model?, model_source}
+```
+
+`turn` is the adapter-normalized 0-based user-turn index inside that session. Agent
+replies are kept in `replies.jsonl` and joined by the same `id`, so terminal search
+and `--json` can emit both sides with `who`.
+
+`who` is one of `user`, `agent`, `control`, `synthetic`, or `recap`. Use
+`--who user` for model-vs-model comparisons; control/synthetic/recap rows stay
+searchable but are excluded from doctor's model-attribution denominator.
+
+`model_source` explains attribution: `explicit` came from the source store,
+`session` was backfilled because that session had exactly one explicit model,
+`unknown` means the adapter/store did not expose one, and `ambiguous_session` means
+the session had multiple explicit models so no backfill was safe.
+
 ## Commands
 
 ```
@@ -162,7 +184,7 @@ agrep warm               # server + preloaded semantic models
 ```
 
 To hack on it, clone and use the same commands as `python cli.py <cmd>`
-(needs Rust for the ingest binary — https://rustup.rs):
+(needs Rust for the ingest binary - https://rustup.rs):
 
 ```
 git clone https://github.com/dannyisbad/agrep && cd agrep
@@ -170,16 +192,21 @@ python cli.py ui
 ```
 
 A dev checkout also has thin wrappers: `agrep.cmd` (Windows) forwards the full CLI,
-and `./tilt` / `tilt.cmd` is shorthand for `agrep ui` — type `tilt`, get the explorer.
+and `./tilt` / `tilt.cmd` is shorthand for `agrep ui` - type `tilt`, get the explorer.
+
+Installed and dev runs use the same per-user index by default, so `agrep`,
+`uvx agrep`, and `python cli.py` see one corpus. Use `AGREP_DATA_DIR=./data` only
+when you intentionally want a repo-local test index; `AGREP_VENV_DIR=py/.venv`
+does the same for an isolated smart-tier venv.
 
 ## Privacy
 
 Everything is local. agrep makes no network calls except to a local Ollama if you opt
 into that tier; the one exception is the web explorer, which loads its fonts from
-Google Fonts (none of your data goes with it — and the app works fine offline on
-system-font fallbacks). Your index lives in a per-user data dir (in a dev checkout:
-the **gitignored** `data/`) and is never committed. The server binds to `127.0.0.1`
-only.
+Google Fonts (none of your data goes with it - and the app works fine offline on
+system-font fallbacks). Your index lives in a per-user data dir unless you explicitly
+set `AGREP_DATA_DIR`; repo-local `data/` is for opt-in test indexes. The server binds
+to `127.0.0.1` only.
 
 ## How it's built
 
@@ -192,4 +219,4 @@ the layout and how to add an adapter for another agent.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

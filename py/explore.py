@@ -236,7 +236,12 @@ def _kw_corpus() -> list[dict]:
                             "agent": o.get("agent", ""),
                             "project": o.get("project", ""), "concept": c,
                             "model": o.get("model", ""),
-                            "who": "recap" if t.startswith(RECAP_PREFIX) else "you",
+                            "model_source": o.get(
+                                "model_source",
+                                "explicit" if o.get("model") else "unknown",
+                            ),
+                            "who": "recap" if t.startswith(RECAP_PREFIX)
+                            else o.get("who", "user"),
                             "text": t, "low": t.lower()})
             r = reps.get(o.get("id", ""), "")
             if r:
@@ -244,6 +249,10 @@ def _kw_corpus() -> list[dict]:
                             "agent": o.get("agent", ""),
                             "project": o.get("project", ""), "concept": c,
                             "model": o.get("model", ""),
+                            "model_source": o.get(
+                                "model_source",
+                                "explicit" if o.get("model") else "unknown",
+                            ),
                             "who": "agent", "text": r, "low": r.lower()})
     return out
 
@@ -384,7 +393,7 @@ def _snip_at(text: str, start: int, end: int, pad: int = 80) -> str:
 
 def _kw_pattern(q: str):
     """Compile a search pattern where any run of space/hyphen/underscore in the query matches
-    any run (or none) of the same in the text — so "cyber filter" also finds "cyber-filter",
+    any run (or none) of the same in the text - so "cyber filter" also finds "cyber-filter",
     "cyber_filter", "cyberfilter". This mirrors a grep `cyber[\\s-]*filter` and is what makes
     keyword search surface every real instance, not just the exact-spacing ones."""
     import re
@@ -436,7 +445,7 @@ def resolve_session(q: str) -> list[str]:
 
 
 def _db_session_rows(session: str) -> list[dict] | None:
-    """One session's turns from the derived corpus db — the fast path that keeps
+    """One session's turns from the derived corpus db - the fast path that keeps
     `agrep around` from parsing 50 MB of jsonl. The db stores user text and agent
     replies as separate rows; merge them back to one row per turn. None when the db
     is unavailable (caller falls back to the in-memory caches)."""
@@ -464,7 +473,7 @@ def _db_session_rows(session: str) -> list[dict] | None:
 def get_window(session: str, center: int, n: int = 4) -> dict:
     """A contiguous window of one chat: turns [center-n, center+n] with replies, plus the
     tool/subagent events that happened during each of those turns. This is the middle
-    tier between a search snippet and the whole transcript — callers (around CLI, agents)
+    tier between a search snippet and the whole transcript - callers (around CLI, agents)
     pull the local story of a hit for a few KB instead of re-reading a 50 MB session.
 
     Events carry only a ts, so they're attributed to the latest turn whose user message
@@ -528,7 +537,7 @@ def get_window(session: str, center: int, n: int = 4) -> dict:
 
 def stats() -> dict:
     """Honest corpus totals. The rail lists only summarized sessions, but keyword search
-    reaches every message of every session — these numbers describe that full corpus so
+    reaches every message of every session - these numbers describe that full corpus so
     the UI never undersells (or oversells) what's actually indexed."""
     _freshen()
     idx = _session_index()
@@ -539,7 +548,7 @@ def stats() -> dict:
         "n_summarized_msgs": sum(o.get("n_msgs", 0) for o in _summaries()),
         "n_vibes": len(_vibe_index()),
         # the username path segment, so the web client can treat "Users/<name>" as a
-        # generic container — whoever runs tilt, without hardcoding anyone's name
+        # generic container - whoever runs tilt, without hardcoding anyone's name
         "user_seg": Path.home().name.lower(),
     }
 
@@ -565,7 +574,7 @@ def events_path(agent: str, session: str):
 @functools.lru_cache(maxsize=1)
 def _event_sessions() -> set[str]:
     """Set of '{agent}-{safe_session}' stems that have an event file. One scandir,
-    cached — lets list/detail rows say has_events without touching 12k files."""
+    cached - lets list/detail rows say has_events without touching 12k files."""
     d = common.DATA_DIR / EVENTS_DIR_NAME
     if not d.exists():
         return set()
@@ -578,7 +587,7 @@ def has_events(agent: str, session: str) -> bool:
 
 def get_events(agent: str, session: str) -> list[dict]:
     """The tool/subagent event stream for one session, in ts order (as ingested).
-    Read per-request from the per-session file — small, and deliberately NOT a global
+    Read per-request from the per-session file - small, and deliberately NOT a global
     cache (the full event corpus can run to hundreds of MB)."""
     p = events_path(agent, session)
     if not p.exists():

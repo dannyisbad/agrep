@@ -1,6 +1,6 @@
 """Force a platform-specific, python-agnostic wheel tag (py3-none-<platform>).
 
-agrep bundles a prebuilt rust binary, so each wheel is tied to one OS/arch — pip
+agrep bundles a prebuilt rust binary, so each wheel is tied to one OS/arch - pip
 must only install the matching one. But the python it carries runs on any 3.10+, so
 we don't want the wheel pinned to one interpreter (cp312 etc). The natural tag is
 `py3-none-win_amd64` / `py3-none-macosx_11_0_arm64` / `py3-none-manylinux...`.
@@ -10,7 +10,7 @@ CI sets $AGREP_WHEEL_PLAT to the precise platform tag for the binary it built
 machine's platform tag, which is correct for a local build.
 
 The hook also guarantees the binary is actually present: CI and local builds stage
-_bin/ before packaging, but a `pip install` from the sdist arrives with no _bin —
+_bin/ before packaging, but a `pip install` from the sdist arrives with no _bin -
 there we cargo-build it (the sdist carries the rust source), and if cargo is missing
 we abort the install with a clear message instead of shipping a wheel whose core
 tier can't run.
@@ -50,7 +50,7 @@ class PlatformWheelHook(BuildHookInterface):
         if not cargo:
             raise RuntimeError(
                 "agrep: this platform has no prebuilt wheel, so pip is building from "
-                "source — that needs Rust (https://rustup.rs). Install cargo and retry, "
+                "source - that needs Rust (https://rustup.rs). Install cargo and retry, "
                 "or use a platform with a prebuilt wheel (win/mac/linux x64, mac arm64)."
             )
         subprocess.run([cargo, "build", "--release"], cwd=root, check=True)

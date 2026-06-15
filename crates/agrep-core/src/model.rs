@@ -19,16 +19,22 @@ pub struct Message {
     pub turn: u32,
     /// The human-authored text (the user's words). Wrappers/tool-results already stripped.
     pub text: Arc<str>,
+    /// User-side row type: "user" for real prompts, "control" for non-model control
+    /// markers, "synthetic" for harness/test traffic.
+    pub who: Arc<str>,
     /// Model that produced the agent's side of this turn ("claude-opus-4-8",
     /// "gpt-5.3-codex-spark", "gemini-3.1-pro-preview"). Empty when the source omits it.
     pub model: Arc<str>,
+    /// How `model` was attributed: "explicit", "session", "unknown", "control",
+    /// "synthetic", or "ambiguous_session".
+    pub model_source: Arc<str>,
     /// The agent's reply to this turn, trimmed for display. Empty if none was captured.
     pub reply: Arc<str>,
 }
 
 /// The mutable form the adapters build while parsing one file (replies stream in as
 /// appends, models backfill). `freeze` converts to the shared form exactly once, when
-/// the parse is done — so the Arc fields never need in-place mutation.
+/// the parse is done - so the Arc fields never need in-place mutation.
 pub struct RawMessage {
     pub agent: &'static str,
     pub project: String,
@@ -49,6 +55,12 @@ impl RawMessage {
             ts: self.ts,
             turn: self.turn,
             text: self.text.into(),
+            who: "user".into(),
+            model_source: if self.model.is_empty() {
+                "unknown".into()
+            } else {
+                "explicit".into()
+            },
             model: self.model.into(),
             reply: self.reply.into(),
         }
@@ -56,7 +68,7 @@ impl RawMessage {
 }
 
 /// One tool call or subagent step inside a session. Written to per-session files under
-/// `data/events/` — a parallel stream to `messages.jsonl` that the existing embed/affect
+/// `data/events/` - a parallel stream to `messages.jsonl` that the existing embed/affect
 /// pipeline never reads. Inputs/outputs are CAPPED summaries; the uncapped payload stays
 /// in the source store and is re-fetched on demand by provenance (agent + session + call_id).
 #[derive(Debug, Clone)]

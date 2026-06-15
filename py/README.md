@@ -1,12 +1,13 @@
-# tilt — Python semantic sidecar
+# tilt - Python semantic sidecar
 
 This directory is the Python side of tilt: it turns the developer-chat messages
-that `tilt scan` produces into (a) semantic embeddings for similarity search and
+that `agrep index` produces into (a) semantic embeddings for similarity search and
 (b) a graded affect read per message. The Rust core (`crates/agrep-core`) reads
 the files written here.
 
-A venv is expected at `py/.venv` (see the repo-root `requirements.txt`). Use its
-interpreter for the ML stages:
+The CLI creates and uses a smart-tier venv in agrep's per-user state dir. If you want
+a repo-local dev venv for running these scripts by hand, set `AGREP_VENV_DIR=py/.venv`,
+create it from the repo root, and use its interpreter:
 
 ```
 # Windows
@@ -18,21 +19,25 @@ py/.venv/bin/python embed.py
 Requirements: `transformers>=4.51.0` (needed for Qwen3), `sentence-transformers`,
 `torch`, `numpy`, `scikit-learn`. A CUDA GPU speeds embeddings/affect up; everything
 also runs on CPU (slower), and the code auto-detects which. None of this is needed for
-the core explorer — see the repo-root README's tier table.
+the core explorer - see the repo-root README's tier table.
 
 ---
 
-## The data contract (Python writes, Rust reads — must agree exactly)
+## The shared data contract
+
+`data/` below means the active agrep data dir, which defaults to the OS user data
+dir and can be overridden with `AGREP_DATA_DIR`.
 
 | File | Format |
 |---|---|
-| `data/messages.jsonl` | one JSON per line: `{id, agent, project, session, ts, turn, text}`. `id == "agent:session:turn"`. Produced by `tilt scan`. **Input** to every script here. |
+| `data/messages.jsonl` | one JSON per line: `{id, agent, project, session, ts, turn, who, text, model?, model_source}`. `id == "agent:session:turn"`. Produced by `agrep index`. `who=user` rows are real prompts; control/synthetic/recap rows are searchable but excluded from model-attribution denominators. |
+| `data/replies.jsonl` | one JSON per line: `{id, reply}`. Agent replies are sidecar rows joined by `id`, so embedding/affect reads stay user-side and search can still emit `who=agent`. |
 | `data/embeddings.f32` | raw little-endian `f32`, row-major, `N` rows × `D` cols. **Each row is L2-normalized.** `D = 256` (Matryoshka truncation of the model's native dim, then renormalized). |
-| `data/embeddings.ids` | UTF-8, one message id per line. Row `r` of `embeddings.f32` ↔ line `r` here. **The ids file is the authority for row order** — it need not match `messages.jsonl` order. |
+| `data/embeddings.ids` | UTF-8, one message id per line. Row `r` of `embeddings.f32` ↔ line `r` here. **The ids file is the authority for row order** - it need not match `messages.jsonl` order. |
 | `data/query.f32` | a single `D=256`-dim L2-normalized `f32` vector (the current search query). |
 | `data/emotions.jsonl` | one JSON per line: `{id, rage_raw, hype_raw, top:[...], routed_to_judge}`. |
 
-Because every stored row is L2-normalized, **cosine similarity == dot product** —
+Because every stored row is L2-normalized, **cosine similarity == dot product** -
 exactly what the Rust AVX2 brute-force kernel computes.
 
 ---
@@ -80,13 +85,13 @@ a `routed_to_judge` flag.
 Typical query flow end to end:
 
 ```
-tilt scan                                  # (Rust) writes data/messages.jsonl
+agrep index                                # (Rust) writes data/messages.jsonl
 .venv/Scripts/python.exe embed.py          # writes embeddings.f32 + .ids
 .venv/Scripts/python.exe embed_query.py "…" # writes query.f32
 tilt search …                              # (Rust) AVX2 dot-product over the matrix
 ```
 
-`embed.py` and `emotion.py` are independent — run them in either order.
+`embed.py` and `emotion.py` are independent - run them in either order.
 
 ---
 
@@ -104,17 +109,17 @@ permissive model rather than crashing.
 
 **Model-specific embedding handling** (branched on which candidate loaded):
 
-- **Qwen3-Embedding** — last-token pooling, **left padding**, and an asymmetric
+- **Qwen3-Embedding** - last-token pooling, **left padding**, and an asymmetric
   instruction: **passages get NO prefix**; **queries** get
   `Instruct: Retrieve developer-chat messages relevant to the query\nQuery: {q}`.
-- **BGE** — mean pooling; passages no prefix; queries get
+- **BGE** - mean pooling; passages no prefix; queries get
   `Represent this sentence for searching relevant passages: {q}`.
-- **MiniLM** — mean pooling; no prefix on either side.
+- **MiniLM** - mean pooling; no prefix on either side.
 
 `embed_query.py` re-runs the same resolve list so the query is embedded by the
 same model that produced the matrix, and applies the matching query prefix.
 
-> Whichever model `embed.py` uses, `embed_query.py` must use the same one —
+> Whichever model `embed.py` uses, `embed_query.py` must use the same one -
 > cosine is only meaningful within a single embedding space. If you pin or
 > change the candidate list, change it in `embed.py` (the single source of
 > truth `embed_query.py` imports from).
@@ -123,7 +128,7 @@ same model that produced the matrix, and applies the matching query prefix.
 
 ## Affect gate details (`emotion.py`)
 
-Multi-label GoEmotions (sigmoid per label, **graded** — not argmax). Per message:
+Multi-label GoEmotions (sigmoid per label, **graded** - not argmax). Per message:
 
 - `rage_raw = anger + annoyance + disapproval + disgust + disappointment`
 - `hype_raw = excitement + admiration + joy + approval + amusement`
@@ -135,7 +140,7 @@ Multi-label GoEmotions (sigmoid per label, **graded** — not argmax). Per messa
 
 **The LLM judge is a separate, later stage.** Messages flagged
 `routed_to_judge=true` are intended to be handed to an LLM (Qwen3.5-4B) for a
-final affect verdict. That judge is **not** implemented here — `emotion.py` only
+final affect verdict. That judge is **not** implemented here - `emotion.py` only
 scores and routes.
 
 ---

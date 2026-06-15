@@ -1,4 +1,4 @@
-"""Derived sqlite/FTS5 index over the search corpus — why cold CLI calls are fast.
+"""Derived sqlite/FTS5 index over the search corpus - why cold CLI calls are fast.
 
 The materialized jsonl stays the source of truth (debuggable, the server's warm caches
 still read it). This module mirrors it into data/corpus.db with a trigram FTS5 index,
@@ -8,7 +8,7 @@ connect; a stale db rebuilds in one shot and swaps in atomically.
 
 Search semantics are IDENTICAL to the legacy scans (explore.keyword_search and
 search.py's word/regex paths): FTS narrows to candidate rows, then the same python
-matchers confirm and place snippets. Trigram needs >=3-char tokens — shorter ones fall
+matchers confirm and place snippets. Trigram needs >=3-char tokens - shorter ones fall
 back to an indexed-table LIKE scan, still no jsonl parse. sqlite without trigram
 support returns None from connect() and callers use the legacy path.
 """
@@ -25,11 +25,12 @@ from pathlib import Path
 import common
 
 DB_PATH = common.DATA_DIR / "corpus.db"
-_SCHEMA = "2"
+_SCHEMA = "3"
 # corpus inputs; a change in any (mtime_ns, size) invalidates the db
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json")
 RECAP_PREFIX = "This session is being continued from a previous conversation"
-_FIELDS = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
+_FIELDS = ("session", "agent", "project", "concept", "model", "model_source",
+           "turn", "ts", "who")
 _TEXT = len(_FIELDS)
 
 
@@ -92,7 +93,7 @@ def _build(dst) -> None:
         CREATE TABLE msgs(
             id INTEGER PRIMARY KEY,
             session TEXT NOT NULL, turn INTEGER, ts INTEGER,
-            agent TEXT, project TEXT, concept TEXT, model TEXT,
+            agent TEXT, project TEXT, concept TEXT, model TEXT, model_source TEXT,
             who TEXT, text TEXT);
         CREATE INDEX msgs_session ON msgs(session, turn);
         CREATE VIRTUAL TABLE msgs_fts USING fts5(
@@ -127,8 +128,8 @@ def _build(dst) -> None:
             if o.get("id"):
                 reps[o["id"]] = o.get("reply", "")
 
-    ins = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, model, who, text) "
-           "VALUES(?,?,?,?,?,?,?,?,?)")
+    ins = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, model, "
+           "model_source, who, text) VALUES(?,?,?,?,?,?,?,?,?,?)")
     rows = []
     with common.MESSAGES_PATH.open(encoding="utf-8") as f:
         for line in f:
@@ -142,11 +143,14 @@ def _build(dst) -> None:
             s = o.get("session")
             if not s:
                 continue
+            model = o.get("model", "")
+            model_source = o.get("model_source") or ("explicit" if model else "unknown")
             base = (s, o.get("turn", 0), o.get("ts", 0), o.get("agent", ""),
-                    o.get("project", ""), concept.get(s, ""), o.get("model", ""))
+                    o.get("project", ""), concept.get(s, ""), model, model_source)
             t = o.get("text", "") or ""
             if t:
-                rows.append((*base, "recap" if t.startswith(RECAP_PREFIX) else "you", t))
+                who = "recap" if t.startswith(RECAP_PREFIX) else o.get("who", "user")
+                rows.append((*base, who, t))
             r = reps.get(o.get("id", ""), "")
             if r:
                 rows.append((*base, "agent", r))
@@ -199,7 +203,7 @@ def connect(quiet: bool = False) -> sqlite3.Connection | None:
     if db is not None:
         return db
     if not quiet:
-        common.log("(re)building search index — one-time after each reindex…")
+        common.log("(re)building search index - one-time after each reindex…")
     with common.IndexLock("corpusdb"):
         stamp = _stamp()
         db = _valid_db(stamp)
@@ -234,7 +238,8 @@ def _candidates(db: sqlite3.Connection, toks: list[str]):
     for >=3-char tokens, indexed LIKE for the stubs. Yields msgs rows."""
     fts = [t for t in toks if len(t) >= 3]
     likes = [t for t in toks if len(t) < 3]
-    sel = "SELECT session, agent, project, concept, model, turn, ts, who, text FROM msgs"
+    sel = ("SELECT session, agent, project, concept, model, model_source, "
+           "turn, ts, who, text FROM msgs")
     if fts:
         where = ["id IN (SELECT rowid FROM msgs_fts WHERE msgs_fts MATCH ?)"]
         params: list = [" AND ".join(_fts_quote(t) for t in fts)]
@@ -335,7 +340,8 @@ def regex(db: sqlite3.Connection, pattern: str, k: int) -> dict:
     hits = []
     lit = _required_literal(pattern)
     cur = (_candidates(db, [lit.lower()]) if lit else db.execute(
-        "SELECT session, agent, project, concept, model, turn, ts, who, text FROM msgs"))
+        "SELECT session, agent, project, concept, model, model_source, "
+        "turn, ts, who, text FROM msgs"))
     for row in cur:
         m = rx.search(row[_TEXT])
         if m:
@@ -346,6 +352,6 @@ def regex(db: sqlite3.Connection, pattern: str, k: int) -> dict:
 def session_rows(db: sqlite3.Connection, session: str) -> list[dict]:
     """One session's rows in turn order, for explore.get_window's fast path."""
     cur = db.execute(
-        "SELECT session, agent, project, concept, model, turn, ts, who, text FROM msgs "
+        "SELECT session, agent, project, concept, model, model_source, turn, ts, who, text FROM msgs "
         "WHERE session = ? ORDER BY turn", (session,))
     return [dict(zip((*_FIELDS, "text"), row)) for row in cur]

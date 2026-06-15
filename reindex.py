@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""tilt reindex — one command to (re)build the whole index.
+"""tilt reindex - one command to (re)build the whole index.
 
 By default every stage is INCREMENTAL: the Rust ingest is always fast, and the
 GPU/LLM stages skip messages/sessions they've already processed, so re-running
@@ -25,7 +25,7 @@ Usage:
     python reindex.py --full         # recompute every stage
     python reindex.py --no-build     # skip cargo build (binary already current)
 
-Run it with any Python; it auto-selects py/.venv for the heavy stages.
+Run it with any Python; it auto-selects the smart-tier venv for the heavy stages.
 """
 
 from __future__ import annotations
@@ -87,13 +87,13 @@ def main() -> int:
     # Fast path: if ingest produced byte-identical messages (no new chats since last
     # run), the whole downstream pipeline would reproduce what's already on disk, so
     # skip it. --full forces a rebuild regardless.
-    msgs = ROOT / "data" / "messages.jsonl"
-    sig_file = ROOT / "data" / ".reindex.sig"
+    msgs = common.MESSAGES_PATH
+    sig_file = common.DATA_DIR / ".reindex.sig"
     sig = ""
     if msgs.exists():
         sig = f"{msgs.stat().st_size}:" + hashlib.md5(msgs.read_bytes()).hexdigest()
     if not args.full and sig and sig_file.exists() and sig_file.read_text().strip() == sig:
-        print(f"\n  no new messages since last index — already up to date. "
+        print(f"\n  no new messages since last index - already up to date. "
               f"({time.perf_counter() - t0:.0f}s)")
         print("  (pass --full to rebuild embeddings/affect/topics/arcs anyway.)")
         return 0
@@ -122,7 +122,7 @@ def main() -> int:
         run("vibe arcs", [PY, "py/vibe.py", "--top", "999", "--min-turns", "8"], optional=True)
 
     # Record what we just fully processed, so an unchanged re-run is instant. A capped
-    # run (--max-new) may have left summaries pending, so don't stamp it complete —
+    # run (--max-new) may have left summaries pending, so don't stamp it complete -
     # the next run must reach the summarize stage again to drain the backlog.
     if sig and not args.max_new:
         sig_file.write_text(sig, encoding="utf-8")

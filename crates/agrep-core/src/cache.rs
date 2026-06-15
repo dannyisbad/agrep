@@ -111,10 +111,14 @@ struct Record<'a> {
     ts: i64,
     turn: u32,
     text: &'a str,
+    /// User-side row kind. Agent replies live in replies.jsonl and join by id.
+    who: &'a str,
     /// Model on the agent's side of this turn ("" when unknown). Tiny, so it rides along
     /// in the hot file; the bulky reply text goes to the replies sidecar instead.
     #[serde(skip_serializing_if = "str::is_empty")]
     model: &'a str,
+    /// explicit | session | unknown | control | synthetic | ambiguous_session.
+    model_source: &'a str,
 }
 
 impl<'a> Record<'a> {
@@ -127,7 +131,9 @@ impl<'a> Record<'a> {
             ts: m.ts,
             turn: m.turn,
             text: &m.text,
+            who: &m.who,
             model: &m.model,
+            model_source: &m.model_source,
         }
     }
 }
@@ -303,7 +309,7 @@ fn content_hash(bytes: &[u8]) -> u64 {
 ///    append-only, so a re-parsed session always carries its complete event set.
 ///
 /// `agents` scopes the DELETE pass: `keep` is built from this run's messages, so on a
-/// single-agent run it contains only that agent's sessions — an unscoped sweep would
+/// single-agent run it contains only that agent's sessions - an unscoped sweep would
 /// silently delete every other agent's event files (it did). Only files whose
 /// `{agent}-` prefix belongs to an adapter actually ingested this run are eligible.
 ///
@@ -368,7 +374,7 @@ pub fn write_events(
         n_events += evs.len();
     }
 
-    // Drop event files (and manifest entries) whose session is no longer live — but only
+    // Drop event files (and manifest entries) whose session is no longer live - but only
     // for the agents this run actually ingested (see the doc comment: an unscoped sweep
     // on a single-agent run deletes every other agent's files).
     if let Ok(rd) = fs::read_dir(dir) {
@@ -489,7 +495,9 @@ mod tests {
                 ts: 1_700_000_000_000,
                 turn: 0,
                 text: "first".into(),
+                who: "user".into(),
                 model: "claude-opus-4-8".into(),
+                model_source: "explicit".into(),
                 reply: "an answer".into(),
             },
             Message {
@@ -499,7 +507,9 @@ mod tests {
                 ts: 0,
                 turn: 7,
                 text: "with \"quotes\" and \n newline".into(),
+                who: "user".into(),
                 model: "".into(),
+                model_source: "unknown".into(),
                 reply: "".into(),
             },
         ];
@@ -520,10 +530,14 @@ mod tests {
         assert_eq!(v0["ts"], 1_700_000_000_000i64);
         assert_eq!(v0["turn"], 0);
         assert_eq!(v0["text"], "first");
+        assert_eq!(v0["who"], "user");
+        assert_eq!(v0["model_source"], "explicit");
 
         let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(v1["id"], "opencode:sess-2:7");
         assert_eq!(v1["text"], "with \"quotes\" and \n newline");
+        assert_eq!(v1["who"], "user");
+        assert_eq!(v1["model_source"], "unknown");
 
         std::fs::remove_file(&path).ok();
     }

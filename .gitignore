@@ -4,7 +4,7 @@
 /dist-test
 *.bin
 
-# the built index — your entire chat history lives here. NEVER commit this.
+# the built index - your entire chat history lives here. NEVER commit this.
 /data
 
 # python

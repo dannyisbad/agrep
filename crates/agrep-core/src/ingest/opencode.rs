@@ -15,7 +15,7 @@
 //! the following input: {...}"), tool results ("Image read successfully"), and
 //! file attachments (`<path>...</path><type>file</type><content>...`). Real corpora
 //! mix these with a genuine typed part in the same message, so filtering is done per
-//! PART (drop injected wrappers, then concatenate survivors) — never per message.
+//! PART (drop injected wrappers, then concatenate survivors) - never per message.
 //! We under-include rather than risk labeling agent/system text as the user's.
 
 use rusqlite::{Connection, OpenFlags};
@@ -53,7 +53,7 @@ fn is_injected_part(text: &str) -> bool {
 ///
 /// The part table is where the whole history lives (~1.6GB across the live DBs), and the
 /// old shape scanned it TWICE (messages, then events with a LIKE) while shipping every
-/// part's full JSON — megabyte tool outputs included — into Rust strings, re-parsing the
+/// part's full JSON - megabyte tool outputs included - into Rust strings, re-parsing the
 /// message envelope once per part. Now SQLite does the filtering and field extraction in
 /// C (`json_extract`), the output is capped with `substr` before it crosses the FFI, and
 /// both consumers share one scan. Rust never sees a payload it won't keep.
@@ -202,8 +202,8 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         }
     }
 
-    // Tool rows are buffered, then sorted by (session, part time, part id) — the exact
-    // ORDER BY the old dedicated events query used — before becoming Events.
+    // Tool rows are buffered, then sorted by (session, part time, part id) - the exact
+    // ORDER BY the old dedicated events query used - before becoming Events.
     let mut tool_rows: Vec<Row> = Vec::new();
 
     for r in rows.flatten() {
@@ -237,7 +237,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
             Some(t) if !t.trim().is_empty() => t,
             _ => continue,
         };
-        // Drop opencode-injected wrappers at the PART level — user turns only (the
+        // Drop opencode-injected wrappers at the PART level - user turns only (the
         // assistant's prose is what we want to keep verbatim as the reply).
         if role == "user" && is_injected_part(&ptext) {
             continue;
@@ -247,7 +247,13 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         if session_id != cur_session {
             if have_msg {
                 flush(
-                    &mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_role, &cur_model,
+                    &mut out,
+                    &mut turn,
+                    &cur_session,
+                    &cur_dir,
+                    cur_ts,
+                    &cur_role,
+                    &cur_model,
                     &cur_text,
                 );
             }
@@ -261,7 +267,13 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         if !have_msg || m_id != cur_msg_id {
             if have_msg {
                 flush(
-                    &mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_role, &cur_model,
+                    &mut out,
+                    &mut turn,
+                    &cur_session,
+                    &cur_dir,
+                    cur_ts,
+                    &cur_role,
+                    &cur_model,
                     &cur_text,
                 );
             }
@@ -282,7 +294,14 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
     // Final pending message.
     if have_msg {
         flush(
-            &mut out, &mut turn, &cur_session, &cur_dir, cur_ts, &cur_role, &cur_model, &cur_text,
+            &mut out,
+            &mut turn,
+            &cur_session,
+            &cur_dir,
+            cur_ts,
+            &cur_role,
+            &cur_model,
+            &cur_text,
         );
     }
 
@@ -356,7 +375,12 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>) {
         }
     }
 
-    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), events)
+    (
+        out.into_iter()
+            .map(crate::model::RawMessage::freeze)
+            .collect(),
+        events,
+    )
 }
 
 /// Open each live opencode DB read-only and collect the user's typed messages + tool events.

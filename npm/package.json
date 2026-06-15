@@ -1,7 +1,7 @@
 {
   "name": "@mundy/agrep",
-  "version": "0.1.4",
-  "description": "grep your AI coding agents' chat history (Claude Code, Codex, opencode, Antigravity, Kimi, Cline) — npm shim that runs the real package via uv/pipx",
+  "version": "0.1.5",
+  "description": "grep your AI coding agents' chat history (Claude Code, Codex, opencode, Antigravity, Kimi, Cline) - npm shim that runs the real package via uv/pipx",
   "bin": { "agrep": "bin.js" },
   "scripts": {
     "postinstall": "node postinstall.js"

@@ -3,7 +3,7 @@
 The old setup panel printed commands and hoped. These jobs run them server-side
 with progress the UI polls (GET /setup/state). One job at a time. Steps:
 
-  smart   create py/.venv (if missing) + pip install -r requirements.txt.
+  smart   create the smart-tier venv (if missing) + pip install -r requirements.txt.
           Always flags restart_needed on success: the running server's import
           state predates the new deps, so it relaunches itself under the venv
           (POST /setup/restart) instead of telling anyone to run a command.
@@ -178,7 +178,7 @@ def _torch_wheel_pys() -> set[tuple[int, int]] | None:
 
 
 def pick_python() -> tuple[tuple[int, int], str]:
-    """The interpreter that should own py/.venv: the newest installed CPython that
+    """The interpreter that should own the smart-tier venv: the newest installed CPython that
     torch actually ships wheels for. A 3.14-only default would otherwise sail into
     a cryptic 'no matching distribution' from pip. Shared with `doctor --fix`."""
     pys = _find_pythons()
@@ -219,13 +219,13 @@ def _smart() -> None:
     if cur:
         wheels = _torch_wheel_pys()
         if wheels and cur not in wheels:
-            _set(label=f"rebuilding py/.venv (python {cur[0]}.{cur[1]} has no torch wheels)",
+            _set(label=f"rebuilding smart venv (python {cur[0]}.{cur[1]} has no torch wheels)",
                  line="")
             shutil.rmtree(VENV_DIR)
     if not VENV_PY.exists():
         (ma, mi), py = pick_python()
         _stream([py, "-m", "venv", str(VENV_DIR)],
-                f"creating py/.venv (python {ma}.{mi})")
+                f"creating smart venv (python {ma}.{mi})")
     _stream([str(VENV_PY), "-m", "pip", "install", "-r", "requirements.txt",
              "--progress-bar", "off"],
             "installing python deps (torch is the big one, ~2.5GB)")

@@ -3,7 +3,7 @@
 The CLI twin of the in-app status chip. agrep works in tiers: a stdlib-only clone
 browses, keyword-searches, watches live sessions, and resumes; the smart tier adds
 semantic search + topics + mood arcs; the named tier adds generated titles/summaries.
-This prints which tiers are live and, for every gap, the exact command to unlock it —
+This prints which tiers are live and, for every gap, the exact command to unlock it -
 no state leaves the reader guessing what to run next.
 
   agrep doctor          # report
@@ -12,9 +12,11 @@ no state leaves the reader guessing what to run next.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import common
@@ -34,6 +36,13 @@ CLI = common.cli_name()
 def _row(name: str, status: str, detail: str = "") -> None:
     glyph = {OK: "ok ", MISS: "MISS", OPT: "-- "}.get(status, "?  ")
     print(f"  [{glyph}] {name:<22} {detail}")
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _venv_has(mod: str) -> bool:
@@ -65,10 +74,48 @@ def _stores() -> list[tuple[str, Path, str]]:
     ]
 
 
+def _corpus_quality() -> dict:
+    out = {
+        "n": 0,
+        "accountable": 0,
+        "with_model": 0,
+        "unknown": 0,
+        "by_who": Counter(),
+        "by_source": Counter(),
+        "unknown_by_agent": Counter(),
+    }
+    if not common.MESSAGES_PATH.exists():
+        return out
+    with common.MESSAGES_PATH.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            out["n"] += 1
+            model = (o.get("model") or "").strip()
+            who = o.get("who", "user")
+            source = o.get("model_source") or ("explicit" if model else "unknown")
+            out["by_who"][who] += 1
+            out["by_source"][source] += 1
+            if who != "user":
+                continue
+            out["accountable"] += 1
+            if model:
+                out["with_model"] += 1
+            else:
+                out["unknown"] += 1
+                out["unknown_by_agent"][o.get("agent", "") or "?"] += 1
+    return out
+
+
 def probe() -> dict:
     """Structured tier report for the in-app setup panel (GET /doctor). Same checks
     as `report()`, no printing. The venv module probes spawn a python each, so this
-    costs ~1-2s — the UI calls it on demand (setup open / recheck), never on boot."""
+    costs ~1-2s - the UI calls it on demand (setup open / recheck), never on boot."""
     has_cargo = shutil.which("cargo") is not None
     has_bin = INGEST_BIN.exists()
     has_venv = VENV_PY.exists()
@@ -86,6 +133,12 @@ def probe() -> dict:
         indexed = {"sessions": sum(1 for _ in sj.open(encoding="utf-8")),
                    "age_s": int(time.time() - sj.stat().st_mtime)}
     return {
+        "paths": {
+            "data_dir": str(common.DATA_DIR),
+            "data_source": common.data_dir_source(),
+            "venv_dir": str(common.VENV_DIR),
+            "warnings": common.data_dir_warnings(),
+        },
         "core": {"live": has_bin, "rust": has_cargo, "binary": has_bin,
                  "stores": stores, "indexed": indexed},
         "smart": {"live": all(deps.values()), "venv": has_venv, "deps": deps},
@@ -96,6 +149,12 @@ def probe() -> dict:
 
 def report() -> dict:
     fixes: list[str] = []
+
+    print("\npaths")
+    _row("data dir", OK, f"{common.DATA_DIR} ({common.data_dir_source()})")
+    _row("smart venv", OK if VENV_PY.exists() else OPT, _display_path(common.VENV_DIR))
+    for warning in common.data_dir_warnings():
+        _row("data warning", OPT, warning)
 
     print("\ncore (required)")
     has_cargo = shutil.which("cargo") is not None
@@ -110,7 +169,7 @@ def report() -> dict:
     except ValueError:
         bin_disp = str(INGEST_BIN)                     # bundled / $AGREP_RS_BIN: outside the tree
     _row("ingest binary", OK if has_bin else MISS,
-         bin_disp if has_bin else f"not built — `{CLI} index` compiles it")
+         bin_disp if has_bin else f"not built - `{CLI} index` compiles it")
     if not has_bin and has_cargo:
         fixes.append(f"build the ingest binary: `{CLI} index`")
 
@@ -125,30 +184,30 @@ def report() -> dict:
             found_stores.append(agent)
     _row("agent stores", OK if found_stores else MISS,
          ", ".join(found_stores) if found_stores
-         else "none under ~ — start a Claude/Codex/opencode session, then re-run doctor")
+         else "none under ~ - start a Claude/Codex/opencode session, then re-run doctor")
 
     print("\nsmart tier - semantic search, topics, mood arcs (optional)")
     has_venv = VENV_PY.exists()
     _row("python venv", OK if has_venv else OPT,
-         str(VENV_PY.relative_to(ROOT)) if has_venv else f"none yet — `{CLI} doctor --fix` creates it")
+         _display_path(VENV_PY) if has_venv else f"none yet - `{CLI} doctor --fix` creates it")
     deps = {m: (_venv_has(m) if has_venv else False)
             for m in ("numpy", "torch", "sentence_transformers", "sklearn")}
     for m, present in deps.items():
         _row(m, OK if present else OPT,
-             "" if present else f"not installed — `{CLI} doctor --fix`")
+             "" if present else f"not installed - `{CLI} doctor --fix`")
     if not all(deps.values()):
         fixes.append(f"smart tier: `{CLI} doctor --fix`  "
-                     "(creates py/.venv, installs requirements.txt)")
+                     f"(creates {_display_path(common.VENV_DIR)}, installs requirements.txt)")
 
     print("\nnamed tier - generated titles & summaries (optional)")
     models = _ollama_models()
     if models is None:
-        _row("ollama", OPT, "not running — install from https://ollama.com, then re-run doctor")
+        _row("ollama", OPT, "not running - install from https://ollama.com, then re-run doctor")
         fixes.append("named tier: install Ollama, then `ollama pull qwen2.5:3b-instruct`")
     else:
         _row("ollama", OK, "reachable")
         _row("a model pulled", OK if models else OPT,
-             ", ".join(models[:3]) if models else "none — `ollama pull qwen2.5:3b-instruct`")
+             ", ".join(models[:3]) if models else "none - `ollama pull qwen2.5:3b-instruct`")
         if not models:
             fixes.append("named tier: `ollama pull qwen2.5:3b-instruct`")
 
@@ -160,8 +219,29 @@ def report() -> dict:
         age = int(time.time() - sj.stat().st_mtime)
         _row("built", OK, f"{n} sessions, updated {age // 60}m ago "
                           f"(refresh anytime: `{CLI} index`)")
+        q = _corpus_quality()
+        accountable = int(q["accountable"])
+        if accountable:
+            with_model = int(q["with_model"])
+            unknown = int(q["unknown"])
+            pct = 100.0 * with_model / accountable
+            _row("model attribution", OK if unknown == 0 else OPT,
+                 f"{with_model:,}/{accountable:,} user turns ({pct:.1f}%), "
+                 f"session backfilled {q['by_source'].get('session', 0):,}, "
+                 f"unknown {unknown:,}")
+            non_model = {
+                k: q["by_who"].get(k, 0)
+                for k in ("control", "synthetic", "recap")
+                if q["by_who"].get(k, 0)
+            }
+            if non_model:
+                _row("non-model turns", OPT,
+                     ", ".join(f"{k} {v:,}" for k, v in non_model.items()))
+            if unknown:
+                _row("unknown by agent", OPT,
+                     ", ".join(f"{k} {v:,}" for k, v in q["unknown_by_agent"].most_common()))
     else:
-        _row("built", OPT, f"none yet — your first `{CLI} <pattern>` builds it automatically")
+        _row("built", OPT, f"none yet - your first `{CLI} <pattern>` builds it automatically")
 
     tiers = []
     if has_bin or has_cargo:
@@ -170,7 +250,7 @@ def report() -> dict:
         tiers.append("smart")
     if models:
         tiers.append("named")
-    print(f"\ntiers available: {', '.join(tiers) or 'none — install Rust first (https://rustup.rs)'}")
+    print(f"\ntiers available: {', '.join(tiers) or 'none - install Rust first (https://rustup.rs)'}")
     if fixes:
         print("\nto unlock more:")
         for f in dict.fromkeys(fixes):  # dedupe, keep order
@@ -193,11 +273,13 @@ def fix() -> int:
         try:
             import setupjobs
             (ma, mi), py = setupjobs.pick_python()
-            print(f"creating py/.venv (python {ma}.{mi}) ...")
+            print(f"creating smart venv at {_display_path(common.VENV_DIR)} "
+                  f"(python {ma}.{mi}) ...")
         except Exception as e:  # noqa: BLE001
             print(f"  ! python picker: {e}")
-            print("creating py/.venv (current python) ...")
-        r = subprocess.run([py, "-m", "venv", str(ROOT / "py" / ".venv")])
+            print(f"creating smart venv at {_display_path(common.VENV_DIR)} "
+                  "(current python) ...")
+        r = subprocess.run([py, "-m", "venv", str(common.VENV_DIR)])
         if r.returncode != 0:
             print("  ! venv creation failed.")
             return 1

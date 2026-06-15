@@ -4,7 +4,8 @@ This module is the Python side of the EMBEDDING CONTRACT that the Rust reader
 (crates/agrep-core) and these scripts must agree on EXACTLY:
 
   data/messages.jsonl  one JSON object per line:
-                         {id, agent, project, session, ts, turn, text, model?}
+                         {id, agent, project, session, ts, turn, text, who,
+                          model?, model_source}
                        id == "agent:session:turn". Produced by the ingest binary.
 
   data/embeddings.f32  raw little-endian float32, row-major, N rows x D cols.
@@ -47,8 +48,7 @@ WIN = sys.platform == "win32"
 
 def _is_dev_checkout() -> bool:
     """A real source tree, not an installed wheel: has the rust crate / git dir
-    alongside. In dev the index lives in <repo>/data; installed, REPO_ROOT is
-    read-only site-packages so it can't be."""
+    alongside. Used for CLI naming and dev binary discovery, not data placement."""
     return (REPO_ROOT / "Cargo.toml").exists() or (REPO_ROOT / ".git").exists()
 
 
@@ -65,22 +65,88 @@ def _user_data_dir() -> Path:
     return Path(base) / "agrep"
 
 
-# $AGREP_DATA_DIR wins (lets the wheel launcher point anywhere, and lets a dev
-# override too); else <repo>/data in a checkout; else the per-user dir. The TILT_*
-# spellings predate the agrep rename and stay honored so old shims keep working.
+# $AGREP_DATA_DIR wins (lets the wheel launcher point anywhere, and lets tests/dev
+# opt into repo-local fixtures); otherwise everything uses the same per-user dir.
+# The TILT_* spellings predate the agrep rename and stay honored so old shims keep
+# working.
 _env_data = os.environ.get("AGREP_DATA_DIR") or os.environ.get("TILT_DATA_DIR")
+_env_data_source = os.environ.get("AGREP_DATA_DIR_SOURCE")
+DATA_DIR_SOURCE = _env_data_source if _env_data_source in ("default", "env") else (
+    "env" if _env_data else "default"
+)
+DEFAULT_DATA_DIR = _user_data_dir()
+LEGACY_REPO_DATA_DIR = REPO_ROOT / "data"
 if _env_data:
     DATA_DIR = Path(_env_data).expanduser()
-elif _is_dev_checkout():
-    DATA_DIR = REPO_ROOT / "data"
 else:
-    DATA_DIR = _user_data_dir()
+    DATA_DIR = DEFAULT_DATA_DIR
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-# Export the RESOLVED dir so every child agrees with us — the rust ingest, reindex
+# Export the RESOLVED dir so every child agrees with us: the rust ingest, reindex
 # stages, and spawned servers all read this env. Without it the binary falls back to
-# cwd-relative ./data, which installed means read-only-ish site-packages, not here.
+# cwd-relative ./data, which splits the world depending on how agrep was launched.
 os.environ["AGREP_DATA_DIR"] = str(DATA_DIR)
+os.environ["AGREP_DATA_DIR_SOURCE"] = DATA_DIR_SOURCE
 INDEX_LOCK_PATH = DATA_DIR / ".index.lock"
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a.absolute() == b.absolute()
+
+
+def _data_artifacts(root: Path) -> dict[str, os.stat_result]:
+    out = {}
+    for name in (
+        "messages.jsonl",
+        "sessions.jsonl",
+        "replies.jsonl",
+        "emotions.jsonl",
+        "corpus.db",
+        ".reindex.sig",
+    ):
+        p = root / name
+        try:
+            if p.exists():
+                out[name] = p.stat()
+        except OSError:
+            continue
+    return out
+
+
+def data_dir_source() -> str:
+    return DATA_DIR_SOURCE
+
+
+def data_dir_warnings() -> list[str]:
+    """Warn when an old repo-local data dir can be mistaken for the active index."""
+    legacy = LEGACY_REPO_DATA_DIR
+    if _same_path(legacy, DATA_DIR):
+        return []
+    legacy_files = _data_artifacts(legacy)
+    if not legacy_files:
+        return []
+
+    active_files = _data_artifacts(DATA_DIR)
+    only_legacy = [n for n in legacy_files if n not in active_files]
+    newer_legacy = [
+        n for n, st in legacy_files.items()
+        if n in active_files and st.st_mtime > active_files[n].st_mtime + 5
+    ]
+    bits: list[str] = []
+    if only_legacy:
+        bits.append("only there: " + ", ".join(only_legacy[:4]))
+    if newer_legacy:
+        bits.append("newer there: " + ", ".join(newer_legacy[:4]))
+    if not bits:
+        bits.append("old artifacts present")
+
+    return [
+        "repo-local data dir ignored: "
+        f"{legacy} ({'; '.join(bits)}). active: {DATA_DIR}. "
+        f"Set AGREP_DATA_DIR={legacy} to use it intentionally."
+    ]
 
 
 class IndexLock:
@@ -143,14 +209,14 @@ def replace_with_retry(src: Path, dst: Path, attempts: int = 80) -> None:
 
 
 def _venv_dir() -> Path:
-    """Where the smart-tier venv lives. Dev: <repo>/py/.venv. Installed: under the
-    user data dir, because the package dir is read-only site-packages and the in-app
-    'install smart tier' button writes a venv there."""
+    """Where the smart-tier venv lives.
+
+    Default to the same per-user state dir in both installed and dev runs. Set
+    AGREP_VENV_DIR/TILT_VENV_DIR to opt into a repo-local venv for isolated hacking.
+    """
     env = os.environ.get("AGREP_VENV_DIR") or os.environ.get("TILT_VENV_DIR")
     if env:
         return Path(env).expanduser()
-    if _is_dev_checkout():
-        return REPO_ROOT / "py" / ".venv"
     return DATA_DIR / ".venv"
 
 
@@ -161,7 +227,7 @@ VENV_PY = VENV_DIR / ("Scripts" if WIN else "bin") / ("python.exe" if WIN else "
 def venv_python() -> str:
     """The python the server/pipeline should run under: the smart-tier venv when it
     exists (it has numpy/torch, so semantic search works), else whatever's running us
-    (core tier — browse/keyword/live all run on stdlib)."""
+    (core tier - browse/keyword/live all run on stdlib)."""
     return str(VENV_PY) if VENV_PY.exists() else sys.executable
 
 
@@ -177,10 +243,13 @@ def ingest_bin() -> Path:
     env = os.environ.get("AGREP_RS_BIN") or os.environ.get("TILT_RS_BIN")
     if env:
         return Path(env)
+    dev = REPO_ROOT / "target" / "release" / exe
+    if _is_dev_checkout() and dev.exists():
+        return dev
     bundled = PY_DIR.parent / "_bin" / exe
     if bundled.exists():
         return bundled
-    return REPO_ROOT / "target" / "release" / exe
+    return dev
 
 MESSAGES_PATH = DATA_DIR / "messages.jsonl"
 EMBEDDINGS_PATH = DATA_DIR / "embeddings.f32"
@@ -222,7 +291,7 @@ def build_index() -> bool:
     """Run the Rust ingest over every agent store, then refresh the derived FTS db.
 
     The single ingest invocation shared by `agrep index`/`ui` (a forced rebuild) and
-    ensure_index() (build-on-first-use). Assumes the binary exists — callers that
+    ensure_index() (build-on-first-use). Assumes the binary exists - callers that
     might not have it check ingest_bin().exists() first. Returns True on success.
     """
     r = subprocess.run([str(ingest_bin()), "index", "--agent", "all"], cwd=str(REPO_ROOT))
@@ -245,13 +314,13 @@ def ensure_index(auto: bool = True) -> bool:
         return True
     cli = cli_name()
     if not auto:
-        log(f"no index yet — run `{cli} index` to scan your agent stores, then search.")
+        log(f"no index yet - run `{cli} index` to scan your agent stores, then search.")
         return False
     if not ingest_bin().exists():
-        log(f"no index yet, and no ingest binary to build one — run `{cli} index` "
+        log(f"no index yet, and no ingest binary to build one - run `{cli} index` "
             f"(install Rust from https://rustup.rs if cargo is missing), then search.")
         return False
-    log("first run — indexing your agent stores (one-time)…")
+    log("first run - indexing your agent stores (one-time)…")
     return build_index()
 
 
@@ -269,7 +338,9 @@ class Message:
     ts: int
     turn: int
     text: str
+    who: str
     model: str
+    model_source: str
 
 
 def iter_messages(path: Path = MESSAGES_PATH, limit: int | None = None) -> Iterator[Message]:
@@ -308,7 +379,12 @@ def iter_messages(path: Path = MESSAGES_PATH, limit: int | None = None) -> Itera
                 ts=int(obj.get("ts", 0)),
                 turn=int(obj.get("turn", 0)),
                 text=text,
+                who=obj.get("who", "user"),
                 model=obj.get("model", ""),
+                model_source=obj.get(
+                    "model_source",
+                    "explicit" if obj.get("model") else "unknown",
+                ),
             )
             yielded += 1
             if limit is not None and yielded >= limit:
@@ -331,7 +407,7 @@ def count_messages(path: Path = MESSAGES_PATH) -> int:
 def l2_normalize(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """Row-wise L2 normalization. Returns float32, contiguous, row-major.
 
-    Zero (or near-zero) rows are left as zeros rather than divided — a zero
+    Zero (or near-zero) rows are left as zeros rather than divided - a zero
     vector has cosine 0 against everything, which is the sane fallback for an
     empty/degenerate message.
     """

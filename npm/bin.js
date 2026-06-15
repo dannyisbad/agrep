@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // agrep is a python package with a bundled rust binary; this npm shim just finds a
-// runner for it. uv is preferred because uvx manages python itself — it works on a
+// runner for it. uv is preferred because uvx manages python itself - it works on a
 // box with no python at all. pipx is the fallback. If neither exists we print the
 // one-liner that fixes it instead of half-installing anything ourselves.
 //
@@ -40,7 +40,7 @@ if (has("uv")) {
   run("pipx", ["run", "--spec", SPEC, "agrep", ...args]);
 } else {
   console.error(
-    "agrep needs uv (or pipx) to run — it's a python package with a bundled rust binary.\n" +
+    "agrep needs uv (or pipx) to run - it's a python package with a bundled rust binary.\n" +
     "install uv (one line, manages python itself):\n\n" +
     (process.platform === "win32"
       ? '  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"'

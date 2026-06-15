@@ -13,12 +13,12 @@ py/                    read-only server + the optional ML/LLM pipeline
   explore.py           read layer over the index (browse/search/detail)
   live.py              passive store-tailing watcher (the live view)
   search.py            the terminal grep (`agrep <pattern>`)
-  resume.py            `agrep resume` — reopen a session in its own agent
+  resume.py            `agrep resume` - reopen a session in its own agent
   native.py            per-agent launch/resume commands + cwd resolution
   indexer.py           background auto-reindex while the server runs
   embed/emotion/...    the optional smart-tier stages
 web/app.html           the entire frontend, one file
-data/                  the built index (gitignored — never committed)
+data/                  the built index (gitignored - never committed)
 ```
 
 Data flows one way: Rust ingest → `data/` → Python server → web app. The Rust core is the
@@ -33,7 +33,7 @@ python cli.py doctor          # what's installed; --fix creates the venv + insta
 ```
 
 `cli.py ui` and `serve` need only Python stdlib + the Rust binary. Editing `web/app.html`
-needs no rebuild — the server re-reads it on each request.
+needs no rebuild - the server re-reads it on each request.
 
 ## Adding an agent adapter
 
@@ -49,7 +49,7 @@ and subagent activity). To add one:
    `is_wrapper`); attach tool/subagent activity as events.
 3. Register it in `ingest/mod.rs` and the CLI's agent list.
 4. For the **live view**, mirror the tailing logic in `py/live.py` (JSONL stores are
-   tailed by byte offset; databases are polled). This is separate from the Rust ingest —
+   tailed by byte offset; databases are polled). This is separate from the Rust ingest -
    it reads the same stores in real time.
 5. For **native resume**, add the agent's resume command to `py/native.py`.
 
@@ -57,7 +57,7 @@ Keep adapters read-only. tilt must never write to, move, or delete an agent's da
 
 ## Conventions
 
-- No hooks, ever. tilt's whole premise is passive reading — it must work for sessions it
+- No hooks, ever. tilt's whole premise is passive reading - it must work for sessions it
   didn't start and agents it didn't install into.
 - Anything that needs a GPU or a model is optional and runs only at index time. The server
   must stay stdlib-only and modelless.

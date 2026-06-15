@@ -1,9 +1,9 @@
 //! kimi adapter: ~/.kimi/sessions/<md5(workdir)>/<session-uuid>/{context,wire}.jsonl.
 //!
 //! context.jsonl is the model-facing transcript (kosong Message records, roles user/
-//! assistant/tool plus `_`-prefixed internal directives) — canonical for WHO SAID WHAT,
-//! but it carries no timestamps. wire.jsonl is the UI event log — every line is
-//! `{"timestamp": <epoch secs float>, "message": {"type", "payload"}}` — canonical for
+//! assistant/tool plus `_`-prefixed internal directives) - canonical for WHO SAID WHAT,
+//! but it carries no timestamps. wire.jsonl is the UI event log - every line is
+//! `{"timestamp": <epoch secs float>, "message": {"type", "payload"}}` - canonical for
 //! WHEN and for tool outcomes (ToolResult.return_value.is_error). Messages come from
 //! context, with user-turn timestamps aligned in order against the wire's TurnBegin/
 //! SteerInput events (steers land in context as plain user messages since kimi 1.21).
@@ -22,7 +22,7 @@ use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, EVE
 use crate::model::{Event, Message, RawMessage};
 
 /// Concatenated text parts of a kosong content value (string, or array of typed parts).
-/// `think` parts are the model's reasoning, not its reply — excluded.
+/// `think` parts are the model's reasoning, not its reply - excluded.
 fn text_of(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
@@ -91,7 +91,10 @@ fn parse_wire(path: &Path) -> Wire {
                             other => cap_str(&text_of(other), EVENT_CAP),
                         })
                         .unwrap_or_default();
-                    let is_err = rv.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+                    let is_err = rv
+                        .get("is_error")
+                        .and_then(|e| e.as_bool())
+                        .unwrap_or(false);
                     w.call_result.insert(id.to_string(), (out, is_err));
                 }
             }
@@ -276,8 +279,10 @@ pub fn collect() -> (Vec<Message>, Vec<Event>) {
         }
     }
 
-    let pairs: Vec<(Vec<Message>, Vec<Event>)> =
-        work.par_iter().map(|(d, proj)| parse_session(d, proj)).collect();
+    let pairs: Vec<(Vec<Message>, Vec<Event>)> = work
+        .par_iter()
+        .map(|(d, proj)| parse_session(d, proj))
+        .collect();
     let mut msgs = Vec::new();
     let mut evts = Vec::new();
     for (m, e) in pairs {

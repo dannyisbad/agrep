@@ -47,7 +47,7 @@ def cluster_summaries(args) -> int:
 
     emb_meta = common.DATA_DIR / "summary_emb.meta"
     if not emb_meta.exists():
-        print("  no summary_emb.* — run the summary embed step first; falling back to centroids")
+        print("  no summary_emb.* - run the summary embed step first; falling back to centroids")
         return cluster_centroids(args)
     dim = int(emb_meta.read_text().strip())
     ids = (common.DATA_DIR / "summary_emb.ids").read_text(encoding="utf-8").splitlines()

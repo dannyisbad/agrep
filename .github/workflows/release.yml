@@ -2,7 +2,7 @@ name: release
 
 # Build one platform-tagged wheel per OS/arch (each carries the prebuilt agrep-rs
 # binary), plus an sdist, and publish to PyPI on a v* tag. The wheel is py3-none-<plat>
-# (any python 3.10+, one platform) — see hatch_build.py.
+# (any python 3.10+, one platform) - see hatch_build.py.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC). npm publishing uses the
 # `NPM_TOKEN` repository secret and still attaches provenance from GitHub Actions.
@@ -28,7 +28,7 @@ jobs:
         include:
           - { name: win-x64,   os: windows-latest, plat: win_amd64,            rustflags: "-C target-cpu=x86-64-v2" }
           # macos-13 (the old intel image) is retired; macos-15-intel is the last
-          # x86_64 image GitHub will ever host (gone Aug 2027 — drop this wheel then).
+          # x86_64 image GitHub will ever host (gone Aug 2027 - drop this wheel then).
           - { name: mac-x64,   os: macos-15-intel, plat: macosx_10_12_x86_64,  rustflags: "-C target-cpu=x86-64-v2" }
           - { name: mac-arm64, os: macos-14,       plat: macosx_11_0_arm64,    rustflags: "" }
     steps:

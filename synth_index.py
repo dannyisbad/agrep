@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fabricate a synthetic embedding index to validate the Rust search spine WITHOUT a GPU.
 
-Pure stdlib (struct + math + json + random) — no torch, no numpy. Writes the exact
+Pure stdlib (struct + math + json + random) - no torch, no numpy. Writes the exact
 contract artifacts the Rust reader expects:
 
   data/embeddings.f32  : raw little-endian f32, row-major, N x D, each ROW L2-normalized.

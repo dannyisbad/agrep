@@ -4,7 +4,7 @@
 //! Per task: `api_conversation_history.json` (Anthropic MessageParam array, the source
 //! of truth for turns and native tool_use/tool_result blocks) and a sibling
 //! `state/taskHistory.json` index at the root (HistoryItem[]: cwd, model, task title).
-//! taskIds are `Date.now()` millisecond strings — that anchors timestamps for older
+//! taskIds are `Date.now()` millisecond strings - that anchors timestamps for older
 //! tasks whose messages predate the per-message `ts` field. Classic (non-native) tool
 //! calls are XML inside assistant text and stay in the reply; only real tool_use
 //! blocks become events.
@@ -27,7 +27,12 @@ fn roots() -> Vec<PathBuf> {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let base = PathBuf::from(appdata);
         for p in PRODUCTS {
-            out.push(base.join(p).join("User").join("globalStorage").join("saoudrizwan.claude-dev"));
+            out.push(
+                base.join(p)
+                    .join("User")
+                    .join("globalStorage")
+                    .join("saoudrizwan.claude-dev"),
+            );
         }
     } else {
         let home = crate::ingest::home();
@@ -37,7 +42,12 @@ fn roots() -> Vec<PathBuf> {
             .unwrap_or_else(|| home.join(".config"));
         for base in [mac, linux] {
             for p in PRODUCTS {
-                out.push(base.join(p).join("User").join("globalStorage").join("saoudrizwan.claude-dev"));
+                out.push(
+                    base.join(p)
+                        .join("User")
+                        .join("globalStorage")
+                        .join("saoudrizwan.claude-dev"),
+                );
             }
         }
     }
@@ -76,7 +86,11 @@ fn task_index(root: &Path) -> HashMap<String, TaskMeta> {
                         .and_then(|c| c.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    model: it.get("modelId").and_then(|m| m.as_str()).unwrap_or_default().to_string(),
+                    model: it
+                        .get("modelId")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                 },
             );
         }
@@ -88,7 +102,10 @@ fn task_index(root: &Path) -> HashMap<String, TaskMeta> {
 /// `<environment_details>` block, unwrap `<task>`/`<feedback>`/`<answer>` envelopes.
 fn clean_user_text(raw: &str) -> String {
     let mut s = raw.to_string();
-    if let (Some(a), Some(b)) = (s.find("<environment_details>"), s.rfind("</environment_details>")) {
+    if let (Some(a), Some(b)) = (
+        s.find("<environment_details>"),
+        s.rfind("</environment_details>"),
+    ) {
         if a < b {
             s.replace_range(a..b + "</environment_details>".len(), "");
         }
@@ -170,10 +187,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> (Vec<Message>, Vec<Event>)
                             };
                             let ev = &mut events[i];
                             ev.output = cap_str(&body, EVENT_CAP);
-                            ev.ok = b
-                                .get("is_error")
-                                .and_then(|e| e.as_bool())
-                                .map(|e| !e);
+                            ev.ok = b.get("is_error").and_then(|e| e.as_bool()).map(|e| !e);
                             pending.remove(id);
                         }
                     }

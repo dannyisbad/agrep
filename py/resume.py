@@ -1,4 +1,4 @@
-"""`agrep resume [id]` — jump back into a past session in its own agent, cd'd to where
+"""`agrep resume [id]` - jump back into a past session in its own agent, cd'd to where
 it ran. The id is whatever you see in `agrep` output: the short 8-char prefix, a full
 uuid, or an opencode `ses_…`. With no id, pick from your most recent sessions.
 
@@ -42,7 +42,7 @@ def _match(rows: list[dict], q: str) -> list[dict]:
 
 
 def _label(r: dict, color: bool) -> str:
-    who = f"{r.get('agent', '?')} · {r.get('project') or '—'}"
+    who = f"{r.get('agent', '?')} · {r.get('project') or '-'}"
     txt = " ".join((r.get("first_text") or "").split())[:70]
     sess = (r.get("session") or "")[:8]
     if color:
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = _sessions()
     if not rows:
-        common.log(f"no index yet — run `{common.cli_name()} index` first.")
+        common.log(f"no index yet - run `{common.cli_name()} index` first.")
         return 2
 
     if args.list:
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             common.log(f"no session matches '{args.id}'. try `agrep resume -l` to see recent ones.")
             return 1
         if len(m) > 1:
-            common.log(f"'{args.id}' is ambiguous — {len(m)} sessions match:")
+            common.log(f"'{args.id}' is ambiguous - {len(m)} sessions match:")
             for r in m[:12]:
                 print(f"  {_label(r, color)}", file=sys.stderr)
             return 1

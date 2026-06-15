@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""agrep — grep and explore your cross-agent chat history.
+"""agrep - grep and explore your cross-agent chat history.
 
   agrep "race condition"    grep your whole agent history; print matches  (the namesake)
   agrep around <id> <turn>  show the conversation around a search hit, tools inline
@@ -49,7 +49,7 @@ def _version() -> str:
 
 def _server_python() -> str:
     """The python the SERVER runs under. Semantic search needs the smart tier's
-    deps (numpy/torch/...), which live in the venv — launching the server with
+    deps (numpy/torch/...), which live in the venv - launching the server with
     whatever python invoked us silently downgrades every 'meaning' search
     to keyword when that python lacks them (it logs one line and carries on).
     Prefer the venv whenever it exists; plain interpreters still run the core."""
@@ -95,7 +95,7 @@ def _wait_for(port: int, timeout: float = 30.0) -> bool:
 # --- status (bare `agrep`) ------------------------------------------------
 
 def _fmt_age(seconds: float) -> str:
-    """Compact human age: '3s', '12m', '5h', '2d' ago. Coarse on purpose — the
+    """Compact human age: '3s', '12m', '5h', '2d' ago. Coarse on purpose - the
     status line wants a glance, not a stopwatch."""
     s = int(max(0, seconds))
     if s < 60:
@@ -109,14 +109,16 @@ def _fmt_age(seconds: float) -> str:
 
 def _status_lines(cli: str) -> list[str]:
     """Cheap index summary for the bare-`agrep` banner. Reads sessions.jsonl (one
-    line per chat, with the per-chat message count `n` and `agent`) — never parses
+    line per chat, with the per-chat message count `n` and `agent`) - never parses
     messages.jsonl, which is ~50 MB. mtime of messages.jsonl dates the last index;
     corpus.db's presence + size says whether keyword search is ready; the smart-tier
     venv's existence says whether meaning search is installed."""
     sessions = common.DATA_DIR / "sessions.jsonl"
-    out: list[str] = []
+    out: list[str] = [f"  data dir: {common.DATA_DIR} ({common.data_dir_source()})"]
+    for warning in common.data_dir_warnings():
+        out.append(f"  warning: {warning}")
     if not sessions.exists():
-        out.append(f"  no index yet — any search will build it on first run, "
+        out.append(f"  no index yet - any search will build it on first run, "
                    f"or run `{cli} index`.")
         return out
 
@@ -137,7 +139,7 @@ def _status_lines(cli: str) -> list[str]:
             if a:
                 agents.add(a)
 
-    ag = ", ".join(sorted(agents)) if agents else "—"
+    ag = ", ".join(sorted(agents)) if agents else "-"
     out.append(f"  {n_messages:,} messages · {n_sessions:,} sessions · "
                f"{len(agents)} agent{'s' if len(agents) != 1 else ''} ({ag})")
 
@@ -157,7 +159,7 @@ def _status_lines(cli: str) -> list[str]:
 
 def cmd_status(a) -> int:
     """Bare `agrep`: print where the index stands and how to drive the tool, then exit.
-    Deliberately does NOT start a server — the explorer is `agrep ui`."""
+    Deliberately does NOT start a server - the explorer is `agrep ui`."""
     # the banner carries em-dashes / middots; windows consoles default to cp1252.
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -165,7 +167,7 @@ def cmd_status(a) -> int:
         except Exception:  # noqa: BLE001 -- not a reconfigurable stream (piped oddly)
             pass
     cli = common.cli_name()  # `python cli.py` in a dev checkout, `agrep` once installed
-    print("agrep — grep and explore your cross-agent chat history\n")
+    print("agrep - grep and explore your cross-agent chat history\n")
     for line in _status_lines(cli):
         print(line)
     print("\ntry:")
@@ -285,7 +287,7 @@ def main() -> int:
 
     # `ui` is the explorer (tilt): serve + open, building the base index only when
     # it is missing. `up` is a kept-working alias
-    # (it lives in scripts / muscle memory) but only `ui` is advertised — a subparser
+    # (it lives in scripts / muscle memory) but only `ui` is advertised - a subparser
     # added without help= is omitted from the command listing, so `up` stays hidden.
     for name in ("ui", "up"):
         kw = {"help": "serve and open the explorer (tilt)"} if name == "ui" else {}
@@ -335,7 +337,7 @@ def main() -> int:
     rs.set_defaults(fn=cmd_resume)
 
     # The agrep promise: a bare pattern greps. If the first arg isn't a known verb
-    # (and isn't a global flag), treat the whole invocation as a search — so
+    # (and isn't a global flag), treat the whole invocation as a search - so
     # `agrep "rust simd"` works, while `agrep ui` / `agrep serve --port N` still
     # dispatch. `agrep` alone prints status + usage; `agrep -h` shows top-level help.
     raw = sys.argv[1:]
@@ -362,7 +364,7 @@ def main() -> int:
     args, unknown = p.parse_known_args()
     args.rest = unknown
     if not getattr(args, "fn", None):
-        # bare `agrep` prints status + usage and exits — the explorer is `agrep ui`.
+        # bare `agrep` prints status + usage and exits - the explorer is `agrep ui`.
         return cmd_status(args)
     return args.fn(args)
 

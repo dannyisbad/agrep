@@ -12,7 +12,9 @@ use memchr::memmem;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::ingest::{cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP};
+use crate::ingest::{
+    cap_str, is_wrapper, project_name, summarize_tool_input, ts_millis, EVENT_CAP,
+};
 use crate::model::{Event, Message};
 
 // Borrowed deserialization: scalar fields are Cow (borrow from the line when escape-free,
@@ -55,7 +57,7 @@ struct Msg<'a> {
 ///
 /// SOUNDNESS of raw-byte key needles, here and in the prefilters: inside any JSON string
 /// value a quote is escaped to `\"`, so the byte sequence `"key":` can only occur as a
-/// real object key — string contents can never produce a false match on it.
+/// real object key - string contents can never produce a false match on it.
 fn raw_str_value<'a>(finder: &memmem::Finder, bytes: &'a [u8]) -> Option<&'a str> {
     let start = finder.find(bytes)? + finder.needle().len();
     let mut j = start;
@@ -138,8 +140,16 @@ fn project_root(dir: &str) -> Option<String> {
             && sl != user
             && !matches!(
                 sl.as_str(),
-                "users" | "desktop" | "documents" | "downloads" | "onedrive"
-                    | "home" | "tmp" | "temp" | "appdata" | "src"
+                "users"
+                    | "desktop"
+                    | "documents"
+                    | "downloads"
+                    | "onedrive"
+                    | "home"
+                    | "tmp"
+                    | "temp"
+                    | "appdata"
+                    | "src"
             )
     })
     .map(|s| s.to_string())
@@ -150,7 +160,11 @@ fn project_root(dir: &str) -> Option<String> {
 /// touched, reduced to project roots. The most-worked-in root wins, so sessions launched
 /// from a home dir that evolve into a real project land on where the work went, not
 /// where the terminal happened to open.
-fn primary_project(cwd_counts: &HashMap<String, usize>, paths: &[String], first_cwd: &str) -> String {
+fn primary_project(
+    cwd_counts: &HashMap<String, usize>,
+    paths: &[String],
+    first_cwd: &str,
+) -> String {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (c, n) in cwd_counts {
         if let Some(k) = project_root(c) {
@@ -280,10 +294,8 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or_default()
                                     .to_string();
-                                let input = b
-                                    .get("input")
-                                    .map(summarize_tool_input)
-                                    .unwrap_or_default();
+                                let input =
+                                    b.get("input").map(summarize_tool_input).unwrap_or_default();
                                 let kind = if name == "Task" || name == "Agent" {
                                     "subagent_start"
                                 } else {
@@ -395,7 +407,12 @@ fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>) {
     for m in &mut out {
         m.project = project.clone();
     }
-    (out.into_iter().map(crate::model::RawMessage::freeze).collect(), events)
+    (
+        out.into_iter()
+            .map(crate::model::RawMessage::freeze)
+            .collect(),
+        events,
+    )
 }
 
 /// Walk all real project dirs and collect the user's Claude messages + tool events.

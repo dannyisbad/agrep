@@ -5,11 +5,11 @@
 //!
 //! Only messages are cached (small). EVENTS are not: their per-session files already persist
 //! on disk and are skipped by content-hash in `cache::write_events`, so re-deriving them for
-//! unchanged sessions would be pure waste (it was — caching events made a run SLOWER than a
+//! unchanged sessions would be pure waste (it was - caching events made a run SLOWER than a
 //! full parse). We therefore return events only for the sessions touched this run.
 //!
 //! SAFETY: the downstream dedup is by `(agent, session, turn)` / `(agent, session, call_id)`,
-//! where a repeated tuple is byte-identical — so the result is order-independent and the cache
+//! where a repeated tuple is byte-identical - so the result is order-independent and the cache
 //! is transparent. claude/codex are one-file-per-session in practice; for any session that DOES
 //! span files, its unchanged sibling files are re-parsed too so its event file stays complete.
 //! A schema bump (`CACHE_VERSION`), a missing/corrupt cache, or `--full` fall back to a clean
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Event, Message};
 
 /// Bump when the cached struct layout changes; old caches are then ignored (full reparse).
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct CMsg {
@@ -35,7 +35,9 @@ struct CMsg {
     ts: i64,
     turn: u32,
     text: std::sync::Arc<str>,
+    who: std::sync::Arc<str>,
     model: std::sync::Arc<str>,
+    model_source: std::sync::Arc<str>,
     reply: std::sync::Arc<str>,
 }
 #[derive(Serialize, Deserialize, Clone)]
@@ -70,7 +72,7 @@ fn intern_agent(s: &str) -> &'static str {
 }
 
 impl CMsg {
-    // both directions are refcount bumps (Arc fields), not string copies — on a warm
+    // both directions are refcount bumps (Arc fields), not string copies - on a warm
     // run every cached message round-trips through here, so this is the hot edge
     fn from(m: &Message) -> Self {
         CMsg {
@@ -80,7 +82,9 @@ impl CMsg {
             ts: m.ts,
             turn: m.turn,
             text: m.text.clone(),
+            who: m.who.clone(),
             model: m.model.clone(),
+            model_source: m.model_source.clone(),
             reply: m.reply.clone(),
         }
     }
@@ -92,7 +96,9 @@ impl CMsg {
             ts: self.ts,
             turn: self.turn,
             text: self.text.clone(),
+            who: self.who.clone(),
             model: self.model.clone(),
+            model_source: self.model_source.clone(),
             reply: self.reply.clone(),
         }
     }
@@ -100,7 +106,7 @@ impl CMsg {
 
 pub struct IngestCache {
     entries: HashMap<String, Entry>,
-    /// true when a valid cache was loaded — i.e. this run is INCREMENTAL (only changed files
+    /// true when a valid cache was loaded - i.e. this run is INCREMENTAL (only changed files
     /// re-parsed, so the returned events cover only touched sessions). false on a cold/forced
     /// load means every file is parsed and the event set is complete.
     pub warm: bool,
@@ -181,7 +187,7 @@ pub struct Pass {
 ///
 /// `root` scopes the stale-entry cleanup: the cache is SHARED across adapters (claude,
 /// then codex, against the same store), so this call may only forget entries under its
-/// own root — wiping everything not in `files` would erase the other adapters' entries
+/// own root - wiping everything not in `files` would erase the other adapters' entries
 /// and silently disable the cache for them (run N parses claude, run N+1 codex, forever).
 pub fn collect_cached<F>(cache: &mut IngestCache, root: &Path, files: &[PathBuf], parse: F) -> Pass
 where
@@ -287,7 +293,7 @@ where
         events.extend(e);
     }
 
-    // forget files that no longer exist — but ONLY under this adapter's root
+    // forget files that no longer exist - but ONLY under this adapter's root
     cache
         .entries
         .retain(|k, _| !k.starts_with(&root_key) || present.contains(k));

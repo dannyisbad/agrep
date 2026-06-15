@@ -2,7 +2,7 @@
 manual command.
 
 The live watcher already surfaces new chats in real time (the rail overlay). This thread
-does the slower job of MATERIALIZING them — re-running the Rust ingest so new sessions get
+does the slower job of MATERIALIZING them - re-running the Rust ingest so new sessions get
 permanent rows, titles, and event trees. It's gated so it doesn't burn CPU needlessly:
 
   - it only runs after the watcher has seen new activity since the last index, AND
@@ -104,7 +104,8 @@ class AutoIndexer(threading.Thread):
         t = time.perf_counter()
         err = ""
         if full and REINDEX.exists():
-            # reindex.py self-selects py/.venv for the heavy stages, so any python works
+            # reindex.py self-selects the smart-tier venv for the heavy stages,
+            # so any python works
             cmd = [sys.executable, str(REINDEX), "--no-build",
                    "--max-new", str(FULL_MAX_NEW)]
             timeout = 3600

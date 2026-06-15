@@ -1,8 +1,8 @@
 """Fetch ONE event's uncapped input/output straight from the source store.
 
 The indexed event files (data/events/) hold capped summaries; the full payload never
-leaves the agent's own store. Given (agent, session, call_id) — the same provenance the
-Rust ingest stamped on every event — this re-opens the source and digs the whole thing
+leaves the agent's own store. Given (agent, session, call_id) - the same provenance the
+Rust ingest stamped on every event - this re-opens the source and digs the whole thing
 out. Used by the /event_raw endpoint when the UI's "full" button is clicked.
 
 Pure stdlib, read-only, no caches: one click = one targeted scan of one session's data.

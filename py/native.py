@@ -1,6 +1,6 @@
 """Resume a session in its OWN native CLI, cd'd to the directory it ran in.
 
-Two paths: open_session() spawns a NEW terminal (the app's resume button — wt/start on
+Two paths: open_session() spawns a NEW terminal (the app's resume button - wt/start on
 Windows, Terminal.app via osascript on mac, $TERMINAL on linux); resume_in_place() runs
 the agent in the CURRENT terminal (`agrep resume`). Both resolve the real cwd from the
 agent's store and build the command via resume_argv().
@@ -8,7 +8,7 @@ agent's store and build the command via resume_argv().
 Resume commands (verified against each CLI's --help):
   claude    claude --resume <id>
   codex     codex resume <id>
-  opencode  opencode <dir> --session <id>   (dir POSITIONAL — opencode scopes by project)
+  opencode  opencode <dir> --session <id>   (dir POSITIONAL - opencode scopes by project)
   agy       agy --conversation <id>         (antigravity)
 
 Spawn safety: known agent only, session id checked against a strict pattern (no shell
@@ -29,7 +29,7 @@ import sys
 
 HOME = os.path.expanduser("~")
 
-# session ids: claude/codex/antigravity uuids, opencode `ses_...`. Strict allowlist — this
+# session ids: claude/codex/antigravity uuids, opencode `ses_...`. Strict allowlist - this
 # value reaches a process argv, so anything outside [A-Za-z0-9._-] is rejected outright.
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]{6,128}$")
 
@@ -128,7 +128,7 @@ def resolve_cwd(agent: str, session: str) -> str:
 
 def resume_argv(agent: str, session: str, cwd: str) -> list[str]:
     """The exact resume command for an agent. opencode scopes sessions by project, so
-    it gets the directory as its positional (`opencode <dir> --session <id>`) — relying
+    it gets the directory as its positional (`opencode <dir> --session <id>`) - relying
     on the process cwd alone was unreliable (the 'opencode resume is broken' bug).
     The others find the session from cwd, set by the caller."""
     exe, pre = _RESUME[agent]
@@ -139,7 +139,7 @@ def resume_argv(agent: str, session: str, cwd: str) -> list[str]:
 
 def resume_in_place(agent: str, session: str) -> int:
     """Run the agent's resume IN THE CURRENT terminal (cd'd to the session's dir), for
-    the `agrep resume` CLI. Unlike open_session this doesn't spawn a window — the agent
+    the `agrep resume` CLI. Unlike open_session this doesn't spawn a window - the agent
     inherits this terminal and replaces the prompt until it exits. Returns its exit code
     (127 if the agent CLI isn't on PATH)."""
     if agent not in _RESUME:
@@ -149,7 +149,7 @@ def resume_in_place(agent: str, session: str) -> int:
     exe = _RESUME[agent][0]
     exe_path = shutil.which(exe)
     if not exe_path:
-        print(f"the {agent} CLI ('{exe}') isn't on your PATH — install it to resume here.",
+        print(f"the {agent} CLI ('{exe}') isn't on your PATH - install it to resume here.",
               file=sys.stderr)
         return 127
     argv = resume_argv(agent, session, cwd)
@@ -164,7 +164,7 @@ def resume_in_place(agent: str, session: str) -> int:
 
 
 def _spawn_windows(argv: list[str], cwd: str) -> str:
-    # cmd /k: run the resume command and KEEP the shell open in `cwd` afterwards —
+    # cmd /k: run the resume command and KEEP the shell open in `cwd` afterwards -
     # exiting the agent should leave you in a usable shell already cd'd into the
     # project, not close the tab under you. (Also required for claude: --resume only
     # finds the session when run from the directory the session belongs to.)
@@ -180,7 +180,7 @@ def _spawn_windows(argv: list[str], cwd: str) -> str:
 
 def _spawn_macos(argv: list[str], cwd: str) -> str:
     # Terminal.app via osascript: `do script` opens a new window, runs the command,
-    # and leaves the shell open — same UX as cmd /k. argv pieces are shlex-quoted
+    # and leaves the shell open - same UX as cmd /k. argv pieces are shlex-quoted
     # before being embedded, then AppleScript-escaped.
     sh = f"cd {shlex.quote(cwd)} && {' '.join(shlex.quote(a) for a in argv)}"
     esc = sh.replace("\\", "\\\\").replace('"', '\\"')

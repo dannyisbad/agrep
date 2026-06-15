@@ -1,11 +1,11 @@
 //! Per-agent transcript adapters. Each yields normalized `Message`s (the user's words only).
 
-pub mod claude;
-pub mod codex;
-pub mod opencode;
 pub mod antigravity;
-pub mod kimi;
+pub mod claude;
 pub mod cline;
+pub mod codex;
+pub mod kimi;
+pub mod opencode;
 
 use std::path::PathBuf;
 
@@ -48,8 +48,16 @@ pub fn project_name(cwd: &str) -> String {
             let generic = lower == home_leaf()
                 || matches!(
                     lower.as_str(),
-                    "src" | "web" | "mobile" | "app" | "lib" | "client" | "server"
-                        | "desktop" | "documents" | "downloads"
+                    "src"
+                        | "web"
+                        | "mobile"
+                        | "app"
+                        | "lib"
+                        | "client"
+                        | "server"
+                        | "desktop"
+                        | "documents"
+                        | "downloads"
                 );
             if generic && parts.len() >= 2 {
                 format!("{}/{}", parts[parts.len() - 2], leaf)

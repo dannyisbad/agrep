@@ -1,6 +1,6 @@
 """tilt tail: follow live agent-session events as JSON lines on stdout.
 
-Drives the same LiveWatcher the explorer's /live/stream uses — no server, no
+Drives the same LiveWatcher the explorer's /live/stream uses - no server, no
 HTTP, stdlib only. One compact JSON object per line, flushed per line, so it
 pipes cleanly into anything that watches stdout (e.g. an agent harness's
 monitor regex: '"type":"done"').
