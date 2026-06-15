@@ -6,4 +6,4 @@ reindex.py, py/, web/) plus the prebuilt rust ingest binary, so `uvx agrep` /
 cargo. The real logic lives in the bundled modules; see __main__.py.
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
