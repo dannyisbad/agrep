@@ -4,7 +4,7 @@ This module is the Python side of the EMBEDDING CONTRACT that the Rust reader
 (crates/agrep-core) and these scripts must agree on EXACTLY:
 
   data/messages.jsonl  one JSON object per line:
-                         {id, agent, project, session, ts, turn, text}
+                         {id, agent, project, session, ts, turn, text, model?}
                        id == "agent:session:turn". Produced by the ingest binary.
 
   data/embeddings.f32  raw little-endian float32, row-major, N rows x D cols.
@@ -208,6 +208,7 @@ class Message:
     ts: int
     turn: int
     text: str
+    model: str
 
 
 def iter_messages(path: Path = MESSAGES_PATH, limit: int | None = None) -> Iterator[Message]:
@@ -246,6 +247,7 @@ def iter_messages(path: Path = MESSAGES_PATH, limit: int | None = None) -> Itera
                 ts=int(obj.get("ts", 0)),
                 turn=int(obj.get("turn", 0)),
                 text=text,
+                model=obj.get("model", ""),
             )
             yielded += 1
             if limit is not None and yielded >= limit:

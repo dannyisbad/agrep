@@ -129,7 +129,7 @@ def _word_scan(q: str, k: int) -> dict:
     this only pays the boundary check where the substring already hit."""
     ql = q.lower()
     n = len(ql)
-    fields = ("session", "agent", "project", "concept", "turn", "ts", "who")
+    fields = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
     hits = []
     for e in explore._kw_corpus():
         low = e["low"]
@@ -153,7 +153,7 @@ def _regex_scan(pattern: str, k: int) -> dict:
     except re.error as e:
         common.log(f"bad regex: {e}")
         raise SystemExit(2)
-    fields = ("session", "agent", "project", "concept", "turn", "ts", "who")
+    fields = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
     hits = []
     for e in explore._kw_corpus():
         m = rx.search(e["low"]) or rx.search(e["text"])
@@ -180,16 +180,22 @@ def _semantic(q: str, k: int, port: int) -> dict | None:
     rows = data.get("results") or data.get("hits") or []
     hits = []
     for o in rows:
+        model = o.get("model", "")
+        if not model and o.get("session"):
+            try:
+                model = explore.get_chat(o["session"]).get("model", "")
+            except Exception:  # noqa: BLE001 -- model is enrichment only
+                model = ""
         snip = o.get("title") or (o.get("summary") or "")[:140] or o.get("text", "")
         hits.append({"session": o.get("session", ""), "agent": o.get("agent", ""),
                      "project": o.get("project", "") or o.get("cwd_project", ""),
-                     "turn": None, "ts": o.get("ts", 0), "who": "",
+                     "model": model, "turn": None, "ts": o.get("ts", 0), "who": "",
                      "snippet": snip, "summary": o.get("summary", "")})
     return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
 
 def _filtered(hits: list[dict], agent: str | None, project: str | None,
-              who: str | None) -> list[dict]:
+              who: str | None, model: str | None, model_soft: bool) -> list[dict]:
     out = hits
     if agent:
         ag = agent.lower()
@@ -199,6 +205,12 @@ def _filtered(hits: list[dict], agent: str | None, project: str | None,
         out = [h for h in out if pr in (h.get("project") or "").lower()]
     if who:
         out = [h for h in out if (h.get("who") == "agent") == (who == "agent")]
+    if model:
+        needle = model.lower()
+        if model_soft:
+            out = [h for h in out if needle in (h.get("model") or "").lower()]
+        else:
+            out = [h for h in out if needle == (h.get("model") or "").lower()]
     return out
 
 
@@ -275,6 +287,8 @@ def main(argv: list[str] | None = None) -> int:
         epilog="examples:\n"
                "  agrep \"race condition\"            grep every agent for a phrase\n"
                "  agrep deadlock --agent codex       just codex\n"
+               "  agrep bug --model gpt-5            only turns from that exact model\n"
+               "  agrep bug --model spark --soft     model contains spark\n"
                "  agrep -w leak                      whole word only\n"
                "  agrep -E 'TODO|FIXME' --who agent  regex, agent turns only\n"
                "  agrep -l auth                      which chats mention it\n"
@@ -297,6 +311,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="one tab-separated row per hit (the default when piped)")
     ap.add_argument("--agent", help="only this agent (claude/codex/opencode/antigravity/kimi/cline)")
     ap.add_argument("--project", help="only chats whose project path contains this")
+    ap.add_argument("--model", help="only turns from this exact model name")
+    ap.add_argument("--soft", "--model-soft", dest="model_soft", action="store_true",
+                    help="with --model, substring-match the model name (like *model*)")
     ap.add_argument("--who", choices=("user", "agent"), help="only your turns or only the agent's")
     ap.add_argument("-s", "--semantic", action="store_true",
                     help="meaning search: most relevant CHATS via a running server "
@@ -317,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
         common.log("empty pattern — give me something to grep for.")
         return 2
     color = _color_on(args.color)
-    filters = bool(args.agent or args.project or args.who)
+    filters = bool(args.agent or args.project or args.who or args.model)
     # Fetch enough to be accurate. Counting, --max 0, or post-filtering all need the
     # FULL match set; otherwise over-fetch a bounded window and trust the engine's
     # true totals (keyword/regex report total/chats computed before the display cap).
@@ -361,7 +378,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             res = corpusdb.keyword(db, q, big) if db else explore.keyword_search(q, big)
 
-    filtered = _filtered(res["hits"], args.agent, args.project, args.who)
+    filtered = _filtered(res["hits"], args.agent, args.project, args.who,
+                         args.model, args.model_soft)
     # true totals: the engine reports them pre-cap; with filters we fetched everything
     if filters:
         n_total = len(filtered)

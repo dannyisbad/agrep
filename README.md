@@ -36,6 +36,8 @@ matching PyPI tool during global install so first run is already warm.
 
 ```
 agrep deadlock --agent codex    # filter to one agent
+agrep "cache bug" --model gpt-5  # exact model filter
+agrep "cache bug" --model spark --soft  # substring model filter (*spark*)
 agrep -E 'TODO|FIXME'           # regex
 agrep -l auth                   # list matching chats, not every line (like grep -l)
 agrep "memory leak" --json      # one JSON object per hit, for piping

@@ -22,10 +22,12 @@ import sqlite3
 import common
 
 DB_PATH = common.DATA_DIR / "corpus.db"
+_SCHEMA = "2"
 # corpus inputs; a change in any (mtime_ns, size) invalidates the db
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json")
 RECAP_PREFIX = "This session is being continued from a previous conversation"
-_FIELDS = ("session", "agent", "project", "concept", "turn", "ts", "who")
+_FIELDS = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
+_TEXT = len(_FIELDS)
 
 
 def _snip_at(text: str, start: int, end: int, pad: int = 80) -> str:
@@ -86,7 +88,7 @@ def _build(dst) -> None:
         CREATE TABLE msgs(
             id INTEGER PRIMARY KEY,
             session TEXT NOT NULL, turn INTEGER, ts INTEGER,
-            agent TEXT, project TEXT, concept TEXT,
+            agent TEXT, project TEXT, concept TEXT, model TEXT,
             who TEXT, text TEXT);
         CREATE INDEX msgs_session ON msgs(session, turn);
         CREATE VIRTUAL TABLE msgs_fts USING fts5(
@@ -121,8 +123,8 @@ def _build(dst) -> None:
             if o.get("id"):
                 reps[o["id"]] = o.get("reply", "")
 
-    ins = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, who, text) "
-           "VALUES(?,?,?,?,?,?,?,?)")
+    ins = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, model, who, text) "
+           "VALUES(?,?,?,?,?,?,?,?,?)")
     rows = []
     with common.MESSAGES_PATH.open(encoding="utf-8") as f:
         for line in f:
@@ -137,7 +139,7 @@ def _build(dst) -> None:
             if not s:
                 continue
             base = (s, o.get("turn", 0), o.get("ts", 0), o.get("agent", ""),
-                    o.get("project", ""), concept.get(s, ""))
+                    o.get("project", ""), concept.get(s, ""), o.get("model", ""))
             t = o.get("text", "") or ""
             if t:
                 rows.append((*base, "recap" if t.startswith(RECAP_PREFIX) else "you", t))
@@ -151,6 +153,7 @@ def _build(dst) -> None:
         db.executemany(ins, rows)
     db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
     db.execute("INSERT INTO meta VALUES('stamp', ?)", (_stamp(),))
+    db.execute("INSERT INTO meta VALUES('schema', ?)", (_SCHEMA,))
     db.commit()
     db.close()
 
@@ -164,7 +167,9 @@ def connect(quiet: bool = False) -> sqlite3.Connection | None:
     if DB_PATH.exists():
         try:
             db = _open(DB_PATH)
-            if db.execute("SELECT value FROM meta WHERE key='stamp'").fetchone()[0] == stamp:
+            meta = dict(db.execute(
+                "SELECT key, value FROM meta WHERE key IN ('stamp', 'schema')"))
+            if meta.get("stamp") == stamp and meta.get("schema") == _SCHEMA:
                 return db
             db.close()
         except (sqlite3.DatabaseError, TypeError):
@@ -199,7 +204,7 @@ def _candidates(db: sqlite3.Connection, toks: list[str]):
     for >=3-char tokens, indexed LIKE for the stubs. Yields msgs rows."""
     fts = [t for t in toks if len(t) >= 3]
     likes = [t for t in toks if len(t) < 3]
-    sel = "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs"
+    sel = "SELECT session, agent, project, concept, model, turn, ts, who, text FROM msgs"
     if fts:
         where = ["id IN (SELECT rowid FROM msgs_fts WHERE msgs_fts MATCH ?)"]
         params: list = [" AND ".join(_fts_quote(t) for t in fts)]
@@ -213,8 +218,8 @@ def _candidates(db: sqlite3.Connection, toks: list[str]):
 
 
 def _hit(row, start: int, end: int) -> dict:
-    h = dict(zip(_FIELDS, row[:7]))
-    h["snippet"] = _snip_at(row[7], start, end)
+    h = dict(zip(_FIELDS, row[:_TEXT]))
+    h["snippet"] = _snip_at(row[_TEXT], start, end)
     return h
 
 
@@ -234,13 +239,13 @@ def keyword(db: sqlite3.Connection, q: str, k: int) -> dict:
     if len(toks) == 1:  # no separators in q, so the token IS the query
         ql = q.strip().lower()
         for row in _candidates(db, [ql]):
-            i = row[7].lower().find(ql)
+            i = row[_TEXT].lower().find(ql)
             if i >= 0:
                 hits.append(_hit(row, i, i + len(ql)))
     else:
         pat = re.compile(r"[\s\-_]*".join(re.escape(t) for t in toks), re.I)
         for row in _candidates(db, toks):
-            m = pat.search(row[7])
+            m = pat.search(row[_TEXT])
             if m:
                 hits.append(_hit(row, m.start(), m.end()))
     return _pack(hits, k)
@@ -253,7 +258,7 @@ def word(db: sqlite3.Connection, q: str, k: int) -> dict:
     wc = re.compile(r"[\w]")
     hits = []
     for row in _candidates(db, [q]):
-        low = row[7].lower()
+        low = row[_TEXT].lower()
         i = low.find(ql)
         while i >= 0:
             j = i + n
@@ -300,9 +305,9 @@ def regex(db: sqlite3.Connection, pattern: str, k: int) -> dict:
     hits = []
     lit = _required_literal(pattern)
     cur = (_candidates(db, [lit.lower()]) if lit else db.execute(
-        "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs"))
+        "SELECT session, agent, project, concept, model, turn, ts, who, text FROM msgs"))
     for row in cur:
-        m = rx.search(row[7])
+        m = rx.search(row[_TEXT])
         if m:
             hits.append(_hit(row, m.start(), m.end()))
     return _pack(hits, k)
@@ -311,6 +316,6 @@ def regex(db: sqlite3.Connection, pattern: str, k: int) -> dict:
 def session_rows(db: sqlite3.Connection, session: str) -> list[dict]:
     """One session's rows in turn order, for explore.get_window's fast path."""
     cur = db.execute(
-        "SELECT session, agent, project, concept, turn, ts, who, text FROM msgs "
+        "SELECT session, agent, project, concept, model, turn, ts, who, text FROM msgs "
         "WHERE session = ? ORDER BY turn", (session,))
     return [dict(zip((*_FIELDS, "text"), row)) for row in cur]

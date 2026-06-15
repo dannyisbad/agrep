@@ -20,7 +20,7 @@ Global npm installs also try to preinstall the matching PyPI tool with
 entrypoint, so `agrep` works even if uv's tool directory is not on PATH.
 
 The npm shim pins the matching PyPI version under the hood, so npm and PyPI releases
-do not drift. Prefer the direct route? `uv tool install agrep==0.1.2` — same thing,
+do not drift. Prefer the direct route? `uv tool install agrep==0.1.3` — same thing,
 no node in the middle.
 
 Full docs: https://github.com/dannyisbad/agrep

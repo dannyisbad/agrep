@@ -104,11 +104,20 @@ def tool_search_chats(query: str, k: int = 5) -> str:
     order = np.argsort(-np.asarray(scores))[:k]
     import explore
     sc = explore._session_concept()
-    out = [{"session": cand[i][0], "concept": sc.get(cand[i][0], ""),
-            "project": cand[i][1].get("cwd_project", ""),
-            "agent": cand[i][1].get("agent", ""), "title": cand[i][1].get("title", ""),
-            "summary": cand[i][1].get("summary", ""),
-            "tags": cand[i][1].get("tags", []), "n_msgs": cand[i][1].get("n_msgs", 0)} for i in order]
+    out = []
+    for i in order:
+        session = cand[i][0]
+        try:
+            model = explore.get_chat(session).get("model", "")
+        except Exception:  # noqa: BLE001 -- model is enrichment only
+            model = ""
+        out.append({"session": session, "concept": sc.get(session, ""),
+                    "project": cand[i][1].get("cwd_project", ""),
+                    "agent": cand[i][1].get("agent", ""),
+                    "model": model,
+                    "title": cand[i][1].get("title", ""),
+                    "summary": cand[i][1].get("summary", ""),
+                    "tags": cand[i][1].get("tags", []), "n_msgs": cand[i][1].get("n_msgs", 0)})
     return json.dumps(out)
 
 
@@ -134,6 +143,7 @@ def tool_search_messages(query: str, k: int = 5) -> str:
     scores = rr.predict([(query, c["text"]) for c in cand], show_progress_bar=False)
     order = np.argsort(-np.asarray(scores))[:k]
     out = [{"project": cand[i].get("project", ""), "agent": cand[i].get("agent", ""),
+            "model": cand[i].get("model", ""),
             "text": " ".join(cand[i].get("text", "").split())[:240]} for i in order]
     return json.dumps(out)
 

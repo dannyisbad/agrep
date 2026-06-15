@@ -235,6 +235,7 @@ def _kw_corpus() -> list[dict]:
                 out.append({"session": session, "turn": o.get("turn", 0), "ts": o.get("ts", 0),
                             "agent": o.get("agent", ""),
                             "project": o.get("project", ""), "concept": c,
+                            "model": o.get("model", ""),
                             "who": "recap" if t.startswith(RECAP_PREFIX) else "you",
                             "text": t, "low": t.lower()})
             r = reps.get(o.get("id", ""), "")
@@ -242,6 +243,7 @@ def _kw_corpus() -> list[dict]:
                 out.append({"session": session, "turn": o.get("turn", 0), "ts": o.get("ts", 0),
                             "agent": o.get("agent", ""),
                             "project": o.get("project", ""), "concept": c,
+                            "model": o.get("model", ""),
                             "who": "agent", "text": r, "low": r.lower()})
     return out
 
@@ -402,7 +404,7 @@ def keyword_search(q: str, k: int = 300) -> dict:
     if not q:
         return {"hits": [], "total": 0, "chats": 0}
     corpus = _kw_corpus()
-    fields = ("session", "agent", "project", "concept", "turn", "ts", "who")
+    fields = ("session", "agent", "project", "concept", "model", "turn", "ts", "who")
     toks = [t for t in re.split(r"[\s\-_]+", q) if t]
     hits = []
     if len(toks) <= 1:  # single token -> plain substring (fastest)
