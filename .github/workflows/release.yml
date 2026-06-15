@@ -172,7 +172,7 @@ jobs:
         shell: bash
         run: |
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep-cli."
+            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep."
             exit 1
           fi
           npm whoami
@@ -204,19 +204,30 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - run: npm install -g npm@latest && npm --version
       - name: publish scoped package
-        working-directory: npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+        shell: bash
+        run: |
+          version=$(node -p "require('./npm/package.json').version")
+          if npm view "@mundy/agrep@$version" version >/dev/null 2>&1; then
+            echo "@mundy/agrep@$version already published"
+          else
+            npm publish ./npm --access public --provenance
+          fi
       - name: publish unscoped alias
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
-          tmp=$(mktemp -d)
-          cp -R npm/. "$tmp/"
-          node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public --provenance "$tmp"
+          version=$(node -p "require('./npm/package.json').version")
+          if npm view "agrep@$version" version >/dev/null 2>&1; then
+            echo "agrep@$version already published"
+          else
+            tmp=$(mktemp -d)
+            cp -R npm/. "$tmp/"
+            node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
+            npm publish --access public --provenance "$tmp"
+          fi
 
   publish-npm-manual:
     name: publish npm manually
@@ -238,7 +249,7 @@ jobs:
         shell: bash
         run: |
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN repository secret is required to publish @mundy/agrep and agrep-cli."
+            echo "::error::NPM_TOKEN repository secret is required to publish @mundy/agrep and agrep."
             exit 1
           fi
           npm whoami
@@ -255,16 +266,27 @@ jobs:
           print(f"PyPI agrep {version} exists")
           PY
       - name: publish scoped package
-        working-directory: npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+        shell: bash
+        run: |
+          version=$(node -p "require('./npm/package.json').version")
+          if npm view "@mundy/agrep@$version" version >/dev/null 2>&1; then
+            echo "@mundy/agrep@$version already published"
+          else
+            npm publish ./npm --access public --provenance
+          fi
       - name: publish unscoped alias
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
-          tmp=$(mktemp -d)
-          cp -R npm/. "$tmp/"
-          node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
-          npm publish --access public --provenance "$tmp"
+          version=$(node -p "require('./npm/package.json').version")
+          if npm view "agrep@$version" version >/dev/null 2>&1; then
+            echo "agrep@$version already published"
+          else
+            tmp=$(mktemp -d)
+            cp -R npm/. "$tmp/"
+            node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
+            npm publish --access public --provenance "$tmp"
+          fi

@@ -28,7 +28,7 @@ The PyPI package already exposes the `agrep` console script; uv/pipx/pip decide
 where that script lands. npm users can install the shim globally instead:
 
 ```
-npm i -g @mundy/agrep   # or: npm i -g agrep-cli
+npm i -g @mundy/agrep   # or: npm i -g agrep
 ```
 
 npm puts its `agrep` shim on PATH and, when uv is available, preinstalls the

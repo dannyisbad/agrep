@@ -11,7 +11,7 @@ python itself, so this works even on a machine with no python installed.
 
 ```
 npm i -g @mundy/agrep
-# or: npm i -g agrep-cli
+# or: npm i -g agrep
 agrep "race condition"     # first run indexes your agent stores, then greps
 ```
 
