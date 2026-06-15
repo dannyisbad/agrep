@@ -20,13 +20,15 @@ pub struct Message {
     /// The human-authored text (the user's words). Wrappers/tool-results already stripped.
     pub text: Arc<str>,
     /// User-side row type: "user" for real prompts, "control" for non-model control
-    /// markers, "synthetic" for harness/test traffic.
+    /// markers, "synthetic" for test traffic, "recap" for continuation summaries, or
+    /// "harness" for generated benchmark/controller prompts.
     pub who: Arc<str>,
     /// Model that produced the agent's side of this turn ("claude-opus-4-8",
     /// "gpt-5.3-codex-spark", "gemini-3.1-pro-preview"). Empty when the source omits it.
     pub model: Arc<str>,
-    /// How `model` was attributed: "explicit", "session", "unknown", "control",
-    /// "synthetic", or "ambiguous_session".
+    /// How `model` was attributed: "explicit", "session", "temporal_session",
+    /// "unknown", "control", "synthetic", "recap", "harness", "explicit_harness",
+    /// or "ambiguous_session".
     pub model_source: Arc<str>,
     /// The agent's reply to this turn, trimmed for display. Empty if none was captured.
     pub reply: Arc<str>,

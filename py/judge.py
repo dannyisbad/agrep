@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 import urllib.request
@@ -52,6 +53,7 @@ def ask_judge(model: str, text: str) -> tuple[float, float] | None:
                      {"role": "user", "content": text[:2000]}],
         "options": {"num_ctx": 1024, "temperature": 0.0},
         "format": "json",
+        "keep_alive": os.environ.get("AGREP_OLLAMA_KEEP_ALIVE", "5m"),
     }
     req = urllib.request.Request(OLLAMA, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})

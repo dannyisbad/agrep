@@ -92,11 +92,21 @@ def main() -> int:
     sig = ""
     if msgs.exists():
         sig = f"{msgs.stat().st_size}:" + hashlib.md5(msgs.read_bytes()).hexdigest()
-    if not args.full and sig and sig_file.exists() and sig_file.read_text().strip() == sig:
+    downstream_missing = not common.EMOTIONS_PATH.exists() or not (common.DATA_DIR / "summaries.jsonl").exists()
+    if (
+        not args.full
+        and not downstream_missing
+        and sig
+        and sig_file.exists()
+        and sig_file.read_text().strip() == sig
+    ):
         print(f"\n  no new messages since last index - already up to date. "
               f"({time.perf_counter() - t0:.0f}s)")
         print("  (pass --full to rebuild embeddings/affect/topics/arcs anyway.)")
         return 0
+    if downstream_missing and not args.full:
+        print("\n  messages unchanged, but derived smart/named artifacts are missing; "
+              "running incremental downstream stages.", flush=True)
 
     # Everything below is an ENHANCEMENT layer (GPU embeddings, affect, LLM summaries,
     # arcs). Each is optional: failures warn and skip, because the explorer is already

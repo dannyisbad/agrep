@@ -459,6 +459,8 @@ def main() -> int:
     ap.add_argument("--no-warm", action="store_true", help=argparse.SUPPRESS)  # pre-lazy-default flag, kept harmless
     ap.add_argument("--no-autoindex", action="store_true",
                     help="don't auto-rebuild the index on new activity (reindex by hand)")
+    ap.add_argument("--no-autosmart", action="store_true",
+                    help="don't opportunistically refresh affect/summaries while idle")
     args = ap.parse_args()
     _reap_superseded()
 
@@ -491,7 +493,7 @@ def main() -> int:
     threading.Thread(target=_sem_reaper, daemon=True, name="tilt-sem-reaper").start()
     w = live.watcher()  # start tailing the agent stores (passive, hook-free)
     if not args.no_autoindex:
-        indexer.start(w)  # keep the materialized index current as agents work
+        indexer.start(w, auto_smart=not args.no_autosmart)
     # Drop a portfile so CLI commands (agrep search links, --semantic) find THIS server
     # without being told the port. Best-effort; a stale file is harmless (the CLI probes
     # reachability before trusting it).

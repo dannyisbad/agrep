@@ -317,9 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", help="only turns from this exact model name")
     ap.add_argument("--soft", "--model-soft", dest="model_soft", action="store_true",
                     help="with --model, substring-match the model name (like *model*)")
-    ap.add_argument("--who", choices=("user", "agent", "control", "synthetic", "recap"),
+    ap.add_argument("--who", choices=("user", "agent", "control", "synthetic", "recap", "harness"),
                     help="only real user turns, agent replies, control markers, "
-                         "test traffic, or continuation recaps")
+                         "test traffic, continuation recaps, or harness prompts")
     ap.add_argument("-s", "--semantic", action="store_true",
                     help="meaning search: most relevant CHATS via a running server "
                          "(keyword greps message lines; falls back to keyword if no server)")

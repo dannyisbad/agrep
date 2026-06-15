@@ -172,6 +172,9 @@ def main() -> int:
     ap.add_argument("--full", action="store_true",
                     help="Re-score every message. Default is incremental: append only "
                          "messages not already in emotions.jsonl.")
+    ap.add_argument("--max-new", type=int, default=None,
+                    help="Cap new messages scored this run. Intended for background "
+                         "UI refreshes; rerun later to continue.")
     args = ap.parse_args()
 
     device = common.pick_device()
@@ -201,6 +204,10 @@ def main() -> int:
         if not msgs:
             common.log("emotions already up to date (0 new).")
             return 0
+    if args.max_new is not None and len(msgs) > args.max_new:
+        msgs.sort(key=lambda m: m.ts, reverse=True)
+        common.log(f"capping at {args.max_new} newest of {len(msgs)} pending messages")
+        msgs = msgs[: args.max_new]
 
     common.log(f"device={device} batch_size={batch_size} messages={len(msgs)}"
                + (f" (smoke, first {args.smoke})" if args.smoke else ""))

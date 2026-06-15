@@ -176,6 +176,13 @@ def main() -> int:
         help="Re-embed every message. Default is incremental: keep existing vectors, "
              "drop ones whose message is gone, and embed only NEW messages.",
     )
+    ap.add_argument(
+        "--max-new",
+        type=int,
+        default=None,
+        help="Cap new messages embedded this run. Intended for background UI refreshes; "
+             "rerun later to continue.",
+    )
     args = ap.parse_args()
 
     device = common.pick_device()
@@ -221,6 +228,11 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 - corrupt/old index -> fall back to full
             common.log(f"incremental read failed ({e}); doing a full re-embed.")
             kept_ids, kept_mat = [], np.zeros((0, common.EMBED_DIM), dtype=np.float32)
+
+    if args.max_new is not None and len(msgs) > args.max_new:
+        msgs.sort(key=lambda m: m.ts, reverse=True)
+        common.log(f"capping at {args.max_new} newest of {len(msgs)} pending messages")
+        msgs = msgs[: args.max_new]
 
     ids = [m.id for m in msgs]
     texts = [m.text for m in msgs]

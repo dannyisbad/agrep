@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.request
 
@@ -29,7 +30,8 @@ def gen_title(model: str, body: str) -> str:
     payload = {"model": model, "stream": False,
                "messages": [{"role": "system", "content": SYS},
                             {"role": "user", "content": body}],
-               "options": {"num_ctx": 2048, "temperature": 0.3}}
+               "options": {"num_ctx": 2048, "temperature": 0.3},
+               "keep_alive": os.environ.get("AGREP_OLLAMA_KEEP_ALIVE", "5m")}
     req = urllib.request.Request(OLLAMA, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -39,6 +41,8 @@ def gen_title(model: str, body: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", type=int, default=None, help="print N titles, write nothing")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="cap title backfills this run; rerun later to continue")
     args = ap.parse_args()
 
     path = common.DATA_DIR / "summaries.jsonl"
@@ -46,6 +50,9 @@ def main() -> int:
     todo = [r for r in recs if not r.get("title")]
     if args.smoke:
         todo = todo[: args.smoke]
+    elif args.limit is not None and len(todo) > args.limit:
+        common.log(f"capping at {args.limit} of {len(todo)} missing titles")
+        todo = todo[: args.limit]
     if not todo:
         print("  every summary already has a title.")
         return 0

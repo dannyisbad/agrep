@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.request
 from collections import defaultdict
@@ -75,7 +76,8 @@ def gen(model, body):
     payload = {"model": model, "stream": False,
                "messages": [{"role": "system", "content": SYS},
                             {"role": "user", "content": PROMPT.format(body=body)}],
-               "options": {"num_ctx": 8192, "temperature": 0.3}}
+               "options": {"num_ctx": 8192, "temperature": 0.3},
+               "keep_alive": os.environ.get("AGREP_OLLAMA_KEEP_ALIVE", "5m")}
     req = urllib.request.Request(OLLAMA, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=180) as r:

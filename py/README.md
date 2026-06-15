@@ -30,7 +30,7 @@ dir and can be overridden with `AGREP_DATA_DIR`.
 
 | File | Format |
 |---|---|
-| `data/messages.jsonl` | one JSON per line: `{id, agent, project, session, ts, turn, who, text, model?, model_source}`. `id == "agent:session:turn"`. Produced by `agrep index`. `who=user` rows are real prompts; control/synthetic/recap rows are searchable but excluded from model-attribution denominators. |
+| `data/messages.jsonl` | one JSON per line: `{id, agent, project, session, ts, turn, who, text, model?, model_source}`. `id == "agent:session:turn"`. Produced by `agrep index`. `who=user` rows are real prompts; control/synthetic/recap/harness rows are searchable but excluded from model-attribution denominators. Non-user rows keep visible placeholder model buckets when no real model is available; `who` is the authoritative tag. |
 | `data/replies.jsonl` | one JSON per line: `{id, reply}`. Agent replies are sidecar rows joined by `id`, so embedding/affect reads stay user-side and search can still emit `who=agent`. |
 | `data/embeddings.f32` | raw little-endian `f32`, row-major, `N` rows × `D` cols. **Each row is L2-normalized.** `D = 256` (Matryoshka truncation of the model's native dim, then renormalized). |
 | `data/embeddings.ids` | UTF-8, one message id per line. Row `r` of `embeddings.f32` ↔ line `r` here. **The ids file is the authority for row order** - it need not match `messages.jsonl` order. |

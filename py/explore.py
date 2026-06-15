@@ -636,12 +636,12 @@ def get_chat(session: str) -> dict:
         })
     turns.sort(key=lambda t: t["turn"])
 
-    # every model the chat ran on, most-used first. "<synthetic>" is claude's placeholder
-    # on harness-fabricated turns (API-error retries etc.), not a model anyone picked.
+    # every real model the chat ran on, most-used first. Angle-bracket buckets are
+    # normalized non-model traffic such as control, recap, synthetic, or harness rows.
     mcount: dict[str, int] = {}
     for t in turns:
         m = t.get("model", "")
-        if m and m != "<synthetic>":
+        if m and not (m.startswith("<") and m.endswith(">")):
             mcount[m] = mcount.get(m, 0) + 1
     models = [{"name": m, "n": n}
               for m, n in sorted(mcount.items(), key=lambda kv: -kv[1])]

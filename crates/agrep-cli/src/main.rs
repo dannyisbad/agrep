@@ -177,45 +177,127 @@ fn is_synthetic_turn(model: &str) -> bool {
 
 fn is_control_turn(text: &str) -> bool {
     let t = text.trim();
-    t == "[Request interrupted by user]" || t == "Request interrupted by user"
+    t.eq_ignore_ascii_case("continue")
+        || t == "Request interrupted by user"
+        || t.starts_with("[Request interrupted by user")
+}
+
+fn is_recap_turn(text: &str) -> bool {
+    text.trim_start()
+        .starts_with("This session is being continued from a previous conversation")
+}
+
+fn is_harness_project(project: &str) -> bool {
+    let p = project.to_ascii_lowercase();
+    p == "vo-exp"
+        || p == "_probe"
+        || p.contains("_probe")
+        || p.contains("control_")
+        || p.contains("run_control")
+        || p.contains("haiku-control")
+        || p.contains("haiku-treatment")
+}
+
+fn is_harness_turn(project: &str, text: &str) -> bool {
+    let t = text.trim_start();
+    is_harness_project(project)
+        || t.starts_with("Return only valid JSON that matches the schema below.")
+        || t.starts_with("Use the context below to decide what Candence should say")
+        || t.starts_with("You are a workflow planner for OpenCode.")
+        || t.starts_with("You are an independent verifier.")
+        || t.starts_with("\"Create a file named ok.txt")
+        || t.starts_with("\"You are working in the current directory.")
+        || t.starts_with("\"Stay in this directory. STEP 1:")
+        || t.starts_with("\"STEP 1: run ")
+        || t.starts_with("Follow the README in this directory to run the analysis")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    User,
+    Synthetic,
+    Control,
+    Recap,
+    Harness,
+}
+
+fn row_kind(m: &Message) -> RowKind {
+    let raw_model = m.model.trim();
+    if is_synthetic_turn(raw_model) {
+        RowKind::Synthetic
+    } else if is_control_turn(&m.text) {
+        RowKind::Control
+    } else if is_recap_turn(&m.text) {
+        RowKind::Recap
+    } else if is_harness_turn(&m.project, &m.text) {
+        RowKind::Harness
+    } else {
+        RowKind::User
+    }
 }
 
 fn normalize_messages(msgs: Vec<Message>) -> Vec<Message> {
     let mut session_models: HashMap<(&'static str, Arc<str>), HashSet<Arc<str>>> = HashMap::new();
+    let mut session_timeline: HashMap<(&'static str, Arc<str>), Vec<(u32, Arc<str>)>> =
+        HashMap::new();
     for m in &msgs {
         let model = m.model.trim();
-        if model.is_empty() || is_synthetic_turn(model) || is_control_turn(&m.text) {
+        if model.is_empty() || row_kind(m) != RowKind::User {
             continue;
         }
         session_models
             .entry((m.agent, m.session.clone()))
             .or_default()
             .insert(m.model.clone());
+        session_timeline
+            .entry((m.agent, m.session.clone()))
+            .or_default()
+            .push((m.turn, m.model.clone()));
+    }
+    for models in session_timeline.values_mut() {
+        models.sort_by_key(|(turn, _)| *turn);
     }
 
     msgs.into_iter()
         .map(|m| {
             let raw_model = m.model.trim();
-            let synthetic = is_synthetic_turn(raw_model);
-            let control = !synthetic && is_control_turn(&m.text);
-            let (who, model, model_source): (&str, Arc<str>, &str) = if synthetic {
-                ("synthetic", Arc::from(""), "synthetic")
-            } else if control {
-                ("control", Arc::from(""), "control")
-            } else if !raw_model.is_empty() {
-                ("user", m.model.clone(), "explicit")
-            } else {
-                let models = session_models.get(&(m.agent, m.session.clone()));
-                match models.map(|s| s.len()).unwrap_or(0) {
-                    1 => {
-                        let model = models
-                            .and_then(|s| s.iter().next())
-                            .cloned()
-                            .unwrap_or_else(|| Arc::from(""));
-                        ("user", model, "session")
+            let (who, model, model_source): (&str, Arc<str>, &str) = match row_kind(&m) {
+                RowKind::Synthetic => ("synthetic", m.model.clone(), "synthetic"),
+                RowKind::Control => ("control", Arc::from("<control>"), "control"),
+                RowKind::Recap => ("recap", Arc::from("<recap>"), "recap"),
+                RowKind::Harness => {
+                    if raw_model.is_empty() {
+                        ("harness", Arc::from("<harness>"), "harness")
+                    } else {
+                        ("harness", m.model.clone(), "explicit_harness")
                     }
-                    0 => ("user", Arc::from(""), "unknown"),
-                    _ => ("user", Arc::from(""), "ambiguous_session"),
+                }
+                RowKind::User => {
+                    if !raw_model.is_empty() {
+                        ("user", m.model.clone(), "explicit")
+                    } else {
+                        let models = session_models.get(&(m.agent, m.session.clone()));
+                        match models.map(|s| s.len()).unwrap_or(0) {
+                            1 => {
+                                let model = models
+                                    .and_then(|s| s.iter().next())
+                                    .cloned()
+                                    .unwrap_or_else(|| Arc::from(""));
+                                ("user", model, "session")
+                            }
+                            0 => ("user", Arc::from(""), "unknown"),
+                            _ => {
+                                let timeline = session_timeline.get(&(m.agent, m.session.clone()));
+                                if let Some(model) =
+                                    timeline.and_then(|rows| temporal_backfill(rows, m.turn))
+                                {
+                                    ("user", model, "temporal_session")
+                                } else {
+                                    ("user", Arc::from(""), "ambiguous_session")
+                                }
+                            }
+                        }
+                    }
                 }
             };
             Message {
@@ -232,6 +314,24 @@ fn normalize_messages(msgs: Vec<Message>) -> Vec<Message> {
             }
         })
         .collect()
+}
+
+fn temporal_backfill(rows: &[(u32, Arc<str>)], turn: u32) -> Option<Arc<str>> {
+    let before = rows
+        .iter()
+        .rev()
+        .find(|(known_turn, _)| *known_turn < turn)
+        .map(|(_, model)| model);
+    let after = rows
+        .iter()
+        .find(|(known_turn, _)| *known_turn > turn)
+        .map(|(_, model)| model);
+    match (before, after) {
+        (Some(a), Some(b)) if a == b => Some(a.clone()),
+        (None, Some(model)) => Some(model.clone()),
+        (Some(model), None) => Some(model.clone()),
+        _ => None,
+    }
 }
 
 /// `agrep index` - ingest and (re)write data/messages.jsonl + data/replies.jsonl. The embeddings,

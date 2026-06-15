@@ -159,14 +159,19 @@ macOS, and Linux.
 replies are kept in `replies.jsonl` and joined by the same `id`, so terminal search
 and `--json` can emit both sides with `who`.
 
-`who` is one of `user`, `agent`, `control`, `synthetic`, or `recap`. Use
-`--who user` for model-vs-model comparisons; control/synthetic/recap rows stay
-searchable but are excluded from doctor's model-attribution denominator.
+`who` is one of `user`, `agent`, `control`, `synthetic`, `recap`, or `harness`.
+Use `--who user` for model-vs-model comparisons; control/synthetic/recap/harness
+rows stay searchable but are excluded from doctor's model-attribution denominator.
 
 `model_source` explains attribution: `explicit` came from the source store,
 `session` was backfilled because that session had exactly one explicit model,
-`unknown` means the adapter/store did not expose one, and `ambiguous_session` means
-the session had multiple explicit models so no backfill was safe.
+`temporal_session` came from an unambiguous same-session model run, `unknown`
+means the adapter/store did not expose one, and `ambiguous_session` means the
+session had multiple explicit models so no backfill was safe.
+
+Synthetic, control, recap, and model-less harness rows keep visible placeholder
+model buckets like `model="<synthetic>"`, but `who` is the authoritative tag.
+Use `--who user` for real model-vs-model comparisons.
 
 ## Commands
 

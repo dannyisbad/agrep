@@ -465,7 +465,7 @@ class LiveWatcher(threading.Thread):
         if sub:
             base["sub"] = True
         model = msg.get("model") or ""
-        if model and model != "<synthetic>":
+        if model and not (model.startswith("<") and model.endswith(">")):
             base["model"] = model
         if o.get("type") == "assistant" and isinstance(content, list):
             for b in content:

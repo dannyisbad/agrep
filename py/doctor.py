@@ -228,10 +228,11 @@ def report() -> dict:
             _row("model attribution", OK if unknown == 0 else OPT,
                  f"{with_model:,}/{accountable:,} user turns ({pct:.1f}%), "
                  f"session backfilled {q['by_source'].get('session', 0):,}, "
+                 f"temporal {q['by_source'].get('temporal_session', 0):,}, "
                  f"unknown {unknown:,}")
             non_model = {
                 k: q["by_who"].get(k, 0)
-                for k in ("control", "synthetic", "recap")
+                for k in ("control", "synthetic", "recap", "harness")
                 if q["by_who"].get(k, 0)
             }
             if non_model:

@@ -117,7 +117,8 @@ struct Record<'a> {
     /// in the hot file; the bulky reply text goes to the replies sidecar instead.
     #[serde(skip_serializing_if = "str::is_empty")]
     model: &'a str,
-    /// explicit | session | unknown | control | synthetic | ambiguous_session.
+    /// explicit | session | temporal_session | unknown | control | synthetic |
+    /// recap | harness | explicit_harness | ambiguous_session.
     model_source: &'a str,
 }
 
