@@ -445,17 +445,19 @@ def _db_session_rows(session: str) -> list[dict] | None:
     if db is None:
         return None
     merged: dict[int, dict] = {}
-    for o in corpusdb.session_rows(db, session):
-        t = o["turn"]
-        m = merged.setdefault(t, {"turn": t, "ts": o["ts"], "agent": o["agent"],
-                                  "project": o["project"], "who": "you",
-                                  "text": "", "reply": ""})
-        if o["who"] == "agent":
-            m["reply"] = o["text"]
-        else:
-            m["text"] = o["text"]
-            m["who"] = o["who"]
-    db.close()
+    try:
+        for o in corpusdb.session_rows(db, session):
+            t = o["turn"]
+            m = merged.setdefault(t, {"turn": t, "ts": o["ts"], "agent": o["agent"],
+                                      "project": o["project"], "who": "you",
+                                      "text": "", "reply": ""})
+            if o["who"] == "agent":
+                m["reply"] = o["text"]
+            else:
+                m["text"] = o["text"]
+                m["who"] = o["who"]
+    finally:
+        db.close()
     return [merged[t] for t in sorted(merged)]
 
 

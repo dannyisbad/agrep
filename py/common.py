@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
@@ -79,6 +80,66 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # stages, and spawned servers all read this env. Without it the binary falls back to
 # cwd-relative ./data, which installed means read-only-ish site-packages, not here.
 os.environ["AGREP_DATA_DIR"] = str(DATA_DIR)
+INDEX_LOCK_PATH = DATA_DIR / ".index.lock"
+
+
+class IndexLock:
+    """Cross-process lock shared with the Rust ingest binary."""
+
+    def __init__(self, label: str, timeout: float = 1800.0, stale_after: float = 6 * 3600):
+        self.label = label
+        self.timeout = timeout
+        self.stale_after = stale_after
+        self._fd: int | None = None
+
+    def __enter__(self) -> "IndexLock":
+        start = time.monotonic()
+        delay = 0.05
+        while True:
+            try:
+                self._fd = os.open(INDEX_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                body = f"pid={os.getpid()} label={self.label} time={time.time():.3f}\n"
+                os.write(self._fd, body.encode("utf-8", "replace"))
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - INDEX_LOCK_PATH.stat().st_mtime
+                    if age > self.stale_after:
+                        INDEX_LOCK_PATH.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() - start >= self.timeout:
+                    raise TimeoutError(f"timed out waiting for {INDEX_LOCK_PATH}")
+                time.sleep(delay)
+                delay = min(delay * 1.5, 1.0)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        try:
+            INDEX_LOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def replace_with_retry(src: Path, dst: Path, attempts: int = 80) -> None:
+    """Replace dst with src, retrying transient Windows reader locks."""
+    delay = 0.025
+    last: OSError | None = None
+    for _ in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            last = e
+            if not WIN:
+                break
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.5)
+    if last is not None:
+        raise last
 
 
 def _venv_dir() -> Path:
@@ -368,8 +429,8 @@ def write_embeddings(
             f.write(mid)
             f.write("\n")
 
-    tmp_emb.replace(embeddings_path)
-    tmp_ids.replace(ids_path)
+    replace_with_retry(tmp_emb, embeddings_path)
+    replace_with_retry(tmp_ids, ids_path)
 
     # Self-describing index: the Rust reader reads this instead of hardcoding the dim.
     (embeddings_path.parent / "embeddings.meta").write_text(str(dim), encoding="utf-8")
@@ -389,7 +450,7 @@ def write_query(vec: np.ndarray, dim: int = EMBED_DIM, query_path: Path = QUERY_
     query_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = query_path.with_suffix(query_path.suffix + ".tmp")
     tmp.write_bytes(vec.tobytes(order="C"))
-    tmp.replace(query_path)
+    replace_with_retry(tmp, query_path)
 
 
 def read_embeddings(

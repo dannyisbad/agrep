@@ -101,7 +101,7 @@ def verify_markers(top: list[dict], emo: dict[str, dict], k: int) -> None:
         with tmp.open("w", encoding="utf-8", newline="\n") as f:
             for row in emo.values():
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        tmp.replace(common.EMOTIONS_PATH)
+        common.replace_with_retry(tmp, common.EMOTIONS_PATH)
 
     t0 = time.perf_counter()
     judged = failed = unflushed = 0
@@ -281,12 +281,18 @@ def main() -> int:
         a.pop("_ids", None)
         # attach short per-turn snippets for the renderer tooltips
         a["snippets"] = [" ".join(t.split())[:140] for t in texts]
-        (vdir / f"{a['session']}.json").write_text(json.dumps(a), encoding="utf-8")
+        path = vdir / f"{a['session']}.json"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(a), encoding="utf-8")
+        common.replace_with_retry(tmp, path)
         if a["session"] in top_set:
             index.append({k: a[k] for k in ("session", "agent", "project", "n_turns",
                                             "peak_turn", "swing", "drift", "juice",
                                             "verdict") if k in a})
-    (vdir / "index.json").write_text(json.dumps(index, indent=1), encoding="utf-8")
+    path = vdir / "index.json"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(index, indent=1), encoding="utf-8")
+    common.replace_with_retry(tmp, path)
     print(f"\n  wrote {len(keep)} vibe-traces ({len(top)} top + {len(refresh)} refreshed) -> {vdir}")
     for a in top[:10]:
         v = a.get("verdict", "")

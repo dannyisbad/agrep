@@ -118,7 +118,7 @@ def main() -> int:
         with tmp.open("w", encoding="utf-8", newline="\n") as f:
             for r in rows:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        tmp.replace(common.EMOTIONS_PATH)
+        common.replace_with_retry(tmp, common.EMOTIONS_PATH)
         common.log(f"judge: {done} verdicts written ({fails} failed parses) "
                    f"in {time.perf_counter()-t0:.0f}s -> {common.EMOTIONS_PATH}")
     return 0

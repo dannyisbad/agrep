@@ -114,14 +114,23 @@ impl IngestCache {
             .and_then(|b| bincode::deserialize::<CacheFile>(&b).ok())
             .filter(|c| c.version == CACHE_VERSION)
         {
-            Some(c) => IngestCache { entries: c.entries, warm: true },
-            None => IngestCache { entries: HashMap::new(), warm: false },
+            Some(c) => IngestCache {
+                entries: c.entries,
+                warm: true,
+            },
+            None => IngestCache {
+                entries: HashMap::new(),
+                warm: false,
+            },
         }
     }
 
     /// An empty cache that treats every file as changed (used for `--full`).
     pub fn cold() -> Self {
-        IngestCache { entries: HashMap::new(), warm: false }
+        IngestCache {
+            entries: HashMap::new(),
+            warm: false,
+        }
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -129,11 +138,19 @@ impl IngestCache {
             version: CACHE_VERSION,
             entries: &self.entries,
         })?;
-        let tmp = path.with_extension("tmp");
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_file_name(format!(
+            "{}.tmp.{pid}.{nanos}",
+            path.file_name()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_else(|| "ingest-cache".into())
+        ));
         fs::write(&tmp, &bytes)?;
-        #[cfg(windows)]
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)?;
+        crate::cache::replace_file(&tmp, path)?;
         Ok(())
     }
 }
@@ -174,7 +191,9 @@ where
     let t_stat = std::time::Instant::now();
     let stats: Vec<(PathBuf, String, i64, u64)> = files
         .par_iter()
-        .filter_map(|p| file_stat(p).map(|(mt, sz)| (p.clone(), p.to_string_lossy().to_string(), mt, sz)))
+        .filter_map(|p| {
+            file_stat(p).map(|(mt, sz)| (p.clone(), p.to_string_lossy().to_string(), mt, sz))
+        })
         .collect();
     let stat_ms = t_stat.elapsed().as_millis();
     let t_parse = std::time::Instant::now();
@@ -253,7 +272,11 @@ where
     for (key, mt, sz, m, e) in miss_parsed {
         cache.entries.insert(
             key,
-            Entry { mtime: mt, size: sz, msgs: m.iter().map(CMsg::from).collect() },
+            Entry {
+                mtime: mt,
+                size: sz,
+                msgs: m.iter().map(CMsg::from).collect(),
+            },
         );
         messages.extend(m);
         events.extend(e);
@@ -271,12 +294,18 @@ where
 
     println!(
         "  [{}] {} files: stat {}ms · parse+materialize {}ms ({} changed, {} siblings)",
-        root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        root.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
         files.len(),
         stat_ms,
         t_parse.elapsed().as_millis(),
         misses.len(),
         siblings.len()
     );
-    Pass { messages, events, parsed: misses.len() + siblings.len() }
+    Pass {
+        messages,
+        events,
+        parsed: misses.len() + siblings.len(),
+    }
 }

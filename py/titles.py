@@ -77,7 +77,7 @@ def main() -> int:
     with tmp.open("w", encoding="utf-8") as f:
         for r in recs:
             f.write(json.dumps(r) + "\n")
-    tmp.replace(path)
+    common.replace_with_retry(tmp, path)
     print(f"  wrote {len(todo)} titles -> {path} in {time.perf_counter()-t0:.0f}s using {model}")
     return 0
 

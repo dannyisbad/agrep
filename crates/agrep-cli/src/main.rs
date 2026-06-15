@@ -1,5 +1,7 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Where the index lands: $AGREP_DATA_DIR (or the pre-rename $TILT_DATA_DIR), else
 /// ./data — the python side always exports the env when it spawns us, so installed
@@ -11,14 +13,70 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("data"))
 }
 
-use clap::{Parser, Subcommand};
+struct IndexLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl IndexLock {
+    fn acquire() -> anyhow::Result<Self> {
+        let path = data_dir().join(".index.lock");
+        let started = Instant::now();
+        let mut delay = Duration::from_millis(50);
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(
+                        file,
+                        "pid={} label=agrep-rs time={:?}",
+                        std::process::id(),
+                        SystemTime::now()
+                    )?;
+                    return Ok(IndexLock { path, _file: file });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(&path) {
+                        if meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|age| age > Duration::from_secs(6 * 3600))
+                            .unwrap_or(false)
+                        {
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        }
+                    }
+                    if started.elapsed() > Duration::from_secs(1800) {
+                        anyhow::bail!("timed out waiting for {}", path.display());
+                    }
+                    std::thread::sleep(delay);
+                    delay = (delay + delay / 2).min(Duration::from_secs(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 use agrep_core::cache;
 use agrep_core::ingest;
 use agrep_core::ingest_cache::IngestCache;
 use agrep_core::model::{Event, Message};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "agrep-rs", version, about = "ingest agent chat transcripts into the agrep index")]
+#[command(
+    name = "agrep-rs",
+    version,
+    about = "ingest agent chat transcripts into the agrep index"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -49,7 +107,10 @@ fn main() -> anyhow::Result<()> {
 /// opencode re-parse only sources changed since the last index via `cache`; antigravity
 /// (small, many tiny per-session files) always full-parses, so it runs concurrently
 /// with the cache-driven chain instead of after it.
-fn ingest_agent(agent: &str, cache: &mut IngestCache) -> anyhow::Result<(Vec<Message>, Vec<Event>)> {
+fn ingest_agent(
+    agent: &str,
+    cache: &mut IngestCache,
+) -> anyhow::Result<(Vec<Message>, Vec<Event>)> {
     let (msgs, evts) = match agent {
         "claude" => ingest::claude::collect(cache),
         "codex" => ingest::codex::collect(cache),
@@ -112,6 +173,7 @@ fn ingest_agent(agent: &str, cache: &mut IngestCache) -> anyhow::Result<(Vec<Mes
 /// affect, topics, and arcs are produced by the Python sidecar (`python reindex.py`).
 fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let t0 = Instant::now();
+    let _index_lock = IndexLock::acquire()?;
     // Per-phase wall clock, printed at the end: optimize from these numbers, not intuition.
     let mut phases: Vec<(&'static str, u128)> = Vec::new();
     let mut mark = Instant::now();
@@ -144,17 +206,25 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     cache::write_messages(&msgs, &path)?;
     let rpath = data_dir().join("replies.jsonl");
     cache::write_replies(&msgs, &rpath)?;
-    let n_sessions =
-        cache::write_session_index(&msgs, &data_dir().join("sessions.jsonl"))?;
+    let n_sessions = cache::write_session_index(&msgs, &data_dir().join("sessions.jsonl"))?;
     lap!("write-msgs");
     // keep = every live session's event filename, so unchanged event files aren't deleted.
     // The delete sweep is scoped to the agents actually ingested this run — keep covers
     // only their sessions, so an unscoped sweep on `--agent opencode` would wipe the
     // claude/codex event files.
-    let keep: std::collections::HashSet<String> =
-        msgs.iter().map(|m| cache::event_fname(m.agent, &m.session)).collect();
+    let keep: std::collections::HashSet<String> = msgs
+        .iter()
+        .map(|m| cache::event_fname(m.agent, &m.session))
+        .collect();
     let run_agents: Vec<&str> = match agent {
-        "all" => vec!["claude", "codex", "opencode", "antigravity", "kimi", "cline"],
+        "all" => vec![
+            "claude",
+            "codex",
+            "opencode",
+            "antigravity",
+            "kimi",
+            "cline",
+        ],
         one => vec![one],
     };
     let edir = data_dir().join("events");
@@ -163,6 +233,7 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         cache::write_event_stats(&evts, &data_dir().join("event_stats.json"))?;
     }
     lap!("write-events");
+    let _ = mark;
     let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();
     let with_reply = msgs.iter().filter(|m| !m.reply.trim().is_empty()).count();
     println!(

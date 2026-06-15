@@ -18,3 +18,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # kimi-cli keys its per-workdir session dirs by md5(workdir path); ~/.kimi/kimi.json holds
 # the real paths, so we hash each registered path to find its sessions dir.
 md5 = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

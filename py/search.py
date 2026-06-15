@@ -366,17 +366,21 @@ def main(argv: list[str] | None = None) -> int:
         # indexed engine when the corpus db is available (cold calls skip the 50 MB
         # jsonl parse entirely); identical hit shape, legacy scans as fallback.
         db = corpusdb.connect()
-        if args.word:  # whole-word: substring prefilter + boundary check (fast)
-            res = corpusdb.word(db, q, big) if db else _word_scan(q, big)
-        elif args.regex:
-            try:
-                re.compile(q, re.I)
-            except re.error as e:
-                common.log(f"bad regex: {e}")
-                return 2
-            res = corpusdb.regex(db, q, big) if db else _regex_scan(q, big)
-        else:
-            res = corpusdb.keyword(db, q, big) if db else explore.keyword_search(q, big)
+        try:
+            if args.word:  # whole-word: substring prefilter + boundary check (fast)
+                res = corpusdb.word(db, q, big) if db else _word_scan(q, big)
+            elif args.regex:
+                try:
+                    re.compile(q, re.I)
+                except re.error as e:
+                    common.log(f"bad regex: {e}")
+                    return 2
+                res = corpusdb.regex(db, q, big) if db else _regex_scan(q, big)
+            else:
+                res = corpusdb.keyword(db, q, big) if db else explore.keyword_search(q, big)
+        finally:
+            if db:
+                db.close()
 
     filtered = _filtered(res["hits"], args.agent, args.project, args.who,
                          args.model, args.model_soft)

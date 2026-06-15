@@ -254,7 +254,7 @@ def main() -> int:
                 written += 1
 
     if not incremental:
-        tmp.replace(common.EMOTIONS_PATH)
+        common.replace_with_retry(tmp, common.EMOTIONS_PATH)
     elapsed = time.perf_counter() - t0
 
     vram = common.approx_vram_mb()

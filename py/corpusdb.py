@@ -16,8 +16,11 @@ support returns None from connect() and callers use the legacy path.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import time
+from pathlib import Path
 
 import common
 
@@ -83,7 +86,8 @@ def _build(dst) -> None:
     every engine reports identical hits."""
     db = sqlite3.connect(dst)
     db.executescript("""
-        PRAGMA journal_mode=WAL;
+        PRAGMA journal_mode=DELETE;
+        PRAGMA synchronous=OFF;
         CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE msgs(
             id INTEGER PRIMARY KEY,
@@ -158,34 +162,60 @@ def _build(dst) -> None:
     db.close()
 
 
+def _valid_db(stamp: str) -> sqlite3.Connection | None:
+    if not DB_PATH.exists():
+        return None
+    try:
+        db = _open(DB_PATH)
+        meta = dict(db.execute(
+            "SELECT key, value FROM meta WHERE key IN ('stamp', 'schema')"))
+        if meta.get("stamp") == stamp and meta.get("schema") == _SCHEMA:
+            return db
+        db.close()
+    except (sqlite3.DatabaseError, TypeError, OSError):
+        pass
+    return None
+
+
+def _tmp_db_path() -> Path:
+    return DB_PATH.with_name(f"{DB_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+
+
+def _cleanup_tmp(path) -> None:
+    for p in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def connect(quiet: bool = False) -> sqlite3.Connection | None:
     """A connection to a FRESH corpus db, building/rebuilding first if the sources
     moved. None when there's nothing to index yet or sqlite lacks trigram fts5."""
     if not common.MESSAGES_PATH.exists() or not _trigram_ok():
         return None
     stamp = _stamp()
-    if DB_PATH.exists():
-        try:
-            db = _open(DB_PATH)
-            meta = dict(db.execute(
-                "SELECT key, value FROM meta WHERE key IN ('stamp', 'schema')"))
-            if meta.get("stamp") == stamp and meta.get("schema") == _SCHEMA:
-                return db
-            db.close()
-        except (sqlite3.DatabaseError, TypeError):
-            pass  # corrupt/half-written/old schema -> rebuild
+    db = _valid_db(stamp)
+    if db is not None:
+        return db
     if not quiet:
         common.log("(re)building search index — one-time after each reindex…")
-    tmp = DB_PATH.with_suffix(".db.tmp")
-    tmp.unlink(missing_ok=True)
-    _build(tmp)
-    # atomic swap; a reader holding the old file on windows just makes us retry next run
-    try:
-        import os
-        os.replace(tmp, DB_PATH)
-    except OSError:
-        return _open(tmp)
-    return _open(DB_PATH)
+    with common.IndexLock("corpusdb"):
+        stamp = _stamp()
+        db = _valid_db(stamp)
+        if db is not None:
+            return db
+        tmp = _tmp_db_path()
+        _cleanup_tmp(tmp)
+        _build(tmp)
+        try:
+            common.replace_with_retry(tmp, DB_PATH)
+        except OSError:
+            # On Windows a live reader can still hold corpus.db. Keep the old
+            # published db serving and let the next connect retry the rebuild.
+            _cleanup_tmp(tmp)
+            return _open(DB_PATH) if DB_PATH.exists() else None
+        return _open(DB_PATH)
 
 
 # ------------------------------------------------------------------ query engines

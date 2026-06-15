@@ -7,17 +7,81 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::model::{Event, Message};
 
 /// Write a file atomically: stream into `<path>.tmp`, flush, then rename over `path`.
-/// Rename is atomic within a filesystem on both Windows and Unix, so a concurrent reader
-/// (the server's auto-indexer reindexes while requests are served) always sees either the
-/// complete old file or the complete new one — never a half-written one.
+/// The temp write keeps half-written files out of the published paths; replacement
+/// retries cover transient Windows readers that briefly hold the destination open.
+fn tmp_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| "tmp".into());
+    path.with_file_name(format!("{name}.tmp.{pid}.{nanos}"))
+}
+
+#[cfg(windows)]
+fn replace_existing(tmp: &Path, path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            src.as_ptr(),
+            dst.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn replace_file(tmp: &Path, path: &Path) -> anyhow::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, path)?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let mut delay = Duration::from_millis(25);
+        let mut last: Option<io::Error> = None;
+        for _ in 0..80 {
+            match replace_existing(tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(delay);
+                    delay = (delay + delay / 2).min(Duration::from_millis(500));
+                }
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "replace failed"))
+            .into())
+    }
+}
+
 fn write_atomic<F>(path: &Path, f: F) -> anyhow::Result<()>
 where
     F: FnOnce(&mut BufWriter<fs::File>) -> anyhow::Result<()>,
@@ -27,21 +91,13 @@ where
             fs::create_dir_all(parent)?;
         }
     }
-    let tmp = path.with_extension(format!(
-        "{}tmp",
-        path.extension().map(|e| format!("{}.", e.to_string_lossy()))
-            .unwrap_or_default()
-    ));
+    let tmp = tmp_path(path);
     {
         let mut w = BufWriter::new(fs::File::create(&tmp)?);
         f(&mut w)?;
         w.flush()?;
     }
-    // On Windows, rename fails if the destination exists; remove it first. The tiny
-    // window between remove and rename is acceptable for a single-writer indexer.
-    #[cfg(windows)]
-    let _ = fs::remove_file(path);
-    fs::rename(&tmp, path)?;
+    replace_file(&tmp, path)?;
     Ok(())
 }
 
@@ -173,7 +229,11 @@ pub fn write_session_index(msgs: &[Message], path: &Path) -> anyhow::Result<usiz
                 agent: a.agent,
                 project: a.project,
                 n: a.n,
-                first_ts: if a.first_ts == i64::MAX { 0 } else { a.first_ts },
+                first_ts: if a.first_ts == i64::MAX {
+                    0
+                } else {
+                    a.first_ts
+                },
                 last_ts: a.last_ts,
                 first_text: a.first_text,
             };
@@ -267,8 +327,11 @@ pub fn write_events(
     }
 
     // carry forward the hashes of sessions still live but not touched this run
-    let mut next_manifest: std::collections::HashMap<String, u64> =
-        manifest.iter().filter(|(k, _)| keep.contains(*k)).map(|(k, v)| (k.clone(), *v)).collect();
+    let mut next_manifest: std::collections::HashMap<String, u64> = manifest
+        .iter()
+        .filter(|(k, _)| keep.contains(*k))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     let mut n_events = 0usize;
     let mut n_written = 0usize;
     for ((agent, session), mut evs) in by {
@@ -442,6 +505,7 @@ mod tests {
         ];
         let mut path = std::env::temp_dir();
         path.push(format!("agrep-cache-test-{}.jsonl", std::process::id()));
+        write_messages(&msgs, &path).unwrap();
         write_messages(&msgs, &path).unwrap();
 
         let data = std::fs::read_to_string(&path).unwrap();
