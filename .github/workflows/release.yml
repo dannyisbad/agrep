@@ -172,7 +172,7 @@ jobs:
         shell: bash
         run: |
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep."
+            echo "::error::NPM_TOKEN repository secret is required before publishing PyPI, @mundy/agrep, and agrep-cli."
             exit 1
           fi
           npm whoami
@@ -220,12 +220,12 @@ jobs:
         shell: bash
         run: |
           version=$(node -p "require('./npm/package.json').version")
-          if npm view "agrep@$version" version >/dev/null 2>&1; then
-            echo "agrep@$version already published"
+          if npm view "agrep-cli@$version" version >/dev/null 2>&1; then
+            echo "agrep-cli@$version already published"
           else
             tmp=$(mktemp -d)
             cp -R npm/. "$tmp/"
-            node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
+            node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
             npm publish --access public --provenance "$tmp"
           fi
 
@@ -249,7 +249,7 @@ jobs:
         shell: bash
         run: |
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN repository secret is required to publish @mundy/agrep and agrep."
+            echo "::error::NPM_TOKEN repository secret is required to publish @mundy/agrep and agrep-cli."
             exit 1
           fi
           npm whoami
@@ -282,11 +282,11 @@ jobs:
         shell: bash
         run: |
           version=$(node -p "require('./npm/package.json').version")
-          if npm view "agrep@$version" version >/dev/null 2>&1; then
-            echo "agrep@$version already published"
+          if npm view "agrep-cli@$version" version >/dev/null 2>&1; then
+            echo "agrep-cli@$version already published"
           else
             tmp=$(mktemp -d)
             cp -R npm/. "$tmp/"
-            node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
+            node -e "const fs=require('fs'); const p='$tmp/package.json'; const j=require(p); j.name='agrep-cli'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n')"
             npm publish --access public --provenance "$tmp"
           fi
