@@ -4,7 +4,12 @@ The materialized jsonl stays the source of truth (debuggable, the server's warm 
 still read it). This module mirrors it into data/corpus.db with a trigram FTS5 index,
 so a cold `agrep <pattern>` is an indexed lookup instead of a parse of ~50 MB of jsonl
 plus a linear scan. Staleness is checked against the source files' (mtime, size) every
-connect; a stale db rebuilds in one shot and swaps in atomically.
+connect; an unchanged stamp reuses the db untouched. When the stamp moves, the db is
+refreshed INCREMENTALLY: a per-session content fingerprint (session_sig) tells us which
+sessions actually changed, and only those are re-indexed (DELETE + re-INSERT, with FTS5
+triggers keeping the index in sync) - in place, under the index lock, with a busy_timeout
+so concurrent searches just briefly wait rather than fail. A full one-shot rebuild + atomic
+swap is the fallback for a cold start, a schema bump, or a corrupt db.
 
 Search semantics are IDENTICAL to the legacy scans (explore.keyword_search and
 search.py's word/regex paths): FTS narrows to candidate rows, then the same python
@@ -15,6 +20,7 @@ support returns None from connect() and callers use the legacy path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,13 +31,48 @@ from pathlib import Path
 import common
 
 DB_PATH = common.DATA_DIR / "corpus.db"
-_SCHEMA = "3"
-# corpus inputs; a change in any (mtime_ns, size) invalidates the db
+_SCHEMA = "4"
+# corpus inputs; a change in any (mtime_ns, size) invalidates the cached stamp and triggers
+# a refresh (incremental when possible, full rebuild on schema bump / corruption / cold).
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json")
 RECAP_PREFIX = "This session is being continued from a previous conversation"
 _FIELDS = ("session", "agent", "project", "concept", "model", "model_source",
            "turn", "ts", "who")
 _TEXT = len(_FIELDS)
+
+# Insert shared by the full build and the incremental update so both write identical rows.
+_INS = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, model, "
+        "model_source, who, text) VALUES(?,?,?,?,?,?,?,?,?,?)")
+
+_SCHEMA_SQL = """
+    CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE msgs(
+        id INTEGER PRIMARY KEY,
+        session TEXT NOT NULL, turn INTEGER, ts INTEGER,
+        agent TEXT, project TEXT, concept TEXT, model TEXT, model_source TEXT,
+        who TEXT, text TEXT);
+    CREATE INDEX msgs_session ON msgs(session, turn);
+    -- per-session content fingerprint: how the incremental update knows which sessions moved
+    CREATE TABLE session_sig(session TEXT PRIMARY KEY, sig TEXT);
+    CREATE VIRTUAL TABLE msgs_fts USING fts5(
+        text, content='msgs', content_rowid='id', tokenize='trigram');
+"""
+
+# External-content FTS5 sync triggers. Created AFTER the cold build's bulk insert + one-shot
+# 'rebuild' (so the cold path doesn't double-index), they then maintain the FTS automatically
+# for the incremental DELETE/INSERT of just the sessions that changed.
+_TRIGGERS_SQL = """
+    CREATE TRIGGER msgs_ai AFTER INSERT ON msgs BEGIN
+        INSERT INTO msgs_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+    CREATE TRIGGER msgs_ad AFTER DELETE ON msgs BEGIN
+        INSERT INTO msgs_fts(msgs_fts, rowid, text) VALUES('delete', old.id, old.text);
+    END;
+    CREATE TRIGGER msgs_au AFTER UPDATE ON msgs BEGIN
+        INSERT INTO msgs_fts(msgs_fts, rowid, text) VALUES('delete', old.id, old.text);
+        INSERT INTO msgs_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+"""
 
 
 def _snip_at(text: str, start: int, end: int, pad: int = 80) -> str:
@@ -71,9 +112,12 @@ def _trigram_ok() -> bool:
 
 def _open(path) -> sqlite3.Connection:
     """Connect for reading with pragmas sized for a corpus-scale db: default
-    cache (~2 MB) and no mmap make the first cold query pay random-read I/O."""
+    cache (~2 MB) and no mmap make the first cold query pay random-read I/O. The
+    busy_timeout lets a read coexist with an in-place incremental update - both are
+    sub-second, so SQLite's file locks just make the loser wait, not fail."""
     db = sqlite3.connect(path)
     db.executescript("""
+        PRAGMA busy_timeout=5000;
         PRAGMA mmap_size=268435456;
         PRAGMA cache_size=-65536;
         PRAGMA temp_store=MEMORY;
@@ -81,25 +125,12 @@ def _open(path) -> sqlite3.Connection:
     return db
 
 
-def _build(dst) -> None:
-    """One-shot rebuild: stream the jsonl sources into msgs + its FTS mirror. Mirrors
-    explore._kw_corpus row-for-row (one row per user turn, one per agent reply) so
-    every engine reports identical hits."""
-    db = sqlite3.connect(dst)
-    db.executescript("""
-        PRAGMA journal_mode=DELETE;
-        PRAGMA synchronous=OFF;
-        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE msgs(
-            id INTEGER PRIMARY KEY,
-            session TEXT NOT NULL, turn INTEGER, ts INTEGER,
-            agent TEXT, project TEXT, concept TEXT, model TEXT, model_source TEXT,
-            who TEXT, text TEXT);
-        CREATE INDEX msgs_session ON msgs(session, turn);
-        CREATE VIRTUAL TABLE msgs_fts USING fts5(
-            text, content='msgs', content_rowid='id', tokenize='trigram');
-    """)
-
+def _scan() -> dict[str, list[tuple]]:
+    """Parse the materialized corpus into per-session row lists - the exact rows the msgs
+    table holds (one per user turn, one per agent reply), mirroring explore._kw_corpus so
+    every engine reports identical hits. Shared by the full build and the incremental update
+    so both index byte-identical content. The session concept rides in each row, so a concept
+    relabel changes that session's fingerprint and re-indexes it like any other content move."""
     names: dict[int, str] = {}
     p = common.DATA_DIR / "concepts.json"
     if p.exists():
@@ -128,9 +159,7 @@ def _build(dst) -> None:
             if o.get("id"):
                 reps[o["id"]] = o.get("reply", "")
 
-    ins = ("INSERT INTO msgs(session, turn, ts, agent, project, concept, model, "
-           "model_source, who, text) VALUES(?,?,?,?,?,?,?,?,?,?)")
-    rows = []
+    by: dict[str, list[tuple]] = {}
     with common.MESSAGES_PATH.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -147,6 +176,7 @@ def _build(dst) -> None:
             model_source = o.get("model_source") or ("explicit" if model else "unknown")
             base = (s, o.get("turn", 0), o.get("ts", 0), o.get("agent", ""),
                     o.get("project", ""), concept.get(s, ""), model, model_source)
+            rows = by.setdefault(s, [])
             t = o.get("text", "") or ""
             if t:
                 who = "recap" if t.startswith(RECAP_PREFIX) else o.get("who", "user")
@@ -154,12 +184,32 @@ def _build(dst) -> None:
             r = reps.get(o.get("id", ""), "")
             if r:
                 rows.append((*base, "agent", r))
-            if len(rows) >= 5000:
-                db.executemany(ins, rows)
-                rows = []
-    if rows:
-        db.executemany(ins, rows)
+    return by
+
+
+def _session_sig(rows: list[tuple]) -> str:
+    """Order-independent fingerprint of one session's indexed rows. Sorted before hashing so a
+    reordering in messages.jsonl never reads as a change; covers every column the msgs table
+    stores, so any content/metadata move (edit, model backfill, concept relabel) flips the sig."""
+    h = hashlib.md5()
+    for row in sorted(rows, key=lambda r: (r[1], r[8], r[9])):  # (turn, who, text)
+        h.update(repr(row).encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def _build(dst) -> None:
+    """One-shot rebuild: stream every session into msgs + its FTS mirror, then arm the sync
+    triggers and record per-session fingerprints so subsequent refreshes go incremental."""
+    db = sqlite3.connect(dst)
+    db.executescript("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;" + _SCHEMA_SQL)
+    by = _scan()
+    for rows in by.values():
+        db.executemany(_INS, rows)
+    # bulk FTS build in one shot (no triggers armed yet, so rows aren't double-indexed)
     db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+    db.executescript(_TRIGGERS_SQL)
+    db.executemany("INSERT INTO session_sig(session, sig) VALUES(?, ?)",
+                   [(s, _session_sig(rows)) for s, rows in by.items()])
     db.execute("INSERT INTO meta VALUES('stamp', ?)", (_stamp(),))
     db.execute("INSERT INTO meta VALUES('schema', ?)", (_SCHEMA,))
     db.commit()
@@ -193,9 +243,61 @@ def _cleanup_tmp(path) -> None:
             pass
 
 
+def _incremental(stamp: str) -> sqlite3.Connection | None:
+    """Refresh an existing current-schema db in place, re-indexing ONLY the sessions whose
+    content fingerprint moved (and dropping ones that vanished). Returns a fresh read
+    connection, or None when a full rebuild is required instead (no db yet, schema bump, or
+    the pass hit a db error - the caller falls back to _build). Runs under the caller's
+    IndexLock; the busy_timeout on both this writer and concurrent readers means a search in
+    flight just waits out the sub-second update rather than erroring."""
+    if not DB_PATH.exists():
+        return None
+    db = None
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("PRAGMA synchronous=NORMAL")
+        meta = dict(db.execute("SELECT key, value FROM meta WHERE key='schema'"))
+        if meta.get("schema") != _SCHEMA:
+            db.close()
+            return None  # schema bump -> let the caller rebuild from scratch
+
+        old = dict(db.execute("SELECT session, sig FROM session_sig"))
+        by = _scan()
+        new_sig = {s: _session_sig(rows) for s, rows in by.items()}
+        changed = [s for s in by if old.get(s) != new_sig[s]]
+        removed = [s for s in old if s not in by]
+
+        db.execute("BEGIN")
+        for s in removed:
+            db.execute("DELETE FROM msgs WHERE session = ?", (s,))
+            db.execute("DELETE FROM session_sig WHERE session = ?", (s,))
+        for s in changed:
+            # DELETE then re-INSERT the whole session; the FTS triggers mirror both sides,
+            # so the trigram index ends byte-identical to a full rebuild of these rows.
+            db.execute("DELETE FROM msgs WHERE session = ?", (s,))
+            db.executemany(_INS, by[s])
+            db.execute("INSERT OR REPLACE INTO session_sig(session, sig) VALUES(?, ?)",
+                       (s, new_sig[s]))
+        db.execute("UPDATE meta SET value = ? WHERE key = 'stamp'", (stamp,))
+        db.commit()
+        db.close()
+        return _open(DB_PATH)
+    except sqlite3.DatabaseError:
+        # corruption / lock blowup -> drop to a clean full rebuild
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.DatabaseError:
+                pass
+        return None
+
+
 def connect(quiet: bool = False) -> sqlite3.Connection | None:
-    """A connection to a FRESH corpus db, building/rebuilding first if the sources
-    moved. None when there's nothing to index yet or sqlite lacks trigram fts5."""
+    """A connection to a FRESH corpus db, refreshing first if the sources moved. None when
+    there's nothing to index yet or sqlite lacks trigram fts5. The common case - unchanged
+    stamp - returns the live db untouched; a moved stamp goes incremental (only the changed
+    sessions re-indexed), full rebuild only on a cold start / schema bump / corruption."""
     if not common.MESSAGES_PATH.exists() or not _trigram_ok():
         return None
     stamp = _stamp()
@@ -203,10 +305,13 @@ def connect(quiet: bool = False) -> sqlite3.Connection | None:
     if db is not None:
         return db
     if not quiet:
-        common.log("(re)building search index - one-time after each reindex…")
+        common.log("refreshing search index…")
     with common.IndexLock("corpusdb"):
         stamp = _stamp()
         db = _valid_db(stamp)
+        if db is not None:
+            return db
+        db = _incremental(stamp)
         if db is not None:
             return db
         tmp = _tmp_db_path()
