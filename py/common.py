@@ -256,6 +256,12 @@ EMBEDDINGS_PATH = DATA_DIR / "embeddings.f32"
 IDS_PATH = DATA_DIR / "embeddings.ids"
 QUERY_PATH = DATA_DIR / "query.f32"
 EMOTIONS_PATH = DATA_DIR / "emotions.jsonl"
+# The Rust ingest writes a content fingerprint here and rewrites it (refreshing its mtime)
+# on every run, skipping the file writes when nothing changed. Its mtime is the CLI's
+# "last freshened" clock - see _maybe_freshen / ensure_index.
+INGEST_SIG_PATH = DATA_DIR / ".ingest.sig"
+# How stale the CLI tolerates the index being before re-running the (now cheap) ingest.
+CLI_FRESHEN_MAX_AGE_S = 120.0
 
 # The contract dimension. Matryoshka truncation target; renormalized after.
 # Bumped 256 -> 1024 (full Qwen3-Embedding width) for better recall. The Rust reader
@@ -287,30 +293,59 @@ def refresh_search_index() -> None:
         pass
 
 
-def build_index() -> bool:
+def build_index(quiet: bool = False) -> bool:
     """Run the Rust ingest over every agent store, then refresh the derived FTS db.
 
-    The single ingest invocation shared by `agrep index`/`ui` (a forced rebuild) and
-    ensure_index() (build-on-first-use). Assumes the binary exists - callers that
-    might not have it check ingest_bin().exists() first. Returns True on success.
+    The single ingest invocation shared by `agrep index`/`ui` (a forced rebuild),
+    ensure_index() (build-on-first-use), and the CLI's pre-search freshen. `quiet`
+    captures the ingest's stdout/stderr (the freshen path runs on every search and
+    must stay silent when nothing changed); the loud path streams progress as before.
+    Assumes the binary exists - callers that might not have it check
+    ingest_bin().exists() first. Returns True on success.
     """
-    r = subprocess.run([str(ingest_bin()), "index", "--agent", "all"], cwd=str(REPO_ROOT))
+    kw = {"capture_output": True, "text": True} if quiet else {}
+    r = subprocess.run([str(ingest_bin()), "index", "--agent", "all"],
+                       cwd=str(REPO_ROOT), **kw)
     if r.returncode != 0 or not MESSAGES_PATH.exists():
         return False
     refresh_search_index()
     return True
 
 
+def _maybe_freshen() -> None:
+    """Re-run the ingest before a search when the index hasn't been checked in a while.
+
+    ensure_index used to only verify messages.jsonl EXISTED, so once built the CLI
+    never re-ingested - `agrep` could serve an index hours stale while new sessions
+    piled up. The Rust ingest now skips all writes when content is unchanged (~stat +
+    hash, no I/O), so it's cheap to run before a search. We gate on .ingest.sig's mtime
+    (rewritten every ingest, even a no-op skip) so back-to-back searches don't each pay
+    for it: at most one freshen per CLI_FRESHEN_MAX_AGE_S, bounding staleness to that.
+    """
+    if not ingest_bin().exists():
+        return
+    try:
+        if time.time() - INGEST_SIG_PATH.stat().st_mtime < CLI_FRESHEN_MAX_AGE_S:
+            return
+    except OSError:
+        pass  # no sig yet (first run after upgrade) -> freshen now
+    build_index(quiet=True)
+
+
 def ensure_index(auto: bool = True) -> bool:
-    """Make sure data/messages.jsonl exists, building it on first use if we can.
+    """Make sure data/messages.jsonl exists and is reasonably fresh, building it on
+    first use (and re-ingesting stale indexes) when we can.
 
     Returns True when the materialized corpus is present (already there, or freshly
     ingested), False when it's missing and we couldn't build it. The CLI's keyword
     paths call this so a fresh clone's first `agrep <pattern>` indexes itself instead
-    of dead-ending on "no index yet". `auto=False` (the --no-auto flag) skips the
-    build and just reports presence, preserving the old script-friendly behavior.
+    of dead-ending on "no index yet", and so a later search picks up new sessions
+    instead of serving a stale snapshot. `auto=False` (the --no-auto flag) skips both
+    the build and the freshen, preserving the old script-friendly behavior.
     """
     if MESSAGES_PATH.exists():
+        if auto:
+            _maybe_freshen()
         return True
     cli = cli_name()
     if not auto:

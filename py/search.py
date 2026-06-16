@@ -345,11 +345,13 @@ def main(argv: list[str] | None = None) -> int:
     # true totals (keyword/regex report total/chats computed before the display cap).
     big = 10_000_000 if (args.count or args.max == 0 or filters) else max(args.max * 10, 500)
 
-    # Fresh install / never indexed: build it on first use rather than dead-ending. On a
-    # success we fall through into the normal keyword path; ensure_index logs an actionable
-    # message and we exit 2 when it can't. (--semantic hits the server, which has its own
-    # empty-index handling, so skip the local build there.)
-    if not args.semantic and not common.MESSAGES_PATH.exists():
+    # Fresh install / never indexed: build it on first use rather than dead-ending. Already
+    # indexed: ensure_index re-runs the (now cheap) ingest if the last check is stale, so a
+    # search picks up new sessions instead of serving an hours-old snapshot. On success we
+    # fall through into the normal keyword path; ensure_index logs an actionable message and
+    # we exit 2 when there's no index and it can't build one. (--semantic hits the server,
+    # which has its own empty-index handling + background auto-index, so skip the local build.)
+    if not args.semantic:
         if not common.ensure_index(auto=not args.no_auto):
             return 2
 

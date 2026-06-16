@@ -72,6 +72,7 @@ use agrep_core::ingest;
 use agrep_core::ingest_cache::IngestCache;
 use agrep_core::model::{Event, Message};
 use clap::{Parser, Subcommand};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(
@@ -334,6 +335,37 @@ fn temporal_backfill(rows: &[(u32, Arc<str>)], turn: u32) -> Option<Arc<str>> {
     }
 }
 
+/// Order-independent FNV-1a fingerprint of the deduped+normalized message set. Each message
+/// hashes its full identity+content; the per-message hashes are combined with `wrapping_add`
+/// (commutative) so a run-to-run reordering from the parallel ingest can never masquerade as a
+/// change. Computed straight off the in-memory messages, which is far cheaper than serializing
+/// them - and serializing IS the write cost we're trying to skip when nothing moved.
+fn content_sig(msgs: &[Message]) -> u64 {
+    fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    msgs.par_iter()
+        .map(|m| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            h = fnv(h, m.agent.as_bytes());
+            h = fnv(h, b"\0");
+            h = fnv(h, m.session.as_bytes());
+            h = fnv(h, &m.turn.to_le_bytes());
+            h = fnv(h, &m.ts.to_le_bytes());
+            h = fnv(h, m.text.as_bytes());
+            h = fnv(h, m.who.as_bytes());
+            h = fnv(h, m.model.as_bytes());
+            h = fnv(h, m.model_source.as_bytes());
+            h = fnv(h, m.reply.as_bytes());
+            h
+        })
+        .reduce(|| 0u64, |a, b| a.wrapping_add(b))
+}
+
 /// `agrep index` - ingest and (re)write data/messages.jsonl + data/replies.jsonl. The embeddings,
 /// affect, topics, and arcs are produced by the Python sidecar (`python reindex.py`).
 fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
@@ -366,8 +398,35 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         eprintln!("  ! parse-cache save failed (next run re-parses): {e}");
     }
     lap!("save-cache");
-    let n = msgs.len();
+
+    // Content fingerprint of the in-memory messages. When it matches the last run's AND the
+    // published index is already on disk, every derived file (messages/replies/sessions/events)
+    // would be byte-identical - so skip the whole write cycle (~5s of Windows tmp+rename churn
+    // plus the corpusdb FTS rebuild it would trigger). The CLI re-runs this ingest before a
+    // search to bound staleness; this skip is what makes that cheap (~stat+hash, no writes).
+    // The sig file is rewritten even on a skip, so its mtime is the CLI's "last checked" clock.
+    let sig_path = data_dir().join(".ingest.sig");
+    let sig_line = format!("{}:{}\n", msgs.len(), content_sig(&msgs));
+    lap!("content-sig");
     let path = data_dir().join("messages.jsonl");
+    if !full
+        && path.exists()
+        && fs::read_to_string(&sig_path)
+            .map(|prev| prev.trim() == sig_line.trim())
+            .unwrap_or(false)
+    {
+        let _ = fs::write(&sig_path, &sig_line);
+        println!(
+            "  unchanged since last index ({} messages); skipped writes ({:.0}ms)",
+            msgs.len(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        let breakdown: Vec<String> = phases.iter().map(|(k, ms)| format!("{k} {ms}ms")).collect();
+        println!("  phases: {}", breakdown.join(" · "));
+        return Ok(());
+    }
+
+    let n = msgs.len();
     cache::write_messages(&msgs, &path)?;
     let rpath = data_dir().join("replies.jsonl");
     cache::write_replies(&msgs, &rpath)?;
@@ -397,6 +456,8 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     if complete {
         cache::write_event_stats(&evts, &data_dir().join("event_stats.json"))?;
     }
+    // Record the fingerprint of what we just published, so the next run can short-circuit.
+    let _ = fs::write(&sig_path, &sig_line);
     lap!("write-events");
     let _ = mark;
     let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();
