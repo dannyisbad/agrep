@@ -364,7 +364,10 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             agent = body.get("agent", "")
             sess = body.get("session", "")
-            self._json(lambda: native.open_session(agent, sess))
+            # same_window (default on): resume as a new tab in the current terminal window
+            # rather than a fresh window. Absent -> the default; explicit False opts out.
+            same_window = bool(body.get("same_window", True))
+            self._json(lambda: native.open_session(agent, sess, same_window))
             return
         if self.path == "/reindex":
             # the in-app "refresh" button: force the auto-indexer to run now

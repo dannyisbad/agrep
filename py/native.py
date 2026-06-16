@@ -45,18 +45,47 @@ _RESUME = {
 }
 
 
+def _claude_slug(path: str) -> str:
+    """Claude Code's project-folder encoding: every non-alphanumeric char -> '-'. So
+    `C:\\Temp\\vo-exp\\gatetest` -> `C--Temp-vo-exp-gatetest`. It's lossy (a real '-' and a
+    separator both become '-'), so you can't decode a folder name back to a path - but you
+    CAN re-encode a candidate cwd and check it matches the folder."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
 def _claude_cwd(session: str) -> str:
+    """The dir `claude --resume <id>` must run from: the one ANCHORING the session, i.e. whose
+    slug equals the `~/.claude/projects/<slug>/` folder the transcript lives under. Claude
+    scopes resume to that folder. The recorded `cwd` drifts mid-session (the agent cd's
+    around) and the UI shows the most-WORKED-in folder, so neither the first nor the busiest
+    cwd is reliably the anchor - match the containing folder. Falls back to the first recorded
+    cwd only when nothing matches (unexpected: a session's own cwd should encode to its folder)."""
     for path in glob.glob(os.path.join(HOME, ".claude", "projects", "*", f"{session}.jsonl")):
+        slug = os.path.basename(os.path.dirname(path))
+        cwds: list[str] = []
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     if '"cwd"' not in line:
                         continue
-                    cwd = (json.loads(line) or {}).get("cwd")
-                    if cwd:
-                        return cwd
-        except (OSError, json.JSONDecodeError):
+                    try:
+                        cwd = (json.loads(line) or {}).get("cwd")
+                    except json.JSONDecodeError:
+                        continue
+                    if cwd and cwd not in cwds:
+                        cwds.append(cwd)
+        except OSError:
             continue
+        if not cwds:
+            continue
+        # case-insensitive: the slug's casing can drift from the cwd's (e.g. folder
+        # `...-danny-...` vs cwd `...\Danny\...`), and Windows paths are case-insensitive
+        # anyway, so a case-only difference still resolves to the same project on disk.
+        want = slug.lower()
+        for cwd in cwds:
+            if _claude_slug(cwd).lower() == want:
+                return cwd
+        return cwds[0]
     return ""
 
 
@@ -163,7 +192,7 @@ def resume_in_place(agent: str, session: str) -> int:
         return 1
 
 
-def _spawn_windows(argv: list[str], cwd: str) -> str:
+def _spawn_windows(argv: list[str], cwd: str, same_window: bool = True) -> str:
     # cmd /k: run the resume command and KEEP the shell open in `cwd` afterwards -
     # exiting the agent should leave you in a usable shell already cd'd into the
     # project, not close the tab under you. (Also required for claude: --resume only
@@ -171,8 +200,16 @@ def _spawn_windows(argv: list[str], cwd: str) -> str:
     keep = ["cmd", "/k", *argv]
     wt = shutil.which("wt") or shutil.which("wt.exe")
     if wt:
+        # same_window: drop the resume into the current/most-recent Windows Terminal window
+        # as a new TAB (`-w 0 new-tab`) instead of spawning a fresh window. `-w 0` creates a
+        # window when none exists, so the first resume still opens one; later ones tab into
+        # it. A plain `wt -d` always opens a new window (the opt-out).
+        if same_window:
+            subprocess.Popen([wt, "-w", "0", "new-tab", "-d", cwd, *keep], close_fds=True)
+            return "wt-tab"
         subprocess.Popen([wt, "-d", cwd, *keep], close_fds=True)
         return "wt"
+    # No Windows Terminal: `start` can only open a new console window (no tabs).
     subprocess.Popen(["cmd", "/c", "start", "tilt", *keep], cwd=cwd,
                      close_fds=True, creationflags=0)
     return "start"
@@ -208,8 +245,11 @@ def _spawn_linux(argv: list[str], cwd: str) -> str:
     return os.path.basename(term)
 
 
-def open_session(agent: str, session: str) -> dict:
-    """Spawn a terminal in the session's cwd running the agent's resume command."""
+def open_session(agent: str, session: str, same_window: bool = True) -> dict:
+    """Spawn a terminal in the session's cwd running the agent's resume command. On Windows,
+    same_window (the default) opens it as a new tab in the current Windows Terminal window
+    rather than a separate window; pass False for the old new-window behavior. (mac/linux
+    always open a new window - reliable same-window tabbing there is terminal-specific.)"""
     if agent not in _RESUME:
         return {"ok": False, "error": f"unknown agent {agent!r}"}
     if not _ID_RE.match(session or ""):
@@ -218,7 +258,7 @@ def open_session(agent: str, session: str) -> dict:
     argv = resume_argv(agent, session, cwd)
     try:
         if sys.platform == "win32":
-            via = _spawn_windows(argv, cwd)
+            via = _spawn_windows(argv, cwd, same_window)
         elif sys.platform == "darwin":
             via = _spawn_macos(argv, cwd)
         else:
