@@ -33,11 +33,16 @@ WIN = sys.platform == "win32"
 TILT = common.ingest_bin()
 REINDEX = common.REPO_ROOT / "reindex.py"
 
-CHECK_S = 20        # how often the thread wakes to check the gates (cheap)
-QUIET_S = 30        # reindex once live activity has been quiet this long
-MIN_GAP_S = 120     # at most one automatic run per this interval (the rust ingest is
-                    # cheap now - it skips all writes when nothing changed - so run it often)
-MAX_STALE_S = 1800  # force a run mid-activity if the last index is older than this
+# The headless freshness daemon (indexd) sets AGREP_INDEXD=1 and runs MUCH tighter gates:
+# its whole job is to keep search current, and the rust ingest + incremental corpus refresh
+# are cheap (skip-on-unchanged + per-session FTS), so it can react within seconds of activity
+# settling. The in-app server keeps the relaxed defaults (it has the live rail for immediacy
+# and shouldn't reindex every few seconds while also serving the explorer / loading models).
+_INDEXD = os.environ.get("AGREP_INDEXD") == "1"
+CHECK_S = 3 if _INDEXD else 20      # how often the thread wakes to check the gates (cheap)
+QUIET_S = 4 if _INDEXD else 30      # reindex once live activity has been quiet this long
+MIN_GAP_S = 12 if _INDEXD else 120  # at most one automatic run per this interval
+MAX_STALE_S = 60 if _INDEXD else 1800  # force a run mid-activity if the index is older than this
 FULL_MAX_NEW = 150  # summaries generated per forced run -- bounds one click to minutes
 SMART_MIN_GAP_S = 600
 SMART_IDLE_S = 180

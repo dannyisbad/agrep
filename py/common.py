@@ -258,10 +258,21 @@ QUERY_PATH = DATA_DIR / "query.f32"
 EMOTIONS_PATH = DATA_DIR / "emotions.jsonl"
 # The Rust ingest writes a content fingerprint here and rewrites it (refreshing its mtime)
 # on every run, skipping the file writes when nothing changed. Its mtime is the CLI's
-# "last freshened" clock - see _maybe_freshen / ensure_index.
+# "last freshened" clock - see _sync_freshen.
 INGEST_SIG_PATH = DATA_DIR / ".ingest.sig"
-# How stale the CLI tolerates the index being before re-running the (now cheap) ingest.
+# How stale the CLI tolerates the index being before re-running the (now cheap) ingest,
+# in the synchronous fallback (no daemon).
 CLI_FRESHEN_MAX_AGE_S = 120.0
+# The headless freshness daemon (indexd) heartbeats this lock's mtime; a fresh one means a
+# daemon is keeping the index hot, so the CLI just searches. STALE_S must match indexd's.
+INDEXD_LOCK_PATH = DATA_DIR / ".indexd.lock"
+INDEXD_STALE_S = 20.0
+# The CLI touches this on every search; the daemon reads it to know it's still wanted.
+SEARCH_BEAT_PATH = DATA_DIR / ".agrep.search"
+# Don't re-spawn the daemon more than once per this interval (avoids a Popen per search if it
+# crash-loops); a healthy daemon stays alive via its heartbeat so we never reach here anyway.
+_SPAWN_GUARD_PATH = DATA_DIR / ".indexd.spawn"
+_SPAWN_GUARD_S = 30.0
 
 # The contract dimension. Matryoshka truncation target; renormalized after.
 # Bumped 256 -> 1024 (full Qwen3-Embedding width) for better recall. The Rust reader
@@ -312,24 +323,117 @@ def build_index(quiet: bool = False) -> bool:
     return True
 
 
-def _maybe_freshen() -> None:
-    """Re-run the ingest before a search when the index hasn't been checked in a while.
+def _server_running() -> bool:
+    """Is the full explorer server up? Its portfile carries the port; confirm something
+    actually answers there. When it is, its auto-indexer already keeps the index fresh."""
+    pf = DATA_DIR / ".server"
+    try:
+        port = int(json.loads(pf.read_text(encoding="utf-8"))["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
 
-    ensure_index used to only verify messages.jsonl EXISTED, so once built the CLI
-    never re-ingested - `agrep` could serve an index hours stale while new sessions
-    piled up. The Rust ingest now skips all writes when content is unchanged (~stat +
-    hash, no I/O), so it's cheap to run before a search. We gate on .ingest.sig's mtime
-    (rewritten every ingest, even a no-op skip) so back-to-back searches don't each pay
-    for it: at most one freshen per CLI_FRESHEN_MAX_AGE_S, bounding staleness to that.
-    """
-    if not ingest_bin().exists():
+
+def _freshener_alive() -> bool:
+    """True when something is already keeping the index hot: a live indexd daemon (its lock
+    heartbeat is recent) or the full explorer server."""
+    try:
+        if time.time() - INDEXD_LOCK_PATH.stat().st_mtime < INDEXD_STALE_S:
+            return True
+    except OSError:
+        pass
+    return _server_running()
+
+
+def _spawn_indexd() -> None:
+    """Launch the headless freshness daemon detached, so it outlives this CLI invocation.
+    Rate-limited so a crash-looping daemon can't turn into a Popen per search."""
+    script = PY_DIR / "indexd.py"
+    if not script.exists():
         return
+    try:
+        if time.time() - _SPAWN_GUARD_PATH.stat().st_mtime < _SPAWN_GUARD_S:
+            return
+    except OSError:
+        pass
+    try:
+        _SPAWN_GUARD_PATH.touch()
+    except OSError:
+        pass
+    try:
+        logf = (DATA_DIR / "indexd.log").open("ab")
+    except OSError:
+        logf = subprocess.DEVNULL
+    kw: dict = {"stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf,
+                "cwd": str(REPO_ROOT)}
+    if WIN:
+        kw["creationflags"] = 0x00000208  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, str(script)], **kw)
+    except OSError:
+        pass
+
+
+def freshness_status() -> str:
+    """One line for the `agrep` status banner: what (if anything) is keeping the index hot.
+    Makes the background daemon visible instead of a mystery process."""
+    try:
+        if time.time() - INDEXD_LOCK_PATH.stat().st_mtime < INDEXD_STALE_S:
+            import re as _re
+            m = _re.search(r"pid=(\d+)", INDEXD_LOCK_PATH.read_text(encoding="utf-8"))
+            return f"live (background daemon{f', pid {m.group(1)}' if m else ''})"
+    except OSError:
+        pass
+    if _server_running():
+        return "live (explorer server)"
+    return "on-demand (a search spawns a background daemon; AGREP_NO_DAEMON to disable)"
+
+
+def _sync_freshen() -> None:
+    """Inline re-ingest before a search, gated on .ingest.sig's mtime so back-to-back
+    searches don't each pay for it (at most one per CLI_FRESHEN_MAX_AGE_S). The Rust ingest
+    skips all writes when content is unchanged, so this is cheap when nothing moved."""
     try:
         if time.time() - INGEST_SIG_PATH.stat().st_mtime < CLI_FRESHEN_MAX_AGE_S:
             return
     except OSError:
         pass  # no sig yet (first run after upgrade) -> freshen now
     build_index(quiet=True)
+
+
+def _maybe_freshen() -> None:
+    """Keep the index current before a search, the cheap way.
+
+    ensure_index used to only check that messages.jsonl EXISTED, so once built the CLI
+    never re-ingested - `agrep` could serve an index hours stale while new sessions piled up.
+    Default behavior now leans on the headless daemon (indexd): if it (or the full server) is
+    already keeping the index hot, we just drop a search heartbeat and return, and the search
+    reads an instant, current corpus.db. If nothing is keeping it fresh, we spawn the daemon
+    AND freshen inline once so THIS search is current; every search after is daemon-served.
+
+    AGREP_NO_DAEMON forces the purely synchronous path (no background process): re-ingest
+    inline whenever the index is stale. Useful for sandboxes / one-shot scripts.
+    """
+    if not ingest_bin().exists():
+        return
+    if os.environ.get("AGREP_NO_DAEMON"):
+        _sync_freshen()
+        return
+    try:
+        SEARCH_BEAT_PATH.touch()  # tell the daemon it's still wanted (drives its idle-exit)
+    except OSError:
+        pass
+    if _freshener_alive():
+        return
+    _spawn_indexd()
+    _sync_freshen()  # bridge the gap until the just-spawned daemon takes over
 
 
 def ensure_index(auto: bool = True) -> bool:

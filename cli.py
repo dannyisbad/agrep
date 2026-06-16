@@ -150,6 +150,7 @@ def _status_lines(cli: str) -> list[str]:
     db = common.DATA_DIR / "corpus.db"
     ready = db.exists() and db.stat().st_size > 0
     out.append(f"  search index: {'ready' if ready else 'missing (builds on first search)'}")
+    out.append(f"  freshness: {common.freshness_status()}")
 
     smart = "installed" if Path(common.venv_python()) != Path(sys.executable) else \
         f"not installed (keyword only; `{cli} doctor` to add meaning search)"
