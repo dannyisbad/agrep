@@ -315,6 +315,11 @@ def build_index(quiet: bool = False) -> bool:
     ingest_bin().exists() first. Returns True on success.
     """
     kw = {"capture_output": True, "text": True} if quiet else {}
+    # quiet runs may fire from a console-less context (the indexd daemon); CREATE_NO_WINDOW
+    # stops agrep-rs popping a blank conhost. The loud path keeps the console so `agrep index`
+    # streams progress.
+    if quiet and WIN:
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     r = subprocess.run([str(ingest_bin()), "index", "--agent", "all"],
                        cwd=str(REPO_ROOT), **kw)
     if r.returncode != 0 or not MESSAGES_PATH.exists():

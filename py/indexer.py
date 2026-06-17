@@ -53,6 +53,13 @@ SMART_TITLE_LIMIT = 20
 SMART_JUDGE_LIMIT = 10
 OLLAMA_TAGS = "http://localhost:11434/api/tags"
 
+# Run console children (agrep-rs, python, nvidia-smi) WITHOUT a console window. The indexd
+# daemon runs detached with no console of its own, so each child would otherwise pop a blank
+# conhost window on screen every reindex. Harmless on a server with a real console (output is
+# captured either way). CREATE_NO_WINDOW only exists on Windows; the conditional keeps it off
+# the attribute lookup elsewhere.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WIN else {}
+
 
 class AutoIndexer(threading.Thread):
     def __init__(self, watcher, auto_smart: bool = True):
@@ -144,7 +151,8 @@ class AutoIndexer(threading.Thread):
             timeout = 1800
         try:
             r = subprocess.run(cmd, cwd=str(common.REPO_ROOT),
-                               capture_output=True, text=True, timeout=timeout)
+                               capture_output=True, text=True, timeout=timeout,
+                               **_NO_WINDOW)
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "ingest failed").strip()[-300:]
             else:
@@ -192,6 +200,7 @@ class AutoIndexer(threading.Thread):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=15,
+                **_NO_WINDOW,
             )
             ok = r.returncode == 0
         except Exception:  # noqa: BLE001
@@ -213,6 +222,7 @@ class AutoIndexer(threading.Thread):
                 capture_output=True,
                 text=True,
                 timeout=5,
+                **_NO_WINDOW,
             )
             if r.returncode != 0:
                 return True
@@ -374,6 +384,7 @@ class AutoIndexer(threading.Thread):
                 text=True,
                 timeout=SMART_TIMEOUT_S,
                 env=env,
+                **_NO_WINDOW,
             )
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or f"{stage} failed").strip()[-300:]
