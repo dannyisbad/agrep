@@ -140,7 +140,8 @@ def _status() -> dict:
         "watcher": {"loops": w._n_loops, "tracked": len(w._offsets),
                     "last_err": w._last_err,
                     "active": sum(1 for s in w.sessions.values()
-                                  if (now * 1000 - s["last_ts"]) <= 90 * 1000)},
+                                  if (now * 1000 - max(s["last_ts"], s.get("live_ts", 0)))
+                                  <= 90 * 1000)},
         # what to TELL the user to type: `agrep` from an installed package, the dev
         # form in a checkout. Drives every command string the UI prints.
         "cli": common.cli_name(),

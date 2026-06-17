@@ -359,16 +359,19 @@ class LiveWatcher(threading.Thread):
         now = time.time() * 1000
         active = []
         for s in self.sessions.values():
-            if now - s["last_ts"] > ACTIVE_WINDOW_S * 1000 * 10:
+            # effective activity = the later of the last conversational event and the last
+            # observed store write (system/heartbeat lines keep a working session "live").
+            eff = max(s["last_ts"], s.get("live_ts", 0))
+            if now - eff > ACTIVE_WINDOW_S * 1000 * 10:
                 continue  # long-idle sessions drop from the snapshot entirely
             active.append({
                 "agent": s["agent"], "session": s["session"], "project": s["project"],
                 "title": s["title"], "model": s.get("model", ""),
-                "last_ts": s["last_ts"], "state": s["state"],
+                "last_ts": int(eff), "state": s["state"],
                 "state_ts": s.get("state_ts", 0),
                 "queued": s.get("queued", 0), "queued_text": s.get("queued_text", ""),
                 "sub": s.get("sub", False),
-                "active": (now - s["last_ts"]) <= ACTIVE_WINDOW_S * 1000,
+                "active": (now - eff) <= ACTIVE_WINDOW_S * 1000,
                 "recent": list(s["recent"])[-60:],
             })
         active.sort(key=lambda s: -s["last_ts"])
@@ -436,8 +439,14 @@ class LiveWatcher(threading.Thread):
                 known = e.path in self._offsets
                 if now - st.st_mtime > ACTIVE_WINDOW_S and not known:
                     continue
-                for ln in self._read_delta(e.path, st.st_size, _fid(st)):
+                lines = self._read_delta(e.path, st.st_size, _fid(st))
+                for ln in lines:
                     self._claude_line(e.name[:-6], ln)
+                if lines:
+                    # the file grew -> the session is alive NOW, even if these were system /
+                    # progress / heartbeat lines that emit no event (claude's file_session ==
+                    # its sessionId, so the key matches what _claude_line/_emit created).
+                    self._mark_live(f"claude:{e.name[:-6]}", now)
 
     def _claude_line(self, file_session: str, ln: str) -> None:
         try:
@@ -875,6 +884,20 @@ class LiveWatcher(threading.Thread):
             # adaptive cadence: tight on the heels of activity, relaxed when quiet
             poll = 0.35 if (time.time() - self._last_event_wall) < 10 else POLL_S
             time.sleep(max(0.1, poll - (time.time() - t0)))
+
+    def _mark_live(self, key: str, now: float) -> None:
+        """Mark a session alive at wall-clock NOW because its store just grew. Tailing reads
+        EVERY new line, but only conversational ones (user/assistant/tool) emit events and move
+        last_ts - so a session writing only system / progress / heartbeat lines (a long xhigh
+        think, or a harness with custom line types like autoteam's bridge-session/agent-name)
+        looked idle while clearly working. Freshness keys off this wall stamp too, so a growing
+        file reads as active regardless of line type. Post-boot only: the startup seed read
+        replays history and must not fake liveness on old files."""
+        if not self._booted:
+            return
+        s = self.sessions.get(key)
+        if s is not None:
+            s["live_ts"] = now * 1000
 
     def _decay(self, now: float) -> None:
         """A turn that goes silent is a turn that died: 'thinking'/'replying' with no
