@@ -360,6 +360,7 @@ fn content_sig(msgs: &[Message]) -> u64 {
             h = fnv(h, m.who.as_bytes());
             h = fnv(h, m.model.as_bytes());
             h = fnv(h, m.model_source.as_bytes());
+            h = fnv(h, m.project.as_bytes());  // project is a written column; a relabel must re-sig
             h = fnv(h, m.reply.as_bytes());
             h
         })
@@ -409,8 +410,13 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     let sig_line = format!("{}:{}\n", msgs.len(), content_sig(&msgs));
     lap!("content-sig");
     let path = data_dir().join("messages.jsonl");
+    // Skip only when the WHOLE published set is on disk - a matching sig with a derived file
+    // missing (deleted out-of-band) would otherwise never regenerate it short of --full.
+    let derived_present = path.exists()
+        && data_dir().join("replies.jsonl").exists()
+        && data_dir().join("sessions.jsonl").exists();
     if !full
-        && path.exists()
+        && derived_present
         && fs::read_to_string(&sig_path)
             .map(|prev| prev.trim() == sig_line.trim())
             .unwrap_or(false)

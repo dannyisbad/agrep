@@ -131,19 +131,32 @@ def _scan() -> dict[str, list[tuple]]:
     every engine reports identical hits. Shared by the full build and the incremental update
     so both index byte-identical content. The session concept rides in each row, so a concept
     relabel changes that session's fingerprint and re-indexes it like any other content move."""
+    # concepts are an enrichment layer; a half-written/malformed file (mid-reindex) must
+    # degrade to "no labels", never raise - _scan runs on the hot per-search refresh path.
     names: dict[int, str] = {}
     p = common.DATA_DIR / "concepts.json"
     if p.exists():
-        for r in json.loads(p.read_text(encoding="utf-8")):
-            names[int(r["concept_id"])] = (r.get("name") or r.get("label") or "").strip()
+        try:
+            for r in json.loads(p.read_text(encoding="utf-8")):
+                names[int(r["concept_id"])] = (r.get("name") or r.get("label") or "").strip()
+        except (OSError, ValueError, KeyError, TypeError):
+            names = {}
     concept: dict[str, str] = {}
     p = common.DATA_DIR / "session_concepts.jsonl"
     if p.exists():
-        for line in p.open(encoding="utf-8"):
-            if line.strip():
-                o = json.loads(line)
-                concept[o["session"]] = (names.get(int(o.get("concept_id", -1)))
-                                         or o.get("label", ""))
+        try:
+            with p.open(encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    concept[o["session"]] = (names.get(int(o.get("concept_id", -1)))
+                                             or o.get("label", ""))
+        except OSError:
+            pass
 
     reps: dict[str, str] = {}
     p = common.DATA_DIR / "replies.jsonl"
@@ -173,7 +186,9 @@ def _scan() -> dict[str, list[tuple]]:
             if not s:
                 continue
             model = o.get("model", "")
-            model_source = o.get("model_source") or ("explicit" if model else "unknown")
+            # absent-key fallback only (NOT `or`): an explicit "" must stay "", matching
+            # explore._kw_corpus so the FTS and legacy engines report identical model_source.
+            model_source = o.get("model_source", "explicit" if model else "unknown")
             base = (s, o.get("turn", 0), o.get("ts", 0), o.get("agent", ""),
                     o.get("project", ""), concept.get(s, ""), model, model_source)
             rows = by.setdefault(s, [])
@@ -259,11 +274,10 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         db.execute("PRAGMA synchronous=NORMAL")
         meta = dict(db.execute("SELECT key, value FROM meta WHERE key='schema'"))
         if meta.get("schema") != _SCHEMA:
-            db.close()
             return None  # schema bump -> let the caller rebuild from scratch
 
         old = dict(db.execute("SELECT session, sig FROM session_sig"))
-        by = _scan()
+        by = _scan()  # may raise OSError / JSONDecodeError on a half-written source
         new_sig = {s: _session_sig(rows) for s, rows in by.items()}
         changed = [s for s in by if old.get(s) != new_sig[s]]
         removed = [s for s in old if s not in by]
@@ -282,15 +296,18 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         db.execute("UPDATE meta SET value = ? WHERE key = 'stamp'", (stamp,))
         db.commit()
         db.close()
+        db = None
         return _open(DB_PATH)
-    except sqlite3.DatabaseError:
-        # corruption / lock blowup -> drop to a clean full rebuild
+    except Exception:  # noqa: BLE001 -- ANY failure (db corruption, a half-written source
+        # file's OSError/JSONDecodeError) must drop to a clean full rebuild, never escape and
+        # crash the search. finally closes db so no write-locked handle blocks the rebuild swap.
+        return None
+    finally:
         if db is not None:
             try:
                 db.close()
             except sqlite3.DatabaseError:
                 pass
-        return None
 
 
 def connect(quiet: bool = False) -> sqlite3.Connection | None:

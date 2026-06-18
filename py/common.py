@@ -342,30 +342,37 @@ def _server_running() -> bool:
         return False
 
 
-def _freshener_alive() -> bool:
-    """True when something is already keeping the index hot: a live indexd daemon (its lock
-    heartbeat is recent) or the full explorer server."""
+def _indexd_alive() -> bool:
+    """A heartbeating indexd daemon: its lock mtime is within the stale window. Single source
+    for the probe shared by _freshener_alive and freshness_status."""
     try:
-        if time.time() - INDEXD_LOCK_PATH.stat().st_mtime < INDEXD_STALE_S:
-            return True
+        return time.time() - INDEXD_LOCK_PATH.stat().st_mtime < INDEXD_STALE_S
     except OSError:
-        pass
-    return _server_running()
+        return False
+
+
+def _freshener_alive() -> bool:
+    """True when something is already keeping the index hot: a live indexd daemon or the
+    full explorer server."""
+    return _indexd_alive() or _server_running()
 
 
 def _spawn_indexd() -> None:
     """Launch the headless freshness daemon detached, so it outlives this CLI invocation.
-    Rate-limited so a crash-looping daemon can't turn into a Popen per search."""
+    The spawn claim is an atomic O_EXCL create (reclaimed when stale), so concurrent searches
+    don't each Popen and a crash-looping daemon can't turn into a Popen per search."""
     script = PY_DIR / "indexd.py"
     if not script.exists():
         return
     try:
-        if time.time() - _SPAWN_GUARD_PATH.stat().st_mtime < _SPAWN_GUARD_S:
+        os.close(os.open(_SPAWN_GUARD_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        try:
+            if time.time() - _SPAWN_GUARD_PATH.stat().st_mtime < _SPAWN_GUARD_S:
+                return  # another search just spawned one; don't pile on
+            os.utime(_SPAWN_GUARD_PATH, None)  # stale -> reclaim and respawn
+        except OSError:
             return
-    except OSError:
-        pass
-    try:
-        _SPAWN_GUARD_PATH.touch()
     except OSError:
         pass
     try:
@@ -387,13 +394,13 @@ def _spawn_indexd() -> None:
 def freshness_status() -> str:
     """One line for the `agrep` status banner: what (if anything) is keeping the index hot.
     Makes the background daemon visible instead of a mystery process."""
-    try:
-        if time.time() - INDEXD_LOCK_PATH.stat().st_mtime < INDEXD_STALE_S:
+    if _indexd_alive():
+        try:
             import re as _re
             m = _re.search(r"pid=(\d+)", INDEXD_LOCK_PATH.read_text(encoding="utf-8"))
             return f"live (background daemon{f', pid {m.group(1)}' if m else ''})"
-    except OSError:
-        pass
+        except OSError:
+            return "live (background daemon)"
     if _server_running():
         return "live (explorer server)"
     return "on-demand (a search spawns a background daemon; AGREP_NO_DAEMON to disable)"
@@ -436,7 +443,10 @@ def _maybe_freshen() -> None:
     if _freshener_alive():
         return
     _spawn_indexd()
-    _sync_freshen()  # bridge the gap until the just-spawned daemon takes over
+    # Nothing was keeping the index fresh, so make THIS search current now - unconditionally,
+    # NOT the sig-age-gated _sync_freshen (which would skip a <120s-old sig and serve stale
+    # while the just-spawned daemon is still booting). Cheap when unchanged (rust skips writes).
+    build_index(quiet=True)
 
 
 def ensure_index(auto: bool = True) -> bool:

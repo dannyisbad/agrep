@@ -565,8 +565,11 @@ class LiveWatcher(threading.Thread):
                     continue
                 if e.path not in self._codex_meta:
                     self._codex_meta[e.path] = self._codex_head(e.path)
-                for ln in self._read_delta(e.path, st.st_size, _fid(st)):
+                lines = self._read_delta(e.path, st.st_size, _fid(st))
+                for ln in lines:
                     self._codex_line(e.path, ln)
+                if lines:  # file growth = alive, even if these lines emitted no event
+                    self._mark_live(f"codex:{self._codex_meta[e.path][0]}", now)
 
     @staticmethod
     def _codex_head(path: str) -> tuple[str, str]:
@@ -794,8 +797,11 @@ class LiveWatcher(threading.Thread):
             known = tr in self._offsets
             if now - st.st_mtime > ACTIVE_WINDOW_S and not known:
                 continue
-            for ln in self._read_delta(tr, st.st_size, _fid(st)):
+            lines = self._read_delta(tr, st.st_size, _fid(st))
+            for ln in lines:
                 self._agy_line(d.name, ln)
+            if lines:  # file growth = alive, even if these lines emitted no event
+                self._mark_live(f"antigravity:{d.name}", now)
             self._agy_mailbox(d.path, d.name, now)
 
     def _agy_line(self, sess: str, ln: str) -> None:
@@ -895,6 +901,10 @@ class LiveWatcher(threading.Thread):
         replays history and must not fake liveness on old files."""
         if not self._booted:
             return
+        # File growth is activity for the auto-indexer's gate too (it reads _last_event_wall):
+        # without this, system-only growth marks the card live but the daemon never reindexes,
+        # so search stays stale for exactly these sessions.
+        self._last_event_wall = now
         s = self.sessions.get(key)
         if s is not None:
             s["live_ts"] = now * 1000

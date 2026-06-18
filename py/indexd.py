@@ -28,10 +28,12 @@ import common  # noqa: E402
 import live  # noqa: E402
 import indexer  # noqa: E402
 
-LOCK = common.DATA_DIR / ".indexd.lock"
-SEARCH_BEAT = common.DATA_DIR / ".agrep.search"  # the CLI touches this on each search
-BEAT_S = 5.0           # how often we bump the lock mtime (our heartbeat)
-STALE_S = 20.0         # a lock older than this is a dead daemon; reclaim it (must match common)
+# Shared with the CLI side via common so the two can't drift (the CLI reads this lock's mtime
+# to decide a daemon is alive; reclaim/liveness must agree on the same path + window).
+LOCK = common.INDEXD_LOCK_PATH
+SEARCH_BEAT = common.SEARCH_BEAT_PATH  # the CLI touches this on each search
+STALE_S = common.INDEXD_STALE_S        # a lock older than this is a dead daemon; reclaim it
+BEAT_S = 5.0                           # how often we bump the lock mtime (our heartbeat)
 # Exit this long after the last SEARCH. The daemon exists to serve searches, so it idles out
 # on search inactivity, NOT on agent activity - no point reindexing for hours if nobody greps.
 # The next search just respawns it. Tunable (and testable) via AGREP_INDEXD_IDLE_S.
