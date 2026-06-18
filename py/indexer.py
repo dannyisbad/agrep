@@ -53,11 +53,8 @@ SMART_TITLE_LIMIT = 20
 SMART_JUDGE_LIMIT = 10
 OLLAMA_TAGS = "http://localhost:11434/api/tags"
 
-# Run console children (agrep-rs, python, nvidia-smi) WITHOUT a console window. The indexd
-# daemon runs detached with no console of its own, so each child would otherwise pop a blank
-# conhost window on screen every reindex. Harmless on a server with a real console (output is
-# captured either way). CREATE_NO_WINDOW only exists on Windows; the conditional keeps it off
-# the attribute lookup elsewhere.
+# Console children of the detached (console-less) daemon would each flash a blank conhost
+# every reindex; CREATE_NO_WINDOW suppresses it. Windows-only.
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WIN else {}
 
 
