@@ -464,6 +464,30 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     }
     // Record the fingerprint of what we just published, so the next run can short-circuit.
     let _ = fs::write(&sig_path, &sig_line);
+    // Changed-session delta for the corpus refresh: a complete run touches everything ("*");
+    // an incremental run unions this run's changed sessions onto whatever a prior run left
+    // unconsumed (corpus deletes the file once applied), so a skipped corpus refresh can't
+    // silently drop a session. Cacheless adapters always full-parse -> all their sessions count.
+    let changed_path = data_dir().join(".changed_sessions");
+    if complete {
+        let _ = fs::write(&changed_path, "*\n");
+    } else {
+        let mut set: HashSet<String> = fs::read_to_string(&changed_path)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        if !set.contains("*") {
+            set.extend(pcache.touched.iter().cloned());
+            for m in &msgs {
+                if matches!(m.agent, "antigravity" | "kimi" | "cline") {
+                    set.insert(m.session.to_string());
+                }
+            }
+            let mut v: Vec<&String> = set.iter().collect();
+            v.sort();
+            let body: String = v.iter().map(|s| format!("{s}\n")).collect();
+            let _ = fs::write(&changed_path, body);
+        }
+    }
     lap!("write-events");
     let _ = mark;
     let with_model = msgs.iter().filter(|m| !m.model.is_empty()).count();

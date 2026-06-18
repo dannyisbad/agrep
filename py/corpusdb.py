@@ -35,6 +35,13 @@ _SCHEMA = "4"
 # corpus inputs; a change in any (mtime_ns, size) invalidates the cached stamp and triggers
 # a refresh (incremental when possible, full rebuild on schema bump / corruption / cold).
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json")
+# positions of session_concepts.jsonl / concepts.json in _SOURCES: a concept relabel can touch
+# many sessions and isn't reflected in .changed_sessions, so it forces the full-scan path.
+_CONCEPT_IDX = (2, 3)
+# The Rust ingest's changed-session delta (newline ids, or "*" = everything). The incremental
+# refresh re-indexes only these instead of rescanning the whole corpus, then deletes it.
+CHANGED_PATH = common.DATA_DIR / ".changed_sessions"
+_FAST_MAX = 500  # more changed sessions than this -> the prefilter scan isn't worth it; full
 RECAP_PREFIX = "This session is being continued from a previous conversation"
 _FIELDS = ("session", "agent", "project", "concept", "model", "model_source",
            "turn", "ts", "who")
@@ -125,12 +132,37 @@ def _open(path) -> sqlite3.Connection:
     return db
 
 
-def _scan() -> dict[str, list[tuple]]:
+def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
     """Parse the materialized corpus into per-session row lists - the exact rows the msgs
     table holds (one per user turn, one per agent reply), mirroring explore._kw_corpus so
     every engine reports identical hits. Shared by the full build and the incremental update
     so both index byte-identical content. The session concept rides in each row, so a concept
-    relabel changes that session's fingerprint and re-indexes it like any other content move."""
+    relabel changes that session's fingerprint and re-indexes it like any other content move.
+
+    `only` restricts the (expensive) JSON parse to a small set of session ids: each line's
+    session is pulled out with one cheap `find` (the Rust writer emits compact JSON, so the
+    keys are literal `"session":"` / `"id":"`), and non-candidate lines are skipped before
+    json.loads. So the incremental refresh parses just the changed sessions, not the whole
+    ~50MB corpus. (A per-line O(1) field-extract, not an any(id in line) scan over the whole
+    candidate set - that was slower than just parsing.)"""
+    def _field(line: str, key: str) -> "str | None":
+        # value of a top-level string field via cheap scan. `"key"` (with quotes) only occurs
+        # as a key - inside a JSON string a quote is escaped - so this never matches a value.
+        # Tolerates optional whitespace after the colon (compact or pretty JSON).
+        k = line.find('"' + key + '"')
+        if k < 0:
+            return None
+        i = line.find(":", k + len(key) + 2)
+        if i < 0:
+            return None
+        i += 1
+        while i < len(line) and line[i] in " \t":
+            i += 1
+        if i >= len(line) or line[i] != '"':
+            return None
+        i += 1
+        b = line.find('"', i)
+        return line[i:b] if b >= 0 else None
     # concepts are an enrichment layer; a half-written/malformed file (mid-reindex) must
     # degrade to "no labels", never raise - _scan runs on the hot per-search refresh path.
     names: dict[int, str] = {}
@@ -165,6 +197,11 @@ def _scan() -> dict[str, list[tuple]]:
             line = line.strip()
             if not line:
                 continue
+            if only is not None:
+                idv = _field(line, "id")  # id = agent:session:turn -> session is the middle
+                parts = idv.split(":") if idv else []
+                if len(parts) < 3 or parts[1] not in only:
+                    continue
             try:
                 o = json.loads(line)
             except json.JSONDecodeError:
@@ -178,12 +215,14 @@ def _scan() -> dict[str, list[tuple]]:
             line = line.strip()
             if not line:
                 continue
+            if only is not None and _field(line, "session") not in only:
+                continue
             try:
                 o = json.loads(line)
             except json.JSONDecodeError:
                 continue
             s = o.get("session")
-            if not s:
+            if not s or (only is not None and s not in only):
                 continue
             model = o.get("model", "")
             # absent-key fallback only (NOT `or`): an explicit "" must stay "", matching
@@ -258,49 +297,119 @@ def _cleanup_tmp(path) -> None:
             pass
 
 
+def _read_changed() -> "set[str] | str | None":
+    """The Rust ingest's changed-session delta: "*" (re-index everything), a set of session
+    ids, or None when the file is absent/unreadable (older binary, or first run -> full scan)."""
+    try:
+        txt = CHANGED_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    ids = {ln.strip() for ln in txt.splitlines() if ln.strip()}
+    return "*" if "*" in ids else ids
+
+
+def _consume_changed() -> None:
+    """Delete the delta once applied. Until then it accumulates across ingests, so a skipped
+    corpus refresh never silently drops a session (we re-apply it next time)."""
+    try:
+        CHANGED_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _current_sessions() -> "set[str] | None":
+    """Every session currently in the corpus, read from the small sessions.jsonl (one tiny row
+    per session) rather than the ~50MB messages.jsonl - for detecting removals on the fast path.
+    None when it can't be read (caller then takes the full-scan path)."""
+    p = common.DATA_DIR / "sessions.jsonl"
+    if not p.exists():
+        return None
+    out: set[str] = set()
+    try:
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    s = json.loads(line).get("session")
+                except json.JSONDecodeError:
+                    continue
+                if s:
+                    out.add(s)
+    except OSError:
+        return None
+    return out
+
+
+def _concepts_moved(old_stamp: str, new_stamp: str) -> bool:
+    """Did a concept source change between the indexed stamp and now? Such a relabel can touch
+    many sessions and isn't in .changed_sessions, so it must take the full-scan path. Unknown
+    -> True (be safe)."""
+    try:
+        o, n = json.loads(old_stamp), json.loads(new_stamp)
+        return any(o[i] != n[i] for i in _CONCEPT_IDX)
+    except (ValueError, IndexError, TypeError):
+        return True
+
+
 def _incremental(stamp: str) -> sqlite3.Connection | None:
-    """Refresh an existing current-schema db in place, re-indexing ONLY the sessions whose
-    content fingerprint moved (and dropping ones that vanished). Returns a fresh read
-    connection, or None when a full rebuild is required instead (no db yet, schema bump, or
-    the pass hit a db error - the caller falls back to _build). Runs under the caller's
-    IndexLock; the busy_timeout on both this writer and concurrent readers means a search in
-    flight just waits out the sub-second update rather than erroring."""
+    """Refresh an existing current-schema db in place, re-indexing ONLY the sessions the Rust
+    delta named (confirmed per-session by sig, removals reconciled against sessions.jsonl). Re-
+    parses just those via _scan's prefilter, so the common "a few new turns" refresh is ~tens of
+    ms instead of rescanning the whole corpus. Returns None - so the caller does a bulk _build -
+    whenever that fast path doesn't apply: no db / schema bump / a half-written source / no usable
+    delta / a concept relabel / a change set big enough that bulk rebuild beats row-by-row trigger
+    updates. (Re-indexing most of the corpus through the FTS triggers is slower than _build's one-
+    shot 'rebuild', so we hand those back.) Runs under the caller's IndexLock; busy_timeout lets an
+    in-flight search wait out the sub-second update rather than error."""
     if not DB_PATH.exists():
         return None
+    changed = _read_changed()
+    current = _current_sessions()
+    if not (isinstance(changed, set) and len(changed) <= _FAST_MAX and current is not None):
+        return None  # not a small named delta -> bulk _build is the right tool
     db = None
     try:
         db = sqlite3.connect(DB_PATH)
         db.execute("PRAGMA busy_timeout=5000")
         db.execute("PRAGMA synchronous=NORMAL")
-        meta = dict(db.execute("SELECT key, value FROM meta WHERE key='schema'"))
+        meta = dict(db.execute("SELECT key, value FROM meta WHERE key IN ('schema', 'stamp')"))
         if meta.get("schema") != _SCHEMA:
-            return None  # schema bump -> let the caller rebuild from scratch
-
+            return None  # schema bump -> caller rebuilds from scratch
+        if _concepts_moved(meta.get("stamp", ""), stamp):
+            return None  # concept relabel touches ~every session -> bulk _build beats triggers
         old = dict(db.execute("SELECT session, sig FROM session_sig"))
-        by = _scan()  # may raise OSError / JSONDecodeError on a half-written source
-        new_sig = {s: _session_sig(rows) for s, rows in by.items()}
-        changed = [s for s in by if old.get(s) != new_sig[s]]
-        removed = [s for s in old if s not in by]
-
+        by = _scan(only=changed)  # prefiltered: parses only the changed sessions' rows
         db.execute("BEGIN")
-        for s in removed:
-            db.execute("DELETE FROM msgs WHERE session = ?", (s,))
-            db.execute("DELETE FROM session_sig WHERE session = ?", (s,))
+        # re-index just the changed candidates; the per-session sig confirms each one really
+        # moved (the delta is a superset). FTS triggers mirror every DELETE/INSERT, so the
+        # result is byte-identical to rebuilding these rows from scratch.
         for s in changed:
-            # DELETE then re-INSERT the whole session; the FTS triggers mirror both sides,
-            # so the trigram index ends byte-identical to a full rebuild of these rows.
+            rows = by.get(s, [])
+            sig = _session_sig(rows) if rows else None
+            if sig == old.get(s):
+                continue  # candidate didn't really change
             db.execute("DELETE FROM msgs WHERE session = ?", (s,))
-            db.executemany(_INS, by[s])
-            db.execute("INSERT OR REPLACE INTO session_sig(session, sig) VALUES(?, ?)",
-                       (s, new_sig[s]))
+            if rows:
+                db.executemany(_INS, rows)
+                db.execute("INSERT OR REPLACE INTO session_sig(session, sig) VALUES(?, ?)", (s, sig))
+            else:
+                db.execute("DELETE FROM session_sig WHERE session = ?", (s,))
+        # removals the delta didn't name (e.g. a deleted session file): anything indexed that
+        # sessions.jsonl no longer lists.
+        for s in old:
+            if s not in changed and s not in current:
+                db.execute("DELETE FROM msgs WHERE session = ?", (s,))
+                db.execute("DELETE FROM session_sig WHERE session = ?", (s,))
         db.execute("UPDATE meta SET value = ? WHERE key = 'stamp'", (stamp,))
         db.commit()
+        _consume_changed()  # applied -> clear the delta
         db.close()
         db = None
         return _open(DB_PATH)
-    except Exception:  # noqa: BLE001 -- ANY failure (db corruption, a half-written source
-        # file's OSError/JSONDecodeError) must drop to a clean full rebuild, never escape and
-        # crash the search. finally closes db so no write-locked handle blocks the rebuild swap.
+    except Exception:  # noqa: BLE001 -- ANY failure (db corruption, a half-written source's
+        # OSError/JSONDecodeError) drops to a clean full rebuild, never escapes to crash the
+        # search. finally closes db so no write-locked handle blocks the rebuild swap.
         return None
     finally:
         if db is not None:
@@ -341,6 +450,7 @@ def connect(quiet: bool = False) -> sqlite3.Connection | None:
             # published db serving and let the next connect retry the rebuild.
             _cleanup_tmp(tmp)
             return _open(DB_PATH) if DB_PATH.exists() else None
+        _consume_changed()  # a full rebuild indexed everything -> the delta is superseded
         return _open(DB_PATH)
 
 

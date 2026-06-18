@@ -110,6 +110,10 @@ pub struct IngestCache {
     /// re-parsed, so the returned events cover only touched sessions). false on a cold/forced
     /// load means every file is parsed and the event set is complete.
     pub warm: bool,
+    /// Sessions whose rows could have changed this run (accumulated across adapters as
+    /// collect_cached re-parses changed files). The corpus refresh reads this to re-index only
+    /// these sessions instead of rescanning the whole materialized corpus.
+    pub touched: HashSet<String>,
 }
 
 impl IngestCache {
@@ -123,10 +127,12 @@ impl IngestCache {
             Some(c) => IngestCache {
                 entries: c.entries,
                 warm: true,
+                touched: HashSet::new(),
             },
             None => IngestCache {
                 entries: HashMap::new(),
                 warm: false,
+                touched: HashSet::new(),
             },
         }
     }
@@ -136,6 +142,7 @@ impl IngestCache {
         IngestCache {
             entries: HashMap::new(),
             warm: false,
+            touched: HashSet::new(),
         }
     }
 
@@ -239,6 +246,8 @@ where
             }
         }
     }
+    // record the changed sessions for the corpus delta (accumulates across adapters)
+    cache.touched.extend(affected.iter().map(|a| a.to_string()));
 
     // unchanged sibling files that share an affected session: re-parse them so the session's
     // event file is rebuilt from ALL its sources (no-op for one-file-per-session adapters)
