@@ -1,0 +1,32 @@
+=== messages.jsonl (8 lines) ===
+{"id":"codex:01990001-0002-7000-8000-000000000002:0","agent":"codex","project":"legacy","session":"01990001-0002-7000-8000-000000000002","ts":1767358800000,"turn":0,"text":"[subagent task] verify the legacy direct child path","content_digest":"833a","who":"subagent","model":"gpt-5.5","model_source":"explicit"}
+{"id":"codex:01990002-0002-7000-8000-000000000002:0","agent":"codex","project":"legacy","session":"01990002-0002-7000-8000-000000000002","ts":1767362400000,"turn":0,"text":"[subagent task] review legacy adapter parsing and report exact evidence","content_digest":"f01a","who":"subagent","model":"gpt-5.5","model_source":"explicit"}
+{"id":"codex:01990003-0003-7000-8000-000000000003:0","agent":"codex","project":"beta","session":"01990003-0003-7000-8000-000000000003","ts":1767355200000,"turn":0,"text":"[subagent task] inspect the native job ownership path","content_digest":"1b96","who":"subagent","model":"gpt-5.5-codex","model_source":"explicit"}
+{"id":"codex:01990003-0003-7000-8000-000000000003:1","agent":"codex","project":"beta","session":"01990003-0003-7000-8000-000000000003","ts":1767355260000,"turn":1,"text":"[subagent message] check the worker chronology too","content_digest":"4084","who":"subagent","model":"gpt-5.5-codex","model_source":"explicit"}
+{"id":"codex:22222222-2222-4222-8222-222222222222:0","agent":"codex","project":"beta","session":"22222222-2222-4222-8222-222222222222","ts":1767348001000,"turn":0,"text":"add a retry to the fetch helper","content_digest":"a9c3","who":"user","model":"gpt-5.5-codex","model_source":"explicit"}
+{"id":"codex:22222222-2222-4222-8222-222222222222:1","agent":"codex","project":"beta","session":"22222222-2222-4222-8222-222222222222","ts":1767348060000,"turn":1,"text":"now cap the backoff at 2s","content_digest":"10d4","who":"user","model":"gpt-5.5-codex","model_source":"explicit"}
+{"id":"codex:33333333-3333-4333-8333-333333333333:0","agent":"codex","project":"beta","session":"33333333-3333-4333-8333-333333333333","ts":1767351600000,"turn":0,"text":"[subagent task] /root/model_check (from /root)","content_digest":"b68f","who":"subagent","model":"gpt-5.5-codex","model_source":"explicit"}
+{"id":"codex:33333333-3333-4333-8333-333333333333:1","agent":"codex","project":"beta","session":"33333333-3333-4333-8333-333333333333","ts":1767351660000,"turn":1,"text":"[subagent message] /root/model_check (from /root)","content_digest":"6b27","who":"subagent","model":"gpt-5.5-codex","model_source":"explicit"}
+=== replies.jsonl (8 lines) ===
+{"id":"codex:01990001-0002-7000-8000-000000000002:0","reply":"Legacy direct child retained.","content_digest":"619f","reply_chars":29,"reply_truncated":false}
+{"id":"codex:01990002-0002-7000-8000-000000000002:0","reply":"Legacy delegation child retained.","content_digest":"ca74","reply_chars":33,"reply_truncated":false}
+{"id":"codex:01990003-0003-7000-8000-000000000003:0","reply":"The native job path belongs to the child only.","content_digest":"e751","reply_chars":46,"reply_truncated":false}
+{"id":"codex:01990003-0003-7000-8000-000000000003:1","reply":"Worker chronology checked.","content_digest":"b260","reply_chars":26,"reply_truncated":false}
+{"id":"codex:22222222-2222-4222-8222-222222222222:0","reply":"Wrapped fetch in a 3-try loop with backoff.","content_digest":"c759","reply_chars":43,"reply_truncated":false}
+{"id":"codex:22222222-2222-4222-8222-222222222222:1","reply":"Capped the backoff at 2000ms.","content_digest":"fc20","reply_chars":29,"reply_truncated":false}
+{"id":"codex:33333333-3333-4333-8333-333333333333:0","reply":"The Granite audit found no current IBM models.","content_digest":"31df","reply_chars":46,"reply_truncated":false}
+{"id":"codex:33333333-3333-4333-8333-333333333333:1","reply":"Compared Granite against the current embedding and reranking roles.","content_digest":"fadf","reply_chars":67,"reply_truncated":false}
+=== sessions.jsonl (5 lines) ===
+{"session":"01990001-0002-7000-8000-000000000002","agent":"codex","project":"legacy","n":1,"first_ts":1767358800000,"last_ts":1767358800000,"first_text":"[subagent task] verify the legacy direct child path","parent":"01990001-0001-7000-8000-000000000001"}
+{"session":"01990002-0002-7000-8000-000000000002","agent":"codex","project":"legacy","n":1,"first_ts":1767362400000,"last_ts":1767362400000,"first_text":"[subagent task] review legacy adapter parsing and report exact evidence","parent":"01990002-0001-7000-8000-000000000001"}
+{"session":"01990003-0003-7000-8000-000000000003","agent":"codex","project":"beta","n":2,"first_ts":1767355200000,"last_ts":1767355260000,"first_text":"[subagent task] inspect the native job ownership path","parent":"01990003-0001-7000-8000-000000000001"}
+{"session":"22222222-2222-4222-8222-222222222222","agent":"codex","project":"beta","n":2,"first_ts":1767348001000,"last_ts":1767348060000,"first_text":"add a retry to the fetch helper"}
+{"session":"33333333-3333-4333-8333-333333333333","agent":"codex","project":"beta","n":2,"first_ts":1767351600000,"last_ts":1767351660000,"first_text":"[subagent task] /root/model_check (from /root)","parent":"22222222-2222-4222-8222-222222222222"}
+=== events/codex-01990001-0002-7000-8000-000000000002--8e278717f4d43999ee7aece3e9bf8dcaf64ff76394a67de8.jsonl (1 lines) ===
+{"ts":1767358801000,"kind":"tool","name":"shell","input":"inspect legacy child","output":"legacy child output","input_chars":20,"output_chars":19,"output_bytes":19,"ok":true,"call_id":"legacy_child_call"}
+=== events/codex-01990003-0003-7000-8000-000000000003--8f99a1ad6dc3b4453f3ad40b94126b4bcfb2f7b6c268f19c.jsonl (1 lines) ===
+{"ts":1767355201000,"kind":"tool","name":"shell","input":"inspect job","output":"native child output","input_chars":11,"output_chars":19,"output_bytes":19,"ok":true,"call_id":"native_child_call"}
+=== events/codex-22222222-2222-4222-8222-222222222222--d1c609cf9167a780e7c648d6d7e3aa521fc98ebfbb0c77dd.jsonl (1 lines) ===
+{"ts":1767348002000,"kind":"tool","name":"shell","input":"bash -lc sed -n 1,40p fetch.rs","output":"pub fn fetch() {}","input_chars":30,"output_chars":17,"output_bytes":17,"ok":true,"call_id":"call_b1"}
+=== events/codex-33333333-3333-4333-8333-333333333333--276c677d9ac46abd19509359e3397b3692c4cc87fbb6f777.jsonl (1 lines) ===
+{"ts":1767351601000,"kind":"tool","name":"shell","input":"inspect models","output":"Granite is not installed","input_chars":14,"output_chars":24,"output_bytes":24,"ok":true,"call_id":"child_call"}

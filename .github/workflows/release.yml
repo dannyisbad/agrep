@@ -1,0 +1,938 @@
+name: release
+run-name: publish agrep ${{ github.ref_name }}
+
+# Build one platform-tagged wheel per OS/arch (each carries the prebuilt agrep-rs
+# binary), plus an sdist, and publish to PyPI on a v* tag. The wheel is py3-none-<plat>
+# (any python 3.10+, one platform) - see hatch_build.py.
+#
+# PyPI and both npm identities publish through registry-scoped OIDC trust for
+# this workflow; no long-lived release credential enters a runner.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-preflight:
+    name: release identity preflight
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: require the canonical repository for tagged releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "dannyisbad/agrep" ]; then
+            echo "::error::tagged releases may run only in dannyisbad/agrep"
+            exit 1
+          fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: reject private artifacts in the release ancestry
+        run: python bench/validate_repo_privacy.py --index --all-refs
+      - name: tag, Python, npm, Cargo, and Cargo.lock must agree
+        run: python bench/release_identity.py
+      - name: exact tag commit must have green default-branch CI
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEFAULT_BRANCH"
+          proof="$RUNNER_TEMP/agrep-ci-proof.json"
+          gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/runs" \
+            -f event=push \
+            -f branch="$DEFAULT_BRANCH" \
+            -f head_sha="$GITHUB_SHA" \
+            -f status=success \
+            -f per_page=100 > "$proof"
+          python bench/release_ci_proof.py \
+            --response "$proof" --sha "$GITHUB_SHA" --branch "$DEFAULT_BRANCH"
+
+  release-gate:
+    name: full release gate
+    needs: [release-preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - name: install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: Rust quality
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Rust suite
+        run: cargo test --workspace --locked --release
+      - name: build and stage runtime
+        run: |
+          cargo build --release --locked -p agrep-ingest
+          mkdir -p _bin
+          cp target/release/agrep-rs _bin/
+      - name: install Python release dependencies
+        run: python -m pip install numpy onnxruntime tokenizers
+      - name: fixed JSONL full-exit budget
+        run: |
+          python -c "import json,os,platform; print(json.dumps({'cpu_count':os.cpu_count(),'loadavg':os.getloadavg(),'platform':platform.platform()}))"
+          python py/test_jsonl_native_full_exit_perf.py -v
+      - name: Python suite and portable budgets
+        env:
+          AGREP_CI: "1"
+          AGREP_PERF_SLACK: "2"
+        run: |
+          (cd py && python selftest.py)
+          for test in py/test_*.py; do
+            case "$test" in
+              py/test_jsonl_native_full_exit_perf.py|py/test_perf_budgets.py) continue ;;
+            esac
+            PYTHONPATH="$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/py" python "$test" -v
+          done
+          python bench/perf.py --check
+          python bench/resources.py --check
+      - name: 1M and 2M full-exit scale gate
+        run: python bench/scale.py --check --runs 3 --budget-profile portable-ci
+      - name: 100k, 1M, and 2M semantic scale gate
+        run: >-
+          python bench/semantic_q8_scale.py --check
+          --rows 100000 1000000 2000000 --repeats 3
+          --budget-profile portable-ci
+      - name: Incremental semantic plan scale gate
+        run: python bench/embed_plan_scale.py --check
+      - name: 10M logical segmented top-up gate
+        run: python bench/semantic_segment_scale.py --check
+      - name: 100k and 2M full-exit semantic CLI gate
+        run: >-
+          python bench/semantic_cli_scale.py --check --runs 3
+          --budget-profile portable-ci
+      - name: Frozen lexical and semantic recall parity gate
+        run: python bench/semantic_recall_parity.py --check
+
+  wheels:
+    name: wheel ${{ matrix.name }}
+    needs: [release-preflight]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `asset` is the raw-binary name the on-demand fetcher expects
+          # (common._platform_asset()); it MUST match exactly - see release-assets.
+          - { name: win-x64,   os: windows-latest, plat: win_amd64,            asset: agrep-rs-windows-x86_64.exe, rustflags: "-C target-cpu=x86-64", pyarch: x64, deployment: "" }
+          # Native Windows ARM runners and ONNX Runtime win_arm64 wheels are both
+          # generally available; publish the asset common._platform_asset() promises.
+          - { name: win-arm64, os: windows-11-arm, plat: win_arm64,             asset: agrep-rs-windows-aarch64.exe, rustflags: "", pyarch: arm64, deployment: "" }
+          # The x86_64 wheel uses GitHub's dedicated Intel macOS runner.
+          - { name: mac-x64,   os: macos-15-intel, plat: macosx_11_0_x86_64,   asset: agrep-rs-macos-x86_64,       rustflags: "-C target-cpu=x86-64-v2", pyarch: x64, deployment: "11.0" }
+          - { name: mac-arm64, os: macos-14,       plat: macosx_11_0_arm64,    asset: agrep-rs-macos-aarch64,      rustflags: "", pyarch: arm64, deployment: "11.0" }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12", architecture: "${{ matrix.pyarch }}" }
+      - name: build ingest binary
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment }}
+        run: |
+          # Distributed wheels need portable CPU baselines to avoid SIGILL.
+          # Optimized kernels still dispatch at runtime; macOS Intel safely uses x86-64-v2.
+          rm -f .cargo/config.toml
+          add_remap() {
+            if [ -n "$1" ]; then
+              RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$1=$2"
+            fi
+          }
+          add_remap "$GITHUB_WORKSPACE" /src/agrep
+          add_remap "${CARGO_HOME:-}" /build/cargo
+          add_remap "${RUSTUP_HOME:-}" /build/rustup
+          add_remap "${USERPROFILE:-}" /build/user
+          add_remap "${HOME:-}" /build/user
+          add_remap "${RUNNER_TEMP:-}" /build/temp
+          add_remap "${RUNNER_WORKSPACE:-}" /build/workspace
+          add_remap "${RUNNER_TOOL_CACHE:-}" /build/tools
+          add_remap "${TEMP:-}" /build/temp
+          add_remap "${TMP:-}" /build/temp
+          add_remap "${TMPDIR:-}" /build/temp
+          export RUSTFLAGS
+          cargo build --release --locked
+          if [ "${{ runner.os }}" = "Windows" ]; then exe=target/release/agrep-rs.exe
+          else exe=target/release/agrep-rs; fi
+          python bench/validate_binary_privacy.py "$exe" \
+            --forbid "$GITHUB_WORKSPACE" --forbid "${CARGO_HOME:-}" \
+            --forbid "${RUSTUP_HOME:-}" --forbid "${USERPROFILE:-}" \
+            --forbid "${HOME:-}" --forbid "${RUNNER_TEMP:-}" \
+            --forbid "${RUNNER_WORKSPACE:-}" --forbid "${RUNNER_TOOL_CACHE:-}" \
+            --forbid "${TEMP:-}" --forbid "${TMP:-}" --forbid "${TMPDIR:-}"
+      - name: stage binary
+        shell: bash
+        run: |
+          mkdir -p _bin
+          if [ "${{ runner.os }}" = "Windows" ]; then cp target/release/agrep-rs.exe _bin/;
+          else cp target/release/agrep-rs _bin/; fi
+      - name: build wheel
+        shell: bash
+        env:
+          AGREP_WHEEL_PLAT: ${{ matrix.plat }}
+        run: |
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build --wheel
+      - name: smoke test wheel
+        shell: bash
+        run: |
+          python bench/validate_wheel.py dist/*.whl
+          python -m pip install dist/*.whl
+          python bench/smoke_installed_wheel.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+          overwrite: true
+      # the same prebuilt binary, under the fetch-contract name, for the release assets
+      - name: stage release binary asset
+        shell: bash
+        run: |
+          mkdir -p relbin
+          if [ "${{ runner.os }}" = "Windows" ]; then cp target/release/agrep-rs.exe "relbin/${{ matrix.asset }}";
+          else cp target/release/agrep-rs "relbin/${{ matrix.asset }}"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binasset-${{ matrix.name }}
+          path: relbin/${{ matrix.asset }}
+          overwrite: true
+
+  # Linux wheels build INSIDE a manylinux container so the rust binary links an old
+  # glibc and the manylinux_2_28 tag is truthful (PyPI rejects plain linux_x86_64).
+  wheels-linux:
+    name: wheel linux-x64
+    needs: [release-preflight]
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:b04887b645dde99b9e955aeae3ff4da414992d0bd88259f046295b56361c5614
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install verified Rust bootstrap
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
+            --output /tmp/rustup-init \
+            https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init
+          echo "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10  /tmp/rustup-init" \
+            | sha256sum --check --strict
+          chmod 0755 /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+          source "$HOME/.cargo/env"
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.0 --profile minimal
+          rustc -Vv > /tmp/rustc-version
+          grep -Fqx "commit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3" /tmp/rustc-version
+      - name: build + wheel
+        env:
+          AGREP_WHEEL_PLAT: manylinux_2_28_x86_64
+          RUSTFLAGS: "-C target-cpu=x86-64"
+        run: |
+          source "$HOME/.cargo/env"
+          rm -f .cargo/config.toml  # drop target-cpu=native; see the wheels job
+          RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$GITHUB_WORKSPACE=/src/agrep"
+          RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$HOME=/build/user"
+          for path in "${RUNNER_TEMP:-}" "${RUNNER_WORKSPACE:-}" \
+              "${RUNNER_TOOL_CACHE:-}" "${TEMP:-}" "${TMP:-}" "${TMPDIR:-}"; do
+            if [ -n "$path" ]; then
+              RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$path=/build/runtime"
+            fi
+          done
+          export RUSTFLAGS
+          cargo build --release --locked
+          mkdir -p _bin && cp target/release/agrep-rs _bin/
+          PYBIN=/opt/python/cp312-cp312/bin
+          "$PYBIN/python" bench/validate_binary_privacy.py target/release/agrep-rs \
+            --forbid "$GITHUB_WORKSPACE" --forbid "$HOME" \
+            --forbid "${RUNNER_TEMP:-}" --forbid "${RUNNER_WORKSPACE:-}" \
+            --forbid "${RUNNER_TOOL_CACHE:-}" --forbid "${TEMP:-}" \
+            --forbid "${TMP:-}" --forbid "${TMPDIR:-}"
+          "$PYBIN/pip" install --disable-pip-version-check build==1.5.0
+          "$PYBIN/python" -m build --wheel
+          "$PYBIN/python" bench/validate_wheel.py dist/*.whl
+          auditwheel -v show dist/*.whl > /tmp/auditwheel-report.txt
+          cat /tmp/auditwheel-report.txt
+          "$PYBIN/python" bench/validate_manylinux.py \
+            --target manylinux_2_28_x86_64 /tmp/auditwheel-report.txt
+          "$PYBIN/pip" install dist/*.whl
+          "$PYBIN/python" bench/smoke_installed_wheel.py --agrep "$PYBIN/agrep"
+          "$PYBIN/python" -c "import json,os,platform; print(json.dumps({'cpu_count':os.cpu_count(),'loadavg':os.getloadavg(),'platform':platform.platform()}))"
+          (
+            cd "${RUNNER_TEMP:-/tmp}"
+            env -u PYTHONPATH -u PYTHONHOME \
+              AGREP_PERF_CLI="$PYBIN/agrep" "$PYBIN/python" \
+                "$GITHUB_WORKSPACE/py/test_perf_budgets.py" -v
+          )
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-linux-x64
+          path: dist/*.whl
+          overwrite: true
+      - name: stage release binary asset
+        run: mkdir -p relbin && cp target/release/agrep-rs relbin/agrep-rs-linux-x86_64
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binasset-linux-x64
+          path: relbin/agrep-rs-linux-x86_64
+          overwrite: true
+
+  # Linux arm64 builds natively inside the aarch64 manylinux container.
+  # Its portable arm64 baseline needs no x86 target override.
+  wheels-linux-arm64:
+    name: wheel linux-arm64
+    needs: [release-preflight]
+    runs-on: ubuntu-24.04-arm
+    container: quay.io/pypa/manylinux_2_28_aarch64@sha256:d129a18d4aeecc9ce6db592474bdb127838339eed67cd7cd61617bb027b14c1e
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install verified Rust bootstrap
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
+            --output /tmp/rustup-init \
+            https://static.rust-lang.org/rustup/archive/1.29.0/aarch64-unknown-linux-gnu/rustup-init
+          echo "9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792  /tmp/rustup-init" \
+            | sha256sum --check --strict
+          chmod 0755 /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+          source "$HOME/.cargo/env"
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.0 --profile minimal
+          rustc -Vv > /tmp/rustc-version
+          grep -Fqx "commit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3" /tmp/rustc-version
+      - name: build + wheel
+        env:
+          AGREP_WHEEL_PLAT: manylinux_2_28_aarch64
+        run: |
+          source "$HOME/.cargo/env"
+          rm -f .cargo/config.toml  # drop target-cpu=native; portable arm64 baseline
+          RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/src/agrep"
+          RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$HOME=/build/user"
+          for path in "${RUNNER_TEMP:-}" "${RUNNER_WORKSPACE:-}" \
+              "${RUNNER_TOOL_CACHE:-}" "${TEMP:-}" "${TMP:-}" "${TMPDIR:-}"; do
+            if [ -n "$path" ]; then
+              RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$path=/build/runtime"
+            fi
+          done
+          export RUSTFLAGS
+          cargo build --release --locked
+          mkdir -p _bin && cp target/release/agrep-rs _bin/
+          PYBIN=/opt/python/cp312-cp312/bin
+          "$PYBIN/python" bench/validate_binary_privacy.py target/release/agrep-rs \
+            --forbid "$GITHUB_WORKSPACE" --forbid "$HOME" \
+            --forbid "${RUNNER_TEMP:-}" --forbid "${RUNNER_WORKSPACE:-}" \
+            --forbid "${RUNNER_TOOL_CACHE:-}" --forbid "${TEMP:-}" \
+            --forbid "${TMP:-}" --forbid "${TMPDIR:-}"
+          "$PYBIN/pip" install --disable-pip-version-check build==1.5.0
+          "$PYBIN/python" -m build --wheel
+          "$PYBIN/python" bench/validate_wheel.py dist/*.whl
+          auditwheel -v show dist/*.whl > /tmp/auditwheel-report.txt
+          cat /tmp/auditwheel-report.txt
+          "$PYBIN/python" bench/validate_manylinux.py \
+            --target manylinux_2_28_aarch64 /tmp/auditwheel-report.txt
+          "$PYBIN/pip" install dist/*.whl
+          "$PYBIN/python" bench/smoke_installed_wheel.py --agrep "$PYBIN/agrep"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-linux-arm64
+          path: dist/*.whl
+          overwrite: true
+      - name: stage release binary asset
+        run: mkdir -p relbin && cp target/release/agrep-rs relbin/agrep-rs-linux-aarch64
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binasset-linux-arm64
+          path: relbin/agrep-rs-linux-aarch64
+          overwrite: true
+
+  sdist:
+    needs: [release-preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: reject private repository artifacts
+        run: python bench/validate_repo_privacy.py --index
+      - name: build and validate closed sdist
+        run: |
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build --sdist
+          python bench/validate_sdist.py dist/*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          overwrite: true
+
+  semantic-canary:
+    name: built-wheel semantic canary
+    needs: [wheels-linux, release-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheel-linux-x64
+          path: wheel
+      - name: install the wheel and prove real ONNX inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/agrep-semantic-canary"
+          python -m venv "$root/venv"
+          "$root/venv/bin/pip" install wheel/*.whl
+          mkdir -p "$root/home/.codex/sessions/2026/01/02" "$root/data" "$root/models"
+          cp crates/agrep-cli/tests/fixtures/codex/home/.codex/sessions/2026/01/02/*.jsonl \
+            "$root/home/.codex/sessions/2026/01/02/"
+          export AGREP_HOME="$root/home"
+          export AGREP_DATA_DIR="$root/data"
+          export AGREP_DATA_DIR_SOURCE=env
+          export AGREP_MODEL_DIR="$root/models"
+          export AGREP_NO_DAEMON=1
+          "$root/venv/bin/agrep" index
+          test -s "$root/data/messages.jsonl"
+          unset AGREP_NO_DAEMON
+
+          ready=0
+          deadline=$((SECONDS + 180))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            set +e
+            AGREP_DEBUG=1 "$root/venv/bin/agrep" -s \
+              "retry the fetch helper after a failure" -n 3 --json \
+              --color never --strict-semantic >"$root/out.jsonl" 2>"$root/err.log"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              set +e
+              "$root/venv/bin/python" bench/validate_search_json.py \
+                "$root/out.jsonl" --engine-prefix semantic: \
+                --contains-any retry fetch
+              parsed=$?
+              set -e
+              if [ "$parsed" -eq 0 ]; then
+                ready=1
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "semantic canary never produced a relevant real-model result"
+            cat "$root/err.log" || true
+            cat "$root/data/semantic-embed.log" || true
+            exit 1
+          fi
+          test -s "$root/models/granite-small-r2-q8/model_quantized.onnx"
+          test -s "$root/models/granite-small-r2-q8/model_quantized.onnx_data"
+          "$root/venv/bin/python" -I - "$root/data/embeddings.meta" <<'PY'
+          import sys
+          from pathlib import Path
+
+          import agrep
+
+          sys.path.insert(0, str(Path(agrep.__file__).parent / "py"))
+          import embedding_segments
+
+          manifest = embedding_segments.load_manifest(
+              Path(sys.argv[1]), verify_hashes=True, validate_liveness=True)
+          if manifest["version"] != 2 or manifest["live_rows"] < 1:
+              raise SystemExit("semantic canary did not publish a live segmented index")
+          PY
+          cat "$root/out.jsonl"
+
+          # This is the one release lane that already downloaded and verified the
+          # pinned model. Require the semantic RSS/query-CPU resource contract here;
+          # the portable CI resource gate remains offline and permits an honest skip.
+          export AGREP_RS_BIN
+          AGREP_RS_BIN=$("$root/venv/bin/python" -I -c \
+            'import sys; from pathlib import Path; import agrep; sys.path.insert(0, str(Path(agrep.__file__).parent / "py")); import common; print(common.ingest_bin())')
+          "$root/venv/bin/python" bench/resources.py --check-semantic
+
+  npm-smoke:
+    name: npm shim smoke
+    needs: [wheels-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.11.29"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheel-linux-x64
+          path: dist
+      - name: run shim against built wheel
+        shell: bash
+        run: |
+          test "$(npm --version)" = "11.16.0"
+          node --test npm/test_publish.js
+          node npm/publish.js --dry-run
+          wheel=$(realpath "$(find dist -maxdepth 1 -name '*.whl' -print -quit)")
+          test -n "$wheel"
+          tmp=$(mktemp -d)
+          AGREP_PYPI_SPEC="$wheel" AGREP_POSTINSTALL_FORCE=1 \
+            AGREP_POSTINSTALL_STRICT=1 npm install -g --prefix "$tmp" ./npm
+          AGREP_PYPI_SPEC="$wheel" "$tmp/bin/agrep" --version
+
+  seal-npm-packages:
+    name: seal exact npm tarballs
+    needs: [release-preflight, npm-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: pack and validate both npm identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(npm --version)" = "11.16.0"
+          node npm/publish.js --out-dir sealed
+          python bench/npm_release.py \
+            --dist-dir sealed --version "${GITHUB_REF_NAME#v}" --offline
+      - name: upload the immutable npm bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-sealed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sealed/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  validate-release-assets:
+    name: seal the exact GitHub release asset set
+    needs: [wheels, wheels-linux, wheels-linux-arm64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: sealed/assets
+          pattern: binasset-*
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: wheel-input
+          pattern: wheel-*
+          merge-multiple: true
+      - name: stage canonical license notices
+        run: cp LICENSE THIRD_PARTY_LICENSES.txt sealed/assets/
+      - name: prepare the exact binary, sidecar, and manifest set
+        run: >-
+          python bench/release_assets.py
+          --prepare sealed/assets
+          --manifest sealed/release-asset-manifest.json
+          --wheels wheel-input
+      - name: upload the immutable release asset bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sealed/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Keep the write-capable job restricted to immutable artifacts and workflow code.
+  release-assets:
+    name: attach prebuilt binaries to the release
+    needs: [validate-release-assets, release-gate, semantic-canary]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'dannyisbad/agrep'
+          && github.event_name == 'push'
+          && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate-release-assets.outputs.artifact-id }}
+          path: sealed
+      - name: inspect an existing release without changing its visibility
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set +e
+          draft=$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.draft' 2>release-state.err)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            if [ "$draft" = "false" ]; then state=published; else state=draft; fi
+          elif grep -Fq "HTTP 404" release-state.err; then
+            state=missing
+          else
+            cat release-state.err
+            exit "$status"
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+      - name: verify immutable assets on an already-published release
+        if: steps.release-state.outputs.state == 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir existing
+          gh release download "$GITHUB_REF_NAME" --dir existing
+          diff --recursive --brief sealed/assets existing
+      - if: steps.release-state.outputs.state != 'published'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          draft: true
+          body: |
+            agrep searches and recalls local AI coding-agent history across supported stores.
+
+            Install with `uv tool install agrep`, `pipx install agrep`, or
+            `npm i -g @mundy/agrep`, then run `agrep setup`.
+
+            Standalone binaries and matching SHA-256 sidecars are attached below.
+            Transcript content and indexes remain on your machine.
+          fail_on_unmatched_files: true
+          files: |
+            sealed/assets/*
+
+  validate-pypi-dist:
+    name: validate PyPI distribution set
+    needs: [wheels, wheels-linux, wheels-linux-arm64, sdist, npm-smoke, release-assets, semantic-canary]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
+      - name: validate the exact PyPI distribution set
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          test "v$version" = "$RELEASE_TAG"
+          python bench/pypi_release.py \
+            --dist-dir dist --version "$version" --offline
+      - name: stage the validated immutable bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir validated
+          cp dist/* validated/
+          sha256sum validated/*
+      - name: upload validated PyPI bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-validated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validated/*
+          if-no-files-found: error
+          retention-days: 1
+
+  twine-check:
+    name: check immutable PyPI bundle metadata
+    needs: [validate-pypi-dist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate-pypi-dist.outputs.artifact-id }}
+          path: dist
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: run Twine in the unprivileged checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check twine==6.2.0
+          python -m twine check dist/*
+
+  reconcile-pypi-dist:
+    name: reconcile PyPI against the validated bundle
+    needs: [validate-pypi-dist, twine-check]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      missing-count: ${{ steps.reconcile.outputs.missing_count }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: download the validated bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate-pypi-dist.outputs.artifact-id }}
+          path: dist
+      - name: compare filenames and hashes with PyPI
+        id: reconcile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python bench/pypi_release.py \
+            --dist-dir dist --version "${GITHUB_REF_NAME#v}" \
+            --stage-missing missing --github-output "$GITHUB_OUTPUT"
+      - name: upload only missing distributions
+        id: upload
+        if: steps.reconcile.outputs.missing_count != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-missing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: missing/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [reconcile-pypi-dist, release-assets]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'dannyisbad/agrep'
+          && github.event_name == 'push'
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.reconcile-pypi-dist.outputs.missing-count != '0'
+          && needs.reconcile-pypi-dist.outputs.artifact-digest != '' }}
+    environment: pypi
+    permissions:
+      id-token: write   # OIDC token for Trusted Publishing
+    steps:
+      - name: download only missing distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.reconcile-pypi-dist.outputs.artifact-id }}
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          skip-existing: true
+
+  verify-pypi-release:
+    name: verify complete immutable PyPI release
+    needs: [validate-pypi-dist, reconcile-pypi-dist, publish]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ always()
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.validate-pypi-dist.result == 'success'
+          && needs.reconcile-pypi-dist.result == 'success'
+          && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate-pypi-dist.outputs.artifact-id }}
+          path: dist
+      - name: require every filename and SHA-256 on PyPI
+        run: >-
+          python bench/pypi_release.py
+          --dist-dir dist --version "${GITHUB_REF_NAME#v}"
+          --require-complete --wait-seconds 120
+
+  reconcile-npm-dist:
+    name: reconcile npm against the sealed bundle
+    needs: [seal-npm-packages, verify-pypi-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      missing-count: ${{ steps.reconcile.outputs.missing_count }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.seal-npm-packages.outputs.artifact-id }}
+          path: sealed
+      - name: compare exact tarball integrities with npm
+        id: reconcile
+        run: >-
+          python bench/npm_release.py
+          --dist-dir sealed --version "${GITHUB_REF_NAME#v}"
+          --stage-missing missing --github-output "$GITHUB_OUTPUT"
+      - name: upload only missing npm tarballs
+        id: upload
+        if: steps.reconcile.outputs.missing_count != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-missing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: missing/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-npm:
+    needs: [reconcile-npm-dist, verify-pypi-release]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'dannyisbad/agrep'
+          && github.event_name == 'push'
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.reconcile-npm-dist.outputs.missing-count != '0'
+          && needs.reconcile-npm-dist.outputs.artifact-id != ''
+          && needs.reconcile-npm-dist.outputs.artifact-digest != '' }}
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.reconcile-npm-dist.outputs.artifact-id }}
+          path: dist
+      - name: publish only the sealed missing tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(npm --version)" = "11.16.0"
+          version="${GITHUB_REF_NAME#v}"
+          mapfile -t files < <(find dist -mindepth 1 -maxdepth 1 -print | sort)
+          if [ "${#files[@]}" -lt 1 ] || [ "${#files[@]}" -gt 2 ]; then
+            echo "::error::expected one or two reconciled npm tarballs"
+            exit 1
+          fi
+          for package in "${files[@]}"; do
+            if [ -L "$package" ] || [ ! -f "$package" ]; then
+              echo "::error::npm artifact is not a regular file: $package"
+              exit 1
+            fi
+            case "${package##*/}" in
+              "mundy-agrep-$version.tgz"|"agrep-cli-$version.tgz") ;;
+              *) echo "::error::unexpected npm artifact: $package"; exit 1 ;;
+            esac
+            npm publish "$package" --access public --provenance --ignore-scripts
+          done
+
+  verify-npm-release:
+    name: verify complete immutable npm release
+    needs: [seal-npm-packages, reconcile-npm-dist, publish-npm]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ always()
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.seal-npm-packages.result == 'success'
+          && needs.reconcile-npm-dist.result == 'success'
+          && (needs.publish-npm.result == 'success'
+              || needs.publish-npm.result == 'skipped') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.seal-npm-packages.outputs.artifact-id }}
+          path: sealed
+      - name: require both live npm integrities
+        run: >-
+          python bench/npm_release.py
+          --dist-dir sealed --version "${GITHUB_REF_NAME#v}"
+          --require-complete --wait-seconds 120
+
+  finalize-release:
+    name: publish the verified GitHub release
+    needs: [verify-npm-release, verify-pypi-release, release-assets, validate-release-assets]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'dannyisbad/agrep'
+          && github.event_name == 'push'
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.validate-release-assets.outputs.artifact-id != ''
+          && needs.validate-release-assets.outputs.artifact-digest != '' }}
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: download the immutable release asset bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate-release-assets.outputs.artifact-id }}
+          path: sealed
+      - name: verify the live draft and expose it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir live
+          gh release download "$GITHUB_REF_NAME" --dir live
+          diff --recursive --brief sealed/assets live
+          draft=$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.draft')
+          if [ "$draft" = "true" ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          elif [ "$draft" != "false" ]; then
+            echo "::error::release draft state is invalid: $draft"
+            exit 1
+          fi

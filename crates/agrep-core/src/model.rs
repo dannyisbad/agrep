@@ -1,0 +1,125 @@
+//! The normalized units every adapter emits: [`Message`] (a human turn + reply) and
+//! [`Event`] (a tool call / subagent step in the same session).
+
+use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    /// Registered source-adapter name.
+    pub agent: &'static str,
+    /// Project bucket (basename of the working dir, disambiguated for generic names).
+    /// `Arc<str>` (here and below): messages round-trip through the parse cache and the
+    /// dedupe set every run, so field copies must be refcount bumps, not string clones.
+    pub project: Arc<str>,
+    /// Session/chat id this message belongs to.
+    pub session: Arc<str>,
+    /// Epoch milliseconds; 0 if unknown.
+    pub ts: i64,
+    /// 0-based index of this message within its session (ingest order).
+    pub turn: u32,
+    /// The human-authored text (the user's words). Wrappers/tool-results already stripped.
+    pub text: Arc<str>,
+    /// User-side row type: "user" for real prompts, "subagent" for side-chat turns
+    /// (a Task/fork child conversation - real work, marked), "control" for non-model
+    /// control markers, "synthetic" for test traffic, "recap" for continuation
+    /// summaries, or "harness" for generated benchmark/controller prompts.
+    pub who: Arc<str>,
+    /// Model that produced the agent's side of this turn ("claude-opus-4-8",
+    /// "gpt-5.3-codex-spark", "gemini-3.1-pro-preview"). Empty when the source omits it.
+    pub model: Arc<str>,
+    /// How `model` was attributed: "explicit", "session", "temporal_session",
+    /// "unknown", "control", "synthetic", "recap", "harness", "explicit_harness",
+    /// or "ambiguous_session".
+    pub model_source: Arc<str>,
+    /// The agent's reply to this turn, trimmed for display. Empty if none was captured.
+    pub reply: Arc<str>,
+    /// Original normalized reply length before the ingest safety cap.
+    pub reply_chars: usize,
+    /// True when this turn lives in a SIDE session (subagent/Task/fork child). The
+    /// normalizer turns it into `who="subagent"`; adapters set it when the store
+    /// proves provenance.
+    pub side: bool,
+    /// The parent session id for side sessions; empty for roots. Surfaces in
+    /// sessions.jsonl so consumers can link child chats to their parent.
+    pub parent: Arc<str>,
+}
+
+/// The mutable form the adapters build while parsing one file (replies stream in as
+/// appends, models backfill). `freeze` converts to the shared form exactly once, when
+/// the parse is done - so the Arc fields never need in-place mutation.
+pub struct RawMessage {
+    pub agent: &'static str,
+    pub project: String,
+    pub session: String,
+    pub ts: i64,
+    pub turn: u32,
+    pub text: String,
+    pub model: String,
+    pub reply: String,
+    pub reply_chars: usize,
+    pub side: bool,
+    pub parent: String,
+}
+
+impl RawMessage {
+    pub fn freeze(self) -> Message {
+        let reply_chars = if self.reply_chars == 0 {
+            self.reply.chars().count()
+        } else {
+            self.reply_chars
+        };
+        Message {
+            agent: self.agent,
+            project: self.project.into(),
+            session: self.session.into(),
+            ts: self.ts,
+            turn: self.turn,
+            text: self.text.into(),
+            who: "user".into(),
+            model_source: if self.model.is_empty() {
+                "unknown".into()
+            } else {
+                "explicit".into()
+            },
+            model: self.model.into(),
+            reply: self.reply.into(),
+            reply_chars,
+            side: self.side,
+            parent: self.parent.into(),
+        }
+    }
+}
+
+/// One tool call or subagent step inside a session. Written to per-session files under
+/// `data/events/`, separate from the canonical message stream. Inputs/outputs are capped
+/// summaries; original lengths disclose loss.
+#[derive(Debug, Clone)]
+pub struct Event {
+    /// Source agent: "claude", "codex", "opencode", "antigravity".
+    pub agent: &'static str,
+    /// Session this event belongs to (the PARENT session for subagent events).
+    pub session: String,
+    /// Epoch milliseconds; 0 if unknown.
+    pub ts: i64,
+    /// "tool" | "control" | "subagent_start" | "subagent_result".
+    pub kind: &'static str,
+    /// Tool name ("Bash", "shell", "run_command") or subagent title/sender.
+    pub name: String,
+    /// Compact human-meaningful input summary (command line, file path, prompt), capped.
+    pub input: String,
+    /// Tool output / subagent result, capped.
+    pub output: String,
+    /// Original character lengths before the summaries were capped.
+    pub input_chars: usize,
+    pub output_chars: usize,
+    /// Original UTF-8 byte length of the output before it was capped. This cannot be
+    /// reconstructed from a capped Unicode excerpt.
+    pub output_bytes: usize,
+    /// Success if the store recorded one (is_error / status / exit hints); None when unknown.
+    pub ok: Option<bool>,
+    /// The store's own correlation id (tool_use id / call_id / callID). Synthesized
+    /// (unique within the session) when the store has none. Dedupe/provenance key.
+    pub call_id: String,
+    /// Subagent events: the child's own session id when it is independently viewable.
+    pub child_session: String,
+}

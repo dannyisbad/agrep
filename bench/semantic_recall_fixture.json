@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "corpus_sizes": [4096, 100000],
+  "semantic_rows_per_task": 512,
+  "tasks": [
+    {
+      "id": "parser-checkpoint",
+      "query": "recover interrupted parser import",
+      "semantic_text": "The loader resumed from its last durable checkpoint after restart.",
+      "keyword_text": "recover interrupted parser import exact lexical evidence",
+      "expected_keyword_session": "kw-parser-checkpoint",
+      "expected_semantic_session": "sem-parser-checkpoint-0000"
+    },
+    {
+      "id": "loopback-bind",
+      "query": "ephemeral loopback binding failure",
+      "semantic_text": "The service needed an explicit loopback address when requesting an automatic port.",
+      "keyword_text": "ephemeral loopback binding failure exact lexical evidence",
+      "expected_keyword_session": "kw-loopback-bind",
+      "expected_semantic_session": "sem-loopback-bind-0000"
+    },
+    {
+      "id": "event-identity",
+      "query": "recorded events disappeared",
+      "semantic_text": "Missing source identifiers collapsed unrelated event records into one entry.",
+      "keyword_text": "recorded events disappeared exact lexical evidence",
+      "expected_keyword_session": "kw-event-identity",
+      "expected_semantic_session": "sem-event-identity-0000"
+    },
+    {
+      "id": "budget-validation",
+      "query": "tiny context budget overflow",
+      "semantic_text": "Input validation rejected a negative rendering budget before pagination.",
+      "keyword_text": "tiny context budget overflow exact lexical evidence",
+      "expected_keyword_session": "kw-budget-validation",
+      "expected_semantic_session": "sem-budget-validation-0000"
+    }
+  ]
+}

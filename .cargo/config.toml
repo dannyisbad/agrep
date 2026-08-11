@@ -1,0 +1,7 @@
+# Build for the CPU of whatever machine compiles this, so the JSON/scan/vector-search hot
+# paths can use its full instruction set (AVX2/FMA/etc.) instead of the x86-64 baseline.
+# Since agrep is built from source on the machine it runs on, the resulting non-portable
+# binary is exactly what you want. If you instead distribute a prebuilt binary across
+# machines, drop this and target a baseline (e.g. x86-64-v2).
+[build]
+rustflags = ["-C", "target-cpu=native"]

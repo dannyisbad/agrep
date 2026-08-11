@@ -1,0 +1,326 @@
+{
+  "schema": 2,
+  "cases": [
+    {
+      "name": "plain-fields",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "Needle", "input": "needle", "output": "needle needle"},
+      "occurrences": 4
+    },
+    {
+      "name": "control",
+      "query": "needle",
+      "event": {"kind": "control", "name": "needle", "input": "needle", "output": "needle"},
+      "occurrences": 0
+    },
+    {
+      "name": "subagent-start",
+      "query": "subagent",
+      "event": {"kind": "subagent_start", "name": "worker"},
+      "occurrences": 1
+    },
+    {
+      "name": "subagent-result",
+      "query": "result",
+      "event": {"kind": "subagent_result", "name": "worker"},
+      "occurrences": 1
+    },
+    {
+      "name": "failed-marker",
+      "query": "failed",
+      "event": {"kind": "tool", "name": "Run", "ok": false},
+      "occurrences": 1
+    },
+    {
+      "name": "unicode-re-i",
+      "query": "isk",
+      "event": {"kind": "tool", "name": "İſK"},
+      "occurrences": 1
+    },
+    {
+      "name": "unicode-i-sequence",
+      "query": "xii",
+      "event": {"kind": "tool", "name": "xİi xıi"},
+      "occurrences": 2
+    },
+    {
+      "name": "camel-substring",
+      "query": "akd",
+      "event": {"kind": "tool", "name": "peakDetect AKD"},
+      "occurrences": 2
+    },
+    {
+      "name": "non-string-fields",
+      "query": "needle",
+      "event": {"kind": "tool", "name": 42, "input": ["needle"], "output": null},
+      "occurrences": 0
+    },
+    {
+      "name": "non-overlapping",
+      "query": "aaa",
+      "event": {"kind": "tool", "name": "aaaaa"},
+      "occurrences": 1
+    }
+  ],
+  "encoded_cases": [
+    {
+      "name": "legacy-ascii-escape",
+      "query": "foo",
+      "event_json": "{\"kind\":\"tool\",\"name\":\"f\\u006fo\"}",
+      "occurrences": 1
+    },
+    {
+      "name": "exceptional-unicode-escapes",
+      "query": "isk",
+      "event_json": "{\"kind\":\"tool\",\"name\":\"\\u0130\\u017f\\u212a\"}",
+      "occurrences": 1
+    }
+  ],
+  "multi_cases": [
+    {
+      "name": "bridged-underscore",
+      "query": "cyber filter",
+      "event": {"kind": "tool", "name": "cyber_filter"},
+      "phrase_occurrences": 1,
+      "all_terms": true
+    },
+    {
+      "name": "bridged-concatenated",
+      "query": "cyber filter",
+      "event": {"kind": "tool", "name": "cyberfilter"},
+      "phrase_occurrences": 1,
+      "all_terms": true
+    },
+    {
+      "name": "alphanumeric-gap",
+      "query": "cyber filter",
+      "event": {"kind": "tool", "name": "cyberXfilter"},
+      "phrase_occurrences": 0,
+      "all_terms": true
+    },
+    {
+      "name": "reverse-all-terms",
+      "query": "cyber filter",
+      "event": {"kind": "tool", "name": "filter cyber"},
+      "phrase_occurrences": 0,
+      "all_terms": true
+    },
+    {
+      "name": "cross-field-bridges",
+      "query": "agent got stuck retrying same command",
+      "event": {"kind": "tool", "name": "Agent", "input": "got_stuck", "output": "retrying--same/command"},
+      "phrase_occurrences": 1,
+      "all_terms": true
+    },
+    {
+      "name": "generated-failed-marker",
+      "query": "build failed",
+      "event": {"kind": "tool", "name": "build", "ok": false},
+      "phrase_occurrences": 1,
+      "all_terms": true
+    },
+    {
+      "name": "unicode-re-i",
+      "query": "isk retry",
+      "event": {"kind": "tool", "name": "İſK", "input": "retry"},
+      "phrase_occurrences": 1,
+      "all_terms": true
+    },
+    {
+      "name": "duplicate-term-reuses-span",
+      "query": "foo foo",
+      "event": {"kind": "tool", "name": "foo"},
+      "phrase_occurrences": 0,
+      "all_terms": true
+    },
+    {
+      "name": "control-excluded",
+      "query": "cyber filter",
+      "event": {"kind": "control", "name": "cyber_filter"},
+      "phrase_occurrences": 0,
+      "all_terms": false
+    },
+    {
+      "name": "scattered-across-fields",
+      "query": "same failing command",
+      "event": {"kind": "tool", "name": "command", "input": "same", "output": "failing"},
+      "phrase_occurrences": 0,
+      "all_terms": true
+    }
+  ],
+  "bound_cases": [
+    {
+      "name": "output-leading-space",
+      "query": "akd",
+      "event": {"ts": 1000, "kind": "tool", "name": "shell", "input": "input", "output": "   akd"},
+      "lane": "phrase",
+      "lower": 0.0132,
+      "upper": 0.11
+    },
+    {
+      "name": "output-leading-combining-mark",
+      "query": "akd",
+      "event": {"ts": 1000, "kind": "tool", "name": "shell", "input": "input", "output": "́akd"},
+      "lane": "phrase",
+      "lower": 0.0132,
+      "upper": 0.11
+    },
+    {
+      "name": "output-leading-variation-selector",
+      "query": "akd",
+      "event": {"ts": 1000, "kind": "tool", "name": "shell", "input": "input", "output": "️akd"},
+      "lane": "phrase",
+      "lower": 0.0132,
+      "upper": 0.11
+    },
+    {
+      "name": "payload-discriminator-splice",
+      "query": "akd",
+      "event": {"ts": 1000, "kind": "tool", "name": "shell", "input": "xakdx", "output": "payload"},
+      "lane": "phrase",
+      "lower": 0.0132,
+      "upper": 0.11
+    },
+    {
+      "name": "later-normalizing-phrase-occurrence",
+      "query": "foo",
+      "event": {"ts": 1000, "kind": "tool", "name": "xfoox zzzzzzzzzzzzzzzzzzzz -foó tail"},
+      "lane": "phrase",
+      "lower": 0.0132,
+      "upper": 0.165
+    },
+    {
+      "name": "all-terms-normalizing-stitch",
+      "query": "akd foo",
+      "event": {"ts": 1000, "kind": "tool", "name": "xakdx", "output": "1foóz"},
+      "lane": "all_terms",
+      "lower": 0.0,
+      "upper": 0.22
+    },
+    {
+      "name": "all-terms-cut-normalization",
+      "query": "akd foo",
+      "event": {"ts": 1000, "kind": "tool", "name": "foóxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxakdxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx foóxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"},
+      "lane": "all_terms",
+      "lower": 0.0,
+      "upper": 0.22
+    },
+    {
+      "name": "all-terms-regex-fold-only",
+      "query": "isk site",
+      "event": {"ts": 1000, "kind": "tool", "name": "ſıte İſK"},
+      "lane": "all_terms",
+      "lower": 0.0,
+      "upper": 0.22
+    },
+    {
+      "name": "plain-output-start-control",
+      "query": "akd",
+      "event": {"ts": 1000, "kind": "tool", "name": "shell", "input": "input", "output": "akd"},
+      "lane": "phrase",
+      "lower": 0.0132,
+      "upper": 0.11
+    }
+  ],
+  "exact_score_cases": [
+    {
+      "name": "payload-output",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "Read", "input": "path=/tmp/x", "output": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx needle yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"},
+      "lane": "phrase",
+      "snippet": "…xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx needle yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy…",
+      "score": 0.11
+    },
+    {
+      "name": "payload-discriminator",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "Run", "input": "needle flag", "output": "useful payload result"},
+      "lane": "phrase",
+      "snippet": "…needle · useful payload result",
+      "score": 0.1073
+    },
+    {
+      "name": "cut-and-decut",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "Run", "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedleyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"},
+      "lane": "phrase",
+      "snippet": "…xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedleyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy…",
+      "score": 0.1045
+    },
+    {
+      "name": "multiple-occurrences",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "Run", "input": "needle one needle two needle"},
+      "lane": "phrase",
+      "snippet": "Run: needle one needle two needle",
+      "score": 0.1925
+    },
+    {
+      "name": "stitched-all-terms",
+      "query": "alpha beta",
+      "event": {"ts": 1000, "kind": "tool", "name": "alpha", "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "output": "beta"},
+      "lane": "all_terms",
+      "snippet": "alpha: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx… …xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx beta",
+      "score": 0.113
+    },
+    {
+      "name": "stitched-all-terms-reverse-order",
+      "query": "alpha beta",
+      "event": {"ts": 1000, "kind": "tool", "name": "beta", "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "output": "alpha"},
+      "lane": "all_terms",
+      "snippet": "beta: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx… …xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx alpha",
+      "score": 0.113
+    },
+    {
+      "name": "generated-failed",
+      "query": "build failed",
+      "event": {"ts": 1000, "kind": "subagent_result", "name": "build", "ok": false, "output": "result payload"},
+      "lane": "phrase",
+      "snippet": "…build [failed · result payload",
+      "score": 0.0919
+    },
+    {
+      "name": "json-escaped-ascii",
+      "query": "foo",
+      "event_json": "{\"ts\":1000,\"kind\":\"tool\",\"name\":\"f\\u006fo\",\"output\":\"payload\"}",
+      "lane": "phrase",
+      "snippet": "foo · payload",
+      "score": 0.11
+    },
+    {
+      "name": "powf-recency",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "needle"},
+      "lane": "phrase",
+      "snippet": "needle",
+      "now_ms": 1234567890,
+      "score": 0.0542
+    },
+    {
+      "name": "powf-near-rounding-half",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "needle"},
+      "lane": "phrase",
+      "snippet": "needle",
+      "now_ms": 1233561339,
+      "score": 0.0542
+    },
+    {
+      "name": "geometric-boundary-near-rounding-half",
+      "query": "akd db",
+      "event": {"ts": 1000, "kind": "tool", "name": "xakdx", "output": "xxdbxx"},
+      "lane": "all_terms",
+      "snippet": "xakdx xxdbxx",
+      "now_ms": 1205913854,
+      "score": 0.0148
+    },
+    {
+      "name": "unrelated-unicode-outside-window",
+      "query": "needle",
+      "event": {"ts": 1000, "kind": "tool", "name": "Run", "input": "😀xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedle"},
+      "lane": "phrase",
+      "snippet": "…xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedle",
+      "score": 0.1073
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{"type":"session","id":"01940000-0000-7000-8000-000000000003","version":3,"cwd":"/work/beta","timestamp":"2026-02-03T04:05:06.000Z"}
+{"type":"custom","id":"x1","parentId":null,"timestamp":"2026-02-03T04:05:07.000Z","customType":"omp.extension.state","data":{"panel":"open"}}
+{"type":"message","id":"b1","parentId":"x1","timestamp":"2026-02-03T04:05:08.000Z","message":{"role":"user","content":[{"type":"text","text":"fork question about the omp panel"}],"attribution":"user","timestamp":"2026-02-03T04:05:08.000Z"}}
+{"type":"message","id":"b2","parentId":"b1","timestamp":"2026-02-03T04:05:09.000Z","message":{"role":"developer","content":[{"type":"text","text":"harness chatter, not a turn"}],"timestamp":"2026-02-03T04:05:09.000Z"}}
+{"type":"message","id":"b3","parentId":"b2","timestamp":"2026-02-03T04:05:10.000Z","message":{"role":"assistant","model":"omp/fable-5","content":[{"type":"text","text":"the panel is fork-only"}],"timestamp":"2026-02-03T04:05:10.000Z"}}

@@ -1,0 +1,2 @@
+{"type":"session","id":"01940000-0000-7000-8000-000000000004","version":3,"cwd":"/work/beta","timestamp":"2026-02-03T04:05:11.000Z"}
+{"type":"message","id":"s1","parentId":null,"timestamp":"2026-02-03T04:05:12.000Z","message":{"role":"user","content":[{"type":"text","text":"sidecar advisor question"}],"timestamp":"2026-02-03T04:05:12.000Z"}}

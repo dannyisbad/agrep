@@ -1,0 +1,5 @@
+{"protocol_version":1}
+{"timestamp":1767348000.0,"message":{"type":"TurnBegin","payload":{}}}
+{"timestamp":1767348001.0,"message":{"type":"ToolCall","payload":{"id":"tc1"}}}
+{"timestamp":1767348002.0,"message":{"type":"ToolResult","payload":{"tool_call_id":"tc1","return_value":{"output":"import sys\nprint()","is_error":false}}}}
+{"timestamp":1767348060.0,"message":{"type":"TurnBegin","payload":{}}}

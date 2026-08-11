@@ -1,0 +1,13 @@
+=== messages.jsonl (3 lines) ===
+{"id":"kimi:44444444-4444-4444-8444-444444444444:0","agent":"kimi","project":"sample-project","session":"44444444-4444-4444-8444-444444444444","ts":1767348000000,"turn":0,"text":"port the script to argparse","content_digest":"4244","who":"user","model_source":"unknown"}
+{"id":"kimi:44444444-4444-4444-8444-444444444444:1","agent":"kimi","project":"sample-project","session":"44444444-4444-4444-8444-444444444444","ts":1767348060000,"turn":1,"text":"add a --verbose flag","content_digest":"a7ef","who":"user","model_source":"unknown"}
+{"id":"kimi:55555555-5555-4555-8555-555555555555:0","agent":"kimi","project":"sample-project","session":"55555555-5555-4555-8555-555555555555","ts":0,"turn":0,"text":"review the argparse defaults","content_digest":"5cc1","who":"subagent","model_source":"unknown"}
+=== replies.jsonl (3 lines) ===
+{"id":"kimi:44444444-4444-4444-8444-444444444444:0","reply":"Reading the current entrypoint. Converted the flags to argparse.","content_digest":"abf3","reply_chars":64,"reply_truncated":false}
+{"id":"kimi:44444444-4444-4444-8444-444444444444:1","reply":"Added --verbose wired to logging.","content_digest":"5f40","reply_chars":33,"reply_truncated":false}
+{"id":"kimi:55555555-5555-4555-8555-555555555555:0","reply":"The defaults preserve the previous command-line behavior.","content_digest":"9eb8","reply_chars":57,"reply_truncated":false}
+=== sessions.jsonl (2 lines) ===
+{"session":"44444444-4444-4444-8444-444444444444","agent":"kimi","project":"sample-project","n":2,"first_ts":1767348000000,"last_ts":1767348060000,"first_text":"port the script to argparse"}
+{"session":"55555555-5555-4555-8555-555555555555","agent":"kimi","project":"sample-project","n":1,"first_ts":0,"last_ts":0,"first_text":"review the argparse defaults","parent":"44444444-4444-4444-8444-444444444444"}
+=== events/kimi-44444444-4444-4444-8444-444444444444--1e2a27ee7e40b3e9f9fd1fe72cf2e6df51efb6d167f898d2.jsonl (1 lines) ===
+{"ts":1767348001000,"kind":"tool","name":"read_file","input":"main.py","output":"import sys\nprint()","input_chars":7,"output_chars":18,"output_bytes":18,"ok":true,"call_id":"tc1"}

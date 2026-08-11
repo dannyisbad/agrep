@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "provenance": "synthetic-generalized-no-transcript-content",
+  "real": [
+    {
+      "id": "parser-checkpoint",
+      "query": "How did the parser resume safely after an interrupted import?"
+    },
+    {
+      "id": "windows-path-identity",
+      "query": "Why did differently cased Windows paths create duplicate workspaces?"
+    },
+    {
+      "id": "output-budget",
+      "query": "How was a negative output budget stopped from expanding the response?"
+    },
+    {
+      "id": "boundary-frontier",
+      "query": "Which bounded frontier kept boundary ranking fast on common terms?"
+    },
+    {
+      "id": "semantic-gibberish",
+      "query": "Why did meaningless semantic queries return confident-looking results?"
+    },
+    {
+      "id": "anonymous-events",
+      "query": "Why did events without source identifiers overwrite one another?"
+    },
+    {
+      "id": "warm-cache",
+      "query": "What made unchanged inputs pay the full materialization cost again?"
+    },
+    {
+      "id": "indexed-archive",
+      "query": "How did we locate one archived conversation without scanning every archive?"
+    }
+  ],
+  "gibberish": [
+    {
+      "id": "gibberish-1",
+      "query": "qzxvplmbrt nfkwoeir zzzq"
+    },
+    {
+      "id": "gibberish-2",
+      "query": "blorf snazzle quuxwibble"
+    },
+    {
+      "id": "gibberish-3",
+      "query": "xjvkt pqrmnz wugga"
+    },
+    {
+      "id": "gibberish-4",
+      "query": "flibbertigib zornqax mivvle"
+    },
+    {
+      "id": "gibberish-5",
+      "query": "vvqkz jjjxpt nnnwlr"
+    }
+  ]
+}

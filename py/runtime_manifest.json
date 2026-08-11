@@ -1,0 +1,317 @@
+{
+ "version": 1,
+ "files": [
+  {
+   "source": "agrep/__init__.py",
+   "member": "agrep/__init__.py"
+  },
+  {
+   "source": "agrep/__main__.py",
+   "member": "agrep/__main__.py"
+  },
+  {
+   "source": "cli.py",
+   "member": "agrep/cli.py"
+  },
+  {
+   "source": "py/archive.py",
+   "member": "agrep/py/archive.py"
+  },
+  {
+   "source": "py/around.py",
+   "member": "agrep/py/around.py"
+  },
+  {
+   "source": "py/ask.py",
+   "member": "agrep/py/ask.py"
+  },
+  {
+   "source": "py/audit.py",
+   "member": "agrep/py/audit.py"
+  },
+  {
+   "source": "py/boundary_rank.py",
+   "member": "agrep/py/boundary_rank.py"
+  },
+  {
+   "source": "py/common.py",
+   "member": "agrep/py/common.py"
+  },
+  {
+   "source": "py/compact.py",
+   "member": "agrep/py/compact.py"
+  },
+  {
+   "source": "py/conceptpair.py",
+   "member": "agrep/py/conceptpair.py"
+  },
+  {
+   "source": "py/console.py",
+   "member": "agrep/py/console.py"
+  },
+  {
+   "source": "py/corpusdb.py",
+   "member": "agrep/py/corpusdb.py"
+  },
+  {
+   "source": "py/display_policy.py",
+   "member": "agrep/py/display_policy.py"
+  },
+  {
+   "source": "py/dist.py",
+   "member": "agrep/py/dist.py"
+  },
+  {
+   "source": "py/doctor.py",
+   "member": "agrep/py/doctor.py"
+  },
+  {
+   "source": "py/embed.py",
+   "member": "agrep/py/embed.py"
+  },
+  {
+   "source": "py/embedder.py",
+   "member": "agrep/py/embedder.py"
+  },
+  {
+   "source": "py/embedding_segments.py",
+   "member": "agrep/py/embedding_segments.py"
+  },
+  {
+   "source": "py/embedding_store.py",
+   "member": "agrep/py/embedding_store.py"
+  },
+  {
+   "source": "py/events.py",
+   "member": "agrep/py/events.py"
+  },
+  {
+   "source": "py/explore.py",
+   "member": "agrep/py/explore.py"
+  },
+  {
+   "source": "py/fileops.py",
+   "member": "agrep/py/fileops.py"
+  },
+  {
+   "source": "py/hookinstall.py",
+   "member": "agrep/py/hookinstall.py"
+  },
+  {
+   "source": "py/hookless/__init__.py",
+   "member": "agrep/py/hookless/__init__.py"
+  },
+  {
+   "source": "py/hookless/_log.py",
+   "member": "agrep/py/hookless/_log.py"
+  },
+  {
+   "source": "py/hookless/agent_registry.json",
+   "member": "agrep/py/hookless/agent_registry.json"
+  },
+  {
+   "source": "py/hookless/capture.py",
+   "member": "agrep/py/hookless/capture.py"
+  },
+  {
+   "source": "py/hookless/fswatch.py",
+   "member": "agrep/py/hookless/fswatch.py"
+  },
+  {
+   "source": "py/hookless/live.py",
+   "member": "agrep/py/hookless/live.py"
+  },
+  {
+   "source": "py/hookless/locators.py",
+   "member": "agrep/py/hookless/locators.py"
+  },
+  {
+   "source": "py/hookless/native.py",
+   "member": "agrep/py/hookless/native.py"
+  },
+  {
+   "source": "py/hookless/proc.py",
+   "member": "agrep/py/hookless/proc.py"
+  },
+  {
+   "source": "py/hookless/procscan.py",
+   "member": "agrep/py/hookless/procscan.py"
+  },
+  {
+   "source": "py/hookless/registry.py",
+   "member": "agrep/py/hookless/registry.py"
+  },
+  {
+   "source": "py/hooks/codex-postcompact.md",
+   "member": "agrep/py/hooks/codex-postcompact.md"
+  },
+  {
+   "source": "py/hooks/codex_compact_payload.py",
+   "member": "agrep/py/hooks/codex_compact_payload.py"
+  },
+  {
+   "source": "py/hooks/compact-contract.md",
+   "member": "agrep/py/hooks/compact-contract.md"
+  },
+  {
+   "source": "py/hooks/pi_postcompact.ts",
+   "member": "agrep/py/hooks/pi_postcompact.ts"
+  },
+  {
+   "source": "py/index_lock.py",
+   "member": "agrep/py/index_lock.py"
+  },
+  {
+   "source": "py/indexd.py",
+   "member": "agrep/py/indexd.py"
+  },
+  {
+   "source": "py/indexd_runtime.py",
+   "member": "agrep/py/indexd_runtime.py"
+  },
+  {
+   "source": "py/indexer.py",
+   "member": "agrep/py/indexer.py"
+  },
+  {
+   "source": "py/install_lag.py",
+   "member": "agrep/py/install_lag.py"
+  },
+  {
+   "source": "py/legacy_cleanup.py",
+   "member": "agrep/py/legacy_cleanup.py"
+  },
+  {
+   "source": "py/lifetime.py",
+   "member": "agrep/py/lifetime.py"
+  },
+  {
+   "source": "py/livetui.py",
+   "member": "agrep/py/livetui.py"
+  },
+  {
+   "source": "py/mlx_embed.py",
+   "member": "agrep/py/mlx_embed.py"
+  },
+  {
+   "source": "py/mlx_modernbert.py",
+   "member": "agrep/py/mlx_modernbert.py"
+  },
+  {
+   "source": "py/nudge_codex.md",
+   "member": "agrep/py/nudge_codex.md"
+  },
+  {
+   "source": "py/nudge_default.md",
+   "member": "agrep/py/nudge_default.md"
+  },
+  {
+   "source": "py/ownerfile.py",
+   "member": "agrep/py/ownerfile.py"
+  },
+  {
+   "source": "py/postcompact.py",
+   "member": "agrep/py/postcompact.py"
+  },
+  {
+   "source": "py/proc.py",
+   "member": "agrep/py/proc.py"
+  },
+  {
+   "source": "py/recall.py",
+   "member": "agrep/py/recall.py"
+  },
+  {
+   "source": "py/removal_fence.py",
+   "member": "agrep/py/removal_fence.py"
+  },
+  {
+   "source": "py/resources.py",
+   "member": "agrep/py/resources.py"
+  },
+  {
+   "source": "py/resume.py",
+   "member": "agrep/py/resume.py"
+  },
+  {
+   "source": "py/runtime_manifest.json",
+   "member": "agrep/py/runtime_manifest.json"
+  },
+  {
+   "source": "py/sabel_observer.py",
+   "member": "agrep/py/sabel_observer.py"
+  },
+  {
+   "source": "py/sabel_pool.py",
+   "member": "agrep/py/sabel_pool.py"
+  },
+  {
+   "source": "py/sabel_shadow.py",
+   "member": "agrep/py/sabel_shadow.py"
+  },
+  {
+   "source": "py/search.py",
+   "member": "agrep/py/search.py"
+  },
+  {
+   "source": "py/segment_query.py",
+   "member": "agrep/py/segment_query.py"
+  },
+  {
+   "source": "py/semantic.py",
+   "member": "agrep/py/semantic.py"
+  },
+  {
+   "source": "py/semantic_q8.py",
+   "member": "agrep/py/semantic_q8.py"
+  },
+  {
+   "source": "py/semantic_segment_build.py",
+   "member": "agrep/py/semantic_segment_build.py"
+  },
+  {
+   "source": "py/semantic_segment_compact.py",
+   "member": "agrep/py/semantic_segment_compact.py"
+  },
+  {
+   "source": "py/semworker.py",
+   "member": "agrep/py/semworker.py"
+  },
+  {
+   "source": "py/server.py",
+   "member": "agrep/py/server.py"
+  },
+  {
+   "source": "py/session_context.py",
+   "member": "agrep/py/session_context.py"
+  },
+  {
+   "source": "py/settings.py",
+   "member": "agrep/py/settings.py"
+  },
+  {
+   "source": "py/surface_policy.py",
+   "member": "agrep/py/surface_policy.py"
+  },
+  {
+   "source": "py/tail.py",
+   "member": "agrep/py/tail.py"
+  },
+  {
+   "source": "py/teach.py",
+   "member": "agrep/py/teach.py"
+  },
+  {
+   "source": "py/winjob.py",
+   "member": "agrep/py/winjob.py"
+  },
+  {
+   "source": "reindex.py",
+   "member": "agrep/reindex.py"
+  },
+  {
+   "source": "web/app.html",
+   "member": "agrep/web/app.html"
+  }
+ ]
+}

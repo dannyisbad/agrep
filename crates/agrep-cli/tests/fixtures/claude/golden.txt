@@ -1,0 +1,15 @@
+=== messages.jsonl (3 lines) ===
+{"id":"claude:11111111-1111-4111-8111-111111111111:0","agent":"claude","project":"work","session":"11111111-1111-4111-8111-111111111111","ts":1767348000000,"turn":0,"text":"how do i fix the flaky timer test","content_digest":"7cbb","who":"user","model":"claude-fable-5","model_source":"explicit"}
+{"id":"claude:11111111-1111-4111-8111-111111111111:1","agent":"claude","project":"work","session":"11111111-1111-4111-8111-111111111111","ts":1767348060000,"turn":1,"text":"the failure is a race, add a barrier","content_digest":"4571","who":"user","model":"claude-fable-5","model_source":"explicit"}
+{"id":"claude:agent-atestchild01:0","agent":"claude","project":"work","session":"agent-atestchild01","ts":1767348300000,"turn":0,"text":"Explore the auth module and report the token refresh flow.","content_digest":"5a39","who":"subagent","model":"claude-fable-5","model_source":"explicit"}
+=== replies.jsonl (3 lines) ===
+{"id":"claude:11111111-1111-4111-8111-111111111111:0","reply":"Let me run the timer test.","content_digest":"12e5","reply_chars":26,"reply_truncated":false}
+{"id":"claude:11111111-1111-4111-8111-111111111111:1","reply":"Added a barrier before the assert; the race is gone.","content_digest":"2213","reply_chars":52,"reply_truncated":false}
+{"id":"claude:agent-atestchild01:0","reply":"The refresh flow rotates tokens in auth/refresh.py via refresh_token().","content_digest":"7fe9","reply_chars":71,"reply_truncated":false}
+=== sessions.jsonl (2 lines) ===
+{"session":"11111111-1111-4111-8111-111111111111","agent":"claude","project":"work","n":2,"first_ts":1767348000000,"last_ts":1767348060000,"first_text":"how do i fix the flaky timer test"}
+{"session":"agent-atestchild01","agent":"claude","project":"work","n":1,"first_ts":1767348300000,"last_ts":1767348300000,"first_text":"Explore the auth module and report the token refresh flow.","parent":"11111111-1111-4111-8111-111111111111"}
+=== events/claude-11111111-1111-4111-8111-111111111111--6810bb1e7984b06f867305f66fb4d1751eb115ebefaf3dd4.jsonl (1 lines) ===
+{"ts":1767348005000,"kind":"tool","name":"Bash","input":"cargo test timer","output":"3 passed; 1 failed","input_chars":16,"output_chars":18,"output_bytes":18,"ok":true,"call_id":"toolu_a1"}
+=== events/claude-agent-atestchild01--90c8d8f9f667402bf207727eb4371b078a1e7e1a7916552a.jsonl (1 lines) ===
+{"ts":1767348310000,"kind":"tool","name":"Grep","input":"refresh_token","output":"auth/refresh.py:42: def refresh_token(...)","input_chars":13,"output_chars":42,"output_bytes":42,"ok":true,"call_id":"toolu_child01"}

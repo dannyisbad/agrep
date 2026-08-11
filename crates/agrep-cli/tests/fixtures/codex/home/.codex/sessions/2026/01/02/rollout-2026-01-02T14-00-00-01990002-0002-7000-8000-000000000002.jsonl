@@ -1,0 +1,6 @@
+{"type":"session_meta","payload":{"id":"01990002-0002-7000-8000-000000000002","parent_thread_id":"01990002-0001-7000-8000-000000000001","cwd":"/work/legacy","thread_source":"subagent","source":"vscode"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"01990002-0003-7000-8000-000000000003"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/work/legacy</cwd>\n</environment_context>"}]}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"01990002-0003-7000-8000-000000000003"}}
+{"type":"response_item","timestamp":"2026-01-02T14:00:00.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_delegation>\n<source_thread_id>01990002-0001-7000-8000-000000000001</source_thread_id>\n<input>review legacy adapter parsing and report exact evidence</input>\n</codex_delegation>"}]}}
+{"type":"response_item","timestamp":"2026-01-02T14:00:01.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Legacy delegation child retained."}]}}

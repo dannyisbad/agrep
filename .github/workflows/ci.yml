@@ -1,0 +1,550 @@
+name: ci
+
+# Push/PR checks cover Rust, Python, performance, packaging, and platform contracts.
+# AGREP_CI skips only self-tests that require a live local corpus or processes.
+# The degrade job proves a no-binary install stays usable and its binary fetch resolves.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  rust:
+    name: cargo test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install pinned Rust toolchain
+        run: rustc --version
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked --release
+
+  python:
+    name: selftest ${{ matrix.os }} py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10", perf: false }
+          - { os: ubuntu-latest, python: "3.12", perf: true }
+          - { os: ubuntu-latest, python: "3.14", perf: false }
+          - { os: macos-14, python: "3.12", perf: true }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - name: install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "${{ matrix.python }}" }
+      - name: build + stage ingest binary
+        shell: bash
+        run: |
+          cargo build --release --locked -p agrep-ingest
+          mkdir -p _bin
+          cp target/release/agrep-rs _bin/
+      - name: install runtime deps (the package's hard deps)
+        run: python -m pip install numpy onnxruntime tokenizers
+      - name: import sanity (core modules load on a clean box)
+        working-directory: py
+        run: python -c "import common, search, explore, corpusdb, doctor, embedder, semantic"
+      - name: runner qualification snapshot
+        run: >-
+          python -c "import json,os,platform;
+          print(json.dumps({'cpu_count':os.cpu_count(),
+          'loadavg':getattr(os,'getloadavg',lambda:None)(),
+          'platform':platform.platform()}))"
+      - name: fixed JSONL full-exit budget
+        run: python py/test_jsonl_native_full_exit_perf.py -v
+      - name: fixed source-layout full-exit budgets (macOS reference)
+        if: ${{ runner.os == 'macOS' && matrix.perf }}
+        run: python py/test_perf_budgets.py -v
+      - name: selftest ci subset
+        working-directory: py
+        env: { AGREP_CI: "1" }
+        run: python selftest.py
+      - name: focused release regressions
+        env: { AGREP_CI: "1" }
+        shell: bash
+        run: |
+          for test in py/test_*.py; do
+            case "$test" in
+              py/test_jsonl_native_full_exit_perf.py|py/test_perf_budgets.py) continue ;;
+            esac
+            PYTHONPATH="$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/py" python "$test" -v
+          done
+      - name: perf gate (isolated 14k ingest + proven 100k search, 3x slack)
+        if: ${{ matrix.perf }}
+        env:
+          AGREP_PERF_SLACK: "3"
+          # hosted ubuntu x64 measured p50 655ms (samples 602-677) vs the
+          # 600ms blanket ceiling; 4x = 800ms clears the observed band
+          AGREP_PERF_INGEST_ONE_CHANGED_SLACK: "4"
+        run: python bench/perf.py --check
+      - name: idle CPU / RSS / handle gate (4,600-file store)
+        if: ${{ matrix.perf }}
+        run: python bench/resources.py --check
+
+  linux-installed-wheel-perf:
+    name: Linux x64 py3.12 installed-wheel full-exit budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - name: install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: build local Linux wheel candidate
+        shell: bash
+        env:
+          AGREP_WHEEL_PLAT: linux_x86_64
+          RUSTFLAGS: "-C target-cpu=x86-64"
+        run: |
+          set -euo pipefail
+          cp .cargo/config.toml "$RUNNER_TEMP/agrep-cargo-config.toml"
+          rm -f .cargo/config.toml
+          RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$GITHUB_WORKSPACE=/src/agrep"
+          RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$HOME=/build/user"
+          for path in "${RUNNER_TEMP:-}" "${RUNNER_WORKSPACE:-}" \
+              "${RUNNER_TOOL_CACHE:-}" "${TEMP:-}" "${TMP:-}" "${TMPDIR:-}"; do
+            if [ -n "$path" ]; then
+              RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$path=/build/runtime"
+            fi
+          done
+          export RUSTFLAGS
+          cargo build --release --locked -p agrep-ingest
+          cp "$RUNNER_TEMP/agrep-cargo-config.toml" .cargo/config.toml
+          python bench/validate_binary_privacy.py target/release/agrep-rs \
+            --forbid "$GITHUB_WORKSPACE" --forbid "$HOME" \
+            --forbid "${RUNNER_TEMP:-}" --forbid "${RUNNER_WORKSPACE:-}" \
+            --forbid "${RUNNER_TOOL_CACHE:-}" --forbid "${TEMP:-}" \
+            --forbid "${TMP:-}" --forbid "${TMPDIR:-}"
+          mkdir -p _bin
+          cp target/release/agrep-rs _bin/
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build --wheel
+          mapfile -t wheels < <(find dist -maxdepth 1 -name '*.whl' -print)
+          test "${#wheels[@]}" -eq 1
+          case "$(basename "${wheels[0]}")" in
+            agrep-*-py3-none-linux_x86_64.whl) ;;
+            *) echo "unexpected local wheel tag: ${wheels[0]}" >&2; exit 1 ;;
+          esac
+          case "$(basename "${wheels[0]}")" in
+            *manylinux*) echo "local wheel must not claim manylinux" >&2; exit 1 ;;
+          esac
+          sha256sum "${wheels[0]}"
+          venv="$RUNNER_TEMP/agrep-linux-candidate"
+          python -m venv "$venv"
+          "$venv/bin/pip" install --disable-pip-version-check "${wheels[0]}"
+          "$venv/bin/python" bench/smoke_installed_wheel.py \
+            --agrep "$venv/bin/agrep"
+          (cd "$RUNNER_TEMP" && "$venv/bin/python" -I -c \
+            'import agrep,pathlib; print(pathlib.Path(agrep.__file__).resolve())')
+      - name: runner qualification snapshot
+        run: >-
+          python -c "import json,os,platform;
+          print(json.dumps({'cpu_count':os.cpu_count(),
+          'loadavg':getattr(os,'getloadavg',lambda:None)(),
+          'platform':platform.platform()}))"
+      - name: binding installed-console full-exit budgets
+        env:
+          AGREP_PERF_CLI: ${{ runner.temp }}/agrep-linux-candidate/bin/agrep
+        run: |
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u PYTHONHOME \
+            "$RUNNER_TEMP/agrep-linux-candidate/bin/python" \
+            "$GITHUB_WORKSPACE/py/test_perf_budgets.py" -v
+
+  windows-gate:
+    name: Windows release gate (Python 3.13, narrow hosted-runner slack)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - name: install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.13" }
+      - name: build and stage portable release binary
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64"
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          rm -f .cargo/config.toml
+          add_remap() {
+            if [ -n "$1" ]; then
+              RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$1=$2"
+            fi
+          }
+          add_remap "$GITHUB_WORKSPACE" /src/agrep
+          add_remap "${CARGO_HOME:-}" /build/cargo
+          add_remap "${RUSTUP_HOME:-}" /build/rustup
+          add_remap "${USERPROFILE:-}" /build/user
+          add_remap "${HOME:-}" /build/user
+          add_remap "${RUNNER_TEMP:-}" /build/temp
+          add_remap "${RUNNER_WORKSPACE:-}" /build/workspace
+          add_remap "${RUNNER_TOOL_CACHE:-}" /build/tools
+          add_remap "${TEMP:-}" /build/temp
+          add_remap "${TMP:-}" /build/temp
+          add_remap "${TMPDIR:-}" /build/temp
+          export RUSTFLAGS
+          cargo build --release --locked -p agrep-ingest
+          python bench/validate_binary_privacy.py target/release/agrep-rs.exe \
+            --forbid "$GITHUB_WORKSPACE" --forbid "${CARGO_HOME:-}" \
+            --forbid "${RUSTUP_HOME:-}" --forbid "${USERPROFILE:-}" \
+            --forbid "${HOME:-}" --forbid "${RUNNER_TEMP:-}" \
+            --forbid "${RUNNER_WORKSPACE:-}" --forbid "${RUNNER_TOOL_CACHE:-}" \
+            --forbid "${TEMP:-}" --forbid "${TMP:-}" --forbid "${TMPDIR:-}"
+          mkdir -p _bin
+          cp target/release/agrep-rs.exe _bin/agrep-rs.exe
+      - name: build, install, and smoke exact win_amd64 wheel
+        shell: pwsh
+        env:
+          AGREP_WHEEL_PLAT: win_amd64
+        run: |
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build --wheel
+          $wheels = @(Get-ChildItem dist\*.whl)
+          if ($wheels.Count -ne 1) { throw "expected one Windows wheel, got $($wheels.Count)" }
+          python bench/validate_wheel.py $wheels[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $venv = Join-Path $env:RUNNER_TEMP "agrep-win-candidate"
+          python -m venv $venv
+          $python = Join-Path $venv "Scripts\python.exe"
+          $agrep = Join-Path $venv "Scripts\agrep.exe"
+          & $python -m pip install --disable-pip-version-check $wheels[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "candidate wheel sha256=$((Get-FileHash $wheels[0].FullName -Algorithm SHA256).Hash.ToLower())"
+          & $agrep --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python bench/smoke_installed_wheel.py --agrep $agrep
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: non-blocking portable perf board (4x default, narrow Windows I/O slack)
+        id: portable_perf
+        continue-on-error: true
+        env:
+          AGREP_PERF_SLACK: "4"
+          AGREP_PERF_INGEST_ONE_CHANGED_SLACK: "8"
+          AGREP_PERF_STREAMED_FIRST_HIT_SLACK: "8"
+          AGREP_PERF_STREAMED_COMPLETION_SLACK: "4"
+        run: python bench/perf.py --check
+      - name: cargo test release
+        run: cargo test --release --workspace --locked
+      - name: install supported semantic wheels
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          numpy onnxruntime tokenizers
+      - name: native semantic runtime and imports
+        shell: pwsh
+        run: |
+          python bench/onnx_smoke.py
+          Push-Location py
+          python -c "import common, search, explore, corpusdb, doctor, embedder, semantic"
+          Pop-Location
+      - name: runner qualification snapshot
+        run: >-
+          python -c "import json,os,platform;
+          print(json.dumps({'cpu_count':os.cpu_count(),
+          'loadavg':getattr(os,'getloadavg',lambda:None)(),
+          'platform':platform.platform()}))"
+      - name: non-blocking fixed JSONL full-exit budget (installed wheel)
+        id: fixed_jsonl
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "agrep-win-candidate"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $agrep = Join-Path $venv "Scripts\agrep.exe"
+          if (-not (Test-Path -LiteralPath $agrep -PathType Leaf)) {
+            throw "installed candidate launcher is unavailable: $agrep"
+          }
+          $env:AGREP_PERF_CLI = $agrep
+          & $python py/test_jsonl_native_full_exit_perf.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: non-blocking fixed CLI full-exit budgets (installed wheel)
+        id: fixed_cli
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "agrep-win-candidate"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $agrep = Join-Path $venv "Scripts\agrep.exe"
+          if (-not (Test-Path -LiteralPath $agrep -PathType Leaf)) {
+            throw "installed candidate launcher is unavailable: $agrep"
+          }
+          $env:AGREP_PERF_CLI = $agrep
+          & $python py/test_perf_budgets.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: selftest with explicit zero-failure proof
+        shell: pwsh
+        working-directory: py
+        env:
+          AGREP_CI: "1"
+        run: |
+          $ErrorActionPreference = "Continue"
+          $output = & python selftest.py 2>&1
+          $exitCode = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+          $output | ForEach-Object { Write-Host $_ }
+          $summaryPattern = '---- \d+ passed, (?<failed>\d+) failed, (?<skipped>\d+) skipped ----'
+          $summaries = @($output | Select-String -Pattern $summaryPattern)
+          if ($summaries.Count -ne 1) { throw "selftest emitted no unique count summary" }
+          $failed = [int]$summaries[0].Matches[0].Groups["failed"].Value
+          $skipped = [int]$summaries[0].Matches[0].Groups["skipped"].Value
+          $allowedCiSkips = @(
+            "AGREP_DEBUG trace"
+            "sticky working flag"
+            "reply cap (64k)"
+            "procscan agent processes"
+            "search engines kw/word/regex"
+            "filter pushdown parity"
+            "semantic embedding coherence tracks generations exactly"
+            "stale lane starts one deduped background embed"
+            "recall hybrid survives misleading keyword phrases"
+            "bag-of-words fallback"
+            "query-echo shadowing"
+            "stale-serve under live writes"
+            "U+2028 jsonl split"
+            "CLI dispatch"
+            "status/doctor --json"
+            "doctor failure-state renders"
+            "recall --json shape"
+            "rust binary installed"
+            "uninstall sentinel teardown contract"
+          )
+          $skipPattern = 'SKIP\s{2}(?<name>.*?)\s+ci: needs live corpus / processes / platform binary$'
+          $ciSkips = @(
+            $output | ForEach-Object {
+              if ("$_" -match $skipPattern) { $Matches["name"].Trim() }
+            }
+          )
+          $unexpected = @($ciSkips | Where-Object { $_ -notin $allowedCiSkips })
+          $missing = @($allowedCiSkips | Where-Object { $_ -notin $ciSkips })
+          if ($skipped -ne $allowedCiSkips.Count -or $unexpected.Count -or $missing.Count) {
+            throw "selftest skip drift: total=$skipped unexpected=$($unexpected -join ',') missing=$($missing -join ',')"
+          }
+          if ($exitCode -ne 0 -or $failed -ne 0) {
+            throw "selftest failed: exit=$exitCode failures=$failed"
+          }
+      - name: every focused Python regression file
+        shell: pwsh
+        run: |
+          $timed = @("test_jsonl_native_full_exit_perf.py", "test_perf_budgets.py")
+          $tests = @(Get-ChildItem py/test_*.py | Where-Object { $_.Name -notin $timed } | Sort-Object Name)
+          if ($tests.Count -eq 0) { throw "no py/test_*.py files found" }
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE;$env:GITHUB_WORKSPACE\py"
+          foreach ($test in $tests) {
+            Write-Host "running $($test.Name)"
+            & python $test.FullName -v
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Write-Host "ran $($tests.Count) focused test files"
+      - name: frozen real-model semantic parity
+        run: python bench/semantic_recall_parity.py --check
+      - name: segmented publication contract
+        run: python bench/semantic_segment_scale.py --check --base-rows 100000
+      - name: segmented force-kill contract
+        run: python py/test_embedding_segment_crash.py -v
+      - name: semantic resources (4x timing slack; strict RAM and handles)
+        env:
+          AGREP_RESOURCE_IDLE_CPU_PERCENT: "20"
+          AGREP_RESOURCE_SEMANTIC_BATCH_WALL_MS: "20000"
+          AGREP_RESOURCE_SEMANTIC_QUERY_CPU_MS: "2000"
+        run: python bench/resources.py --check-semantic
+
+  core-only:
+    name: core-only setup ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Force a core-only install on both native architectures; marker logic
+          # for genuinely unsupported tuples is evaluated explicitly below.
+          - { name: mac-arm64-py314, os: macos-14, python: "3.14", arch: arm64 }
+          # setup-python has no Windows ARM64 CPython 3.10 artifact. Exercise the
+          # runtime core-only contract on native 3.12 and evaluate the 3.10 marker
+          # explicitly below.
+          - { name: win-arm64-py312, os: windows-11-arm, python: "3.12", arch: arm64 }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "${{ matrix.python }}", architecture: "${{ matrix.arch }}" }
+      - name: install source package without optional native dependencies
+        shell: bash
+        run: python -m pip install --disable-pip-version-check --no-deps .
+      - name: prove setup and semantic fallback without optional native deps
+        shell: bash
+        env:
+          AGREP_DATA_DIR: ${{ runner.temp }}/agrep-core-only
+          AGREP_DATA_DIR_SOURCE: env
+          AGREP_HOME: ${{ runner.temp }}/agrep-core-only-home
+          AGREP_NO_DAEMON: "1"
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tomllib
+
+          try:
+              from packaging.requirements import Requirement
+              from packaging.markers import default_environment
+          except ImportError:
+              from pip._vendor.packaging.requirements import Requirement
+              from pip._vendor.packaging.markers import default_environment
+          requirements = tomllib.loads(
+              Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
+          parsed = [Requirement(item) for item in requirements]
+          # A marker-less dependency is unconditional by definition; only
+          # pure-python certifi is allowed to be one. The conditional-install
+          # contract below governs the native wheels.
+          assert {item.name for item in parsed if item.marker is None} <= {"certifi"}, requirements
+          parsed = [item for item in parsed if item.marker is not None]
+          # mlx is darwin/arm64-only by design; every other conditioned dep
+          # must still resolve on the Linux vendor tuple.
+          mlx_reqs = [item for item in parsed if item.name == "mlx"]
+          parsed = [item for item in parsed if item.name != "mlx"]
+          assert len(mlx_reqs) == 1, requirements
+          env = default_environment()
+          linux_vendor = dict(env, sys_platform="linux",
+                              platform_release="6.17.0-1020-azure")
+          assert all(item.marker.evaluate(linux_vendor) for item in parsed), requirements
+          assert not mlx_reqs[0].marker.evaluate(linux_vendor), requirements
+          if sys.platform == "win32":
+              env.update(python_version="3.10", python_full_version="3.10.0",
+                         sys_platform="win32", platform_machine="ARM64")
+              assert all(not item.marker.evaluate(env) for item in parsed), requirements
+          else:
+              # Py3.14 semantics are automatic on macOS 14 Apple silicon, but
+              # remain core-only on macOS 11 and on Intel.
+              env.update(python_version="3.14", python_full_version="3.14.0",
+                         sys_platform="darwin", platform_machine="arm64",
+                         platform_release="23.0.0")
+              assert all(item.marker.evaluate(env) for item in parsed), requirements
+              env["platform_release"] = "20.0.0"
+              assert all(not item.marker.evaluate(env) for item in parsed), requirements
+              env.update(platform_release="23.0.0", platform_machine="x86_64")
+              assert all(not item.marker.evaluate(env) for item in parsed), requirements
+              env.update(python_version="3.13", python_full_version="3.13.0",
+                         platform_release="22.0.0")
+              assert all(item.marker.evaluate(env) for item in parsed), requirements
+
+          for name in ("numpy", "onnxruntime", "tokenizers"):
+              assert importlib.util.find_spec(name) is None, f"unexpected optional dep: {name}"
+          project = Path(os.environ["AGREP_HOME"]) / ".claude" / "projects" / "core-only"
+          project.mkdir(parents=True)
+          session = "00000000-0000-4000-8000-000000000020"
+          records = [
+              {"type": "user", "userType": "external", "sessionId": session,
+               "timestamp": "2026-08-04T00:00:00.000Z", "cwd": "/core-only",
+               "message": {"role": "user", "content": "core-only-positive-needle"}},
+              {"type": "assistant", "sessionId": session,
+               "timestamp": "2026-08-04T00:00:01.000Z", "cwd": "/core-only",
+               "message": {"role": "assistant", "model": "fixture",
+                           "content": [{"type": "text", "text": "keyword reply"}]}},
+          ]
+          (project / f"{session}.jsonl").write_text(
+              "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in records),
+              encoding="utf-8")
+          subprocess.run(["agrep", "--version"], check=True)
+          report = subprocess.run(
+              ["agrep", "doctor", "--json"], check=True,
+              capture_output=True, text=True)
+          payload = json.loads(report.stdout)
+          assert payload["semantic"]["optional"] is True
+          assert payload["semantic"]["available"] is None
+          assert payload["semantic"]["runtime_state"] == "not-inspected"
+          assert payload["semantic"]["install_hint"] is None
+          deep = subprocess.run(
+              ["agrep", "doctor", "--json", "--deep"], check=True,
+              capture_output=True, text=True)
+          deep_payload = json.loads(deep.stdout)
+          assert deep_payload["semantic"]["available"] is False
+          assert deep_payload["semantic"]["runtime_verified"] is True
+          assert "agrep[semantic]" in deep_payload["semantic"]["install_hint"]
+          subprocess.run(
+              ["agrep", "setup", "--no-teach", "--no-archive"], check=True)
+          fallback = subprocess.run(
+              ["agrep", "core-only-positive-needle", "--color", "never"],
+              capture_output=True, text=True)
+          assert fallback.returncode == 0, (
+              fallback.returncode, fallback.stdout, fallback.stderr)
+          assert "core-only-positive-needle" in fallback.stdout, (
+              fallback.stdout, fallback.stderr)
+          explicit = subprocess.run(
+              ["agrep", "-s", "core-only-smoke", "--no-auto", "--color", "never"])
+          assert explicit.returncode == 2, explicit.returncode
+          PY
+
+  sync:
+    name: version + docs sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: candidate snapshot + HEAD ancestry privacy
+        run: python bench/validate_repo_privacy.py --index --history HEAD
+      - name: canonical reachable-ref privacy
+        if: github.repository == 'dannyisbad/agrep'
+        run: python bench/validate_repo_privacy.py --all-refs
+      - name: release identity
+        run: python bench/release_identity.py
+
+  degrade:
+    name: no-binary install + fetch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - name: build sdist
+        run: |
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build --sdist --outdir dist .
+      - name: degraded install must NOT brick (no rust on PATH)
+        run: |
+          python -m venv /tmp/rv
+          # install from the sdist with cargo hidden -> hatch_build degrades (warn+continue)
+          env -u CARGO_HOME PATH="/usr/bin:/bin:/tmp/rv/bin" /tmp/rv/bin/pip install --no-input dist/*.tar.gz
+          # install succeeded (no brick); the CLI runs without a bundled binary
+          /tmp/rv/bin/agrep --version
+      - name: on-demand fetch resolves the binary
+        run: |
+          # a local file:// "release" with a dummy binary + sha256 sidecar
+          # Leave the checkout so stdin-mode Python cannot shadow the installed wheel.
+          cd /tmp
+          mkdir -p /tmp/rel
+          version=$(/tmp/rv/bin/python -c 'import agrep; print(agrep.__version__)')
+          printf '#!/bin/sh\necho "agrep-rs %s"\n' "$version" > /tmp/rel/agrep-rs-linux-x86_64
+          chmod +x /tmp/rel/agrep-rs-linux-x86_64
+          sha256sum /tmp/rel/agrep-rs-linux-x86_64 | awk '{print $1}' > /tmp/rel/agrep-rs-linux-x86_64.sha256
+          export AGREP_BIN_URL="file:///tmp/rel/"
+          export AGREP_DATA_DIR=/tmp/agdata
+          /tmp/rv/bin/python - <<'PY'
+          import pathlib, sys
+          pkg = pathlib.Path(__import__('agrep').__file__).parent
+          sys.path.insert(0, str(pkg / 'py')); sys.path.insert(0, str(pkg))
+          import common
+          p = common.fetch_binary(assume_yes=True)
+          assert p and p.exists(), "fetch did not install a binary"
+          assert str(common.ingest_bin()) == str(p), f"ingest_bin {common.ingest_bin()} != fetched {p}"
+          print("fetch resolves OK:", p)
+          PY

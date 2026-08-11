@@ -1,0 +1,23 @@
+=== messages.jsonl (8 lines) ===
+{"id":"pi:01920000-0000-7000-8000-000000000002:0","agent":"pi","project":"/work/legacy","session":"01920000-0000-7000-8000-000000000002","ts":1761955201000,"turn":0,"text":"legacy linear question","content_digest":"0b59","who":"user","model":"pi/legacy-1","model_source":"explicit"}
+{"id":"pi:01930000-0000-7000-8000-000000000001:0","agent":"pi","project":"/work/alpha","session":"01930000-0000-7000-8000-000000000001","ts":1767323046000,"turn":0,"text":"why did the retry backoff cap at 30s","content_digest":"cd22","who":"user","model":"pi/sonnet-5","model_source":"explicit"}
+{"id":"pi:01930000-0000-7000-8000-000000000001:1","agent":"pi","project":"/work/alpha","session":"01930000-0000-7000-8000-000000000001","ts":1767323051000,"turn":1,"text":"earlier: capped the backoff at 30s with jitter after the throttle","content_digest":"e291","who":"recap","model":"<recap>","model_source":"recap"}
+{"id":"pi:01930000-0000-7000-8000-000000000001:2","agent":"pi","project":"/work/alpha","session":"01930000-0000-7000-8000-000000000001","ts":1767323052000,"turn":2,"text":"now add jitter to the retry","content_digest":"18ba","who":"user","model":"pi/fable-5","model_source":"explicit"}
+{"id":"pi:01940000-0000-7000-8000-000000000003:0","agent":"pi","project":"/work/beta","session":"01940000-0000-7000-8000-000000000003","ts":1770091508000,"turn":0,"text":"fork question about the omp panel","content_digest":"03a3","who":"user","model":"omp/fable-5","model_source":"explicit"}
+{"id":"pi:01940000-0000-7000-8000-000000000004:0","agent":"pi","project":"/work/beta","session":"01940000-0000-7000-8000-000000000004","ts":1770091512000,"turn":0,"text":"sidecar advisor question","content_digest":"d74c","who":"subagent","model_source":"unknown"}
+{"id":"pi:01950000-0000-7000-8000-000000000005:0","agent":"pi","project":"/work/upstream","session":"01950000-0000-7000-8000-000000000005","ts":1772600768000,"turn":0,"text":"upstream pi question","content_digest":"b709","who":"user","model":"gpt-5.6","model_source":"session"}
+{"id":"pi:01950000-0000-7000-8000-000000000005:1","agent":"pi","project":"/work/upstream","session":"01950000-0000-7000-8000-000000000005","ts":1772600771000,"turn":1,"text":"and after the model switch","content_digest":"2e22","who":"user","model":"gpt-5.6","model_source":"explicit"}
+=== replies.jsonl (3 lines) ===
+{"id":"pi:01920000-0000-7000-8000-000000000002:0","reply":"legacy answer","content_digest":"385c","reply_chars":13,"reply_truncated":false}
+{"id":"pi:01930000-0000-7000-8000-000000000001:0","reply":"the 60s ceiling tripped the account throttle","content_digest":"e5c8","reply_chars":44,"reply_truncated":false}
+{"id":"pi:01940000-0000-7000-8000-000000000003:0","reply":"the panel is fork-only","content_digest":"86c7","reply_chars":22,"reply_truncated":false}
+=== sessions.jsonl (5 lines) ===
+{"session":"01920000-0000-7000-8000-000000000002","agent":"pi","project":"/work/legacy","n":1,"first_ts":1761955201000,"last_ts":1761955201000,"first_text":"legacy linear question"}
+{"session":"01930000-0000-7000-8000-000000000001","agent":"pi","project":"/work/alpha","n":3,"first_ts":1767323046000,"last_ts":1767323052000,"first_text":"why did the retry backoff cap at 30s"}
+{"session":"01940000-0000-7000-8000-000000000003","agent":"pi","project":"/work/beta","n":1,"first_ts":1770091508000,"last_ts":1770091508000,"first_text":"fork question about the omp panel"}
+{"session":"01940000-0000-7000-8000-000000000004","agent":"pi","project":"/work/beta","n":1,"first_ts":1770091512000,"last_ts":1770091512000,"first_text":"sidecar advisor question","parent":"01940000-0000-7000-8000-000000000003"}
+{"session":"01950000-0000-7000-8000-000000000005","agent":"pi","project":"/work/upstream","n":2,"first_ts":1772600768000,"last_ts":1772600771000,"first_text":"upstream pi question"}
+=== events/pi-01930000-0000-7000-8000-000000000001--52389507ea327288adee44a3f7176ea6fc694de6cbf47252.jsonl (1 lines) ===
+{"ts":1767323047000,"kind":"tool","name":"bash","input":"grep -rn backoff src/","output":"src/retry.rs:88: cap = Duration::from_secs(30)","input_chars":21,"output_chars":46,"output_bytes":46,"ok":true,"call_id":"tc-alpha-1"}
+=== events/pi-01950000-0000-7000-8000-000000000005--e119a16160b5157e5348bc2c04b86daffc40d61cc998c728.jsonl (1 lines) ===
+{"ts":1772600770000,"kind":"tool","name":"bash","input":"cargo test --quiet","output":"ok. 12 passed","input_chars":18,"output_chars":13,"output_bytes":13,"ok":true,"call_id":"u3"}

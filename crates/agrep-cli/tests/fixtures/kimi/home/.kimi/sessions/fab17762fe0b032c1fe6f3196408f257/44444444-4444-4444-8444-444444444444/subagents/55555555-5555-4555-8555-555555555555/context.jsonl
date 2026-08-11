@@ -1,0 +1,2 @@
+{"role":"user","content":"review the argparse defaults"}
+{"role":"assistant","content":"The defaults preserve the previous command-line behavior."}

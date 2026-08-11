@@ -1,0 +1,351 @@
+{
+  "version": 2,
+  "adapters": [
+    {
+      "name": "claude",
+      "live": {"state": "supported"},
+      "native_resume": {"state": "supported"},
+      "agent_context": {
+        "state": "supported",
+        "env_keys": [
+          "CLAUDECODE",
+          "CLAUDE_CODE",
+          "CLAUDE_CODE_ENTRYPOINT",
+          "CLAUDE_CODE_SESSION_ID"
+        ]
+      },
+      "teach": {"state": "supported", "target_ids": ["claude"]}
+    },
+    {
+      "name": "codex",
+      "live": {"state": "supported"},
+      "native_resume": {"state": "supported"},
+      "agent_context": {
+        "state": "supported",
+        "env_keys": ["CODEX_SANDBOX", "CODEX_THREAD_ID"]
+      },
+      "teach": {"state": "supported", "target_ids": ["codex"]}
+    },
+    {
+      "name": "opencode",
+      "live": {"state": "supported"},
+      "native_resume": {"state": "supported"},
+      "agent_context": {
+        "state": "supported",
+        "env_keys": ["OPENCODE"]
+      },
+      "teach": {"state": "supported", "target_ids": ["opencode"]}
+    },
+    {
+      "name": "antigravity",
+      "aliases": ["agy"],
+      "live": {"state": "supported"},
+      "native_resume": {"state": "supported"},
+      "agent_context": {
+        "state": "unsupported",
+        "reason": "the CLI exports no validated ambient shell marker"
+      },
+      "teach": {
+        "state": "supported",
+        "target_ids": ["gemini-antigravity"]
+      }
+    },
+    {
+      "name": "kimi",
+      "live": {
+        "state": "unsupported",
+        "reason": "no validated incremental journal tailer"
+      },
+      "native_resume": {
+        "state": "unsupported",
+        "reason": "no verified resume-by-session CLI contract"
+      },
+      "agent_context": {
+        "state": "unsupported",
+        "reason": "the CLI exports no validated ambient shell marker"
+      },
+      "teach": {"state": "supported", "target_ids": ["kimi"]}
+    },
+    {
+      "name": "cline",
+      "live": {
+        "state": "unsupported",
+        "reason": "no validated low-cost task-store watcher"
+      },
+      "native_resume": {
+        "state": "unsupported",
+        "reason": "tasks are editor-owned and have no standalone resume command"
+      },
+      "agent_context": {
+        "state": "supported",
+        "env_keys": ["CLINE_ACTIVE"]
+      },
+      "teach": {"state": "supported", "target_ids": ["cline"]}
+    },
+    {
+      "name": "gemini",
+      "live": {
+        "state": "unsupported",
+        "reason": "rewritten session files have no validated mutation poller"
+      },
+      "native_resume": {
+        "state": "unsupported",
+        "reason": "no verified resume-by-session CLI contract"
+      },
+      "agent_context": {
+        "state": "supported",
+        "env_keys": ["GEMINI_CLI"]
+      },
+      "teach": {
+        "state": "supported",
+        "target_ids": ["gemini-antigravity"]
+      }
+    },
+    {
+      "name": "crush",
+      "live": {
+        "state": "unsupported",
+        "reason": "no validated live database watermark contract"
+      },
+      "native_resume": {
+        "state": "unsupported",
+        "reason": "no verified resume-by-session CLI contract"
+      },
+      "agent_context": {
+        "state": "unsupported",
+        "reason": "the CLI exports no validated ambient shell marker"
+      },
+      "teach": {"state": "supported", "target_ids": ["crush"]}
+    },
+    {
+      "name": "cursor",
+      "live": {"state": "supported"},
+      "native_resume": {
+        "state": "unsupported",
+        "reason": "sessions are editor-owned and have no safe CLI resume command"
+      },
+      "agent_context": {
+        "state": "supported",
+        "env_keys": ["CURSOR_AGENT"]
+      },
+      "teach": {"state": "supported", "target_ids": ["cursor"]}
+    },
+    {
+      "name": "pi",
+      "aliases": ["omp"],
+      "live": {"state": "unsupported", "reason": "no live-activity surface is published"},
+      "native_resume": {
+        "state": "unsupported",
+        "reason": "resume is an interactive picker with no documented resume-by-id command"
+      },
+      "agent_context": {
+        "state": "supported",
+        "env_keys": ["AGREP_PI_SESSION_ID"]
+      },
+      "teach": {"state": "supported", "target_ids": ["pi", "omp"]}
+    }
+  ],
+  "teach_clients": [
+    {
+      "name": "qwen",
+      "teach": {"state": "supported", "target_ids": ["qwen"]}
+    },
+    {
+      "name": "windsurf",
+      "teach": {"state": "supported", "target_ids": ["windsurf"]}
+    },
+    {
+      "name": "roo",
+      "teach": {"state": "supported", "target_ids": ["roo"]}
+    },
+    {
+      "name": "goose",
+      "teach": {"state": "supported", "target_ids": ["goose"]}
+    },
+    {
+      "name": "amp",
+      "teach": {"state": "supported", "target_ids": ["amp"]}
+    },
+    {
+      "name": "copilot",
+      "teach": {"state": "supported", "target_ids": ["copilot"]}
+    },
+    {
+      "name": "droid",
+      "teach": {"state": "supported", "target_ids": ["droid"]}
+    },
+    {
+      "name": "grok",
+      "teach": {"state": "supported", "target_ids": ["grok"]}
+    },
+    {
+      "name": "continue",
+      "teach": {"state": "supported", "target_ids": ["continue"]}
+    }
+  ],
+  "teach_targets": [
+    {
+      "id": "claude",
+      "label": "claude",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".claude"]},
+      "target": {"base": "home", "parts": [".claude", "CLAUDE.md"]}
+    },
+    {
+      "id": "codex",
+      "label": "codex",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".codex"]},
+      "target": {"base": "home", "parts": [".codex", "AGENTS.md"]}
+    },
+    {
+      "id": "opencode",
+      "label": "opencode",
+      "kind": "markdown",
+      "proof": {"base": "opencode_data", "parts": []},
+      "target": {
+        "base": "home",
+        "parts": [".config", "opencode", "AGENTS.md"]
+      }
+    },
+    {
+      "id": "gemini-antigravity",
+      "label": "gemini/antigravity",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".gemini"]},
+      "target": {"base": "home", "parts": [".gemini", "GEMINI.md"]}
+    },
+    {
+      "id": "qwen",
+      "label": "qwen",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".qwen"]},
+      "target": {"base": "home", "parts": [".qwen", "QWEN.md"]}
+    },
+    {
+      "id": "crush",
+      "label": "crush",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".config", "crush"]},
+      "target": {
+        "base": "home",
+        "parts": [".config", "crush", "CRUSH.md"]
+      }
+    },
+    {
+      "id": "kimi",
+      "label": "kimi",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".kimi"]},
+      "target": {"base": "home", "parts": [".kimi", "AGENTS.md"]}
+    },
+    {
+      "id": "windsurf",
+      "label": "windsurf",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".codeium", "windsurf"]},
+      "target": {
+        "base": "home",
+        "parts": [".codeium", "windsurf", "memories", "global_rules.md"]
+      }
+    },
+    {
+      "id": "cline",
+      "label": "cline",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": ["Documents", "Cline", "Rules"]},
+      "target": {
+        "base": "home",
+        "parts": ["Documents", "Cline", "Rules", "agrep-recall.md"]
+      }
+    },
+    {
+      "id": "roo",
+      "label": "roo",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".roo"]},
+      "target": {
+        "base": "home",
+        "parts": [".roo", "rules", "agrep-recall.md"]
+      }
+    },
+    {
+      "id": "goose",
+      "label": "goose",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".config", "goose"]},
+      "target": {
+        "base": "home",
+        "parts": [".config", "goose", ".goosehints"]
+      }
+    },
+    {
+      "id": "amp",
+      "label": "amp",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".config", "amp"]},
+      "target": {
+        "base": "home",
+        "parts": [".config", "amp", "AGENTS.md"]
+      }
+    },
+    {
+      "id": "copilot",
+      "label": "copilot",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".copilot"]},
+      "target": {
+        "base": "home",
+        "parts": [".copilot", "copilot-instructions.md"]
+      }
+    },
+    {
+      "id": "droid",
+      "label": "droid",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".factory"]},
+      "target": {"base": "home", "parts": [".factory", "AGENTS.md"]}
+    },
+    {
+      "id": "grok",
+      "label": "grok",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".grok"]},
+      "target": {"base": "home", "parts": [".grok", "GROK.md"]}
+    },
+    {
+      "id": "continue",
+      "label": "continue",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".continue"]},
+      "target": {
+        "base": "home",
+        "parts": [".continue", "rules", "agrep-recall.md"]
+      }
+    },
+    {
+      "id": "cursor",
+      "label": "cursor",
+      "kind": "skill",
+      "proof": {"base": "home", "parts": [".cursor"]},
+      "target": {
+        "base": "home",
+        "parts": [".cursor", "skills", "agrep-recall", "SKILL.md"]
+      }
+    },
+    {
+      "id": "pi",
+      "label": "pi",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".pi", "agent"]},
+      "target": {"base": "home", "parts": [".pi", "agent", "AGENTS.md"]}
+    },
+    {
+      "id": "omp",
+      "label": "pi",
+      "kind": "markdown",
+      "proof": {"base": "home", "parts": [".omp", "agent"]},
+      "target": {"base": "home", "parts": [".omp", "agent", "AGENTS.md"]}
+    }
+  ]
+}
