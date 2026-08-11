@@ -20,13 +20,17 @@ from __future__ import annotations
 import atexit
 import locale
 import os
-import resource
 import signal
 import subprocess
 import sys
 import time
 import unittest
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 PY_DIR = Path(__file__).resolve().parent
 REPO = PY_DIR.parent

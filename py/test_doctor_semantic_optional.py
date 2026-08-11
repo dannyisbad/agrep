@@ -1307,7 +1307,8 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
     def test_probe_json_exposes_native_content_without_writer_ownership(self) -> None:
         native = "b" * 20
         with mock.patch.object(
-                doctor.dist, "native_binary_build_id", return_value=native):
+                doctor.dist, "bounded_native_binary_build_id",
+                return_value=native):
             payload = doctor.probe(routine_deadline=time.monotonic() + 1.0)
         identity = payload["runtime_identity"]
         self.assertEqual(identity["native_binary_build_id"], native)
