@@ -540,7 +540,10 @@ def t_filter_parity():
         try:
             jsonl = explore.keyword_search("the", 10_000_000)["hits"]
         except RuntimeError as exc:
-            if "generation changed" not in str(exc):
+            if not any(reason in str(exc) for reason in (
+                    "generation changed",
+                    "event proof changed during bulk read",
+            )):
                 raise
             source_moved = True
         else:
