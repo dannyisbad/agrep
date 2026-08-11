@@ -2655,7 +2655,7 @@ class LifecycleTests(unittest.TestCase):
         process.poll.return_value = -signal.SIGTERM
         with mock.patch.object(
                 native, "_posix_group_active", return_value=False), \
-                mock.patch.object(native.os, "killpg") as killpg:
+                mock.patch.object(native.os, "killpg", create=True) as killpg:
             self.assertTrue(native._drain_owned(process))
         killpg.assert_not_called()
 
@@ -2668,7 +2668,7 @@ class LifecycleTests(unittest.TestCase):
                 native, "_posix_group_active", return_value=True), \
                 mock.patch.object(
                     native.process_util, "pid_alive", return_value=True), \
-                mock.patch.object(native.os, "killpg") as killpg:
+                mock.patch.object(native.os, "killpg", create=True) as killpg:
             self.assertTrue(native._drain_owned(process))
         killpg.assert_not_called()
 
@@ -2684,7 +2684,7 @@ class LifecycleTests(unittest.TestCase):
                 mock.patch.object(
                     native.process_util, "process_start_identity",
                     return_value=None), \
-                mock.patch.object(native.os, "killpg") as killpg:
+                mock.patch.object(native.os, "killpg", create=True) as killpg:
             self.assertTrue(native._drain_owned(process))
         killpg.assert_called_once_with(4242, signal.SIGTERM)
 

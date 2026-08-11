@@ -345,12 +345,16 @@ jobs:
           $tests = @(Get-ChildItem py/test_*.py | Where-Object { $_.Name -notin $timed } | Sort-Object Name)
           if ($tests.Count -eq 0) { throw "no py/test_*.py files found" }
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE;$env:GITHUB_WORKSPACE\py"
+          $failures = @()
           foreach ($test in $tests) {
             Write-Host "running $($test.Name)"
             & python $test.FullName -v
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($LASTEXITCODE -ne 0) { $failures += $test.Name }
           }
           Write-Host "ran $($tests.Count) focused test files"
+          if ($failures.Count -ne 0) {
+            throw "focused test failures: $($failures -join ', ')"
+          }
       - name: frozen real-model semantic parity
         run: python bench/semantic_recall_parity.py --check
       - name: segmented publication contract
