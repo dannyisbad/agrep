@@ -448,10 +448,11 @@ def embedding_coherence() -> dict:
             "detail": str(exc),
         }
     except RuntimeError as exc:
-        return {"coherent": False, "state": "unstable-source", "basis": None,
-                "reason": str(exc)}
+        return {"coherent": False, "searchable": False,
+                "state": "unstable-source", "basis": None, "reason": str(exc)}
     if source is None:
-        return {"coherent": False, "state": "missing-source", "basis": None}
+        return {"coherent": False, "searchable": False,
+                "state": "missing-source", "basis": None}
     source_mtime = max(
         (value["mtime_ns"] for value in source["files"].values()), default=0)
     if integrity_rebuild_requested():
@@ -464,20 +465,24 @@ def embedding_coherence() -> dict:
     try:
         output = output_generation()
     except _LegacyEmbeddingBundle as exc:
-        return {"coherent": False, "state": "legacy-embeddings", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "legacy-embeddings", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        return {"coherent": False, "state": "corrupt-embeddings", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "corrupt-embeddings", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     if output is None:
-        return {"coherent": False, "state": "missing-embeddings", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "missing-embeddings", "basis": None,
                 "source_mtime_ns": source_mtime}
     try:
         actual_dim, actual_model = common.read_index_meta(
             common.EMBEDDINGS_PATH.parent / "embeddings.meta")
         expected_dim, expected_model = _active_embedding_profile(actual_model)
     except (ImportError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        return {"coherent": False, "state": "profile-unavailable", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "profile-unavailable", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     if actual_dim != expected_dim or actual_model != expected_model:
         return {
@@ -496,14 +501,17 @@ def embedding_coherence() -> dict:
             output_after = output_generation()
         except (OSError, RuntimeError, ValueError, TypeError,
                 json.JSONDecodeError) as exc:
-            return {"coherent": False, "state": "unstable-embeddings", "basis": None,
+            return {"coherent": False, "searchable": False,
+                    "state": "unstable-embeddings", "basis": None,
                     "reason": str(exc), "source_mtime_ns": source_mtime}
         if source_after != source:
-            return {"coherent": False, "state": "unstable-source", "basis": None,
+            return {"coherent": False, "searchable": False,
+                    "state": "unstable-source", "basis": None,
                     "reason": "transcript generation moved during coherence check",
                     "source_mtime_ns": source_mtime}
         if output_after != output:
-            return {"coherent": False, "state": "unstable-embeddings", "basis": None,
+            return {"coherent": False, "searchable": False,
+                    "state": "unstable-embeddings", "basis": None,
                     "reason": "embedding generation moved during coherence check",
                     "source_mtime_ns": source_mtime}
         bound = output.get("source") == source
@@ -536,18 +544,22 @@ def embedding_coherence() -> dict:
         source_after = source_generation()
         output_after = output_generation()
     except RuntimeError as exc:
-        return {"coherent": False, "state": "unstable-source", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "unstable-source", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     except (_LegacyEmbeddingBundle, OSError, ValueError, TypeError,
             json.JSONDecodeError) as exc:
-        return {"coherent": False, "state": "unstable-embeddings", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "unstable-embeddings", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     if source_after != source:
-        return {"coherent": False, "state": "unstable-source", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "unstable-source", "basis": None,
                 "reason": "transcript generation moved during coherence check",
                 "source_mtime_ns": source_mtime}
     if output_after != output:
-        return {"coherent": False, "state": "unstable-embeddings", "basis": None,
+        return {"coherent": False, "searchable": False,
+                "state": "unstable-embeddings", "basis": None,
                 "reason": "embedding generation moved during coherence check",
                 "source_mtime_ns": source_mtime}
     marker_output = marker.get("output")
