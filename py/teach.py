@@ -878,6 +878,7 @@ def _reenroll_target(target: Path, is_skill: bool) -> None:
 # not scheduler-hours - per-platform watch catalog on _sentinel_install's docstring.
 
 TASK_NAME = "agrep-sentinel"
+_LINUX_UNARMED_MARKER = "sentinel-linux-unarmed"
 
 # Windows resident children need CREATE_NO_WINDOW or each subprocess flashes a console.
 _NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -1607,9 +1608,23 @@ def _sentinel_install_mac(targets: list[Path]) -> bool:
 def _sentinel_install_linux(targets: list[Path]) -> bool:
     if _data_dir_readonly():
         return False
-    service = _systemd_unit_dir() / f"{TASK_NAME}.service"
-    timer = _systemd_unit_dir() / f"{TASK_NAME}.timer"
-    path_unit = _systemd_unit_dir() / f"{TASK_NAME}.path"
+    marker = common.DATA_DIR / _LINUX_UNARMED_MARKER
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        return False
+    unit_dir = _systemd_unit_dir()
+    service = unit_dir / f"{TASK_NAME}.service"
+    timer = unit_dir / f"{TASK_NAME}.timer"
+    path_unit = unit_dir / f"{TASK_NAME}.path"
+    links = (
+        (unit_dir / "paths.target.wants" / path_unit.name, path_unit),
+        (unit_dir / "timers.target.wants" / timer.name, timer),
+    )
+    preexisting = any(
+        path.exists() or path.is_symlink()
+        for path in (service, timer, path_unit, *(link for link, _ in links))
+    )
     subs = _sh_subs(targets) | {
         "@@UNIT@@": TASK_NAME,
         "@@UNITS@@": " ".join(_sh_squote(u) for u in (service, timer, path_unit)),
@@ -1620,13 +1635,55 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
     _atomic_write_text(timer, _SYSTEMD_TIMER)
     _atomic_write_text(path_unit, _SYSTEMD_PATH.format(cli=REPO / "cli.py"))
     _systemctl_user("daemon-reload")
-    ok_path = _systemctl_user("enable", "--now", f"{TASK_NAME}.path") == 0
-    ok_timer = _systemctl_user("enable", "--now", f"{TASK_NAME}.timer") == 0
+    path_enable: dict = {}
+    timer_enable: dict = {}
+    ok_path = _systemctl_user(
+        "enable", "--now", path_unit.name, observation=path_enable) == 0
+    ok_timer = _systemctl_user(
+        "enable", "--now", timer.name, observation=timer_enable) == 0
     if ok_path and ok_timer and sentinel_armed():
         return True
-    _systemctl_user("disable", "--now", f"{TASK_NAME}.timer", f"{TASK_NAME}.path")
-    for u in (service, timer, path_unit):  # no user manager - leave nothing dead
-        u.unlink(missing_ok=True)
+    _systemctl_user("disable", "--now", timer.name, path_unit.name)
+    manager_unavailable = all(
+        observed.get("state") == "unavailable"
+        or "failed to connect to bus" in (
+            f"{observed.get('stdout', '')} {observed.get('stderr', '')}".lower())
+        for observed in (path_enable, timer_enable)
+    )
+    proven_unarmed = (
+        not preexisting and not ok_path and not ok_timer and manager_unavailable)
+    if proven_unarmed:
+        for link, target in links:
+            try:
+                if link.is_symlink():
+                    if link.resolve(strict=False) != target.resolve(strict=False):
+                        proven_unarmed = False
+                        continue
+                    link.unlink()
+                    try:
+                        link.parent.rmdir()
+                    except OSError:
+                        pass
+                elif link.exists():
+                    proven_unarmed = False
+            except OSError:
+                proven_unarmed = False
+    for unit in (service, timer, path_unit):
+        unit.unlink(missing_ok=True)
+    if proven_unarmed:
+        for name in (
+                "sentinel.sh", "sentinel_skill_front", "sentinel_codex_hooks",
+                "sentinel_pi_extension", "sentinel_strip.pl"):
+            try:
+                (common.DATA_DIR / name).unlink(missing_ok=True)
+            except OSError:
+                proven_unarmed = False
+        if proven_unarmed:
+            try:
+                _atomic_write_bytes(
+                    marker, b"not-armed\n", expect_absent=True)
+            except (OSError, ValueError):
+                pass
     return False
 
 
@@ -1666,22 +1723,47 @@ def _sentinel_remove() -> bool:
                 or any(marker in missing for marker in (
                     "could not find service", "not found", "no such process")))
         elif sys.platform.startswith("linux"):
-            disabled: dict = {}
-            _systemctl_user(
-                "disable", "--now", f"{TASK_NAME}.timer", f"{TASK_NAME}.path",
-                observation=disabled)
-            absent = disabled.get("state") == "complete"
-            expected = {
-                "is-enabled": {"disabled", "static", "indirect", "masked", "not-found"},
-                "is-active": {"inactive", "failed", "unknown"},
-            }
-            for unit in (f"{TASK_NAME}.timer", f"{TASK_NAME}.path"):
-                for action, states in expected.items():
-                    observed: dict = {}
-                    rc = _systemctl_user(action, unit, observation=observed)
-                    absent = absent and (
-                        rc != 0 and observed.get("state") == "complete"
-                        and observed.get("stdout") in states)
+            unit_dir = _systemd_unit_dir()
+            units = tuple(
+                unit_dir / f"{TASK_NAME}{suffix}"
+                for suffix in (".service", ".timer", ".path")
+            )
+            links = (
+                unit_dir / "paths.target.wants" / f"{TASK_NAME}.path",
+                unit_dir / "timers.target.wants" / f"{TASK_NAME}.timer",
+            )
+            marker = common.DATA_DIR / _LINUX_UNARMED_MARKER
+            try:
+                proven_unarmed = (
+                    not marker.is_symlink()
+                    and marker.read_bytes() == b"not-armed\n"
+                    and not any(
+                        path.exists() or path.is_symlink()
+                        for path in (*units, *links)
+                    )
+                )
+            except OSError:
+                proven_unarmed = False
+            if proven_unarmed:
+                absent = True
+            else:
+                disabled: dict = {}
+                _systemctl_user(
+                    "disable", "--now", f"{TASK_NAME}.timer", f"{TASK_NAME}.path",
+                    observation=disabled)
+                absent = disabled.get("state") == "complete"
+                expected = {
+                    "is-enabled": {
+                        "disabled", "static", "indirect", "masked", "not-found"},
+                    "is-active": {"inactive", "failed", "unknown"},
+                }
+                for unit in (f"{TASK_NAME}.timer", f"{TASK_NAME}.path"):
+                    for action, states in expected.items():
+                        observed: dict = {}
+                        rc = _systemctl_user(action, unit, observation=observed)
+                        absent = absent and (
+                            rc != 0 and observed.get("state") == "complete"
+                            and observed.get("stdout") in states)
         else:
             absent = True
     except OSError:
@@ -1698,7 +1780,8 @@ def _sentinel_remove() -> bool:
         for n in ("sentinel.ps1", "sentinel.sh", "sentinel.json", "sentinel.miss",
                   "sentinel_watch.py", "sentinel_skill_front",
                   "sentinel_codex_hooks", "sentinel_pi_extension",
-                  "sentinel_strip.pl", RECONCILE_HEALTH):
+                  "sentinel_strip.pl", _LINUX_UNARMED_MARKER,
+                  RECONCILE_HEALTH):
             (common.DATA_DIR / n).unlink(missing_ok=True)
     except OSError:
         return False

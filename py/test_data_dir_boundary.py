@@ -73,8 +73,8 @@ class DataDirBoundaryTests(unittest.TestCase):
             script = (
                 "import os; from pathlib import Path; from unittest import mock; "
                 "import events; "
-                "guard=r'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\agrep'; "
-                "selected=Path(r'c:\\\\users\\\\example\\\\appdata\\\\local\\\\AGREP'); "
+                "guard=r'C:\\Users\\Example\\AppData\\Local\\agrep'; "
+                "selected=Path(r'c:\\users\\example\\appdata\\local\\AGREP'); "
                 "p1=mock.patch.dict(os.environ,{'AGREP_DATA_READONLY':guard},clear=False); "
                 "p2=mock.patch.object(events.os.path,'realpath',"
                 "side_effect=lambda value: os.fspath(value)); "

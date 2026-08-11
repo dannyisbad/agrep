@@ -624,6 +624,52 @@ class TeachSafetyTest(unittest.TestCase):
         self.assertFalse(plist.exists())
         self.assertFalse(artifact.exists())
 
+    def test_linux_never_armed_sentinel_has_a_clean_remove_path(self) -> None:
+        unit_dir = teach._systemd_unit_dir()
+        calls: list[tuple[str, ...]] = []
+
+        def unavailable(
+                *args: str, timeout_s: float | None = None,
+                observation: dict | None = None) -> int:
+            del timeout_s
+            calls.append(args)
+            if args[0] == "enable":
+                name = args[-1]
+                target = unit_dir / name
+                group = (
+                    "paths.target.wants"
+                    if name.endswith(".path") else "timers.target.wants")
+                link = unit_dir / group / name
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target)
+            if observation is not None:
+                observation.update(
+                    state="complete", detail="systemctl returned 1",
+                    stdout="", stderr="Failed to connect to bus")
+            return 1
+
+        with mock.patch.object(teach.sys, "platform", "linux"), \
+                mock.patch.object(
+                    teach, "_systemctl_user", side_effect=unavailable):
+            self.assertFalse(teach._sentinel_install_linux([]))
+            marker = self.data / teach._LINUX_UNARMED_MARKER
+            self.assertEqual(marker.read_bytes(), b"not-armed\n")
+            for path in (
+                    unit_dir / f"{teach.TASK_NAME}.service",
+                    unit_dir / f"{teach.TASK_NAME}.timer",
+                    unit_dir / f"{teach.TASK_NAME}.path",
+                    unit_dir / "paths.target.wants" / f"{teach.TASK_NAME}.path",
+                    unit_dir / "timers.target.wants" / f"{teach.TASK_NAME}.timer",
+                    self.data / "sentinel.sh",
+                    self.data / "sentinel_strip.pl"):
+                self.assertFalse(path.exists() or path.is_symlink(), path)
+
+            before_remove = len(calls)
+            self.assertTrue(teach._sentinel_remove())
+
+        self.assertEqual(calls[before_remove:], [("daemon-reload",)])
+        self.assertFalse(marker.exists())
+
     def test_interrupted_remove_cannot_be_reinjected(self) -> None:
         first = self.home / ".codex" / "AGENTS.md"
         second = self.home / ".claude" / "CLAUDE.md"
