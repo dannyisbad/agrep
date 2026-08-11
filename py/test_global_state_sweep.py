@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import io
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
 
 import global_state_sweep as sweep
+
+
+class PlatformImportTests(unittest.TestCase):
+    def test_module_imports_without_posix_resource(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import sys; sys.modules['resource'] = None; "
+                "import global_state_sweep as sweep; "
+                "assert sweep._LIMITS == ()",
+            ],
+            cwd=Path(sweep.__file__).resolve().parent,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class SourceInventoryTests(unittest.TestCase):
