@@ -230,7 +230,8 @@ class ResourceHarnessTests(unittest.TestCase):
         process.poll.return_value = 1
         setattr(process, self.resources._PRIVATE_GROUP_ATTR, 42)
         with mock.patch.object(
-                self.resources.os, "killpg", side_effect=PermissionError):
+                self.resources.os, "killpg", side_effect=PermissionError,
+                create=True):
             self.resources._stop_posix_process(process)
         process.terminate.assert_not_called()
         process.kill.assert_not_called()

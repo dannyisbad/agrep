@@ -49,7 +49,8 @@ class CourtesyGate(unittest.TestCase):
 
     def _load(self, value, cores=8):
         return mock.patch.object(
-            mlx_embed.os, "getloadavg", return_value=(value, value, value)), \
+            mlx_embed.os, "getloadavg",
+            return_value=(value, value, value), create=True), \
             mock.patch.object(mlx_embed.os, "cpu_count", return_value=cores)
 
     def test_idle_machine_takes_the_gpu(self) -> None:
@@ -89,8 +90,9 @@ class CourtesyGate(unittest.TestCase):
         self.assertIn("pinned", reason)
 
     def test_unreadable_load_is_not_permission(self) -> None:
-        with mock.patch.object(mlx_embed.os, "getloadavg",
-                               side_effect=OSError("no")):
+        with mock.patch.object(
+                mlx_embed.os, "getloadavg",
+                side_effect=OSError("no"), create=True):
             ok, reason = mlx_embed.should_use()
         self.assertFalse(ok)
         self.assertIn("unreadable", reason)
@@ -178,7 +180,8 @@ class LaneSelection(unittest.TestCase):
 
     def _machine(self, load, cores=8):
         return mock.patch.object(
-            mlx_embed.os, "getloadavg", return_value=(load, load, load)), \
+            mlx_embed.os, "getloadavg",
+            return_value=(load, load, load), create=True), \
             mock.patch.object(mlx_embed.os, "cpu_count", return_value=cores)
 
     def test_cpu_lane_identity_is_the_bare_profile_string(self) -> None:

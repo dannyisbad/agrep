@@ -25,7 +25,7 @@ class LinuxRawBinaryCompatibilityTests(unittest.TestCase):
         with mock.patch.object(dist.sys, "platform", "linux"), \
                 mock.patch.object(dist, "WIN", False), \
                 mock.patch("platform.machine", return_value=machine), \
-                mock.patch.object(dist.os, "confstr", side_effect=(
+                mock.patch.object(dist.os, "confstr", create=True, side_effect=(
                     result if isinstance(result, BaseException) else None
                 ), return_value=(None if isinstance(result, BaseException) else result)):
             return dist._platform_asset()
@@ -45,7 +45,8 @@ class LinuxRawBinaryCompatibilityTests(unittest.TestCase):
         with mock.patch.object(dist.sys, "platform", "linux"), \
                 mock.patch.object(dist, "WIN", False), \
                 mock.patch("platform.machine", return_value="x86_64"), \
-                mock.patch.object(dist.os, "confstr", return_value="glibc 2.17"), \
+                mock.patch.object(
+                    dist.os, "confstr", create=True, return_value="glibc 2.17"), \
                 mock.patch.object(dist, "_download_binary") as download, \
                 contextlib.redirect_stderr(stderr):
             self.assertIsNone(dist.fetch_binary(assume_yes=True))
@@ -60,7 +61,7 @@ class LinuxRawBinaryCompatibilityTests(unittest.TestCase):
         with mock.patch.object(dist.sys, "platform", "linux"), \
                 mock.patch.object(dist, "WIN", False), \
                 mock.patch("platform.machine", return_value="riscv64"), \
-                mock.patch.object(dist.os, "confstr") as confstr:
+                mock.patch.object(dist.os, "confstr", create=True) as confstr:
             self.assertIsNone(dist._platform_asset())
             rendered = dist._unsupported_asset_message()
         confstr.assert_not_called()
@@ -90,7 +91,7 @@ class SupportedRawBinaryPlatformTests(unittest.TestCase):
         with mock.patch.object(dist.sys, "platform", "darwin"), \
                 mock.patch.object(dist, "WIN", False), \
                 mock.patch("platform.machine", return_value="arm64"), \
-                mock.patch.object(dist.os, "confstr") as confstr:
+                mock.patch.object(dist.os, "confstr", create=True) as confstr:
             self.assertEqual(dist._platform_asset(), "agrep-rs-macos-aarch64")
         confstr.assert_not_called()
 
@@ -98,7 +99,7 @@ class SupportedRawBinaryPlatformTests(unittest.TestCase):
         with mock.patch.object(dist.sys, "platform", "win32"), \
                 mock.patch.object(dist, "WIN", True), \
                 mock.patch("platform.machine", return_value="AMD64"), \
-                mock.patch.object(dist.os, "confstr") as confstr:
+                mock.patch.object(dist.os, "confstr", create=True) as confstr:
             self.assertEqual(dist._platform_asset(), "agrep-rs-windows-x86_64.exe")
         confstr.assert_not_called()
 
