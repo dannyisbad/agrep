@@ -2827,9 +2827,8 @@ class LifecycleTests(unittest.TestCase):
                         time.sleep(0.02)
                     self.assertTrue(root_path.exists())
                     self.assertTrue(grandchild_path.exists())
-                    root_pid = int(root_path.read_text(encoding="ascii"))
-                    grandchild_pid = int(
-                        grandchild_path.read_text(encoding="ascii"))
+                    root_pid = self._read_published_pid(root_path)
+                    grandchild_pid = self._read_published_pid(grandchild_path)
                     stopper.start()
                     stopper.join(timeout=6)
                     runner.join(timeout=6)
