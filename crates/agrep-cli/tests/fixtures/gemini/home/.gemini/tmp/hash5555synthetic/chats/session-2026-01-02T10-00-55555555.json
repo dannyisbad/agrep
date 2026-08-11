@@ -1,0 +1,13 @@
+{
+  "sessionId": "55555555-5555-4555-8555-555555555555",
+  "projectHash": "hash5555synthetic",
+  "startTime": "2026-01-02T10:00:00.000Z",
+  "lastUpdated": "2026-01-02T10:01:05.000Z",
+  "messages": [
+    {"id": "i1", "timestamp": "2026-01-02T10:00:00.000Z", "type": "info", "content": "Authentication succeeded"},
+    {"id": "u1", "timestamp": "2026-01-02T10:00:01.000Z", "type": "user", "content": "scaffold a rust cli with clap"},
+    {"id": "g1", "timestamp": "2026-01-02T10:00:05.000Z", "type": "gemini", "content": "Creating the project files now.", "model": "gemini-3-pro-preview", "thoughts": [{"subject": "plan", "description": "reasoning that must be excluded"}], "toolCalls": [{"id": "write_file-1", "name": "write_file", "args": {"file_path": "Cargo.toml", "content": "[package]"}, "result": [{"functionResponse": {"id": "write_file-1", "name": "write_file", "response": {"output": "wrote Cargo.toml"}}}], "status": "success"}], "tokens": {"input": 100, "output": 20, "total": 120}},
+    {"id": "u2", "timestamp": "2026-01-02T10:01:00.000Z", "type": "user", "content": "add a --verbose flag"},
+    {"id": "g2", "timestamp": "2026-01-02T10:01:05.000Z", "type": "gemini", "content": "Added --verbose to the clap parser.", "model": "gemini-3-pro-preview"}
+  ]
+}

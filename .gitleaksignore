@@ -1,0 +1,6 @@
+# synthetic conformance fixtures: sequential-hex placeholder keys, not secrets
+crates/agrep-cli/src/index_lock.rs:generic-api-key:1418
+py/fixtures/index_lock_conformance.json:generic-api-key:8
+py/fixtures/index_lock_conformance.json:generic-api-key:11
+py/fixtures/index_lock_conformance.json:generic-api-key:12
+py/fixtures/index_lock_conformance.json:generic-api-key:30

@@ -1,0 +1,111 @@
+# build output
+/target
+/dist
+/dist-test
+*.bin
+
+# the built index - your entire chat history lives here. NEVER commit this.
+/data
+/corpus.db
+
+# benchmark datasets + their throwaway index homes (fetched, never committed)
+/bench/.data
+/bench/.home*
+/bench/.mp-venv
+/bench/.qhome-test
+/bench/.work-ctxbench
+
+# local-only: strategy notes + personal shell shims
+/WHERE-AGREP-EATS.md
+/agrep.ps1
+/GOAL.md
+/checklist.md
+
+# local-only evaluation inputs and reports
+/bench/semantic_worth_tasks.json
+/bench/semantic_worth_tasks.local.json
+/bench/semantic_calibration_tasks.local.json
+/bench/semantic_worth_results*
+/bench/blind-private*.json
+
+# python
+/py/.venv
+/.venv
+/.pytest_cache
+/uv.lock
+__pycache__/
+*.pyc
+
+# local credentials and tool state
+.env
+.env.*
+!.env.example
+/.opencode
+
+# local scratch/debug helper
+py/_check.py
+
+# tooling / scratch
+/web/shots/
+/.playwright-mcp
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+
+# downloaded model and numeric artifacts
+*.onnx
+*.safetensors
+*.npy
+*.npz
+*.pt
+*.pth
+
+# private session dumps + capture output - real transcripts land here. NEVER commit these.
+# (machine-specific one-off dump names live in .git/info/exclude so they never enter history)
+/out_*
+/err_*
+/bench/render/
+/ar.err
+/err.corrupt
+/err.stderr
+/full_recall.txt
+/j1.txt
+/j2.txt
+/ns.err
+/out.stderr
+/out.stdout
+/p1.err
+/p1.out
+/p2.out
+/p3.out
+/rc.stderr
+
+# local campaign governance and agent scratch never belong in OSS history
+*.local.md
+*.local.json
+/.goals-archive/
+/py/.codex-slop/
+/bench/adversarial/GOAL8_VERIFICATION.md
+/bench/adversarial/UX_AUDIT.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# prebuilt rust binary staged for wheel packaging (CI / local build)
+_bin/
+.codex/
+expert-review/
+extract-real20-top2.py
+
+# adoption-bench raw run outputs: contain real transcript text, never committed
+/bench/adoption/runs
+
+# local-only: audit evidence + one-off launchers carrying real box paths
+/RC2_AUDIT.md
+/RC2_AUDIT_FULL.json
+/bench/adoption/detach_run.py

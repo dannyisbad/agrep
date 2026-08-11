@@ -1,0 +1,12 @@
+=== messages.jsonl (2 lines) ===
+{"id":"opencode:sess-oc-1:0","agent":"opencode","project":"epsilon","session":"sess-oc-1","ts":1767348000000,"turn":0,"text":"convert config to yaml","content_digest":"e09e","who":"user","model":"claude-fable-5","model_source":"explicit"}
+{"id":"opencode:sess-oc-child:0","agent":"opencode","project":"epsilon","session":"sess-oc-child","ts":1767348030000,"turn":0,"text":"check the generated yaml schema","content_digest":"21eb","who":"subagent","model":"claude-fable-5","model_source":"explicit"}
+=== replies.jsonl (2 lines) ===
+{"id":"opencode:sess-oc-1:0","reply":"Converted config.json to config.yaml.","content_digest":"07cb","reply_chars":37,"reply_truncated":false}
+{"id":"opencode:sess-oc-child:0","reply":"The generated yaml matches the schema.","content_digest":"cb3d","reply_chars":38,"reply_truncated":false}
+=== sessions.jsonl (2 lines) ===
+{"session":"sess-oc-1","agent":"opencode","project":"epsilon","n":1,"first_ts":1767348000000,"last_ts":1767348000000,"first_text":"convert config to yaml"}
+{"session":"sess-oc-child","agent":"opencode","project":"epsilon","n":1,"first_ts":1767348030000,"last_ts":1767348030000,"first_text":"check the generated yaml schema","parent":"sess-oc-1"}
+=== events/opencode-sess-oc-1--6625dec2050f15ebe73d54b2a52ce162814872c1aa0d624c.jsonl (2 lines) ===
+{"ts":1767348001500,"kind":"tool","name":"bash","input":"cat config.json","output":"config as text","input_chars":15,"output_chars":14,"output_bytes":14,"ok":true,"call_id":"c1"}
+{"ts":1767348030000,"kind":"subagent_start","name":"spec check","input_chars":0,"output_chars":0,"output_bytes":0,"call_id":"sess-oc-child","child":"sess-oc-child"}

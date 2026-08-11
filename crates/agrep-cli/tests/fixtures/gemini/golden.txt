@@ -1,0 +1,10 @@
+=== messages.jsonl (2 lines) ===
+{"id":"gemini:55555555-5555-4555-8555-555555555555:0","agent":"gemini","project":"gemini","session":"55555555-5555-4555-8555-555555555555","ts":1767348001000,"turn":0,"text":"scaffold a rust cli with clap","content_digest":"e3ce","who":"user","model":"gemini-3-pro-preview","model_source":"explicit"}
+{"id":"gemini:55555555-5555-4555-8555-555555555555:1","agent":"gemini","project":"gemini","session":"55555555-5555-4555-8555-555555555555","ts":1767348060000,"turn":1,"text":"add a --verbose flag","content_digest":"a7ef","who":"user","model":"gemini-3-pro-preview","model_source":"explicit"}
+=== replies.jsonl (2 lines) ===
+{"id":"gemini:55555555-5555-4555-8555-555555555555:0","reply":"Creating the project files now.","content_digest":"3683","reply_chars":31,"reply_truncated":false}
+{"id":"gemini:55555555-5555-4555-8555-555555555555:1","reply":"Added --verbose to the clap parser.","content_digest":"83ba","reply_chars":35,"reply_truncated":false}
+=== sessions.jsonl (1 lines) ===
+{"session":"55555555-5555-4555-8555-555555555555","agent":"gemini","project":"gemini","n":2,"first_ts":1767348001000,"last_ts":1767348060000,"first_text":"scaffold a rust cli with clap"}
+=== events/gemini-55555555-5555-4555-8555-555555555555--41206cb21169e0d4b43595bac3a851582d851dace5e05f3f.jsonl (1 lines) ===
+{"ts":1767348005000,"kind":"tool","name":"write_file","input":"Cargo.toml","output":"wrote Cargo.toml","input_chars":10,"output_chars":16,"output_bytes":16,"ok":true,"call_id":"write_file-1"}

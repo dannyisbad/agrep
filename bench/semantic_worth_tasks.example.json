@@ -1,0 +1,142 @@
+[
+  {
+    "id": "stale-schema-cache",
+    "category": "synthetic-debugging",
+    "query": "Why did the build keep using an older generated schema after the source changed?",
+    "target": "cache identity omitted the schema version",
+    "expected": ["demo-session-01:4"]
+  },
+  {
+    "id": "retry-jitter",
+    "category": "synthetic-decision",
+    "query": "What stopped every worker from retrying the failed request at the same instant?",
+    "target": "bounded exponential backoff with jitter",
+    "expected": ["demo-session-02:7"]
+  },
+  {
+    "id": "vanished-input",
+    "category": "synthetic-debugging",
+    "query": "How did the indexer recover when an input vanished between discovery and reading?",
+    "target": "skip the vanished input and retry from a fresh snapshot",
+    "expected": ["demo-session-03:3"]
+  },
+  {
+    "id": "windows-path-case",
+    "category": "synthetic-debugging",
+    "query": "Why was the same workspace indexed twice when its Windows path changed case?",
+    "target": "case-insensitive path identity on Windows",
+    "expected": ["demo-session-04:5"]
+  },
+  {
+    "id": "artifact-version-parity",
+    "category": "synthetic-release",
+    "query": "Why did publication reject artifacts that were built successfully?",
+    "target": "package and binary versions did not match the release manifest",
+    "expected": ["demo-session-05:8"]
+  },
+  {
+    "id": "negative-output-budget",
+    "category": "synthetic-debugging",
+    "query": "How was a negative output budget prevented from expanding the response?",
+    "target": "validate and clamp the rendered output budget",
+    "expected": ["demo-session-06:2"]
+  },
+  {
+    "id": "link-attribute-escaping",
+    "category": "synthetic-security",
+    "query": "How did the renderer keep quotation marks in a link target from becoming markup?",
+    "target": "attribute-safe escaping before rendering links",
+    "expected": ["demo-session-07:6"]
+  },
+  {
+    "id": "anonymous-event-identity",
+    "category": "synthetic-debugging",
+    "query": "Why did unrelated events disappear when their source identifiers were missing?",
+    "target": "anonymous events receive distinct stable identities",
+    "expected": ["demo-session-08:9"]
+  },
+  {
+    "id": "idle-poller",
+    "category": "synthetic-performance",
+    "query": "What background loop kept scanning unchanged inputs while the service was idle?",
+    "target": "replace fixed polling with change-driven wakeups",
+    "expected": ["demo-session-09:1"]
+  },
+  {
+    "id": "child-copy-dedupe",
+    "category": "synthetic-debugging",
+    "query": "How were copied parent messages kept out of a child worker conversation?",
+    "target": "anchor child turns after the delegation boundary",
+    "expected": ["demo-session-10:4"]
+  },
+  {
+    "id": "meaning-confidence",
+    "category": "synthetic-quality",
+    "query": "Why did meaningless semantic queries receive confident-looking matches?",
+    "target": "model-specific confidence floor with a silent weak tail",
+    "expected": ["demo-session-11:7"]
+  },
+  {
+    "id": "indexed-inventory",
+    "category": "synthetic-performance",
+    "query": "How did the diagnostic inventory avoid recursively walking the entire disk?",
+    "target": "query the platform file index and inspect bounded candidates",
+    "expected": ["demo-session-12:3"]
+  },
+  {
+    "id": "certificate-reload",
+    "category": "synthetic-operations",
+    "query": "Where did the service reload its peer certificate after configuration changed?",
+    "target": "versioned certificate path resolved from the service data directory",
+    "expected": ["demo-session-13:5"]
+  },
+  {
+    "id": "worker-queue-shutdown",
+    "category": "synthetic-debugging",
+    "query": "What prevented the worker queue from draining after shutdown began?",
+    "target": "the producer retained an extra sender handle",
+    "expected": ["demo-session-14:8"]
+  },
+  {
+    "id": "retry-policy",
+    "category": "synthetic-decision",
+    "query": "What retry policy separated transient network errors from permanent failures?",
+    "target": "bounded retries only for explicitly transient error classes",
+    "expected": ["demo-session-15:2"]
+  },
+  {
+    "id": "archived-conversation",
+    "category": "synthetic-recall",
+    "query": "How was an older archived conversation located without scanning every archive?",
+    "target": "search the session metadata index before opening one archive",
+    "expected": ["demo-session-16:6"]
+  },
+  {
+    "id": "durable-publication",
+    "category": "synthetic-correctness",
+    "query": "What proof was required before declaring a generated record durable?",
+    "target": "flush artifacts before the atomic manifest publication",
+    "expected": ["demo-session-17:9"]
+  },
+  {
+    "id": "schema-field-move",
+    "category": "synthetic-debugging",
+    "query": "How did the parser keep finding records after a field moved in the new schema?",
+    "target": "versioned extraction with an explicit legacy fallback",
+    "expected": ["demo-session-18:1"]
+  },
+  {
+    "id": "boundary-refinement",
+    "category": "synthetic-performance",
+    "query": "Which safeguard kept boundary-aware ranking from slowing broad searches?",
+    "target": "refine only a bounded score frontier",
+    "expected": ["demo-session-19:4"]
+  },
+  {
+    "id": "family-diversity",
+    "category": "synthetic-ranking",
+    "query": "How were repeated matches from one conversation kept from filling the result page?",
+    "target": "family-aware top-k selection after ranking",
+    "expected": ["demo-session-20:7"]
+  }
+]

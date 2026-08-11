@@ -1,0 +1,3 @@
+{"type":"session","version":1,"id":"01920000-0000-7000-8000-000000000002","cwd":"/work/legacy","timestamp":"2025-11-01T00:00:00.000Z"}
+{"type":"message","timestamp":"2025-11-01T00:00:01.000Z","message":{"role":"user","content":"legacy linear question","timestamp":"2025-11-01T00:00:01.000Z"}}
+{"type":"message","timestamp":"2025-11-01T00:00:02.000Z","message":{"role":"assistant","model":"pi/legacy-1","content":[{"type":"text","text":"legacy answer"}],"timestamp":"2025-11-01T00:00:02.000Z"}}

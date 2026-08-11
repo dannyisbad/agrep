@@ -1,0 +1,8 @@
+{"type":"session","id":"01950000-0000-7000-8000-000000000005","version":3,"cwd":"/work/upstream","timestamp":"2026-03-04T05:06:07.000Z"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-03-04T05:06:08.000Z","message":{"role":"user","content":[{"type":"text","text":"upstream pi question"}],"timestamp":"2026-03-04T05:06:08.000Z"}}
+{"type":"model_change","id":"u2","parentId":"u1","timestamp":"2026-03-04T05:06:09.000Z","provider":"openai","modelId":"gpt-5.6"}
+{"type":"message","id":"u3","parentId":"u2","timestamp":"2026-03-04T05:06:10.000Z","message":{"role":"bashExecution","command":"cargo test --quiet","output":"ok. 12 passed","exitCode":0,"cancelled":false,"truncated":false,"content":null,"timestamp":"2026-03-04T05:06:10.000Z"}}
+{"type":"message","id":"u4","parentId":"u3","timestamp":"2026-03-04T05:06:11.000Z","message":{"role":"user","content":[{"type":"text","text":"and after the model switch"}],"timestamp":"2026-03-04T05:06:11.000Z"}}
+{"type":"session_info","id":"u5","parentId":"u4","timestamp":"2026-03-04T05:06:12.000Z","name":"upstream run"}
+{"type":"label","id":"u6","parentId":"u5","timestamp":"2026-03-04T05:06:13.000Z","targetId":"u1","label":"bookmark"}
+{"type":"branch_summary","id":"u7","parentId":"u6","timestamp":"2026-03-04T05:06:14.000Z","fromId":"u1","fromHook":false,"summary":"an abandoned branch, summarized"}

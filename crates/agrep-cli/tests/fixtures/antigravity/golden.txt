@@ -1,0 +1,11 @@
+=== messages.jsonl (2 lines) ===
+{"id":"antigravity:33333333-3333-4333-8333-333333333333:0","agent":"antigravity","project":"gamma","session":"33333333-3333-4333-8333-333333333333","ts":1767348000000,"turn":0,"text":"refactor the parser into modules","content_digest":"8a9e","who":"user","model_source":"unknown"}
+{"id":"antigravity:33333333-3333-4333-8333-333333333333:1","agent":"antigravity","project":"gamma","session":"33333333-3333-4333-8333-333333333333","ts":1767348060000,"turn":1,"text":"now add a token cache","content_digest":"8cc4","who":"user","model_source":"unknown"}
+=== replies.jsonl (2 lines) ===
+{"id":"antigravity:33333333-3333-4333-8333-333333333333:0","reply":"I'll split the parser first.","content_digest":"297f","reply_chars":28,"reply_truncated":false}
+{"id":"antigravity:33333333-3333-4333-8333-333333333333:1","reply":"Added an LRU token cache in front of the lexer.","content_digest":"cad0","reply_chars":47,"reply_truncated":false}
+=== sessions.jsonl (1 lines) ===
+{"session":"33333333-3333-4333-8333-333333333333","agent":"antigravity","project":"gamma","n":2,"first_ts":1767348000000,"last_ts":1767348060000,"first_text":"refactor the parser into modules"}
+=== events/antigravity-33333333-3333-4333-8333-333333333333--5d102670a5a72fe506cd44e7dd7e1fa93bea3167cdc892fc.jsonl (2 lines) ===
+{"ts":1767348006000,"kind":"tool","name":"run_command","input":"ls src","output":"lexer.rs parser.rs","input_chars":6,"output_chars":18,"output_bytes":18,"ok":true,"call_id":"ag1"}
+{"ts":1767348030000,"kind":"subagent_result","name":"lint task","input":"task-1","output":"lint passed with no warnings","input_chars":6,"output_chars":28,"output_bytes":28,"call_id":"mail-1"}

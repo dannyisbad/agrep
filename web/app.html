@@ -1,0 +1,1654 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>agrep explorer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #dbe2ef;
+      --muted: #79869d;
+      --faint: #515d72;
+      --paper: #090c11;
+      --panel: #0e131b;
+      --raised: #141b25;
+      --line: #273142;
+      --line-hot: #465a76;
+      --signal: #ffb454;
+      --signal-soft: #3b2d1d;
+      --agent: #93b4e9;
+      --user: #c8d39d;
+      --bad: #ff7b72;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --body: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: var(--paper);
+      color: var(--ink);
+      font: 14px/1.55 var(--body);
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; }
+    :focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+    .shell {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-height: 100%;
+    }
+
+    .command-bar {
+      display: grid;
+      grid-template-columns: auto minmax(260px, 720px) auto;
+      align-items: center;
+      gap: 18px;
+      min-height: 68px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(9, 12, 17, .96);
+    }
+
+    .wordmark {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 154px;
+      font-family: var(--mono);
+      letter-spacing: -.04em;
+    }
+
+    .wordmark strong { font-size: 24px; font-weight: 760; }
+    .wordmark i {
+      width: 7px;
+      height: 7px;
+      background: var(--signal);
+      box-shadow: 0 0 18px rgba(255, 180, 84, .45);
+    }
+    .wordmark span {
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .identity { display: flex; align-items: center; gap: 18px; }
+    .surface-switch {
+      display: flex;
+      padding: 3px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .surface-switch button {
+      border: 0;
+      padding: 6px 10px;
+      background: transparent;
+      color: var(--muted);
+      font: 650 10px var(--mono);
+      letter-spacing: .055em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .surface-switch button[aria-pressed="true"] {
+      background: var(--raised);
+      color: var(--ink);
+      box-shadow: inset 0 -2px var(--signal);
+    }
+
+    .search-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 42px;
+      border: 1px solid var(--line-hot);
+      background: var(--panel);
+    }
+
+    .search-form:focus-within { border-color: var(--signal); }
+    .search-form input {
+      min-width: 0;
+      padding: 0 14px;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--ink);
+      font-family: var(--mono);
+    }
+    .search-form input::placeholder { color: var(--faint); }
+    .search-form button {
+      border: 0;
+      border-left: 1px solid var(--line-hot);
+      padding: 0 18px;
+      background: var(--signal);
+      color: #20180e;
+      font: 700 12px var(--mono);
+      cursor: pointer;
+    }
+
+    .corpus-state {
+      justify-self: end;
+      color: var(--muted);
+      font: 11px var(--mono);
+      white-space: nowrap;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(320px, 39vw) minmax(0, 1fr);
+      min-height: 0;
+    }
+
+    .rail {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-height: 0;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .rail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 54px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .rail-controls, .history-controls, .mode-switch, .sort-switch {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .history-controls { flex-wrap: wrap; }
+    .board-rail-label {
+      display: none;
+      color: var(--ink);
+      font: 650 11px var(--mono);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .view-button, .mode-switch button, .sort-switch button {
+      border: 1px solid transparent;
+      padding: 6px 9px;
+      background: transparent;
+      color: var(--muted);
+      font: 11px var(--mono);
+      cursor: pointer;
+    }
+    .view-button[aria-pressed="true"],
+    .mode-switch button[aria-pressed="true"],
+    .sort-switch button[aria-pressed="true"] {
+      border-color: var(--line-hot);
+      background: var(--raised);
+      color: var(--ink);
+    }
+    .mode-switch::before, .sort-switch::before {
+      content: "";
+      width: 1px;
+      height: 18px;
+      margin: 0 3px;
+      background: var(--line);
+    }
+    .sort-switch[hidden] { display: none; }
+
+    .result-count { color: var(--muted); font: 11px var(--mono); }
+    .results { overflow: auto; overscroll-behavior: contain; }
+
+    .result {
+      position: relative;
+      display: grid;
+      width: 100%;
+      gap: 7px;
+      padding: 15px 15px 15px 20px;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+    .result::before {
+      content: "";
+      position: absolute;
+      inset: 12px auto 12px 8px;
+      width: 2px;
+      background: var(--line);
+    }
+    .result:hover { background: #111822; }
+    .result[aria-current="true"] { background: var(--raised); }
+    .result[aria-current="true"]::before { background: var(--signal); }
+
+    .result.board-session::before { background: var(--faint); }
+    .result.board-session.working::before {
+      background: var(--signal);
+      box-shadow: 0 0 13px rgba(255, 180, 84, .4);
+    }
+    .board-session .result-title {
+      display: -webkit-box;
+      overflow: hidden;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
+    .result.board-side {
+      width: calc(100% - 22px);
+      margin-left: 22px;
+      padding-left: 24px;
+      border-left: 1px solid var(--line-hot);
+    }
+    .result.board-side::after {
+      content: "";
+      position: absolute;
+      top: 25px;
+      left: -1px;
+      width: 12px;
+      border-top: 1px solid var(--line-hot);
+    }
+    .board-divider {
+      padding: 11px 15px 7px;
+      border-bottom: 1px solid var(--line);
+      color: var(--faint);
+      font: 9px var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .result-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font: 10px var(--mono);
+      text-transform: uppercase;
+      letter-spacing: .055em;
+    }
+    .result-meta b { color: var(--agent); font-weight: 650; }
+    .result-snippet {
+      color: #bac3d2;
+      font: 12px/1.55 var(--mono);
+      overflow-wrap: anywhere;
+    }
+    .result-title {
+      color: var(--ink);
+      font: 650 13px/1.45 var(--mono);
+      overflow-wrap: anywhere;
+    }
+    .result-detail {
+      display: -webkit-box;
+      overflow: hidden;
+      color: #98a4b6;
+      font: 11px/1.5 var(--body);
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
+    .result-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+    .badge {
+      padding: 2px 5px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font: 9px var(--mono);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    mark {
+      padding: 0 .12em;
+      background: #f4cf72;
+      color: #211b10;
+    }
+
+    .reader {
+      min-width: 0;
+      overflow: auto;
+      overscroll-behavior: contain;
+      background:
+        linear-gradient(90deg, rgba(147,180,233,.025) 1px, transparent 1px) 0 0/64px 100%,
+        var(--paper);
+    }
+
+    .reader-inner { max-width: 980px; margin: 0 auto; padding: 28px 34px 80px; }
+    .empty {
+      display: grid;
+      place-content: center;
+      min-height: calc(100vh - 69px);
+      padding: 40px;
+      text-align: center;
+      color: var(--muted);
+    }
+    .empty-glyph {
+      margin-bottom: 12px;
+      color: var(--line-hot);
+      font: 54px/1 var(--mono);
+      letter-spacing: -.18em;
+    }
+    .empty h1 { margin: 0 0 8px; color: var(--ink); font: 600 17px var(--mono); }
+    .empty p { max-width: 520px; margin: 0; }
+    .empty p.error { color: var(--bad); }
+    .shortcut { margin-top: 15px; color: var(--faint); font: 10px var(--mono); }
+
+    .chat-head {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      margin: -28px -34px 24px;
+      padding: 20px 34px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(9, 12, 17, .94);
+      backdrop-filter: blur(12px);
+    }
+    .chat-head h1 {
+      margin: 0 0 5px;
+      font: 650 18px/1.35 var(--mono);
+      overflow-wrap: anywhere;
+    }
+    .chat-head p { margin: 0; color: var(--muted); font: 11px var(--mono); }
+
+    .turn {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr);
+      gap: 18px;
+      padding: 19px 0 23px;
+      border-bottom: 1px solid var(--line);
+    }
+    .turn-number { color: var(--faint); font: 10px var(--mono); }
+    .turn-body { min-width: 0; }
+    .message { margin-bottom: 18px; }
+    .message:last-child { margin-bottom: 0; }
+    .speaker {
+      display: inline-block;
+      margin-bottom: 7px;
+      color: var(--user);
+      font: 700 10px var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .message.agent .speaker { color: var(--agent); }
+    .message.system .speaker { color: var(--signal); }
+    .message pre, .tool pre {
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #c7cfdb;
+      font: 12px/1.62 var(--mono);
+    }
+    .tool {
+      margin: 11px 0 0;
+      padding: 10px 12px;
+      border-left: 2px solid var(--line-hot);
+      background: rgba(20, 27, 37, .72);
+    }
+    .tool b { color: var(--muted); font: 10px var(--mono); }
+    .tool pre { margin-top: 4px; color: #8e9aad; font-size: 11px; }
+    .cut { margin-top: 7px; color: var(--signal); font: 10px var(--mono); }
+
+    .board-overview {
+      display: grid;
+      gap: 20px;
+      min-height: calc(100vh - 69px);
+      align-content: start;
+    }
+    .board-head {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: grid;
+      gap: 13px;
+      margin: -28px -34px 0;
+      padding: 20px 34px 17px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(9, 12, 17, .94);
+      backdrop-filter: blur(12px);
+    }
+    .board-head-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+    }
+    .board-kicker {
+      margin-bottom: 3px;
+      color: var(--signal);
+      font: 700 9px var(--mono);
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+    .board-head h1 { margin: 0; font: 650 18px/1.35 var(--mono); overflow-wrap: anywhere; }
+    .board-subtitle { margin: 4px 0 0; color: var(--muted); font: 11px var(--mono); }
+    .read-only {
+      flex: 0 0 auto;
+      padding: 4px 6px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font: 9px var(--mono);
+      letter-spacing: .07em;
+      text-transform: uppercase;
+    }
+    .board-counts { display: flex; flex-wrap: wrap; gap: 7px; }
+    .board-count {
+      padding: 5px 7px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font: 10px var(--mono);
+    }
+    .board-count strong { color: var(--ink); font-weight: 700; }
+    .board-count.live strong { color: var(--signal); }
+    .board-state {
+      margin: 0 0 2px;
+      padding: 9px 11px;
+      border-left: 2px solid var(--line-hot);
+      background: rgba(20, 27, 37, .7);
+      color: var(--muted);
+      font: 10px/1.5 var(--mono);
+    }
+    .board-state.warn { border-left-color: var(--signal); color: #c8af8b; }
+    .board-state.error { border-left-color: var(--bad); color: var(--bad); }
+    .board-feed { display: grid; gap: 0; }
+    .board-event {
+      display: grid;
+      grid-template-columns: 84px minmax(0, 1fr);
+      gap: 18px;
+      padding: 15px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .board-event-meta { color: var(--faint); font: 10px/1.45 var(--mono); }
+    .board-event-kind { display: block; margin-bottom: 3px; color: var(--agent); }
+    .board-event.failed .board-event-kind { color: var(--bad); }
+    .board-event-body { min-width: 0; }
+    .board-event-body b {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font: 650 10px var(--mono);
+    }
+    .board-event-body pre {
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #c7cfdb;
+      font: 12px/1.62 var(--mono);
+    }
+    .board-actions { display: flex; align-items: center; gap: 8px; }
+    .quiet-button {
+      border: 1px solid var(--line-hot);
+      padding: 7px 9px;
+      background: var(--raised);
+      color: var(--ink);
+      font: 10px var(--mono);
+      cursor: pointer;
+    }
+    .board-back, .history-back { display: none; }
+
+    body[data-surface="board"] .history-controls { display: none; }
+    body[data-surface="board"] .board-rail-label { display: block; }
+
+    .notice {
+      margin: 14px;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font: 11px/1.5 var(--mono);
+    }
+    .notice.error { border-color: #683c3c; color: var(--bad); }
+    .notice.warn { border-color: #5d4930; color: #c8af8b; }
+    .rail-tail { display: grid; gap: 8px; margin: 14px; }
+    .rail-tail .quiet-button { width: 100%; }
+    .rail-tail p { margin: 0; color: var(--muted); font: 10px/1.5 var(--mono); }
+    .context-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .board-rail-state { display: none; }
+    .spinner { animation: pulse 1s steps(2, end) infinite; }
+    @keyframes pulse { 50% { opacity: .35; } }
+
+    @media (max-width: 760px) {
+      body { overflow: auto; }
+      .shell { min-height: 100vh; }
+      .command-bar { grid-template-columns: 1fr auto; gap: 10px; }
+      .identity { gap: 10px; }
+      .wordmark { min-width: 0; }
+      .wordmark span { display: none; }
+      .surface-switch button { padding: 6px 8px; }
+      .search-form { grid-column: 1 / -1; grid-row: 2; }
+      .corpus-state { grid-column: 2; grid-row: 1; }
+      .workspace { grid-template-columns: 1fr; }
+      .rail { min-height: 46vh; max-height: 58vh; border-right: 0; border-bottom: 1px solid var(--line); }
+      .reader { min-height: 54vh; }
+      .reader-inner { padding: 20px 18px 60px; }
+      .chat-head { margin: -20px -18px 16px; padding: 16px 18px 13px; }
+      .turn { grid-template-columns: 48px minmax(0, 1fr); gap: 10px; }
+      .empty { min-height: 46vh; }
+      .board-overview { min-height: calc(100vh - 127px); }
+      .board-head { margin: -20px -18px 0; padding: 15px 18px 13px; }
+      .board-head-row { gap: 10px; }
+      .board-event { grid-template-columns: 62px minmax(0, 1fr); gap: 10px; }
+      .board-back, .history-back { display: inline-block; }
+      .history-back { margin-bottom: 12px; }
+      .board-rail-state { display: block; }
+      body[data-surface="history"] .rail { min-height: calc(100vh - 127px); max-height: none; }
+      body[data-surface="history"] .reader { display: none; }
+      body[data-surface="history"].history-detail .rail { display: none; }
+      body[data-surface="history"].history-detail .reader { display: block; min-height: calc(100vh - 127px); }
+      body[data-surface="board"] .rail { min-height: calc(100vh - 127px); max-height: none; }
+      body[data-surface="board"] .reader { display: none; }
+      body[data-surface="board"].board-detail .rail { display: none; }
+      body[data-surface="board"].board-detail .reader { display: block; min-height: calc(100vh - 127px); }
+    }
+
+    @media (max-width: 480px) {
+      .command-bar { grid-template-columns: 1fr; }
+      .corpus-state { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .spinner { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="command-bar">
+      <div class="identity">
+        <div class="wordmark" aria-label="agrep explorer">
+          <strong>agrep</strong><i aria-hidden="true"></i><span>history strata</span>
+        </div>
+        <nav class="surface-switch" aria-label="Explorer view">
+          <button id="history-surface" type="button" aria-pressed="true">History</button>
+          <button id="board-surface" type="button" aria-pressed="false">Live board</button>
+        </nav>
+      </div>
+      <form class="search-form" id="search-form" role="search">
+        <input id="query" name="q" autocomplete="off" spellcheck="false"
+               placeholder="search every agent chat…" aria-label="Search history">
+        <button type="submit">search</button>
+      </form>
+      <div class="corpus-state" id="corpus-state">connecting</div>
+    </header>
+
+    <main class="workspace">
+      <aside class="rail" aria-label="History results">
+        <div class="rail-head">
+          <div class="rail-controls">
+            <div class="history-controls">
+              <button class="view-button" id="recent-button" type="button"
+                      aria-pressed="true">recent history</button>
+              <div class="mode-switch" aria-label="Search mode">
+                <button type="button" data-mode="keyword" aria-pressed="true">grep</button>
+                <button type="button" data-mode="semantic" aria-pressed="false">meaning</button>
+              </div>
+              <div class="sort-switch" id="sort-switch"
+                   aria-label="Search result order" hidden>
+                <button type="button" data-sort="score" aria-pressed="true">score</button>
+                <button type="button" data-sort="time" aria-pressed="false">newest</button>
+              </div>
+            </div>
+            <div class="board-rail-label">live activity · read only</div>
+          </div>
+          <div class="result-count" id="result-count">loading</div>
+        </div>
+        <div class="results" id="results" aria-live="polite"></div>
+      </aside>
+
+      <section class="reader" id="reader" aria-live="polite">
+        <div class="empty">
+          <div class="empty-glyph" aria-hidden="true">//</div>
+          <h1>Browse the strata. Open the moment.</h1>
+          <p>Recent main chats stay quiet on the left; search reaches every indexed agent conversation. Everything here is local and read-only.</p>
+          <div class="shortcut">/ search · j/k move · esc recent</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    "use strict";
+
+    const state = {
+      surface: "history", mode: "keyword", sort: "score",
+      view: "recent", historyView: "recent", query: "",
+      hits: [], searchPayload: null, chats: [], chatTotal: 0,
+      chatTotalsExact: true, chatLimit: 80, searchLimit: 40,
+      indexed: true, active: -1, ready: false,
+      searchEpoch: 0, contextEpoch: 0, searchController: null,
+      contextController: null, contextRadius: 4,
+      recentEpoch: 0, recentController: null, recentLoading: false,
+      lastRecentRequestAt: 0,
+      board: {
+        payload: null, selected: "", timer: null, controller: null,
+        loading: false, failures: 0, lastError: "", navigationError: "", epoch: 0
+      }
+    };
+    const form = document.querySelector("#search-form");
+    const input = document.querySelector("#query");
+    const results = document.querySelector("#results");
+    const reader = document.querySelector("#reader");
+    const rail = document.querySelector(".rail");
+    const count = document.querySelector("#result-count");
+    const corpus = document.querySelector("#corpus-state");
+    const recentButton = document.querySelector("#recent-button");
+    const sortSwitch = document.querySelector("#sort-switch");
+    const historySurface = document.querySelector("#history-surface");
+    const boardSurface = document.querySelector("#board-surface");
+    const CHAT_PAGE_STEP = 80;
+    const CHAT_MAX_ROWS = 200;
+    const SEARCH_PAGE_STEP = 40;
+    const SEARCH_MAX_ROWS = 100;
+
+    function node(tag, className, text) {
+      const out = document.createElement(tag);
+      if (className) out.className = className;
+      if (text !== undefined) out.textContent = String(text);
+      return out;
+    }
+
+    function compactProject(value) {
+      const parts = String(value || "").replaceAll("\\", "/").split("/").filter(Boolean);
+      return parts.at(-1) || "history";
+    }
+
+    function relativeTime(value) {
+      const stamp = Number(value || 0);
+      if (!stamp) return "undated";
+      const elapsed = Math.max(0, Date.now() - stamp);
+      const minutes = Math.floor(elapsed / 60000);
+      if (minutes < 1) return "now";
+      if (minutes < 60) return `${minutes}m`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 48) return `${hours}h`;
+      const days = Math.floor(hours / 24);
+      return days < 60 ? `${days}d` : new Date(stamp).toLocaleDateString();
+    }
+
+    function preciseAge(value) {
+      const stamp = Number(value || 0);
+      if (!Number.isFinite(stamp) || stamp <= 0) return "unknown";
+      const elapsed = Math.max(0, Date.now() - stamp);
+      if (elapsed < 1500) return "just now";
+      if (elapsed < 60000) return `${Math.floor(elapsed / 1000)}s ago`;
+      const relative = relativeTime(stamp);
+      return /^\d+[mhd]$/.test(relative) ? `${relative} ago` : `on ${relative}`;
+    }
+
+    function canAutofocus() {
+      return window.innerWidth > 760 && window.matchMedia("(pointer: fine)").matches;
+    }
+
+    function mobileLayout() {
+      return window.matchMedia("(max-width: 760px)").matches;
+    }
+
+    function selectResult(index) {
+      state.active = index;
+      results.querySelectorAll(".result").forEach((item, itemIndex) => {
+        item.setAttribute("aria-current", String(itemIndex === index));
+      });
+    }
+
+    function setHistoryView(view) {
+      state.view = view;
+      state.historyView = view;
+      recentButton.setAttribute("aria-pressed", String(view === "recent"));
+      sortSwitch.hidden = view !== "search" || state.mode === "semantic";
+    }
+
+    function appendHighlighted(target, text, query) {
+      const source = String(text || "");
+      const terms = [...new Set(String(query || "").split(/[\s_-]+/).filter(Boolean))];
+      if (!terms.length) {
+        target.textContent = source;
+        return;
+      }
+      const escaped = terms
+        .sort((left, right) => right.length - left.length)
+        .map(term => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      const pattern = new RegExp(escaped.join("|"), "giu");
+      let cursor = 0;
+      for (const match of source.matchAll(pattern)) {
+        const found = Number(match.index);
+        if (found > cursor) target.append(document.createTextNode(source.slice(cursor, found)));
+        target.append(node("mark", "", match[0]));
+        cursor = found + match[0].length;
+      }
+      if (cursor < source.length) target.append(document.createTextNode(source.slice(cursor)));
+    }
+
+    async function request(path, options = {}) {
+      const response = await fetch(path, { credentials: "same-origin", ...options });
+      if (response.status === 204) return null;
+      const payload = await response.json().catch(() => ({ error: "invalid explorer response" }));
+      if (!response.ok) throw new Error(payload.error || `request failed (${response.status})`);
+      return payload;
+    }
+
+    function abortHistoryRequests() {
+      state.searchEpoch += 1;
+      state.contextEpoch += 1;
+      state.searchController?.abort();
+      state.contextController?.abort();
+      state.searchController = null;
+      state.contextController = null;
+      state.recentEpoch += 1;
+      state.recentController?.abort();
+      state.recentController = null;
+      state.recentLoading = false;
+    }
+
+    function stopBoardPolling() {
+      window.clearTimeout(state.board.timer);
+      state.board.timer = null;
+      state.board.epoch += 1;
+      state.board.controller?.abort();
+      state.board.controller = null;
+      state.board.loading = false;
+    }
+
+    function setSurface(surface, render = true) {
+      const previous = state.surface;
+      state.surface = surface;
+      document.body.dataset.surface = surface;
+      historySurface.setAttribute("aria-pressed", String(surface === "history"));
+      boardSurface.setAttribute("aria-pressed", String(surface === "board"));
+      rail.setAttribute("aria-label", surface === "board" ? "Live agent chats" : "History results");
+      results.setAttribute("aria-live", surface === "board" ? "off" : "polite");
+      reader.setAttribute("aria-live", surface === "board" ? "off" : "polite");
+      document.body.classList.remove("board-detail");
+      document.body.classList.remove("history-detail");
+      if (surface === "board") {
+        abortHistoryRequests();
+        state.view = "board";
+        if (render) renderBoard();
+        scheduleBoard(0);
+        return;
+      }
+      stopBoardPolling();
+      if (previous === "board") {
+        state.contextEpoch += 1;
+        state.contextController?.abort();
+        state.contextController = null;
+      }
+      if (!render) return;
+      if (state.historyView === "search" && state.searchPayload) {
+        renderResults(state.searchPayload);
+      } else {
+        renderChats({
+          total: state.chatTotal, totals_exact: state.chatTotalsExact,
+          chats: state.chats
+        });
+      }
+    }
+
+    function showRailNotice(message, error = false) {
+      results.replaceChildren(node("div", `notice${error ? " error" : ""}`, message));
+    }
+
+    function showReaderNotice(title, message, error = false) {
+      const empty = node("div", "empty");
+      empty.append(node("div", "empty-glyph", "//"));
+      empty.append(node("h1", "", title));
+      empty.append(node("p", error ? "error" : "", message));
+      reader.replaceChildren(empty);
+    }
+
+    function showRecentLanding() {
+      showReaderNotice(
+        "Browse the strata. Open the moment.",
+        "Choose a recent chat, or search every indexed agent conversation.");
+    }
+
+    function renderChats(payload, options = {}) {
+      const preserveReader = Boolean(options.preserveReader);
+      const selectedSession = String(options.selectedSession || "");
+      if (!preserveReader) document.body.classList.remove("history-detail");
+      state.chats = payload.chats || [];
+      state.chatTotal = Number(payload.total || state.chats.length);
+      state.chatTotalsExact = payload.totals_exact !== false;
+      state.active = -1;
+      setHistoryView("recent");
+      results.replaceChildren();
+      if (!preserveReader) showRecentLanding();
+      const total = Math.max(state.chatTotal, state.chats.length);
+      const totalSuffix = state.chatTotalsExact ? "" : "+ known";
+      count.textContent = total > state.chats.length
+        ? `${state.chats.length} of ${total.toLocaleString()}${totalSuffix} recent`
+        : `${state.chats.length}${totalSuffix} recent`;
+      if (!state.chats.length) {
+        const message = state.indexed
+          ? "No main chats are indexed yet."
+          : "No history index yet. Run `agrep index` in a terminal.";
+        showRailNotice(message);
+        if (!preserveReader) showReaderNotice("No recent chats.", message);
+        return;
+      }
+      state.chats.forEach((chat, index) => {
+        const button = node("button", "result");
+        button.type = "button";
+        button.dataset.index = String(index);
+        const selected = Boolean(selectedSession && chat.session === selectedSession);
+        button.setAttribute("aria-current", String(selected));
+        if (selected) state.active = index;
+        const meta = node("div", "result-meta");
+        meta.append(node("b", "", chat.agent || "agent"));
+        meta.append(node("span", "", `${compactProject(chat.project)} · ${relativeTime(chat.last_ts)}`));
+        const title = chat.title || chat.concept || chat.first_text || compactProject(chat.project);
+        button.append(meta, node("div", "result-title", title));
+        const detail = chat.summary || ((chat.title || chat.concept) ? chat.first_text : "");
+        if (detail && detail !== title) button.append(node("div", "result-detail", detail));
+        const badges = node("div", "result-badges");
+        badges.append(node("span", "badge", `${Number(chat.n_msgs || 0)} turns`));
+        if (chat.concept) badges.append(node("span", "badge", chat.concept));
+        button.append(badges);
+        button.addEventListener("click", () => openChat(index));
+        results.append(button);
+      });
+      const hasMore = total > state.chats.length
+        || (!state.chatTotalsExact && state.chats.length >= state.chatLimit);
+      if (hasMore) {
+        const tail = node("div", "rail-tail");
+        if (state.chats.length < CHAT_MAX_ROWS) {
+          const more = node("button", "quiet-button", "Show more recent chats");
+          more.type = "button";
+          more.addEventListener("click", () => loadMoreChats(more));
+          tail.append(more);
+        } else {
+          tail.append(node(
+            "p", "", `Showing the newest ${state.chats.length}; search reaches all indexed chats.`));
+        }
+        results.append(tail);
+      }
+    }
+
+    async function loadMoreChats(button) {
+      const nextLimit = Math.min(CHAT_MAX_ROWS, state.chatLimit + CHAT_PAGE_STEP);
+      button.disabled = true;
+      button.textContent = "Loading more…";
+      const refreshed = await refreshRecent({
+        limit: nextLimit, force: true, preserveReader: true
+      });
+      if (!refreshed && state.surface === "history"
+          && state.historyView === "recent") {
+        button.disabled = false;
+        button.textContent = "Retry more recent chats";
+      }
+    }
+
+    async function refreshRecent(options = {}) {
+      if (state.surface !== "history" || state.historyView !== "recent") return false;
+      const force = Boolean(options.force);
+      const now = Date.now();
+      if (!force && (state.recentLoading || now - state.lastRecentRequestAt < 750)) {
+        return false;
+      }
+      const selected = state.active >= 0 ? state.chats[state.active] : null;
+      const preserveReader = Boolean(
+        options.preserveReader && reader.querySelector(".reader-inner"));
+      const selectedSession = selected ? String(selected.session || "") : "";
+      const limit = Math.min(CHAT_MAX_ROWS, Math.max(
+        1, Number(options.limit || state.chatLimit)));
+      const epoch = ++state.recentEpoch;
+      state.recentController?.abort();
+      const controller = new AbortController();
+      state.recentController = controller;
+      state.recentLoading = true;
+      state.lastRecentRequestAt = now;
+      if (options.announce) count.textContent = "refreshing history";
+      try {
+        const payload = await request(`/api/chats?n=${limit}`, {
+          signal: controller.signal
+        });
+        if (epoch !== state.recentEpoch || state.surface !== "history"
+            || state.historyView !== "recent") return false;
+        state.chatLimit = limit;
+        renderChats(payload, { preserveReader, selectedSession });
+        return true;
+      } catch (error) {
+        if (error.name !== "AbortError" && epoch === state.recentEpoch
+            && options.announce) count.textContent = "history refresh failed";
+        return false;
+      } finally {
+        if (state.recentController === controller) state.recentController = null;
+        if (epoch === state.recentEpoch) state.recentLoading = false;
+      }
+    }
+
+    function refreshRecentOnActivation() {
+      if (!state.ready || document.hidden || state.surface !== "history"
+          || state.historyView !== "recent") return;
+      refreshRecent({ preserveReader: true });
+    }
+
+    function meaningSuffix(semantic) {
+      if (!semantic) return "";
+      if (semantic.complete) return " · meaning complete";
+      const indexed = Number(semantic.indexed || 0);
+      const total = Number(semantic.total || 0);
+      if (total > 0) {
+        return ` · meaning ${indexed.toLocaleString()} of ${total.toLocaleString()} rows`;
+      }
+      return semantic.fallback_recommended ? " · meaning unavailable" : " · meaning partial";
+    }
+
+    function searchCount(payload) {
+      const shown = state.hits.length;
+      const total = Math.max(shown, Number(payload.total || 0));
+      const exact = payload.totals_exact !== false;
+      const tools = payload.tools_excluded ? " · tool output still indexing" : "";
+      if (!exact && total === 0) return `no returned hits · total unknown${meaningSuffix(payload.semantic)}${tools}`;
+      const noun = total === 1 ? "hit" : "hits";
+      const base = total > shown
+        ? `${shown} of ${total.toLocaleString()}${exact ? "" : "+ known"} ${noun}`
+        : `${total.toLocaleString()}${exact ? "" : "+ known"} ${noun}`;
+      return base + meaningSuffix(payload.semantic) + tools;
+    }
+
+    function emptySearchMessage(payload) {
+      const semantic = payload.semantic;
+      if (state.mode === "semantic" && semantic?.fallback_recommended) {
+        return "Meaning search is unavailable for this query. Try Grep.";
+      }
+      if (state.mode === "semantic" && semantic && !semantic.complete
+          && Number(semantic.total || 0) > 0) {
+        return `No meaning matches in ${Number(semantic.indexed || 0).toLocaleString()} of ${Number(semantic.total).toLocaleString()} indexed rows.`;
+      }
+      if (payload.tools_excluded) {
+        return "No prose hits; tool output is still indexing.";
+      }
+      if (payload.totals_exact === false) {
+        return "No hits were returned; this search did not prove there are none.";
+      }
+      return "No matches in the published index.";
+    }
+
+    function renderResults(payload) {
+      document.body.classList.remove("history-detail");
+      state.searchPayload = payload;
+      state.hits = payload.hits || [];
+      state.active = -1;
+      setHistoryView("search");
+      results.replaceChildren();
+      count.textContent = searchCount(payload);
+      if (!state.hits.length) {
+        const message = emptySearchMessage(payload);
+        showRailNotice(message);
+        showReaderNotice("Nothing to open.", message);
+        return;
+      }
+      state.hits.forEach((hit, index) => {
+        const button = node("button", "result");
+        button.type = "button";
+        button.dataset.index = String(index);
+        button.setAttribute("aria-current", "false");
+        const meta = node("div", "result-meta");
+        meta.append(node("b", "", hit.agent || "agent"));
+        meta.append(node("span", "",
+          `${compactProject(hit.project)} · ${relativeTime(hit.ts)} · turn ${hit.turn ?? "?"}`));
+        const snippet = node("div", "result-snippet");
+        appendHighlighted(
+          snippet, hit.snippet || "", state.mode === "semantic" ? "" : state.query);
+        button.append(meta, snippet);
+        button.addEventListener("click", () => openHit(index, true));
+        results.append(button);
+      });
+      const total = Math.max(state.hits.length, Number(payload.total || 0));
+      const hasMore = total > state.hits.length
+        || (payload.totals_exact === false && state.hits.length >= state.searchLimit)
+        || Boolean(payload.semantic?.truncated);
+      if (hasMore) {
+        const tail = node("div", "rail-tail");
+        if (state.searchLimit < SEARCH_MAX_ROWS) {
+          const more = node("button", "quiet-button", "Show more search results");
+          more.type = "button";
+          more.addEventListener("click", () => searchNow(
+            Math.min(SEARCH_MAX_ROWS, state.searchLimit + SEARCH_PAGE_STEP)));
+          tail.append(more);
+        } else {
+          tail.append(node(
+            "p", "", `Showing the top ${state.hits.length}; refine the query for a smaller result set.`));
+        }
+        results.append(tail);
+      }
+      if (mobileLayout()) {
+        showReaderNotice(
+          "Choose a result.", "Open a matching row to read its context.");
+      } else {
+        openHit(0, false);
+      }
+    }
+
+    function messageBlock(kind, text, truncated, label = kind) {
+      const box = node("div", `message ${kind}`);
+      box.append(node("span", "speaker", label));
+      box.append(node("pre", "", text));
+      if (truncated) box.append(node("div", "cut", "truncated in this view · use agrep around for the complete turn"));
+      return box;
+    }
+
+    function renderWindow(windowData) {
+      const wrap = node("div", "reader-inner");
+      const head = node("header", "chat-head");
+      const back = node("button", "quiet-button history-back", "Back to results");
+      back.type = "button";
+      back.addEventListener("click", showHistoryList);
+      head.append(back);
+      head.append(node("h1", "", windowData.title || windowData.concept || compactProject(windowData.project)));
+      head.append(node("p", "", `${windowData.agent || "agent"} · ${compactProject(windowData.project)} · ${windowData.session}`));
+      if (windowData.truncated) {
+        const omitted = [
+          windowData.omitted_turns ? `${windowData.omitted_turns} turns` : "",
+          windowData.omitted_events ? `${windowData.omitted_events} tool events` : ""
+        ].filter(Boolean).join(" · ");
+        head.append(node("div", "cut", `view clipped${omitted ? ` · ${omitted} omitted` : ""}`));
+      }
+      const turnNumbers = (windowData.turns || [])
+        .map(turn => Number(turn.turn)).filter(Number.isFinite);
+      const firstShown = turnNumbers.length ? Math.min(...turnNumbers) : null;
+      const lastShown = turnNumbers.length ? Math.max(...turnNumbers) : null;
+      const firstTurn = Number(windowData.first_turn);
+      const lastTurn = Number(windowData.last_turn);
+      const actions = node("div", "context-actions");
+      const addPage = (label, turn) => {
+        const button = node("button", "quiet-button", label);
+        button.type = "button";
+        button.addEventListener("click", () => loadHistoryWindow(
+          windowData.session, turn, state.contextRadius, true,
+          `Reading ${label.toLowerCase()}…`, "This context page is unavailable."));
+        actions.append(button);
+      };
+      if (firstShown !== null && Number.isFinite(firstTurn) && firstShown > firstTurn) {
+        addPage("Earlier turns", Math.max(
+          firstTurn, firstShown - state.contextRadius - 1));
+      }
+      if (lastShown !== null && Number.isFinite(lastTurn) && lastShown < lastTurn) {
+        addPage("Later turns", Math.min(
+          lastTurn, lastShown + state.contextRadius + 1));
+      }
+      if (actions.childElementCount) head.append(actions);
+      wrap.append(head);
+      const events = new Map();
+      for (const event of windowData.events || []) {
+        const key = Number(event.turn);
+        if (!events.has(key)) events.set(key, []);
+        events.get(key).push(event);
+      }
+      for (const turn of windowData.turns || []) {
+        const row = node("article", "turn");
+        row.append(node("div", "turn-number", `turn ${turn.turn}`));
+        const body = node("div", "turn-body");
+        if (turn.text) {
+          const who = String(turn.who || "user");
+          const kind = who === "agent" ? "agent" : who === "user" ? "user" : "system";
+          body.append(messageBlock(kind, turn.text, turn.text_truncated,
+                                   who === "user" ? "you" : who));
+        }
+        for (const event of events.get(Number(turn.turn)) || []) {
+          const tool = node("div", "tool");
+          tool.append(node("b", "", `${event.ok === false ? "failed " : ""}${event.name || event.kind || "tool"}`));
+          if (event.input) tool.append(node("pre", "", event.input));
+          if (event.input_truncated) tool.append(node("div", "cut", "tool input truncated"));
+          body.append(tool);
+        }
+        if (turn.reply) body.append(messageBlock("agent", turn.reply, turn.reply_truncated, "agent"));
+        row.append(body);
+        wrap.append(row);
+      }
+      reader.replaceChildren(wrap);
+      reader.scrollTop = 0;
+    }
+
+    function boardKey(session) {
+      return JSON.stringify([String(session.agent || ""), String(session.session || "")]);
+    }
+
+    function boardTitle(session) {
+      if (session.title) return session.title;
+      const recent = [...(session.recent || [])].reverse();
+      const event = recent.find(item => String(item.text || "").trim());
+      if (event?.text) return event.text;
+      const agent = session.agent || "agent";
+      const project = compactProject(session.project);
+      const short = String(session.session || "").slice(0, 8);
+      return `${agent} in ${project}${short ? ` · ${short}` : ""}`;
+    }
+
+    function boardStatusLines(payload) {
+      const lines = [];
+      if (state.board.lastError) {
+        lines.push({ kind: "error", text: `Refresh failed; last update ${preciseAge(payload.updated_at)}.` });
+      }
+      if (payload.status === "scanning") {
+        lines.push({ kind: "", text: "Scanning local agent stores for live activity…" });
+      }
+      if (payload.status === "degraded") {
+        const agents = (payload.degraded_agents || []).join(", ");
+        lines.push({ kind: "warn", text: agents
+          ? `Live view is partial; ${agents} could not be read.`
+          : "Live view is partial; one or more stores could not be read." });
+      }
+      const staleAfter = Math.max(5000, Math.min(12000, Number(payload.window_s || 90) * 250));
+      if (Date.now() - Number(payload.updated_at || 0) > staleAfter) {
+        lines.push({ kind: "warn", text: `Live view is stale; last update ${preciseAge(payload.updated_at)}.` });
+      }
+      if (payload.truncated || payload.recent_trimmed || payload.recent_events_omitted) {
+        lines.push({ kind: "warn", text: "Older live sessions or activity were trimmed from this view." });
+      }
+      const hiddenSide = Number(payload.hidden_orphan_sides || 0);
+      if (hiddenSide > 0) {
+        lines.push({ kind: "", text: `${hiddenSide} completed side agent${hiddenSide === 1 ? "" : "s"} without a visible main session ${hiddenSide === 1 ? "is" : "are"} collapsed.` });
+      }
+      return lines;
+    }
+
+    function boardCounts(payload) {
+      const wrap = node("div", "board-counts");
+      const entries = [
+        ["live", Number(payload.working || 0), "working"],
+        ["", Number(payload.roots || 0), "main sessions in window"],
+        ["", Number(payload.side || 0), "side agents"]
+      ];
+      for (const [kind, value, label] of entries) {
+        const item = node("span", `board-count${kind ? ` ${kind}` : ""}`);
+        item.append(node("strong", "", value.toLocaleString()), document.createTextNode(` ${label}`));
+        wrap.append(item);
+      }
+      return wrap;
+    }
+
+    function boardEmpty(payload) {
+      const wrap = node("div", "reader-inner board-overview");
+      const head = node("header", "board-head");
+      const top = node("div", "board-head-row");
+      const identity = node("div");
+      identity.append(node("div", "board-kicker", "live activity"));
+      identity.append(node("h1", "", "Agent board"));
+      identity.append(node(
+        "p", "board-subtitle",
+        "Main sessions retained in the live window and their side agents."));
+      top.append(identity, node("span", "read-only", "read only"));
+      head.append(top, boardCounts(payload));
+      for (const line of boardStatusLines(payload)) {
+        head.append(node("p", `board-state${line.kind ? ` ${line.kind}` : ""}`, line.text));
+      }
+      const empty = node("div", "empty");
+      empty.append(node("div", "empty-glyph", "//"));
+      empty.append(node(
+        "h1", "", payload.status === "scanning"
+          ? "Finding live sessions…" : "The live window is empty."));
+      empty.append(node("p", "", payload.status === "scanning"
+        ? "The first scan is still reading local agent stores."
+        : "No main or side sessions are retained in this live window."));
+      wrap.append(head, empty);
+      return wrap;
+    }
+
+    function eventKind(event) {
+      const labels = {
+        user: "you", reply: "agent", tool: "tool", tool_done: "done",
+        subagent_result: "side result", system: "system"
+      };
+      return labels[event.type] || event.type || "activity";
+    }
+
+    function renderBoardDetail(session, payload) {
+      if (!session) {
+        reader.replaceChildren(boardEmpty(payload));
+        return;
+      }
+      const wrap = node("div", "reader-inner board-overview");
+      const head = node("header", "board-head");
+      const top = node("div", "board-head-row");
+      const identity = node("div");
+      identity.append(node("div", "board-kicker", session.sub ? "side agent" : "live chat"));
+      identity.append(node("h1", "", boardTitle(session)));
+      identity.append(node("p", "board-subtitle",
+        `${session.agent || "agent"} · ${compactProject(session.project)} · ${session.state || (session.working ? "working" : "idle")}`));
+      top.append(identity, node("span", "read-only", "read only"));
+      const actions = node("div", "board-actions");
+      const back = node("button", "quiet-button board-back", "Back to live chats");
+      back.type = "button";
+      back.dataset.boardAction = "back";
+      back.addEventListener("click", showBoardList);
+      const open = node("button", "quiet-button", "Open indexed chat");
+      open.type = "button";
+      open.dataset.boardAction = "open";
+      open.addEventListener("click", () => openBoardInHistory(session));
+      actions.append(back, open);
+      head.append(top, boardCounts(payload), actions);
+      for (const line of boardStatusLines(payload)) {
+        head.append(node("p", `board-state${line.kind ? ` ${line.kind}` : ""}`, line.text));
+      }
+      if (state.board.navigationError) {
+        head.append(node("p", "board-state error", state.board.navigationError));
+      }
+      wrap.append(head);
+
+      if (session.queued) {
+        const queued = `${Number(session.queued).toLocaleString()} queued${session.queued_text ? ` · ${session.queued_text}` : ""}`;
+        wrap.append(node("p", "board-state warn", queued));
+      }
+      const feed = node("div", "board-feed");
+      const rich = (session.recent || []).filter(event =>
+        String(event.text || "").trim() || event.name || String(event.input || "").trim());
+      if (!rich.length) {
+        feed.append(node("div", "notice", "No recent message or tool activity for this chat."));
+      }
+      for (const event of rich) {
+        const row = node("article", `board-event${event.ok === false ? " failed" : ""}`);
+        const meta = node("div", "board-event-meta");
+        meta.append(node("span", "board-event-kind", eventKind(event)));
+        meta.append(document.createTextNode(preciseAge(event.ts)));
+        const body = node("div", "board-event-body");
+        if (event.name) body.append(node("b", "", event.name));
+        const text = String(event.text || event.input || "").trim();
+        if (text) body.append(node("pre", "", text));
+        if (event.text_truncated || event.input_truncated) {
+          body.append(node("div", "cut", "trimmed in the live view"));
+        }
+        row.append(meta, body);
+        feed.append(row);
+      }
+      wrap.append(feed);
+      reader.replaceChildren(wrap);
+    }
+
+    function renderBoardRail(payload) {
+      const activeKey = document.activeElement?.dataset?.boardKey || "";
+      results.replaceChildren();
+      const sessions = payload.sessions || [];
+      const working = Number(payload.working || 0);
+      const roots = Number(payload.roots || 0);
+      const side = Number(payload.side || 0);
+      count.textContent = `${working} working · ${roots} main in window · ${side} side`;
+      for (const line of boardStatusLines(payload)) {
+        results.append(node("div", `notice board-rail-state${line.kind ? ` ${line.kind}` : ""}`, line.text));
+      }
+      if (!sessions.length) {
+        if (payload.status !== "scanning") {
+          results.append(node("div", "notice",
+            "No sessions are retained in the current live window."));
+        }
+        return;
+      }
+      let orphanHeading = false;
+      sessions.forEach(session => {
+        if (session.orphan && !orphanHeading) {
+          results.append(node("div", "board-divider", "side agents without a visible parent"));
+          orphanHeading = true;
+        }
+        const key = boardKey(session);
+        const classes = ["result", "board-session"];
+        if (session.sub) classes.push("board-side");
+        const sideWorking = Number(session.side_working || 0);
+        if (session.working || sideWorking) classes.push("working");
+        const button = node("button", classes.join(" "));
+        button.type = "button";
+        button.dataset.boardKey = key;
+        button.setAttribute("aria-current", String(key === state.board.selected));
+        button.setAttribute("aria-label", `${session.sub ? "Side agent" : "Chat"}: ${boardTitle(session)}`);
+        const meta = node("div", "result-meta");
+        meta.append(node("b", "", session.agent || "agent"));
+        const updated = session.sub ? session.last_ts : session.family_last_ts || session.last_ts;
+        meta.append(node("span", "", `${compactProject(session.project)} · ${relativeTime(updated)}`));
+        button.append(meta, node("div", "result-title", boardTitle(session)));
+        const status = session.state || (session.working ? "working" : "idle");
+        button.append(node("div", "result-detail", status));
+        const badges = node("div", "result-badges");
+        const sideTotal = Number(session.side_total || 0);
+        if (session.working) badges.append(node("span", "badge", "working"));
+        if (!session.sub && sideWorking) {
+          badges.append(node("span", "badge", `${sideWorking} side working`));
+        }
+        if (!session.sub && sideTotal) {
+          badges.append(node("span", "badge", `${sideTotal} side agent${sideTotal === 1 ? "" : "s"}`));
+        }
+        if (session.sub) badges.append(node("span", "badge", session.orphan ? "side · parent hidden" : "side agent"));
+        if (session.queued) badges.append(node("span", "badge", `${session.queued} queued`));
+        if (session.model) badges.append(node("span", "badge", session.model));
+        if (badges.childElementCount) button.append(badges);
+        button.addEventListener("click", () => selectBoardSession(key, true));
+        results.append(button);
+      });
+      if (activeKey) {
+        [...results.querySelectorAll(".board-session")]
+          .find(button => button.dataset.boardKey === activeKey)?.focus();
+      }
+    }
+
+    function selectedBoardSession(payload) {
+      const sessions = payload.sessions || [];
+      let selected = sessions.find(session => boardKey(session) === state.board.selected);
+      if (!selected) selected = sessions.find(session => session.working) || sessions[0];
+      state.board.selected = selected ? boardKey(selected) : "";
+      return selected;
+    }
+
+    function selectBoardSession(key, reveal) {
+      const payload = state.board.payload;
+      if (!payload) return;
+      const session = (payload.sessions || []).find(item => boardKey(item) === key);
+      if (!session) return;
+      state.board.navigationError = "";
+      state.board.selected = key;
+      renderBoardRail(payload);
+      renderBoardDetail(session, payload);
+      reader.scrollTop = 0;
+      if (reveal && mobileLayout()) document.body.classList.add("board-detail");
+    }
+
+    function showBoardList() {
+      document.body.classList.remove("board-detail");
+      const selected = [...results.querySelectorAll(".board-session")]
+        .find(button => button.dataset.boardKey === state.board.selected);
+      selected?.focus();
+    }
+
+    function showHistoryList() {
+      document.body.classList.remove("history-detail");
+      const selected = [...results.querySelectorAll(".result")]
+        .find(button => button.getAttribute("aria-current") === "true");
+      selected?.focus();
+    }
+
+    function showHistoryDetail() {
+      if (mobileLayout()) document.body.classList.add("history-detail");
+    }
+
+    function renderBoard() {
+      if (state.surface !== "board") return;
+      const railScroll = results.scrollTop;
+      const readerScroll = reader.scrollTop;
+      const focusAction = document.activeElement?.dataset?.boardAction || "";
+      const payload = state.board.payload;
+      if (!payload) {
+        count.textContent = state.board.lastError ? "unavailable" : "connecting";
+        showRailNotice(state.board.lastError || "Connecting to the live board…", Boolean(state.board.lastError));
+        const empty = node("div", "empty");
+        empty.append(node("div", `empty-glyph${state.board.lastError ? "" : " spinner"}`, "//"));
+        empty.append(node("h1", "", state.board.lastError ? "Live board unavailable." : "Connecting to live activity…"));
+        empty.append(node("p", "", state.board.lastError
+          ? "The explorer will retry while this view stays open."
+          : "This view is local, read-only, and updates while visible."));
+        reader.replaceChildren(empty);
+        return;
+      }
+      const selected = selectedBoardSession(payload);
+      renderBoardRail(payload);
+      renderBoardDetail(selected, payload);
+      results.scrollTop = railScroll;
+      reader.scrollTop = readerScroll;
+      if (focusAction) reader.querySelector(`[data-board-action="${focusAction}"]`)?.focus();
+    }
+
+    function scheduleBoard(delay) {
+      window.clearTimeout(state.board.timer);
+      state.board.timer = null;
+      if (state.surface !== "board" || document.hidden || state.board.loading) return;
+      state.board.timer = window.setTimeout(loadBoard, delay);
+    }
+
+    async function loadBoard() {
+      if (state.surface !== "board" || document.hidden || state.board.loading) return;
+      state.board.loading = true;
+      const epoch = state.board.epoch;
+      const controller = new AbortController();
+      state.board.controller = controller;
+      try {
+        const payload = await request("/api/board", { signal: controller.signal });
+        if (state.surface !== "board" || epoch !== state.board.epoch) return;
+        state.board.payload = payload;
+        state.board.failures = 0;
+        state.board.lastError = "";
+        renderBoard();
+      } catch (error) {
+        if (error.name === "AbortError" || epoch !== state.board.epoch) return;
+        state.board.failures += 1;
+        state.board.lastError = "Live refresh failed; retrying.";
+        renderBoard();
+      } finally {
+        if (state.board.controller === controller) state.board.controller = null;
+        if (epoch === state.board.epoch) state.board.loading = false;
+        const delay = Math.min(8000, 1000 * (2 ** Math.min(state.board.failures, 3)));
+        scheduleBoard(delay);
+      }
+    }
+
+    async function loadHistoryWindow(
+        session, turn, radius, reveal, loadingTitle, errorTitle) {
+      const epoch = ++state.contextEpoch;
+      state.contextController?.abort();
+      const controller = new AbortController();
+      state.contextController = controller;
+      state.contextRadius = radius;
+      if (reveal) showHistoryDetail();
+      const loading = node("div", "empty");
+      loading.append(node("div", "empty-glyph spinner", "//"));
+      loading.append(node("h1", "", loadingTitle));
+      reader.replaceChildren(loading);
+      try {
+        const params = new URLSearchParams({
+          session: String(session), turn: String(turn), radius: String(radius)
+        });
+        const payload = await request(`/api/around?${params}`, { signal: controller.signal });
+        if (epoch !== state.contextEpoch || state.surface !== "history") return;
+        renderWindow(payload);
+      } catch (error) {
+        if (error.name === "AbortError" || epoch !== state.contextEpoch) return;
+        const empty = node("div", "empty");
+        empty.append(node("h1", "", errorTitle));
+        empty.append(node("p", "", error.message));
+        reader.replaceChildren(empty);
+      }
+    }
+
+    async function openHit(index, reveal = true) {
+      const hit = state.hits[index];
+      if (!hit) return;
+      selectResult(index);
+      await loadHistoryWindow(
+        hit.session, hit.turn ?? 0, 4, reveal,
+        "Reading around the hit…", "This context is unavailable.");
+    }
+
+    async function openChat(index) {
+      const chat = state.chats[index];
+      if (!chat) return;
+      selectResult(index);
+      await loadHistoryWindow(
+        chat.session, 2147483647, 6, true,
+        "Opening the latest turns…", "This chat is unavailable.");
+    }
+
+    async function openBoardInHistory(session) {
+      const epoch = ++state.contextEpoch;
+      state.contextController?.abort();
+      const controller = new AbortController();
+      state.contextController = controller;
+      const params = new URLSearchParams({
+        session: String(session.session), turn: "2147483647", radius: "6"
+      });
+      try {
+        const payload = await request(`/api/around?${params}`, { signal: controller.signal });
+        if (epoch !== state.contextEpoch) return;
+        state.board.navigationError = "";
+        setSurface("history", false);
+        renderChats({
+          total: state.chatTotal, totals_exact: state.chatTotalsExact,
+          chats: state.chats
+        });
+        state.contextRadius = 6;
+        renderWindow(payload);
+        showHistoryDetail();
+      } catch (error) {
+        if (error.name === "AbortError" || epoch !== state.contextEpoch) return;
+        state.board.navigationError = "This live chat is not in the published history yet.";
+        renderBoardDetail(session, state.board.payload);
+      }
+    }
+
+    async function searchNow(rowLimit = SEARCH_PAGE_STEP) {
+      const query = input.value.trim();
+      if (!query) {
+        const message = "Enter a query to search the published index.";
+        showRailNotice(message);
+        showReaderNotice("Nothing to search yet.", message);
+        return;
+      }
+      setSurface("history", false);
+      state.recentEpoch += 1;
+      state.recentController?.abort();
+      state.recentController = null;
+      state.recentLoading = false;
+      state.contextEpoch += 1;
+      state.contextController?.abort();
+      state.contextController = null;
+      state.query = query;
+      state.searchLimit = Math.min(SEARCH_MAX_ROWS, Math.max(1, rowLimit));
+      setHistoryView("search");
+      count.textContent = "searching";
+      showRailNotice("Scanning history…");
+      showReaderNotice("Searching history…", "The best matching context will open here.");
+      const epoch = ++state.searchEpoch;
+      state.searchController?.abort();
+      const controller = new AbortController();
+      state.searchController = controller;
+      try {
+        const params = new URLSearchParams({
+          q: query, mode: state.mode, sort: state.sort,
+          n: String(state.searchLimit)
+        });
+        const payload = await request(`/api/search?${params}`, { signal: controller.signal });
+        if (epoch !== state.searchEpoch || state.surface !== "history") return;
+        renderResults(payload);
+      } catch (error) {
+        if (error.name === "AbortError" || epoch !== state.searchEpoch) return;
+        count.textContent = "unavailable";
+        showRailNotice(error.message, true);
+        showReaderNotice("Search unavailable.", error.message, true);
+      }
+    }
+
+    form.addEventListener("submit", event => {
+      event.preventDefault();
+      searchNow(SEARCH_PAGE_STEP);
+    });
+
+    historySurface.addEventListener("click", () => {
+      setSurface("history");
+      if (state.historyView === "recent") {
+        refreshRecent({ force: true, preserveReader: true });
+      }
+    });
+    boardSurface.addEventListener("click", () => setSurface("board"));
+
+    document.querySelectorAll("[data-mode]").forEach(button => {
+      button.addEventListener("click", () => {
+        state.mode = button.dataset.mode;
+        if (state.mode === "semantic") state.sort = "score";
+        document.querySelectorAll("[data-mode]").forEach(item => {
+          item.setAttribute("aria-pressed", String(item === button));
+        });
+        document.querySelectorAll("[data-sort]").forEach(item => {
+          item.setAttribute("aria-pressed", String(item.dataset.sort === state.sort));
+        });
+        sortSwitch.hidden = state.historyView !== "search" || state.mode === "semantic";
+        if (input.value.trim()) searchNow(SEARCH_PAGE_STEP);
+        else if (canAutofocus()) input.focus();
+      });
+    });
+
+    document.querySelectorAll("[data-sort]").forEach(button => {
+      button.addEventListener("click", () => {
+        if (state.mode === "semantic") return;
+        state.sort = button.dataset.sort;
+        document.querySelectorAll("[data-sort]").forEach(item => {
+          item.setAttribute("aria-pressed", String(item === button));
+        });
+        if (input.value.trim()) searchNow(SEARCH_PAGE_STEP);
+      });
+    });
+
+    recentButton.addEventListener("click", () => {
+      abortHistoryRequests();
+      renderChats({
+        total: state.chatTotal, totals_exact: state.chatTotalsExact,
+        chats: state.chats
+      });
+      refreshRecent({ force: true, announce: true });
+    });
+
+    document.addEventListener("keydown", event => {
+      const typing = event.target === input;
+      if (event.key === "/" && !typing && canAutofocus()) {
+        event.preventDefault();
+        input.focus();
+        return;
+      }
+      if (event.key === "Escape" && state.surface === "board") {
+        if (document.body.classList.contains("board-detail")) showBoardList();
+        else setSurface("history");
+        return;
+      }
+      if (event.key === "Escape" && document.body.classList.contains("history-detail")) {
+        showHistoryList();
+        return;
+      }
+      if (event.key === "Escape" && state.historyView !== "recent") {
+        renderChats({
+          total: state.chatTotal, totals_exact: state.chatTotalsExact,
+          chats: state.chats
+        });
+        return;
+      }
+      if (typing || !["j", "k"].includes(event.key)) return;
+      const buttons = [...results.querySelectorAll(".result")];
+      if (!buttons.length) return;
+      event.preventDefault();
+      const delta = event.key === "j" ? 1 : -1;
+      const current = buttons.findIndex(button => button.getAttribute("aria-current") === "true");
+      const origin = current >= 0 ? current : state.active;
+      const next = Math.min(buttons.length - 1, Math.max(0, origin + delta));
+      buttons[next].focus();
+      buttons[next].click();
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopBoardPolling();
+      else if (state.surface === "board") scheduleBoard(0);
+      else refreshRecentOnActivation();
+    });
+    window.addEventListener("focus", refreshRecentOnActivation);
+    window.addEventListener("pageshow", refreshRecentOnActivation);
+
+    async function start() {
+      const hash = new URLSearchParams(location.hash.slice(1));
+      const bootstrap = hash.get("bootstrap");
+      try {
+        if (bootstrap) {
+          await request("/auth", {
+            method: "POST",
+            headers: { "X-Agrep-Bootstrap": bootstrap }
+          });
+          history.replaceState(null, "", location.pathname);
+        }
+        const [status, chats] = await Promise.all([
+          request("/api/status"), request("/api/chats?n=80")
+        ]);
+        state.indexed = Boolean(status.indexed);
+        corpus.textContent = status.indexed
+          ? `${Number(status.sessions).toLocaleString()} chats · ${Number(status.messages).toLocaleString()} rows`
+          : "index not built";
+        renderChats(chats);
+        state.ready = true;
+        state.lastRecentRequestAt = Date.now();
+        document.body.dataset.surface = "history";
+        if (canAutofocus()) input.focus();
+      } catch (error) {
+        corpus.textContent = "unavailable";
+        showRailNotice(error.message, true);
+        showReaderNotice("Explorer unavailable.", error.message, true);
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>

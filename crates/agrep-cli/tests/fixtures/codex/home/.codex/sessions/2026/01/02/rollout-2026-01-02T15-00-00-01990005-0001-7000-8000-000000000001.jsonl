@@ -1,0 +1,6 @@
+{"timestamp":"2026-01-02T15:00:00Z","type":"session_meta","payload":{"id":"01990005-0001-7000-8000-000000000001","cwd":"/work/beta","thread_source":"subagent","parent_thread_id":"22222222-2222-4222-8222-222222222222","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-01-02T15:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"01990005-0002-7000-8000-000000000002"}}
+{"timestamp":"2026-01-02T15:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Codex agent history and tool output for an automatic approval assessment"}],"internal_chat_message_metadata_passthrough":{"turn_id":"01990005-0002-7000-8000-000000000002"}}}
+{"timestamp":"2026-01-02T15:00:02Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"inspect approval target\"}","call_id":"guardian-call"}}
+{"timestamp":"2026-01-02T15:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"guardian-call","output":"approval target inspected"}}
+{"timestamp":"2026-01-02T15:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"decision\":\"allow\"}"}]}}

@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "protocol": "index-lock-v1",
+  "canonical": {
+    "fields": ["pid", "start", "token", "label", "time"],
+    "pid": 12345,
+    "start": "proc_67890",
+    "token": "0123456789abcdef0123456789abcdef",
+    "label": "fixture",
+    "time_ms": 1700000000123,
+    "base64": "cGlkPTEyMzQ1IHN0YXJ0PXByb2NfNjc4OTAgdG9rZW49MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYgbGFiZWw9Zml4dHVyZSB0aW1lPTE3MDAwMDAwMDAuMTIzCg==",
+    "record": "pid=12345 start=proc_67890 token=0123456789abcdef0123456789abcdef label=fixture time=1700000000.123\n"
+  },
+  "constants": {
+    "timeout_ms": 1800000,
+    "publication_grace_ms": 3000,
+    "retry_initial_ms": 50,
+    "retry_factor_numerator": 3,
+    "retry_factor_denominator": 2,
+    "retry_max_ms": 1000,
+    "wait_notice_ms": 1000,
+    "wait_repeat_ms": 30000,
+    "max_record_bytes": 4096,
+    "max_pid": {
+      "posix": 2147483647,
+      "windows": 4294967295
+    }
+  },
+  "legacy_records": [
+    "pid=12345 start=proc_67890 token=0123456789abcdef01234567 label=python time=1700000000.123\n",
+    "pid=12345 start=proc_67890 token=12345-1700000000123456789 label=agrep-rs time=SystemTime { tv_sec: 1700000000, tv_nsec: 123000000 }\n",
+    "pid=12345 start=proc_67890 token=legacy label=fixture time=1700000000.123\r\n",
+    "pid=12345 start=proc_67890 token=legacy label=fixture time=1700000000.123 future=value\n",
+    "pid=12345\n",
+    "pid=12345 start=unknown\n"
+  ],
+  "raw_cases": [
+    {
+      "name": "invalid-utf8",
+      "base64": "cGlkPTEyMzQ1IHN0YXJ0PXByb2NfNjc4OTAgdG9rZW49bGVnYWN5IGxhYmVsPWZpeHR1cmUgdGltZT0xNzAwMDAwMDAwLjEyM/8K",
+      "classification": "malformed"
+    },
+    {
+      "name": "missing-lf",
+      "base64": "cGlkPTEyMzQ1IHN0YXJ0PXByb2NfNjc4OTAgdG9rZW49bGVnYWN5IGxhYmVsPWZpeHR1cmUgdGltZT0xNzAwMDAwMDAwLjEyMw==",
+      "classification": "malformed"
+    },
+    {
+      "name": "duplicate-pid",
+      "base64": "cGlkPTEyMzQ1IHBpZD0xMjM0NSBzdGFydD1wcm9jXzY3ODkwIHRva2VuPWxlZ2FjeSBsYWJlbD1maXh0dXJlIHRpbWU9MTcwMDAwMDAwMC4xMjMK",
+      "classification": "malformed"
+    },
+    {
+      "name": "unicode-nbsp-delimiter",
+      "base64": "cGlkPTEyMzQ1wqBzdGFydD11bmtub3duCg==",
+      "classification": "malformed"
+    },
+    {
+      "name": "unicode-decimal-pid",
+      "base64": "cGlkPdmh2aLZo9mk2aUgc3RhcnQ9dW5rbm93bgo=",
+      "classification": "malformed"
+    },
+    {
+      "name": "signed-pid",
+      "base64": "cGlkPSsxMjM0NSBzdGFydD11bmtub3duCg==",
+      "classification": "malformed"
+    },
+    {
+      "name": "empty",
+      "base64": "",
+      "classification": "malformed"
+    },
+    {
+      "name": "nul",
+      "base64": "cGlkPTEyMzQ1IHN0YXJ0PXByb2NfNjc4OTAAIHRva2VuPXgK",
+      "classification": "malformed"
+    },
+    {
+      "name": "extra-line",
+      "base64": "cGlkPTEyMzQ1IHN0YXJ0PXByb2NfNjc4OTAKZXh0cmE9dmFsdWUK",
+      "classification": "malformed"
+    },
+    {
+      "name": "pid-zero",
+      "base64": "cGlkPTAgc3RhcnQ9dW5rbm93bgo=",
+      "classification": "malformed"
+    },
+    {
+      "name": "pid-posix-overflow",
+      "base64": "cGlkPTIxNDc0ODM2NDggc3RhcnQ9dW5rbm93bgo=",
+      "classification": {
+        "posix": "malformed",
+        "windows": "owner",
+        "pid": 2147483648,
+        "start": "unknown"
+      }
+    },
+    {
+      "name": "pid-windows-overflow",
+      "base64": "cGlkPTQyOTQ5NjcyOTYgc3RhcnQ9dW5rbm93bgo=",
+      "classification": "malformed"
+    },
+    {
+      "name": "oversized",
+      "base64_repeat": {
+        "base64_byte": "eA==",
+        "count": 4097
+      },
+      "classification": "protected-nonrecord"
+    }
+  ]
+}

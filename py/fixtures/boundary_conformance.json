@@ -1,0 +1,1003 @@
+{
+  "schema": 2,
+  "python_unicode_version": "16.0.0",
+  "segmentation": [
+    {
+      "text": "caf\u00e9's",
+      "aligned": []
+    },
+    {
+      "text": "cafe\u0301's",
+      "aligned": []
+    },
+    {
+      "text": "caf\u00e9Bar",
+      "aligned": [
+        "bar",
+        "caf\u00e9"
+      ]
+    },
+    {
+      "text": "cafe\u0301Bar",
+      "aligned": [
+        "bar",
+        "caf\u00e9"
+      ]
+    },
+    {
+      "text": "don't",
+      "aligned": []
+    },
+    {
+      "text": "peakDetect",
+      "aligned": [
+        "peak"
+      ]
+    },
+    {
+      "text": "fooBar",
+      "aligned": [
+        "bar",
+        "foo"
+      ]
+    },
+    {
+      "text": "HTTPServer",
+      "aligned": [
+        "http"
+      ]
+    },
+    {
+      "text": "sha256",
+      "aligned": [
+        "256",
+        "sha"
+      ]
+    },
+    {
+      "text": "JSON\u89e3\u6790",
+      "aligned": [
+        "json",
+        "\u89e3\u6790"
+      ]
+    },
+    {
+      "text": "pho\u031b\u030942",
+      "aligned": [
+        "42",
+        "ph\u1edf"
+      ]
+    },
+    {
+      "text": "a\u20dd",
+      "aligned": [
+        "a\u20dd"
+      ]
+    },
+    {
+      "text": "\ud802\udd40a",
+      "aligned": []
+    },
+    {
+      "text": "a\u00bc",
+      "aligned": [
+        "a1\u20444"
+      ]
+    },
+    {
+      "text": "pic \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 set",
+      "aligned": [
+        "pic",
+        "set"
+      ]
+    },
+    {
+      "text": "get\u0130D",
+      "aligned": [
+        "get",
+        "i\u0307d"
+      ]
+    },
+    {
+      "text": "Ma\u00df",
+      "aligned": [
+        "mass"
+      ]
+    }
+  ],
+  "evaluations": [
+    {
+      "name": "camel",
+      "query": "bar",
+      "text": "fooBarBaz",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            3,
+            6
+          ]
+        ]
+      }
+    },
+    {
+      "name": "acronym",
+      "query": "http",
+      "text": "myHTTPServer",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            6
+          ]
+        ]
+      }
+    },
+    {
+      "name": "alpha_digit",
+      "query": "256",
+      "text": "sha256",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            3,
+            6
+          ]
+        ]
+      }
+    },
+    {
+      "name": "partial_digit",
+      "query": "2",
+      "text": "sha256",
+      "expected": {
+        "factor": 0.7,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            3,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "script_change",
+      "query": "\u03b4",
+      "text": "var\u0394x",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            3,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "interior",
+      "query": "akd",
+      "text": "peakDetect",
+      "expected": {
+        "factor": 0.25,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "punctuation",
+      "query": "filter",
+      "text": "cyber_filter",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            6,
+            12
+          ]
+        ]
+      }
+    },
+    {
+      "name": "partial_suffix",
+      "query": "filter",
+      "text": "cyber_filterilter",
+      "expected": {
+        "factor": 0.975,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            6,
+            12
+          ]
+        ]
+      }
+    },
+    {
+      "name": "apostrophe",
+      "query": "t",
+      "text": "don't",
+      "expected": {
+        "factor": 0.55,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            4,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sharp_s",
+      "query": "STRASSE",
+      "text": "Stra\u00dfe",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            6
+          ]
+        ]
+      }
+    },
+    {
+      "name": "combining",
+      "query": "\u00e9",
+      "text": "e\u0301",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hangul_jamo",
+      "query": "\uac00",
+      "text": "\u1100\u1161",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "casefold_expansion_span",
+      "query": "xxi",
+      "text": "xx\u0130foo",
+      "spans": [
+        [
+          0,
+          3
+        ]
+      ],
+      "expected": {
+        "factor": 0.625,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "validate_disabled",
+      "query": "i",
+      "text": "x\u0131x",
+      "spans": [
+        [
+          1,
+          2
+        ]
+      ],
+      "validate_spans": false,
+      "expected": {
+        "factor": 0.12,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "observed_floor",
+      "query": "akd",
+      "stats": {
+        "akd": [
+          372,
+          32
+        ]
+      },
+      "text": "peakDetect",
+      "expected": {
+        "factor": 0.12,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "geometric_mean",
+      "query": "akd xyz",
+      "stats": {
+        "akd": [
+          372,
+          32
+        ],
+        "xyz": [
+          100,
+          100
+        ]
+      },
+      "text": "peakDetect xyz",
+      "expected": {
+        "factor": 0.34641016151377546,
+        "qualities": [
+          0.0,
+          1.0
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ],
+          [
+            11,
+            14
+          ]
+        ]
+      }
+    },
+    {
+      "name": "duplicate_term",
+      "query": "akd akd",
+      "stats": {
+        "akd": [
+          10,
+          2
+        ]
+      },
+      "text": "akd and akd",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0,
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "exact_spans",
+      "query": "cyber filter",
+      "text": "cyber_filterilter and standalone filter",
+      "spans": [
+        [
+          0,
+          5
+        ],
+        [
+          6,
+          12
+        ]
+      ],
+      "expected": {
+        "factor": 0.9874208829065749,
+        "qualities": [
+          1.0,
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            5
+          ],
+          [
+            6,
+            12
+          ]
+        ]
+      }
+    },
+    {
+      "name": "automatic_phrase",
+      "query": "cyber filter",
+      "text": "cyber_filterilter and standalone filter",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0,
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            5
+          ],
+          [
+            33,
+            39
+          ]
+        ]
+      }
+    },
+    {
+      "name": "unsegmented_interior",
+      "query": "\u6771\u4eac",
+      "text": "\u99d0\u6771\u4eac\u90fd",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            1,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "unsegmented_aligned",
+      "query": "\u6771\u4eac",
+      "text": "\u6771\u4eac tower",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "unsegmented_stats",
+      "query": "\u6771\u4eac",
+      "stats": {
+        "\u6771\u4eac": [
+          100,
+          0
+        ]
+      },
+      "text": "\u6771\u4eac\u90fd",
+      "expected": {
+        "factor": 0.6212121212121212,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "mapping_stats",
+      "query": "akd",
+      "stats": {
+        "akd": {
+          "n": 10,
+          "s": 2
+        }
+      },
+      "text": "peakDetect",
+      "expected": {
+        "factor": 0.23809523809523814,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "half_quality_stats",
+      "query": "akd",
+      "stats": {
+        "akd": [
+          10,
+          2
+        ]
+      },
+      "text": "xakd",
+      "expected": {
+        "factor": 0.6190476190476191,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            1,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stats_over",
+      "query": "akd",
+      "stats": {
+        "akd": [
+          10,
+          50
+        ]
+      },
+      "text": "peakDetect",
+      "expected": {
+        "factor": 0.4285714285714286,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stats_negative",
+      "query": "akd",
+      "stats": {
+        "akd": [
+          10,
+          -5
+        ]
+      },
+      "text": "peakDetect",
+      "expected": {
+        "factor": 0.19047619047619047,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stats_unseen",
+      "query": "akd",
+      "stats": {
+        "akd": [
+          0,
+          7
+        ]
+      },
+      "text": "peakDetect",
+      "expected": {
+        "factor": 0.25,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "missing_term",
+      "query": "one two",
+      "text": "one only",
+      "expected": {
+        "factor": 0.5,
+        "qualities": [
+          1.0,
+          0.0
+        ],
+        "match_class": "partial",
+        "matched": false,
+        "spans": [
+          [
+            0,
+            3
+          ],
+          null
+        ]
+      }
+    },
+    {
+      "name": "empty_query",
+      "query": " -_ ",
+      "text": "anything",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [],
+        "match_class": "partial",
+        "matched": true,
+        "spans": []
+      }
+    },
+    {
+      "name": "span_count_error",
+      "query": "one two",
+      "text": "one two",
+      "spans": [
+        [
+          0,
+          3
+        ]
+      ],
+      "expected": {
+        "error": "one span is required per query token"
+      }
+    },
+    {
+      "name": "span_validation_error",
+      "query": "one two",
+      "text": "one two",
+      "spans": [
+        [
+          4,
+          7
+        ],
+        [
+          0,
+          3
+        ]
+      ],
+      "expected": {
+        "error": "span does not identify its query token"
+      }
+    },
+    {
+      "name": "negative_span_error",
+      "query": "akd",
+      "text": "peakDetect",
+      "spans": [
+        [
+          -3,
+          3
+        ]
+      ],
+      "expected": {
+        "error": "boundary span outside text"
+      }
+    },
+    {
+      "name": "reversed_span_error",
+      "query": "akd",
+      "text": "peakDetect\u6771",
+      "spans": [
+        [
+          3,
+          1
+        ]
+      ],
+      "validate_spans": false,
+      "expected": {
+        "error": "boundary span outside text"
+      }
+    },
+    {
+      "name": "long_span_error",
+      "query": "\u6771\u4eac",
+      "text": "\u6771\u4eac\u90fd",
+      "spans": [
+        [
+          0,
+          999
+        ]
+      ],
+      "expected": {
+        "error": "boundary span outside text"
+      }
+    },
+    {
+      "name": "unicode16_casefold",
+      "query": "\ua7cc",
+      "text": "x\ua7cdy",
+      "expected": {
+        "factor": 0.12,
+        "qualities": [
+          0.0
+        ],
+        "match_class": "interior",
+        "matched": true,
+        "spans": [
+          [
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "unicode16_separator",
+      "query": "a",
+      "text": "\ud833\udc00a",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ccc_zero_mark",
+      "query": "a",
+      "text": "a\u20ddy",
+      "expected": {
+        "factor": 0.55,
+        "qualities": [
+          0.5
+        ],
+        "match_class": "partial",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "emoji_zwj",
+      "query": "y",
+      "text": "x\ud83d\udc69\u200d\ud83d\udcbby",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            4,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nfc_cafe",
+      "query": "caf\u00e9",
+      "text": "caf\u00e9Bar",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nfd_cafe",
+      "query": "caf\u00e9",
+      "text": "cafe\u0301Bar",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nfc_bar",
+      "query": "bar",
+      "text": "caf\u00e9Bar",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            4,
+            7
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nfd_bar",
+      "query": "bar",
+      "text": "cafe\u0301Bar",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            5,
+            8
+          ]
+        ]
+      }
+    },
+    {
+      "name": "compatibility",
+      "query": "k",
+      "text": "\u212a",
+      "expected": {
+        "factor": 1.0,
+        "qualities": [
+          1.0
+        ],
+        "match_class": "aligned",
+        "matched": true,
+        "spans": [
+          [
+            0,
+            1
+          ]
+        ]
+      }
+    }
+  ]
+}

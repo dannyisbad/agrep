@@ -1,0 +1,14 @@
+=== messages.jsonl (3 lines) ===
+{"id":"crush:sc1:0","agent":"crush","project":"crush","session":"sc1","ts":1767348000000,"turn":0,"text":"convert the readme to asciidoc","content_digest":"cbbf","who":"user","model":"gpt-5.5","model_source":"explicit"}
+{"id":"crush:sc2:0","agent":"crush","project":"crush","session":"sc2","ts":1767348100000,"turn":0,"text":"add a smoke test","content_digest":"8812","who":"user","model":"gpt-5.5","model_source":"explicit"}
+{"id":"crush:sc3:0","agent":"crush","project":"crush","session":"sc3","ts":1767348200000,"turn":0,"text":"verify the asciidoc headings","content_digest":"008d","who":"subagent","model":"gpt-5.5","model_source":"explicit"}
+=== replies.jsonl (3 lines) ===
+{"id":"crush:sc1:0","reply":"Converted README.md to README.adoc.","content_digest":"efb8","reply_chars":35,"reply_truncated":false}
+{"id":"crush:sc2:0","reply":"Added tests/smoke.rs with one assertion.","content_digest":"7531","reply_chars":40,"reply_truncated":false}
+{"id":"crush:sc3:0","reply":"All converted headings retain their levels.","content_digest":"0349","reply_chars":43,"reply_truncated":false}
+=== sessions.jsonl (3 lines) ===
+{"session":"sc1","agent":"crush","project":"crush","n":1,"first_ts":1767348000000,"last_ts":1767348000000,"first_text":"convert the readme to asciidoc"}
+{"session":"sc2","agent":"crush","project":"crush","n":1,"first_ts":1767348100000,"last_ts":1767348100000,"first_text":"add a smoke test"}
+{"session":"sc3","agent":"crush","project":"crush","n":1,"first_ts":1767348200000,"last_ts":1767348200000,"first_text":"verify the asciidoc headings","parent":"sc1"}
+=== events/crush-sc1--ded8a4247ce8f1305f185ed1bf4a6eefd677a075ca021d1a.jsonl (1 lines) ===
+{"ts":1767348001000,"kind":"tool","name":"bash","input":"pandoc README.md -o README.adoc","output":"wrote README.adoc","input_chars":31,"output_chars":17,"output_bytes":17,"ok":true,"call_id":"tcx"}

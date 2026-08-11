@@ -1,0 +1,8 @@
+{"type":"session_meta","payload":{"id":"01990001-0002-7000-8000-000000000002","parent_thread_id":"01990001-0001-7000-8000-000000000001","cwd":"/work/legacy","thread_source":"subagent","source":"vscode"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"01990001-0003-7000-8000-000000000003"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n<INSTRUCTIONS>injected</INSTRUCTIONS>"}]}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"01990001-0003-7000-8000-000000000003"}}
+{"type":"response_item","timestamp":"2026-01-02T13:00:00.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"verify the legacy direct child path"}]}}
+{"type":"response_item","timestamp":"2026-01-02T13:00:01.000Z","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"inspect legacy child\"}","call_id":"legacy_child_call","status":"completed"}}
+{"type":"response_item","timestamp":"2026-01-02T13:00:02.000Z","payload":{"type":"function_call_output","call_id":"legacy_child_call","output":"legacy child output"}}
+{"type":"response_item","timestamp":"2026-01-02T13:00:03.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Legacy direct child retained."}]}}
