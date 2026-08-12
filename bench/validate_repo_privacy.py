@@ -102,6 +102,10 @@ def _path_reason(relative: str) -> str | None:
         return "local or transcript-derived evidence"
     if relative.startswith("bench/render/"):
         return "private capture or agent scratch tree"
+    parts = relative.split("/")
+    if (parts[0] == "bench"
+            and any(part in {"runs", ".claude", ".codex"} for part in parts[1:])):
+        return "private capture or agent scratch tree"
     if relative.endswith((".local.md", ".local.json")):
         return "local-only metadata"
     return None
