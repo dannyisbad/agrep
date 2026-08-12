@@ -368,7 +368,7 @@ fn write_session_family_aggregate(
 
 /// Publish only the parent-census proof for an already edge-proven session index.
 ///
-/// Goal 9's legacy upgrade uses this narrow path so it can generation-bind an
+/// The legacy upgrade uses this narrow path so it can generation-bind an
 /// unchanged v4 publication without replacing any of that publication's six
 /// proved artifacts.
 pub fn write_session_family_meta(

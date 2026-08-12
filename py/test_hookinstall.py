@@ -66,6 +66,14 @@ class ClaudeHookTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), self.shipped)
         self.assertIn("compact-contract.md", self._registered_command())
 
+    def test_payload_gates_recovery_on_a_missing_fact(self) -> None:
+        text = self.shipped.decode("utf-8")
+        self.assertIn(
+            "If the summary fully states those facts, use it and do not retrieve history.",
+            text,
+        )
+        self.assertIn("If it only names or alludes to a needed exact value", text)
+
     def test_settings_sidecars_are_never_touched(self) -> None:
         self.settings.write_text("{}", encoding="utf-8")
         backup = self.settings.with_suffix(".json.bak")
@@ -417,6 +425,12 @@ class PiOmpExtensionTests(unittest.TestCase):
             self.assertTrue(hookinstall.install_pi_extensions(warn=False))
         for path in self.paths.values():
             self.assertEqual(path.read_bytes(), self.shipped)
+
+    def test_known_prior_payload_hashes_remain_upgradeable(self) -> None:
+        self.assertEqual(hookinstall.PRIOR_PI_EXTENSION_HASHES, frozenset({
+            "34c99ac023bca77e457359c36bc57f698e364e49aece0100c3135a4fe22ea55b",
+            "127c3cf0cc2afc4bd3d2aee86b589ec3a80810b896413e3b6e3f084869186e32",
+        }))
 
     def test_user_extension_is_preserved_while_other_agent_installs(
             self) -> None:

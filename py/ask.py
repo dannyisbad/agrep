@@ -1040,9 +1040,6 @@ class _MessageRefStore:
                 "semantic refs database lost a requested candidate")
         return [found[i] for i in requested]
 
-    def resolve_for_diagnostic(self, ordinals) -> list[dict]:
-        """Resolve immutable rows without a separate integrity-accounting lane."""
-        return self.resolve(ordinals)
 
 
 def _message_refs_prefix(identity: str) -> str:
@@ -1706,257 +1703,6 @@ def _top_indices(values: np.ndarray, n: int) -> np.ndarray:
     return selected[np.lexsort((selected, -values[selected]))]
 
 
-def _sabel_stage(stage: str, active: list[str], kept: set[str], *,
-                 keep_reason: str, drop_reason: str,
-                 retained_by: dict[str, str] | None = None,
-                 state: str = "applied", reason: str) -> dict:
-    retained_by = retained_by or {}
-    decisions = []
-    for candidate_id in active:
-        is_kept = candidate_id in kept
-        decisions.append({
-            "candidate_id": candidate_id,
-            "decision": "kept" if is_kept else "dropped",
-            "reason_code": keep_reason if is_kept else drop_reason,
-            "retained_as": (candidate_id if is_kept
-                            else retained_by.get(candidate_id)),
-        })
-    return {"stage": stage, "state": state, "reason": reason,
-            "decisions": decisions}
-
-
-def _sabel_grouped_candidate_loss(
-        query_text: str, generation: str, k: int, diagnostic: dict,
-        rows: list[dict], row_filters: dict | None,
-        excluded_family_id: int | None, serving_output_ordinals: list[int], *,
-        request_level: str = "hybrid",
-        request_filters: dict | None = None) -> dict:
-    """Build a validated, unlabeled shadow record from one serving q8 scan.
-
-    It deliberately computes only deterministic identities and retention sets.
-    No support judgment or serving score is changed.
-    """
-    import sabel_shadow
-
-    expected_keys = {
-        "q8_ordinals", "q8_scores", "f16_ordinals", "f16_scores",
-        "f16_groups", "group_count",
-    }
-    if not isinstance(diagnostic, dict) or set(diagnostic) != expected_keys:
-        raise ValueError("semantic shadow diagnostic has the wrong shape")
-    q8_ordinals = [int(value) for value in diagnostic["q8_ordinals"]]
-    q8_scores = [float(value) for value in diagnostic["q8_scores"]]
-    f16_ordinals = [int(value) for value in diagnostic["f16_ordinals"]]
-    f16_scores = [float(value) for value in diagnostic["f16_scores"]]
-    f16_groups = [int(value) for value in diagnostic["f16_groups"]]
-    group_count = int(diagnostic["group_count"])
-    count = len(f16_ordinals)
-    if (count != len(q8_ordinals) or count != len(q8_scores)
-            or count != len(f16_scores) or count != len(f16_groups)
-            or len(set(q8_ordinals)) != count
-            or set(q8_ordinals) != set(f16_ordinals)
-            or len(rows) != count
-            or not all(np.isfinite(q8_scores))
-            or not all(np.isfinite(f16_scores))):
-        raise ValueError("semantic shadow diagnostic is partial or misaligned")
-    row_by_ordinal = {int(row.get("ordinal", -1)): row for row in rows}
-    if set(row_by_ordinal) != set(f16_ordinals):
-        raise ValueError("semantic shadow source rows are partial or misaligned")
-    q8_by_ordinal = {
-        ordinal: (rank, q8_scores[rank - 1])
-        for rank, ordinal in enumerate(q8_ordinals, start=1)
-    }
-    group_by_ordinal = dict(zip(f16_ordinals, f16_groups))
-    candidates = []
-    id_by_ordinal: dict[int, str] = {}
-    for rank, (ordinal, f16_score) in enumerate(
-            zip(f16_ordinals, f16_scores), start=1):
-        row = row_by_ordinal[ordinal]
-        text = row.get("text")
-        if not isinstance(text, str):
-            raise ValueError("semantic shadow source row has no exact text")
-        source_id = row.get("id")
-        source_mid = row.get("mid")
-        if (isinstance(source_id, str) and source_id
-                and isinstance(source_mid, str) and source_mid
-                and source_id != source_mid):
-            raise ValueError("semantic shadow source identities conflict")
-        if not isinstance(source_id, str) or not source_id:
-            source_id = source_mid
-        session = row.get("session")
-        who = row.get("who")
-        if (not isinstance(source_id, str) or not source_id
-                or not isinstance(session, str) or not session
-                or not isinstance(who, str) or not who):
-            raise ValueError("semantic shadow source identity is incomplete")
-        turn = int(row.get("turn"))
-        q8_rank, q8_score = q8_by_ordinal[ordinal]
-        candidate_id = f"row-{ordinal}"
-        id_by_ordinal[ordinal] = candidate_id
-        candidates.append({
-            "candidate_id": candidate_id,
-            "ordinal": ordinal,
-            "source_id": source_id,
-            "session_id": session,
-            "family_group": group_by_ordinal[ordinal],
-            "turn": turn,
-            "who": who,
-            "content_digest": _result_content_digest(row),
-            "exact_copy_sha256": hashlib.sha256(
-                text.encode("utf-8", "surrogatepass")).hexdigest(),
-            "q8": {"rank": q8_rank, "score": q8_score},
-            "f16": {"rank": rank, "score": f16_score},
-        })
-
-    all_ids = [candidate["candidate_id"] for candidate in candidates]
-    candidate_by_id = {candidate["candidate_id"]: candidate
-                       for candidate in candidates}
-    eligible_ids = []
-    eligibility_reason: dict[str, str] = {}
-    for candidate in candidates:
-        candidate_id = candidate["candidate_id"]
-        row = row_by_ordinal[int(candidate["ordinal"])]
-        excluded = (excluded_family_id is not None
-                    and candidate["family_group"] == int(excluded_family_id))
-        matches = not excluded and _matches(row, row_filters)
-        if matches:
-            eligible_ids.append(candidate_id)
-        else:
-            eligibility_reason[candidate_id] = (
-                "excluded_family" if excluded else "row_filter")
-    eligibility_set = set(eligible_ids)
-    eligibility_decisions = []
-    for candidate_id in all_ids:
-        kept = candidate_id in eligibility_set
-        eligibility_decisions.append({
-            "candidate_id": candidate_id,
-            "decision": "kept" if kept else "dropped",
-            "reason_code": "eligible" if kept else eligibility_reason[candidate_id],
-            "retained_as": candidate_id if kept else None,
-        })
-    eligibility_stage = {
-        "stage": "eligibility_filter", "state": "applied",
-        "reason": "serving metadata and excluded-family filters",
-        "decisions": eligibility_decisions,
-    }
-    session_stage = _sabel_stage(
-        "session_max", eligible_ids, set(eligible_ids),
-        keep_reason="not_applied", drop_reason="not_applied",
-        state="not_applied",
-        reason="grouped q8 path groups directly by conversation family")
-
-    family_winner: dict[int, str] = {}
-    for candidate_id in eligible_ids:
-        family = int(candidate_by_id[candidate_id]["family_group"])
-        family_winner.setdefault(family, candidate_id)
-    family_kept = [candidate_id for candidate_id in eligible_ids
-                   if family_winner[int(candidate_by_id[candidate_id][
-                       "family_group"])] == candidate_id]
-    family_retained = {
-        candidate_id: family_winner[int(candidate_by_id[candidate_id][
-            "family_group"])]
-        for candidate_id in eligible_ids if candidate_id not in set(family_kept)
-    }
-    family_stage = _sabel_stage(
-        "family_max", eligible_ids, set(family_kept),
-        keep_reason="family_f16_max", drop_reason="lower_f16_within_family",
-        retained_by=family_retained,
-        reason="current serving path retains one f16 maximum per family")
-
-    output_ids = [id_by_ordinal[ordinal] for ordinal in serving_output_ordinals]
-    if output_ids != family_kept[:len(output_ids)]:
-        raise ValueError("semantic shadow output does not match serving family order")
-    output_set = set(output_ids)
-    output_stage = _sabel_stage(
-        "output", family_kept, output_set,
-        keep_reason="within_output_limit", drop_reason="outside_output_limit",
-        reason="current dense-only serving limit after family maximum")
-
-    ablations = []
-    for h in sabel_shadow.SEMANTIC_CANDIDATE_LOSS_H:
-        exact_first: dict[str, str] = {}
-        exact_kept = []
-        exact_retained = {}
-        for candidate_id in eligible_ids:
-            exact_hash = str(candidate_by_id[candidate_id]["exact_copy_sha256"])
-            representative = exact_first.setdefault(exact_hash, candidate_id)
-            if representative == candidate_id:
-                exact_kept.append(candidate_id)
-            else:
-                exact_retained[candidate_id] = representative
-        exact_stage = _sabel_stage(
-            "exact_copy", eligible_ids, set(exact_kept),
-            keep_reason="unique_exact_copy", drop_reason="exact_copy_of",
-            retained_by=exact_retained,
-            reason="cryptographic decoded-text identity collapse")
-
-        session_counts: dict[str, int] = {}
-        session_kept = []
-        for candidate_id in exact_kept:
-            session = str(candidate_by_id[candidate_id]["session_id"])
-            count_for_session = session_counts.get(session, 0)
-            if count_for_session < h:
-                session_kept.append(candidate_id)
-            session_counts[session] = count_for_session + 1
-        session_h_stage = _sabel_stage(
-            "session_top_h", exact_kept, set(session_kept),
-            keep_reason="within_session_top_h",
-            drop_reason="outside_session_top_h",
-            reason=f"shadow retention of H={h} unique rows per session")
-
-        family_counts: dict[int, int] = {}
-        family_h_kept = []
-        for candidate_id in session_kept:
-            family = int(candidate_by_id[candidate_id]["family_group"])
-            count_for_family = family_counts.get(family, 0)
-            if count_for_family < h:
-                family_h_kept.append(candidate_id)
-            family_counts[family] = count_for_family + 1
-        family_h_stage = _sabel_stage(
-            "family_top_h", session_kept, set(family_h_kept),
-            keep_reason="within_family_top_h",
-            drop_reason="outside_family_top_h",
-            reason=f"shadow retention of H={h} unique rows per family")
-        ablations.append({
-            "h": h,
-            "stages": [exact_stage, session_h_stage, family_h_stage],
-            "candidate_ids": family_h_kept,
-            "support_selection": {
-                "state": "not_run",
-                "reason": "unlabeled trace cannot infer direct support",
-            },
-            "family_diversity": {
-                "state": "deferred_after_support_selection",
-                "reason": "diversity cannot precede support selection in this ablation",
-            },
-        })
-
-    effective_request = sabel_shadow.semantic_effective_request(
-        query_text, request_level, max(0, int(k)), request_filters)
-    body = {
-        "schema": sabel_shadow.SEMANTIC_CANDIDATE_LOSS_SCHEMA,
-        "version": sabel_shadow.SEMANTIC_CANDIDATE_LOSS_VERSION,
-        "pipeline": "grouped_q8_f16",
-        "generation": generation,
-        "query_sha256": effective_request["query_sha256"],
-        "effective_request": effective_request,
-        "score_kinds": {"q8": "cosine-q8-v1", "f16": "cosine-f16-v1"},
-        "group_count": group_count,
-        "candidates": candidates,
-        "serving": {
-            "limit": max(0, int(k)),
-            "stages": [eligibility_stage, session_stage, family_stage, output_stage],
-            "output_candidate_ids": output_ids,
-        },
-        "ablations": ablations,
-    }
-    # Validate before the diagnostic crosses the semantic worker protocol. The
-    # observer replaces these temporary self-bindings with the real artifact ids.
-    sabel_shadow.validate_semantic_candidate_loss({
-        **body, "artifact_id": "pending-artifact",
-        "retrieval_id": "pending-retrieval",
-    })
-    return {"state": "captured", "record": body}
 
 
 def _family_representatives(sessions: list[str], scores: np.ndarray,
@@ -2092,10 +1838,7 @@ def _refuse_large_dense_fallback(refs, coverage: dict | None) -> None:
 
 
 def _q8_grouped_pool(query: np.ndarray, refs: _MessageRefStore,
-                     filters: dict | None, k: int, *,
-                     shadow_sink: dict | None = None,
-                     shadow_query: str = "",
-                     shadow_level: str = "hybrid"):
+                     filters: dict | None, k: int):
     if not _family_diversity_enabled(filters):
         return None
     generation = str(_CURRENT_MESSAGE_STATE.get("generation") or "")
@@ -2113,26 +1856,9 @@ def _q8_grouped_pool(query: np.ndarray, refs: _MessageRefStore,
         import semantic_q8
         reserved_groups = 1 + int(excluded_family_id is not None)
         group_k = min(256, max(128, int(k) + reserved_groups))
-        if shadow_sink is None:
-            result = semantic_q8.grouped_exact_candidates(
-                query, generation, k=group_k, heads=8, eligible=eligible)
-            diagnostic = None
-        else:
-            captured = semantic_q8.grouped_exact_candidates_with_shadow(
-                query, generation, k=group_k, heads=8, eligible=eligible)
-            if captured is None:
-                shadow_sink["capture"] = {
-                    "state": "unavailable",
-                    "reason": "grouped q8/f16 diagnostic was unavailable",
-                }
-                return None
-            result, diagnostic = captured
+        result = semantic_q8.grouped_exact_candidates(
+            query, generation, k=group_k, heads=8, eligible=eligible)
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-        if shadow_sink is not None:
-            shadow_sink["capture"] = {
-                "state": "unavailable",
-                "reason": "grouped q8/f16 diagnostic failed closed",
-            }
         return None
     if result is None:
         return None
@@ -2186,39 +1912,6 @@ def _q8_grouped_pool(query: np.ndarray, refs: _MessageRefStore,
             _q8_grouped_fast_path(row_filters))
         if excluded_family_present:
             candidate_count -= 1
-    if shadow_sink is not None:
-        try:
-            assert diagnostic is not None
-            raw_ordinals = [int(value)
-                            for value in diagnostic["f16_ordinals"]]
-            diagnostic_resolve = getattr(refs, "resolve_for_diagnostic", None)
-            if not callable(diagnostic_resolve):
-                raise ValueError(
-                    "semantic shadow source has no isolated diagnostic resolver")
-            resolved_raw = diagnostic_resolve(raw_ordinals)
-            raw_rows = []
-            for expected_ordinal, row in zip(raw_ordinals, resolved_raw):
-                exposed = row.get("ordinal")
-                if exposed is not None and int(exposed) != expected_ordinal:
-                    raise ValueError("semantic shadow row ordinal is misaligned")
-                raw_rows.append({**row, "ordinal": expected_ordinal})
-            output_ordinals = [
-                int(ordinals[position])
-                for position in kept_positions[:max(0, int(k))]
-            ]
-            shadow_sink["capture"] = _sabel_grouped_candidate_loss(
-                shadow_query, generation, k, diagnostic, raw_rows,
-                row_filters, (int(excluded_family_id)
-                              if excluded_family_id is not None else None),
-                output_ordinals, request_level=shadow_level,
-                request_filters=filters)
-        except (AssertionError, AttributeError, KeyError, OSError, RuntimeError,
-                TypeError, ValueError, sqlite3.DatabaseError) as exc:
-            shadow_sink["capture"] = {
-                "state": "unavailable",
-                "reason": ("grouped q8/f16 candidate-loss trace failed closed: "
-                           f"{type(exc).__name__}"),
-            }
     return (
         kept_rows,
         scores[np.asarray(kept_positions, dtype=np.int64)],
@@ -2487,16 +2180,6 @@ def _envelope(results: list[dict], candidate_sessions: int, meta: dict) -> dict:
     }
 
 
-def _attach_sabel_candidate_loss(
-        payload: dict, requested: bool, capture: dict | None,
-        fallback_reason: str) -> None:
-    if not requested:
-        return
-    import sabel_shadow
-    payload[sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD] = (
-        capture if isinstance(capture, dict) else {
-            "state": "unavailable", "reason": fallback_reason,
-        })
 
 
 def _attach_semantic_integrity(payload: dict, refs) -> dict:
@@ -2573,8 +2256,7 @@ def tool_search_chats(query: str, k: int = 5, filters: dict | None = None,
 
 
 def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
-                         group_session: bool = False, envelope: bool = False,
-                         *, shadow_candidate_trace: bool = False) -> str:
+                         group_session: bool = False, envelope: bool = False) -> str:
     k = max(1, min(int(k), SEMANTIC_MAX_RESULTS))
     meta_path = common.EMBEDDINGS_PATH.parent / "embeddings.meta"
     dim, idx_model = common.read_index_meta(meta_path)
@@ -2584,10 +2266,6 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
     fast_query = None
     fast_pool = None
     accelerator = None
-    shadow_sink = ({"capture": {
-        "state": "unavailable",
-        "reason": "grouped q8/f16 path was not served",
-    }} if shadow_candidate_trace else None)
     try:
         import semantic_q8
         fast_coverage = _require_current_message_index()
@@ -2597,9 +2275,7 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
             accelerator = semantic_q8.accelerator_coverage(generation)
             fast_query = _embed_query(query, idx_model)
             fast_pool = (_q8_grouped_pool(
-                fast_query, fast_refs, filters, k,
-                shadow_sink=shadow_sink, shadow_query=query,
-                shadow_level="message-session") if group_session else
+                fast_query, fast_refs, filters, k) if group_session else
                 _q8_flat_pool(fast_query, fast_refs, filters, k))
     except (OSError, RuntimeError, ValueError, TypeError,
             json.JSONDecodeError, sqlite3.DatabaseError):
@@ -2627,10 +2303,6 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
                               or bool(accelerator
                                       and not accelerator.get("complete")))
         _attach_semantic_integrity(payload, fast_refs)
-        _attach_sabel_candidate_loss(
-            payload, shadow_candidate_trace,
-            shadow_sink.get("capture") if shadow_sink is not None else None,
-            "message search did not serve grouped q8/f16")
         return json.dumps(payload if envelope else out)
     _refuse_large_dense_fallback(fast_refs, fast_coverage)
     # Never initialize ONNX just to learn the refs sidecar isn't ready; managed
@@ -2691,19 +2363,11 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
     if q8_shadow is not None:
         payload["_semantic_q8_shadow"] = q8_shadow
     _attach_semantic_integrity(payload, refs)
-    _attach_sabel_candidate_loss(
-        payload, shadow_candidate_trace, None,
-        "message search used dense fallback rather than grouped q8/f16")
     return json.dumps(payload if envelope else out)
 
 
 def _tool_search_hybrid_q8(query: str, k: int, filters: dict | None,
-                           timer: _SemanticTimer, dim: int, idx_model: str | None,
-                           *, shadow_candidate_trace: bool = False):
-    shadow_sink = ({"capture": {
-        "state": "unavailable",
-        "reason": "grouped q8/f16 path was not served",
-    }} if shadow_candidate_trace else None)
+                           timer: _SemanticTimer, dim: int, idx_model: str | None):
     try:
         import semantic_q8
         coverage = _require_current_message_index()
@@ -2721,15 +2385,8 @@ def _tool_search_hybrid_q8(query: str, k: int, filters: dict | None,
         timer.mark("embed")
         if _session_grouping_required(filters):
             pooled = _q8_session_pool(qv, refs, filters, k)
-            if shadow_sink is not None:
-                shadow_sink["capture"] = {
-                    "state": "unavailable",
-                    "reason": "q8 session-paged path has no grouped-head trace",
-                }
         else:
-            pooled = _q8_grouped_pool(
-                qv, refs, filters, k, shadow_sink=shadow_sink,
-                shadow_query=query)
+            pooled = _q8_grouped_pool(qv, refs, filters, k)
         if pooled is None:
             return None
         rows, dense, candidate_sessions = pooled
@@ -2776,17 +2433,12 @@ def _tool_search_hybrid_q8(query: str, k: int, filters: dict | None,
     payload["partial"] = (not bool(coverage.get("complete"))
                           or not bool(accelerator.get("complete")))
     _attach_semantic_integrity(payload, refs)
-    _attach_sabel_candidate_loss(
-        payload, shadow_candidate_trace,
-        shadow_sink.get("capture") if shadow_sink is not None else None,
-        "hybrid search did not serve grouped q8/f16")
     timer.mark("enrichment")
     return timer.dumps(payload)
 
 
 def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
-                       *, timing: bool | None = None,
-                       shadow_candidate_trace: bool = False) -> str:
+                       *, timing: bool | None = None) -> str:
     """Session-level semantic search over complete message coverage plus summaries.
 
     Every score and turn comes from the same message embedding. Optional summaries
@@ -2799,8 +2451,7 @@ def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
     _guard_embedder(idx_model, "message index", "embed.py")
     timer.mark("metadata")
     fast = _tool_search_hybrid_q8(
-        query, k, filters, timer, dim, idx_model,
-        shadow_candidate_trace=shadow_candidate_trace)
+        query, k, filters, timer, dim, idx_model)
     if fast is not None:
         return fast
     fallback_coverage = None
@@ -2834,9 +2485,6 @@ def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
         if q8_shadow is not None:
             payload["_semantic_q8_shadow"] = q8_shadow
         _attach_semantic_integrity(payload, refs)
-        _attach_sabel_candidate_loss(
-            payload, shadow_candidate_trace, None,
-            "hybrid search used dense fallback rather than grouped q8/f16")
         timer.mark("rank")
         return timer.dumps(payload)
 
@@ -2916,9 +2564,6 @@ def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
     if q8_shadow is not None:
         payload["_semantic_q8_shadow"] = q8_shadow
     _attach_semantic_integrity(payload, refs)
-    _attach_sabel_candidate_loss(
-        payload, shadow_candidate_trace, None,
-        "hybrid search used dense fallback rather than grouped q8/f16")
     timer.mark("enrichment")
     return timer.dumps(payload)
 

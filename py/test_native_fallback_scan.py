@@ -214,11 +214,26 @@ class NativeHydrationProof(unittest.TestCase):
             for name in corpusdb._DERIVED_PROOF_NAMES:
                 path = root / name
                 identity = corpusdb._proof_file_identity(path)
+                if corpusdb._PLATFORM_NAME == "posix":
+                    change_token = {
+                        "Metadata": corpusdb._unix_change_token(identity[2])}
+                elif corpusdb._PLATFORM_NAME == "nt":
+                    try:
+                        _change_time, usn = corpusdb._windows_file_state(
+                            path, include_usn=True)
+                        if usn is None:
+                            raise OSError("filesystem did not return a USN")
+                        change_token = {"Metadata": usn}
+                    except OSError:
+                        change_token = {
+                            "ContentSha256": list(
+                                corpusdb._content_sha256(path, identity))}
+                else:
+                    change_token = {"Metadata": 0}
                 files.append({
                     "name": name, "len": identity[0],
                     "modified_ns": identity[1],
-                    "change_token": {
-                        "Metadata": corpusdb._unix_change_token(identity[2])},
+                    "change_token": change_token,
                     "edge_hash": corpusdb._edge_hash(
                         path, identity[0], identity),
                 })

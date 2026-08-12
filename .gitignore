@@ -18,15 +18,7 @@
 # local-only: strategy notes + personal shell shims
 /WHERE-AGREP-EATS.md
 /agrep.ps1
-/GOAL.md
 /checklist.md
-
-# local-only evaluation inputs and reports
-/bench/semantic_worth_tasks.json
-/bench/semantic_worth_tasks.local.json
-/bench/semantic_calibration_tasks.local.json
-/bench/semantic_worth_results*
-/bench/blind-private*.json
 
 # python
 /py/.venv
@@ -84,13 +76,9 @@ py/_check.py
 /p3.out
 /rc.stderr
 
-# local campaign governance and agent scratch never belong in OSS history
+# local scratch
 *.local.md
 *.local.json
-/.goals-archive/
-/py/.codex-slop/
-/bench/adversarial/GOAL8_VERIFICATION.md
-/bench/adversarial/UX_AUDIT.json
 
 # OS cruft
 .DS_Store
@@ -99,13 +87,3 @@ Thumbs.db
 # prebuilt rust binary staged for wheel packaging (CI / local build)
 _bin/
 .codex/
-expert-review/
-extract-real20-top2.py
-
-# adoption-bench raw run outputs: contain real transcript text, never committed
-/bench/adoption/runs
-
-# local-only: audit evidence + one-off launchers carrying real box paths
-/RC2_AUDIT.md
-/RC2_AUDIT_FULL.json
-/bench/adoption/detach_run.py

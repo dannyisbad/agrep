@@ -1114,7 +1114,10 @@ def _unix_change_token(ctime_ns: int) -> int:
 
 
 def _rust_windows_usn_token(usn: int) -> int:
-    value = int(usn) & 0xFFFFFFFFFFFFFFFF
+    value = int(usn)
+    if value == 0:
+        raise OSError("file USN contains no journal evidence")
+    value &= 0xFFFFFFFFFFFFFFFF
     rotated = ((value << 7) | (value >> 57)) & 0xFFFFFFFFFFFFFFFF
     return rotated ^ 0x55534E5F46494C45
 
@@ -3637,6 +3640,7 @@ def dense_phrase_preflight(db: sqlite3.Connection, toks: list[str], flt: dict | 
     filtered, params = _filter_sql(flt)
     where = " WHERE " + " AND ".join(filtered) if filtered else ""
     pattern = re.compile(r"[\W_]*".join(re.escape(token) for token in toks), re.I)
+    min_phrase_chars = sum(len(token) for token in toks)
     refs: list[tuple[int, int, int]] = []
     started = time.perf_counter()
     examined = 0
@@ -3645,7 +3649,7 @@ def dense_phrase_preflight(db: sqlite3.Connection, toks: list[str], flt: dict | 
     try:
         for rowid, text in cursor:
             examined += 1
-            match = pattern.search(text)
+            match = pattern.search(text) if len(text) >= min_phrase_chars else None
             if match is None:
                 continue
             refs.append((int(rowid), match.start(), match.end()))
@@ -4471,7 +4475,8 @@ def count_tokens(q: str) -> list[str]:
     toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
     if not toks:
         return []
-    return [q.strip().lower()] if len(toks) == 1 else [t.lower() for t in toks]
+    return ([q.strip().lower()] if len(toks) == 1 else
+            list(dict.fromkeys(t.lower() for t in toks)))
 
 
 def count_rides_the_index(q: str) -> bool:
@@ -4493,7 +4498,7 @@ def keyword_count(db: sqlite3.Connection, q: str,
     lows = count_tokens(q)
     if not lows:
         return {"total": 0, "chats": 0, "tool_hits": 0, "exact": True}
-    toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
+    raw_toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
     _register_functions(db)
     where, params = _candidate_where(lows, flt)
     ceiling = None if cap is None else max(1, int(cap))
@@ -4518,11 +4523,11 @@ def keyword_count(db: sqlite3.Connection, q: str,
     select = "SELECT session, who, text FROM msgs" + where
     total = tools = 0
     chats: set[str] = set()
-    needle = q.strip() if len(toks) == 1 else None
+    needle = q.strip() if len(raw_toks) == 1 else None
     for session, who, text in db.execute(select, params):
         matched = (common.insensitive_span(text, needle) is not None
                    if needle is not None else
-                   all(common.insensitive_span(text, token) is not None for token in toks))
+                   all(common.insensitive_span(text, token) is not None for token in lows))
         if not matched:
             continue
         total += 1
@@ -4557,9 +4562,10 @@ def keyword(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None, *,
         # token gap = any non-alphanumeric run: [\W_] keeps underscore,
         # so "cyber filter" finds "cyber_filter".
         pat = re.compile(r"[\W_]*".join(re.escape(t) for t in toks), re.I)
+        min_phrase_chars = sum(len(t) for t in toks)
         for row in _candidates(db, toks, flt):
             cand += 1
-            m = pat.search(row[_TEXT])
+            m = pat.search(row[_TEXT]) if len(row[_TEXT]) >= min_phrase_chars else None
             if m:
                 hits.append(_hit(row, m.start(), m.end()))
     # cand >> hits means FTS surfaced rows the adjacency matcher then rejected - the exact
@@ -4730,6 +4736,7 @@ def keyword_terms(db: sqlite3.Connection, q: str, k: int, flt: dict | None = Non
                 "terms": {"hits": [], "total": 0, "chats": 0}}
     lows = [t.lower() for t in toks]
     pat = re.compile(r"[\W_]*".join(re.escape(t) for t in toks), re.I)
+    min_phrase_chars = sum(len(t) for t in toks)
     phrase_hits: list[dict] = []
     term_hits: list[dict] = []
     # Hot at corpus scale: the precomputed lowered tokens feed the span fast
@@ -4753,7 +4760,7 @@ def keyword_terms(db: sqlite3.Connection, q: str, k: int, flt: dict | None = Non
                 break
             spans.append(span)
         if not complete:
-            m = search(text)
+            m = search(text) if len(text) >= min_phrase_chars else None
             if m:
                 phrase_hit = _hit(row, m.start(), m.end())
                 phrase_hit["_agrep_row_key"] = row_key
@@ -4762,7 +4769,7 @@ def keyword_terms(db: sqlite3.Connection, q: str, k: int, flt: dict | None = Non
         term_hit = _spans_hit(row, spans)
         term_hit["_agrep_row_key"] = row_key
         term_hits.append(term_hit)
-        m = search(text)
+        m = search(text) if len(text) >= min_phrase_chars else None
         if m:
             phrase_hit = dict(term_hit)
             phrase_hit["snippet"] = _snip_at(text, m.start(), m.end())

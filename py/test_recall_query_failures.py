@@ -50,7 +50,7 @@ class RecallQueryFailureTests(unittest.TestCase):
             rc = recall.main(argv)
         return rc, stdout.getvalue(), stderr.getvalue()
 
-    def test_classic_snapshot_failures_are_terse_rc2(self) -> None:
+    def test_classic_snapshot_failures_are_terse(self) -> None:
         cases = (
             (
                 search.DirectSnapshotQueryError,
@@ -96,7 +96,7 @@ class RecallQueryFailureTests(unittest.TestCase):
         self.assertEqual(payload["hits"], [])
         self.assertEqual(stderr, "")
 
-    def test_classic_database_failures_are_terse_rc2(self) -> None:
+    def test_classic_database_failures_are_terse(self) -> None:
         cases = (
             (
                 search.QueryDatabaseBusyError,

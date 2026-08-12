@@ -831,6 +831,39 @@ class SegmentCompactionTests(unittest.TestCase):
                 embedding_segments.load_manifest(meta)["generation"],
                 base["generation"])
 
+    def test_transcript_publication_race_defers_at_final_manifest_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            meta = root / "embeddings.meta"
+            source = {"ingest_signature": "current"}
+            artifacts, hashes, refs = _inputs(
+                root, "base", ["a", "b"],
+                np.asarray([[1, 0], [0, 1]], dtype=np.float32), [1, 2])
+            base = embedding_segments.publish_base(
+                meta, source=source, model_id="model", dim=2,
+                artifacts=artifacts, ids=["a", "b"], hashes=hashes,
+                refs=refs, coverage={"total": 2})
+            before = meta.read_bytes()
+            race = common.TranscriptPublicationRace(
+                "session-family publication precedes its ingest signature")
+
+            with (
+                mock.patch.object(
+                    semantic, "source_generation", side_effect=(source, race)),
+                mock.patch.object(
+                    compact, "_derive_artifacts", side_effect=_derived),
+            ):
+                result = compact.compact(
+                    meta, force=True, governor=lambda: None,
+                    check_every_rows=1)
+
+            self.assertEqual(result["state"], "deferred")
+            self.assertIn("session-family publication", result["reason"])
+            self.assertEqual(meta.read_bytes(), before)
+            self.assertEqual(
+                embedding_segments.load_manifest(meta)["generation"],
+                base["generation"])
+
     def test_q8_timeout_leaves_old_generation_and_removes_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

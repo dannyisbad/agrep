@@ -13,6 +13,8 @@ import time
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
+from package_metadata import normalize_distribution_version
+
 
 PLATFORMS = {
     "win_amd64",
@@ -29,8 +31,7 @@ class IncompleteRelease(RuntimeError):
 
 
 def expected_filenames(version: str) -> set[str]:
-    if not version or version.startswith("v") or "/" in version or "\\" in version:
-        raise ValueError(f"invalid release version: {version!r}")
+    version = normalize_distribution_version(version)
     wheels = {
         f"agrep-{version}-py3-none-{platform}.whl"
         for platform in PLATFORMS
@@ -65,6 +66,7 @@ def local_manifest(directory: Path, version: str) -> dict[str, str]:
 
 
 def remote_manifest(version: str) -> dict[str, str]:
+    version = normalize_distribution_version(version)
     url = f"https://pypi.org/pypi/agrep/{version}/json"
     try:
         with urlopen(url, timeout=30) as response:

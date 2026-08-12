@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -11,7 +12,9 @@ SPEC = importlib.util.spec_from_file_location(
     "agrep_pypi_release_test", ROOT / "bench" / "pypi_release.py")
 pypi_release = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
+sys.path.insert(0, str(ROOT / "bench"))
 SPEC.loader.exec_module(pypi_release)
+sys.path.pop(0)
 
 
 class PyPIReleaseTests(unittest.TestCase):
@@ -21,6 +24,11 @@ class PyPIReleaseTests(unittest.TestCase):
                 sorted(pypi_release.expected_filenames(version))):
             (root / name).write_bytes(f"distribution-{index}".encode())
         return pypi_release.local_manifest(root, version)
+
+    def test_prerelease_uses_canonical_python_distribution_names(self):
+        names = pypi_release.expected_filenames("0.2.0-rc.2")
+        self.assertIn("agrep-0.2.0rc2.tar.gz", names)
+        self.assertTrue(all("-0.2.0-rc.2-" not in name for name in names))
 
     def test_partial_release_stages_only_missing_exact_files(self):
         with tempfile.TemporaryDirectory() as temporary:

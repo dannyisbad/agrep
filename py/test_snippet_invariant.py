@@ -1,4 +1,4 @@
-"""The snippet-match invariant (goal-10 owner bug): every rendered snippet
+"""The snippet-match invariant: every rendered snippet
 contains the matched span, and highlighting marks the actual matched text.
 
 Pinned per lane: corpusdb FTS (phrase/word/terms/regex/content), the jsonl

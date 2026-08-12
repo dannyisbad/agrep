@@ -1962,6 +1962,9 @@ def semantic_lane_answered(status: Mapping | None) -> bool:
 # an accurate diagnosis; the notice's job is to shorten it, never to drop it.
 # Ordered: the blocking cause wins when a reason names several.
 SEMANTIC_LANE_CAUSES = (
+    ("AGREP_NO_SEM_WORKER",
+     "AGREP_NO_SEM_WORKER disables automatic meaning; unset it to enable the lane"),
+    ("agrep removal", "agrep removal blocks semantic serving"),
     ("model-not-cached",
      "semantic model not cached; `-s` or `agrep setup` fetches it once"),
     ("missing-embeddings", "meaning index is still building"),

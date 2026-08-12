@@ -69,8 +69,28 @@ def checkout_version(root: Path = ROOT) -> str:
     return versions[0]
 
 
+def normalize_distribution_version(raw: str) -> str:
+    match = re.fullmatch(
+        r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+        r"(?:-(a|alpha|b|beta|rc)\.(0|[1-9]\d*))?",
+        raw,
+    )
+    if match is None:
+        raise InvalidMetadata(f"unsupported release version: {raw!r}")
+    release = ".".join(match.group(1, 2, 3))
+    prerelease = match.group(4)
+    if prerelease is None:
+        return release
+    label = {"alpha": "a", "beta": "b"}.get(prerelease, prerelease)
+    return f"{release}{label}{match.group(5)}"
+
+
+def distribution_version(root: Path = ROOT) -> str:
+    return normalize_distribution_version(checkout_version(root))
+
+
 def expected_core_metadata(version: str, *, root: Path = ROOT) -> bytes:
-    if version != checkout_version(root):
+    if version != distribution_version(root):
         raise InvalidMetadata("archive version differs from agrep/__init__.py")
     if tomllib is None:
         raise InvalidMetadata("core metadata validation requires Python 3.11 or newer")

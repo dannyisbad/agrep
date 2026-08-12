@@ -672,7 +672,12 @@ def compact(
             }
         finally:
             shutil.rmtree(root, ignore_errors=True)
-    except (CompactionDeferred, indexd_runtime.DerivedWriteContended) as exc:
+    except (
+            CompactionDeferred,
+            indexd_runtime.DerivedWriteContended,
+            common.TranscriptPublicationRace,
+            embedding_segments.SegmentPublicationRace,
+    ) as exc:
         return {"state": "deferred", "reason": str(exc), **policy}
     finally:
         if metadata_db is not None:

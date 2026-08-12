@@ -1,6 +1,6 @@
 """A check that did not run earns no row, and no machine field pretends it did.
 
-Goal 10 asked the doctor surface for one deferral phrasing and got it: four
+The doctor surface has one deferral phrasing: four
 spellings became one, and every row that should not have existed still
 rendered. So none of these pins name a phrasing. They assert shapes a rewrite
 cannot satisfy - that a row is absent, that a render is empty, and that the
@@ -70,7 +70,7 @@ class UnrunChecksRenderNothing(unittest.TestCase):
 
         Not one row, not a footer, not a count of what was skipped.
         """
-        from test_goal10_doctor_slop import _report_snapshot, _semantic_state
+        from test_doctor_output import _report_snapshot, _semantic_state
         unrun = {"state": "status-deferred"}
         snapshot = _report_snapshot(
             paths={"data_dir": "/fixture", "data_source": "default",
@@ -116,7 +116,7 @@ class UnrunChecksRenderNothing(unittest.TestCase):
 
         Their absence is the contract: `--deep` is where they speak.
         """
-        from test_goal10_doctor_slop import _report_snapshot
+        from test_doctor_output import _report_snapshot
         routine = self.rows(_report_snapshot(
             model_attribution={"state": "not-inspected"},
             core={

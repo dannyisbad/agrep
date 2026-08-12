@@ -660,27 +660,6 @@ class SegmentQueryTests(unittest.TestCase):
             db.close()
 
 
-    def test_diagnostic_resolution_restores_serving_integrity_accounting(self):
-        refs = object.__new__(segment_query.SegmentRefStore)
-        refs._integrity_drops = {3}
-        refs._absent_drops = {4}
-        refs._resolve_considered = 7
-
-        def diagnostic_resolve(rowrefs):
-            self.assertEqual(rowrefs, [8, 9])
-            refs._integrity_drops.add(8)
-            refs._absent_drops.add(9)
-            refs._resolve_considered += 2
-            return [{"ordinal": 8}]
-
-        with mock.patch.object(
-                segment_query.SegmentRefStore, "resolve",
-                side_effect=diagnostic_resolve):
-            self.assertEqual(
-                refs.resolve_for_diagnostic([8, 9]), [{"ordinal": 8}])
-        self.assertEqual(refs._integrity_drops, {3})
-        self.assertEqual(refs._absent_drops, {4})
-        self.assertEqual(refs._resolve_considered, 7)
 
     @staticmethod
     def _fixture_rows_with_bad_text() -> list[dict]:

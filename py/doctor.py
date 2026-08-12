@@ -1327,9 +1327,10 @@ def _regular_file_identity(path: Path) -> list[int] | None:
     if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
             or bool(getattr(info, "st_file_attributes", 0) & reparse)):
         raise OSError(f"diagnostic evidence target is not a regular file: {path}")
-    # fileops uses NTFS ChangeTime on Windows. st_ctime_ns is creation time
-    # there, so it cannot invalidate a same-size rewrite whose mtime was reset.
-    return [int(value) for value in fileops.file_identity(path)]
+    # NTFS ChangeTime is not reliable on every Windows volume; the shared
+    # identity falls back to the Rust USN token or a stable content proof.
+    return [
+        int(value) for value in fileops.change_sensitive_file_identity(path)]
 
 
 def _quick_check_identity(path: Path) -> dict:

@@ -70,27 +70,6 @@ class RecallBudgetPriorityTests(unittest.TestCase):
         "0199bbbb-0000-7000-8000-000000000002",
     )
 
-    def test_returned_handle_provenance_ignores_quoted_content_tokens(self) -> None:
-        real = "@session-a:7.beef"
-        fake = "@fake:9.cafe"
-        payload = (
-            f"── {real} · codex · agrep\n"
-            f"     7 user: quoted historical token {fake}")
-        stdout = io.StringIO()
-        with mock.patch.object(recall.sabel_observer, "active",
-                               return_value=True), \
-                mock.patch.object(
-                    recall.sabel_observer, "record_stdout") as record_stdout, \
-                mock.patch.object(
-                    recall.sabel_observer,
-                    "record_returned_handles") as record_handles, \
-                contextlib.redirect_stdout(stdout):
-            recall._write_payload(
-                payload, 0, returned_handles=[real])
-
-        self.assertEqual(stdout.getvalue(), payload + "\n")
-        record_stdout.assert_called_once_with((payload + "\n").encode("utf-8"))
-        record_handles.assert_called_once_with([real])
 
     @classmethod
     def _result(cls) -> dict:

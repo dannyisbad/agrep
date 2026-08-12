@@ -95,7 +95,25 @@ class AgentContextContracts(unittest.TestCase):
         })
         self.assertEqual(identity.session, "pi-session")
         self.assertEqual(identity.reason, "pi")
-    def test_conflicting_agent_identities_fail_open_with_a_reason(self) -> None:
+
+    def test_direct_identity_outranks_presence_only_fingerprints(self) -> None:
+        cases = (
+            ("codex", {
+                "CODEX_THREAD_ID": "codex-session",
+                "CLAUDECODE": "1",
+            }),
+            ("pi", {
+                "AGREP_PI_SESSION_ID": "pi-session",
+                "CLAUDECODE": "1",
+            }),
+        )
+        for agent, env in cases:
+            with self.subTest(agent=agent):
+                identity = common.calling_identity(env)
+                self.assertEqual(identity.session, f"{agent}-session")
+                self.assertEqual(identity.reason, agent)
+
+    def test_conflicting_direct_agent_identities_fail_open(self) -> None:
         cases = (
             {
                 "CODEX_THREAD_ID": "stale-codex-thread",
@@ -103,16 +121,8 @@ class AgentContextContracts(unittest.TestCase):
                 "CLAUDECODE": "1",
             },
             {
-                "CODEX_THREAD_ID": "stale-codex-thread",
-                "CLAUDECODE": "1",
-            },
-            {
                 "AGREP_PI_SESSION_ID": "pi-session",
                 "CODEX_THREAD_ID": "codex-session",
-            },
-            {
-                "AGREP_PI_SESSION_ID": "pi-session",
-                "CLAUDECODE": "1",
             },
         )
         for env in cases:

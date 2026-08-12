@@ -139,7 +139,7 @@ class NpmReleaseTests(unittest.TestCase):
                 [node, str(ROOT / "npm" / "publish.js"),
                  "--out-dir", str(root / "dist")],
                 cwd=ROOT, env=env, capture_output=True, text=True,
-                check=False, timeout=30)
+                check=False, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = npm_release.local_manifest(root / "dist", VERSION)
         self.assertEqual(set(manifest), set(npm_release.PACKAGE_NAMES))

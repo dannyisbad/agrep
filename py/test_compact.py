@@ -281,7 +281,7 @@ class CompactTests(unittest.TestCase):
         self.assertIn("~semantic-weak", search._compact_line(weak, index))
         self.assertIn("~semantic", search._compact_line(strong, index))
         self.assertNotIn("~semantic-weak", search._compact_line(strong, index))
-        # M11: a strong score over a query that anchors nowhere is still weak
+        # A strong score over a query that anchors nowhere is still weak.
         unanchored = {**strong, "_sem_unanchored": True}
         self.assertIn("~semantic-weak", search._compact_line(unanchored, index))
 
@@ -1820,7 +1820,7 @@ class CompactTests(unittest.TestCase):
                 "--no-auto", "--color=never",
             ], _force_compact=True)
         self.assertEqual(rc, 0)
-        self.assertEqual(limits, [120])
+        self.assertEqual(limits, [search._DEEPER_QUERY_MIN_ROWS])
 
 def _window(session: str, center: int) -> dict:
     return {"session": session, "project": "proj", "agent": "claude",

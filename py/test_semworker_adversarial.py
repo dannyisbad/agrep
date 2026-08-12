@@ -406,28 +406,98 @@ class SemanticWorkerAdversarialTests(unittest.TestCase):
         self.assertFalse(
             semworker._descriptor_bound_to_lock(descriptor, inspected))
 
-    def test_disable_environment_bypasses_an_existing_descriptor(self) -> None:
+    def test_explicit_semantic_gate_bypasses_an_existing_descriptor(self) -> None:
         rec = self._descriptor()
         descriptor = (rec, self._snapshot(b"descriptor"))
-        for variable in ("AGREP_NO_SEM_WORKER", "AGREP_NO_DAEMON"):
-            with self.subTest(variable=variable), \
-                    mock.patch.dict(
-                        os.environ,
-                        {"AGREP_NO_SEM_WORKER": "", "AGREP_NO_DAEMON": "",
-                         variable: "1"}), \
-                    mock.patch.object(
-                        semworker, "_reconcile_descriptor",
-                        return_value=descriptor), \
-                    mock.patch.object(
-                        semworker, "_worker_request") as request, \
-                    mock.patch.object(
-                        semworker, "_semantic_owner_pending",
-                        return_value=False) as pending:
-                result = semworker.search_worker(
-                    "disabled worker", level="hybrid", k=3)
-            self.assertIsNone(result)
-            request.assert_not_called()
-            pending.assert_not_called()
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_SEM_WORKER": "1", "AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(
+                    semworker, "_reconcile_descriptor",
+                    return_value=descriptor), \
+                mock.patch.object(semworker, "_worker_request") as request, \
+                mock.patch.object(
+                    semworker, "_semantic_owner_pending",
+                    return_value=False) as pending:
+            result = semworker.search_worker(
+                "disabled worker", level="hybrid", k=3)
+            disabled_reason = semworker._worker_query_disabled_reason()
+        self.assertIsNone(result)
+        self.assertEqual(
+            disabled_reason,
+            "AGREP_NO_SEM_WORKER disables semantic worker queries")
+        request.assert_not_called()
+        pending.assert_not_called()
+
+    def test_no_daemon_still_queries_the_semantic_worker(self) -> None:
+        rec = self._descriptor()
+        payload = {"results": [], "score_kind": "cosine"}
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_SEM_WORKER": "", "AGREP_NO_DAEMON": "1"}), \
+                mock.patch.object(
+                    semworker.removal_fence, "background_removal_active",
+                    return_value=False), \
+                mock.patch.object(
+                    semworker, "_worker_coordination_refusal_reason",
+                    return_value=None), \
+                mock.patch.object(
+                    semworker, "_ensure_worker", return_value=rec) as ensure, \
+                mock.patch.object(
+                    semworker, "_worker_request",
+                    return_value=payload) as request:
+            result = semworker.search_worker(
+                "meaning survives", level="hybrid", k=3)
+            disabled_reason = semworker._worker_query_disabled_reason()
+        self.assertIs(result, payload)
+        self.assertIsNone(disabled_reason)
+        ensure.assert_called_once()
+        request.assert_called_once()
+
+    def test_no_daemon_still_starts_the_semantic_worker(self) -> None:
+        rec = self._descriptor()
+        claim = mock.Mock()
+        process = mock.Mock()
+        absent = semworker._WorkerOwner(semworker._WorkerOwnerState.ABSENT)
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_SEM_WORKER": "", "AGREP_NO_DAEMON": "1"}), \
+                mock.patch.object(
+                    semworker.removal_fence, "background_removal_active",
+                    return_value=False), \
+                mock.patch.object(
+                    semworker, "_worker_coordination_refusal_reason",
+                    return_value=None), \
+                mock.patch.object(
+                    semworker, "_reconcile_descriptor", return_value=None), \
+                mock.patch.object(
+                    semworker, "_descriptor_entry_present",
+                    return_value=False), \
+                mock.patch.object(
+                    semworker, "_inspect_worker_lock",
+                    side_effect=(absent, absent)), \
+                mock.patch.object(
+                    semworker, "_acquire_start_claim", return_value=claim), \
+                mock.patch.object(
+                    semworker, "_spawn_worker", return_value=process) as spawn, \
+                mock.patch.object(
+                    semworker, "_wait_for_worker", return_value=rec), \
+                mock.patch.object(semworker, "_release_start_claim") as release:
+            result = semworker._ensure_worker(0.2)
+        self.assertIs(result, rec)
+        spawn.assert_called_once_with(claim)
+        release.assert_called_once_with(claim)
+
+    def test_disable_environment_reason_precedes_removal_fence(self) -> None:
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_SEM_WORKER": "1", "AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(
+                    semworker.removal_fence, "background_removal_active",
+                    return_value=True):
+            self.assertEqual(
+                semworker._worker_query_disabled_reason(),
+                "AGREP_NO_SEM_WORKER disables semantic worker queries")
 
     def test_stop_http_zero_budget_never_opens_a_connection(self) -> None:
         rec = self._descriptor()

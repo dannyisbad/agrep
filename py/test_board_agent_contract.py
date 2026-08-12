@@ -195,7 +195,7 @@ class BoardPartialTests(unittest.TestCase):
         def snapshot(self) -> dict:
             return self.value
 
-    def test_json_partial_is_rc2_with_no_unrelated_rows_and_exact_retry(self) -> None:
+    def test_json_partial_has_no_unrelated_rows_and_exact_retry(self) -> None:
         watcher = self.Watcher(_snapshot(
             _row("unrelated", 100), booting=True))
         out, err = io.StringIO(), io.StringIO()
@@ -333,7 +333,7 @@ class BoardPartialTests(unittest.TestCase):
         self.assertEqual(payload["source"], "foreground")
         self.assertEqual(payload["sessions"][0]["handle"], "@fresh")
 
-    def test_json_complete_no_match_is_structured_rc1(self) -> None:
+    def test_json_complete_no_match_is_structured(self) -> None:
         watcher = self.Watcher(_snapshot(_row("unrelated", 100)))
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(
@@ -374,7 +374,7 @@ class BoardPartialTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("invalid result handle", err.getvalue())
 
-    def test_json_ambiguous_selector_is_structured_rc2(self) -> None:
+    def test_json_ambiguous_selector_is_structured(self) -> None:
         watcher = self.Watcher(_snapshot(
             _row("shared-one", 100), _row("shared-two", 200)))
         out, err = io.StringIO(), io.StringIO()

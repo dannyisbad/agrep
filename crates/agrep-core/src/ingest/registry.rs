@@ -347,7 +347,7 @@ impl WindowsFileIdentity {
 
 #[cfg(windows)]
 pub fn metadata_change_token(path: &Path, metadata: &fs::Metadata) -> std::io::Result<ChangeToken> {
-    windows_metadata_identity(path, metadata, false, false, false).map(|(token, _)| token)
+    windows_metadata_identity(path, metadata, false, false).map(|(token, _)| token)
 }
 
 #[cfg(windows)]
@@ -355,22 +355,7 @@ pub fn metadata_change_token_with_file_identity(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> std::io::Result<(ChangeToken, WindowsFileIdentity)> {
-    let (token, identity) = windows_metadata_identity(path, metadata, true, false, false)?;
-    let identity = identity.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "filesystem did not provide a stable file identity",
-        )
-    })?;
-    Ok((token, identity))
-}
-
-#[cfg(windows)]
-fn audit_metadata_change_token_with_file_identity(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> std::io::Result<(ChangeToken, WindowsFileIdentity)> {
-    let (token, identity) = windows_metadata_identity(path, metadata, true, false, true)?;
+    let (token, identity) = windows_metadata_identity(path, metadata, true, false)?;
     let identity = identity.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -385,7 +370,7 @@ pub fn content_sha256_with_file_identity(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> std::io::Result<([u8; 32], WindowsFileIdentity)> {
-    let (token, identity) = windows_metadata_identity(path, metadata, true, true, false)?;
+    let (token, identity) = windows_metadata_identity(path, metadata, true, true)?;
     let ChangeToken::ContentSha256(digest) = token else {
         unreachable!("forced content hashing returned metadata identity")
     };
@@ -420,11 +405,6 @@ fn windows_file_size_from_parts(high: u32, low: u32) -> std::io::Result<u64> {
         ));
     }
     Ok(size)
-}
-
-#[cfg(windows)]
-fn windows_audit_change_token(state: WindowsHandleState) -> ChangeToken {
-    ChangeToken::Metadata(state.change_time)
 }
 
 /// Handle identity without extent: what stays true of a file a writer is still appending to.
@@ -502,12 +482,22 @@ fn windows_handle_state(
     })
 }
 
+#[cfg(any(windows, test))]
+fn windows_usn_change_token(usn: i64) -> Option<ChangeToken> {
+    if usn == 0 {
+        None
+    } else {
+        Some(ChangeToken::Metadata(
+            (usn as u64).rotate_left(7) ^ 0x5553_4e5f_4649_4c45,
+        ))
+    }
+}
+
 #[cfg(windows)]
 fn windows_open_file_change_token(
     file: &fs::File,
     metadata: &fs::Metadata,
     force_content_hash: bool,
-    audit_change_time_fallback: bool,
 ) -> std::io::Result<(ChangeToken, WindowsHandleState)> {
     use std::io::Read;
     use std::os::windows::io::AsRawHandle;
@@ -585,29 +575,10 @@ fn windows_open_file_change_token(
                     "source was replaced while reading its freshness identity",
                 ));
             }
-            return Ok((
-                ChangeToken::Metadata((usn as u64).rotate_left(7) ^ 0x5553_4e5f_4649_4c45),
-                initial_identity,
-            ));
+            if let Some(token) = windows_usn_change_token(usn) {
+                return Ok((token, initial_identity));
+            }
         }
-    }
-
-    if audit_change_time_fallback {
-        // Use identity-only comparison: a file whose extent moved between the stat and this
-        // re-read is changing, not unreadable, and change_time already records the move.
-        let post = windows_handle_state(file.as_raw_handle())?;
-        if post.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || !same_open_file(&post, &initial_identity)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "source changed while reading its audit identity",
-            ));
-        }
-        return Ok((
-            windows_audit_change_token(initial_identity),
-            initial_identity,
-        ));
     }
 
     let mut provider = 0_usize;
@@ -682,7 +653,6 @@ fn windows_metadata_identity(
     metadata: &fs::Metadata,
     need_file_id: bool,
     force_content_hash: bool,
-    audit_change_time_fallback: bool,
 ) -> std::io::Result<(ChangeToken, Option<WindowsFileIdentity>)> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -696,12 +666,8 @@ fn windows_metadata_identity(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    let (token, initial_identity) = windows_open_file_change_token(
-        &file,
-        metadata,
-        force_content_hash,
-        audit_change_time_fallback,
-    )?;
+    let (token, initial_identity) =
+        windows_open_file_change_token(&file, metadata, force_content_hash)?;
     let path_after = fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -1282,7 +1248,7 @@ fn open_file_change_token(
     file: &fs::File,
     metadata: &fs::Metadata,
 ) -> std::io::Result<ChangeToken> {
-    windows_open_file_change_token(file, metadata, false, false).map(|(token, _)| token)
+    windows_open_file_change_token(file, metadata, false).map(|(token, _)| token)
 }
 
 #[cfg(not(windows))]
@@ -1902,30 +1868,20 @@ pub fn source_snapshot_coverage(bytes: &[u8]) -> SourceCoverage {
     snapshot.coverage()
 }
 
-fn source_file_with_mode(
+fn source_file(
     agent: &str,
     path: &Path,
     hash_content: bool,
     stable_sqlite: bool,
-    audit_identity: bool,
 ) -> anyhow::Result<Option<SourceFile>> {
     let before = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot stat {}", path.display())),
     };
-    source_file_from_meta_with_mode(
-        agent,
-        path,
-        hash_content,
-        stable_sqlite,
-        audit_identity,
-        before,
-    )
+    source_file_from_meta(agent, path, hash_content, stable_sqlite, before)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn source_file_from_meta(
     agent: &str,
     path: &Path,
@@ -1933,19 +1889,6 @@ fn source_file_from_meta(
     _stable_sqlite: bool,
     before: fs::Metadata,
 ) -> anyhow::Result<Option<SourceFile>> {
-    source_file_from_meta_with_mode(agent, path, hash_content, _stable_sqlite, false, before)
-}
-
-fn source_file_from_meta_with_mode(
-    agent: &str,
-    path: &Path,
-    hash_content: bool,
-    _stable_sqlite: bool,
-    audit_identity: bool,
-    before: fs::Metadata,
-) -> anyhow::Result<Option<SourceFile>> {
-    #[cfg(not(windows))]
-    let _ = audit_identity;
     if metadata_is_link(&before) || !before.is_file() {
         return Ok(None);
     }
@@ -1955,15 +1898,10 @@ fn source_file_from_meta_with_mode(
         .duration_since(std::time::UNIX_EPOCH)
         .with_context(|| format!("invalid modified time for {}", path.display()))?;
     #[cfg(windows)]
-    let (change_token, file_identity) = if audit_identity {
-        audit_metadata_change_token_with_file_identity(path, &before)
-            .map(|(token, identity)| (token, Some(identity)))
-    } else {
-        metadata_change_token_with_file_identity(path, &before)
-            .map(|(token, identity)| (token, Some(identity)))
-            .or_else(|_| metadata_change_token(path, &before).map(|token| (token, None)))
-    }
-    .with_context(|| format!("cannot read freshness identity for {}", path.display()))?;
+    let (change_token, file_identity) = metadata_change_token_with_file_identity(path, &before)
+        .map(|(token, identity)| (token, Some(identity)))
+        .or_else(|_| metadata_change_token(path, &before).map(|token| (token, None)))
+        .with_context(|| format!("cannot read freshness identity for {}", path.display()))?;
     #[cfg(target_os = "linux")]
     let change_token = if _stable_sqlite {
         crate::ingest::sqlite_stable_change_token(path, &before)
@@ -2143,7 +2081,6 @@ fn walk_sources(
     adapter: &dyn Adapter,
     path: &Path,
     hash_content: bool,
-    audit_identity: bool,
     out: &mut Vec<SourceFile>,
 ) -> (bool, Vec<SourceIssue>, SourceSnapshotTiming) {
     // Discovery (notably Codex's YYYY/MM/DD tree) has no depth ceiling. Store roots
@@ -2161,12 +2098,11 @@ fn walk_sources(
         .map(|candidate| {
             let stable_sqlite = matches!(kind, Fingerprint::Stat | Fingerprint::Token)
                 && (sqlite_database(&candidate.path) || is_sqlite_sidecar(&candidate.path));
-            let result = source_file_from_meta_with_mode(
+            let result = source_file_from_meta(
                 agent,
                 &candidate.path,
                 hash_content,
                 stable_sqlite,
-                audit_identity,
                 candidate.metadata,
             );
             (candidate.path, result)
@@ -2223,7 +2159,6 @@ fn adapter_source_with_timing(
     token_projection: SnapshotTokenProjection,
 ) -> anyhow::Result<(AdapterSource, SourceSnapshotTiming)> {
     let kind = adapter.fingerprint();
-    let audit_identity = matches!(token_projection, SnapshotTokenProjection::Intake);
     let hash_content = kind == Fingerprint::Always;
     let roots = adapter.freshness_roots();
     let mut files = Vec::new();
@@ -2232,7 +2167,7 @@ fn adapter_source_with_timing(
     let mut timing = SourceSnapshotTiming::default();
     for root in &roots {
         let (root_complete, mut root_issues, root_timing) =
-            walk_sources(adapter, root, hash_content, audit_identity, &mut files);
+            walk_sources(adapter, root, hash_content, &mut files);
         complete &= root_complete;
         issues.append(&mut root_issues);
         timing.traversal += root_timing.traversal;
@@ -2248,7 +2183,7 @@ fn adapter_source_with_timing(
             .collect();
         for database in databases {
             let wal = crate::ingest::sqlite_sidecar(&database, "-wal");
-            match source_file_with_mode(adapter.name(), &wal, false, true, audit_identity) {
+            match source_file(adapter.name(), &wal, false, true) {
                 Ok(Some(stamp)) => files.push(stamp),
                 Ok(None) => {}
                 Err(error) => {
@@ -3517,47 +3452,30 @@ mod tests {
         assert_eq!(error.to_string(), "invalid negative source size");
     }
 
+    #[test]
+    fn windows_usn_token_rejects_zero_and_preserves_nonzero_transform() {
+        assert_eq!(windows_usn_change_token(0), None);
+        assert_eq!(
+            windows_usn_change_token(1),
+            Some(ChangeToken::Metadata(0x5553_4e5f_4649_4cc5))
+        );
+    }
+
     #[cfg(windows)]
     #[test]
-    fn audit_windows_fallback_uses_change_time_not_content_hash() {
-        let identity = WindowsFileIdentity {
-            kind: 1,
-            volume: 7,
-            id: [9; 16],
-        };
-        let before = WindowsHandleState {
-            identity,
-            legacy_volume: 7,
-            legacy_inode: 9,
-            size: 4096,
-            last_write: 123,
-            change_time: 456,
-            attributes: 0,
-        };
-        let after = WindowsHandleState {
-            change_time: 457,
-            ..before
-        };
-        assert_eq!(
-            windows_audit_change_token(before),
-            ChangeToken::Metadata(456)
-        );
-        assert_eq!(
-            windows_audit_change_token(after),
-            ChangeToken::Metadata(457)
-        );
-        assert_ne!(
-            windows_audit_change_token(before),
-            windows_audit_change_token(after),
-            "same-size restored-last-write ChangeTime movement must invalidate audit"
-        );
+    fn windows_reader_identity_uses_filetime_precision() {
         let state = WindowsHandleState {
+            identity: WindowsFileIdentity {
+                kind: 1,
+                volume: 7,
+                id: [9; 16],
+            },
             legacy_volume: 11,
             legacy_inode: 13,
             size: 17,
             last_write: 116_444_736_000_000_123,
             change_time: 456,
-            ..before
+            attributes: 0,
         };
         assert_eq!(
             windows_reader_identity(state).unwrap(),
@@ -4188,7 +4106,7 @@ mod tests {
             metadata_change_token(&path, &fs::symlink_metadata(&path).unwrap()).unwrap();
         assert_eq!(observed, old_token);
         assert_ne!(observed, replacement_token);
-        let (forced_hash, _) = windows_open_file_change_token(&file, &opened, true, false).unwrap();
+        let (forced_hash, _) = windows_open_file_change_token(&file, &opened, true).unwrap();
         assert!(matches!(forced_hash, ChangeToken::ContentSha256(_)));
         let _ = fs::remove_dir_all(root);
     }

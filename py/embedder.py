@@ -1,7 +1,6 @@
 """The semantic embedding model - the only module in agrep that touches one.
 
-granite-embedding-small-english-r2, int8 ONNX, CPU. The pinned selection campaign
-in bench/EMBEDDER_SELECTION.md keeps it as the production profile. Its model-card
+granite-embedding-small-english-r2, int8 ONNX on CPU. Its pinned model-card
 contract is CLS pooling, no query/passage prefixes (symmetric), 384 dimensions,
 and local L2 normalization.
 
@@ -31,7 +30,7 @@ import stat
 import sys
 import time
 import urllib.request
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import numpy as np
 
@@ -148,237 +147,7 @@ def store_profile_string(model_id: str | None) -> str:
     return profile_string(resolve_lane(model_id))
 
 
-_BENCH_PROFILE_ENV = "AGREP_BENCH_EMBED_PROFILE"
-_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_SAFE_REPO_RE = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
-_PROVIDER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*ExecutionProvider\Z")
 _PAST_INPUT_RE = re.compile(r"past_key_values\.\d+\.(?:key|value)\Z")
-_WINDOWS_RESERVED = {
-    "con", "prn", "aux", "nul", "clock$",
-    *(f"com{i}" for i in range(1, 10)),
-    *(f"lpt{i}" for i in range(1, 10)),
-}
-
-
-def _fail_profile(message: str) -> None:
-    raise EmbedderUnavailable(f"invalid benchmark embedding profile: {message}")
-
-
-def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            _fail_profile(f"duplicate JSON key {key!r}")
-        value[key] = item
-    return value
-
-
-def _exact_keys(value: dict, required: set[str], optional: set[str], where: str) -> None:
-    missing = required - set(value)
-    unknown = set(value) - required - optional
-    if missing:
-        _fail_profile(f"{where} missing {', '.join(sorted(missing))}")
-    if unknown:
-        _fail_profile(f"{where} has unknown keys {', '.join(sorted(unknown))}")
-
-
-def _int_field(value, name: str, low: int, high: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-        _fail_profile(f"{name} must be an integer in [{low}, {high}]")
-    return value
-
-
-def _string_field(value, name: str, max_length: int = 4096) -> str:
-    if not isinstance(value, str) or not value or len(value) > max_length:
-        _fail_profile(f"{name} must be a non-empty string up to {max_length} characters")
-    return value
-
-
-def _safe_artifact_name(value, where: str) -> str:
-    name = _string_field(value, where, 128)
-    stem = name.split(".", 1)[0].casefold()
-    if (not _SAFE_NAME_RE.fullmatch(name) or name.endswith((".", " "))
-            or stem in _WINDOWS_RESERVED):
-        _fail_profile(f"{where} is not a portable artifact filename")
-    return name
-
-
-def _safe_remote_path(value, where: str) -> str:
-    raw = _string_field(value, where, 512)
-    path = PurePosixPath(raw)
-    if (path.is_absolute() or "\\" in raw or any(
-            part in ("", ".", "..") or not _SAFE_NAME_RE.fullmatch(part)
-            for part in path.parts)):
-        _fail_profile(f"{where} is not a safe repository-relative path")
-    return raw
-
-
-def _search_bands(value) -> dict[str, float]:
-    if not isinstance(value, dict):
-        _fail_profile("search_bands must be an object")
-    _exact_keys(value, {"floor", "strong"}, set(), "search_bands")
-    bands = {}
-    for key in ("floor", "strong"):
-        raw = value[key]
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            _fail_profile(f"search_bands.{key} must be a finite number")
-        number = float(raw)
-        if not math.isfinite(number) or not -1.0 <= number <= 1.0:
-            _fail_profile(f"search_bands.{key} must be in [-1, 1]")
-        bands[key] = number
-    if bands["floor"] > bands["strong"]:
-        _fail_profile("search_bands.floor must not exceed search_bands.strong")
-    return bands
-
-
-def _load_bench_profile(path: Path) -> dict:
-    try:
-        if path.stat().st_size > 1 << 20:
-            _fail_profile("profile JSON exceeds 1 MiB")
-        raw = json.loads(path.read_text(encoding="utf-8"),
-                         object_pairs_hook=_unique_json_object)
-    except EmbedderUnavailable:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        _fail_profile(f"could not read {path}: {exc}")
-    if not isinstance(raw, dict):
-        _fail_profile("root must be an object")
-    required = {
-        "schema", "id", "repo", "revision", "license", "license_permissive",
-        "dim", "native_dim", "max_seq", "pooling", "normalize",
-        "query_prefix", "document_prefix", "layernorm_before_truncate",
-        "quantization", "runtime", "files", "model_file", "tokenizer_file",
-        "model_bytes", "output",
-    }
-    _exact_keys(raw, required, {"provider", "search_bands", "pad_token"}, "root")
-    _int_field(raw["schema"], "schema", 1, 1)
-    ident = _safe_artifact_name(raw["id"], "id")
-    repo = _string_field(raw["repo"], "repo", 257)
-    if not _SAFE_REPO_RE.fullmatch(repo):
-        _fail_profile("repo must be an owner/name Hugging Face repository")
-    revision = _string_field(raw["revision"], "revision", 40)
-    if not _REVISION_RE.fullmatch(revision):
-        _fail_profile("revision must be a full lowercase 40-character commit SHA")
-    license_name = _string_field(raw["license"], "license", 128)
-    if not isinstance(raw["license_permissive"], bool):
-        _fail_profile("license_permissive must be boolean")
-    dim = _int_field(raw["dim"], "dim", 1, 16384)
-    native_dim = _int_field(raw["native_dim"], "native_dim", dim, 16384)
-    max_seq = _int_field(raw["max_seq"], "max_seq", 1, 131072)
-    if raw["pooling"] not in ("cls", "masked_mean", "last_token", "direct_2d"):
-        _fail_profile("pooling must be cls, masked_mean, last_token, or direct_2d")
-    if raw["normalize"] is not True:
-        _fail_profile("normalize must be true")
-    query_prefix = raw["query_prefix"]
-    document_prefix = raw["document_prefix"]
-    if not isinstance(query_prefix, str) or len(query_prefix) > 4096:
-        _fail_profile("query_prefix must be a string up to 4096 characters")
-    if not isinstance(document_prefix, str) or len(document_prefix) > 4096:
-        _fail_profile("document_prefix must be a string up to 4096 characters")
-    if not isinstance(raw["layernorm_before_truncate"], bool):
-        _fail_profile("layernorm_before_truncate must be boolean")
-    quantization = _string_field(raw["quantization"], "quantization", 64)
-    if raw["runtime"] != "onnxruntime":
-        _fail_profile("runtime must equal onnxruntime")
-    provider = raw.get("provider", "CPUExecutionProvider")
-    if not isinstance(provider, str) or not _PROVIDER_RE.fullmatch(provider):
-        _fail_profile("provider must name one ONNX Runtime execution provider")
-    pad_token = raw.get("pad_token")
-    if pad_token is not None and (
-            not isinstance(pad_token, str) or not pad_token or len(pad_token) > 256):
-        _fail_profile("pad_token must be a non-empty string up to 256 characters")
-    files_raw = raw["files"]
-    if not isinstance(files_raw, dict) or not files_raw:
-        _fail_profile("files must be a non-empty object")
-    files = {}
-    remote_paths = {}
-    folded_names = set()
-    for key, spec in files_raw.items():
-        name = _safe_artifact_name(key, "files key")
-        folded = name.casefold()
-        if folded in folded_names:
-            _fail_profile("artifact filenames must be unique case-insensitively")
-        folded_names.add(folded)
-        if not isinstance(spec, dict):
-            _fail_profile(f"files.{name} must be an object")
-        _exact_keys(spec, {"remote_path", "size", "sha256"}, set(), f"files.{name}")
-        size = _int_field(spec["size"], f"files.{name}.size", 1, 1 << 40)
-        sha = _string_field(spec["sha256"], f"files.{name}.sha256", 64)
-        if not _SHA256_RE.fullmatch(sha):
-            _fail_profile(f"files.{name}.sha256 must be 64 lowercase hex characters")
-        files[name] = (size, sha)
-        remote_paths[name] = _safe_remote_path(
-            spec["remote_path"], f"files.{name}.remote_path")
-    model_file = _safe_artifact_name(raw["model_file"], "model_file")
-    tokenizer_file = _safe_artifact_name(raw["tokenizer_file"], "tokenizer_file")
-    if model_file not in files or tokenizer_file not in files:
-        _fail_profile("model_file and tokenizer_file must name pinned artifacts")
-    model_bytes = _int_field(raw["model_bytes"], "model_bytes", 1, 1 << 40)
-    pinned_model_bytes = sum(size for name, (size, _) in files.items()
-                             if name != tokenizer_file)
-    if model_bytes != pinned_model_bytes:
-        _fail_profile("model_bytes must equal the pinned non-tokenizer artifact bytes")
-    output = raw["output"]
-    if not isinstance(output, dict):
-        _fail_profile("output must be an object")
-    if set(output) == {"index"}:
-        output = {"index": _int_field(output["index"], "output.index", 0, 1024)}
-    elif set(output) == {"name"}:
-        name = _string_field(output["name"], "output.name", 256)
-        if any(ord(char) < 0x21 or ord(char) > 0x7e for char in name):
-            _fail_profile("output.name must contain printable ASCII without spaces")
-        output = {"name": name}
-    else:
-        _fail_profile("output must contain exactly one of index or name")
-    profile = {
-        "id": ident, "repo": repo, "revision": revision, "dim": dim,
-        "native_dim": native_dim, "max_seq": max_seq, "files": files,
-        "remote_paths": remote_paths, "model_file": model_file,
-        "tokenizer_file": tokenizer_file, "pooling": raw["pooling"],
-        "query_prefix": query_prefix, "document_prefix": document_prefix,
-        "layernorm_before_truncate": raw["layernorm_before_truncate"],
-        "output": output, "provider": provider, "license": license_name,
-        "license_permissive": raw["license_permissive"], "quantization": quantization,
-        "runtime": "onnxruntime", "normalize": True, "model_bytes": model_bytes,
-    }
-    if pad_token is not None:
-        profile["pad_token"] = pad_token
-    if "search_bands" in raw:
-        profile["search_bands"] = _search_bands(raw["search_bands"])
-    return profile
-
-
-def _vector_identity(profile: dict) -> str:
-    files = {name: {"size": size, "sha256": sha}
-             for name, (size, sha) in profile["files"].items()}
-    vector = {
-        "version": 1, "files": files, "model_file": profile["model_file"],
-        "tokenizer_file": profile["tokenizer_file"], "dim": profile["dim"],
-        "native_dim": profile["native_dim"], "max_seq": profile["max_seq"],
-        "pooling": profile["pooling"], "query_prefix": profile["query_prefix"],
-        "document_prefix": profile["document_prefix"],
-        "layernorm_before_truncate": profile["layernorm_before_truncate"],
-        "output": profile["output"], "normalize": True,
-        "pad_token": profile.get("pad_token"), "provider": profile["provider"],
-    }
-    canonical = json.dumps(vector, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=True).encode("ascii")
-    return f"bench-vector-v1:{hashlib.sha256(canonical).hexdigest()}"
-
-
-def _activate_bench_profile() -> None:
-    global PROFILE, PROFILE_STRING
-    raw_path = os.environ.get(_BENCH_PROFILE_ENV)
-    if raw_path is None:
-        return
-    path = Path(raw_path)
-    if not path.is_absolute():
-        _fail_profile(f"{_BENCH_PROFILE_ENV} must be an absolute path")
-    PROFILE = _load_bench_profile(path)
-    PROFILE_STRING = _vector_identity(PROFILE)
 
 
 def semantic_bands() -> surface.SemanticScoreBands:
@@ -391,7 +160,6 @@ def semantic_bands() -> surface.SemanticScoreBands:
     )
 
 
-_activate_bench_profile()
 
 
 MODEL_DOWNLOAD_WAIT_S = 600.0

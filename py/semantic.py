@@ -1777,8 +1777,6 @@ def search(query: str, *, level: str = "hybrid", k: int = 10,
     if not query:
         raise ValueError("missing semantic query")
     filters = dict(filters or {})
-    shadow_candidate_trace = bool(
-        filters.pop("_sabel_candidate_trace", False))
     refresh_if_stale = bool(refresh_if_stale and not diagnostic_only)
     allow_model_download = bool(allow_model_download and not diagnostic_only)
     timing_enabled = _semantic_timing_enabled() if timing is None else timing
@@ -1850,17 +1848,14 @@ def search(query: str, *, level: str = "hybrid", k: int = 10,
             try:
                 if level == "hybrid":
                     payload = json.loads(ask.tool_search_hybrid(
-                        query, k=k, filters=filters, timing=timing_enabled,
-                        shadow_candidate_trace=shadow_candidate_trace))
+                        query, k=k, filters=filters, timing=timing_enabled))
                 elif level == "message":
                     payload = json.loads(ask.tool_search_messages(
-                        query, k=k, filters=filters, envelope=True,
-                        shadow_candidate_trace=shadow_candidate_trace))
+                        query, k=k, filters=filters, envelope=True))
                 elif level == "message-session":
                     payload = json.loads(ask.tool_search_messages(
                         query, k=k, filters=filters,
-                        group_session=True, envelope=True,
-                        shadow_candidate_trace=shadow_candidate_trace))
+                        group_session=True, envelope=True))
                 elif level == "chats":
                     payload = json.loads(ask.tool_search_chats(
                         query, k=k, filters=filters, envelope=True))

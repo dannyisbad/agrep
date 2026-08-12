@@ -16,29 +16,15 @@ from typing import Iterable
 
 
 MAX_REPOSITORY_BYTES = 1_000_000
-REPOSITORY_BYTE_LIMITS = {
-    "bench/adversarial/GOAL8_DECISION_DELTA.json": 2_000_000,
-}
 ROOT_SCRATCH = {
     "ar.err", "err.corrupt", "err.stderr", "full_recall.txt", "j1.txt",
     "j2.txt", "ns.err", "out.stderr", "out.stdout", "p1.err", "p1.out",
     "p2.out", "p3.out", "rc.stderr",
 }
-PRIVATE_EVIDENCE = {
-    "GOAL11.md",
-    "bench/adversarial/AGENT_PANEL2_CLAUDE_SEATS.md",
-    "bench/adversarial/AGENT_PANEL2_SOL.md",
-    "bench/adversarial/AGENT_PANEL3_CLAUDE_SEATS.md",
-    "bench/adversarial/AGENT_PANEL3_SOL.md",
-    "bench/adversarial/BOND_REVIEW.md",
-    "bench/adversarial/DOCKET.md",
-    "bench/adversarial/GOAL11_STATUS_CHARTER.md",
-    "bench/adversarial/GOAL8_VERIFICATION.md",
-    "bench/adversarial/UX_AUDIT.json",
-    "bench/adversarial/UX_VERDICT.md",
-    "bench/gauntlet/REGRESSION_AUTOPSY.md",
-    "bench/gauntlet/baseline_prefix.txt",
-}
+PRIVATE_PATH_PREFIXES = (
+    "bench/adversarial/",
+    "bench/gauntlet/",
+)
 SECRET_PATTERNS = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -85,10 +71,6 @@ WORD_TOKEN = re.compile(rb"[A-Za-z0-9]{3,64}")
 Finding = tuple[str, str]
 
 
-def _repository_byte_limit(label: str) -> int:
-    return REPOSITORY_BYTE_LIMITS.get(label, MAX_REPOSITORY_BYTES)
-
-
 def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
     result = subprocess.run(
         ["git", *args], cwd=repo, input=input_bytes, check=True,
@@ -116,13 +98,12 @@ def _relative(repo: Path, path: Path) -> tuple[str, Path] | None:
 def _path_reason(relative: str) -> str | None:
     if relative in ROOT_SCRATCH:
         return "root scratch output"
-    if relative in PRIVATE_EVIDENCE:
+    if relative.startswith(PRIVATE_PATH_PREFIXES):
         return "local or transcript-derived evidence"
-    if relative.startswith((
-            ".goals-archive/", "bench/render/", "py/.codex-slop/")):
+    if relative.startswith("bench/render/"):
         return "private capture or agent scratch tree"
     if relative.endswith((".local.md", ".local.json")):
-        return "local campaign governance"
+        return "local-only metadata"
     return None
 
 
@@ -182,10 +163,9 @@ def _scan_blob(label: str, raw: bytes, findings: list[Finding]) -> None:
     reason = _path_reason(label)
     if reason is not None:
         findings.append((label, reason))
-    byte_limit = _repository_byte_limit(label)
-    if len(raw) > byte_limit:
+    if len(raw) > MAX_REPOSITORY_BYTES:
         findings.append((
-            label, f"repository file exceeds {byte_limit} bytes"))
+            label, f"repository file exceeds {MAX_REPOSITORY_BYTES} bytes"))
         return
     for content_reason in _content_reasons(raw):
         findings.append((label, content_reason))
@@ -228,11 +208,10 @@ def scan_worktree(repo: Path, paths: list[Path] | None = None) -> list[Finding]:
         except OSError as exc:
             findings.append((relative, f"unreadable repository file: {exc}"))
             continue
-        byte_limit = _repository_byte_limit(relative)
-        if len(raw) > byte_limit:
+        if len(raw) > MAX_REPOSITORY_BYTES:
             findings.append((
                 relative,
-                f"repository file exceeds {byte_limit} bytes"))
+                f"repository file exceeds {MAX_REPOSITORY_BYTES} bytes"))
             continue
         for content_reason in _content_reasons(raw):
             findings.append((relative, content_reason))

@@ -58,7 +58,7 @@ class ResumeLiveTests(unittest.TestCase):
         lookup.assert_called_once_with("branch-full-id")
         launch.assert_called_once_with("claude", "branch-full-id")
 
-    def test_partial_live_lookup_is_unverified_rc2(self) -> None:
+    def test_partial_live_lookup_is_unverified(self) -> None:
         rc, out, err, _lookup, launch = self._run(
             ["branch-full-id"], [_row("older")], ([], False))
         self.assertEqual(rc, 2)

@@ -1,4 +1,4 @@
-"""Help clarity (goal-10 item 5): examples ARE the documentation.
+"""Help clarity: examples ARE the documentation.
 
 Every user-facing verb's --help carries an EXAMPLES section with real
 invocations, and the top-level --help groups the verbs by task.
@@ -191,7 +191,7 @@ class TopLevelHelpGrouping(unittest.TestCase):
     def test_setup_confirmation_carries_exact_core_evidence_path(self) -> None:
         stdout = io.StringIO()
         args = SimpleNamespace(
-            rest=[], yes=True, no_teach=False, no_semantic=True,
+            rest=[], yes=True, no_teach=False, no_hook=True, no_semantic=True,
             archive=False, no_archive=True,
         )
         with mock.patch("doctor.main", return_value=0), \
@@ -203,8 +203,10 @@ class TopLevelHelpGrouping(unittest.TestCase):
                 mock.patch.object(cli, "_setup_archive"), \
                 mock.patch("teach.detected_agents", return_value=[]), \
                 mock.patch.object(cli.common, "cli_name", return_value="agrep"), \
+                mock.patch("hookinstall.install") as hook_install, \
                 contextlib.redirect_stdout(stdout):
             self.assertEqual(cli.cmd_setup(args), 0)
+        hook_install.assert_not_called()
         rendered = stdout.getvalue()
         self.assertIn(REVIEWED_CORE_EVIDENCE_PATH, rendered)
         self.assertNotIn("AGREP EVERYDAY USE", rendered)

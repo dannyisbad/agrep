@@ -1864,13 +1864,16 @@ def _wait_for_worker(
         time.sleep(0.02)
 
 
+def _worker_query_disabled_reason() -> str | None:
+    if os.environ.get("AGREP_NO_SEM_WORKER"):
+        return "AGREP_NO_SEM_WORKER disables semantic worker queries"
+    if removal_fence.background_removal_active():
+        return "agrep removal blocks semantic worker queries"
+    return None
+
+
 def _worker_query_disabled() -> bool:
-    # Read-only callers may use an already-running resident now that request
-    # serialization is external to DATA_DIR.  Startup remains blocked by
-    # _worker_disabled() through the durable mutation refusal below.
-    return bool(os.environ.get("AGREP_NO_DAEMON")
-                or os.environ.get("AGREP_NO_SEM_WORKER")
-                or removal_fence.background_removal_active())
+    return _worker_query_disabled_reason() is not None
 
 
 def _worker_disabled() -> bool:
@@ -2220,15 +2223,13 @@ def _validate_request(obj: object) -> tuple[str, str, int, dict, bool]:
                "exclude_session_from_turn", "exclude_family",
                "_family_diverse", "_exclude_who", "_include_who",
                "_exclude_sessions",
-               "_allow_model_download", "_diagnostic_only",
-               "_sabel_candidate_trace"}
+               "_allow_model_download", "_diagnostic_only"}
     if set(filters) - allowed:
         raise ValueError("invalid semantic filter")
     clean = {}
     for key, value in filters.items():
         if key in {"model_soft", "_family_diverse", "exclude_family",
-                   "_allow_model_download", "_diagnostic_only",
-                   "_sabel_candidate_trace"}:
+                   "_allow_model_download", "_diagnostic_only"}:
             if not isinstance(value, bool):
                 raise ValueError("invalid semantic filter")
         elif key in {"_exclude_who", "_include_who", "_exclude_sessions"}:

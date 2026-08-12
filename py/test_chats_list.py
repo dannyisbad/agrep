@@ -308,7 +308,7 @@ class ChatsListTests(unittest.TestCase):
 
 class ChatsDamagedAggregateTests(unittest.TestCase):
     """sessions.jsonl is derived and rebuildable: damage is agrep's own repair
-    task (GOAL11 law 1). chats serves what parses, marks its totals a floor,
+    task. chats serves what parses, marks its totals a floor,
     kicks the rebuild silently, and never crashes or lies a confident zero."""
 
     def setUp(self) -> None:

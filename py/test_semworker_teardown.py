@@ -667,10 +667,15 @@ class WindowsSemanticWorkerTeardownTests(unittest.TestCase):
                 "server.serve()\n"
                 "owner.close()\n"
             )
+            env = dict(os.environ)
+            env.pop("AGREP_NO_DAEMON", None)
+            env.pop("AGREP_NO_SEM_WORKER", None)
             process = subprocess.Popen(
                 [sys.executable, "-c", worker, child, str(mapped), str(ready)],
                 cwd=Path(__file__).resolve().parent,
-                creationflags=subprocess.CREATE_NO_WINDOW)
+                env=env,
+                creationflags=common.windows_background_child_flags(
+                    subprocess.CREATE_NO_WINDOW))
             try:
                 deadline = time.monotonic() + 8.0
                 while not ready.exists() and process.poll() is None:

@@ -1,4 +1,4 @@
-"""Filterable provenance (goal-10 item 3, 4/4 panel consensus).
+"""Filterable provenance has one owned vocabulary.
 
 --who takes a comma list, --no-who excludes, and both parse through the one
 owned vocabulary in surface_policy. --no-meta drops ~meta rows entirely with

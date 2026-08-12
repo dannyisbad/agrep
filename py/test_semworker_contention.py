@@ -401,18 +401,11 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         discard_handoff.assert_called_once_with(server.owner_nonce)
         server.http.server_close.assert_called_once_with()
 
-    def test_internal_trace_and_session_filters_validate_independently(self) -> None:
+    def test_internal_session_filters_validate(self) -> None:
         request = {
-            "query": "candidate trace", "level": "hybrid", "k": 2,
-            "filters": {"_sabel_candidate_trace": True}, "timing": False,
+            "query": "session filter", "level": "hybrid", "k": 2,
+            "filters": {"_exclude_sessions": ["unrelated"]}, "timing": False,
         }
-        _query, _level, _k, filters, _timing = (
-            semworker._validate_request(request))
-        self.assertEqual(filters, {"_sabel_candidate_trace": True})
-        request["filters"] = {"_sabel_candidate_trace": "yes"}
-        with self.assertRaisesRegex(ValueError, "invalid semantic filter"):
-            semworker._validate_request(request)
-        request["filters"] = {"_exclude_sessions": ["unrelated"]}
         _query, _level, _k, filters, _timing = (
             semworker._validate_request(request))
         self.assertEqual(filters, {"_exclude_sessions": ("unrelated",)})
@@ -446,8 +439,15 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 worker_path = semworker.worker_lock_path()
                 self.assertEqual(request_path.parent.parent, runtime.resolve())
                 self.assertEqual(worker_path.parent, request_path.parent)
-                self.assertEqual(
-                    stat.S_IMODE(request_path.parent.stat().st_mode), 0o700)
+                coordination_info = os.lstat(request_path.parent)
+                if os.name == "nt":
+                    self.assertFalse(
+                        getattr(coordination_info, "st_file_attributes", 0)
+                        & getattr(
+                            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+                else:
+                    self.assertEqual(
+                        stat.S_IMODE(coordination_info.st_mode), 0o700)
                 self.assertNotEqual(request_path, worker_path)
                 self.assertEqual(
                     semworker.descriptor_path().parent, protected)

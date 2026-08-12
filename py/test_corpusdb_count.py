@@ -68,6 +68,28 @@ class CorpusCountTests(unittest.TestCase):
         repeated = corpusdb._candidate_where(["a"] * 50, None)
         self.assertEqual(single, repeated)
 
+    def test_repeated_phrase_skips_rows_too_short_to_match(self) -> None:
+        phrase = mock.Mock()
+        phrase.search.side_effect = AssertionError("impossible phrase was scanned")
+        with mock.patch.object(corpusdb.re, "compile", return_value=phrase):
+            result = corpusdb.keyword_terms(
+                self.db, "alpha " * 50, 100, position_order=False)
+        self.assertEqual(
+            {hit["session"] for hit in result["terms"]["hits"]},
+            {"a", "b", "c"},
+        )
+        self.assertEqual(result["phrase"]["hits"], [])
+        phrase.search.assert_not_called()
+
+    def test_repeated_count_confirms_each_distinct_term_once(self) -> None:
+        with mock.patch.object(
+                corpusdb.common, "insensitive_span",
+                wraps=corpusdb.common.insensitive_span) as span:
+            result = corpusdb.keyword_count(self.db, "sss " * 50)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(corpusdb.count_tokens("sss " * 50), ["sss"])
+        self.assertEqual(span.call_count, 2)
+
     def test_count_matches_materialized_union(self) -> None:
         for query in ("the", "alpha beta", "hi", "sss"):
             with self.subTest(query=query):

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import zipfile
 
-from package_metadata import checkout_version
+from package_metadata import checkout_version, distribution_version
 import validate_wheel as wheel_validator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,7 +101,7 @@ def validate_wheel_payloads(asset_directory: Path, wheel_directory: Path) -> Non
         raise RuntimeError(
             f"release binary set is incomplete: missing={sorted(missing_assets)}")
     wheels = _directory_entries(wheel_directory)
-    version = checkout_version()
+    version = distribution_version()
     expected_wheels = {
         f"agrep-{version}-py3-none-{target[2]}.whl"
         for target in BINARY_TARGETS.values()

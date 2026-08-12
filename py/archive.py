@@ -1440,6 +1440,12 @@ def _read_source(path: Path, is_sqlite: bool) -> bytes:
         tmp.unlink(missing_ok=True)
 
 
+def _file_usn_change_token(usn: int) -> tuple[str, int] | None:
+    if usn == 0:
+        return None
+    return ("usn", usn)
+
+
 def _metadata_change_token(
         path: Path, info: os.stat_result) -> tuple[str, int] | None:
     if os.name != "nt":
@@ -1499,8 +1505,9 @@ def _metadata_change_token(
         if (usn_offset < 0 or record_length > len(raw)
                 or record_length < usn_offset + 8):
             raise ValueError("invalid file USN response")
-        return ("usn", int.from_bytes(
-            raw[usn_offset:usn_offset + 8], "little", signed=True))
+        usn = int.from_bytes(
+            raw[usn_offset:usn_offset + 8], "little", signed=True)
+        return _file_usn_change_token(usn)
     finally:
         kernel32.CloseHandle(handle)
 

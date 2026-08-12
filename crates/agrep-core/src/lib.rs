@@ -9,14 +9,12 @@ pub mod boundary_stats;
 pub mod cache;
 pub mod emit;
 pub mod fallback_scan;
-pub mod frozen_source;
 pub mod ingest;
 pub mod ingest_cache;
 pub mod intake;
 pub mod model;
 pub mod row_class;
 pub mod semantic_q8;
-pub mod source_atom;
 
 #[cfg(any(unix, windows))]
 mod mapped_file;

@@ -99,13 +99,8 @@ _BINARY_IDENTITY_STOP_S = 0.05
 
 
 def _version() -> str:
-    """Single-sourced from agrep/__init__.py (pyproject reads the same file).
-    Resolves both installed (site-packages/agrep) and dev (repo root/agrep)."""
-    try:
-        from agrep import __version__
-        return __version__
-    except ImportError:
-        return "dev"
+    """The package version for both installed and source invocations."""
+    return dist.package_version()
 
 
 def _binary_identity_child(binary: str, sender) -> None:

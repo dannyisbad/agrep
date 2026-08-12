@@ -124,7 +124,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reference-model", type=Path, required=True)
     parser.add_argument("--tasks", type=Path,
-                        default=ROOT / "bench" / "semantic_worth_tasks.example.json")
+                        default=ROOT / "bench" / "embed_model_parity_tasks.json")
     parser.add_argument("--sample", type=int, default=128)
     args = parser.parse_args()
     if args.sample < 10:

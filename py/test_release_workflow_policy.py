@@ -342,9 +342,26 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
     def test_branch_dispatch_remains_available_for_read_only_builds(self):
         trigger = self.text[:self.text.index("\npermissions:\n")]
         self.assertIn("  workflow_dispatch:\n", trigger)
+        aggregate = _job(self.text, "validate-built-artifacts")
+        self.assertEqual(
+            _job_field(aggregate, "if"),
+            "${{ !startsWith(github.ref, 'refs/tags/v') }}")
+        self.assertIn(
+            "needs: [wheels, wheels-linux, wheels-linux-arm64, sdist, "
+            "npm-smoke, semantic-canary]", aggregate)
+        self.assertIn("pattern: binasset-*", aggregate)
+        self.assertIn("pattern: wheel-*", aggregate)
+        self.assertIn("name: sdist", aggregate)
+        self.assertIn("bench/release_assets.py", aggregate)
+        self.assertIn("bench/pypi_release.py", aggregate)
+        self.assertIn(
+            "from bench.package_metadata import checkout_version", aggregate)
+        self.assertNotIn(
+            "from bench.package_metadata import distribution_version", aggregate)
+        self.assertNotIn("contents: write", aggregate)
         for name in ("release-gate", "wheels", "wheels-linux",
                      "wheels-linux-arm64", "sdist", "semantic-canary",
-                     "npm-smoke"):
+                     "npm-smoke", "validate-built-artifacts"):
             with self.subTest(job=name):
                 block = _job(self.text, name)
                 self.assertNotRegex(
