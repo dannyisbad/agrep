@@ -169,6 +169,24 @@ class SearchBoundedRowsTests(unittest.TestCase):
         for field, count in exact.items():
             self.assertLessEqual(bounded[field], count, field)
 
+
+    def test_repeated_terms_do_not_repeat_candidate_span_work(self):
+        query = ("phase " * 200).strip()
+        with self._fixed_ranking(), mock.patch.object(
+                search.common, "insensitive_span",
+                wraps=search.common.insensitive_span) as span:
+            rows = search._bounded_keyword_rows(
+                self.db, query, 4, {}, False)
+            sessions = search._bounded_keyword_sessions(
+                self.db, query, 4, {}, False)
+        self.assertIsNotNone(rows)
+        self.assertIsNotNone(sessions)
+        self.assertTrue(all(hit.get("matched") == "all-terms"
+                            for hit in rows["hits"]))
+        self.assertTrue(all(hit.get("matched") == "all-terms"
+                            for hit in sessions["hits"]))
+        self.assertLess(span.call_count, 1_000)
+
     def test_phrase_page_prunes_with_exact_head(self):
         with mock.patch.object(search, "_BOUNDARY_REFINE_POOL", 1):
             exhaustive, bounded = self._run("phase lock", 4)

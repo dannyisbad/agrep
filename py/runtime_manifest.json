@@ -238,18 +238,6 @@
    "member": "agrep/py/runtime_manifest.json"
   },
   {
-   "source": "py/sabel_observer.py",
-   "member": "agrep/py/sabel_observer.py"
-  },
-  {
-   "source": "py/sabel_pool.py",
-   "member": "agrep/py/sabel_pool.py"
-  },
-  {
-   "source": "py/sabel_shadow.py",
-   "member": "agrep/py/sabel_shadow.py"
-  },
-  {
    "source": "py/search.py",
    "member": "agrep/py/search.py"
   },

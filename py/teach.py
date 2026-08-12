@@ -1316,7 +1316,7 @@ def _write_codex_hook_snapshot(directory: Path) -> None:
     if not owned:
         snapshot.unlink(missing_ok=True)
         return
-    _atomic_write_text(snapshot, owned[0].read_text(encoding="utf-8"))
+    _atomic_write_bytes(snapshot, owned[0].read_bytes())
 
 
 def _owned_pi_extensions() -> list[Path]:

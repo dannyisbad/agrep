@@ -13,7 +13,11 @@ import sys
 import tarfile
 import zlib
 
-from package_metadata import InvalidMetadata, validate_core_metadata
+from package_metadata import (
+    InvalidMetadata,
+    distribution_version,
+    validate_core_metadata,
+)
 from validate_wheel import RUNTIME_SOURCES
 
 
@@ -128,6 +132,14 @@ def validate(path: Path) -> tuple[str, int]:
     if match is None:
         _fail("filename must be agrep-<version>.tar.gz")
     version = match.group("version")
+    try:
+        expected_version = distribution_version()
+    except InvalidMetadata as exc:
+        _fail(f"invalid checkout version: {exc}")
+    if version != expected_version:
+        _fail(
+            f"sdist version differs from checkout: expected {expected_version!r}, "
+            f"got {version!r}")
     try:
         mode = path.lstat().st_mode
     except OSError as exc:

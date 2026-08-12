@@ -35,7 +35,6 @@ import corpusdb
 import display_policy
 import explore
 import indexd_runtime
-import sabel_observer
 import search
 import surface_policy as surface
 from around import (
@@ -85,76 +84,15 @@ def _utf8_prefix(value: str, budget: int) -> str:
     return encoded[:budget].decode("utf-8", errors="ignore")
 
 
-def _renderer_returned_handles(
-        payload: str, owned_handles: list[str] | tuple[str, ...]) -> list[str]:
-    """Return only renderer-owned handle affordances that survived final fitting.
-
-    Conversation prose can legitimately quote handle-shaped text.  The observer
-    must not promote those bytes into renderer provenance, so this recognizes
-    only exact row headers and the renderer's own continuation-marker lines,
-    then intersects them with handles supplied by the renderer.
-    """
-    owned = set(owned_handles)
-    if not owned:
-        return []
-    returned: list[str] = []
-
-    def add(candidate: str) -> None:
-        if (candidate in owned and compact.is_result_handle(candidate)
-                and candidate not in returned):
-            returned.append(candidate)
-
-    for rendered_line in payload.splitlines():
-        line = rendered_line
-        for code in set(_C.values()):
-            if code:
-                line = line.replace(code, "")
-        if line.startswith("── "):
-            add(line[len("── "):].split(" · ", 1)[0])
-            continue
-        tools_fact = surface.SCAN_TOOLS_PENDING_LINE
-        if line.startswith(f"{tools_fact} · "):
-            add(line[len(tools_fact) + 3:])
-            continue
-        probe_line = (
-            line[len(tools_fact) + 3:]
-            if line.startswith(f"{tools_fact} - ")
-            else line
-        )
-        if probe_line.startswith("recall: ") and " - pull: " in probe_line:
-            pointer = probe_line.split(" - pull: ", 1)[0]
-            for candidate in owned_handles:
-                if (f": {candidate} ·" in pointer
-                        or pointer.endswith(f": {candidate}")):
-                    add(candidate)
-            continue
-        trailer = _TRAILER_RE.fullmatch(line)
-        if trailer is not None:
-            for token in trailer.group(2).replace(" · ", " ").split():
-                add(token)
-            continue
-        cap = re.fullmatch(
-            r"\[output truncated to --budget - rest at (@[^\]]+)\]", line)
-        if cap is not None:
-            add(cap.group(1))
-    return returned
 
 
-def _write_payload(
-        payload: str, budget: int, *,
-        returned_handles: list[str] | tuple[str, ...] = (),
-) -> None:
+def _write_payload(payload: str, budget: int) -> None:
     """Write one complete line while counting its newline in the byte budget."""
     content_budget = _content_budget(budget)
     if budget and _utf8_size(payload) > content_budget:
         payload = _utf8_prefix(payload, content_budget)
     rendered = payload + "\n"
     sys.stdout.write(rendered)
-    if sabel_observer.active():
-        sabel_observer.record_stdout(
-            rendered.encode("utf-8", errors="replace"))
-        sabel_observer.record_returned_handles(
-            _renderer_returned_handles(payload, returned_handles))
 
 
 def _content_budget(budget: int) -> int:
@@ -983,15 +921,14 @@ def _provenance_marks(hit: dict) -> str:
 def _probe_line(
         queries: list[str], hits: list[dict], engine: str,
         total_sessions: int | None = None, session_index=None,
-        returned_handles: list[str] | None = None,
 ) -> str | None:
     """Build the one-line probe pointer, or None when evidence is too weak.
 
-    Confidence is judged per lane (panel 2): when no hit carries a semantic
-    score, only the keyword lane served, and its own standard applies - a
-    row holding every query term is a confident pointer. Absent semantic
-    scores must never demote keyword evidence to a miss that plain search
-    would answer first try. Related-terms rows stay weak in every lane.
+    Confidence is judged per lane: when no hit carries a semantic score, only
+    the keyword lane served, and its own standard applies - a row holding every
+    query term is a confident pointer. Absent semantic scores must never demote
+    keyword evidence to a miss that plain search would answer first try.
+    Related-terms rows stay weak in every lane.
 
     Every lane has a floor, because "this box has not hit that before" is a
     useful answer and the best available row is not evidence that it is a
@@ -1026,9 +963,6 @@ def _probe_line(
                    top, session_index=session_index)
                if top_turn is not None else compact.encode_session_target(
                    top["session"], session_index=session_index))
-    if (returned_handles is not None
-            and compact.is_result_handle(top_ref)):
-        returned_handles.append(top_ref)
     where = " · ".join(x for x in (
                                    console.terminal_safe(top_ref),
                                    console.terminal_safe(top.get("agent", "")),
@@ -1074,10 +1008,9 @@ def _probe(queries: list[str], hits: list[dict], engine: str,
            weak_neighbors_command: str | None = None) -> int:
     """Emit one pointer for confident past context, or the owned miss line:
     rc 1 still means no confident pointer, but never means no output."""
-    returned_handles: list[str] = []
     line = _probe_line(
         queries, hits, engine, total_sessions=total_sessions,
-        session_index=session_index, returned_handles=returned_handles)
+        session_index=session_index)
     if line is None:
         summary = common.index_summary()
         # a filter over an empty dimension searched nothing (law 4): the miss
@@ -1099,12 +1032,10 @@ def _probe(queries: list[str], hits: list[dict], engine: str,
             # the one owned lane-down story (F4), not a third phrasing
             line = f"{line} - {surface.SEMANTIC_LANE_POLICY.keyword_only}"
         _write_payload(
-            _fit_probe_line(line, budget, tools_excluded), budget,
-            returned_handles=returned_handles)
+            _fit_probe_line(line, budget, tools_excluded), budget)
         return 1
     _write_payload(
-        _fit_probe_line(line, budget, tools_excluded), budget,
-        returned_handles=returned_handles)
+        _fit_probe_line(line, budget, tools_excluded), budget)
     return 0
 
 
@@ -1433,10 +1364,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
 
     raw_queries = [" ".join(args.query)] if one else args.query
     queries = [q.strip() for q in raw_queries if q.strip()]
-    if sabel_observer.active():
-        sabel_observer.record_query(
-            list(raw_queries), list(queries), surface=prog,
-            semantic_requested=bool(args.semantic), lexical_only=bool(args.lexical))
     self_inactive_reason = "caller-unresolved"
     auto_self_exclusion = common.in_agent_context()
     self_exclusion_requested = (
@@ -1515,7 +1442,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             semantic_coverage: dict | None = None,
             exclusion_pending: bool = False,
             index_unavailable: bool = False) -> None:
-        sabel_observer.record_outcome("error", code, reason)
         if not args.json:
             return
         error = {"code": code}
@@ -2078,29 +2004,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             if not args.probe:
                 return 2
         hits = []
-    if sabel_observer.active():
-        if args.semantic:
-            sabel_observer.record_lane_not_run(
-                "keyword", "explicit --semantic selected the semantic-only surface")
-        if args.lexical:
-            semantic_not_run_reason = "explicit --lexical disabled semantic retrieval"
-        elif direct_hit is not None:
-            semantic_not_run_reason = "direct result-handle lookup bypassed retrieval lanes"
-        elif args.who_filter == "tool":
-            semantic_not_run_reason = "tool-only rows are not embedded"
-        elif not search._semantic_runtime_installed():
-            semantic_not_run_reason = "semantic runtime was not installed"
-        elif not meaning_room:
-            semantic_not_run_reason = "recall budget left no meaning-lane room"
-        elif not any(_auto_semantic_query(query) for query in search_queries):
-            semantic_not_run_reason = "query was not language-shaped"
-        else:
-            semantic_not_run_reason = "recall policy did not execute a semantic call"
-        sabel_observer.record_lane_not_run("semantic", semantic_not_run_reason)
     if used_engines:
         engine = "+".join(used_engines)
     common.lap("query", engine)
-    sabel_observer.record_pool("merged_pre_self", hits, lane="merged")
     self_excluded_count: int | None = None
     if self_policy is not None:
         exact_specs = []
@@ -2155,7 +2061,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         if len(kept) != len(hits):
             self_dropped = len(hits) - len(kept)
             hits = kept
-    sabel_observer.record_pool("post_self", hits, lane="merged")
     if direct_hit is not None and self_dropped:
         self_excluded_count = self_dropped
 
@@ -2214,7 +2119,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         if meta_dropped or meta_retained:
             common.log(surface.meta_filter_notice(
                 meta_dropped, meta_retained))
-    sabel_observer.record_pool("post_meta_sort", hits, lane="merged")
     if args.probe:
         # one pointer out, but the judgment set holds each query's best
         # candidate (per lane under hybrid): a weak query-0 row must not
@@ -2237,7 +2141,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             selected = _reserve_semantic_hits(
                 selected, hits, target, len(queries),
                 family_diverse=family_diverse)
-    sabel_observer.record_pool("final_selected", selected, lane="selected")
     hybrid_visible = any(hit.get("lane") == "semantic" for hit in selected)
     if hybrid_visible:
         semantic_meta["hybrid"] = True
@@ -2345,7 +2248,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         raw_windows = _windows(
             selected, max(0, args.context), cached=lineage_windows)
     pairs = _trim_self_windows(raw_windows)
-    sabel_observer.record_windows("hydrated_windows", pairs)
     common.lap("windows")
     recall_timing = {
         "windows": round((time.perf_counter() - windows_started) * 1000.0, 3),
@@ -2433,7 +2335,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     expand_started = time.perf_counter()
     pairs = _trim_self_windows(
         _expand(pairs, queries, budget, max(0, args.context), self_policy))
-    sabel_observer.record_windows("expanded_windows", pairs)
     common.lap("expand")
     if timing_enabled:
         recall_timing["expand"] = round(
@@ -2629,12 +2530,13 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         threshold_label = ""
         project_label = f"project={console.terminal_safe(search._proj(w['project']))}"
         # @session:turn is the universal handle; colliding sessions need longer prefixes.
+        rendered_handle = console.terminal_safe(result_handle)
         identity = (
-            console.terminal_safe(result_handle),
+            rendered_handle, f"pull: agrep around {rendered_handle}",
             console.terminal_safe(w["agent"]), project_label,
             _ts_label(h.get("ts") or 0),
         )
-        head_fields = ((meaning_label, score_label, threshold_label, *identity,
+        head_fields = ((*identity, meaning_label, score_label, threshold_label,
                         _provenance_marks(h)) if sem_score is not None else
                        (*identity, score_label, _provenance_marks(h)))
         head = " · ".join(x for x in head_fields if x)
@@ -2749,9 +2651,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         "\n\n".join(blocks), budget, ends, trailer,
         color=common.color_enabled(sys.stdout, args.color))
     common.lap("render")
-    _write_payload(
-        payload, budget,
-        returned_handles=[*block_cmds, *trailer_cmds])
+    _write_payload(payload, budget)
 
     _note_self_exclusion()
     _note_freshness()
@@ -2760,52 +2660,12 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
 
 def main(argv: list[str] | None = None, prog: str = "recall", *,
          auto_semantic_timeout_s: float | None = None) -> int:
-    observed_argv = list(sys.argv[1:] if argv is None else argv)
-    scope = sabel_observer.safe_begin(prog, observed_argv)
-    rc = None
-    error = None
-    if scope is not None:
-        try:
-            runtime_metadata = {
-                "package_version": common.package_version(),
-                "build_id": common.runtime_build_id(
-                    "recall.py", "search.py", "around.py", "sabel_observer.py"),
-                "python": sys.version,
-                "cwd": os.getcwd(),
-            }
-        except Exception as exc:
-            runtime_metadata = {
-                "state": "unavailable", "error": type(exc).__qualname__}
-        sabel_observer.record_metadata("runtime", runtime_metadata)
-        try:
-            sabel_observer.record_metadata(
-                "generation_before", common.transcript_generation(attempts=1))
-        except Exception as exc:
-            sabel_observer.record_metadata("generation_before", {
-                "state": "unavailable", "error": type(exc).__qualname__})
     try:
-        try:
-            rc = _main(
-                argv, prog=prog,
-                auto_semantic_timeout_s=auto_semantic_timeout_s)
-        except _RecallQueryAbort:
-            rc = 2
-        return rc
-    except BaseException as exc:
-        error = exc
-        raise
-    finally:
-        if scope is not None:
-            try:
-                sabel_observer.record_metadata(
-                    "generation_after", common.transcript_generation(attempts=1))
-            except Exception as exc:
-                sabel_observer.record_metadata("generation_after", {
-                    "state": "unavailable", "error": type(exc).__qualname__})
-        exit_code = rc
-        if exit_code is None and isinstance(error, SystemExit):
-            exit_code = error.code if isinstance(error.code, int) else 1
-        sabel_observer.safe_finish(scope, exit_code, error=error)
+        return _main(
+            argv, prog=prog,
+            auto_semantic_timeout_s=auto_semantic_timeout_s)
+    except _RecallQueryAbort:
+        return 2
 
 
 if __name__ == "__main__":

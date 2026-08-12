@@ -1895,8 +1895,8 @@ class AutoSemanticHybridTests(unittest.TestCase):
                 replay_rc = search.main(["--deeper", deeper])
         self.assertEqual(replay_rc, 0)
         self.assertCountEqual(modes, ["keyword", "semantic"])
-        # the all-terms row now highlights its own terms on a tty (snippet
-        # invariant, goal-10 item 1) - the text survives under the marks
+        # the all-terms row highlights its own terms on a tty, so the text
+        # survives under the marks
         replay_plain = re.sub(r"\x1b\[[0-9;]*m", "", stdout.getvalue())
         self.assertIn("deployment retry evidence", replay_plain)
         self.assertIn("meaning evidence", replay_plain)
@@ -2105,6 +2105,46 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(len(calls), 1)
 
+    def test_automatic_no_sem_worker_unavailability_names_the_gate(self) -> None:
+        reason = "AGREP_NO_SEM_WORKER disables semantic worker queries"
+        with mock.patch.object(
+                semworker, "resident_status", return_value={"running": True}), \
+                mock.patch.object(
+                    semworker, "search_worker", return_value=None), \
+                mock.patch.object(
+                    semworker, "_worker_query_disabled", return_value=True), \
+                mock.patch.object(
+                    semworker, "_worker_query_disabled_reason",
+                    return_value=reason):
+            result = search._semantic_local(
+                "deployment retry loop", 3,
+                timeout_s=search._AUTO_SEMANTIC_TIMEOUT_S)
+        status = result["semantic_status"]
+        self.assertEqual(status["reason"], reason)
+        self.assertEqual(
+            surface.semantic_keyword_only_notice(status),
+            "meaning unavailable; keyword-only "
+            "(AGREP_NO_SEM_WORKER disables automatic meaning; "
+            "unset it to enable the lane)")
+
+    def test_automatic_disable_gate_wins_over_preflight_reason(self) -> None:
+        reason = "AGREP_NO_SEM_WORKER disables semantic worker queries"
+        with mock.patch.object(
+                semworker, "resident_status", return_value={"running": True}), \
+                mock.patch.object(
+                    semworker, "search_worker",
+                    side_effect=semworker.ResidentSemanticPreflightUnavailable(
+                        surface.SEMANTIC_INDEX_UPDATE_REASON)), \
+                mock.patch.object(
+                    semworker, "_worker_query_disabled", return_value=True), \
+                mock.patch.object(
+                    semworker, "_worker_query_disabled_reason",
+                    return_value=reason):
+            result = search._semantic_local(
+                "deployment retry loop", 3,
+                timeout_s=search._AUTO_SEMANTIC_TIMEOUT_S)
+        self.assertEqual(result["semantic_status"]["reason"], reason)
+
     def test_inprocess_fallback_holds_one_owner_through_resource_release(self) -> None:
         import semantic
 
@@ -2259,6 +2299,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
     def test_guarded_explicit_semantic_returns_the_child_result(self) -> None:
         result = {"engine": "semantic:hybrid", "hits": []}
         process = mock.Mock()
+        tree = mock.Mock()
         process.pid = 41
         process.returncode = 0
         process.communicate.return_value = (
@@ -2278,6 +2319,9 @@ class AutoSemanticHybridTests(unittest.TestCase):
                     search.common, "process_start_identity",
                     return_value="birth"), \
                 mock.patch.object(
+                    search, "_open_windows_semantic_tree",
+                    return_value=tree) as open_tree, \
+                mock.patch.object(
                     search, "_stop_semantic_subprocess",
                     return_value=True) as stop:
             self.assertEqual(search._guarded_semantic_query(spec), result)
@@ -2296,8 +2340,13 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(stop.call_args.args[:2], (process, "birth"))
         if search.common.WIN:
             self.assertIn("creationflags", popen.call_args.kwargs)
+            open_tree.assert_called_once()
+            self.assertIs(stop.call_args.kwargs["windows_tree"], tree)
+            tree.close.assert_called_once_with()
         else:
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            open_tree.assert_not_called()
+            tree.close.assert_not_called()
         process.stdin.close.assert_called_once_with()
         process.stdout.close.assert_called_once_with()
         process.stderr.close.assert_called_once_with()
@@ -2328,6 +2377,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
 
     def test_guarded_explicit_semantic_timeout_stops_the_child(self) -> None:
         process = mock.Mock()
+        tree = mock.Mock()
         process.pid = 41
         process.communicate.side_effect = subprocess.TimeoutExpired(
             "semantic", 0.05)
@@ -2339,6 +2389,9 @@ class AutoSemanticHybridTests(unittest.TestCase):
                     search.common, "process_start_identity",
                     return_value="birth"), \
                 mock.patch.object(
+                    search, "_open_windows_semantic_tree",
+                    return_value=tree) as open_tree, \
+                mock.patch.object(
                     search, "_stop_semantic_subprocess",
                     return_value=True) as stop, \
                 self.assertRaises(search.SemanticQueryTimeoutError):
@@ -2348,6 +2401,13 @@ class AutoSemanticHybridTests(unittest.TestCase):
 
         self.assertEqual(stop.call_args.args[:2], (process, "birth"))
         self.assertGreaterEqual(stop.call_args.args[2], 0.0)
+        if search.common.WIN:
+            open_tree.assert_called_once()
+            self.assertIs(stop.call_args.kwargs["windows_tree"], tree)
+            tree.close.assert_called_once_with()
+        else:
+            open_tree.assert_not_called()
+            tree.close.assert_not_called()
 
     def test_guarded_explicit_semantic_timeout_drains_the_bound_tree(self) -> None:
         process = mock.Mock()
@@ -2366,6 +2426,56 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(terminate.call_args.kwargs["term_grace_s"], 0.1)
         process.kill.assert_not_called()
 
+        tree = mock.Mock()
+        tree.terminate_and_wait.return_value = True
+        with mock.patch.object(
+                search.common, "terminate_exact_process_tree") as terminate:
+            self.assertTrue(search._stop_semantic_subprocess(
+                process, "birth", 1.0, windows_tree=tree))
+        tree.terminate_and_wait.assert_called_once()
+        terminate.assert_not_called()
+
+        tree = mock.Mock()
+        tree.terminate_and_wait.return_value = False
+        with mock.patch.object(
+                search.common, "terminate_exact_process",
+                return_value=True) as terminate:
+            self.assertTrue(search._stop_semantic_subprocess(
+                process, "birth", 1.0, windows_tree=tree))
+        terminate.assert_called_once_with(41, "birth")
+        process.wait.assert_called_once()
+
+
+    def test_unbounded_semantic_child_waits_for_its_job_boundary(self) -> None:
+        process = mock.Mock(pid=41)
+        process.poll.return_value = None
+        tree = mock.Mock()
+        jobs = mock.Mock()
+        jobs.open_exact.side_effect = [None, tree]
+        with mock.patch.object(search.common, "WIN", True), \
+                mock.patch.dict(search.sys.modules, {"winjob": jobs}), \
+                mock.patch.object(search.time, "sleep") as sleep:
+            self.assertIs(
+                search._open_windows_semantic_tree(process, "birth", None),
+                tree)
+        self.assertEqual(jobs.open_exact.call_count, 2)
+        sleep.assert_called_once_with(0.005)
+
+    def test_unbounded_semantic_child_bounds_job_acquisition(self) -> None:
+        process = mock.Mock(pid=41)
+        process.poll.return_value = None
+        jobs = mock.Mock()
+        jobs.open_exact.return_value = None
+        with mock.patch.object(search.common, "WIN", True), \
+                mock.patch.dict(search.sys.modules, {"winjob": jobs}), \
+                mock.patch.object(
+                    search.time, "monotonic", side_effect=(10.0, 11.0)), \
+                mock.patch.object(search.time, "sleep") as sleep:
+            self.assertIsNone(
+                search._open_windows_semantic_tree(process, "birth", None))
+        jobs.open_exact.assert_called_once_with(41, "birth")
+        sleep.assert_not_called()
+
     def test_exited_semantic_root_still_requires_tree_proof(self) -> None:
         process = mock.Mock(pid=41)
         with mock.patch.object(
@@ -2379,6 +2489,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
 
     def test_guarded_explicit_semantic_reports_an_undrained_tree(self) -> None:
         process = mock.Mock()
+        tree = mock.Mock()
         process.pid = 41
         process.communicate.side_effect = subprocess.TimeoutExpired(
             "semantic", 0.05)
@@ -2390,6 +2501,9 @@ class AutoSemanticHybridTests(unittest.TestCase):
                     search.common, "process_start_identity",
                     return_value="birth"), \
                 mock.patch.object(
+                    search, "_open_windows_semantic_tree",
+                    return_value=tree) as open_tree, \
+                mock.patch.object(
                     search, "_stop_semantic_subprocess",
                     return_value=False), \
                 self.assertRaisesRegex(
@@ -2397,6 +2511,12 @@ class AutoSemanticHybridTests(unittest.TestCase):
             search.run_query(
                 "deployment retry loop", mode="semantic",
                 semantic_timeout_s=0.05, semantic_process_guard=True)
+        if search.common.WIN:
+            open_tree.assert_called_once()
+            tree.close.assert_called_once_with()
+        else:
+            open_tree.assert_not_called()
+            tree.close.assert_not_called()
 
 
 class RecallHybridTests(unittest.TestCase):
@@ -2515,8 +2635,8 @@ class RecallHybridTests(unittest.TestCase):
         self.assertIn("@meaning:7", stdout.getvalue())
 
     def test_probe_keyword_only_all_terms_hit_is_a_confident_pointer(self) -> None:
-        # panel 2: plain keyword search answered first try, yet the probe
-        # reported a miss because its gate expected semantic confirmation
+        # Plain keyword search answered first try; a missing semantic score
+        # must not turn that answer into a probe miss.
         def run_query(_query, *, mode="keyword", **kwargs):
             if mode == "semantic":
                 return None  # the meaning lane is down
@@ -3525,6 +3645,8 @@ class RecallHybridTests(unittest.TestCase):
             rc = recall.main(["deployment retry loop", "-s", "--budget", "0"])
         self.assertEqual(rc, 0)
         head = stdout.getvalue().splitlines()[0]
+        self.assertTrue(head.startswith("── @meaning:7"), head)
+        self.assertIn("pull: agrep around @meaning:7", head)
         self.assertIn("cosine 0.8256", head)
         self.assertIn("weak meaning match", head)
         self.assertNotIn("score 0.4851", head)

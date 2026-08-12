@@ -1236,10 +1236,6 @@ def in_agent_context(environ: Mapping[str, str] | None = None) -> bool:
     return any(env.get(key) for key in AGENT_CONTEXT_ENV_KEYS)
 
 
-# which agent's history a given env fingerprint belongs to (calling_session)
-_CLAUDE_ENV = ("CLAUDECODE", "CLAUDE_CODE", "CLAUDE_CODE_ENTRYPOINT")
-
-
 class CallerIdentity(NamedTuple):
     session: str | None
     reason: str
@@ -1255,11 +1251,8 @@ def calling_identity(
         "codex": env.get("CODEX_THREAD_ID", "").strip(),
         "pi": env.get("AGREP_PI_SESSION_ID", "").strip(),
     }
-    claude_present = bool(
-        identities["claude"] or any(env.get(key) for key in _CLAUDE_ENV))
     nonempty = [(agent, value) for agent, value in identities.items() if value]
-    if (claude_present and not identities["claude"] and nonempty
-            or len({value for _, value in nonempty}) > 1):
+    if len({value for _, value in nonempty}) > 1:
         return CallerIdentity(None, "identity-conflict")
     if len(nonempty) > 1:
         return CallerIdentity(nonempty[0][1], "corroborated")

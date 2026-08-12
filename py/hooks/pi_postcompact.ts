@@ -4,7 +4,7 @@ const MESSAGE_TYPE = "agrep-postcompact";
 const COMPACTION_GUIDANCE = `Required handoff content:
 
 ## Post-compact recovery
-State as an instruction, not an option: this summary is lossy, but the conversation it replaces remains indexed. Whenever resumed work needs an exact value, decision, error text, path, or result from before this boundary, the agent's first move is \`agrep postcompact\`, bounded rather than a dump, before acting or reconstructing from memory. \`agrep recall\` is for other sessions, not this boundary.
+State as a gate, not a ritual: before acting, name exactly what the next action needs and check the visible summary. If the summary fully states those facts, use it and do not retrieve history. If it only names or alludes to a needed exact value, decision, error text, path, failed approach, or unread result from before this boundary, the agent's first move is \`agrep postcompact\`, bounded rather than a dump, before acting or reconstructing from memory. \`agrep recall\` is for other sessions, not this boundary.
 
 ## Retrieval anchors
 For every frame change, key discovery, user correction, and commissioned result, preserve one distinctive verbatim quote of 4-10 words. Never paraphrase an anchor. If no quotable phrase exists, name the pivot and write "no anchor".
@@ -25,7 +25,7 @@ function scopedCommand(sessionId) {
 
 function recoveryMessage(sessionId) {
   const command = scopedCommand(sessionId);
-  return `Post-compaction recovery: this session just crossed a compaction boundary. The summary is lossy, while the replaced turns remain indexed. If the task needs any exact pre-boundary value, decision, error text, path, or result, run \`${command}\` as the first tool action before acting or reconstructing from memory. This exact command is already scoped to this Pi/OMP session; do not inspect the environment or substitute \`agrep recall\`. Follow only the \`--more\` continuation it prints if the needed evidence is omitted.`;
+  return `Post-compaction recovery: this session just crossed a compaction boundary. The summary is lossy, while the replaced turns remain indexed. Before acting, name exactly what the next action needs and check the visible summary. If it fully states those facts, use it and do not retrieve history. If it only names or alludes to a needed exact value, decision, error text, path, failed approach, or unread result from before this boundary, run \`${command}\` as the first tool action before acting or reconstructing from memory. This exact command is already scoped to this Pi/OMP session; do not inspect the environment or substitute \`agrep recall\`. Follow only the \`--more\` continuation it prints if the needed evidence is omitted.`;
 }
 
 function resumedAtUnrecoveredCompaction(entries, sessionId) {

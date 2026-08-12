@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import time
@@ -102,9 +103,18 @@ def windows_file_identity(path: Path) -> FileIdentity:
         kernel32.CloseHandle(handle)
 
 
+def _windows_usn_change_token(usn: int) -> int | None:
+    if usn == 0:
+        return None
+    value = usn & 0xFFFFFFFFFFFFFFFF
+    rotated = ((value << 7) | (value >> 57)) & 0xFFFFFFFFFFFFFFFF
+    return rotated ^ 0x55534E5F46494C45
+
+
 def windows_rust_change_token(
-        path: Path, expected_identity: FileIdentity | None = None) -> int:
-    """Return the same NTFS USN token Rust serializes in ``ChangeToken``."""
+        path: Path,
+        expected_identity: FileIdentity | None = None) -> int | None:
+    """Return Rust's NTFS USN token, or ``None`` without journal evidence."""
     if not WIN:
         raise OSError("Windows change tokens are unavailable on this platform")
     global _WINDOWS_USN_API
@@ -168,9 +178,7 @@ def windows_rust_change_token(
             raw[usn_offset:usn_offset + 8], "little", signed=True)
         if _windows_handle_identity(handle) != opened_identity:
             raise OSError("file changed while reading its USN token")
-        value = usn & 0xFFFFFFFFFFFFFFFF
-        rotated = ((value << 7) | (value >> 57)) & 0xFFFFFFFFFFFFFFFF
-        return rotated ^ 0x55534E5F46494C45
+        return _windows_usn_change_token(usn)
     finally:
         kernel32.CloseHandle(handle)
 
@@ -202,6 +210,51 @@ def file_identity(path: Path) -> FileIdentity:
         return file_identity_fd(fd)
     finally:
         os.close(fd)
+
+
+def _content_change_token(
+        path: Path, expected_identity: FileIdentity) -> int:
+    """Hash one stable regular-file generation for filesystems without USNs."""
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags)
+    try:
+        opened_identity = file_identity_fd(fd)
+        if opened_identity != expected_identity:
+            raise OSError("file changed before hashing its change token")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if (file_identity_fd(fd) != opened_identity
+                or file_identity(path) != opened_identity):
+            raise OSError("file changed while hashing its change token")
+        # Keep the content-proof domain disjoint from Rust's u64 USN tokens.
+        return (1 << 256) | int.from_bytes(digest.digest(), "big")
+    finally:
+        os.close(fd)
+
+
+def change_sensitive_file_identity(path: Path) -> FileIdentity:
+    """Identity whose final member changes after every observable file rewrite.
+
+    NTFS ChangeTime can remain static on hosted or synthetic volumes. Prefer
+    the journal token shared with Rust and fall back to a stable full-content
+    proof when the filesystem cannot provide one. POSIX ctime already supplies
+    the change-sensitive member.
+    """
+    identity = file_identity(path)
+    if not WIN:
+        return identity
+    try:
+        token = windows_rust_change_token(path, expected_identity=identity)
+    except OSError:
+        token = None
+    if token is None:
+        token = _content_change_token(path, identity)
+    return (*identity[:4], token)
 
 
 def replace_with_retry(

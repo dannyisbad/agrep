@@ -224,8 +224,8 @@ class CollapseRendering(unittest.TestCase):
 
 
 class MetaProvenance(unittest.TestCase):
-    """Panel SP1: a row that quotes an incident must not outrank the row that
-    lived it, and the demotion must be visible."""
+    """A row quoting an incident must not outrank the row that lived it, and
+    the demotion must be visible."""
 
     @staticmethod
     def _row(project: str, who: str = "user") -> dict:
@@ -315,8 +315,7 @@ class MetaProvenance(unittest.TestCase):
 
 
 class RecallMetaStory(unittest.TestCase):
-    """SP1 for recall: the shared engine rank-reduces meta rows (x0.45), so
-    recall's render must mark them the way search's does."""
+    """Recall must mark rank-demoted meta rows the same way search does."""
 
     def test_probe_pointer_carries_the_meta_mark(self) -> None:
         hit = {"session": "abcdef0123456789", "turn": 3, "ts": 1,
@@ -336,8 +335,7 @@ class RecallMetaStory(unittest.TestCase):
             "~self ~meta")
 
 class CountingModel(unittest.TestCase):
-    """C6/SP5: three models could not parse "showing 39 of at least 92 hits
-    (75 in tool output)" - the unit and the subset relationship must be said."""
+    """The hit unit and tool-output subset relationship must be explicit."""
 
     def _run(self, argv: list[str], hits: list[dict], total: int,
              tool_hits: int = 0, exact: bool = True):
@@ -370,7 +368,7 @@ class CountingModel(unittest.TestCase):
 
 
 class SlowLaneHealsItself(unittest.TestCase):
-    """Goal 11 for the unusable-db lane: the state is repaired, not narrated.
+    """The unusable-db lane is repaired, not narrated.
 
     A pending repair or a dead foreign owner's stores are agrep's own damage;
     the query kicks the background repair and serves the scan in silence

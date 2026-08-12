@@ -224,9 +224,9 @@ def _cache_entry_owned(path: Path) -> bool:
 
 def _cache_snapshot(path: Path) -> ownerfile.Snapshot:
     """Read one cache only while its strong path identity remains unchanged."""
-    before = fileops.file_identity(path)
+    before = fileops.change_sensitive_file_identity(path)
     snapshot = ownerfile.snapshot(path, max_bytes=_CACHE_MAX_BYTES)
-    after = fileops.file_identity(path)
+    after = fileops.change_sensitive_file_identity(path)
     snapshot_identity = tuple(snapshot.identity)
     strong_identity = tuple(after[:4])
     same_entry = (
@@ -818,10 +818,10 @@ def _path_state(path: str) -> tuple[str, str]:
 def _optional_plain_identity(
         path: os.PathLike) -> tuple[int, int, int, int, int] | None:
     try:
-        # `st_ctime_ns` is creation time on supported older Windows Pythons.
-        # Use the source census's no-follow identity so restored mtimes still
-        # advance FILE_BASIC_INFO.ChangeTime after same-size rewrites.
-        return _entry_identity(fileops.file_identity(Path(path)))
+        # Use the source census's no-follow identity plus the Windows
+        # USN/content fallback so restored mtimes cannot hide rewrites.
+        return _entry_identity(
+            fileops.change_sensitive_file_identity(Path(path)))
     except FileNotFoundError:
         return None
 
@@ -834,7 +834,7 @@ def _sqlite_family_identity(path: Path) -> tuple:
         try:
             family.append((
                 suffix,
-                _entry_identity(fileops.file_identity(member)),
+                _entry_identity(fileops.change_sensitive_file_identity(member)),
             ))
         except FileNotFoundError:
             if not suffix:

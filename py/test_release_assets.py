@@ -39,7 +39,7 @@ def _binary(kind: str, architecture: int,
         struct.pack_into("<6I", data, 32, 0x32, 24, 1, encoded, 0, 0)
     marker = (
         f"agrep-release-version:{release_assets.checkout_version()}".encode("ascii"))
-    data[100:100 + len(marker)] = marker
+    data[512:512 + len(marker)] = marker
     return bytes(data)
 
 
@@ -54,7 +54,7 @@ class ReleaseAssetsTests(unittest.TestCase):
 
     def _wheels(self, directory: Path, assets: Path) -> None:
         directory.mkdir()
-        version = release_assets.checkout_version()
+        version = release_assets.distribution_version()
         for asset_name, (_, _, platform, member) in (
                 release_assets.BINARY_TARGETS.items()):
             wheel = directory / f"agrep-{version}-py3-none-{platform}.whl"
@@ -262,7 +262,7 @@ class ReleaseAssetsTests(unittest.TestCase):
                 asset_name = "agrep-rs-linux-x86_64"
                 _, _, platform, member = release_assets.BINARY_TARGETS[asset_name]
                 wheel = wheels / (
-                    f"agrep-{release_assets.checkout_version()}-py3-none-{platform}.whl")
+                    f"agrep-{release_assets.distribution_version()}-py3-none-{platform}.whl")
                 with zipfile.ZipFile(wheel, "w") as archive:
                     archive.writestr(member, b"different")
                 with self.assertRaisesRegex(RuntimeError, "differs from wheel payload"):

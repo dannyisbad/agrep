@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import datetime
@@ -33,7 +32,6 @@ import console
 import display_policy
 import explore
 import indexd_runtime
-import sabel_observer
 import session_context
 import surface_policy as surface
 
@@ -48,13 +46,10 @@ _stdout_bytes = 0
 
 
 def _stdout_print(value: object = "") -> None:
-    """Print one stdout line and mirror the exact UTF-8 render to the observer."""
+    """Print one stdout line and count its rendered bytes."""
     global _stdout_bytes
     print(value)
     _stdout_bytes += len(str(value)) + 1
-    if sabel_observer.active():
-        sabel_observer.record_stdout(
-            (str(value) + "\n").encode("utf-8", errors="replace"))
 
 
 def _warn_if_oversized(argv: list[str] | None) -> None:
@@ -210,7 +205,6 @@ def _serve(notes: list[dict], json_output: bool, kind: str, **fields) -> None:
 
 def _fail(json_output: bool, code: str, reason: str, **fields) -> int:
     """Emit one error on the channel owned by the selected output contract."""
-    sabel_observer.record_outcome("error", code, reason)
     if json_output:
         _stdout_print(json.dumps(
             {"kind": "agrep-meta",
@@ -233,7 +227,6 @@ def _unchecked_freshness() -> dict:
 def _miss(json_output: bool, code: str, reason: str, *,
           checked: bool = True, **fields) -> int:
     """Render one scoped empty selection; unchecked absence is unverified."""
-    sabel_observer.record_outcome("miss", code, reason)
     if json_output:
         row = {"kind": "agrep-meta",
                "miss": {"code": code, "reason": reason, **fields}}
@@ -866,10 +859,6 @@ def _main(argv: list[str] | None = None) -> int:
             "--no-tools or use a different prose handle",
         )
 
-    sabel_observer.record_around_open(
-        str(args.session) if is_handle else None,
-        session=str(w["session"]), requested_turn=int(requested_center),
-        served_turn=int(w["center"]), window=w)
 
     raw_session_rows = explore._session_index()
     if hasattr(raw_session_rows, "items"):
@@ -1173,51 +1162,12 @@ def _main(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    observed_argv = list(sys.argv[1:] if argv is None else argv)
-    scope = sabel_observer.safe_begin("around", observed_argv)
-    rc = None
-    error = None
-    if scope is not None:
-        try:
-            runtime_metadata = {
-                "package_version": common.package_version(),
-                "build_id": common.runtime_build_id(
-                    "recall.py", "search.py", "around.py", "sabel_observer.py"),
-                "python": sys.version,
-                "cwd": os.getcwd(),
-            }
-        except Exception as exc:
-            runtime_metadata = {
-                "state": "unavailable", "error": type(exc).__qualname__}
-        sabel_observer.record_metadata("runtime", runtime_metadata)
-        try:
-            sabel_observer.record_metadata(
-                "generation_before", common.transcript_generation(attempts=1))
-        except Exception as exc:
-            sabel_observer.record_metadata("generation_before", {
-                "state": "unavailable", "error": type(exc).__qualname__})
     global _stdout_bytes
     _stdout_bytes = 0
-    try:
-        rc = _main(argv)
-        if rc == 0:
-            _warn_if_oversized(argv)
-        return rc
-    except BaseException as exc:
-        error = exc
-        raise
-    finally:
-        if scope is not None:
-            try:
-                sabel_observer.record_metadata(
-                    "generation_after", common.transcript_generation(attempts=1))
-            except Exception as exc:
-                sabel_observer.record_metadata("generation_after", {
-                    "state": "unavailable", "error": type(exc).__qualname__})
-        exit_code = rc
-        if exit_code is None and isinstance(error, SystemExit):
-            exit_code = error.code if isinstance(error.code, int) else 1
-        sabel_observer.safe_finish(scope, exit_code, error=error)
+    rc = _main(argv)
+    if rc == 0:
+        _warn_if_oversized(argv)
+    return rc
 
 
 if __name__ == "__main__":

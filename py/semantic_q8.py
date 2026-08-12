@@ -1228,63 +1228,6 @@ def exact_candidates(
         return None
 
 
-def _grouped_exact_candidates(
-    query: np.ndarray,
-    generation: str,
-    k: int = 128,
-    heads: int = 8,
-    eligible=None,
-    *, capture_shadow: bool = False,
-):
-    """Generation-safe grouped q8 candidates reranked from immutable f16.
-
-    The optional diagnostic return reuses the exact serving scan and sidecar
-    gather.  It never performs another model call or candidate scan.
-    """
-    try:
-        manifest = _ready_manifest(str(generation or ""))
-        if manifest is None:
-            close_scanner()
-            return None
-        vector = np.asarray(query, dtype=np.float32).reshape(-1)
-        with _LOCK:
-            scanner = _scanner_for_manifest(manifest)
-            q8_ordinals, q8_scores = scanner.top(
-                vector, _artifact_generation(manifest), k,
-                grouped=True, heads=heads, eligible=eligible)
-            scores, group_ids = _exact_candidate_sidecars(
-                manifest, q8_ordinals, vector)
-            if (not np.all(np.isfinite(scores))
-                    or np.any(group_ids >= int(manifest["group_count"]))):
-                raise RuntimeError("q8 exact candidate sidecars are invalid")
-            order = np.lexsort((q8_ordinals, -scores))
-            ordinals = q8_ordinals[order]
-            scores = scores[order]
-            group_ids = group_ids[order]
-        if _ready_manifest(generation) is None:
-            close_scanner()
-            return None
-        result = (ordinals, scores, group_ids, int(manifest["group_count"]))
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError,
-            json.JSONDecodeError, subprocess.SubprocessError, EOFError):
-        close_scanner()
-        return None
-    if not capture_shadow:
-        return result
-    try:
-        diagnostic = {
-            "q8_ordinals": q8_ordinals.astype(np.int64, copy=False).tolist(),
-            "q8_scores": q8_scores.astype(np.float32, copy=False).tolist(),
-            "f16_ordinals": ordinals.astype(np.int64, copy=False).tolist(),
-            "f16_scores": scores.astype(np.float32, copy=False).tolist(),
-            "f16_groups": group_ids.astype(np.uint32, copy=False).tolist(),
-            "group_count": int(manifest["group_count"]),
-        }
-    except Exception:  # noqa: BLE001 -- observer diagnostics cannot wound serving
-        diagnostic = None
-    return result, diagnostic
-
-
 def grouped_exact_candidates(
     query: np.ndarray,
     generation: str,
@@ -1293,25 +1236,34 @@ def grouped_exact_candidates(
     eligible=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
     """Generation-safe grouped q8 candidates reranked from immutable f16."""
-    return _grouped_exact_candidates(
-        query, generation, k=k, heads=heads, eligible=eligible)
-
-
-def grouped_exact_candidates_with_shadow(
-    query: np.ndarray,
-    generation: str,
-    k: int = 128,
-    heads: int = 8,
-    eligible=None,
-):
-    """Return serving candidates plus their already-computed q8/f16 trace.
-
-    This is an internal observer seam.  Callers must not use the trace to
-    influence the serving result.
-    """
-    return _grouped_exact_candidates(
-        query, generation, k=k, heads=heads, eligible=eligible,
-        capture_shadow=True)
+    try:
+        manifest = _ready_manifest(str(generation or ""))
+        if manifest is None:
+            close_scanner()
+            return None
+        vector = np.asarray(query, dtype=np.float32).reshape(-1)
+        with _LOCK:
+            scanner = _scanner_for_manifest(manifest)
+            ordinals, _ = scanner.top(
+                vector, _artifact_generation(manifest), k,
+                grouped=True, heads=heads, eligible=eligible)
+            scores, group_ids = _exact_candidate_sidecars(
+                manifest, ordinals, vector)
+            if (not np.all(np.isfinite(scores))
+                    or np.any(group_ids >= int(manifest["group_count"]))):
+                raise RuntimeError("q8 exact candidate sidecars are invalid")
+            order = np.lexsort((ordinals, -scores))
+            ordinals = ordinals[order]
+            scores = scores[order]
+            group_ids = group_ids[order]
+        if _ready_manifest(generation) is None:
+            close_scanner()
+            return None
+        return ordinals, scores, group_ids, int(manifest["group_count"])
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError,
+            json.JSONDecodeError, subprocess.SubprocessError, EOFError):
+        close_scanner()
+        return None
 
 
 def shadow_scores(query: np.ndarray, matrix) -> np.ndarray | None:

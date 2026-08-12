@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,27 @@ from _test_support import isolate_data_dir  # noqa: E402
 isolate_data_dir()
 
 import dist  # noqa: E402
+
+
+class PackageVersionTests(unittest.TestCase):
+    def test_source_checkout_does_not_borrow_an_installed_version(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            package = root / "agrep"
+            package.mkdir()
+            (package / "__init__.py").write_text(
+                '__version__ = "1.2.3-rc.4"\n', encoding="utf-8")
+            installed = types.ModuleType("agrep")
+            installed.__version__ = "9.9.9"
+            with mock.patch.object(dist, "REPO_ROOT", root), \
+                    mock.patch.dict(sys.modules, {"agrep": installed}):
+                self.assertEqual(dist.package_version(), "1.2.3-rc.4")
+                with mock.patch.dict(os.environ, {"AGREP_BIN_URL": ""}):
+                    self.assertEqual(
+                        dist._fetch_base_url(),
+                        "https://github.com/dannyisbad/agrep/releases/"
+                        "download/v1.2.3-rc.4/")
 
 
 class LinuxRawBinaryCompatibilityTests(unittest.TestCase):

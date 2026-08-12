@@ -47,8 +47,10 @@ _LIMITS = tuple(
 # _test_support establishes the sandbox on the first module that imports it,
 # which is the isolation working. Allowed for exactly these keys and only from
 # unset to set: a module changing one afterwards is still a leak.
-ESTABLISHED = ("AGREP_DATA_DIR", "AGREP_DATA_DIR_SOURCE", "AGREP_HOME",
-               "AGREP_PYTHON_RUNTIME_BUILD_ID", "AGREP_NO_DAEMON")
+ESTABLISHED = (
+    "AGREP_DATA_DIR", "AGREP_DATA_DIR_SOURCE", "AGREP_HOME",
+    "AGREP_PYTHON_RUNTIME_BUILD_ID", "AGREP_NO_DAEMON",
+    "AGREP_NO_SEM_WORKER")
 
 # events.py:98 writes the source it resolved back to the environment on import,
 # so the harness's "test" becomes the product's "env" once. Only that pair.
@@ -153,8 +155,7 @@ def main() -> int:
     modules = sorted(path.stem for path in PY_DIR.glob("test_*.py"))
     started = time.monotonic()
     found: list[str] = []
-    # A sweep that probed nothing and said "clean" is the check-that-did-not-run
-    # this campaign exists to delete. The floor is the count it swept last.
+    # A sweep that probed nothing must not report clean.
     if len(modules) < MIN_MODULES:
         print(f"  swept {len(modules)} modules, fewer than the {MIN_MODULES} "
               "this tree had: the probe did not run")

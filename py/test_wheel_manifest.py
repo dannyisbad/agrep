@@ -23,7 +23,8 @@ sys.path.pop(0)
 import common
 import indexd_runtime  # noqa: E402
 
-VERSION = package_metadata.checkout_version()
+VERSION = package_metadata.distribution_version()
+BINARY_VERSION = package_metadata.checkout_version()
 PLATFORM = "macosx_11_0_arm64"
 BINARY_NAME = "agrep/_bin/agrep-rs"
 
@@ -34,8 +35,8 @@ def _fake_binary(minimum: tuple[int, int, int] = (11, 0, 0)) -> bytes:
     struct.pack_into("<7I", data, 4, 0x0100000C, 0, 2, 1, 24, 0, 0)
     encoded_minimum = minimum[0] << 16 | minimum[1] << 8 | minimum[2]
     struct.pack_into("<6I", data, 32, 0x32, 24, 1, encoded_minimum, 0, 0)
-    marker = f"agrep-release-version:{VERSION}".encode("ascii")
-    data[100:100 + len(marker)] = marker
+    marker = f"agrep-release-version:{BINARY_VERSION}".encode("ascii")
+    data[512:512 + len(marker)] = marker
     return bytes(data)
 
 
@@ -45,8 +46,8 @@ def _fake_pe_binary(machine: int = 0x8664) -> bytes:
     struct.pack_into("<I", data, 0x3C, 0x80)
     data[0x80:0x84] = b"PE\0\0"
     struct.pack_into("<H", data, 0x84, machine)
-    marker = f"agrep-release-version:{VERSION}".encode("ascii")
-    data[100:100 + len(marker)] = marker
+    marker = f"agrep-release-version:{BINARY_VERSION}".encode("ascii")
+    data[512:512 + len(marker)] = marker
     return bytes(data)
 
 
@@ -188,7 +189,7 @@ class WheelManifestTests(unittest.TestCase):
             (PLATFORM, len(validate_wheel.RUNTIME_FILES) + 7))
 
     def test_rejects_binary_without_release_marker(self) -> None:
-        marker = f"agrep-release-version:{VERSION}".encode("ascii")
+        marker = f"agrep-release-version:{BINARY_VERSION}".encode("ascii")
         binary = _fake_binary().replace(marker, b"x" * len(marker))
         _wheel(self.path, binary=binary)
         with self.assertRaisesRegex(
@@ -303,10 +304,9 @@ class WheelManifestTests(unittest.TestCase):
 class StagedBinaryFreshnessTests(unittest.TestCase):
     """A local wheel never ships a `_bin/` artifact that isn't what you built.
 
-    The only identity `_validate_binary_version` checks is the version string,
-    which has been "0.2.0" across every rebuild - so a days-old staged binary
-    validates and ships silently. That shipped a stale binary to a live box
-    twice and invalidated the measurements taken from it.
+    The release version alone does not identify a source-only rebuild, so a
+    days-old staged binary can validate and ship silently. That shipped a stale
+    binary to a live box twice and invalidated the measurements taken from it.
     """
 
     def setUp(self) -> None:
@@ -364,15 +364,17 @@ class StagedBinaryFreshnessTests(unittest.TestCase):
                 self.staged, self.root, "agrep-rs"))
 
     def test_external_cargo_target_supplies_the_staged_binary(self) -> None:
+        exe = "agrep-rs.exe" if sys.platform == "win32" else "agrep-rs"
         target = self.root / "external-target"
         (target / "release").mkdir(parents=True)
-        built = target / "release" / "agrep-rs"
+        built = target / "release" / exe
         built.write_bytes(b"external-build")
         (self.root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
         self.hook.root = str(self.root)
         for configured in (str(target), target.name):
             with self.subTest(target_dir=configured):
-                self.staged.unlink(missing_ok=True)
+                staged = self.root / "_bin" / exe
+                staged.unlink(missing_ok=True)
                 with mock.patch.dict(
                         os.environ, {"CARGO_TARGET_DIR": configured}), \
                         mock.patch.object(
@@ -381,7 +383,7 @@ class StagedBinaryFreshnessTests(unittest.TestCase):
                         mock.patch.object(self.hook, "_validate_binary_version"):
                     self.hook._ensure_binary()
                 run.assert_called_once()
-                self.assertEqual(self.staged.read_bytes(), b"external-build")
+                self.assertEqual(staged.read_bytes(), b"external-build")
 
     def test_external_cargo_target_participates_in_staleness(self) -> None:
         target = self.root / "external-target"

@@ -506,8 +506,8 @@ class ReportedCaseTests(unittest.TestCase):
 
 
 # -- machine surfaces (--json / --flat / -l): the same partition, every
-# refusal live (docket S14/M9). -l beside --json is HONORED - one json row
-# per chat (selftest pins the shape) - a combined surface, not a drop.
+# refusal live. -l beside --json is HONORED - one json row per chat
+# (selftest pins the shape) - a combined surface, not a drop.
 _MACHINE_HONORED = frozenset({
     "-E", "-w", "--agent", "--project", "--exclude-project", "--model",
     "--soft", "--who", "--no-who", "--chat", "--since", "--until",
@@ -593,8 +593,8 @@ class MachineSurfacePartitionTests(unittest.TestCase):
                 with self.subTest(surface=face.flag, flag=flag):
                     self.assertTrue(reason.strip())
 
-    # Docket S14/M9 closed: refused pairs are exercised live above; the
-    # honored -l/--json pair (per-chat json rows) is pinned in both orders.
+    # Refused pairs are exercised live above; the honored -l/--json pair
+    # (per-chat json rows) is pinned in both orders.
     def test_l_beside_json_is_honored_in_both_orders(self) -> None:
         for base in (["deadlock", "--json", "-l"], ["deadlock", "-l", "--json"]):
             with self.subTest(argv=base):

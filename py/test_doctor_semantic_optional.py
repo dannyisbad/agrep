@@ -41,6 +41,8 @@ import semantic  # noqa: E402
 import semworker  # noqa: E402
 import teach  # noqa: E402
 
+SEMANTIC_REQUIREMENT = f"agrep[semantic]=={doctor.common.package_version()}"
+
 
 def _missing_semantic() -> dict:
     return {
@@ -694,7 +696,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                 self.assertIn("semantic model prefetch skipped", rendered)
                 self.assertIn("semantic search is optional", rendered)
                 self.assertIn("pip install", rendered)
-                self.assertIn("agrep[semantic]==0.2.0", rendered)
+                self.assertIn(SEMANTIC_REQUIREMENT, rendered)
                 self.assertNotIn("hard dependency", rendered)
 
     def test_doctor_fix_command_succeeds_without_semantic_runtime(self) -> None:
@@ -716,7 +718,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertIn("tiers now: core", rendered)
         self.assertIn("prefetch skipped", rendered)
         self.assertIn("pip install", rendered)
-        self.assertIn("agrep[semantic]==0.2.0", rendered)
+        self.assertIn(SEMANTIC_REQUIREMENT, rendered)
 
     def test_setup_no_semantic_is_one_run_network_sterile(self) -> None:
         output = io.StringIO()
@@ -1058,10 +1060,10 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                          "missing-optional-dependencies")
         self.assertIn("pip install", report["semantic"]["install_hint"])
         self.assertIn(
-            "agrep[semantic]==0.2.0", report["semantic"]["install_hint"])
+            SEMANTIC_REQUIREMENT, report["semantic"]["install_hint"])
         fixes = "\n".join(report["fixes"])
         self.assertIn("pip install", fixes)
-        self.assertIn("agrep[semantic]==0.2.0", fixes)
+        self.assertIn(SEMANTIC_REQUIREMENT, fixes)
         self.assertNotIn("reinstall agrep", "\n".join(report["fixes"]))
 
     def test_json_report_does_not_offer_semantic_repairs_while_off(self) -> None:
@@ -1420,7 +1422,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertIn("not installed (optional)", rendered)
         self.assertNotIn("[MISS] numpy", rendered)
         self.assertIn("pip install", rendered)
-        self.assertIn("agrep[semantic]==0.2.0", rendered)
+        self.assertIn(SEMANTIC_REQUIREMENT, rendered)
         self.assertIn(doctor.SEMANTIC_UNLOCK, report["fixes"])
 
     def test_human_report_describes_off_as_disabled_not_self_healing(
@@ -1513,7 +1515,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
             rendered = "\n".join(cli._status_lines("agrep"))
         self.assertIn("optional dependencies are not installed", rendered)
         self.assertIn("pip install", rendered)
-        self.assertIn("agrep[semantic]==0.2.0", rendered)
+        self.assertIn(SEMANTIC_REQUIREMENT, rendered)
         self.assertNotIn("reinstall agrep", rendered)
         # a working keyword search is the healthy default and earns no line
         self.assertNotIn("keyword search works", rendered)
@@ -1714,7 +1716,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertEqual(cache["state"], "unavailable")
         self.assertIsNone(cache["bytes"])
 
-    # goal10 audit B10: a directory (or any unprovable corpus) at the
+    # A directory (or any unprovable corpus) at the
     # messages path printed "already built - 0 messages" and exited 0
     def test_setup_uses_a_verified_current_daemon_during_index_repair(self) -> None:
         output = io.StringIO()

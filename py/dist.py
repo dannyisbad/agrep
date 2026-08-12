@@ -65,17 +65,19 @@ def cli_invocation(
 
 def package_version() -> str:
     """The Python package/release version without importing the CLI tree."""
+    if _is_dev_checkout():
+        try:
+            raw = (REPO_ROOT / "agrep" / "__init__.py").read_text(
+                encoding="utf-8")
+            match = re.search(r'__version__\s*=\s*["\']([^"\']+)', raw)
+            return match.group(1) if match else "dev"
+        except Exception:  # noqa: BLE001 -- an unreadable checkout is not installed
+            return "dev"
     try:
         from agrep import __version__  # noqa: PLC0415
         return str(__version__)
-    except Exception:  # noqa: BLE001 -- source checkouts may not be import-installed
-        try:
-            import re as _re
-            raw = (REPO_ROOT / "agrep" / "__init__.py").read_text(encoding="utf-8")
-            match = _re.search(r'__version__\s*=\s*["\']([^"\']+)', raw)
-            return match.group(1) if match else "dev"
-        except Exception:  # noqa: BLE001
-            return "dev"
+    except Exception:  # noqa: BLE001 -- a damaged installation is unidentified
+        return "dev"
 
 
 _DISTRIBUTION_MANIFEST_MAX_BYTES = 1024 * 1024
@@ -439,11 +441,10 @@ def _fetch_base_url() -> str:
     base = os.environ.get("AGREP_BIN_URL")
     if base:
         return base if base.endswith("/") else base + "/"
-    try:
-        from agrep import __version__ as v  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
-        v = "dev"
-    return f"https://github.com/dannyisbad/agrep/releases/download/v{v}/"
+    return (
+        "https://github.com/dannyisbad/agrep/releases/download/"
+        f"v{package_version()}/"
+    )
 
 
 def _display_url(url: str) -> str:

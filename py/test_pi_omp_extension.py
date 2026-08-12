@@ -70,6 +70,7 @@ check(Array.isArray(compacting.context) && compacting.context.length === 1,
 const guidance = compacting.context[0];
 for (const phrase of ["## Post-compact recovery", "## Retrieval anchors",
   "## Killed hypotheses and open contradictions", "## Commissioned, unread",
+  "check the visible summary", "do not retrieve history",
   "agrep postcompact"]) {{
   check(guidance.includes(phrase), `missing compaction guidance: ${{phrase}}`);
 }}
@@ -84,6 +85,8 @@ check(sent[0].message.display === false
 for (const phrase of [
   `agrep postcompact --session ${{sessionId}}`,
   "first tool action",
+  "check the visible summary",
+  "do not retrieve history",
   "do not inspect the environment",
   "do not inspect the environment or substitute `agrep recall`",
   "--more",

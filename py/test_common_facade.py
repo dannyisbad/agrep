@@ -20,8 +20,7 @@ DEFINITION_LINES = {
     "index_summary": 77,
     "detected_stores": 45,
     "store_freshness": 15,
-    # M10: background children stamp datable log lines; M14: corpus-size
-    # disclosure for fork probes.
+    # Background children stamp datable lines; fork probes disclose corpus size.
     "_LineStampWriter": 17,
     "stamp_stdio_lines": 6,
     "committed_message_total": 15,

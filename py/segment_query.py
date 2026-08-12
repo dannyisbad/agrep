@@ -588,17 +588,6 @@ class SegmentRefStore:
         self.assert_current()
         return [found[row_ref] for row_ref in requested if row_ref in found]
 
-    def resolve_for_diagnostic(self, rowrefs) -> list[dict]:
-        """Resolve shadow heads without changing serving-integrity disclosure."""
-        integrity_drops = set(self._integrity_drops)
-        absent_drops = set(self._absent_drops)
-        resolve_considered = self._resolve_considered
-        try:
-            return self.resolve(rowrefs)
-        finally:
-            self._integrity_drops = integrity_drops
-            self._absent_drops = absent_drops
-            self._resolve_considered = resolve_considered
 
     def take_integrity_disclosure(self) -> dict | None:
         mismatched = len(self._integrity_drops)

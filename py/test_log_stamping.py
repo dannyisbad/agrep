@@ -1,4 +1,4 @@
-"""Background embed children must write datable log lines (RC2 M10).
+"""Background embed children must write datable log lines.
 
 semantic-embed.log is the only forensic record of embed failures, and its
 lines carried no timestamps, so "when did the last build fail" was

@@ -2650,6 +2650,7 @@ class LifecycleTests(unittest.TestCase):
             grandchild_pid = int(pid_path.read_text(encoding="ascii"))
             self.assertFalse(common.pid_alive(grandchild_pid))
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
     def test_owned_drain_accepts_a_zombie_only_group(self) -> None:
         process = mock.Mock(pid=4242, returncode=-signal.SIGTERM)
         process.poll.return_value = -signal.SIGTERM
@@ -2659,6 +2660,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertTrue(native._drain_owned(process))
         killpg.assert_not_called()
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
     def test_owned_drain_never_signals_a_recycled_pgid(self) -> None:
         # The leader is reaped but its pid is occupied again: the numeric
         # pgid belongs to a stranger now, so the drain must not touch it.
@@ -2672,6 +2674,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertTrue(native._drain_owned(process))
         killpg.assert_not_called()
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
     def test_owned_drain_still_reaps_true_orphans_of_a_dead_leader(self) -> None:
         process = mock.Mock(pid=4242, returncode=0)
         process.poll.return_value = 0

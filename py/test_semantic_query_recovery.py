@@ -400,9 +400,12 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
 
     def test_hot_preflight_miss_is_typed_and_retryable(self) -> None:
         import semworker
-        with mock.patch.object(
-                semworker, "resident_status",
-                return_value={"running": True, "descriptor_state": "ready"}), \
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_DAEMON": "", "AGREP_NO_SEM_WORKER": ""}), \
+                mock.patch.object(
+                    semworker, "resident_status",
+                    return_value={"running": True, "descriptor_state": "ready"}), \
                 mock.patch.object(
                     semworker, "search_worker",
                     side_effect=semworker.ResidentSemanticLoopbackUnavailable(
@@ -420,8 +423,11 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
     def test_known_transient_preflight_preserves_exact_reason(self) -> None:
         import semworker
         reason = "semantic worker ownership is still settling"
-        with mock.patch.object(
-                semworker, "resident_status", return_value={"running": True}), \
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_DAEMON": "", "AGREP_NO_SEM_WORKER": ""}), \
+                mock.patch.object(
+                    semworker, "resident_status", return_value={"running": True}), \
                 mock.patch.object(
                     semworker, "search_worker",
                     side_effect=semworker.ResidentSemanticPreflightUnavailable(
@@ -441,6 +447,9 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
         )
         for reason in reasons:
             with self.subTest(reason=reason), \
+                    mock.patch.dict(
+                        os.environ,
+                        {"AGREP_NO_DAEMON": "", "AGREP_NO_SEM_WORKER": ""}), \
                     mock.patch.object(
                         semworker, "resident_status",
                         return_value={"running": True}), \

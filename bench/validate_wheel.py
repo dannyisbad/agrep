@@ -22,7 +22,12 @@ import struct
 import sys
 import zipfile
 
-from package_metadata import InvalidMetadata, validate_core_metadata
+from package_metadata import (
+    InvalidMetadata,
+    checkout_version,
+    distribution_version,
+    validate_core_metadata,
+)
 from validate_binary_privacy import (
     InvalidBinary as InvalidBinaryPrivacy,
     validate_bytes as validate_binary_privacy,
@@ -372,6 +377,15 @@ def validate(path: Path) -> tuple[str, int]:
     version = match.group("version")
     platform = match.group("platform")
     try:
+        expected_version = distribution_version()
+        binary_version = checkout_version()
+    except InvalidMetadata as exc:
+        _fail(f"invalid checkout version: {exc}")
+    if version != expected_version:
+        _fail(
+            f"wheel version differs from checkout: expected {expected_version!r}, "
+            f"got {version!r}")
+    try:
         binary_name, binary_kind, expected_arch = PLATFORMS[platform]
     except KeyError:
         _fail(f"unsupported or non-release wheel platform: {platform!r}")
@@ -468,7 +482,7 @@ def validate(path: Path) -> tuple[str, int]:
             binary,
             kind=binary_kind,
             architecture=expected_arch,
-            version=version,
+            version=binary_version,
             macos_minimum=(11, 0, 0) if binary_kind == "macho" else None,
         )
         if platform.startswith(("macosx_", "manylinux_")):

@@ -210,7 +210,7 @@ class SharedSurfacePolicyTests(unittest.TestCase):
         )
 
     def test_wall_clock_age_is_no_longer_a_read_time_verdict(self) -> None:
-        # goal 10 D3: freshness is drift, not duty-cycle. The 120s constant
+        # Freshness is drift, not duty-cycle. The 120s constant
         # survives only as indexd_runtime's write-side stamp rate limit, and
         # the read side renders exactly one of the three drift states.
         self.assertFalse(hasattr(surface, "FRESHNESS_MAX_AGE_S"))
@@ -815,7 +815,7 @@ class AroundSpeakerPolicyTests(unittest.TestCase):
 
 
 class CoverageNoticeTrivialGapTests(unittest.TestCase):
-    """A live box's own churn tail is not a coverage story (RC2 m1).
+    """A live box's own churn tail is not a coverage story.
 
     Hit pages pass suppress_trivial=True; the miss-proof path never does,
     so absence claims always state their scope."""

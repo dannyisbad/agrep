@@ -53,8 +53,6 @@ One pinned model, two engines that can run it:
   store already records, so a Metal store keeps getting Metal rows without the
   environment being set and a CPU store stays CPU even with it. Only `--full` is
   allowed to re-decide, because a half-and-half backfill is the failure the rule
-  exists to prevent. See `bench/EMBEDDER_SELECTION.md` for the
-  selection evidence and reproducible candidate definitions.
 - `mlx_embed.py` / `mlx_modernbert.py` - the Metal lane: the same pinned
   weights pre-quantization, run through MLX in fp16. Measured interleaved in one
   process over 300 messages, median of 4, the ONNX CPU pass took 8.62 s and this

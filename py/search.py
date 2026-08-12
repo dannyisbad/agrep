@@ -35,8 +35,6 @@ import compact
 import console
 import display_policy
 import indexd_runtime
-import sabel_observer
-import sabel_shadow
 import surface_policy as surface
 
 corpusdb = None
@@ -263,16 +261,7 @@ def _content_scan(toks: list[str], k: int, flt: dict | None = None) -> dict:
 
 
 SEMANTIC_MAX_RESULTS = 200
-def _semantic_score_bands() -> surface.SemanticScoreBands:
-    if "AGREP_BENCH_EMBED_PROFILE" not in os.environ:
-        return surface.DEFAULT_SEMANTIC_SCORE_BANDS
-    # Candidate profiles carry independently calibrated policy; normal keyword
-    # startup never imports the model stack.
-    import embedder
-    return embedder.semantic_bands()
-
-
-SEMANTIC_SCORE_BANDS = _semantic_score_bands()
+SEMANTIC_SCORE_BANDS = surface.DEFAULT_SEMANTIC_SCORE_BANDS
 SEMANTIC_MIN_COSINE = SEMANTIC_SCORE_BANDS.floor
 _RECALL_STRONG_SEM = SEMANTIC_SCORE_BANDS.strong
 # Lexical evidence a scattered-terms row must carry before a pointer calls it
@@ -374,7 +363,7 @@ def semantic_corpus_anchor(query: str, flt: dict | None = None) -> dict:
     query's own echo in the transcript that typed it never anchors itself.
     """
     words: list[str] = []
-    for word in re.findall(r"[A-Za-z]+", query or ""):
+    for word in re.findall(r"[A-Za-z0-9]+", query or ""):
         low = word.lower()
         if len(low) < 3 or low in _STOP or low in words:
             continue
@@ -562,7 +551,6 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                     exclude_sessions: tuple[str, ...] = (),
                     exclude_family: bool = True,
                     family_diverse: bool = True,
-                    capture_shadow: bool = False,
                     timeout_s: float | None = None,
                     allow_model_download: bool = False) -> dict | None:
     """Meaning search through a disposable resident worker, then an in-process
@@ -618,9 +606,6 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     if model and model_soft:
         filters["model_soft"] = True
     filters["_family_diverse"] = bool(family_diverse)
-    semantic_filters = dict(filters)
-    if capture_shadow:
-        semantic_filters["_sabel_candidate_trace"] = True
     sem_level = "message-session" if level == "message" else level
     import semworker
     resident = semworker.resident_status()
@@ -666,8 +651,6 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
             **filters,
             "_allow_model_download": bool(allow_model_download),
         }
-        if capture_shadow:
-            wire_filters["_sabel_candidate_trace"] = True
         data = semworker.search_worker(
             q, level=sem_level, k=fetch_k, filters=wire_filters,
             **worker_timeout)
@@ -691,28 +674,25 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
         if surface.semantic_status_retryable({"reason": preflight_reason}):
             preflight_retry_reason = preflight_reason
         data = None
-    except semworker.ResidentSemanticPreflightUnavailable as exc:
-        # Request-slot, connect, or cold-start failure happened before bytes
-        # could be accepted by a semantic worker.  A local attempt is safe only
-        # after acquiring the same lifetime owner used by that worker.
-        preflight_reason = str(exc)
-        data = None
     except semworker.ResidentSemanticUnavailable as exc:
         # Once bytes may have been accepted, never stack duplicate inference on
         # top of the resident. Accepted timeouts/disconnects are terminal.
         return _semantic_runtime_unavailable(
             q, requested, who, str(exc))
     if data is None:
-        if preflight_reason is None and timeout_s is not None:
-            preflight_reason = (
-                "semantic worker is disabled for this process"
-                if semworker._worker_query_disabled()
-                else _SEMANTIC_WORKER_START_MISS)
-            if preflight_reason == _SEMANTIC_WORKER_START_MISS:
-                preflight_retry_reason = preflight_reason
+        worker_disabled = semworker._worker_query_disabled()
+        disabled_reason = (
+            semworker._worker_query_disabled_reason()
+            if worker_disabled else None)
+        if disabled_reason is not None:
+            preflight_reason = disabled_reason
+            preflight_retry_reason = None
+        elif preflight_reason is None and timeout_s is not None:
+            preflight_reason = _SEMANTIC_WORKER_START_MISS
+            preflight_retry_reason = preflight_reason
         constrained_fallback = bool(
             preflight_reason is not None
-            or semworker._worker_query_disabled()
+            or worker_disabled
             or semworker._data_dir_readonly())
         if timeout_s is not None:
             available = remaining()
@@ -729,7 +709,7 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
             try:
                 guarded = _guarded_semantic_local_fallback(
                     q, level=sem_level, k=fetch_k,
-                    filters=semantic_filters, timeout_s=available)
+                    filters=filters, timeout_s=available)
             except SemanticQueryTimeoutError:
                 return _semantic_runtime_unavailable(
                     q, requested, who,
@@ -768,7 +748,7 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                     semworker.verify_inprocess_owner(owner)
                     data = semantic_module.search(
                         q, level=sem_level, k=fetch_k,
-                        filters=semantic_filters,
+                        filters=filters,
                         refresh_if_stale=not constrained_fallback,
                         allow_model_download=(
                             allow_model_download and not constrained_fallback),
@@ -789,8 +769,6 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                             f"semantic release failed: {type(exc).__name__}")
                 semworker.finish_inprocess_owner(
                     owner, resources_released=resources_released)
-    shadow_candidate_loss = data.pop(
-        sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD, None)
     timing_value = os.environ.get("AGREP_SEM_TIMING", "")
     if (common.DEBUG or timing_value.lower() not in ("", "0", "false", "no", "off")):
         timing = data.get("_semantic_timing")
@@ -868,11 +846,6 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
             "semantic_status": policy["semantic_status"],
             "fallback_recommended": bool(
                 policy["semantic_status"].get("fallback_recommended"))}
-    if capture_shadow:
-        result[sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD] = (
-            shadow_candidate_loss if isinstance(shadow_candidate_loss, dict)
-            else {"state": "unavailable",
-                  "reason": "semantic worker returned no candidate-loss trace"})
     return result
 
 
@@ -1538,14 +1511,16 @@ def _score(h: dict, pat: re.Pattern | None, qlen: int, now_ms: float,
     """Bounded tightness, recency, speaker, source, and boundary evidence."""
     match = 1.0  # semantic: the vector engine already judged relevance
     if pat is not None:
+        snippet = h.get("snippet") or ""
         best = n = 0
-        for m in pat.finditer(h.get("snippet") or ""):
-            n += 1
-            # span arithmetic == len(m.group(0)) without materializing the
-            # matched substring; this loop runs once per hit at corpus scale
-            length = m.end() - m.start()
-            if not best or length < best:
-                best = length
+        if len(snippet) >= qlen:
+            for m in pat.finditer(snippet):
+                n += 1
+                # span arithmetic == len(m.group(0)) without materializing the
+                # matched substring; this loop runs once per hit at corpus scale
+                length = m.end() - m.start()
+                if not best or length < best:
+                    best = length
         # tightness = minimal-possible-length / tightest actual match: compact exact = 1.0, gappy scores lower
         tight = min(1.0, qlen / best) if (n and qlen and best) else (1.0 if n else 0.0)
         match = tight * (1.0 - 0.5 ** n)
@@ -1556,7 +1531,7 @@ def _score(h: dict, pat: re.Pattern | None, qlen: int, now_ms: float,
             if h.get("coverage") is not None:
                 match = max(match, h["coverage"])
             else:
-                match = max(match, _terms_proximity(h.get("snippet") or "", terms, qlen))
+                match = max(match, _terms_proximity(snippet, terms, qlen))
     age_days = max(0.0, now_ms - (h.get("ts") or 0)) / 86_400_000
     rec = 0.5 ** (age_days / _RECENCY_HALF_LIFE_DAYS)
     speaker = h.get("who") or ""
@@ -1920,12 +1895,6 @@ def _start_semantic_query(
         "timeout_s": timeout_s,
         "allow_recovery": bool(_allow_recovery),
     }
-    # An enabled observer must not extend this lane's serving deadline.  The
-    # worker captures only a small in-memory envelope; the caller publishes it
-    # after deciding whether the result completed in time.
-    observation = {} if sabel_observer.active() else None
-    if observation is not None:
-        state["_sabel_observation"] = observation
     # A verified live publisher already extends the keyword horizon. Give meaning
     # that wait plus its original compute headroom; never charge ordinary searches
     # or a merely stale/unavailable lane this larger deadline.
@@ -1948,13 +1917,8 @@ def _start_semantic_query(
                 **kwargs, "semantic_timeout_s": remaining,
                 "allow_model_download": False,
             }
-            if observation is None:
-                state["result"] = run_query(
-                    query, mode="semantic", **call_kwargs)
-            else:
-                state["result"] = run_query(
-                    query, mode="semantic", **call_kwargs,
-                    _sabel_observation=observation)
+            state["result"] = run_query(
+                query, mode="semantic", **call_kwargs)
         except Exception as exc:  # noqa: BLE001 -- optional meaning cannot wound grep
             state["error"] = exc
 
@@ -2010,36 +1974,6 @@ def _finish_semantic_query_inner(pending) -> dict | None:
     thread, state, deadline = pending
     thread.join(timeout=max(0.0, deadline - time.monotonic()))
     timed_out = thread.is_alive()
-    observation = state.get("_sabel_observation")
-    if observation is not None:
-        invocation = observation.get("invocation")
-        completion = observation.get("completion")
-        if invocation is not None:
-            query, mode, kwargs, started_ns = invocation
-            if timed_out:
-                # The worker may complete later, but its result was not observed
-                # at the serving deadline.  Publish that typed absence now and
-                # never let the background thread write into a closing trace.
-                result = None
-                error = None
-                duration_ns = max(0, time.monotonic_ns() - started_ns)
-            elif completion is not None:
-                result, duration_ns, error = completion
-            else:
-                result = None
-                error = state.get("error")
-                duration_ns = max(0, time.monotonic_ns() - started_ns)
-            try:
-                sabel_observer.record_search_call(
-                    query, mode, kwargs, result, duration_ns, error)
-            except Exception:
-                # The public recorder is already fail-safe.  Keep this boundary
-                # fail-safe too if a replacement/test double violates that API.
-                pass
-            finally:
-                if isinstance(result, dict):
-                    result.pop(
-                        sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD, None)
     if timed_out:
         common.dbg("automatic semantic lane exceeded its deadline; keeping keyword results", "!")
         # The serving deadline is a hard boundary; transport owns later cleanup.
@@ -2513,7 +2447,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         # python row-by-row merge over the whole table (an emoji query measured
         # 492k fetchones, ~5s). The SQL lane scans the same rows in C.
         return None
-    lows = [token.lower() for token in toks]
+    lows = list(dict.fromkeys(token.lower() for token in toks))
     gate = max(0, int(_BOUNDED_KEYWORD_MIN_CANDIDATES))
     try:
         if corpusdb.candidate_count_capped(db, lows, flt, gate + 1) <= gate:
@@ -2633,7 +2567,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
             examined += 1
             text = row[corpusdb._TEXT]
             lowered = text.lower()
-            spans = [common.insensitive_span(text, token, lowered) for token in toks]
+            spans = [common.insensitive_span(text, token, lowered) for token in lows]
             if any(span is None for span in spans):
                 continue
 
@@ -2645,7 +2579,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
                 phrase_match = True
                 start, end = span
             else:
-                match = phrase_pat.search(text)
+                match = phrase_pat.search(text) if len(text) >= qlen else None
                 phrase_match = match is not None
                 start, end = match.span() if match is not None else (-1, -1)
             if phrase_complete and phrase_match:
@@ -3020,7 +2954,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
     toks = [t for t in re.split(r"[\s\-_]+", q.strip()) if t]
     if not toks or limit <= 0:
         return None
-    lows = [t.lower() for t in toks]
+    lows = list(dict.fromkeys(t.lower() for t in toks))
     caller = str(flt.get("exclude_session") or "")
     window_boundary = flt.get("exclude_session_from_turn")
     exclude_family = flt.get("exclude_family", True)
@@ -3236,7 +3170,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
             text = row[corpusdb._TEXT]
             low = text.lower()
             term_spans = [common.insensitive_span(text, token, low)
-                          for token in toks]
+                          for token in lows]
             if any(span is None for span in term_spans):
                 continue
             term_lane_confirmed = True
@@ -3249,7 +3183,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 phrase_match = span is not None
                 start, end = span if span is not None else (-1, -1)
             else:
-                match = phrase_pat.search(text)
+                match = phrase_pat.search(text) if len(text) >= qlen else None
                 phrase_match = match is not None
                 start = match.start() if match else -1
                 end = match.end() if match else -1
@@ -3501,12 +3435,26 @@ _SEMANTIC_CHILD_ARG = "--explorer-semantic-child"
 _SEMANTIC_FALLBACK_CHILD_ARG = "--semantic-local-fallback-child"
 _SEMANTIC_CHILD_INPUT_MAX = 8 * 1024
 _SEMANTIC_CHILD_OUTPUT_MAX = 8 * 1024 * 1024
+_SEMANTIC_TREE_OPEN_S = 1.0
 
 
 def _stop_semantic_subprocess(
         process: subprocess.Popen, process_start: str | None,
-        wait_s: float) -> bool:
+        wait_s: float, *, windows_tree: object | None = None) -> bool:
     deadline = time.monotonic() + max(0.0, wait_s)
+    if windows_tree is not None:
+        if windows_tree.terminate_and_wait(
+                max(0.0, deadline - time.monotonic())):
+            return True
+        if (process_start is None
+                or not common.terminate_exact_process(
+                    process.pid, process_start)):
+            return False
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return True
     if process_start is not None:
         if common.terminate_exact_process_tree(
                 process.pid, process_start,
@@ -3561,6 +3509,28 @@ def _stop_semantic_subprocess(
     return process.poll() is not None
 
 
+def _open_windows_semantic_tree(
+        process: subprocess.Popen, process_start: str,
+        deadline: float | None) -> object | None:
+    """Retain the child's exact Job before sending work that may spawn."""
+    if not common.WIN:
+        return None
+    import winjob
+
+    if deadline is None:
+        deadline = time.monotonic() + _SEMANTIC_TREE_OPEN_S
+
+    while True:
+        tree = winjob.open_exact(process.pid, process_start)
+        if tree is not None:
+            return tree
+        if process.poll() is not None:
+            return None
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        time.sleep(0.005)
+
+
 def _run_guarded_semantic_child(
         request_obj: dict, *, timeout_s: float | None,
         child_arg: str) -> dict | None:
@@ -3608,7 +3578,15 @@ def _run_guarded_semantic_child(
     work_deadline = (
         None if timeout is None
         else started + max(0.05, timeout - cleanup_reserve))
+    windows_tree = None
     try:
+        if common.WIN:
+            windows_tree = _open_windows_semantic_tree(
+                process, process_start, work_deadline)
+            if windows_tree is None:
+                _stop_semantic_subprocess(process, process_start, 0.5)
+                raise SemanticQueryWorkerError(
+                    "semantic query worker lifetime boundary could not be verified")
         try:
             stdout, stderr = process.communicate(
                 input=request,
@@ -3619,7 +3597,8 @@ def _run_guarded_semantic_child(
             assert timeout is not None
             remaining = max(0.0, started + timeout - time.monotonic())
             if not _stop_semantic_subprocess(
-                    process, process_start, remaining):
+                    process, process_start, remaining,
+                    windows_tree=windows_tree):
                 raise SemanticQueryWorkerError(
                     "timed-out semantic query tree could not be drained") from exc
             raise SemanticQueryTimeoutError(
@@ -3628,18 +3607,24 @@ def _run_guarded_semantic_child(
             remaining = (
                 1.0 if timeout is None
                 else max(0.0, started + timeout - time.monotonic()))
-            _stop_semantic_subprocess(process, process_start, remaining)
+            _stop_semantic_subprocess(
+                process, process_start, remaining,
+                windows_tree=windows_tree)
             raise
+        remaining = (
+            1.0 if timeout is None
+            else max(0.0, started + timeout - time.monotonic()))
+        if not _stop_semantic_subprocess(
+                process, process_start, remaining,
+                windows_tree=windows_tree):
+            raise SemanticQueryWorkerError(
+                "semantic query tree could not be drained")
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
-    remaining = (
-        1.0 if timeout is None
-        else max(0.0, started + timeout - time.monotonic()))
-    if not _stop_semantic_subprocess(process, process_start, remaining):
-        raise SemanticQueryWorkerError(
-            "semantic query tree could not be drained")
+        if windows_tree is not None:
+            windows_tree.close()
     if process.returncode != 0:
         detail = stderr.decode("utf-8", "replace").strip()[-500:]
         raise SemanticQueryWorkerError(
@@ -3840,8 +3825,7 @@ def _semantic_local_fallback_child_main() -> int:
     return 0
 
 
-def _semantic_candidates(spec: QuerySpec, *,
-                         capture_shadow: bool = False) -> LaneResult | None:
+def _semantic_candidates(spec: QuerySpec) -> LaneResult | None:
     # Dense search has no cheap corpus-wide count, so count and unlimited requests stay capped.
     requested = spec.session_limit if spec.session_limit is not None else spec.limit
     k = (SEMANTIC_MAX_RESULTS
@@ -3858,7 +3842,6 @@ def _semantic_candidates(spec: QuerySpec, *,
         exclude_sessions=spec.excluded_sessions,
         exclude_family=spec.exclude_family,
         family_diverse=spec.family_diverse,
-        capture_shadow=capture_shadow,
         timeout_s=spec.semantic_timeout_s,
         allow_model_download=spec.allow_model_download)
     if res is None:
@@ -3880,12 +3863,6 @@ def _semantic_candidates(spec: QuerySpec, *,
         "fallback_recommended": bool(res.get("fallback_recommended")),
         "semantic_integrity": res.get("semantic_integrity"),
     }
-    if capture_shadow:
-        semantic_meta[sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD] = res.get(
-            sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD, {
-                "state": "unavailable",
-                "reason": "semantic result omitted candidate-loss trace",
-            })
     return LaneResult(
         hits=hits,
         engine="semantic:hybrid",
@@ -3908,9 +3885,9 @@ def _announce_slow_lane(key: str, line: str) -> None:
 
 
 def _scan_lever_tail(spec: QuerySpec) -> str:
-    """The cheapest narrowing the query has not used yet: a measured 60s
-    degraded scan fell to 3.2s under --who (panel 2), so the banner names
-    the lever, derived from the query's actual unused filters."""
+    """The cheapest narrowing the query has not used yet. A measured degraded
+    scan fell from 60s to 3.2s under --who, so the banner names the lever
+    derived from the query's actual unused filters."""
     levers = [flag for flag, value in (
         ("--who", spec.who), ("--project", spec.project),
         ("--since", spec.since_ms)) if value is None]
@@ -4095,6 +4072,8 @@ _QUERY_PUBLICATION_TIMEOUT = (
     "rerun the same agrep command")
 # ranked rows a --deeper replay resumes past: the frozen chain served them
 _DEEPER_SKIP_ROWS: int = 0
+# Scan past duplicate/family folds without increasing the 40-row output bound.
+_DEEPER_QUERY_MIN_ROWS = 512
 _NATIVE_EVENT_CANDIDATE_PAGE = 512
 _NATIVE_EVENT_ORPHAN_DETAILS = frozenset({
     "event row identity has no published owner",
@@ -4888,8 +4867,7 @@ def run_query(q: str, *, mode: str = "keyword", limit: int = 40, sort: str = "sc
               semantic_timeout_s: float | None = None,
               semantic_process_guard: bool = False,
               allow_model_download: bool = False,
-              exclude_project: str | None = None,
-              _sabel_observation: dict | None = None) -> dict | None:
+              exclude_project: str | None = None) -> dict | None:
     """The one query layer all callers share: dispatch to the right engine
     (corpusdb keyword/word/regex, JSONL scans when unavailable, the in-process
     semantic lane), filter, rank, cap. No printing; raises re.error on a bad regex.
@@ -4902,83 +4880,31 @@ def run_query(q: str, *, mode: str = "keyword", limit: int = 40, sort: str = "sc
     become observed lower bounds and carry ``totals_exact=False``. Ordinary search
     and probes retain exhaustive totals by default. Caller-family filters run before
     top-k so self echoes cannot mask past hits."""
-    trace_active = sabel_observer.active() and _sabel_observation is None
-    trace_requested = trace_active or _sabel_observation is not None
-    # Deadline-bound/background calls publish their serving result before any
-    # expensive raw-head resolution.  Candidate-loss capture is available on
-    # direct diagnostic calls, where it cannot flip a serving timeout/fallback.
-    candidate_trace_requested = trace_active
-    trace_started = time.monotonic_ns() if trace_requested else 0
-    trace_kwargs = ({
-        "limit": limit, "sort": sort, "agent": agent, "project": project,
-        "who": who, "model": model, "model_soft": model_soft, "chat": chat,
-        "since_ms": since_ms, "until_ms": until_ms,
-        "exhaustive": exhaustive, "session_limit": session_limit,
-        "include_tools": include_tools, "exclude_session": exclude_session,
-        "exclude_session_from_turn": exclude_session_from_turn,
-        "_exclude_sessions": tuple(_exclude_sessions),
-        "exclude_family": exclude_family, "allow_fallback": allow_fallback,
-        "exact_totals": exact_totals, "family_diverse": family_diverse,
-        "semantic_timeout_s": semantic_timeout_s,
-        "semantic_process_guard": semantic_process_guard,
-        "allow_model_download": allow_model_download,
-        "exclude_project": exclude_project,
-    } if trace_requested else None)
-    if _sabel_observation is not None:
-        _sabel_observation["invocation"] = (
-            q, mode, trace_kwargs, trace_started)
-    observed_result = None
-    observed_error = None
-    try:
-        if session_limit is not None:
-            session_limit = max(0, int(session_limit))
-        if family_diverse is None:
-            family_diverse = mode == "semantic"
-        spec = QuerySpec(
-            q=q, mode=mode, limit=limit, sort=sort, agent=agent, project=project,
-            who=who, model=model, model_soft=model_soft, chat=chat, since_ms=since_ms,
-            until_ms=until_ms, exhaustive=exhaustive, session_limit=session_limit,
-            include_tools=include_tools, exclude_session=exclude_session,
-            exclude_session_from_turn=exclude_session_from_turn,
-            excluded_sessions=tuple(_exclude_sessions),
-            exclude_family=exclude_family,
-            allow_fallback=allow_fallback,
-            exact_totals=exact_totals, family_diverse=bool(family_diverse),
-            semantic_timeout_s=semantic_timeout_s,
-            allow_model_download=allow_model_download,
-            exclude_project=exclude_project)
-        if spec.mode == "regex":
-            observed_result = _guarded_regex_query(spec)
-        elif spec.mode == "semantic" and semantic_process_guard:
-            observed_result = _guarded_semantic_query(spec)
-        else:
-            if spec.mode == "semantic":
-                candidates = (
-                    _semantic_candidates(spec, capture_shadow=True)
-                    if candidate_trace_requested else _semantic_candidates(spec))
-            else:
-                candidates = _keyword_candidates(spec)
-            observed_result = (
-                None if candidates is None else _finalize_query(spec, candidates))
-    except BaseException as exc:
-        observed_error = exc
-        raise
-    finally:
-        trace_duration = (
-            time.monotonic_ns() - trace_started if trace_requested else 0)
-        if _sabel_observation is not None:
-            # One atomic reference publication; no serialization or observer I/O
-            # occurs on the deadline-bound worker thread.
-            _sabel_observation["completion"] = (
-                observed_result, trace_duration, observed_error)
-        elif trace_active:
-            sabel_observer.record_search_call(
-                q, mode, trace_kwargs, observed_result,
-                trace_duration, observed_error)
-            if isinstance(observed_result, dict):
-                observed_result.pop(
-                    sabel_shadow.SEMANTIC_CANDIDATE_LOSS_FIELD, None)
-    return observed_result
+    if session_limit is not None:
+        session_limit = max(0, int(session_limit))
+    if family_diverse is None:
+        family_diverse = mode == "semantic"
+    spec = QuerySpec(
+        q=q, mode=mode, limit=limit, sort=sort, agent=agent, project=project,
+        who=who, model=model, model_soft=model_soft, chat=chat, since_ms=since_ms,
+        until_ms=until_ms, exhaustive=exhaustive, session_limit=session_limit,
+        include_tools=include_tools, exclude_session=exclude_session,
+        exclude_session_from_turn=exclude_session_from_turn,
+        excluded_sessions=tuple(_exclude_sessions),
+        exclude_family=exclude_family,
+        allow_fallback=allow_fallback,
+        exact_totals=exact_totals, family_diverse=bool(family_diverse),
+        semantic_timeout_s=semantic_timeout_s,
+        allow_model_download=allow_model_download,
+        exclude_project=exclude_project)
+    if spec.mode == "regex":
+        return _guarded_regex_query(spec)
+    if spec.mode == "semantic" and semantic_process_guard:
+        return _guarded_semantic_query(spec)
+    candidates = (
+        _semantic_candidates(spec) if spec.mode == "semantic"
+        else _keyword_candidates(spec))
+    return None if candidates is None else _finalize_query(spec, candidates)
 
 
 def _group(hits):
@@ -5425,6 +5351,7 @@ def _start_compact_page(
         return roots.get(session, session)
 
     frozen_cap = compact.MAX_FROZEN_HITS + _DEEPER_SKIP_ROWS
+    source_more = corpus_more
     corpus_more = corpus_more or len(hits) > frozen_cap
     # Demote inside the frozen slice: page membership stays pure rank, so a
     # sunk meta row can never be pushed off the frozen page by rows behind it.
@@ -5445,9 +5372,15 @@ def _start_compact_page(
         frozen = [row for row in frozen if _row_key(row) not in served]
         if not frozen:
             corpus_more = False
-            common.log(
-                f"nothing deeper: the {_DEEPER_SKIP_ROWS} rows already served "
-                "cover every distinct ranked match (near-duplicates fold)")
+            if source_more:
+                common.log(
+                    f"nothing deeper in the bounded ranked scan after "
+                    f"{_DEEPER_SKIP_ROWS} served rows; narrow the query")
+            else:
+                common.log(
+                    f"nothing deeper: the {_DEEPER_SKIP_ROWS} rows already "
+                    "served cover every distinct ranked match "
+                    "(near-duplicates fold)")
     ordered = compact.diversify_hits(frozen, family)
     ordered, first_page_rows, tool_rescue_page = _compact_tool_rescue(
         ordered, roots, explicit_tools=explicit_tool_filter,
@@ -6819,10 +6752,13 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     # output. A --deeper replay widens by the rows already served, or its
     # resumed ranked order would end exactly where the chain did.
     compact_cap = 40 + _DEEPER_SKIP_ROWS
+    query_cap = (
+        max(compact_cap, _DEEPER_QUERY_MIN_ROWS)
+        if _force_compact and _DEEPER_SKIP_ROWS else compact_cap)
     if compact_output and (
-            args.max is None or args.max == 0 or args.max > compact_cap
-            or (_force_compact and args.max < compact_cap)):
-        args.max = compact_cap
+            args.max is None or args.max == 0 or args.max > query_cap
+            or (_force_compact and args.max < query_cap)):
+        args.max = query_cap
     elif args.max is None:
         args.max = 40 if not args.semantic else 10
     if args.count:

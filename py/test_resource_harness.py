@@ -22,6 +22,51 @@ def _load_resources():
     return module
 
 
+def _support_root(env: dict[str, str]) -> tuple[Path, bool]:
+    code = (
+        "import _test_support as s;"
+        "print(s._DATA_ROOT);"
+        "print(s._DATA is None)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parent,
+        env=env, capture_output=True, text=True, check=True)
+    lines = completed.stdout.splitlines()
+    return Path(lines[0]), lines[1] == "True"
+
+
+class TestSupportIsolationTests(unittest.TestCase):
+    def test_inherited_test_root_requires_the_complete_sandbox_tuple(self):
+        with tempfile.TemporaryDirectory() as raw:
+            forged = Path(raw)
+            env = dict(os.environ)
+            env.update({
+                "AGREP_TEST_DATA_ROOT": str(forged),
+                "AGREP_DATA_DIR": str(forged / "data"),
+                "AGREP_DATA_DIR_SOURCE": "test",
+                "AGREP_HOME": str(forged / "home"),
+            })
+            observed, inherited = _support_root(env)
+        self.assertNotEqual(observed, forged)
+        self.assertFalse(inherited)
+
+    def test_spawned_test_process_reuses_a_marked_temporary_root(self):
+        with tempfile.TemporaryDirectory(
+                prefix="agrep-unittest-data-proof-") as raw:
+            root = Path(raw)
+            env = dict(os.environ)
+            env.update({
+                "AGREP_TEST_DATA_ROOT": str(root),
+                "AGREP_DATA_DIR": str(root / "data"),
+                "AGREP_DATA_DIR_SOURCE": "test",
+                "AGREP_HOME": str(root / "home"),
+            })
+            observed, inherited = _support_root(env)
+            self.assertEqual(observed, root)
+            self.assertTrue(inherited)
+
+
 class ResourceHarnessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -145,12 +190,13 @@ class ResourceHarnessTests(unittest.TestCase):
         self.assertNotIn("model.embed_texts([query])", helper)
 
     def test_semantic_worker_env_explicitly_enables_the_measured_worker(self):
+        model_root = Path(tempfile.gettempdir()) / "agrep-resource-model"
         env = self.resources._semantic_worker_env(
             {"AGREP_NO_DAEMON": "1", "AGREP_NO_SEM_WORKER": "1"},
-            Path("/model"))
+            model_root)
         self.assertEqual(env["AGREP_NO_DAEMON"], "")
         self.assertEqual(env["AGREP_NO_SEM_WORKER"], "")
-        self.assertEqual(env["AGREP_MODEL_DIR"], "/model")
+        self.assertEqual(env["AGREP_MODEL_DIR"], os.fspath(model_root))
         self.assertEqual(env["AGREP_SEM_IDLE_S"], "300")
 
     def test_semantic_request_deadline_header_matches_worker(self):

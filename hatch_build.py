@@ -222,10 +222,10 @@ class PlatformWheelHook(BuildHookInterface):
             self, staged: Path, root: Path, exe: str) -> bool:
         """True when a local build exists and the staged bytes are not it.
 
-        The version string is the only identity `_validate_binary_version`
-        checks, and it stays "0.2.0" across every rebuild - so a `_bin/`
-        artifact staged days ago validates perfectly and ships silently in
-        place of the source you just built. That has invalidated live
+        The release version is the only identity `_validate_binary_version`
+        checks, and it stays constant across source-only rebuilds - so a
+        `_bin/` artifact staged days ago can validate perfectly and ship silently
+        in place of the source you just built. That has invalidated live
         measurements twice. CI stages deliberately and is never second-guessed.
         """
         if os.environ.get("AGREP_WHEEL_PLAT"):

@@ -829,6 +829,20 @@ time.sleep(30)
         after, _, _ = archive._sqlite_source_state(source)
         self.assertNotEqual(before, after)
 
+    def test_sqlite_zero_usn_selects_content_hash_fallback(self) -> None:
+        self.assertIsNone(archive._file_usn_change_token(0))
+        self.assertEqual(archive._file_usn_change_token(1), ("usn", 1))
+        source = self.base / "change-token.db"
+        source.write_bytes(b"content")
+        with mock.patch.object(
+                archive, "_metadata_change_token",
+                return_value=archive._file_usn_change_token(0)), \
+                mock.patch.object(
+                    archive, "_hash_regular_file",
+                    wraps=archive._hash_regular_file) as hashed:
+            archive._sqlite_source_state(source)
+        hashed.assert_called_once_with(source, source.parent)
+
     def test_sqlite_signature_hashes_when_file_usn_is_unavailable(self) -> None:
         source = self.base / "change-token.db"
         source.write_bytes(b"same size before")
@@ -1915,7 +1929,7 @@ time.sleep(30)
 
     # Two action flags in one run have no defined winner; the verb must
     # reject the combination instead of silently obeying the first branch
-    # (goal10 audit B11: `--on --off` enabled retention and exited 0).
+    # (`--on --off` previously enabled retention and exited 0).
     def test_conflicting_archive_action_flags_are_rejected(self) -> None:
         for argv in (["--on", "--off"], ["--off", "--on"],
                      ["--off", "--status"], ["--keep", "5", "--status"],
@@ -1930,7 +1944,7 @@ time.sleep(30)
                          "a rejected flag combination changed retention state")
 
     # A restore whose superseded-sidecar cleanup fails must fail its verdict
-    # and name the residue, never print "sha256 verified" (goal10 audit P4).
+    # and name the residue, never print "sha256 verified".
     def test_restore_fails_loudly_when_superseded_cleanup_leaves_residue(self) -> None:
         archive.ROOTS = []
         db = self._wal_cursor_store("ARCHIVED")
@@ -2008,7 +2022,7 @@ time.sleep(30)
             {p.read_bytes() for p in parked}, {wal_bytes, shm_bytes})
 
     # Non-force publication must be atomic: a file born between the absence
-    # check and the publish syscall survives (goal10 audit B7).
+    # check and the publish syscall survives.
     @unittest.skipIf(os.name == "nt", "dir_fd publication is the posix leg")
     def test_nonforce_restore_never_replaces_a_file_born_in_the_window(self) -> None:
         source, _ = self._capture_codex()

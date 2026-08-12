@@ -318,11 +318,20 @@ def _windows_current_process_in_job() -> bool | None:
 
 
 def windows_background_child_flags(base: int) -> int:
-    """Keep durable background work independent of the invoking Windows Job."""
+    """Keep durable background work independent of agrep's own descendant Job.
+
+    A provider Job may deny direct breakaway.  Insert agrep's breakaway-enabled
+    Job at the bottom of the nested chain first; the child can then escape that
+    immediate lifetime boundary while remaining in any ancestor that denies it.
+    """
     flags = windows_detached_child_flags(base)
     if not WIN or flags & _WINDOWS_CREATE_BREAKAWAY_FROM_JOB:
         return flags
-    if _windows_current_process_in_job() is not False:
+    membership = _windows_current_process_in_job()
+    if membership is True and sys.platform == "win32":
+        bind_descendants_to_process_lifetime()
+        flags = windows_detached_child_flags(base)
+    if membership is not False:
         flags |= _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
     return flags
 

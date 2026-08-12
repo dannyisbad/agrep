@@ -498,6 +498,53 @@ jobs:
             AGREP_POSTINSTALL_STRICT=1 npm install -g --prefix "$tmp" ./npm
           AGREP_PYPI_SPEC="$wheel" "$tmp/bin/agrep" --version
 
+  validate-built-artifacts:
+    name: validate complete branch artifact set
+    needs: [wheels, wheels-linux, wheels-linux-arm64, sdist, npm-smoke, semantic-canary]
+    runs-on: ubuntu-latest
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: sealed/assets
+          pattern: binasset-*
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: wheel-input
+          pattern: wheel-*
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
+      - name: validate every standalone binary against its wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp LICENSE THIRD_PARTY_LICENSES.txt sealed/assets/
+          python bench/release_assets.py \
+            --prepare sealed/assets \
+            --manifest sealed/release-asset-manifest.json \
+            --wheels wheel-input
+      - name: validate the complete branch distribution set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp wheel-input/*.whl dist/
+          version=$(python - <<'PY'
+          from bench.package_metadata import checkout_version
+          print(checkout_version())
+          PY
+          )
+          python bench/pypi_release.py \
+            --dist-dir dist --version "$version" --offline
+
   seal-npm-packages:
     name: seal exact npm tarballs
     needs: [release-preflight, npm-smoke]
@@ -626,6 +673,8 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: false
           body: |
             agrep searches and recalls local AI coding-agent history across supported stores.
 
@@ -649,6 +698,9 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -927,12 +979,27 @@ jobs:
           mkdir live
           gh release download "$GITHUB_REF_NAME" --dir live
           diff --recursive --brief sealed/assets live
-          draft=$(gh api \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq '.draft')
+          release=$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          draft=$(jq -r '.draft' <<<"$release")
+          prerelease=$(jq -r '.prerelease' <<<"$release")
+          expected_prerelease=false
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            expected_prerelease=true
+          fi
           if [ "$draft" = "true" ]; then
-            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+            if [ "$expected_prerelease" = "true" ]; then
+              gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+            else
+              gh release edit "$GITHUB_REF_NAME" \
+                --draft=false --prerelease=false --latest
+            fi
           elif [ "$draft" != "false" ]; then
             echo "::error::release draft state is invalid: $draft"
             exit 1
+          elif [ "$prerelease" != "$expected_prerelease" ]; then
+            echo "::error::published release prerelease state is invalid"
+            exit 1
+          elif [ "$expected_prerelease" = "false" ]; then
+            gh release edit "$GITHUB_REF_NAME" --latest
           fi

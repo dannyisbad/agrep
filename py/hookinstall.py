@@ -44,6 +44,8 @@ PRIOR_PAYLOAD_HASHES = frozenset({
     # v6: before postcompact's "returns exactly the pre-boundary turns" became
     # the bounded-excerpt wording the implementation actually serves
     "0557eb91adce33d36c08ca136e62a5a47e77e044b25b787f027d34b6e17347e1",
+    # v7: before recovery explicitly checked the visible summary first
+    "1d6c76882e0b8a8da3d19b724e88cfe47e946f56d5d8d17b50768bf2ae7251ed",
 })
 
 def _home() -> Path:
@@ -82,7 +84,12 @@ CODEX_PAYLOAD = HOOKS_DIR / "codex_compact_payload.py"
 
 PI_EXTENSION = HOOKS_DIR / "pi_postcompact.ts"
 PI_EXTENSION_NAME = "agrep-postcompact.ts"
-PRIOR_PI_EXTENSION_HASHES: frozenset[str] = frozenset()
+PRIOR_PI_EXTENSION_HASHES: frozenset[str] = frozenset({
+    # v1: before recovery required a current ID and missing IDs cleared the env
+    "34c99ac023bca77e457359c36bc57f698e364e49aece0100c3135a4fe22ea55b",
+    # v2: before the check-first gate stopped sufficient-summary pulls
+    "127c3cf0cc2afc4bd3d2aee86b589ec3a80810b896413e3b6e3f084869186e32",
+})
 
 
 def pi_extension_paths() -> tuple[tuple[str, Path], ...]:

@@ -1416,7 +1416,7 @@ DRIFT_SESSION = "b0d9e7f0-0000-4000-8000-composeddrift"
 
 
 class DisclosureCompositionBlackBox(_IsolatedBlackBox, unittest.TestCase):
-    """Goal 10 unification: one degraded search, at most ONE freshness line
+    """One degraded search emits at most ONE freshness line
     plus at most one lane line, agreeing surfaces - never the 2-5 stacked,
     contradicting stderr hedges the composition review found. Same stranger's
     posture as above: fixture home, subprocess cli.py, filesystem as input."""

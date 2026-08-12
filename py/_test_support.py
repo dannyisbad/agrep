@@ -10,8 +10,27 @@ import sys
 import tempfile
 
 
-_DATA = tempfile.TemporaryDirectory(prefix="agrep-unittest-data-")
-atexit.register(_DATA.cleanup)
+_TEST_ROOT_ENV = "AGREP_TEST_DATA_ROOT"
+_inherited_root = Path(os.environ.get(_TEST_ROOT_ENV, ""))
+_temp_root = Path(tempfile.gettempdir())
+# Windows multiprocessing re-imports the test module. Reuse only the complete
+# sandbox tuple this helper exported; a lone ambient variable cannot redirect
+# a direct test process into production data.
+_reuse_inherited_root = (
+    os.environ.get("AGREP_DATA_DIR_SOURCE") == "test"
+    and _inherited_root.is_absolute()
+    and _inherited_root.parent == _temp_root
+    and _inherited_root.name.startswith("agrep-unittest-data-")
+    and os.environ.get("AGREP_DATA_DIR") == str(_inherited_root / "data")
+    and os.environ.get("AGREP_HOME") == str(_inherited_root / "home")
+)
+if _reuse_inherited_root:
+    _DATA = None
+    _DATA_ROOT = Path(_inherited_root)
+else:
+    _DATA = tempfile.TemporaryDirectory(prefix="agrep-unittest-data-")
+    _DATA_ROOT = Path(_DATA.name)
+    atexit.register(_DATA.cleanup)
 
 
 def isolate_data_dir() -> Path:
@@ -21,19 +40,20 @@ def isolate_data_dir() -> Path:
     this owner in a shared module makes import order irrelevant and prevents a
     diagnostic test from ever observing or mutating the developer's real corpus.
     """
-    root = Path(_DATA.name) / "data"
+    root = _DATA_ROOT / "data"
+    os.environ[_TEST_ROOT_ENV] = str(_DATA_ROOT)
     os.environ["AGREP_DATA_DIR"] = str(root)
     os.environ["AGREP_DATA_DIR_SOURCE"] = "test"
     # Store discovery is half the contract: pointed at the real home, a
     # background rebuild ingests the developer's transcripts into the sandbox
     # mid-run, and every census and fence after it inherits how far that got.
-    home = Path(_DATA.name) / "home"
+    home = _DATA_ROOT / "home"
     home.mkdir(parents=True, exist_ok=True)
     os.environ["AGREP_HOME"] = str(home)
-    # A repair kick that really spawns indexd leaves a live process mutating
-    # the sandbox under later tests; spawn-semantics suites opt back in via
-    # daemon_spawns_allowed(), everything else gets a dead switch.
+    # Background indexers and query-time semantic workers would keep mutating
+    # the shared sandbox after their test; suites about either opt back in.
     os.environ["AGREP_NO_DAEMON"] = "1"
+    os.environ["AGREP_NO_SEM_WORKER"] = "1"
     # Tree purity: the venv's editable .pth serves the MAIN checkout's cli.py
     # to worktree runs, which then prepends ITS py/ and mixes two source
     # trees. This tree's root goes first; a crossing resolution is an error.
@@ -150,17 +170,18 @@ def _restore_env(name: str, value: str | None) -> None:
 def lift_daemon_semantics(indexd_runtime):
     """Module-scope lift for suites ABOUT background-process semantics.
 
-    Returns (setUpModule, tearDownModule): the isolation default
-    (AGREP_NO_DAEMON) lifts for exactly the module's run so daemon SEMANTICS
-    are real, while _spawn_indexd is stubbed in-flight so daemon PROCESSES
-    never are - a real spawn mutates the shared sandbox under every later
-    module. Tests about the spawn itself patch over the stub."""
+    Returns (setUpModule, tearDownModule): the isolation defaults lift for
+    exactly the module's run, while _spawn_indexd is stubbed in-flight so
+    daemon PROCESSES never are - a real spawn mutates the shared sandbox under
+    every later module. Tests about the spawn itself patch over the stub."""
     state = {}
 
     def set_up_module() -> None:
         from unittest import mock
         global REAL_SPAWN_INDEXD
-        state["env"] = os.environ.pop("AGREP_NO_DAEMON", None)
+        state["no_daemon"] = os.environ.pop("AGREP_NO_DAEMON", None)
+        state["no_sem_worker"] = os.environ.pop(
+            "AGREP_NO_SEM_WORKER", None)
         REAL_SPAWN_INDEXD = indexd_runtime._spawn_indexd
         state["stub"] = mock.patch.object(
             indexd_runtime, "_spawn_indexd",
@@ -169,7 +190,9 @@ def lift_daemon_semantics(indexd_runtime):
             state["stub"].start()
         except BaseException:
             REAL_SPAWN_INDEXD = None
-            _restore_env("AGREP_NO_DAEMON", state.get("env"))
+            _restore_env("AGREP_NO_DAEMON", state.get("no_daemon"))
+            _restore_env(
+                "AGREP_NO_SEM_WORKER", state.get("no_sem_worker"))
             state.clear()
             raise
 
@@ -181,7 +204,9 @@ def lift_daemon_semantics(indexd_runtime):
                 stub.stop()
         finally:
             REAL_SPAWN_INDEXD = None
-            _restore_env("AGREP_NO_DAEMON", state.get("env"))
+            _restore_env("AGREP_NO_DAEMON", state.get("no_daemon"))
+            _restore_env(
+                "AGREP_NO_SEM_WORKER", state.get("no_sem_worker"))
             state.clear()
 
     return set_up_module, tear_down_module

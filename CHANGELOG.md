@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — 2026-08-10
+## 0.2.0-rc.2 — 2026-08-10
 
 0.1.x shipped multi-agent ingest, keyword search, and an optional semantic tier
 that required torch and a running local server. 0.2.0 keeps the ingest
@@ -133,15 +133,6 @@ read-only; transcript content is never uploaded.
   can leave Claude's self-contained entry behind; the cleanup sentinel removes
   the package-dependent Codex hook and the exact pi/oh-my-pi extension copies
   it enrolled.
-- Adoption measured on headless runs by an external harness: agents resuming
-  from a plain summary reached for recovery 0 times in 35. With the hook's
-  guidance carried into the summary, 151/151 runs recovered the planted fact,
-  each using `postcompact` as its first agrep call at 1.21 mean calls, and
-  DeepSeek (3/3) and Grok (3/3) recovered under the same guidance. The same
-  guidance also sent agents to `postcompact` in 23 of 25 controls whose summary
-  already sufficed, the truncated context was constructed rather than produced
-  by a real compaction, and the two non-Anthropic cells ran with caller identity
-  supplied. bench/ADOPTION.md carries the tables and the reproduction limits.
 
 ### Teaching your agents
 

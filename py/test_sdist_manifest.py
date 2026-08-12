@@ -35,7 +35,7 @@ sdist_sources = importlib.util.module_from_spec(SOURCE_SPEC)
 assert SOURCE_SPEC.loader is not None
 SOURCE_SPEC.loader.exec_module(sdist_sources)
 
-VERSION = package_metadata.checkout_version()
+VERSION = package_metadata.distribution_version()
 
 
 def _gzip_tar(data: bytes, *, flags: int = 0, optional: bytes = b"") -> bytes:

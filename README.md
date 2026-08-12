@@ -15,7 +15,7 @@ is never uploaded.
 
 ```
 $ agrep recall "why the retry backoff was capped at 30s"
-── meaning match · cosine 0.91 · @3f2a91c4:88.d1e0 · claude · project=payments · 12d
+── @3f2a91c4:88.d1e0 · pull: agrep around @3f2a91c4:88.d1e0 · claude · project=payments · 12d · meaning match · cosine 0.91
     88 user: cap retries at 30s - aws support confirmed the throttle window
     88 agent: capping the backoff at 30s and adding jitter; the 60s ceiling was
        what tripped the account-level throttle in us-east-1 ...
@@ -210,14 +210,8 @@ The compaction integrations (installed by setup, `--no-hook` to skip) make the
 summary itself carry the recovery route, so resumed agents reach for it without
 being told. The pi/oh-my-pi extension also exports the exact live session ID,
 lets their summarizer carry the same recovery schema, and injects hidden
-next-turn guidance only when it observes a real compaction boundary. In an
-external benchmark: 0 of 35 resumed from a plain summary; **151 of 151**
-recovered with the hook-shaped summary, every one calling `postcompact` first.
-The same guidance also over-triggered, sending agents to `postcompact` in 23 of
-25 controls whose summary already held the answer, and the truncated context
-was constructed rather than produced by a real compaction event.
-[bench/ADOPTION.md](bench/ADOPTION.md) has the tables and the reproduction
-limits.
+next-turn guidance only when it observes a real compaction boundary.
+
 
 ## Meaning search
 
@@ -284,8 +278,8 @@ prompts (their own evals improved 10-15% when system prompts shrank),
 each instruction stated once, goal/constraints/success-criteria structure,
 and examples only where they encode a requirement or correct a measured
 gap. So the Codex block is a terse rule list plus one worked transcript of
-the post-compaction recovery sequence, which is the routing failure the
-adoption benchmark measured.
+the post-compaction recovery sequence, where a generic search would hide the
+current conversation's missing turn.
 
 The compaction integrations address different lifecycle APIs for the same
 reason. Claude's `PreCompact` payload instructs the *summary writer* to preserve
@@ -556,4 +550,3 @@ MIT - see [LICENSE][license].
 [search-ranking]: https://github.com/dannyisbad/agrep/blob/master/docs/SEARCH_RANKING.md
 [semantic-cli-scale]: https://github.com/dannyisbad/agrep/blob/master/bench/SEMANTIC_CLI_SCALE.md
 [semantic-scale]: https://github.com/dannyisbad/agrep/blob/master/bench/SEMANTIC_SCALE.md
-[semantic-worth]: https://github.com/dannyisbad/agrep/blob/master/bench/SEMANTIC_WORTH.md

@@ -23,6 +23,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
 
+import fileops
+
 LAG_BOUND_SECONDS = 7 * 24 * 60 * 60
 _DIRECT_URL_MAX_BYTES = 16 * 1024
 _GIT_TOTAL_SECONDS = 0.35
@@ -53,11 +55,24 @@ def _trusted_provenance_stat(observed: os.stat_result) -> bool:
     return os.name == "nt" or not (stat.S_IMODE(observed.st_mode) & 0o022)
 
 
-def _stat_identity(observed: os.stat_result) -> tuple[int, ...]:
+def _stat_identity(
+        observed: os.stat_result, *, change_sensitive: bool = False,
+) -> tuple[int, ...]:
+    modified_ns = int(observed.st_mtime_ns)
+    changed_ns = int(observed.st_ctime_ns)
+    created_ns = int(getattr(
+        observed, "st_birthtime_ns", observed.st_ctime_ns))
+    if os.name == "nt":
+        # Path stat exposes creation while fstat exposes ChangeTime on 3.13.
+        modified_ns = modified_ns // 100 * 100
+        changed_ns = changed_ns // 100 * 100
+        created_ns = created_ns // 100 * 100
+        if not change_sensitive:
+            changed_ns = created_ns
     return (
         int(observed.st_dev), int(observed.st_ino), int(observed.st_mode),
-        int(observed.st_size), int(observed.st_mtime_ns),
-        int(observed.st_ctime_ns), int(observed.st_uid),
+        int(observed.st_size), modified_ns, changed_ns, created_ns,
+        int(observed.st_uid),
     )
 
 
@@ -102,8 +117,14 @@ def _read_regular(path: Path, max_bytes: int) -> tuple[bytes, os.stat_result] | 
         return None
     if not _trusted_provenance_stat(before):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        windows_before = (
+            fileops.change_sensitive_file_identity(path)
+            if os.name == "nt" else None)
+    except OSError:
+        return None
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
         descriptor = os.open(path, flags)
     except OSError:
@@ -113,6 +134,12 @@ def _read_regular(path: Path, max_bytes: int) -> tuple[bytes, os.stat_result] | 
         if (not stat.S_ISREG(current.st_mode)
                 or current.st_size > max_bytes
                 or _stat_identity(before) != _stat_identity(current)):
+            return None
+        windows_opened = (
+            fileops.file_identity_fd(descriptor)
+            if os.name == "nt" else None)
+        if (windows_before is not None
+                and windows_opened[:4] != windows_before[:4]):
             return None
         chunks = []
         remaining = max_bytes + 1
@@ -124,8 +151,17 @@ def _read_regular(path: Path, max_bytes: int) -> tuple[bytes, os.stat_result] | 
             remaining -= len(chunk)
         data = b"".join(chunks)
         after = os.fstat(descriptor)
+        path_after = path.lstat()
         if (len(data) > max_bytes or len(data) != current.st_size
-                or _stat_identity(current) != _stat_identity(after)):
+                or _stat_identity(
+                    current, change_sensitive=True) != _stat_identity(
+                        after, change_sensitive=True)
+                or _stat_identity(current) != _stat_identity(path_after)):
+            return None
+        if (windows_before is not None
+                and (fileops.file_identity_fd(descriptor) != windows_opened
+                     or fileops.change_sensitive_file_identity(path)
+                     != windows_before)):
             return None
         return data, current
     except OSError:

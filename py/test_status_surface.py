@@ -99,6 +99,11 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIsNone(writer_missing["writer_build_id"])
         self.assertEqual(writer_missing["writer_build_state"], "unavailable")
 
+    def test_cli_version_uses_distribution_identity(self) -> None:
+        with mock.patch.object(
+                cli.dist, "package_version", return_value="1.2.3-rc.4"):
+            self.assertEqual(cli._version(), "1.2.3-rc.4")
+
     def test_version_reports_portable_native_identity(self) -> None:
         identity = {
             "distribution_build_id": "d" * 20,

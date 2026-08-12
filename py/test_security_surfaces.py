@@ -255,6 +255,10 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
         self.assertIn("id: upload", validate)
         self.assertNotIn("python -m pip install", validate)
         self.assertNotIn("id-token: write", validate)
+        self.assertIn("actions/checkout@", validate)
+        self.assertLess(
+            validate.index("actions/checkout@"),
+            validate.index("bench/pypi_release.py"))
 
         checker = _workflow_job(text, "twine-check")
         self.assertIn("python -m twine check", checker)
@@ -313,6 +317,9 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
 
         assets = _workflow_job(text, "release-assets")
         self.assertIn("draft: true", assets)
+        self.assertIn(
+            "prerelease: ${{ contains(github.ref_name, '-') }}", assets)
+        self.assertIn("make_latest: false", assets)
         self.assertIn("inspect an existing release without changing its visibility", assets)
         self.assertIn("verify immutable assets on an already-published release", assets)
         self.assertIn("steps.release-state.outputs.state != 'published'", assets)
@@ -339,6 +346,15 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
         publish_draft = final.index("--draft=false")
         self.assertLess(live_download, exact_compare)
         self.assertLess(exact_compare, publish_draft)
+        self.assertIn('if [[ "$GITHUB_REF_NAME" == *-* ]]; then', final)
+        self.assertIn(
+            'gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease\n',
+            final)
+        self.assertIn("--draft=false --prerelease=false --latest", final)
+        self.assertIn(
+            'elif [ "$expected_prerelease" = "false" ]; then\n'
+            '            gh release edit "$GITHUB_REF_NAME" --latest',
+            final)
         self.assertNotIn("publish-npm-manual:", text)
         self.assertNotIn("npm_only", text)
 

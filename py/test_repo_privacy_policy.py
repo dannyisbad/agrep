@@ -68,20 +68,14 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
             capture.parent.mkdir(parents=True)
             capture.write_text("private transcript", encoding="utf-8")
             local = root / "RELEASE.local.md"
-            local.write_text("campaign", encoding="utf-8")
-            archived = root / ".goals-archive" / "campaign.md"
-            archived.parent.mkdir()
-            archived.write_text("campaign", encoding="utf-8")
+            local.write_text("private metadata", encoding="utf-8")
             audit = root / "bench" / "adversarial" / "UX_AUDIT.json"
             audit.parent.mkdir()
             audit.write_text("{}", encoding="utf-8")
-            findings = self.validator.scan(
-                root, [capture, local, archived, audit])
+            findings = self.validator.scan(root, [capture, local, audit])
         self.assertEqual(
             findings,
-            [(".goals-archive/campaign.md",
-              "private capture or agent scratch tree"),
-             ("RELEASE.local.md", "local campaign governance"),
+            [("RELEASE.local.md", "local-only metadata"),
              ("bench/adversarial/UX_AUDIT.json",
               "local or transcript-derived evidence"),
              ("bench/render/capture.txt", "private capture or agent scratch tree")])
@@ -133,28 +127,23 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
             [("config.py", "personal-identity token"),
              ("notes.md", "personal-identity token")])
 
-    def test_large_public_ledger_is_scanned_with_a_bounded_limit(self) -> None:
+    def test_private_evaluation_trees_are_rejected_structurally(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
-            ledger = root / "bench" / "adversarial" / "GOAL8_DECISION_DELTA.json"
-            ledger.parent.mkdir(parents=True)
-            ledger.write_bytes(
-                b"x" * self.validator.MAX_REPOSITORY_BYTES
-                + b"\nsk-" + b"z" * 24)
-            findings = self.validator.scan(root, [ledger])
-            ledger.write_bytes(
-                b"x" * (self.validator.REPOSITORY_BYTE_LIMITS[
-                    "bench/adversarial/GOAL8_DECISION_DELTA.json"] + 1))
-            oversized = self.validator.scan(root, [ledger])
+            paths = [
+                root / "bench" / "adversarial" / "report.json",
+                root / "bench" / "gauntlet" / "trace.json",
+            ]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            findings = self.validator.scan(root, paths)
 
         self.assertEqual(
             findings,
-            [("bench/adversarial/GOAL8_DECISION_DELTA.json",
-              "credential-shaped content")])
-        self.assertEqual(
-            oversized,
-            [("bench/adversarial/GOAL8_DECISION_DELTA.json",
-              "repository file exceeds 2000000 bytes")])
+            [(path.relative_to(root).as_posix(),
+              "local or transcript-derived evidence")
+             for path in paths])
 
     def test_banned_external_and_broken_symlinks_are_safe(self) -> None:
         with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as out:
@@ -272,7 +261,7 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
                 code = self.validator.main([os.fspath(root), "--all-refs"])
 
         self.assertEqual(code, 1)
-        self.assertIn("RELEASE.local.md: local campaign governance", output.getvalue())
+        self.assertIn("RELEASE.local.md: local-only metadata", output.getvalue())
 
     def test_all_refs_scans_annotated_tag_messages(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

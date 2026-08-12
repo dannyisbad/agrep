@@ -1121,6 +1121,7 @@ def fts_delegation_active() -> bool:
 
 
 _SEARCH_INDEX_REQUEST = ".search_index_request"
+_SEARCH_INDEX_REQUEST_MAX_BYTES = 1024
 # Both outcomes leave the build outside this process; only the command whose
 # job IS the build distinguishes them.
 _DELEGATING_OUTCOMES = frozenset({
@@ -1154,12 +1155,14 @@ def request_search_index_build() -> bool:
 
 
 def search_index_build_pending() -> bool:
-    """The durable cross-process fact behind every tools-gap surface: a
-    queued FTS build request exists, so the missing db is being built."""
+    """Whether a valid durable FTS build request is waiting to be served."""
     try:
-        return _search_index_request_path().exists()
+        ownerfile.snapshot(
+            _search_index_request_path(),
+            max_bytes=_SEARCH_INDEX_REQUEST_MAX_BYTES)
     except OSError:
         return False
+    return True
 
 
 def serve_search_index_request(
@@ -1171,7 +1174,8 @@ def serve_search_index_request(
     landed under this one."""
     path = _search_index_request_path()
     try:
-        before = path.stat().st_mtime_ns
+        before = ownerfile.snapshot(
+            path, max_bytes=_SEARCH_INDEX_REQUEST_MAX_BYTES)
     except OSError:
         return False
     if not derived_writes_permitted():
@@ -1180,8 +1184,8 @@ def serve_search_index_request(
     if run_refresh() is False:
         return False
     try:
-        if path.stat().st_mtime_ns == before:
-            path.unlink()
+        ownerfile.remove_exact(
+            path, before, tombstone=True, require_stable_mtime=True)
     except OSError:
         pass
     return True
@@ -3398,6 +3402,15 @@ def _reap_killed_drift_probe(proc: subprocess.Popen) -> None:
         _untrack_drift_probe(proc)
 
 
+def _new_drift_reaper(proc: subprocess.Popen) -> threading.Thread:
+    return threading.Thread(
+        target=_reap_killed_drift_probe,
+        args=(proc,),
+        daemon=True,
+        name="agrep-drift-reaper",
+    )
+
+
 def _kill_drift_probe(proc: subprocess.Popen) -> None:
     """Kill promptly; hand a pathological wait to a tracked daemon reaper."""
     killed = True
@@ -3415,12 +3428,7 @@ def _kill_drift_probe(proc: subprocess.Popen) -> None:
             # Retain it for the process-exit fence instead.
             return
         try:
-            reaper = threading.Thread(
-                target=_reap_killed_drift_probe,
-                args=(proc,),
-                daemon=True,
-                name="agrep-drift-reaper",
-            )
+            reaper = _new_drift_reaper(proc)
             reaper.start()
         except (RuntimeError, TypeError, ValueError):
             # Keep it in _DRIFT_PROBE_LIVE so the atexit fence can retry.

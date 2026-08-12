@@ -27,28 +27,18 @@ How the system is built and what its surfaces promise.
 
 ## Benchmarks
 
-Measured evidence. Each names what it measured. Most also carry the command
-that reproduces it; ADOPTION.md is the exception and says so.
+Measured evidence. Each names what it measured and how to reproduce it.
 
-- [EMBEDDER_SELECTION.md](../bench/EMBEDDER_SELECTION.md): the fail-closed
-  model bakeoff and why the shipped embedder won.
 - [EMBED_SPEED.md](../bench/EMBED_SPEED.md): initial-embed throughput in
   rows/s, including which noisy samples were discarded and why.
 - [EMBED_TOPUP.md](../bench/EMBED_TOPUP.md): incremental-plan scale, the cost
   of the planner's transcript walk before any inference happens.
-- [SEMANTIC_WORTH.md](../bench/SEMANTIC_WORTH.md): whether meaning search earns
-  its keep, measured on frozen recall tasks against lexical and hybrid modes.
 - [SEMANTIC_SCALE.md](../bench/SEMANTIC_SCALE.md): candidate-selection scale to
   2M rows against an adversarial session distribution.
 - [SEMANTIC_CLI_SCALE.md](../bench/SEMANTIC_CLI_SCALE.md): process start to
   process exit for real CLI semantic queries, cold and warm.
 - [SEMANTIC_SEGMENTS.md](../bench/SEMANTIC_SEGMENTS.md): the design contract for
   immutable segmented publication (a design doc that lives with its harnesses).
-- [ADOPTION.md](../bench/ADOPTION.md): post-compact recovery adoption, produced
-  by an external harness whose fixtures are not in this tree, so it reports
-  results rather than reproducing them. 0/35 reached unprompted; 151/151
-  recovered with the hook-shaped summary; 23/25 also over-triggered on controls
-  whose summary already sufficed.
 
 ## Meta
 

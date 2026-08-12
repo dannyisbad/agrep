@@ -602,6 +602,8 @@ class TeachSafetyTest(unittest.TestCase):
             mock.Mock(returncode=0, stdout="active", stderr=""),
         ]
         with mock.patch.object(teach.sys, "platform", "darwin"), \
+                mock.patch.object(
+                    teach.os, "getuid", return_value=501, create=True), \
                 mock.patch.object(teach.subprocess, "run", side_effect=outcomes):
             self.assertFalse(teach._sentinel_remove())
         self.assertTrue(plist.is_file())
@@ -619,6 +621,8 @@ class TeachSafetyTest(unittest.TestCase):
             mock.Mock(returncode=1, stdout="", stderr="not found"),
         ]
         with mock.patch.object(teach.sys, "platform", "darwin"), \
+                mock.patch.object(
+                    teach.os, "getuid", return_value=501, create=True), \
                 mock.patch.object(teach.subprocess, "run", side_effect=outcomes):
             self.assertTrue(teach._sentinel_remove())
         self.assertFalse(plist.exists())

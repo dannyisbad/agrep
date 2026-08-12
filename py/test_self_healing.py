@@ -740,7 +740,6 @@ class ColdRollbackJournalTests(unittest.TestCase):
             start_new_session=(os.name != "nt"))
         if live:
             writer.stdout.readline()
-            self.addCleanup(writer.stdout.close)
         else:
             writer.wait(timeout=60)
             writer.stdout.close()
@@ -797,13 +796,19 @@ class ColdRollbackJournalTests(unittest.TestCase):
             self.assertEqual(self._agrep(first, "index").returncode, 0)
             seeded = self._owner(data)
             writer = self._wedge(data, live=True)
-            self.addCleanup(writer.wait)
-            self.addCleanup(writer.kill)
-
-            for label, env in (("upgraded build", second), ("own build", first)):
-                for argv in (("index",), ("index", "--full")):
-                    with self.subTest(build=label, argv=argv):
-                        self._assert_declined(self._agrep(env, *argv), data, seeded)
+            assert writer is not None
+            try:
+                for label, env in (("upgraded build", second), ("own build", first)):
+                    for argv in (("index",), ("index", "--full")):
+                        with self.subTest(build=label, argv=argv):
+                            self._assert_declined(
+                                self._agrep(env, *argv), data, seeded)
+            finally:
+                if writer.poll() is None:
+                    writer.kill()
+                writer.wait(timeout=60)
+                if writer.stdout is not None:
+                    writer.stdout.close()
 
     def _stop_daemons(self, env: dict) -> None:
         subprocess.run(
@@ -824,22 +829,27 @@ class ColdRollbackJournalTests(unittest.TestCase):
             first, _second, data = self._sandbox(root)
             live = dict(first)
             live.pop("AGREP_NO_DAEMON", None)
-            self.addCleanup(self._stop_daemons, dict(first))
-            self.assertEqual(self._agrep(first, "index").returncode, 0)
-            self._wedge(data, live=False)
-            journal = Path(f"{data / 'corpus.db'}-journal")
+            try:
+                self.assertEqual(self._agrep(first, "index").returncode, 0)
+                self._wedge(data, live=False)
+                journal = Path(f"{data / 'corpus.db'}-journal")
 
-            search = self._agrep(live, "search", "cold journal wedge phrase")
-            self.assertIn("cold journal wedge phrase", search.stdout)
-            deadline = time.monotonic() + 30.0
-            while journal.exists() and time.monotonic() < deadline:
-                time.sleep(0.25)
-            self.assertFalse(
-                journal.exists(),
-                "the daemon lane left the rollback journal wedged")
-            healed = self._agrep(live, "search", "cold journal wedge phrase")
-            self.assertNotIn("history may be stale", healed.stderr)
-            self.assertNotIn("scanning sources this query", healed.stderr)
+                search = self._agrep(
+                    live, "search", "cold journal wedge phrase")
+                self.assertIn("cold journal wedge phrase", search.stdout)
+                deadline = time.monotonic() + 30.0
+                while journal.exists() and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                self.assertFalse(
+                    journal.exists(),
+                    "the daemon lane left the rollback journal wedged")
+                healed = self._agrep(
+                    live, "search", "cold journal wedge phrase")
+                self.assertNotIn("history may be stale", healed.stderr)
+                self.assertNotIn(
+                    "scanning sources this query", healed.stderr)
+            finally:
+                self._stop_daemons(dict(first))
 
     def _assert_declined(self, declined: subprocess.CompletedProcess,
                          data: Path, seeded: str) -> None:

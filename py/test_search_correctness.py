@@ -138,7 +138,7 @@ class SearchCorrectnessTests(unittest.TestCase):
         self.assertEqual([row[8] for row in rows], ["user", "recap"])
 
     def test_stream_row_who_reads_the_streamed_field_fail_closed(self) -> None:
-        # goal-9 residual closed: no prose mirror - the streamed row's own
+        # No prose mirror: the streamed row's own
         # normalize-pass `who` decides, and anything else stays unknown.
         for who in ("user", "subagent", "synthetic", "control", "recap",
                     "harness"):
@@ -825,9 +825,9 @@ class SearchCorrectnessTests(unittest.TestCase):
 
 
 class CorpusAnchorTests(unittest.TestCase):
-    """M11: multi-word out-of-vocabulary mush clears the strong band on
-    embedding hubness alone. Zero anchored words demotes every label and says
-    so once; it never refuses the page and never changes an exit code."""
+    """Multi-word out-of-vocabulary mush clears the strong band on embedding
+    hubness alone. Zero anchored words demotes every label and says so once; it
+    never refuses the page and never changes an exit code."""
 
     QUERY = "zqxjklwvutplmb frobnicated quuxstring"
 
@@ -916,6 +916,16 @@ class CorpusAnchorTests(unittest.TestCase):
         self.assertEqual(anchor, {"anchored": False, "probed": 1})
         self.assertEqual([call.args[1] for call in fake.keyword_count.call_args_list],
                          ["zqxjklwvutplmb"])
+
+    def test_mixed_alphanumeric_terms_do_not_anchor_on_letter_fragments(self):
+        with self._probe() as fake:
+            anchor = search.semantic_corpus_anchor(
+                "z123race456 z789retrying012")
+        self.assertEqual(anchor, {"anchored": False, "probed": 2})
+        self.assertEqual(
+            [call.args[1] for call in fake.keyword_count.call_args_list],
+            ["z123race456", "z789retrying012"],
+        )
 
     def test_wordless_query_and_absent_corpus_never_demote(self):
         with self._probe() as fake:

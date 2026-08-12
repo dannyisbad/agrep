@@ -540,12 +540,19 @@ def t_filter_parity():
         try:
             jsonl = explore.keyword_search("the", 10_000_000)["hits"]
         except RuntimeError as exc:
-            if not any(reason in str(exc) for reason in (
-                    "generation changed",
-                    "event proof changed during bulk read",
-            )):
+            source_after = corpusdb._stamp()
+            observed_source_stamps.append(source_after)
+            reasons = (
+                "generation changed",
+                "event proof changed during bulk read",
+            )
+            if any(reason in str(exc) for reason in reasons):
+                source_moved = True
+            elif (str(exc) == "event store cannot be opened"
+                  and not corpusdb._stamps_equal(source_before, source_after)):
+                source_moved = True
+            else:
                 raise
-            source_moved = True
         else:
             source_after = corpusdb._stamp()
             observed_source_stamps.append(source_after)

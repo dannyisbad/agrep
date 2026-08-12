@@ -5,4 +5,4 @@ binary, so `uvx agrep` / `pipx run agrep` / `pip install agrep` need no clone or
 The real logic lives in the bundled modules; see __main__.py.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.0-rc.2"

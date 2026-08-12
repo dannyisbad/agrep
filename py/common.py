@@ -188,9 +188,9 @@ def stamp_stdio_lines() -> None:
     """Timestamp this process's stdout/stderr lines when the parent asked.
 
     Background embed children write straight into semantic-embed.log via an
-    inherited fd, so an undated failure there cannot be placed in time
-    (RC2 M10). Parents set LOG_STAMP_ENV on the spawn; direct/manual runs
-    and test captures stay byte-identical."""
+    inherited fd, so an undated failure there cannot be placed in time.
+    Parents set LOG_STAMP_ENV on the spawn; direct/manual runs and test captures
+    stay byte-identical."""
     import sys
     if os.environ.get(LOG_STAMP_ENV) != "1":
         return
