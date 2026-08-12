@@ -145,6 +145,25 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
               "local or transcript-derived evidence")
              for path in paths])
 
+    def test_benchmark_run_and_agent_store_trees_are_rejected_structurally(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            paths = [
+                root / "bench" / "corpus" / ".claude" / "projects" / "session.jsonl",
+                root / "bench" / "corpus" / ".codex" / "sessions" / "rollout.jsonl",
+                root / "bench" / "latency" / "runs" / "seat.jsonl",
+            ]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            findings = self.validator.scan(root, paths)
+
+        self.assertEqual(
+            findings,
+            [(path.relative_to(root).as_posix(),
+              "private capture or agent scratch tree")
+             for path in paths])
+
     def test_banned_external_and_broken_symlinks_are_safe(self) -> None:
         with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as out:
             root = Path(raw).resolve()
