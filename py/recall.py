@@ -1462,7 +1462,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
 
     if blank_query or not queries:
         # bare `agrep recall`/`agrep pack` may have meant the word itself
-        common.log("query arguments must not be empty - give me something to recall "
+        common.log("query arguments must not be empty "
                    "(searching the word itself: "
                    f'agrep search "{prog}")')
         _json_error("empty-query")

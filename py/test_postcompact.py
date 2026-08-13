@@ -409,6 +409,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("no structural compaction boundary", stderr.getvalue())
 
+    def test_explicit_session_with_family_but_no_recap_retries_then_names_it(
+            self) -> None:
+        # A session indexed before its compaction landed has a family but no
+        # recap turn (the omp report): retry one synchronous ingest, then name
+        # the session in the refusal, never "this caller".
+        dbs = [_db(), _db()]
+        ingested = []
+        try:
+            with mock.patch.object(
+                    postcompact.indexd_runtime, "ensure_index",
+                    return_value=True), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "build_index",
+                        side_effect=lambda quiet: ingested.append(True)), \
+                    mock.patch.object(
+                        postcompact.common, "ingest_bin",
+                        return_value=mock.Mock(exists=lambda: True)), \
+                    mock.patch.object(
+                        postcompact.session_context,
+                        "_open_session_family_index",
+                        side_effect=lambda: dbs.pop(0)), \
+                    mock.patch.object(
+                        postcompact.session_context,
+                        "_indexed_calling_family_state_in_db",
+                        return_value=("root", frozenset({"root"}), None)):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    rc = postcompact.main(["--session", "root"])
+        finally:
+            for db in dbs:
+                db.close()
+        self.assertEqual(rc, 2)
+        self.assertEqual(ingested, [True])
+        self.assertIn("session root", stderr.getvalue())
+        self.assertNotIn("this caller", stderr.getvalue())
+
     def test_explicit_session_honors_the_freshness_gate(self) -> None:
         db = _db()
         try:

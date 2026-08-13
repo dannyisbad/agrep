@@ -405,6 +405,14 @@ def _serve(args, *, retry_pending: bool) -> int | None:
                     "no structural compaction boundary is indexed for "
                     f"session {args.session}")
             root, members, recap_turn = indexed
+            if recap_turn is None:
+                # a known family with no indexed recap is the same
+                # staleness-shaped miss as an unknown session: the boundary
+                # was written seconds ago and one ingest closes the race
+                return stale(
+                    "boundary_unavailable",
+                    "no structural compaction boundary is indexed for "
+                    f"session {args.session}")
             family = session_context.CallingFamily(
                 session=args.session, root=root,
                 members=members | {args.session},

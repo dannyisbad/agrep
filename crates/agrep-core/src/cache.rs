@@ -300,10 +300,9 @@ struct SessionAggregate<'a> {
     parent: &'a str,
 }
 
-fn aggregate_sessions<'a>(
-    msgs: &'a [Message],
-) -> anyhow::Result<BTreeMap<&'a str, SessionAggregate<'a>>> {
+fn aggregate_sessions<'a>(msgs: &'a [Message]) -> BTreeMap<&'a str, SessionAggregate<'a>> {
     let mut by: BTreeMap<&str, SessionAggregate> = BTreeMap::new();
+    let mut parent_conflicts: u32 = 0;
     for m in msgs {
         let a = by.entry(&*m.session).or_insert(SessionAggregate {
             agent: m.agent,
@@ -317,14 +316,19 @@ fn aggregate_sessions<'a>(
         if !m.parent.is_empty() {
             if a.parent.is_empty() {
                 a.parent = m.parent.as_ref();
-            } else {
-                anyhow::ensure!(
-                    a.parent == m.parent.as_ref(),
-                    "session {} has conflicting parents {} and {}",
-                    crate::ingest::terminal_safe(&m.session),
-                    crate::ingest::terminal_safe(a.parent),
-                    crate::ingest::terminal_safe(&m.parent),
-                );
+            } else if a.parent != m.parent.as_ref() {
+                // A sidecar thread surviving into a resumed session's container
+                // leaves two truthful parent claims; ambiguous lineage is damage
+                // to absorb, never a publication failure - the first claim stands.
+                if parent_conflicts == 0 {
+                    eprintln!(
+                        "  ! session {} has conflicting parents {} and {}; keeping the first",
+                        crate::ingest::terminal_safe(&m.session),
+                        crate::ingest::terminal_safe(a.parent),
+                        crate::ingest::terminal_safe(&m.parent),
+                    );
+                }
+                parent_conflicts += 1;
             }
         }
         a.n += 1;
@@ -337,7 +341,10 @@ fn aggregate_sessions<'a>(
             a.first_text = one_line.chars().take(120).collect();
         }
     }
-    Ok(by)
+    if parent_conflicts > 1 {
+        eprintln!("  ! {parent_conflicts} conflicting parent claims absorbed (first claim kept)");
+    }
+    by
 }
 
 fn write_session_family_aggregate(
@@ -376,7 +383,7 @@ pub fn write_session_family_meta(
     family_meta_path: &Path,
     ingest_signature: &str,
 ) -> anyhow::Result<usize> {
-    let by = aggregate_sessions(msgs)?;
+    let by = aggregate_sessions(msgs);
     write_session_family_aggregate(&by, family_meta_path, ingest_signature)?;
     Ok(by.len())
 }
@@ -388,7 +395,7 @@ pub fn write_session_index(
     family_meta_path: &Path,
     ingest_signature: &str,
 ) -> anyhow::Result<usize> {
-    let by = aggregate_sessions(msgs)?;
+    let by = aggregate_sessions(msgs);
     let n = by.len();
     write_session_family_aggregate(&by, family_meta_path, ingest_signature)?;
     write_atomic(path, |w| {
@@ -6490,7 +6497,10 @@ mod tests {
     }
 
     #[test]
-    fn session_parent_conflicts_abort_before_publication() {
+    fn session_parent_conflicts_absorb_and_keep_the_first_claim() {
+        // A sidecar thread surviving into a resumed session's container gives
+        // one session two truthful parent claims; the publication must still
+        // land with the first claim instead of wedging the whole box.
         let root = tmp_path(&std::env::temp_dir().join("agrep-family-parent-conflict"));
         fs::create_dir_all(&root).unwrap();
         let message = |parent: &str| Message {
@@ -6510,15 +6520,13 @@ mod tests {
         };
         let sessions = root.join("sessions.jsonl");
         let meta = root.join(SESSION_FAMILY_META_FILE);
-        let messages = vec![message("root-a\u{1b}[31m"), message("root-b")];
-        let error = write_session_index(&messages, &sessions, &meta, "2:conflict")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("conflicting parents"));
-        assert!(error.contains(r"\u001b"));
-        assert!(!error.contains('\u{1b}'));
-        assert!(!sessions.exists());
-        assert!(!meta.exists());
+        let messages = vec![message("root-a"), message("root-b")];
+        let count = write_session_index(&messages, &sessions, &meta, "2:conflict").unwrap();
+        assert_eq!(count, 1);
+        let row: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sessions).unwrap()).unwrap();
+        assert_eq!(row["parent"], "root-a");
+        assert!(meta.exists());
         fs::remove_dir_all(root).ok();
     }
 }
