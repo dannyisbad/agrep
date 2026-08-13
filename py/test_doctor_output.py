@@ -571,6 +571,52 @@ class DoctorRowLanguageTests(unittest.TestCase):
         self.assertNotIn("RSS", rendered)
         self.assertNotIn("doctor --deep", rendered)
 
+    def test_young_converging_churn_renders_as_the_system_working(self) -> None:
+        # Live sessions write on every turn, so a converging daemon is behind
+        # by one publish essentially forever; that steady state must not read
+        # as a fault or name a manual remedy.
+        snapshot = _report_snapshot(
+            resources={
+                **_report_snapshot()["resources"],
+                "indexd": {
+                    "state": "running", "running": True, "pid": 42,
+                    "rss_state": "not-inspected", "rss_bytes": None,
+                },
+            },
+            freshness={
+                "state": "index-behind", "changed_stores": 2,
+                "young": True, "converging": True,
+            },
+        )
+        rendered = _render_report(snapshot)
+        line = next(
+            line for line in rendered.splitlines() if "freshness" in line)
+        self.assertIn("[ok ]", line)
+        self.assertIn("absorbing live-session churn (2 stores still writing", line)
+        self.assertNotIn("index behind", rendered)
+        self.assertNotIn(doctor._cli_command("index"), rendered)
+
+    def test_aged_drift_with_a_running_daemon_still_names_the_remedy(self) -> None:
+        snapshot = _report_snapshot(
+            resources={
+                **_report_snapshot()["resources"],
+                "indexd": {
+                    "state": "running", "running": True, "pid": 42,
+                    "rss_state": "not-inspected", "rss_bytes": None,
+                },
+            },
+            freshness={
+                "state": "index-behind", "behind_s": 2520.0,
+                "changed_stores": 1,
+            },
+        )
+        rendered = _render_report(snapshot)
+        line = next(
+            line for line in rendered.splitlines() if "freshness" in line)
+        self.assertIn("[-- ]", line)
+        self.assertIn("index 42m behind (1 store changed)", line)
+        self.assertIn(doctor._cli_command("index"), line)
+
     def test_clobber_recovery_owns_one_resolved_verification_step(self) -> None:
         database = Path("/fixture/data/corpus.db")
         search_db = {

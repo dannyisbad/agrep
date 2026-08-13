@@ -97,6 +97,52 @@ class PacketTests(unittest.TestCase):
         self.assertEqual(
             packet["omissions"]["delegated_sessions"], "policy_excluded")
 
+    def test_adjacent_boundaries_fall_back_to_the_nearest_filled_window(self) -> None:
+        # An archive resume immediately re-compacted leaves recap rows on
+        # adjacent turns; the packet must serve the nearest earlier window
+        # instead of a useless proven-empty one.
+        db = _db()
+        try:
+            db.execute(
+                "INSERT INTO msgs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (50, "root", 9, 9, "codex", "agrep", "", "recap", "recap",
+                 "", None))
+            packet = postcompact.read_packet(db, _family(boundary=9))
+        finally:
+            db.close()
+        self.assertEqual(packet["status"], "recovered")
+        self.assertEqual(packet["selection"]["window_fallbacks"], 1)
+        self.assertEqual(packet["selection"]["previous_boundary_turn"], 2)
+        self.assertEqual(
+            [(row["turn"], row["who"]) for row in packet["rows"]],
+            [(3, "user"), (3, "agent"), (7, "user"), (7, "agent")],
+        )
+        rendered = postcompact._human(packet)
+        self.assertIn("newest 1 window(s) before this boundary were empty",
+                      rendered)
+
+    def test_a_session_with_no_content_before_any_boundary_stays_empty(self) -> None:
+        db = sqlite3.connect(":memory:")
+        try:
+            db.execute(
+                "CREATE TABLE msgs("
+                "id INTEGER PRIMARY KEY, session TEXT, turn INTEGER, "
+                "ts INTEGER, agent TEXT, project TEXT, model TEXT, "
+                "model_source TEXT, who TEXT, text TEXT, content_digest TEXT)")
+            db.executemany(
+                "INSERT INTO msgs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [(1, "root", 1, 1, "codex", "agrep", "", "recap", "recap",
+                  "", None),
+                 (2, "root", 2, 2, "codex", "agrep", "", "recap", "recap",
+                  "", None)])
+            packet = postcompact.read_packet(db, _family(boundary=2))
+        finally:
+            db.close()
+        self.assertEqual(packet["status"], "empty")
+        self.assertEqual(packet["selection"]["window_fallbacks"], 1)
+        self.assertNotIn(
+            "window(s) before this boundary", postcompact._human(packet))
+
     def test_child_sessions_are_never_injected_into_the_root_packet(self) -> None:
         db = _db()
         try:

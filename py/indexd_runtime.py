@@ -1323,6 +1323,12 @@ def explicit_index_outcome() -> tuple[surface.IndexBuildOutcome, str]:
                      if outcome is surface.IndexBuildOutcome.BLOCKED else "")
 
 
+# How long an explicit index waits out a daemon owner-record beat before
+# reporting the block; takeover/adoption transitions settle inside the
+# publication grace, so this comfortably covers a healthy box.
+_EXPLICIT_INDEX_OWNER_WAIT_S = 5.0
+
+
 def hand_off_search_index() -> bool:
     """Explicit `agrep index`: return once the corpus is published and served,
     leaving the derived FTS build to the daemon that will run it.
@@ -1332,6 +1338,16 @@ def hand_off_search_index() -> bool:
     global _inline_refresh_failed
     _inline_refresh_failed = False
     outcome, cause = explicit_index_outcome()
+    if outcome is surface.IndexBuildOutcome.BLOCKED and cause == "blocked-owner":
+        # A daemon takeover or adoption rewrites its owner records in a short
+        # beat; an explicit index landing inside it retries until the beat
+        # settles instead of failing a healthy box.
+        deadline = time.monotonic() + _EXPLICIT_INDEX_OWNER_WAIT_S
+        while (outcome is surface.IndexBuildOutcome.BLOCKED
+               and cause == "blocked-owner"
+               and time.monotonic() < deadline):
+            time.sleep(0.5)
+            outcome, cause = explicit_index_outcome()
     _set_fts_delegated(outcome is surface.IndexBuildOutcome.DELEGATED)
     line = surface.index_build_line(outcome, cause, cli=_cli_invocation_name())
     if line:

@@ -169,8 +169,17 @@ def read_packet(
     if boundary is None:
         raise ValueError("no structural compaction boundary is indexed for this caller")
     session = family.session
+    # Back-to-back recaps (an archive resume immediately re-compacted) leave
+    # the newest window empty; an empty packet helps nobody, so walk back to
+    # the nearest window with content and disclose how far the walk went.
     previous = _previous_boundary(db, session, int(boundary))
     eligible = _eligible_rows(db, session, previous, int(boundary))
+    window_fallbacks = 0
+    while not eligible and previous is not None:
+        upper = previous
+        previous = _previous_boundary(db, session, upper)
+        eligible = _eligible_rows(db, session, previous, upper)
+        window_fallbacks += 1
     rows, omitted_blocks, render_omitted = _select_rows(eligible)
     eligible_blocks = len({int(row["turn"]) for row in eligible})
     shown_blocks = len({int(row["turn"]) for row in rows})
@@ -196,6 +205,7 @@ def read_packet(
             "boundary_turn": int(boundary),
             "previous_boundary_turn": previous,
             "boundary_basis": "indexed_structural_recap",
+            "window_fallbacks": window_fallbacks,
             "tools": "excluded",
             "delegated_sessions": "excluded",
             "project": project,
@@ -252,7 +262,10 @@ def _human(packet: dict, *, enforce_budget: bool = True) -> str:
              if selection.get("project") else ""),
         ) if part),
         (f"boundary turn {selection['boundary_turn']} (structural recap) · "
-         f"{selection['scope']} · tools and delegated sessions excluded"),
+         f"{selection['scope']} · tools and delegated sessions excluded"
+         + (f" · newest {selection['window_fallbacks']} window(s) before this "
+            "boundary were empty; showing the nearest earlier window"
+            if selection.get("window_fallbacks") and packet["rows"] else "")),
         "",
         "── recent root/main tail · newest blocks selected, chronological render ──",
     ]
