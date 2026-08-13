@@ -6700,10 +6700,13 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if args.max is not None and args.max < 0:
         ap.error("--max must be 0 or greater")
     selected_modes = sum(bool(value) for value in
-                         (args.semantic, args.regex, args.word, args.lexical,
-                          args.hybrid))
+                         (args.semantic, args.regex, args.word, args.hybrid))
     if selected_modes > 1:
         ap.error("search matcher modes are mutually exclusive")
+    if args.lexical and args.semantic:
+        # --lexical narrows the lanes, not the matcher: it combines freely
+        # with -E/-w and only contradicts an explicit semantic request
+        ap.error("-s and --lexical are contradictory; pick one")
     if args.hybrid and (
             not args.classic or args.who_filter == "tool" or args.sort != "score"
             or args.count or args.count_by_tier or args.chats
@@ -6887,7 +6890,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if not q:
         # `agrep search` also lands here when a bare `agrep <word>` consumed a
         # command word as the verb - name the escape hatch, not just the miss
-        common.log("empty pattern - give me something to grep for "
+        common.log("empty pattern - add a word or phrase to search "
                    "(a word that is also a command searches with: "
                    'agrep search "search")')
         _json_error("empty-query", q)
