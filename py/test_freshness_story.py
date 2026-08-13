@@ -893,6 +893,40 @@ class ExplicitIndexHandsOffTheSearchDatabase(unittest.TestCase):
         inline.assert_not_called()
         self.assertEqual(self._logged(logged), [])
 
+    def test_a_foreign_co_install_is_never_waited_on(self) -> None:
+        # Only this build's own daemon takeover is worth waiting for; a
+        # genuinely foreign owner keeps the immediate decline.
+        with mock.patch.object(indexd_runtime, "derived_writer_build_id",
+                               return_value="a" * 20), \
+                mock.patch.object(
+                    indexd_runtime, "derived_writer_mutation_info",
+                    return_value=mock.Mock(writable=False)), \
+                mock.patch.object(
+                    indexd_runtime, "_inspect_indexd_owner",
+                    return_value=mock.Mock(
+                        state=indexd_runtime._IndexdOwnerState.INCOMPATIBLE)), \
+                mock.patch.object(indexd_runtime, "_same_build_adoption_claim",
+                                  return_value=False), \
+                mock.patch.object(
+                    time, "sleep",
+                    side_effect=AssertionError("waited on a foreign owner")):
+            self.assertFalse(indexd_runtime._await_upgrade_settlement(5.0))
+
+    def test_a_same_build_takeover_settles_and_grants_the_writer(self) -> None:
+        infos = iter([mock.Mock(writable=False), mock.Mock(writable=False),
+                      mock.Mock(writable=True)])
+        with mock.patch.object(indexd_runtime, "derived_writer_build_id",
+                               return_value="a" * 20), \
+                mock.patch.object(
+                    indexd_runtime, "derived_writer_mutation_info",
+                    side_effect=lambda: next(infos)), \
+                mock.patch.object(
+                    indexd_runtime, "_inspect_indexd_owner",
+                    return_value=mock.Mock(
+                        state=indexd_runtime._IndexdOwnerState.COMPATIBLE)), \
+                mock.patch.object(time, "sleep"):
+            self.assertTrue(indexd_runtime._await_upgrade_settlement(5.0))
+
 
 class ADelegatedBuildIsAQueuedWorkItem(unittest.TestCase):
     """B2: the daemon converges on a MISSING search db only because the
