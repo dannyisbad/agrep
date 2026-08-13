@@ -288,6 +288,10 @@ class DriftGraceWindow(unittest.TestCase):
         self.assertTrue(disclosure["may_be_stale"])
         self.assertEqual(disclosure["cause"], "store-drift")
         self.assertEqual(disclosure["changed_stores"], 1)
+        # Doctor renders young converging churn as the system working, so
+        # the machine shape must keep the distinction visible.
+        self.assertTrue(disclosure["young"])
+        self.assertTrue(disclosure["converging"])
 
     def test_fresh_record_graces_every_undated_change(self) -> None:
         # A record younger than the horizon bounds all drift age outright:
@@ -763,6 +767,8 @@ class ExplicitIndexHandsOffTheSearchDatabase(unittest.TestCase):
         with mock.patch.object(indexd_runtime, "_search_db_state",
                                return_value="stale"), \
                 mock.patch.object(
+                    indexd_runtime, "_EXPLICIT_INDEX_OWNER_WAIT_S", 0.0), \
+                mock.patch.object(
                     indexd_runtime, "_spawn_indexd",
                     return_value=indexd_runtime._IndexdSpawnResult.BLOCKED), \
                 mock.patch.object(indexd_runtime, "refresh_search_index") as inline, \
@@ -777,6 +783,25 @@ class ExplicitIndexHandsOffTheSearchDatabase(unittest.TestCase):
         self.assertEqual(
             indexd_runtime.indexing_failure().code, "blocked-owner")
         self.assertFalse(indexd_runtime.fts_delegation_active())
+
+    def test_a_blocked_owner_beat_is_waited_out_and_retried(self) -> None:
+        # A daemon takeover rewrites its owner records for a moment; an
+        # explicit index that lands inside the beat must settle and succeed,
+        # not report a healthy box as blocked.
+        outcomes = iter([
+            (surface.IndexBuildOutcome.BLOCKED, "blocked-owner"),
+            (surface.IndexBuildOutcome.DELEGATED, ""),
+        ])
+        with mock.patch.object(
+                indexd_runtime, "explicit_index_outcome",
+                side_effect=lambda: next(outcomes)) as polled, \
+                mock.patch.object(time, "sleep"), \
+                mock.patch.object(common, "log") as logged:
+            self.assertTrue(indexd_runtime.hand_off_search_index())
+        self.assertEqual(polled.call_count, 2)
+        self.assertIn(surface.EXPLICIT_INDEX_HANDOFF_LINE, self._logged(logged))
+        self.assertTrue(indexd_runtime.fts_delegation_active())
+        indexd_runtime._set_fts_delegated(False)
 
     def test_a_current_search_database_claims_no_background_build(self) -> None:
         """B3: a re-index of a complete store says nothing - there is no

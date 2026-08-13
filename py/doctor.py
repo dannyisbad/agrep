@@ -2875,17 +2875,26 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
     machine_freshness = snapshot.get("freshness") or {}
     behind_line = ""
     behind_base = ""
+    live_churn = False
     if machine_freshness.get("state") == "index-behind":
-        behind_base = surface.freshness_story_line(surface.FreshnessStory(
-            "behind",
-            behind_s=machine_freshness.get("behind_s"),
-            changed_stores=int(
-                machine_freshness.get("changed_stores") or 0),
-            converging=True,
-        )).removesuffix(" - daemon catching up")
-        behind_line = (
-            behind_base + " - "
-            + _command_remedy("index-publish", "index"))
+        changed = int(machine_freshness.get("changed_stores") or 0)
+        live_churn = bool(machine_freshness.get("young")
+                          and machine_freshness.get("converging"))
+        if live_churn:
+            plural = "s" if changed != 1 else ""
+            behind_base = behind_line = (
+                f"absorbing live-session churn ({changed} store{plural} "
+                "still writing; republishes continuously)")
+        else:
+            behind_base = surface.freshness_story_line(surface.FreshnessStory(
+                "behind",
+                behind_s=machine_freshness.get("behind_s"),
+                changed_stores=changed,
+                converging=True,
+            )).removesuffix(" - daemon catching up")
+            behind_line = (
+                behind_base + " - "
+                + _command_remedy("index-publish", "index"))
     fails = int(render["freshness_failures"])
     freshness_failure = render["indexing_failure"]
     generation = render["generation"]
@@ -2949,7 +2958,8 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
             detail += f", {behind_line}"
         _row(
             "freshness",
-            WARN if freshness_failure is not None else OPT if behind_line else OK,
+            WARN if freshness_failure is not None
+            else OK if live_churn or not behind_line else OPT,
             detail)
     elif daemon.get("blocked"):
         # six ownership states, one reader situation: the index is not moving

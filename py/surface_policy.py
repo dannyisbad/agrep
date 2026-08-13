@@ -1546,6 +1546,10 @@ def freshness_behind_disclosure(story: FreshnessStory) -> dict:
         "cause": "store-drift",
         "changed_stores": max(0, int(story.changed_stores)),
     }
+    if story.young:
+        out["young"] = True
+    if story.converging:
+        out["converging"] = True
     if story.behind_s is not None:
         out["behind_s"] = round(max(0.0, story.behind_s))
     return out
