@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-rc.2 — 2026-08-10
+## 0.2.0 — 2026-08-12
 
 0.1.x shipped multi-agent ingest, keyword search, and an optional semantic tier
 that required torch and a running local server. 0.2.0 keeps the ingest
