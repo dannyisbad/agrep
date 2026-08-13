@@ -2168,7 +2168,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             common.log(coverage_notice)
     if not args.json:
         integrity_notice = surface.semantic_integrity_notice(
-            semantic_meta.get("semantic_integrity"))
+            semantic_meta.get("semantic_integrity"), suppress_trivial=True)
         if integrity_notice:
             common.log(integrity_notice)
         anchor_notice = surface.semantic_anchor_notice(

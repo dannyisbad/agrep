@@ -2024,7 +2024,9 @@ def semantic_anchor_notice(status: Mapping | None) -> str | None:
             "speculative nearest neighbors")
 
 
-def semantic_integrity_notice(integrity: Mapping | None) -> str | None:
+def semantic_integrity_notice(
+        integrity: Mapping | None, *, suppress_trivial: bool = False,
+) -> str | None:
     """Rows the meaning lane refused: the page is short and the reader must
     know which way it is wrong before judging the hits it did get."""
     if not integrity:
@@ -2041,6 +2043,10 @@ def semantic_integrity_notice(integrity: Mapping | None) -> str | None:
     # Rows the derived mirror has not ingested yet prove nothing about the
     # embedded text, so they are stated as the coverage gap they are.
     if int(integrity.get("mismatched", dropped) or 0) <= 0:
+        if suppress_trivial and dropped <= SEMANTIC_TRIVIAL_GAP_ROWS:
+            # a live box's mirror trails its newest turns by a beat; page
+            # surfaces stay quiet over that churn (miss proofs never do)
+            return None
         return (f"semantic integrity: {dropped} {row} held back - the search "
                 "index has not mirrored them yet; it catches up in the background")
     repair = (" a full rebuild is running"
@@ -2085,12 +2091,20 @@ def semantic_coverage_notice(
         return None
     indexed = coverage.get("indexed", "?")
     total = coverage.get("total", "?")
-    if (suppress_trivial and base_partial and not accelerator_partial
-            and isinstance(indexed, int) and isinstance(total, int)
-            and total > 0
-            and total - indexed <= SEMANTIC_TRIVIAL_GAP_ROWS
-            and indexed >= total * SEMANTIC_TRIVIAL_GAP_RATIO):
-        return None
+
+    def trivial(have: object, want: object) -> bool:
+        return (isinstance(have, int) and isinstance(want, int) and want > 0
+                and want - have <= SEMANTIC_TRIVIAL_GAP_ROWS
+                and have >= want * SEMANTIC_TRIVIAL_GAP_RATIO)
+
+    if suppress_trivial:
+        # a live box never closes its newest rows in ANY lane; the notice
+        # returns the moment a real gap opens in one of them
+        base_trivial = not base_partial or trivial(indexed, total)
+        accelerator_trivial = not accelerator_partial or trivial(
+            accelerator.get("indexed"), accelerator.get("total"))
+        if base_trivial and accelerator_trivial:
+            return None
     searched = accelerator.get("indexed") if accelerator else None
     if searched is not None and searched != indexed:
         return (
