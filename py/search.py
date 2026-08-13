@@ -7735,7 +7735,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 common.log(coverage_notice)
                 _note_lane_change_rebuild()
             integrity_notice = surface.semantic_integrity_notice(
-                semantic_evidence.get("semantic_integrity"))
+                semantic_evidence.get("semantic_integrity"),
+                suppress_trivial=True)
             if integrity_notice:
                 common.log(integrity_notice)
             anchor_notice = surface.semantic_anchor_notice(
@@ -7767,7 +7768,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     # piped, and machine callers read this from the json field
     if not args.json and not args.count and not args.count_by_tier:
         integrity_notice = surface.semantic_integrity_notice(
-            semantic_evidence.get("semantic_integrity"))
+            semantic_evidence.get("semantic_integrity"), suppress_trivial=True)
         if integrity_notice:
             common.log(integrity_notice)
         anchor_notice = surface.semantic_anchor_notice(

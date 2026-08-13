@@ -838,7 +838,7 @@ class CoverageNoticeTrivialGapTests(unittest.TestCase):
         self.assertIsNotNone(surface.semantic_coverage_notice(
             small, suppress_trivial=True))
 
-    def test_accelerator_gaps_and_unknown_counts_never_suppress(self) -> None:
+    def test_real_accelerator_gaps_and_unknown_counts_never_suppress(self) -> None:
         churn = {"indexed": 46358, "total": 46421, "complete": False}
         accel = {"indexed": 12, "total": 20, "complete": False}
         self.assertIsNotNone(surface.semantic_coverage_notice(
@@ -846,6 +846,32 @@ class CoverageNoticeTrivialGapTests(unittest.TestCase):
         unknown = {"indexed": "?", "total": "?", "complete": False}
         self.assertIsNotNone(surface.semantic_coverage_notice(
             unknown, suppress_trivial=True))
+
+    def test_churn_scale_accelerator_lag_is_silent_on_hit_pages(self) -> None:
+        # The q8 lane trails the base by a handful of rows on every live
+        # request; that tail is the same churn as the base lane's.
+        churn = {"indexed": 91266, "total": 91292, "complete": False}
+        accel_churn = {"indexed": 91240, "total": 91292, "complete": False}
+        self.assertIsNone(surface.semantic_coverage_notice(
+            churn, accel_churn, suppress_trivial=True))
+        # the miss-proof caller still gets the full disclosure
+        self.assertIn("semantic coverage is partial",
+                      surface.semantic_coverage_notice(churn, accel_churn))
+
+    def test_trivial_mirror_lag_is_silent_on_hit_pages_only(self) -> None:
+        lag = {"dropped": 2, "mismatched": 0}
+        self.assertIsNone(surface.semantic_integrity_notice(
+            lag, suppress_trivial=True))
+        self.assertIn("held back",
+                      surface.semantic_integrity_notice(lag))
+        flood = {"dropped": surface.SEMANTIC_TRIVIAL_GAP_ROWS + 1,
+                 "mismatched": 0}
+        self.assertIn("held back", surface.semantic_integrity_notice(
+            flood, suppress_trivial=True))
+        # real mismatches are never churn
+        mismatch = {"dropped": 1, "mismatched": 1}
+        self.assertIn("no longer matches", surface.semantic_integrity_notice(
+            mismatch, suppress_trivial=True))
 
 
 class MissVerdictTests(unittest.TestCase):
