@@ -872,6 +872,36 @@ def _same_build_adoption_claim(build_id: str) -> bool:
     return found
 
 
+# How long an explicit index waits for a live daemon of this exact build to
+# adopt the derived stores after an upgrade; the takeover lands with the
+# daemon's first publication pass, observed in the tens of seconds.
+_UPGRADE_SETTLEMENT_WAIT_S = 45.0
+
+
+def _await_upgrade_settlement(timeout_s: float) -> bool:
+    """Wait while this build's own daemon adopts the derived stores.
+
+    True once this writer may publish. Only a live freshness owner of this
+    exact build (or its adoption fence) is worth waiting on - a foreign
+    co-install has no such daemon and fails immediately, as before."""
+    try:
+        writer = derived_writer_build_id(require_binary=True)
+    except OSError:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        if derived_writer_mutation_info().writable:
+            return True
+        inspected = _inspect_indexd_owner(current_writer_id=writer)
+        if (inspected.state is not _IndexdOwnerState.COMPATIBLE
+                and not _same_build_adoption_claim(writer)):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return derived_writer_mutation_info().writable
+        time.sleep(min(0.5, remaining))
+
+
 def _await_first_publication(build_id: str, *, timeout_s: float) -> bool:
     """Wait briefly for the same-build cold writer instead of racing its empty state."""
     deadline = time.monotonic() + max(0.0, timeout_s)
@@ -1015,9 +1045,18 @@ def build_index(
                 f"indexing failed with exit {r.returncode}"
                 f"{_captured_ingest_failure(r)}")
         return False
-    if require_search_index and explicit_index_declined():
-        # a declined ingest published nothing for the census below to vouch for
-        return False
+    if require_search_index and not derived_writer_mutation_info().writable:
+        # An upgrade's takeover republishes under the new writer within one
+        # daemon pass; an explicit index landing inside that window waits for
+        # the settlement and reruns the ingest instead of failing a healthy box.
+        if _await_upgrade_settlement(_UPGRADE_SETTLEMENT_WAIT_S):
+            r = subprocess.run(cmd, cwd=str(common.REPO_ROOT), **kw)
+            common.dbg(
+                f"ingest rerun after writer settlement: rc={r.returncode}",
+                "<" if r.returncode == 0 else "!")
+        if r.returncode != 0 or explicit_index_declined():
+            # a declined ingest published nothing for the census below to vouch for
+            return False
     if census_before is not None and not unreadable_before:
         # The pre-pass census under-claims what the ingest consumed, so a
         # green verdict from this record can never cover unconsumed changes.
