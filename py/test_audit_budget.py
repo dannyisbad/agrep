@@ -110,7 +110,9 @@ class AuditBudgetTests(unittest.TestCase):
             cached = {}
             for index in range(8):
                 path = root / f"rollout-{index}.jsonl"
-                path.write_text("{}\n", encoding="utf-8")
+                # newline pinned: pending_bytes assertions count source bytes,
+                # and Windows CRLF translation would grow each file to 4 bytes.
+                path.write_text("{}\n", encoding="utf-8", newline="\n")
                 entry = _entry(path, seen=1)
                 book[str(path)] = entry
                 discovered.append(("codex", str(path)))
@@ -542,7 +544,7 @@ class AuditBudgetTests(unittest.TestCase):
             if os.name == "nt":
                 self.assertEqual(scratch_files, [])
                 self.assertIn(
-                    "cache update unavailable",
+                    "census cache unavailable",
                     payload["census"]["disclosure"])
             else:
                 self.assertEqual(len(scratch_files), 1)

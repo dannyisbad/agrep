@@ -14,10 +14,10 @@ _TEST_ROOT_ENV = "AGREP_TEST_DATA_ROOT"
 _inherited_root = Path(os.environ.get(_TEST_ROOT_ENV, ""))
 _temp_root = Path(tempfile.gettempdir())
 # Windows multiprocessing re-imports the test module. Reuse only the complete
-# sandbox tuple this helper exported; a lone ambient variable cannot redirect
-# a direct test process into production data.
+# sandbox tuple this helper exported ("test", or "env" after events.py import
+# normalized it); a lone ambient variable cannot redirect into production data.
 _reuse_inherited_root = (
-    os.environ.get("AGREP_DATA_DIR_SOURCE") == "test"
+    os.environ.get("AGREP_DATA_DIR_SOURCE") in ("test", "env")
     and _inherited_root.is_absolute()
     and _inherited_root.parent == _temp_root
     and _inherited_root.name.startswith("agrep-unittest-data-")
