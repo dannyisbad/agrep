@@ -314,6 +314,9 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                         mock.patch.object(
                             proc, "_windows_current_process_in_job",
                             return_value=external_job), \
+                        mock.patch.object(
+                            proc, "process_start_identity",
+                            return_value=None), \
                         mock.patch.object(semantic.sys, "platform", "win32"), \
                         mock.patch.object(
                             semantic, "_background_refresh_disabled",
@@ -359,6 +362,9 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                         mock.patch.object(
                             proc, "_windows_current_process_in_job",
                             return_value=external_job), \
+                        mock.patch.object(
+                            proc, "process_start_identity",
+                            return_value=None), \
                         mock.patch.object(semantic.sys, "platform", "win32"), \
                         mock.patch.object(
                             semantic, "_background_refresh_disabled",
@@ -396,6 +402,9 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                         mock.patch.object(
                             proc, "_windows_current_process_in_job",
                             return_value=external_job), \
+                        mock.patch.object(
+                            proc, "process_start_identity",
+                            return_value=None), \
                         mock.patch.object(embed.sys, "platform", "win32"), \
                         mock.patch.object(
                             embedding_segments, "load_manifest",
@@ -440,6 +449,9 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                         mock.patch.object(
                             proc, "_windows_current_process_in_job",
                             return_value=external_job), \
+                        mock.patch.object(
+                            proc, "process_start_identity",
+                            return_value=None), \
                         mock.patch.object(semworker.sys, "platform", "win32"), \
                         mock.patch.object(
                             common, "open_bounded_log", return_value=log), \
@@ -585,6 +597,9 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                 mock.patch.object(
                     proc, "_windows_current_process_in_job",
                     return_value=True), \
+                mock.patch.object(
+                    proc, "process_start_identity",
+                    return_value=None), \
                 mock.patch.object(semworker.sys, "platform", "win32"), \
                 mock.patch.object(
                     common, "open_bounded_log", return_value=log), \
