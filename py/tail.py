@@ -53,6 +53,9 @@ def _line(obj: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    live_aliases = tuple(
+        alias for adapter in registry.REGISTRY.adapters
+        if adapter.live.supported for alias in adapter.aliases)
     p = surface.ArgumentParser(
         prog="agrep tail", description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -64,7 +67,8 @@ def main(argv: list[str] | None = None) -> int:
                "130 interrupted while streaming.",
         allow_abbrev=False)
     p.add_argument("--agent", action="append",
-                   help=f"store filter: {'/'.join(live.LIVE_AGENTS)} "
+                   help=f"store filter: "
+                        f"{'/'.join((*live.LIVE_AGENTS, *live_aliases))} "
                         "(repeatable or comma-separated)")
     p.add_argument("--session", "--chat", dest="session",
                    help="substring filter on the session/chat id")

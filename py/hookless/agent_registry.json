@@ -133,7 +133,7 @@
     {
       "name": "pi",
       "aliases": ["omp"],
-      "live": {"state": "unsupported", "reason": "no live-activity surface is published"},
+      "live": {"state": "supported"},
       "native_resume": {
         "state": "unsupported",
         "reason": "resume is an interactive picker with no documented resume-by-id command"

@@ -1,8 +1,8 @@
 """Live watcher for the registry's supported hook-free agent stores.
 
 No hooks, no agent-side install, no instrumentation. Supported agents already journal
-what they do to disk (claude/codex/antigravity append JSONL; opencode commits to
-SQLite). This module tails those stores directly:
+what they do to disk (claude/codex/pi/antigravity append JSONL; opencode and Cursor
+commit to SQLite). This module tails those stores directly:
 
   - JSONL stores are tailed by byte offset: each tick, stat the candidate files; on
     growth, read only the delta and parse the complete new lines.
@@ -60,6 +60,7 @@ LIVE_TICKS = {
     "opencode": "_tick_opencode",
     "antigravity": "_tick_antigravity",
     "cursor": "_tick_cursor",
+    "pi": "_tick_pi",
 }
 require_exact("live watcher ticks", LIVE_TICKS, LIVE_AGENTS)
 
@@ -376,6 +377,26 @@ def _codex_text(payload: dict) -> str:
         if b.get("type") in ("input_text", "output_text", "text") and b.get("text")
     )
 
+def _pi_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        block["text"] for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str) and block["text"]
+    )
+
+
+def _pi_ts_ms(value) -> int:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return int(value * 1000 if abs(value) < 100_000_000_000 else value)
+        except (OverflowError, ValueError):
+            return 0
+    return _ts_ms(value if isinstance(value, str) else None)
+
 
 def _header_value(text: str, key: str) -> str:
     for line in text.splitlines():
@@ -478,6 +499,8 @@ class LiveWatcher(threading.Thread):
         self._claude_projects: dict[str, dict[str, int]] = {}  # session -> project vote counts
         self._claude_pending: dict[tuple[str, str], dict] = {}  # (session, call_id) -> event
         self._codex_pending: dict[tuple[str, str], dict] = {}
+        self._pi_meta: dict[str, dict] = {}                  # path -> stable session metadata
+        self._pi_pending: dict[tuple[str, str], dict] = {}   # (session, call_id) -> event
         self._agy_announced: dict[str, deque] = {}          # session -> queued (name, input)
         self._agy_mail_seen: set[str] = set()
         self._oc_watermark: dict[str, tuple[int, str]] = {}  # db path -> (updated, part id)
@@ -552,7 +575,8 @@ class LiveWatcher(threading.Thread):
             # A touched history copy must not become resident daemon state.
             agent = ev.get("agent")
             pending = (self._claude_pending if agent == "claude" else
-                       self._codex_pending if agent == "codex" else None)
+                       self._codex_pending if agent == "codex" else
+                       self._pi_pending if agent == "pi" else None)
             if pending is not None and ev.get("type") == "tool":
                 pending.pop((ev.get("session"), ev.get("call_id")), None)
             return
@@ -913,7 +937,8 @@ class LiveWatcher(threading.Thread):
         self.ring.extend(retained_events)
         for agent, mapping in (
                 ("claude", self._claude_pending),
-                ("codex", self._codex_pending)):
+                ("codex", self._codex_pending),
+                ("pi", self._pi_pending)):
             for key in tuple(mapping):
                 if (agent, key[0]) in stale_pairs:
                     mapping.pop(key, None)
@@ -1175,6 +1200,260 @@ class LiveWatcher(threading.Thread):
                     self._emit({**base, "type": "done", "why": "interrupted"})
                 elif not _noise(content):
                     self._emit({**base, "type": "user", "text": _snip(content, MSG)})
+
+    # ------------------------------------------------------------- pi / oh-my-pi
+
+    @staticmethod
+    def _pi_head(path: str, root: str) -> dict | None:
+        """Read identity from the small header even when the live seed starts at EOF."""
+        title = ""
+        header = None
+        try:
+            with open(path, "rb") as stream:
+                for _ in range(8):
+                    raw = stream.readline(TAIL_SEED)
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        return None
+                    try:
+                        row = json.loads(raw.decode("utf-8", "replace"))
+                    except (json.JSONDecodeError, UnicodeError):
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("type") in ("title", "title_change"):
+                        named = row.get("title")
+                        if isinstance(named, str) and named.strip():
+                            title = named
+                    if row.get("type") == "session":
+                        header = row
+                        break
+        except OSError:
+            return None
+        if header is None:
+            return None
+
+        stem = os.path.basename(path)[:-6]
+        fallback = stem.rsplit("_", 1)[-1] or stem
+        session = header.get("id")
+        session = session if isinstance(session, str) and session else fallback
+        cwd = header.get("cwd")
+        cwd = cwd if isinstance(cwd, str) else ""
+        try:
+            parts = Path(os.path.relpath(path, root)).parts
+        except ValueError:
+            return None
+        slug = parts[0] if parts else ""
+        project = (_project_of(cwd) if cwd else
+                   (slug.strip("-").replace("-", "/") or "pi"))
+        parent = ""
+        if len(parts) >= 3:
+            parent = parts[1].rsplit("_", 1)[-1]
+        return {
+            "session": session, "cwd": cwd, "project": project,
+            "title": title, "model": "", "parent": parent,
+        }
+
+    def _tick_pi(self, now: float) -> None:
+        roots = store_roots("pi", HOME)
+        healthy = self._refresh_source_health("pi", roots)
+        candidates: dict[str, tuple[os.stat_result, str]] = {}
+        for root in roots:
+            if root not in healthy or not _plain_dir(root):
+                continue
+            pending_dirs = [root]
+            while pending_dirs:
+                directory = pending_dirs.pop()
+                entries = self._source_entries("pi", directory)
+                if entries is None:
+                    continue
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending_dirs.append(entry.path)
+                            continue
+                        if (not store_content("pi", entry.path)
+                                or not entry.is_file(follow_symlinks=False)):
+                            continue
+                        found = entry.stat(follow_symlinks=False)
+                    except OSError as error:
+                        self._record_source_error("pi", entry.path, error)
+                        continue
+                    known = entry.path in self._offsets
+                    if now - found.st_mtime <= ACTIVE_WINDOW_S or known:
+                        candidates[entry.path] = (found, root)
+
+        for path, (found, root) in candidates.items():
+            identity = _fid(found)
+            rotated = (path in self._offsets
+                       and self._ctimes.get(path) not in (None, identity))
+            if path not in self._pi_meta or rotated:
+                meta = self._pi_head(path, root)
+                if meta is None:
+                    continue
+                self._pi_meta[path] = meta
+            count = self._dispatch_delta(
+                path, found.st_size, identity,
+                lambda line, selected=path: self._pi_line(selected, line),
+                agent="pi")
+            if count:
+                self._mark_live(f"pi:{self._pi_meta[path]['session']}", now)
+
+    def _pi_line(self, path: str, ln: str) -> None:
+        try:
+            row = json.loads(ln)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(row, dict):
+            return
+        meta = self._pi_meta.get(path)
+        if meta is None:
+            return
+        record_type = row.get("type")
+        if record_type in ("title", "title_change"):
+            title = row.get("title")
+            if isinstance(title, str) and title.strip():
+                meta["title"] = title
+                with self._state_lock:
+                    session = self.sessions.get(f"pi:{meta['session']}")
+                    if session is not None:
+                        session["title"] = title
+            return
+        if record_type == "model_change":
+            model = row.get("modelId") or row.get("model")
+            if isinstance(model, str) and model:
+                meta["model"] = model
+                with self._state_lock:
+                    session = self.sessions.get(f"pi:{meta['session']}")
+                    if session is not None:
+                        session["model"] = model
+            return
+        if record_type == "session":
+            return
+
+        ts = _pi_ts_ms(row.get("timestamp"))
+        base = {
+            "agent": "pi", "session": meta["session"], "ts": ts,
+            "project": meta["project"],
+        }
+        if meta["title"]:
+            base["title"] = meta["title"]
+        if meta["model"]:
+            base["model"] = meta["model"]
+        if meta["parent"]:
+            base.update({"sub_session": True, "parent": meta["parent"]})
+
+        if record_type == "custom" and row.get("customType") == "session_exit":
+            with self._state_lock:
+                session = self.sessions.get(f"pi:{meta['session']}")
+                working = bool(session and session.get("working"))
+            if working:
+                data = row.get("data")
+                data = data if isinstance(data, dict) else {}
+                event = {**base, "type": "done"}
+                if data.get("kind") == "signal":
+                    event["why"] = "interrupted"
+                self._emit(event)
+            return
+        if record_type != "message":
+            return
+        message = row.get("message")
+        if not isinstance(message, dict):
+            return
+        ts = (_pi_ts_ms(message.get("timestamp"))
+              or _pi_ts_ms(row.get("timestamp")))
+        base["ts"] = ts
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "assistant":
+            model = message.get("model")
+            if isinstance(model, str) and model:
+                meta["model"] = model
+                base["model"] = model
+            blocks = content if isinstance(content, list) else []
+            if isinstance(content, str) and content.strip():
+                self._emit({**base, "type": "reply", "text": _snip(content, MSG)})
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if (block_type == "text" and isinstance(block.get("text"), str)
+                        and block["text"].strip()):
+                    self._emit({
+                        **base, "type": "reply", "text": _snip(block["text"], MSG),
+                    })
+                    continue
+                if block_type != "toolCall":
+                    continue
+                arguments = block.get("arguments")
+                call_id = block.get("id")
+                call_id = call_id if isinstance(call_id, str) else ""
+                event = {
+                    **base, "type": "tool", "name": block.get("name", "?"),
+                    "input": _summarize_input(arguments), "call_id": call_id,
+                }
+                images = _image_files(arguments)
+                if images:
+                    event["imgs"] = _img_records(images, meta["cwd"])
+                    caption = (arguments.get("caption")
+                               if isinstance(arguments, dict) else None)
+                    if isinstance(caption, str) and caption.strip():
+                        event["imgcap"] = _snip(caption, 200)
+                if call_id:
+                    self._pi_pending[(meta["session"], call_id)] = event
+                self._emit(event)
+            stop = message.get("stopReason")
+            if isinstance(stop, str) and stop and stop not in ("toolUse", "tool_use"):
+                event = {**base, "type": "done"}
+                if stop in ("aborted", "error"):
+                    event["why"] = "interrupted"
+                self._emit(event)
+            return
+
+        if role == "user":
+            text = _pi_text(content)
+            if text.strip() and not _noise(text):
+                self._emit({**base, "type": "user", "text": _snip(text, MSG)})
+            return
+
+        if role == "toolResult":
+            call_id = message.get("toolCallId")
+            call_id = call_id if isinstance(call_id, str) else ""
+            started = self._pi_pending.pop((meta["session"], call_id), None)
+            name = message.get("toolName") or (started or {}).get("name", "")
+            event = {
+                **base, "type": "tool_done", "call_id": call_id,
+                "name": name, "output": _snip(_pi_text(content)),
+            }
+            is_error = message.get("isError")
+            if isinstance(is_error, bool):
+                event["ok"] = not is_error
+            if started and started.get("ts"):
+                event["dur"] = max(0, ts - started["ts"])
+            self._emit(event)
+            return
+
+        if role == "bashExecution":
+            command = message.get("command")
+            command = command if isinstance(command, str) else ""
+            call_id = row.get("id")
+            call_id = call_id if isinstance(call_id, str) else ""
+            self._emit({
+                **base, "type": "tool", "name": "bash",
+                "input": _snip(command), "call_id": call_id,
+            })
+            output = message.get("output")
+            output = output if isinstance(output, str) else ""
+            event = {
+                **base, "type": "tool_done", "name": "bash",
+                "call_id": call_id, "output": _snip(output),
+            }
+            exit_code = message.get("exitCode")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                event["ok"] = (exit_code == 0 and not bool(message.get("cancelled")))
+            self._emit(event)
 
     # ------------------------------------------------------------- codex
 

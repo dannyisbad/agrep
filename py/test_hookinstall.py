@@ -513,6 +513,8 @@ class SetupConsentTests(unittest.TestCase):
                     mock.patch.object(cli, "_setup_archive"), \
                     mock.patch.object(
                         cli, "_core_evidence_path", return_value="proof"), \
+                    mock.patch.object(cli.common, "in_agent_context",
+                                      return_value=False), \
                     mock.patch.object(cli.sys, "stdin", _TTY(answers)), \
                     contextlib.redirect_stdout(stdout):
                 rc = cli.cmd_setup(args)
@@ -535,5 +537,57 @@ class SetupConsentTests(unittest.TestCase):
         teach_call.assert_called_once_with(yes=True)
         hook_call.assert_not_called()
         self.assertIn("post-compact integrations skipped", rendered)
+
+    def test_agent_context_skips_prompts_and_prints_the_strong_brief(
+            self) -> None:
+        # A tty is not consent when an agent env drives setup: no input()
+        # call may hang or answer for the human; the headless brief with the
+        # `setup --yes` recommendation renders once, and nothing installs.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            data = root / "data"
+            (home / ".pi" / "agent").mkdir(parents=True)
+            data.mkdir()
+            teach_call = mock.Mock(return_value=0)
+            hook_call = mock.Mock(return_value=0)
+            stdout = io.StringIO()
+            args = SimpleNamespace(
+                rest=[], yes=False, no_teach=False, no_hook=False,
+                no_semantic=True, archive=False, no_archive=True)
+            with mock.patch.object(teach, "HOME", home), \
+                    mock.patch.object(teach, "STATE_PATH", data / "teach.json"), \
+                    mock.patch.object(cli.common, "DATA_DIR", data), \
+                    mock.patch.object(cli, "_setup_consentable_writes",
+                                      return_value=True), \
+                    mock.patch("doctor.main", return_value=0), \
+                    mock.patch.object(teach, "teach", teach_call), \
+                    mock.patch.object(
+                        hookinstall, "hooks_need_consent", return_value=True), \
+                    mock.patch.object(hookinstall, "install", hook_call), \
+                    mock.patch.object(
+                        teach, "refresh_sentinel", return_value=True), \
+                    mock.patch.object(
+                        cli, "_setup_index_state",
+                        return_value=({"messages": 1, "sessions": 1}, False)), \
+                    mock.patch.object(cli, "_setup_archive"), \
+                    mock.patch.object(
+                        cli, "_core_evidence_path", return_value="proof"), \
+                    mock.patch.object(cli.common, "in_agent_context",
+                                      return_value=True), \
+                    mock.patch.object(
+                        cli.sys, "stdin",
+                        _TTY("")) as stdin, \
+                    contextlib.redirect_stdout(stdout):
+                rc = cli.cmd_setup(args)
+        self.assertEqual(rc, 0)
+        teach_call.assert_not_called()
+        hook_call.assert_not_called()
+        rendered = stdout.getvalue()
+        self.assertEqual(stdin.read(), "")  # no prompt consumed stdin
+        self.assertIn("strongly", rendered)
+        self.assertIn("setup --yes --no-semantic", rendered)
+        self.assertIn("agent instructions (first consent choice", rendered)
+        self.assertEqual(rendered.count("headless setup without --yes"), 1)
 if __name__ == "__main__":
     unittest.main()

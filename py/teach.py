@@ -73,7 +73,7 @@ def _readonly_error() -> PermissionError:
 # Bump NUDGE_V on ANY block-text change (selftest hash-enforces). Write-fight
 # tiebreaker: a process only rewrites blocks older than its own, so a stale daemon
 # can't byte-flip newer text every reconcile tick and shred agents' prompt cache.
-NUDGE_V = 36
+NUDGE_V = 37
 MARK_PREFIX = "<!-- agrep:recall"
 MARK_BEGIN = f"{MARK_PREFIX} v{NUDGE_V} -->"
 MARK_END = "<!-- /agrep:recall -->"
@@ -1522,8 +1522,18 @@ def sentinel_armed(*, timeout_s: float | None = None) -> bool:
 
 
 def _pythonw() -> str:
-    w = Path(sys.executable).with_name("pythonw.exe")
-    return str(w if w.exists() else sys.executable)
+    """The interpreter the sentinel task may reference for years.
+
+    Under `uv tool run` (the npm shim) sys.executable is a venv shim inside
+    uv's GC-able cache - `uv cache clean` leaves the logon task dangling.
+    The venv's base interpreter is uv's managed install, which cache cleans
+    never touch, so the task points there. The watcher is stdlib-only, so
+    losing the venv's site-packages costs nothing."""
+    exe = Path(getattr(sys, "_base_executable", "") or sys.executable)
+    if not exe.exists():
+        exe = Path(sys.executable)
+    w = exe.with_name("pythonw.exe")
+    return str(w if w.exists() else exe)
 
 
 def _sentinel_install_win(targets: list[Path]) -> bool:
@@ -1556,12 +1566,31 @@ def _sentinel_install_win(targets: list[Path]) -> bool:
         "pi_extensions": [str(t) for t in pi_extensions],
         "pi_extension_snapshot": pi_snapshot,
     }, indent=1) + "\n")
-    # logon task revives the waiter after reboots; the spawn below covers right now
+    # schtasks /SC ONLOGON demands elevation (denied under npm postinstall);
+    # the Task Scheduler COM surface allows an own-user logon trigger
+    # unelevated, so Register-ScheduledTask leads and schtasks is the fallback.
+    def _ps_quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    register = (
+        "Register-ScheduledTask -Force -TaskName " + _ps_quote(TASK_NAME)
+        + " -Action (New-ScheduledTaskAction -Execute "
+        + _ps_quote(_pythonw())
+        + " -Argument " + _ps_quote(f'"{watcher}"')
+        + ") -Trigger (New-ScheduledTaskTrigger -AtLogOn -User "
+        + _ps_quote(os.environ.get("USERNAME") or "") + ")"
+    )
     r = subprocess.run(
-        ["schtasks", "/Create", "/F", "/TN", TASK_NAME, "/SC", "ONLOGON",
-         "/TR", f'"{_pythonw()}" "{watcher}"'],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", register],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         **_NO_WINDOW)
+    if r.returncode != 0:
+        # logon task revives the waiter after reboots; the spawn below covers right now
+        r = subprocess.run(
+            ["schtasks", "/Create", "/F", "/TN", TASK_NAME, "/SC", "ONLOGON",
+             "/TR", f'"{_pythonw()}" "{watcher}"'],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            **_NO_WINDOW)
     launched = False
     try:
         subprocess.Popen([_pythonw(), str(watcher)],

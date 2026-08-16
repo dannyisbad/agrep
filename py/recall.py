@@ -2179,8 +2179,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         # search's twin path discloses this; recall must not go silently lexical.
         # A pack with labeled meaning rows on the page scopes the lane-down
         # story to the queries whose runs failed - one story, no contradiction.
+        status = semantic_meta.get("semantic_status")
         lane_notice = surface.semantic_keyword_only_notice(
-            semantic_meta.get("semantic_status"))
+            status, brief=indexd_runtime.semantic_notice_brief(
+                (status or {}).get("reason")))
         if hybrid_visible and meaning_down_queries:
             down = " · ".join(console.terminal_safe(q)[:60]
                               for q in meaning_down_queries)

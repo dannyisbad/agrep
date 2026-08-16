@@ -1,11 +1,12 @@
 """Passive process-table scan: ground-truth liveness for running agents.
 
 Zero setup, no wrapper, no PATH shim. Reads the OS process table and finds agent
-processes (claude/codex/opencode/...) by image name + command line. The command line
-carries the session id for most CLIs (`claude --resume <id>`, `codex resume <id>`,
-`opencode --session <id>`), so a process maps to its session EXACTLY. Process alive =
-ground-truth `working`; process gone = ground-truth `done`. Works for any terminal,
-PTY, tmux pane, IDE terminal, or GUI app — we observe the process, not its tty.
+processes (claude/codex/opencode/pi/...) by image name + command line. The command
+line carries the session id for most CLIs (`claude --resume <id>`, `codex resume
+<id>`, `opencode --session <id>`, `omp --resume <id>`), so a process maps to its
+session EXACTLY. Process alive = ground-truth `working`; process gone =
+ground-truth `done`. Works for any terminal, PTY, tmux pane, IDE terminal, or GUI
+app -- we observe the process, not its tty.
 
 Windows: ctypes read of the PEB (command line + cwd), no subprocess, no deps.
 Linux:   /proc/<pid>/cmdline + /proc/<pid>/cwd.
@@ -54,6 +55,10 @@ def _classify(name: str, cmd: str) -> str | None:
         return "kimi"
     if n in ("agy.exe", "agy", "antigravity.exe", "antigravity"):
         return "antigravity"
+    if n in ("pi.exe", "pi", "omp.exe", "omp"):
+        if re.search(r"(?:^|\s)(?:__omp_[^\s]*|browser-relay)(?:\s|$)", c):
+            return None
+        return "pi"
     # Node/bun-hosted CLIs: identify by the script in the command line.
     if n in ("node.exe", "node", "bun.exe", "bun"):
         if "opencode" in c:
@@ -62,6 +67,9 @@ def _classify(name: str, cmd: str) -> str | None:
             return "claude"
         if "codex" in c and "node_modules" in c:
             return "codex"
+        if ("pi-coding-agent" in c or "@oh-my-pi/" in c
+                or "node_modules/oh-my-pi" in c):
+            return "pi"
     return None
 
 
@@ -188,7 +196,8 @@ def _scan_windows() -> list[dict]:
 
     # 2) for name-candidates (and node/bun hosts), read cmdline to classify precisely
     HOSTS = {"node.exe", "bun.exe"}
-    NAMEHIT = re.compile(r"^(claude|codex|opencode|kimi|agy|antigravity)", re.I)
+    NAMEHIT = re.compile(
+        r"^(claude|codex|opencode|kimi|agy|antigravity|pi|omp)", re.I)
     for pid, name in candidates:
         nl = name.lower()
         looks = bool(NAMEHIT.match(nl)) or nl in HOSTS
@@ -377,7 +386,8 @@ def _scan_macos_native() -> list[dict]:
             continue
         name = namebuf.value.decode("utf-8", "replace")
         lower = name.lower()
-        if (not re.match(r"^(claude|codex|opencode|kimi|agy|antigravity)", lower)
+        if (not re.match(
+                r"^(claude|codex|opencode|kimi|agy|antigravity|pi|omp)", lower)
                 and lower not in {"node", "bun"}):
             continue
         argv = _mac_procargs(pid)

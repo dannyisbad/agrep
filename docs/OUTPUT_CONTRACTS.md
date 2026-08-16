@@ -197,6 +197,18 @@ The routing rules for this layer:
    succeed. Diagnosis is part of the remedy: "run doctor to see why" is
    delegation when the surface could carry the reason itself.
 
+One meaning lane, two participations (rules 1, 2, and 4 together): the agent
+profile (compact) fuses keyword and meaning evidence into one labeled page,
+because its reader consumes exactly one page programmatically. The human
+profile (classic tty) keeps the hit list exact-match-first with
+single-meaning keyword scores; the meaning lane still participates as
+disclosed sidelines - a zero-exact-hit query escalates to labeled semantic
+matches, and a weak page (tool-output-only, or a related-terms fallback)
+appends the `chats about this semantically` block, which counts the
+neighbors held below the similarity floor and points at `agrep recall` as
+the lane-fusing surface. Cross-lane scores are never merged into one human
+ranking, and `--lexical` / `-s` pin either lane on both surfaces.
+
 ## Status
 
 Every rule above is classified here, and every rule listed as standing names

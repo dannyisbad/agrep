@@ -33,6 +33,8 @@ The core motions:
 
 - `agrep chats <topic or quote>` - find a prior conversation even when its
   opening line or title is useless; run its printed `agrep around` follow-up.
+  Bare `agrep chats` lists the newest sessions first - it is the answer to
+  "what were we working on" and "show recent chats/sessions".
 - `agrep recall "<distinctive phrase>"` - prior solutions with bounded
   context, from OTHER sessions on this box.
 - `agrep around <handle>` - open a hit at its source. Claims come from the
@@ -46,8 +48,9 @@ The core motions:
   overrides), and as a ranked search over ALL history it makes {name}'s own
   tail compete with lookalikes from other sessions. Same-session recovery
   means postcompact, every time.
-- `agrep board --once` - live agent activity on this box right now (`chats`
-  is indexed history; `board` is the present).
+- `agrep board --once` - live agent activity on this box right now. Route by
+  the question: running/active right now means `board --once`; recent, last,
+  or latest sessions means `chats` (indexed history, newest first).
 
 Everything else - tail, resume, archive, audit, semantic controls -
 lives behind `agrep --help`, and each command documents its own flags and

@@ -27,12 +27,17 @@ _KINDS = {
     "opencode": "opencode",
     "antigravity": "fixed",
     "cursor": "cursor",
+    "pi": "pi",
 }
 _FIXED_ROOTS = {
     "claude": (".claude", "projects"),
     "codex": (".codex", "sessions"),
     "antigravity": (".gemini", "antigravity-cli", "brain"),
 }
+_PI_ROOTS = (
+    (".pi", "agent", "sessions"),
+    (".omp", "agent", "sessions"),
+)
 require_exact("hookless store locators", _KINDS, LIVE_AGENTS)
 STORE_AGENTS = tuple(_KINDS)
 
@@ -145,6 +150,8 @@ def store_roots(
         return cursor_db_paths(
             home, environ=environ, os_name=os_name,
             sys_platform=sys_platform)
+    if kind == "pi":
+        return [os.path.join(home, *parts) for parts in _PI_ROOTS]
     raise ValueError(f"no hookless store locator for {agent!r}")
 
 
@@ -168,6 +175,8 @@ def store_content(
         )
     if agent == "antigravity":
         return Path(candidate).suffix in {".json", ".jsonl"}
+    if agent == "pi":
+        return Path(candidate).suffix == ".jsonl"
     if agent == "cursor":
         return True
     raise ValueError(f"no hookless content predicate for {agent!r}")

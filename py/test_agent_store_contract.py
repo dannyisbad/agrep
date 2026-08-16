@@ -82,6 +82,13 @@ class AgentStoreContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
+            locators.store_roots("pi", home),
+            [
+                os.path.join(home, ".pi", "agent", "sessions"),
+                os.path.join(home, ".omp", "agent", "sessions"),
+            ],
+        )
+        self.assertEqual(
             locators.opencode_data_dirs(home, environ=env, os_name="nt")[0],
             os.path.join(env["XDG_DATA_HOME"], "opencode"),
         )
@@ -138,6 +145,13 @@ class AgentStoreContractTests(unittest.TestCase):
             os.path.join(override, ".claude", "projects"),
         )
         self.assertEqual(
+            locators.store_roots("pi", override),
+            [
+                os.path.join(override, ".pi", "agent", "sessions"),
+                os.path.join(override, ".omp", "agent", "sessions"),
+            ],
+        )
+        self.assertEqual(
             locators.opencode_data_dirs(
                 override, environ=env, os_name="posix"),
             [os.path.join(override, ".local", "share", "opencode")],
@@ -160,6 +174,10 @@ class AgentStoreContractTests(unittest.TestCase):
             "antigravity": {
                 "yes": ["transcript.jsonl", "conversation.json"],
                 "no": ["transcript.txt", "conversation.JSON"],
+            },
+            "pi": {
+                "yes": ["chat.jsonl"],
+                "no": ["chat.JSONL", "chat.jsonl.gz", "chat.json"],
             },
         }
         for agent, verdicts in cases.items():
@@ -185,6 +203,10 @@ class AgentStoreContractTests(unittest.TestCase):
             {call.args[0] for call in root.call_args_list},
             {"claude", "codex", "antigravity"},
         )
+        with mock.patch.object(
+                live, "store_roots", return_value=[]) as roots:
+            watcher._tick_pi(0.0)
+        roots.assert_called_once_with("pi", live.HOME)
         with mock.patch.object(
                 live, "cursor_db_paths", return_value=["cursor.db"]) as cursor:
             self.assertEqual(live._cursor_db_paths(), ["cursor.db"])
@@ -305,6 +327,8 @@ class AgentStoreContractTests(unittest.TestCase):
                 locators.store_root("antigravity", td),
                 "session", ".system_generated", "logs",
                 "transcript.txt"))
+            for root in locators.store_roots("pi", td):
+                _write(os.path.join(root, "project", "chat.jsonl"))
             _write(locators.cursor_db_candidates(
                 td, environ=env, os_name=os.name,
                 sys_platform=sys.platform)[0])

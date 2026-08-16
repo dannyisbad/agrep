@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import OrderedDict
 from typing import Mapping
 
@@ -29,6 +30,10 @@ TEXT_BUDGET_BYTES = 5_000
 MAX_BLOCKS = 8
 MIN_ROW_BYTES = 320
 MAX_ROW_BYTES = 2_400
+# Staleness-shaped misses re-ingest and re-serve on this schedule (seconds of
+# sleep before each attempt): immediate covers index lag, the waits cover a
+# boundary row not yet flushed to its transcript. Once per compaction.
+_RETRY_PAUSES_S = (0.0, 1.0, 3.0)
 
 
 def _stdout(value: object) -> None:
@@ -101,6 +106,32 @@ def _previous_boundary(db, session: str, boundary: int) -> int | None:
         "SELECT max(turn) FROM msgs WHERE session=? AND who='recap' AND turn<?",
         (session, boundary),
     ).fetchone()
+    return None if not row or row[0] is None else int(row[0])
+
+
+def _boundary_ts(db, session: str, boundary: int) -> int | None:
+    row = db.execute(
+        "SELECT ts FROM msgs WHERE session=? AND who='recap' AND turn=? "
+        "ORDER BY ts LIMIT 1",
+        (session, boundary),
+    ).fetchone()
+    return None if not row or row[0] is None else int(row[0])
+
+
+def _newest_turn_at_or_before(
+        db, session: str, until_ts: int | None) -> int | None:
+    """Newest turn in ``session`` at or before the compaction moment; an
+    unknown moment falls back to the session's newest turn."""
+    if until_ts is None:
+        row = db.execute(
+            "SELECT max(turn) FROM msgs WHERE session=?", (session,),
+        ).fetchone()
+    else:
+        row = db.execute(
+            "SELECT max(turn) FROM msgs WHERE session=? "
+            "AND coalesce(ts,0)<=?",
+            (session, int(until_ts)),
+        ).fetchone()
     return None if not row or row[0] is None else int(row[0])
 
 
@@ -180,6 +211,24 @@ def read_packet(
         previous = _previous_boundary(db, session, upper)
         eligible = _eligible_rows(db, session, previous, upper)
         window_fallbacks += 1
+    window_source = "caller"
+    if not eligible and family.root and family.root != session:
+        # A compacted resume (pi/omp) starts a NEW session with its recap at
+        # turn 1: the pre-boundary root tail lives in the family root, capped
+        # at the boundary row's timestamp so post-compaction rows stay out.
+        root_upper = _newest_turn_at_or_before(
+            db, family.root, _boundary_ts(db, session, int(boundary)))
+        if root_upper is not None:
+            upper = root_upper + 1
+            previous = _previous_boundary(db, family.root, upper)
+            eligible = _eligible_rows(db, family.root, previous, upper)
+            while not eligible and previous is not None:
+                upper = previous
+                previous = _previous_boundary(db, family.root, upper)
+                eligible = _eligible_rows(db, family.root, previous, upper)
+                window_fallbacks += 1
+            if eligible:
+                window_source = "family_root"
     rows, omitted_blocks, render_omitted = _select_rows(eligible)
     eligible_blocks = len({int(row["turn"]) for row in eligible})
     shown_blocks = len({int(row["turn"]) for row in rows})
@@ -206,6 +255,7 @@ def read_packet(
             "previous_boundary_turn": previous,
             "boundary_basis": "indexed_structural_recap",
             "window_fallbacks": window_fallbacks,
+            "window_source": window_source,
             "tools": "excluded",
             "delegated_sessions": "excluded",
             "project": project,
@@ -263,6 +313,9 @@ def _human(packet: dict, *, enforce_budget: bool = True) -> str:
         ) if part),
         (f"boundary turn {selection['boundary_turn']} (structural recap) · "
          f"{selection['scope']} · tools and delegated sessions excluded"
+         + (" · window served from the family root (compacted resume)"
+            if selection.get("window_source") == "family_root"
+            and packet["rows"] else "")
          + (f" · newest {selection['window_fallbacks']} window(s) before this "
             "boundary were empty; showing the nearest earlier window"
             if selection.get("window_fallbacks") and packet["rows"] else "")),
@@ -372,22 +425,102 @@ def main(argv: list[str] | None = None) -> int:
     outcome = _serve(args, retry_pending=not args.no_auto)
     if outcome is not None:
         return outcome
-    # The primary moment is seconds after a compaction is written, and the
-    # published snapshot legitimately lags live files by a beat; one
-    # synchronous ingest closes exactly that race, then the answer is final.
-    if common.ingest_bin().exists():
-        indexd_runtime.build_index(quiet=True)
+    # The primary moment is seconds after a compaction: the snapshot trails
+    # live files AND the boundary row may not be flushed yet (seen on omp).
+    # Ingests close the index lag; the bounded waits close the flush lag.
+    can_ingest = common.ingest_bin().exists()
+    for pause_s in _RETRY_PAUSES_S:
+        if pause_s:
+            time.sleep(pause_s)
+        if can_ingest:
+            indexd_runtime.build_index(quiet=True)
+        outcome = _serve(args, retry_pending=True)
+        if outcome is not None:
+            return outcome
     outcome = _serve(args, retry_pending=False)
     assert outcome is not None
     return outcome
 
 
+_FAMILY_CHURN_NOTICE = (
+    "family index trails live stores; served from the last published snapshot")
+
+
+def _lenient_family_snapshot():
+    """Last published corpus snapshot, without the live-stamp equality gate.
+
+    The strict open needs one quiescent instant; a conversation that writes
+    continuously may never offer one - each retry's own ingest advances the
+    generation the daemon is also advancing (the second omp report). The
+    snapshot stays one internally consistent SQLite view; only "reflects this
+    exact instant" is given up, and the served packet says so.
+    """
+    import sqlite3
+    path = common.DATA_DIR / "corpus.db"
+    if not path.exists():
+        return None
+    db = None
+    try:
+        db = session_context.open_sqlite_snapshot(path, 0)
+        db.execute("PRAGMA busy_timeout=0")
+        db.execute("PRAGMA query_only=ON")
+        db.execute("BEGIN")
+        row = db.execute(
+            "SELECT value FROM meta WHERE key='family_stamp'").fetchone()
+        if row and row[0]:
+            return db
+    except (OSError, sqlite3.DatabaseError):
+        pass
+    if db is not None:
+        db.close()
+    return None
+
+
+def _serve_lenient(args, session: str) -> int | None:
+    """Final-attempt fallback when the generation-stable open kept losing its
+    race: serve the boundary from the last published snapshot as an
+    explicitly partial packet. None = nothing usable there either."""
+    db = _lenient_family_snapshot()
+    if db is None:
+        return None
+    try:
+        indexed = session_context._indexed_calling_family_state_in_db(
+            db, session)
+        if indexed is None:
+            return None
+        root, members, recap_turn = indexed
+        if recap_turn is None:
+            return None
+        family = session_context.CallingFamily(
+            session=session, root=root, members=members | {session},
+            resolved=True, recap_turn=recap_turn)
+        try:
+            packet = read_packet(db, family)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+    finally:
+        db.close()
+    packet["status"] = "partial"
+    packet["coverage"]["index_freshness"] = _FAMILY_CHURN_NOTICE
+    if args.json:
+        _stdout(json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
+    else:
+        _stdout(_human(packet))
+    return 2
+
+
 def _serve(args, *, retry_pending: bool) -> int | None:
     """One resolution attempt. None = staleness-shaped miss worth one retry."""
+    caller_session = [args.session]
 
     def stale(status: str, reason: str) -> int | None:
         if retry_pending:
             return None
+        session = caller_session[0]
+        if session:
+            outcome = _serve_lenient(args, session)
+            if outcome is not None:
+                return outcome
         return _failure(status, reason, json_output=args.json)
 
     if args.session:
@@ -424,27 +557,10 @@ def _serve(args, *, retry_pending: bool) -> int | None:
                     "index_unavailable", str(exc), json_output=args.json)
         finally:
             db.close()
-        if args.no_auto:
-            packet["status"] = "partial"
-            packet["coverage"]["index_freshness"] = "unchecked"
-        else:
-            notice = indexd_runtime.agent_freshness_notice()
-            if notice:
-                return _failure(
-                    "index_unavailable", notice, json_output=args.json)
-            packet["coverage"]["index_freshness"] = "fresh"
-        if args.json:
-            _stdout(json.dumps(
-                packet, ensure_ascii=False, separators=(",", ":")))
-        else:
-            _stdout(_human(packet))
-        # Same exit contract as the identity path (0 recovered, 1 proven
-        # empty, 2 partial); a hardcoded 0 here once reported emptiness as success.
-        if packet["status"] == "empty":
-            return 1
-        return 2 if packet["status"] == "partial" else 0
+        return _finish(args, packet, retry_pending=retry_pending)
 
     with session_context.calling_family_snapshot() as (identity, family, db):
+        caller_session[0] = identity.session
         if not identity.session:
             return _failure(
                 "identity_unavailable",
@@ -466,16 +582,31 @@ def _serve(args, *, retry_pending: bool) -> int | None:
             return _failure(
                 "index_unavailable", str(exc), json_output=args.json)
 
+    return _finish(args, packet, retry_pending=retry_pending)
+
+
+def _finish(args, packet: dict, *, retry_pending: bool) -> int | None:
+    """Render one packet under the shared exit contract (0 recovered, 1
+    proven empty, 2 partial). A live freshness story is staleness-shaped
+    first (one ingest usually clears it), and disclosure last: the boundary
+    is proven and the rows are verbatim, so global store churn only makes
+    "newest boundary" uncertain. Refusing here starved the exact moment the
+    packet exists for (observed on omp: the compacting session's own churn
+    kept the index permanently "behind" right after its compaction).
+    """
     if args.no_auto:
         packet["status"] = "partial"
         packet["coverage"]["index_freshness"] = "unchecked"
     else:
         notice = indexd_runtime.agent_freshness_notice()
+        if notice and retry_pending:
+            return None
         if notice:
-            return _failure(
-                "index_unavailable", notice, json_output=args.json)
-        packet["coverage"]["index_freshness"] = "fresh"
-
+            # An unverified empty page is not a proven zero either: partial.
+            packet["status"] = "partial"
+            packet["coverage"]["index_freshness"] = notice
+        else:
+            packet["coverage"]["index_freshness"] = "fresh"
     if args.json:
         _stdout(json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
     else:

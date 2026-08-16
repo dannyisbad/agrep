@@ -4439,6 +4439,43 @@ def agent_freshness_notice(environ: Mapping[str, str] | None = None) -> str:
     return surface.freshness_story_line(freshness_story())
 
 
+# One full lane-down story per cause per window; repeats inside it render
+# the bare line. Ten minutes: long enough to stop a per-query lecture, short
+# enough that a persisting outage re-states its cause within one sitting.
+_LANE_NOTICE_TTL_S = 600.0
+_LANE_NOTICE_PATH_NAME = ".lane-notice.json"
+
+
+def semantic_notice_brief(reason: object) -> bool:
+    """Was this exact lane-down cause already told within the window?
+
+    Disclosure-only state: a True never silences the notice, it only drops
+    the repeated cause/retry tail (surface_policy renders the bare story).
+    The stamp keeps its original timestamp while the cause persists, so a
+    standing outage re-prints its full story once per window even under
+    steady querying. Any unreadable or unwritable state answers False:
+    the full story is always the safe rendering.
+    """
+    key = str(reason or "")
+    path = common.DATA_DIR / _LANE_NOTICE_PATH_NAME
+    now = time.time()
+    try:
+        stamp = json.loads(path.read_text(encoding="utf-8"))
+        age = now - float(stamp.get("ts") or 0.0)
+        if stamp.get("reason") == key and 0 <= age < _LANE_NOTICE_TTL_S:
+            return True
+    except (OSError, ValueError, TypeError):
+        pass
+    if common.data_dir_readonly(common.DATA_DIR):
+        return False
+    try:
+        path.write_text(
+            json.dumps({"reason": key, "ts": now}), encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
 def _bounded_freshness_reason(reason: object) -> str:
     rendered = common.terminal_safe(reason)
     if len(rendered) <= _FRESHNESS_RENDER_MAX_CHARS:

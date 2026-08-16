@@ -23,6 +23,7 @@ import indexd_runtime  # noqa: E402
 import livetui  # noqa: E402
 import ownerfile  # noqa: E402
 import tail  # noqa: E402
+from hookless import live as live_mod, procscan  # noqa: E402
 
 
 def _owner(token: str = "a" * 32, inode: int = 7) -> ownerfile.Snapshot:
@@ -391,6 +392,234 @@ class ResidentSnapshotSurfaceTests(unittest.TestCase):
             rendered)
         self.assertIn("no events visible yet", rendered)
         self.assertNotIn("no events yet this window", rendered)
+
+class PiLiveSnapshotTests(unittest.TestCase):
+    def test_omp_journal_maps_to_live_events_and_alias_snapshot(self) -> None:
+        """A newly active OMP journal is canonical pi state selected by either name."""
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(live_mod, "HOME", td):
+            now = time.time()
+
+            def stamped(offset: int) -> str:
+                return time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now + offset))
+
+            session_id = "01234567-89ab-7000-8000-0123456789ab"
+            store = (Path(td) / ".omp" / "agent" / "sessions"
+                     / "-work-app")
+            store.mkdir(parents=True)
+            path = store / f"2026-08-16T09-00-00-000Z_{session_id}.jsonl"
+            rows = [
+                {
+                    "type": "title", "v": 1, "title": "Fixture task",
+                    "updatedAt": stamped(-7), "pad": " ",
+                },
+                {
+                    "type": "session", "version": 3, "id": session_id,
+                    "timestamp": stamped(-7), "cwd": "/work/app",
+                },
+                {
+                    "type": "model_change", "id": "model", "parentId": None,
+                    "timestamp": stamped(-6), "model": "fixture-model",
+                },
+                {
+                    "type": "message", "id": "user", "parentId": "model",
+                    "timestamp": stamped(-5),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "inspect it"}],
+                    },
+                },
+                {
+                    "type": "message", "id": "assistant-tool",
+                    "parentId": "user", "timestamp": stamped(-4),
+                    "message": {
+                        "role": "assistant", "model": "fixture-model",
+                        "content": [
+                            {"type": "thinking", "thinking": "hidden"},
+                            {"type": "text", "text": "checking"},
+                            {
+                                "type": "toolCall", "id": "call-1",
+                                "name": "read",
+                                "arguments": {"path": "/work/app/a.txt"},
+                            },
+                        ],
+                        "stopReason": "toolUse",
+                    },
+                },
+                {
+                    "type": "custom", "customType": "tool_execution_start",
+                    "id": "tool-start", "parentId": "assistant-tool",
+                    "timestamp": stamped(-4),
+                    "data": {
+                        "toolCallId": "call-1", "toolName": "read",
+                        "startedAt": stamped(-4),
+                    },
+                },
+                {
+                    "type": "message", "id": "tool-result",
+                    "parentId": "tool-start", "timestamp": stamped(-3),
+                    "message": {
+                        "role": "toolResult", "toolCallId": "call-1",
+                        "toolName": "read", "isError": False,
+                        "content": [{"type": "text", "text": "a.txt"}],
+                    },
+                },
+                {
+                    "type": "message", "id": "assistant-final",
+                    "parentId": "tool-result", "timestamp": stamped(-2),
+                    "message": {
+                        "role": "assistant", "model": "fixture-model",
+                        "content": [{"type": "text", "text": "finished"}],
+                        "stopReason": "stop",
+                    },
+                },
+                {
+                    "type": "custom", "customType": "session_exit",
+                    "id": "exit", "parentId": "assistant-final",
+                    "timestamp": stamped(-1),
+                    "data": {"reason": "dispose", "kind": "normal"},
+                },
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8")
+
+            watcher = live_mod.LiveWatcher()
+            watcher._booted = True
+            watcher._boot_complete.set()
+            events = watcher.subscribe()
+            watcher._tick_pi(now)
+            emitted = []
+            while not events.empty():
+                emitted.append(events.get_nowait())
+
+            snapshot = watcher.snapshot()
+            self.assertEqual(len(snapshot["sessions"]), 1)
+            live_session = snapshot["sessions"][0]
+            self.assertEqual(
+                {
+                    "agent": live_session["agent"],
+                    "session": live_session["session"],
+                    "project": live_session["project"],
+                    "title": live_session["title"],
+                    "model": live_session["model"],
+                    "state": live_session["state"],
+                    "working": live_session["working"],
+                },
+                {
+                    "agent": "pi", "session": session_id,
+                    "project": "work/app", "title": "Fixture task",
+                    "model": "fixture-model", "state": "done",
+                    "working": False,
+                },
+            )
+            self.assertEqual(
+                [event["type"] for event in emitted],
+                ["user", "reply", "tool", "tool_done", "reply", "done"],
+            )
+            tool = next(event for event in emitted if event["type"] == "tool")
+            self.assertEqual(
+                {key: tool[key] for key in ("agent", "session", "name",
+                                            "input", "call_id")},
+                {
+                    "agent": "pi", "session": session_id, "name": "read",
+                    "input": "/work/app/a.txt", "call_id": "call-1",
+                },
+            )
+            tool_done = next(
+                event for event in emitted if event["type"] == "tool_done")
+            self.assertEqual(
+                {key: tool_done[key] for key in
+                 ("name", "output", "call_id", "ok", "dur")},
+                {
+                    "name": "read", "output": "a.txt",
+                    "call_id": "call-1", "ok": True, "dur": 1000,
+                },
+            )
+            self.assertEqual(
+                [event.get("text") for event in emitted
+                 if event["type"] in ("user", "reply")],
+                ["inspect it", "checking", "finished"],
+            )
+
+            out = io.StringIO()
+            with (
+                mock.patch.object(
+                    tail.indexd_runtime, "resident_indexd_live_snapshot",
+                    return_value=None),
+                mock.patch.object(tail.live, "watcher", return_value=watcher),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(
+                    tail.main(["--snapshot", "--agent", "omp"]), 0)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["type"], "snapshot")
+            self.assertEqual(
+                [(row["agent"], row["session"]) for row in payload["sessions"]],
+                [("pi", session_id)],
+            )
+
+    def test_pi_reader_discovers_both_home_stores(self) -> None:
+        """The canonical pi adapter watches the native and oh-my-pi session roots."""
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(live_mod, "HOME", td):
+            now = time.time()
+            timestamp = time.strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+            expected = set()
+            for home_name, session_id in (
+                    (".pi", "11111111-1111-7111-8111-111111111111"),
+                    (".omp", "22222222-2222-7222-8222-222222222222")):
+                expected.add(session_id)
+                store = (Path(td) / home_name / "agent" / "sessions"
+                         / "-work-project")
+                store.mkdir(parents=True)
+                path = store / f"2026-08-16T09-00-00-000Z_{session_id}.jsonl"
+                rows = [
+                    {
+                        "type": "session", "version": 3, "id": session_id,
+                        "timestamp": timestamp, "cwd": "/work/project",
+                    },
+                    {
+                        "type": "message", "id": f"user-{home_name}",
+                        "parentId": None, "timestamp": timestamp,
+                        "message": {
+                            "role": "user", "content": [
+                                {"type": "text", "text": home_name},
+                            ],
+                        },
+                    },
+                ]
+                path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows),
+                    encoding="utf-8")
+            watcher = live_mod.LiveWatcher()
+            watcher._booted = True
+            watcher._tick_pi(now)
+            self.assertEqual(
+                {row["session"] for row in watcher.snapshot()["sessions"]},
+                expected,
+            )
+
+    def test_pi_process_fingerprints_exclude_omp_helpers(self) -> None:
+        """Only interactive pi/OMP commands are agent writers; daemon helpers are not."""
+        session_id = "12345678-1234-1234-1234-123456789abc"
+        self.assertEqual(
+            procscan._classify("omp", f"omp --resume {session_id}"), "pi")
+        self.assertEqual(
+            procscan._session_from_cmd(
+                "pi", f"omp --resume {session_id}"),
+            session_id,
+        )
+        self.assertEqual(procscan._classify("pi.exe", "pi"), "pi")
+        self.assertEqual(
+            procscan._classify(
+                "node", "/app/node_modules/pi-coding-agent/dist/cli.js"),
+            "pi",
+        )
+        self.assertIsNone(
+            procscan._classify("omp", "omp __omp_worker_daemon_broker"))
 
 
 class TailSnapshotFilterTests(unittest.TestCase):

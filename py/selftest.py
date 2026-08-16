@@ -4359,7 +4359,13 @@ def t_doctor_states():
                             env={**env, "AGREP_RS_BIN": "/nonexistent/agrep-rs"},
                             capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=90)
-        for w in ("not built", "can build from source"):
+        import shutil as _shutil
+        # doctor renders the cargo row for the host it is on: a box with
+        # cargo says "can build from source"; a box without says where to
+        # get it. Assert the host-appropriate string, not the CI one.
+        cargo_tail = ("can build from source" if _shutil.which("cargo")
+                      else "install from https://rustup.rs")
+        for w in ("not built", cargo_tail):
             if w not in r2.stdout:
                 missing.append(w)
     ok = not missing and r.returncode == 0 and r2.returncode == 0
@@ -5464,7 +5470,7 @@ def t_block_version():
     import tempfile
     from pathlib import Path as P
     import teach
-    pinned = (36, "fcccd2c6068f")  # (NUDGE_V, sha256(NUDGE)[:12]) - update BOTH together
+    pinned = (37, "4b7040519c28")  # (NUDGE_V, sha256(NUDGE)[:12]) - update BOTH together
     h = hashlib.sha256(teach.NUDGE.encode()).hexdigest()[:12]
     if (teach.NUDGE_V, h) != pinned:
         return ("FAIL", f"NUDGE changed (v{teach.NUDGE_V}, {h}) vs pinned {pinned} - "
