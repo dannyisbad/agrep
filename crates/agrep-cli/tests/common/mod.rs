@@ -232,10 +232,19 @@ pub fn fixture_home(agent: &str) -> PathBuf {
 /// opencode's store is a sqlite db; build it from the auditable seed.sql into a fresh temp
 /// home (never committed as a binary, never mutating the repo).
 pub fn opencode_home() -> PathBuf {
+    opencode_home_from("opencode")
+}
+
+/// Same store location, opencode 2.x schema (session_v2/session_message).
+pub fn opencode_v2_home() -> PathBuf {
+    opencode_home_from("opencode_v2")
+}
+
+fn opencode_home_from(fixture: &str) -> PathBuf {
     let home = temp_dir("opencode-home");
     let ocdir = home.join(".local").join("share").join("opencode");
     fs::create_dir_all(&ocdir).unwrap();
-    let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql")).unwrap();
+    let seed = fs::read_to_string(fixtures_dir().join(fixture).join("seed.sql")).unwrap();
     let conn = rusqlite::Connection::open(ocdir.join("opencode.db")).unwrap();
     conn.execute_batch(&seed).unwrap();
     conn.close().unwrap();

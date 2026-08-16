@@ -441,9 +441,10 @@ unset, both fall back under `%USERPROFILE%\AppData\Local\`. On macOS and Linux,
 Whichever of these exist get indexed; missing ones are skipped. Prebuilt wheels
 cover Windows, macOS, and glibc 2.28+ Linux; musl and older-glibc Linux require a
 source-built Rust binary. All eleven agent tools are searchable through grep
-and recall; live tailing additionally covers claude, codex, opencode,
-antigravity, and cursor, and native resume covers claude, codex, opencode, and
-antigravity.
+and recall (both opencode 1.x and 2.x database schemas are read); live tailing
+additionally covers claude, codex, opencode, antigravity, cursor, and
+pi/oh-my-pi, and native resume covers claude, codex, opencode, antigravity,
+and pi/oh-my-pi (`omp -r`/`pi -r`).
 
 Detected but not yet indexed: Copilot CLI (`~/.copilot/session-state`) and
 qwen-code (`~/.qwen`). agrep surfaces these - with a session count - in

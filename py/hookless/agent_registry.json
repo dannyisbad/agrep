@@ -134,10 +134,7 @@
       "name": "pi",
       "aliases": ["omp"],
       "live": {"state": "supported"},
-      "native_resume": {
-        "state": "unsupported",
-        "reason": "resume is an interactive picker with no documented resume-by-id command"
-      },
+      "native_resume": {"state": "supported"},
       "agent_context": {
         "state": "supported",
         "env_keys": ["AGREP_PI_SESSION_ID"]

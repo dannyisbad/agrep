@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import time
@@ -392,6 +393,229 @@ class ResidentSnapshotSurfaceTests(unittest.TestCase):
             rendered)
         self.assertIn("no events visible yet", rendered)
         self.assertNotIn("no events yet this window", rendered)
+
+class OpenCodeV2LiveSnapshotTests(unittest.TestCase):
+    def test_message_envelopes_map_to_v1_events_and_done_state(self) -> None:
+        """A mutable v2 envelope must drive the same turn lifecycle as v1 parts."""
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(live_mod, "HOME", td), \
+                mock.patch.dict(
+                    os.environ, {"OPENCODE_DB": "", "XDG_DATA_HOME": ""},
+                    clear=False):
+            now = time.time()
+            base_ms = int(now * 1000) - 1000
+            store = Path(td) / ".local" / "share" / "opencode"
+            store.mkdir(parents=True)
+            database = store / "opencode.db"
+            connection = sqlite3.connect(database)
+            connection.executescript("""
+                CREATE TABLE session_v2(
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    directory TEXT NOT NULL,
+                    title TEXT,
+                    model TEXT,
+                    agent TEXT,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );
+                CREATE TABLE session_message(
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL,
+                    UNIQUE(session_id, seq)
+                );
+            """)
+            connection.execute(
+                "INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    "ses_parent", "project", None, "/work/app", "Parent",
+                    json.dumps({"id": "fixture-model", "providerID": "fixture"}),
+                    "build", base_ms, base_ms + 90,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    "ses_child", "project", "ses_parent", "/work/app",
+                    "Fixture task",
+                    json.dumps({"id": "fixture-model", "providerID": "fixture"}),
+                    "build", base_ms, base_ms + 90,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                (
+                    "msg_user", "ses_child", "user", 1,
+                    base_ms + 10, base_ms + 10,
+                    json.dumps({
+                        "time": {"created": base_ms + 10},
+                        "text": "inspect it", "files": [], "agents": [],
+                    }),
+                ),
+            )
+            running_assistant = {
+                "time": {"created": base_ms + 20},
+                "agent": "build",
+                "model": {
+                    "id": "fixture-model", "providerID": "fixture",
+                    "variant": "max",
+                },
+                "content": [
+                    {"type": "reasoning", "text": "hidden"},
+                    {"type": "text", "text": "checking"},
+                    {
+                        "type": "tool", "id": "call-1", "name": "grep",
+                        "state": {
+                            "status": "running",
+                            "input": {
+                                "path": "/work/app", "pattern": "needle",
+                            },
+                            "content": [], "metadata": {},
+                        },
+                        "time": {
+                            "created": base_ms + 31,
+                            "ran": base_ms + 32,
+                        },
+                    },
+                ],
+            }
+            connection.execute(
+                "INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                (
+                    "msg_assistant", "ses_child", "assistant", 2,
+                    base_ms + 20, base_ms + 40,
+                    json.dumps(running_assistant),
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            watcher = live_mod.LiveWatcher()
+            watcher._booted = True
+            watcher._boot_complete.set()
+            events = watcher.subscribe()
+            watcher._tick_opencode(now)
+
+            completed_assistant = {
+                **running_assistant,
+                "time": {
+                    "created": base_ms + 20, "completed": base_ms + 82,
+                },
+                "content": [
+                    {"type": "reasoning", "text": "still hidden"},
+                    {"type": "text", "text": "checking"},
+                    {
+                        "type": "tool", "id": "call-1", "name": "grep",
+                        "state": {
+                            "status": "completed",
+                            "input": {
+                                "path": "/work/app", "pattern": "needle",
+                            },
+                            "content": [
+                                {"type": "text", "text": "match\n"},
+                                {"type": "text", "text": "complete"},
+                            ],
+                            "metadata": {},
+                        },
+                        "time": {
+                            "created": base_ms + 31,
+                            "ran": base_ms + 32,
+                            "completed": base_ms + 80,
+                        },
+                    },
+                    {
+                        "type": "tool", "id": "call-2", "name": "read",
+                        "state": {
+                            "status": "completed",
+                            "input": {"path": "/work/app/result.txt"},
+                            "output": "preferred legacy output",
+                            "content": [
+                                {"type": "text", "text": "ignored fallback"},
+                            ],
+                            "metadata": {},
+                        },
+                        "time": {
+                            "created": base_ms + 70,
+                            "ran": base_ms + 71,
+                            "completed": base_ms + 81,
+                        },
+                    },
+                ],
+            }
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE session_message SET time_updated=?, data=? WHERE id=?",
+                (
+                    base_ms + 90, json.dumps(completed_assistant),
+                    "msg_assistant",
+                ),
+            )
+            connection.commit()
+            connection.close()
+            watcher._tick_opencode(now + 1)
+
+            emitted = []
+            while not events.empty():
+                emitted.append(events.get_nowait())
+            self.assertEqual(
+                [event["type"] for event in emitted],
+                ["user", "reply", "tool", "tool_done", "tool_done", "done"],
+            )
+            self.assertEqual(
+                [event.get("text") for event in emitted
+                 if event["type"] in ("user", "reply")],
+                ["inspect it", "checking"],
+            )
+            self.assertEqual(
+                [event.get("name") for event in emitted
+                 if event["type"] in ("tool", "tool_done")],
+                ["grep", "grep", "read"],
+            )
+            started = next(event for event in emitted
+                           if event["type"] == "tool")
+            self.assertEqual(
+                {key: started[key] for key in
+                 ("call_id", "name", "input", "output", "ok")},
+                {
+                    "call_id": "call-1", "name": "grep",
+                    "input": "/work/app · needle", "output": "", "ok": None,
+                },
+            )
+            completed = [event for event in emitted
+                         if event["type"] == "tool_done"]
+            self.assertEqual(
+                [(event["call_id"], event["output"], event["ok"],
+                  event["dur"]) for event in completed],
+                [
+                    ("call-1", "match complete", True, 48),
+                    ("call-2", "preferred legacy output", True, 10),
+                ],
+            )
+            self.assertTrue(emitted[0]["sub_session"])
+            self.assertEqual(emitted[0]["who"], "subagent")
+            self.assertEqual(watcher._oc_schema[str(database)], "v2")
+
+            snapshot = watcher.snapshot()
+            self.assertEqual(len(snapshot["sessions"]), 1)
+            session = snapshot["sessions"][0]
+            self.assertEqual(
+                {key: session[key] for key in
+                 ("agent", "session", "project", "title", "model", "state",
+                  "working", "sub")},
+                {
+                    "agent": "opencode", "session": "ses_child",
+                    "project": "work/app", "title": "Fixture task",
+                    "model": "fixture-model", "state": "done",
+                    "working": False, "sub": True,
+                },
+            )
+
 
 class PiLiveSnapshotTests(unittest.TestCase):
     def test_omp_journal_maps_to_live_events_and_alias_snapshot(self) -> None:
