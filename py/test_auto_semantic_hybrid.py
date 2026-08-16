@@ -1189,8 +1189,12 @@ class AutoSemanticHybridTests(unittest.TestCase):
                 self.assertIn(
                     "no exact phrase match - chats about this "
                     f"semantically{floor_note}:", stderr)
+                # the shell renderer quotes per-platform (single-quoted on
+                # POSIX, double-quoted on Windows): assert through it
+                import console
                 self.assertIn(
-                    "deeper: agrep recall 'deployment retry loop'", stderr)
+                    "deeper: " + console.shell_command(
+                        "agrep", "recall", query), stderr)
 
     def test_compact_complete_semantic_miss_discloses_the_searched_scope(self) -> None:
         query = "why did the deployment keep retrying"
