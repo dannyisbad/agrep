@@ -2517,6 +2517,36 @@ impl IngestCache {
         MaterialVerdict::Retained
     }
 
+    /// May a pass publish although `scope` under `agent` was unreadable?
+    ///
+    /// True exactly when the guarded snapshot still serves the agent's
+    /// last-good rows, or the published inventory positively proves the scope
+    /// never published material (fresh boxes carry the proven-empty set).
+    /// Narrower than [`Self::published_material_under`] on purpose: an
+    /// Always-adapter's stale per-file entries are never re-emitted, so their
+    /// Retained verdict must not license publishing without their rows.
+    pub fn unreadable_scope_covered(&self, agent: &str, scope: &Path) -> bool {
+        let snapshot_key = format!("\x00snapshot\x00{agent}");
+        let has_material = |entry: &Entry| {
+            !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
+        };
+        if self.entries.get(&snapshot_key).is_some_and(has_material) {
+            return true;
+        }
+        self.published_proves_empty(agent, scope)
+    }
+
+    /// The published inventory's positive claim that `scope` held no material.
+    fn published_proves_empty(&self, agent: &str, scope: &Path) -> bool {
+        match self.published_material.as_ref() {
+            Some(paths) => {
+                !paths.iter().any(|path| source_path_within(path, scope))
+                    && !self.published_inventory_blind_to(agent, scope)
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn guard_epoch(&self) -> u64 {
         self.guard_epoch
     }
@@ -2593,6 +2623,7 @@ impl IngestCache {
     pub fn guard_never_empty(
         &mut self,
         agent: &str,
+        root: &Path,
         fresh: Vec<Message>,
         fresh_events: &[Event],
         source_outcome: ReadOutcome,
@@ -2604,7 +2635,10 @@ impl IngestCache {
             if let Some(entry) = self.entries.get(&key) {
                 return (entry.msgs.iter().map(CMsg::to_msg).collect(), true);
             }
-            if source_outcome == ReadOutcome::Invalid {
+            if source_outcome == ReadOutcome::Invalid && !self.published_proves_empty(agent, root) {
+                // No snapshot and published material at stake: may not replace the
+                // generation. A provably-empty store has nothing to lose, so it
+                // publishes with disclosure instead of freezing every other agent.
                 self.output_incomplete = true;
             }
             return (fresh, true);
@@ -3416,7 +3450,13 @@ mod tests {
     #[test]
     fn empty_always_snapshot_is_not_prior_material() {
         let mut cache = IngestCache::cold();
-        cache.guard_never_empty("kimi", Vec::new(), &[], ReadOutcome::Complete);
+        cache.guard_never_empty(
+            "kimi",
+            std::path::Path::new("/fixture-store"),
+            Vec::new(),
+            &[],
+            ReadOutcome::Complete,
+        );
         cache.set_current_source_agents(HashSet::new());
         assert!(!cache.adapter_required("kimi"));
     }
@@ -4221,6 +4261,7 @@ mod tests {
         let mut always = IngestCache::cold();
         let (fresh, guarded) = always.guard_never_empty(
             "gemini",
+            std::path::Path::new("/fixture-store"),
             vec![test_message("good")],
             &[],
             ReadOutcome::Complete,
@@ -4228,8 +4269,13 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert!(!guarded);
         assert!(always.source_snapshot_safe());
-        let (served, guarded) =
-            always.guard_never_empty("gemini", Vec::new(), &[], ReadOutcome::Complete);
+        let (served, guarded) = always.guard_never_empty(
+            "gemini",
+            std::path::Path::new("/fixture-store"),
+            Vec::new(),
+            &[],
+            ReadOutcome::Complete,
+        );
         assert_eq!(served.len(), 1);
         assert!(guarded);
         assert!(!always.source_snapshot_safe());
@@ -4237,6 +4283,7 @@ mod tests {
         let mut partial = IngestCache::cold();
         let (readable, guarded) = partial.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             vec![test_message("readable sibling")],
             &[],
             ReadOutcome::Skipped,
@@ -4253,6 +4300,7 @@ mod tests {
         old_b.session = "b".into();
         merged.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             vec![old_a, old_b],
             &[test_event("a", "old-a"), test_event("b", "old-b")],
             ReadOutcome::Complete,
@@ -4261,6 +4309,7 @@ mod tests {
         new_a.session = "a".into();
         let (messages, suppress_events) = merged.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             vec![new_a],
             &[test_event("a", "new-a")],
             ReadOutcome::Skipped,
@@ -4276,16 +4325,26 @@ mod tests {
         assert!(!merged.source_snapshot_safe());
         let mut no_event_a = test_message("newer a");
         no_event_a.session = "a".into();
-        let (_, suppress_events) =
-            merged.guard_never_empty("cline", vec![no_event_a], &[], ReadOutcome::Skipped);
+        let (_, suppress_events) = merged.guard_never_empty(
+            "cline",
+            std::path::Path::new("/fixture-store"),
+            vec![no_event_a],
+            &[],
+            ReadOutcome::Skipped,
+        );
         assert!(!suppress_events);
         assert!(merged
             .event_prune_files(&merged.live_event_files())
             .contains(&crate::cache::event_fname("claude", "a")));
 
         let mut invalid = IngestCache::cold();
-        let (_, guarded) =
-            invalid.guard_never_empty("cline", Vec::new(), &[], ReadOutcome::Invalid);
+        let (_, guarded) = invalid.guard_never_empty(
+            "cline",
+            std::path::Path::new("/fixture-store"),
+            Vec::new(),
+            &[],
+            ReadOutcome::Invalid,
+        );
         assert!(guarded);
         assert!(!invalid.output_complete());
 
@@ -4368,6 +4427,7 @@ mod tests {
         let mut cache = IngestCache::cold();
         cache.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             vec![test_message("last source")],
             &[],
             ReadOutcome::Complete,
@@ -4380,6 +4440,7 @@ mod tests {
         vanished_after_preflight.allow_repeated_missing_roots(HashSet::from(["cline".to_string()]));
         let (messages, guarded) = vanished_after_preflight.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             Vec::new(),
             &[],
             ReadOutcome::Complete,
@@ -4392,8 +4453,13 @@ mod tests {
         let (mut retry, refusal) = IngestCache::guarded_retry(&cache_path);
         assert!(refusal.is_none());
         retry.allow_repeated_missing_roots(HashSet::from(["cline".to_string()]));
-        let (messages, guarded) =
-            retry.guard_never_empty("cline", Vec::new(), &[], ReadOutcome::Complete);
+        let (messages, guarded) = retry.guard_never_empty(
+            "cline",
+            std::path::Path::new("/fixture-store"),
+            Vec::new(),
+            &[],
+            ReadOutcome::Complete,
+        );
         assert!(messages.is_empty());
         assert!(!guarded);
         assert!(retry.has_provisional_deletions());
@@ -4404,8 +4470,13 @@ mod tests {
         let (mut other, refusal) = IngestCache::guarded_retry(&cache_path);
         assert!(refusal.is_none());
         other.allow_repeated_missing_roots(HashSet::from(["kimi".to_string()]));
-        let (messages, guarded) =
-            other.guard_never_empty("cline", Vec::new(), &[], ReadOutcome::Complete);
+        let (messages, guarded) = other.guard_never_empty(
+            "cline",
+            std::path::Path::new("/fixture-store"),
+            Vec::new(),
+            &[],
+            ReadOutcome::Complete,
+        );
         assert_eq!(messages.len(), 1);
         assert!(guarded);
         assert!(!other.has_provisional_deletions());
@@ -4428,6 +4499,7 @@ mod tests {
         let mut old = IngestCache::cold();
         old.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             vec![test_message("old semantics")],
             &[],
             ReadOutcome::Complete,

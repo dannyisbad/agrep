@@ -48,6 +48,17 @@
 - pi and oh-my-pi sessions resume natively: `agrep resume <id>` runs
   `omp -r <id>` (or `pi -r`, whichever fork owns the session's store root)
   from the session's recorded working directory.
+- One unreadable store no longer freezes the whole index. The fail-closed
+  rule stays exactly where it protects data - a generation that would DROP a
+  store's published chats is still refused - but every other shape degrades
+  to disclosed per-source staleness: warm passes keep publishing the guarded
+  snapshot's last-good rows, complete passes publish past a deterministic
+  parse failure whose rows are served or provably absent, and a fresh box
+  whose only store is unreadable publishes an empty disclosed generation
+  instead of failing its first index build. Absence still requires the
+  two-stable-observation protocol before any deletion. Pinned by three new
+  torture tests (warm survival, fresh-box first build, and the retained
+  deletion fence).
 - `postcompact` now recovers on pi/oh-my-pi compacted resumes. Four fixes,
   each observed live on omp: staleness-shaped boundary misses retry on a
   short bounded schedule (one immediate ingest, then ~1s and ~3s later)

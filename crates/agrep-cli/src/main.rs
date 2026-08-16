@@ -5043,9 +5043,12 @@ fn index_cmd_locked(
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
         && source_preflight_error.is_none();
+    // A parse failure is stably unreadable like a stat failure PROVIDED the guarded
+    // snapshot serves the scope's last-good rows or the inventory proves it empty:
+    // one broken store degrades to disclosed staleness, never a frozen index.
     let stable_unreadable = !source_snapshot_safe
         && source_preflight_error.is_none()
-        && !source_issues.is_empty()
+        && (!source_issues.is_empty() || !pcache.source_read_issues().is_empty())
         && source_before.is_some()
         && source_issues.iter().all(|issue| {
             durable_source_issue(issue.kind())
@@ -5057,6 +5060,11 @@ fn index_cmd_locked(
             source_issues
                 .iter()
                 .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
+                // Only a deterministic parse failure ("source-read-failed") may ride the
+                // covered lane: guard-synthesized absence issues ("source-read-incomplete")
+                // keep the two-stable-observation deletion protocol.
+                || (read.kind == "source-read-failed"
+                    && pcache.unreadable_scope_covered(read.agent, &read.path))
         });
     // This pass read every source, so its verdict is the whole truth about
     // their health. Publication can still be declined for reasons that say

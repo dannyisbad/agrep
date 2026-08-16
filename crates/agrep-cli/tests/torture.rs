@@ -3189,11 +3189,12 @@ fn guarded_empty_reparse_does_not_publish_source_snapshot() {
     let _ = fs::remove_dir_all(&data);
 }
 
-/// A first-ever parse failure has no last-good fallback. It must abort before publishing even a
-/// partial generation, retain its pending preflight, and let an ordinary retry build the first
-/// complete cache/source generation without requiring a manual --full.
+/// A first-ever parse failure has nothing published that an output could delete, so it
+/// publishes what it can read as a disclosed, incomplete first generation instead of
+/// bricking the first index build; an ordinary retry after the source heals absorbs the
+/// rows and clears the disclosure without requiring a manual --full.
 #[test]
-fn first_generation_parse_failure_aborts_cleanly_and_normal_retry_recovers() {
+fn first_generation_parse_failure_publishes_disclosed_and_retry_recovers() {
     let home = temp_dir("cold-source-failure-home");
     copy_dir(&fixture_home("cline"), &home);
     let file = home
@@ -3206,33 +3207,19 @@ fn first_generation_parse_failure_aborts_cleanly_and_normal_retry_recovers() {
     fs::write(&file, b"{").unwrap();
     let data = temp_dir("cold-source-failure-data");
 
-    let failed = ingest_output("cline", &home, &data, false);
+    let first = ingest_output("cline", &home, &data, false);
     assert!(
-        !failed.status.success(),
-        "unreadable cold source unexpectedly published"
+        first.status.success(),
+        "one unreadable file bricked the first index build: {}",
+        String::from_utf8_lossy(&first.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("no generation was published"),
-        "unexpected failure: {}",
-        String::from_utf8_lossy(&failed.stderr)
+        !normalize(&data).contains("build a cli flag parser"),
+        "an unreadable file invented its rows"
     );
-    for name in [
-        "messages.jsonl",
-        "replies.jsonl",
-        "sessions.jsonl",
-        agrep_core::cache::SESSION_FAMILY_META_FILE,
-        ".ingest.sig",
-        ".ingest_cache.bin",
-        ".source_snapshot.bin",
-    ] {
-        assert!(
-            !data.join(name).exists(),
-            "cold failure left a partial publication: {name}"
-        );
-    }
     assert!(
-        data.join(".ingest_pending.bin").exists(),
-        "cold failure must leave its preflight for a guarded automatic retry"
+        data.join(".source-health.json").exists(),
+        "unreadable source published silently"
     );
 
     fs::write(&file, source).unwrap();
@@ -4707,6 +4694,110 @@ fn opencode_undecodable_child_scope_retains_last_good_subagent_events() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+fn break_opencode_schema(home: &Path) {
+    let db = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE part; DROP TABLE message; DROP TABLE session; \
+         CREATE TABLE future_schema(x TEXT);",
+    )
+    .unwrap();
+    conn.close().unwrap();
+}
+
+/// One store the parser cannot decode (an app's in-place schema migration) must degrade
+/// to disclosed per-source staleness, never a frozen index: warm passes keep publishing
+/// the guarded snapshot's last-good rows and keep exiting zero.
+#[test]
+fn unreadable_schema_keeps_warm_passes_publishing_last_good_rows() {
+    let home = opencode_home();
+    let data = temp_dir("schema-break-warm-data");
+    ingest_into("opencode", &home, &data, false);
+    assert!(fs::read_to_string(data.join("messages.jsonl"))
+        .unwrap()
+        .contains("convert config to yaml"));
+
+    break_opencode_schema(&home);
+    for _pass in 0..2 {
+        let warm = ingest_output("opencode", &home, &data, false);
+        assert!(
+            warm.status.success(),
+            "warm pass froze on one unreadable source: {}",
+            String::from_utf8_lossy(&warm.stderr)
+        );
+    }
+    assert!(
+        fs::read_to_string(data.join("messages.jsonl"))
+            .unwrap()
+            .contains("convert config to yaml"),
+        "last-good rows vanished behind an unreadable source"
+    );
+    assert!(
+        data.join(".source-health.json").exists(),
+        "unreadable source served silently"
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A fresh box whose only store is unreadable publishes an empty, disclosed generation
+/// instead of failing its first index build outright: nothing published means nothing
+/// an empty output could delete.
+#[test]
+fn fresh_box_with_unreadable_store_publishes_empty_and_discloses() {
+    let home = opencode_home();
+    let data = temp_dir("schema-break-fresh-data");
+    break_opencode_schema(&home);
+
+    let first = ingest_output("opencode", &home, &data, false);
+    assert!(
+        first.status.success(),
+        "first build bricked by one unreadable store: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        fs::read_to_string(data.join("messages.jsonl"))
+            .unwrap()
+            .is_empty(),
+        "an unreadable store invented rows"
+    );
+    assert!(
+        data.join(".source-health.json").exists(),
+        "unreadable source served silently"
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// The deletion fence stands: published material with no cache to serve it (lost cache
+/// plus unreadable source) still retains the old generation rather than publishing a
+/// generation that would drop the store's chats.
+#[test]
+fn lost_cache_with_published_material_still_retains_the_generation() {
+    let home = opencode_home();
+    let data = temp_dir("schema-break-lost-cache-data");
+    ingest_into("opencode", &home, &data, false);
+
+    break_opencode_schema(&home);
+    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+
+    let output = ingest_output("opencode", &home, &data, false);
+    assert_retained_generation_refusal(&output);
+    assert!(
+        fs::read_to_string(data.join("messages.jsonl"))
+            .unwrap()
+            .contains("convert config to yaml"),
+        "refusal did not retain the published rows"
+    );
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
 }

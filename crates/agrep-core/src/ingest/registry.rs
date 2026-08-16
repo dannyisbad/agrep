@@ -2924,7 +2924,7 @@ pub fn collect(
         let start = msgs.len();
         let guard_epoch = cache.guard_epoch();
         let (guarded_messages, guard_fired) =
-            cache.guard_never_empty(name, fresh, &fresh_events, healthy);
+            cache.guard_never_empty(name, &root, fresh, &fresh_events, healthy);
         ensure_guard_issue(cache, name, &root, guard_epoch, issue_count);
         msgs.extend(guarded_messages);
         crate::emit::rows_only(&msgs[start..]);
@@ -3255,6 +3255,7 @@ mod tests {
         let mut cache = IngestCache::cold();
         cache.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             vec![message("session", 0, "last good")],
             &[],
             crate::ingest_cache::ReadOutcome::Complete,
@@ -3263,6 +3264,7 @@ mod tests {
         let issue_count = cache.source_read_issues().len();
         cache.guard_never_empty(
             "cline",
+            std::path::Path::new("/fixture-store"),
             Vec::new(),
             &[],
             crate::ingest_cache::ReadOutcome::Skipped,
@@ -3755,6 +3757,7 @@ mod tests {
         let mut cache = IngestCache::cold();
         cache.guard_never_empty(
             "codex",
+            std::path::Path::new("/fixture-store"),
             vec![message("prior", 0, "prior row")],
             &[],
             crate::ingest_cache::ReadOutcome::Complete,
