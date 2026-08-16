@@ -1163,6 +1163,35 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(calls, ["semantic", "keyword"])
         self.assertNotIn("meaning unavailable", stderr)
 
+    def test_weak_keyword_semantic_sideline_discloses_floor_and_recall(
+            self) -> None:
+        query = "deployment retry loop"
+        keyword = [_hit("keyword", 1, "deployment retries looped")]
+        meaning = [_hit("meaning", 7, "the deploy loop verdict", semantic=True)]
+        for weak, floor_note in ((39, " (39 weaker matches held below the "
+                                      "similarity floor)"),
+                                 (0, "")):
+            def run_query(_query, *, mode="keyword", **_kwargs):
+                if mode == "semantic":
+                    return _result(
+                        meaning, semantic=True,
+                        semantic_status={
+                            "state": "ready", "complete": True,
+                            "filtered": {"weak": weak, "noise": 0,
+                                         "invalid": 0}})
+                return _result(keyword, content_fallback=True)
+
+            with self.subTest(weak=weak):
+                rc, _stdout, stderr = self._run(
+                    [query], run_query, compact_profile=False,
+                    tty_stderr=True)
+                self.assertEqual(rc, 0)
+                self.assertIn(
+                    "no exact phrase match - chats about this "
+                    f"semantically{floor_note}:", stderr)
+                self.assertIn(
+                    "deeper: agrep recall 'deployment retry loop'", stderr)
+
     def test_compact_complete_semantic_miss_discloses_the_searched_scope(self) -> None:
         query = "why did the deployment keep retrying"
         coverage = {"indexed": 20, "total": 20, "pending": 0,
@@ -3995,6 +4024,52 @@ class ProbeOrderIndependenceTests(unittest.TestCase):
                 rc, out = self._probe(queries)
                 self.assertEqual(rc, 1, out)
                 self.assertIn("no confident past-context pointer", out)
+
+
+class LaneNoticeDampenerTests(unittest.TestCase):
+    """One full lane-down story per cause per window; repeats stay disclosed
+    but bare. The dampener is disclosure-only state: it may never silence."""
+
+    def test_full_story_once_per_cause_per_window(self) -> None:
+        runtime = search.indexd_runtime
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(runtime.common, "DATA_DIR", root), \
+                    mock.patch.object(runtime.common, "data_dir_readonly",
+                                      return_value=False):
+                reason = surface.SEMANTIC_INDEX_UPDATE_REASON
+                self.assertFalse(runtime.semantic_notice_brief(reason))
+                self.assertTrue(runtime.semantic_notice_brief(reason))
+                # a different cause restarts the full story
+                self.assertFalse(runtime.semantic_notice_brief("other"))
+                self.assertTrue(runtime.semantic_notice_brief("other"))
+                # the stamp keeps its original timestamp while the cause
+                # persists, so a standing outage re-lectures once per window
+                stamp_path = root / ".lane-notice.json"
+                stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+                stamp["ts"] -= 601
+                stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+                self.assertFalse(runtime.semantic_notice_brief("other"))
+
+    def test_brief_render_still_names_the_lane_state(self) -> None:
+        status = {"state": "unavailable",
+                  "reason": surface.SEMANTIC_INDEX_UPDATE_REASON}
+        self.assertEqual(
+            surface.semantic_keyword_only_notice(status, brief=True),
+            surface.SEMANTIC_LANE_POLICY.keyword_only)
+        self.assertIn(
+            surface.SEMANTIC_INDEX_UPDATE_REASON,
+            surface.semantic_keyword_only_notice(status))
+
+    def test_readonly_data_dir_always_tells_the_full_story(self) -> None:
+        runtime = search.indexd_runtime
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(runtime.common, "DATA_DIR", root), \
+                    mock.patch.object(runtime.common, "data_dir_readonly",
+                                      return_value=True):
+                self.assertFalse(runtime.semantic_notice_brief("r"))
+                self.assertFalse(runtime.semantic_notice_brief("r"))
 
 
 if __name__ == "__main__":

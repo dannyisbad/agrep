@@ -55,6 +55,71 @@ class TeachSafetyTest(unittest.TestCase):
         norm = lambda s: " ".join(s.split())
         self.assertIn(norm(needle), norm(block))
 
+    def _install_win_calls(self, register_rc: int) -> list[list[str]]:
+        """Run _sentinel_install_win with subprocess mocked; return argvs."""
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            rc = register_rc if argv[0] == "powershell" else 0
+            return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
+
+        with mock.patch.object(teach.subprocess, "run",
+                               side_effect=fake_run), \
+                mock.patch.object(teach.subprocess, "Popen"), \
+                mock.patch.object(teach.common,
+                                  "windows_background_child_flags",
+                                  return_value=0), \
+                mock.patch.object(teach, "sentinel_armed",
+                                  return_value=True):
+            self.assertTrue(teach._sentinel_install_win([]))
+        return calls
+
+    def test_win_sentinel_registers_unelevated_before_schtasks(self) -> None:
+        # schtasks /SC ONLOGON is denied without elevation (the npm
+        # postinstall report): the COM path must lead, and its task must run
+        # the same watcher the schtasks fallback would.
+        calls = self._install_win_calls(register_rc=0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:4], [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command"])
+        script = calls[0][4]
+        self.assertIn("Register-ScheduledTask", script)
+        self.assertIn("-AtLogOn", script)
+        self.assertIn(teach.TASK_NAME, script)
+        self.assertIn("sentinel_watch.py", script)
+
+    def test_win_sentinel_falls_back_to_schtasks_on_register_failure(
+            self) -> None:
+        calls = self._install_win_calls(register_rc=1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "powershell")
+        self.assertEqual(calls[1][:5], [
+            "schtasks", "/Create", "/F", "/TN", teach.TASK_NAME])
+        self.assertIn("/SC", calls[1])
+        self.assertIn("ONLOGON", calls[1])
+
+    def test_sentinel_interpreter_prefers_the_base_executable(self) -> None:
+        # A uv tool-run venv shim dies with `uv cache clean`; the logon task
+        # must reference the managed base interpreter that survives it.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "base" / "python.exe"
+            base.parent.mkdir()
+            base.write_bytes(b"")
+            with mock.patch.object(teach.sys, "_base_executable",
+                                   str(base), create=True):
+                self.assertEqual(teach._pythonw(), str(base))
+            basew = base.with_name("pythonw.exe")
+            basew.write_bytes(b"")
+            with mock.patch.object(teach.sys, "_base_executable",
+                                   str(base), create=True):
+                self.assertEqual(teach._pythonw(), str(basew))
+        # a dangling base falls back to the running interpreter
+        with mock.patch.object(teach.sys, "_base_executable",
+                               str(Path("/nonexistent/python.exe")),
+                               create=True):
+            self.assertTrue(Path(teach._pythonw()).exists())
+
     def test_compaction_handoff_is_an_explicit_recall_trigger(self) -> None:
         # The claude block must keep the same-session recovery route: the
         # measured failure is a resumed agent reaching for recall out of
@@ -87,12 +152,14 @@ class TeachSafetyTest(unittest.TestCase):
         codex = teach._block(self.home / ".codex" / "AGENTS.md")
         for phrase in (
             "`agrep board --once` - live agent activity right now",
+            "recent-history questions are `chats`",
             "`agrep recall "'"'"<distinctive phrase>"'"'"`",
         ):
             self._assert_phrase(phrase, codex)
         claude = teach._block(self.home / ".claude" / "CLAUDE.md")
         for phrase in (
-            "`chats` is indexed history; `board` is the present",
+            "running/active right now means `board --once`",
+            "latest sessions means `chats` (indexed history, newest first)",
             "live agent activity on this box right now",
         ):
             self._assert_phrase(phrase, claude)

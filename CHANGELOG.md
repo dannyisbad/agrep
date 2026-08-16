@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.3.0 — 2026-08-15
+
+- `agrep setup` renders its five steps with colored boundaries and opens with
+  a one-line step map. Headless runs and env-detected agent contexts never
+  sit on a consent prompt: they get the full write disclosure plus explicit
+  agent instructions strongly recommending `agrep setup --yes`, and the
+  archive question is deferred rather than asked. Nothing consent-gated is
+  written without `--yes`, as before.
+- Global npm installs now run `agrep setup --yes --no-semantic --no-archive`
+  from postinstall, so `npm install -g` ends enrolled with a built index;
+  `AGREP_NO_AUTO_SETUP=1` restores warm-only, `AGREP_SKIP_POSTINSTALL=1`
+  skips postinstall entirely. The model fetch still waits for first semantic
+  use. The uninstall-cleanup sentinel ships with the auto-written blocks by
+  design - it is the undo mechanism for exactly those writes - and the
+  postinstall log and both READMEs name it.
+- The Windows uninstall sentinel now arms without elevation: `schtasks /SC
+  ONLOGON` demands administrator rights (observed live: every unelevated
+  setup - including npm postinstall - printed "sentinel could not be armed"),
+  so registration goes through `Register-ScheduledTask` with an own-user
+  logon trigger, keeping schtasks as the fallback. Verified end to end on
+  Windows 11 ARM64: arm, doctor "armed", `agrep remove` deletes the task.
+- The Windows sentinel task now references uv's managed base interpreter
+  instead of the tool-run venv shim: `uv cache clean` deletes the ephemeral
+  venv (leaving the logon task dangling) but never the managed install. The
+  watcher is stdlib-only, so the base interpreter suffices.
+- Bare `agrep` now ends its status page with the five newest indexed chats
+  and their copyable `agrep around` follow-ups - the "what was I working on"
+  answer without learning a command first.
+- Instruction block v37 routes session questions by their tense: running or
+  active right now is `agrep board --once`; recent, last, or latest sessions
+  is bare `agrep chats` (newest first). Agents measurably reached for the
+  live board when asked about recent history.
+- Live observation now covers pi and oh-my-pi: `agrep board` and `agrep tail`
+  see running omp agents (sessions, subagents, tool activity) by tailing
+  their append-mode JSONL stores, the same hook-free route as Claude. The
+  `pi.live` registry capability is flipped to supported and `--agent omp`
+  aliases to pi everywhere. Previously the board was blind to a box full of
+  working omp agents.
+- `postcompact` now recovers on pi/oh-my-pi compacted resumes. Four fixes,
+  each observed live on omp: staleness-shaped boundary misses retry on a
+  short bounded schedule (one immediate ingest, then ~1s and ~3s later)
+  because the hook can fire before the compacting agent flushes its boundary
+  row to disk; a freshly-resumed session whose recap is turn 1 serves its
+  pre-boundary tail from the family root, capped at the boundary timestamp
+  and disclosed as `window_source: family_root`; a live freshness story
+  no longer refuses a proven packet - after the retries it serves as an
+  explicitly partial packet carrying the story, since the compacting
+  session's own churn kept the index "behind" at exactly the moment the
+  packet exists for; and when that churn starves the generation-stable
+  snapshot open outright (each retry ingest advances the generation the
+  daemon is also advancing), the final attempt serves the boundary from the
+  last published snapshot as a partial packet naming the churn.
+- When weak keyword hits print the "chats about this semantically" block, the
+  header now counts the neighbors held below the similarity floor, and a dim
+  `deeper: agrep recall '<query>'` pointer names the lane-fusing surface.
+  Machine modes are unchanged.
+- The `meaning unavailable; keyword-only` story lectures once per cause per
+  ten-minute window: the first occurrence carries the cause and retry lever,
+  repeats of the same cause render the bare line. The lane state itself is
+  disclosed on every render, machine `semantic_status` is never dampened,
+  and read-only data dirs always get the full story.
+
 ## 0.2.0 — 2026-08-12
 
 0.1.x shipped multi-agent ingest, keyword search, and an optional semantic tier

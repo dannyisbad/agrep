@@ -7448,7 +7448,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if (auto_semantic_failed and not porcelain_zero
             and not res.get("tools_excluded")):
         common.log(surface.semantic_keyword_only_notice(
-            auto_semantic_failure_status))
+            auto_semantic_failure_status,
+            brief=indexd_runtime.semantic_notice_brief(
+                (auto_semantic_failure_status or {}).get("reason"))))
     if (sem_used and not hits and not args.json and not args.count
             and not args.count_by_tier and not args.chat):
         # Before the render dispatch so every porcelain path gets it: no
@@ -7871,9 +7873,23 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                     why = ("all exact hits are tool output"
                            if (res.get("tool_hits") or 0) == n_total
                            else "no exact phrase match")
-                    common.log(f"{why} - chats about this semantically:")
+                    weak = int(((sem_extra.get("semantic_status") or {})
+                                .get("filtered") or {}).get("weak") or 0)
+                    floor_note = (
+                        " (" + surface.count_noun(weak, "weaker match",
+                                                  "weaker matches")
+                        + " held below the similarity floor)" if weak else "")
+                    common.log(
+                        f"{why} - chats about this semantically{floor_note}:")
                     for sh in seen_chats:
                         common.log(_compact_line(sh, ()))
+                    import recall as _recall
+                    deeper = ("deeper: "
+                              + _recall._command("agrep", "recall", q)
+                              + " fuses meaning with keyword and pulls the "
+                                "conversations")
+                    common.log(f"{_C['d']}{deeper}{_C['r']}"
+                               if color else deeper)
         if (not sem_used and not args.regex and not args.word
                 and not args.semantic and not args.lexical
                 and not args.flat and not args.chats and not args.coverage

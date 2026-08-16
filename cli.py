@@ -969,6 +969,15 @@ def cmd_status(a) -> int:
                        "cross-agent chat history", color) + "\n", flush=True)
     for line in _status_lines(cli, color):
         print(line)
+    if common.MESSAGES_PATH.is_file():
+        # orientation, not diagnostics: the newest indexed chats with their
+        # copyable follow-ups; any failure here must not wound the status page
+        print("\nrecent chats (`" + cli + " chats` for more):", flush=True)
+        try:
+            import search
+            search.chats_main(["-n", "5"])
+        except Exception:  # noqa: BLE001 -- status stays useful without the list
+            pass
     print("\ntry:")
     print(f'  {cli} "race condition"        grep every agent for a phrase')
     print(f"  {cli} deadlock --agent codex  filter to one agent")
@@ -1057,8 +1066,9 @@ def _setup_archive(choice: bool | None, *, assume_yes: bool = False) -> None:
         print(f"  location: {archive.ARCHIVE_DIR}")
         print("  retention: 3 versions per source path by default; may include deleted chats")
         print("  inspect/disable: agrep archive --status / agrep archive --off")
-        if not sys.stdin.isatty():
-            print("  (not a terminal - archive left off; use `agrep setup --archive`)")
+        if not sys.stdin.isatty() or common.in_agent_context():
+            print("  (not an interactive human terminal - archive left off; "
+                  "use `agrep setup --archive`)")
             choice = False
         else:
             try:
@@ -1272,6 +1282,51 @@ def _setup_consentable_writes() -> bool:
                for _, proof, _ in teach.MD_TARGETS + teach.SKILL_TARGETS)
 
 
+_SETUP_STEP_TOTAL = 5
+
+
+def _setup_color() -> bool:
+    return common.color_enabled(sys.stdout)
+
+
+def _setup_step(step: int, title: str) -> None:
+    """One obvious, colored step boundary; the text itself stays grep-stable."""
+    line = f"=== setup {step}/{_SETUP_STEP_TOTAL}: {title} ==="
+    prefix = "\n" if step > 1 else ""
+    print(prefix + common.paint("hd", line, _setup_color()), flush=True)
+
+
+def _setup_banner(cli: str) -> None:
+    on = _setup_color()
+    print(common.paint("bold", f"{cli} setup", on)
+          + f" - {_SETUP_STEP_TOTAL} steps: dependencies · agent instructions"
+          " · recovery integrations · search index · archive\n", flush=True)
+
+
+def _setup_headless_brief(cli: str, *, no_semantic: bool) -> str:
+    """No terminal, or an agent is driving: a consent prompt cannot run, so
+    disclose the writes and hand the agent one explicit strong next step.
+    Nothing consent-gated is written this run (the t_agent_setup_consent
+    contract); the core index still builds below."""
+    flag = " --no-semantic" if no_semantic else ""
+    return "\n".join([
+        "headless setup without --yes: agent instructions and recovery "
+        "integrations stay untouched this run.",
+        "",
+        _setup_consent_screen(no_semantic=no_semantic),
+        "instructions for coding agents driving this setup - strongly "
+        "recommended:",
+        f"  1. run `{cli} setup --yes{flag}` now: it writes exactly the "
+        "blocks disclosed above,",
+        f"     all owned by agrep and fully undone by `{cli} remove`. "
+        "without them, no agent",
+        "     on this box ever discovers this searchable history.",
+        "  2. tell your human what was installed (or ask first when they "
+        "are reachable);",
+        "     opt-outs: --no-teach (instructions), --no-hook (integrations).",
+    ])
+
+
 def cmd_setup(a) -> int:
     # dependency tier first, then two separately disclosed local-write choices.
     cli = common.cli_name()
@@ -1298,9 +1353,14 @@ def cmd_setup(a) -> int:
     hook_consented = yes
     # A valid receipt with a live target already answered the instruction choice.
     enrolled = teach.enrollment_active()
+    _setup_banner(cli)
+    # An agent driving a PTY still must not answer its human's consent
+    # prompt; env-detected agent context reads the headless brief instead.
+    interactive = sys.stdin.isatty() and not common.in_agent_context()
+    headless_brief_shown = False
     if (not yes and not enrolled and not no_teach
             and _setup_consentable_writes()):
-        if sys.stdin.isatty():
+        if interactive:
             print(_setup_consent_screen(no_semantic=no_semantic), flush=True)
             try:
                 answer = input("write these instructions? [Y/n] ").strip().lower()
@@ -1314,10 +1374,11 @@ def cmd_setup(a) -> int:
                 consented = True
         else:
             no_teach = True
-            print("headless setup without --yes: agent instructions left "
-                  "untouched; rerun with --yes to write the files disclosed "
-                  "by `setup` interactively.", flush=True)
-    print("=== setup 1/5: dependencies (doctor) ===", flush=True)
+            headless_brief_shown = True
+            print(_setup_headless_brief(cli, no_semantic=no_semantic),
+                  flush=True)
+            print("", flush=True)
+    _setup_step(1, "dependencies (doctor)")
     import doctor
     doctor_args = ["--setup"] + (["--no-semantic"] if no_semantic else [])
     rc = doctor.main(doctor_args)
@@ -1325,15 +1386,15 @@ def cmd_setup(a) -> int:
     if rc != 0:
         return rc
     if no_teach:
-        print("\n=== setup 2/5: agent instructions skipped ===", flush=True)
+        _setup_step(2, "agent instructions skipped")
     else:
-        print("\n=== setup 2/5: agent instructions ===", flush=True)
+        _setup_step(2, "agent instructions")
         import teach
         rc = teach.teach(yes=yes or consented)
     if not no_hook:
         import hookinstall
         if not yes and hookinstall.hooks_need_consent():
-            if sys.stdin.isatty():
+            if interactive:
                 print("\n" + _setup_hook_consent_screen(), flush=True)
                 try:
                     answer = input(
@@ -1349,15 +1410,15 @@ def cmd_setup(a) -> int:
                     hook_consented = True
             else:
                 no_hook = True
-                print("headless setup without --yes: post-compact "
-                      "integrations left untouched; rerun with --yes to "
-                      "install the files disclosed by `setup` interactively.",
-                      flush=True)
+                if not headless_brief_shown:
+                    print("headless setup without --yes: post-compact "
+                          "integrations left untouched; rerun with --yes to "
+                          "install the files disclosed by `setup` "
+                          "interactively.", flush=True)
     if no_hook:
-        print("\n=== setup 3/5: post-compact integrations skipped ===", flush=True)
+        _setup_step(3, "post-compact integrations skipped")
     else:
-        print("\n=== setup 3/5: post-compact recovery integrations ===",
-              flush=True)
+        _setup_step(3, "post-compact recovery integrations")
         import hookinstall
         hook_rc = hookinstall.install(yes=hook_consented)
         import teach
@@ -1369,7 +1430,7 @@ def cmd_setup(a) -> int:
     index_upgrade_pending = False
     if rc == 0:
         # setup ends with search working - never "your first search will fetch/build"
-        print("\n=== setup 4/5: search index ===", flush=True)
+        _setup_step(4, "search index")
         # A plain leaf is not enough: its committed generation must also prove
         # that the bytes belong to the corpus setup is about to vouch for.
         s, index_upgrade_pending = _setup_index_state()
@@ -1392,7 +1453,7 @@ def cmd_setup(a) -> int:
                   f"retries the build.", flush=True)
             rc = 1
     if rc == 0:
-        print("\n=== setup 5/5: optional archive retention ===", flush=True)
+        _setup_step(5, "optional archive retention")
         choice = True if archive_on else False if archive_off else None
         _setup_archive(choice, assume_yes=yes)
     if rc == 0 and not no_semantic and common.MESSAGES_PATH.is_file() and \
@@ -1412,7 +1473,8 @@ def cmd_setup(a) -> int:
                     if teach.detected_agents() else
                     " (no agents detected on this box - `agrep setup` enrolls "
                     "them once one is installed)")
-        print(f"\nsetup complete{tail}.")
+        print("\n" + common.paint(
+            "g", f"setup complete{tail}.", _setup_color()))
         print(f"\n{_core_evidence_path(cli)}")
     return rc
 

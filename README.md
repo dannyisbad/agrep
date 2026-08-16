@@ -75,9 +75,13 @@ pi/oh-my-pi extension copies it enrolled.
 
 To try it without installing anything, `uvx agrep "race condition"` (or
 `pipx run agrep ...`) fetches the prebuilt package, Rust ingest binary
-included, and searches. A global npm install is a shim: it warms uv's ephemeral
-cache with the matching PyPI tool, and it needs `uv` or `pipx` already on the
-machine to run at all.
+included, and searches. A global npm install is a shim that needs `uv` or
+`pipx` already on the machine: its postinstall runs
+`agrep setup --yes --no-semantic --no-archive` so the box ends enrolled with
+a built index, including the uninstall-cleanup sentinel that strips agrep's
+own blocks if the package disappears (`AGREP_NO_AUTO_SETUP=1` keeps the old
+warm-only behavior, and `agrep remove` undoes every written block); the
+semantic model still waits for first semantic use.
 
 When a hit is the session you want back:
 
@@ -154,13 +158,25 @@ serving different text under the same citation. `AGREP_PROFILE=compact` can forc
 that profile when a harness exposes no agent fingerprint. The stderr hint `agrep
 --more <handle>` serves the next page from a short-lived frozen top-40 snapshot;
 `agrep around @handle` and `agrep recall @handle` pull the corresponding context
-directly. `--classic` or `AGREP_PROFILE=classic` selects the human renderer and
-disables the compact profile's hybrid retrieval; an interactive query that finds
-nothing may still try the meaning lane, and `--lexical` is what turns that off.
-`-s` requests semantic search explicitly.
-`-c` remains an exhaustive, one-integer grep count. Prose-shaped compact queries
-may add labeled meaning evidence when the optional semantic tier is ready;
-`--lexical` opts out and `-s` forces semantic-only search.
+directly. `--classic` or `AGREP_PROFILE=classic` selects the human renderer.
+
+The two profiles deliberately use the meaning lane differently, and both are
+forcible:
+
+- **Agent view (compact):** prose-shaped queries run the keyword and meaning
+  lanes together and interleave both into one labeled page - an agent reads
+  one page programmatically, so the fusion happens for it.
+- **Human view (classic tty):** the hit list stays exact-match-first with
+  keyword scores that mean one thing. The meaning lane still runs: a query
+  with zero exact hits escalates to labeled semantic matches, and a page of
+  weak evidence (tool-output-only, or related-terms fallback) appends a
+  separate `chats about this semantically` block that also counts how many
+  weaker neighbors the similarity floor held back, plus an
+  `agrep recall '<query>'` pointer to the lane-fusing surface. Scores from
+  the two lanes are never mixed into one human ranking.
+
+`--lexical` turns the meaning lane off on either surface, `-s` forces
+semantic-only search, and `-c` remains an exhaustive, one-integer grep count.
 
 Literal grep remains exhaustive across real side chats. Ranked meaning/recall
 surfaces instead treat a root chat and its spawned children as one conversation
@@ -197,8 +213,10 @@ Ingest safety caps remain labeled.
 
 When an agent's conversation compacts, the summary is lossy - it keeps what
 was decided but drops the exact values and paths those decisions rest on.
-`agrep postcompact` serves the same session's proven pre-boundary tail,
-bounded, so a resumed agent recovers the dropped detail instead of guessing:
+`agrep postcompact` serves the same conversation's proven pre-boundary tail,
+bounded, so a resumed agent recovers the dropped detail instead of guessing.
+When compaction started a fresh session (the pi/oh-my-pi shape), the tail is
+served from the conversation's family root and says so:
 
 ```
 agrep postcompact                 # this session's recent pre-compact turns
@@ -330,7 +348,7 @@ shipped with the installed version.
 on stdout - one compact object per event, flushed per line, so it pipes into a
 statusline, a dashboard, or another agent's monitor. The event shapes are a
 supported interface. Today the hook-free live readers cover Claude, Codex,
-OpenCode, Antigravity, and Cursor; indexing covers every adapter.
+OpenCode, Antigravity, Cursor, and pi/oh-my-pi; indexing covers every adapter.
 
 ```
 agrep tail                 # turn ends, all supported agents

@@ -97,6 +97,55 @@ class PacketTests(unittest.TestCase):
         self.assertEqual(
             packet["omissions"]["delegated_sessions"], "policy_excluded")
 
+    def test_compacted_resume_serves_the_family_root_tail(self) -> None:
+        """pi/omp compaction starts a NEW session whose recap is turn 1: the
+        pre-boundary tail lives in the family root. The walk crosses into
+        the root, capped at the boundary row's timestamp so nothing written
+        after the compaction moment leaks in as pre-compact context."""
+        db = _db()
+        try:
+            db.executemany(
+                "INSERT INTO msgs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (60, "resumed", 1, 8, "pi", "agrep", "", "recap",
+                     "recap", "Resume prior conversation.", None),
+                    (61, "resumed", 2, 9, "pi", "agrep", "m", "explicit",
+                     "user", "post-compact prompt", None),
+                    # written to the root after the compaction moment: excluded
+                    (62, "root", 9, 9, "codex", "agrep", "m", "explicit",
+                     "user", "late root row after the boundary", None),
+                ])
+            family = session_context.CallingFamily(
+                "resumed", "root", frozenset({"root", "resumed"}), True, 1)
+            packet = postcompact.read_packet(db, family)
+        finally:
+            db.close()
+        self.assertEqual(packet["status"], "recovered")
+        self.assertEqual(packet["selection"]["window_source"], "family_root")
+        self.assertEqual(
+            [(row["session"], row["turn"], row["who"])
+             for row in packet["rows"]],
+            [("root", 3, "user"), ("root", 3, "agent"),
+             ("root", 7, "user"), ("root", 7, "agent")],
+        )
+        rendered = "\n".join(row["text"] for row in packet["rows"])
+        self.assertNotIn("late root row after the boundary", rendered)
+        self.assertNotIn("post-compact prompt", rendered)
+        self.assertIn("window served from the family root",
+                      postcompact._human(packet))
+
+    def test_caller_window_still_wins_when_it_has_content(self) -> None:
+        # An in-place compaction (claude/codex shape) never crosses into the
+        # root: the caller session's own window serves.
+        db = _db()
+        try:
+            packet = postcompact.read_packet(db, _family())
+        finally:
+            db.close()
+        self.assertEqual(packet["selection"]["window_source"], "caller")
+        self.assertNotIn("window served from the family root",
+                         postcompact._human(packet))
+
     def test_adjacent_boundaries_fall_back_to_the_nearest_filled_window(self) -> None:
         # An archive resume immediately re-compacted leaves recap rows on
         # adjacent turns; the packet must serve the nearest earlier window
@@ -411,15 +460,23 @@ class CliTests(unittest.TestCase):
 
     def test_explicit_session_with_family_but_no_recap_retries_then_names_it(
             self) -> None:
-        # A session indexed before its compaction landed has a family but no
-        # recap turn (the omp report): retry one synchronous ingest, then name
-        # the session in the refusal, never "this caller".
-        dbs = [_db(), _db()]
+        """A session indexed before its compaction landed has a family but
+        no recap turn (the omp report): every scheduled retry re-ingests
+        without sleeping the suite, then the refusal names the session,
+        never "this caller"."""
+        opened = []
+
+        def _fresh_db():
+            opened.append(_db())
+            return opened[-1]
+
         ingested = []
         try:
             with mock.patch.object(
-                    postcompact.indexd_runtime, "ensure_index",
-                    return_value=True), \
+                    postcompact, "_RETRY_PAUSES_S", (0.0, 0.0)), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "ensure_index",
+                        return_value=True), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "build_index",
                         side_effect=lambda quiet: ingested.append(True)), \
@@ -429,7 +486,7 @@ class CliTests(unittest.TestCase):
                     mock.patch.object(
                         postcompact.session_context,
                         "_open_session_family_index",
-                        side_effect=lambda: dbs.pop(0)), \
+                        side_effect=_fresh_db), \
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
@@ -439,26 +496,93 @@ class CliTests(unittest.TestCase):
                         contextlib.redirect_stderr(stderr):
                     rc = postcompact.main(["--session", "root"])
         finally:
-            for db in dbs:
+            for db in opened:
                 db.close()
         self.assertEqual(rc, 2)
-        self.assertEqual(ingested, [True])
+        self.assertEqual(ingested, [True, True])
         self.assertIn("session root", stderr.getvalue())
         self.assertNotIn("this caller", stderr.getvalue())
 
-    def test_explicit_session_honors_the_freshness_gate(self) -> None:
-        db = _db()
+    def test_boundary_landing_during_the_retry_window_recovers(self) -> None:
+        # The observed race: the hook fires before the freshly-compacted
+        # session flushes its first store write. The boundary appears between
+        # attempts; the bounded retry serves it instead of refusing.
+        opened = []
+
+        def _fresh_db():
+            opened.append(_db())
+            return opened[-1]
+
+        states = [None, None, ("root", frozenset({"root", "child"}), 8)]
         try:
             with mock.patch.object(
-                    postcompact.indexd_runtime, "ensure_index",
-                    return_value=True), \
+                    postcompact, "_RETRY_PAUSES_S", (0.0, 0.0)), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "ensure_index",
+                        return_value=True), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "agent_freshness_notice",
+                        return_value=None), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "build_index",
+                        side_effect=lambda quiet: True), \
+                    mock.patch.object(
+                        postcompact.common, "ingest_bin",
+                        return_value=mock.Mock(exists=lambda: True)), \
+                    mock.patch.object(
+                        postcompact.session_context,
+                        "_open_session_family_index",
+                        side_effect=_fresh_db), \
+                    mock.patch.object(
+                        postcompact.session_context,
+                        "_indexed_calling_family_state_in_db",
+                        side_effect=lambda db, session: states.pop(0)):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    rc = postcompact.main(["--session", "root", "--json"])
+        finally:
+            for db in opened:
+                db.close()
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["status"], "recovered")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_explicit_session_freshness_story_degrades_to_a_partial_packet(
+            self) -> None:
+        """A live freshness story is staleness-shaped first (each retry
+        re-ingests), then disclosure: the proven boundary still serves as an
+        explicitly partial packet carrying the story, never a confident
+        'recovered' and never a refusal (the omp report: the compacting
+        session's own churn kept the index "behind" at exactly the moment
+        the packet exists for)."""
+        opened = []
+
+        def _fresh_db():
+            opened.append(_db())
+            return opened[-1]
+
+        ingested = []
+        try:
+            with mock.patch.object(
+                    postcompact, "_RETRY_PAUSES_S", (0.0,)), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "ensure_index",
+                        return_value=True), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "build_index",
+                        side_effect=lambda quiet: ingested.append(True)), \
+                    mock.patch.object(
+                        postcompact.common, "ingest_bin",
+                        return_value=mock.Mock(exists=lambda: True)), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "agent_freshness_notice",
                         return_value="index is tearing down"), \
                     mock.patch.object(
                         postcompact.session_context,
                         "_open_session_family_index",
-                        return_value=db), \
+                        side_effect=_fresh_db), \
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
@@ -467,13 +591,68 @@ class CliTests(unittest.TestCase):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
                         contextlib.redirect_stderr(stderr):
-                    rc = postcompact.main(["--session", "root"])
+                    rc = postcompact.main(["--session", "root", "--json"])
         finally:
-            db.close()
-        # a torn/failing index must refuse the named path too, never render a
-        # confident 'recovered' beside no freshness disclosure
+            for db in opened:
+                db.close()
         self.assertEqual(rc, 2)
-        self.assertIn("index is tearing down", stderr.getvalue())
+        self.assertEqual(ingested, [True])
+        packet = json.loads(stdout.getvalue())
+        self.assertEqual(packet["status"], "partial")
+        self.assertEqual(
+            packet["coverage"]["index_freshness"], "index is tearing down")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_unresolvable_generation_serves_the_last_published_snapshot(
+            self) -> None:
+        """A continuously writing conversation can starve the strict
+        generation-stable open forever (the second omp report): the final
+        attempt serves the boundary from the last published snapshot as an
+        explicitly partial packet naming the churn."""
+        opened = []
+
+        def _fresh_db():
+            opened.append(_db())
+            return opened[-1]
+
+        try:
+            with mock.patch.object(
+                    postcompact, "_RETRY_PAUSES_S", (0.0,)), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "ensure_index",
+                        return_value=True), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "build_index",
+                        side_effect=lambda quiet: True), \
+                    mock.patch.object(
+                        postcompact.common, "ingest_bin",
+                        return_value=mock.Mock(exists=lambda: True)), \
+                    mock.patch.object(
+                        postcompact.session_context,
+                        "_open_session_family_index",
+                        return_value=None), \
+                    mock.patch.object(
+                        postcompact, "_lenient_family_snapshot",
+                        side_effect=_fresh_db), \
+                    mock.patch.object(
+                        postcompact.session_context,
+                        "_indexed_calling_family_state_in_db",
+                        return_value=("root",
+                                      frozenset({"root", "child"}), 8)):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    rc = postcompact.main(["--session", "root", "--json"])
+        finally:
+            for db in opened:
+                db.close()
+        self.assertEqual(rc, 2)
+        packet = json.loads(stdout.getvalue())
+        self.assertEqual(packet["status"], "partial")
+        self.assertEqual(
+            packet["coverage"]["index_freshness"],
+            postcompact._FAMILY_CHURN_NOTICE)
+        self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

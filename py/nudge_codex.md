@@ -28,7 +28,9 @@ Run `agrep --help` once before first use; `agrep <command> --help` documents
 each command's flags and caveats.
 
 - `agrep chats <topic or quote>` - find a prior conversation by identity or
-  indexed contents, then run its printed `agrep around` follow-up.
+  indexed contents, then run its printed `agrep around` follow-up. Bare
+  `agrep chats` lists the newest sessions first: use it for "recent/last/
+  latest sessions", not board.
 - `agrep recall "<distinctive phrase>"` - prior solutions from OTHER
   sessions, bounded context.
 - `agrep around <handle>` - open a hit at its source before citing it.
@@ -37,7 +39,8 @@ each command's flags and caveats.
   needed. Do not use recall for this session's own facts: recall hides the
   current context window, demotes this session's turns to ~self (`--self`
   overrides), and ranks your tail against lookalikes from all history.
-- `agrep board --once` - live agent activity right now.
+- `agrep board --once` - live agent activity right now (running/active
+  questions only; recent-history questions are `chats`).
 
 ## Example: recovering after a compaction
 

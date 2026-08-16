@@ -295,6 +295,7 @@ class AgentRegistryTests(unittest.TestCase):
             tail.main()
         self.assertEqual(stopped.exception.code, 0)
         self.assertIn("/".join(registry.LIVE_AGENTS), stdout.getvalue())
+        self.assertIn("omp", stdout.getvalue())
 
     def test_tail_event_filter_vocabulary_matches_the_emitter(self) -> None:
         tree = ast.parse(Path(live.__file__).read_text(encoding="utf-8"))

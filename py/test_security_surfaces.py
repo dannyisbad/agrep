@@ -205,14 +205,14 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
 
     def test_installed_wheel_smoke_pins_the_source_instruction_contract(self):
         version, digest, codex_digest = wheel_smoke._source_nudge_contract()
-        self.assertEqual(version, 36)
+        self.assertEqual(version, 37)
         self.assertEqual(
             digest,
-            "fcccd2c6068f34ef7c5385a6fbe280d0e4d75a086f9e8d1bfdb14e7cf75a8c8b",
+            "4b7040519c28031e580256866f5f0cbc8221d376a1183aac128e9a0e185c7c1d",
         )
         self.assertEqual(
             codex_digest,
-            "240065c9557ba974a6d8ca88869a3d2aec51d359d0acb1dd18d8d50b19a17adb",
+            "ab23bf6cab082bb9eaaf8d732bf6ea038aca90fde2ac4b1788751cb3c4315b3b",
         )
 
     def test_installed_wheel_smoke_attests_the_written_instruction_body(self):

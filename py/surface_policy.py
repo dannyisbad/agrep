@@ -1983,12 +1983,18 @@ def semantic_lane_cause(reason: str) -> str | None:
     return None
 
 
-def semantic_keyword_only_notice(status: Mapping | None = None) -> str:
+def semantic_keyword_only_notice(
+        status: Mapping | None = None, *, brief: bool = False) -> str:
     """Automatic-lane fallback with one factual explanation - transient or not.
 
     Dropping non-transient reasons was the bug: on a box whose model was
     never fetched the lane reported `refresh model-not-cached` and the
-    reader got a bare hedge with no cause and no lever, forever."""
+    reader got a bare hedge with no cause and no lever, forever.
+    ``brief`` renders the bare story for a cause the reader was already told
+    this window (common.semantic_notice_brief owns that decision): the lane
+    state is disclosed on every render, the lecture only once per outage."""
+    if brief:
+        return SEMANTIC_LANE_POLICY.keyword_only
     line = SEMANTIC_LANE_POLICY.keyword_only
     reason = str((status or {}).get("reason") or "")
     if _semantic_index_update_retryable(reason):

@@ -15,8 +15,15 @@ uvx agrep "race condition"   # zero-install try (uv runs the real PyPI package)
 agrep "race condition"     # first run indexes your agent stores, then greps
 ```
 
-Global npm installs also warm uv's ephemeral cache with the matching PyPI tool.
-npm's own `bin` shim remains the PATH entrypoint, so the install does not create
+Global npm installs run one-time setup from postinstall
+(`agrep setup --yes --no-semantic --no-archive`): the index is built and the
+detected agents are taught immediately; every written block is disclosed in
+the setup output and undone by `agrep remove`. That includes the
+uninstall-cleanup sentinel (a launchd agent, systemd user units, or a
+scheduled task) whose only job is stripping agrep's own blocks and hooks if
+the package disappears. Set `AGREP_NO_AUTO_SETUP=1` to only warm uv's cache
+instead, or `AGREP_SKIP_POSTINSTALL=1` to skip postinstall entirely. npm's
+own `bin` shim remains the PATH entrypoint, so the install does not create
 or replace a persistent uv-managed command.
 
 The npm shim pins the matching PyPI version under the hood, so npm and PyPI releases
