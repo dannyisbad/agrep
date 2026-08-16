@@ -23,8 +23,14 @@ use std::path::Path;
 /// Compare against the checked-in golden, or rewrite it under UPDATE_GOLDEN=1. On mismatch,
 /// report the section, first differing line, and a little context - not just "mismatch".
 fn check(agent: &str, home: &Path) {
+    check_fixture(agent, agent, home);
+}
+
+/// One adapter can own several fixture schemas (opencode v1/v2); the fixture
+/// name picks the golden while `agent` stays the real adapter under test.
+fn check_fixture(agent: &str, fixture: &str, home: &Path) {
     let got = run_ingest(agent, home);
-    let golden = fixtures_dir().join(agent).join("golden.txt");
+    let golden = fixtures_dir().join(fixture).join("golden.txt");
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         fs::write(&golden, &got).unwrap();
         eprintln!("  updated golden: {}", golden.display());
@@ -92,6 +98,13 @@ fn golden_cline() {
 fn golden_opencode() {
     let home = opencode_home();
     check("opencode", &home);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn golden_opencode_v2() {
+    let home = opencode_v2_home();
+    check_fixture("opencode", "opencode_v2", &home);
     let _ = fs::remove_dir_all(&home);
 }
 

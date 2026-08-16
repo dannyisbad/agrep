@@ -4,19 +4,29 @@
 //! READ-ONLY through SQLite's live snapshot protocol, so committed WAL rows are visible
 //! without disturbing a running writer; a DB that fails to open is skipped (never panics).
 //!
-//! Schema (identical across DBs):
-//!   session(id, directory, ...)            -- directory -> project_name
-//!   message(id, session_id, data JSON {role}, time_created ms)
-//!   part(message_id, session_id, data JSON {type,text}, time_created)
+//! Two on-disk schemas exist and are detected per database (opencode 2.x migrates
+//! in place, dropping the old tables):
 //!
-//! the user's text = concat of part.data.text for type=="text" parts whose message
-//! has role=="user". But opencode bundles non-user content into the SAME user
-//! message as extra "text" parts: tool-call narration ("Called the <X> tool with
-//! the following input: {...}"), tool results ("Image read successfully"), and
-//! file attachments (`<path>...</path><type>file</type><content>...`). Real corpora
-//! mix these with a genuine typed part in the same message, so filtering is done per
-//! PART (drop injected wrappers, then concatenate survivors) - never per message.
-//! We under-include rather than risk labeling agent/system text as the user's.
+//! v1 (opencode 0.x/1.x):
+//!   session(id, directory, parent_id, title, ...)   -- directory -> project_name
+//!   message(id, session_id, data JSON {role,modelID}, time_created ms)
+//!   part(message_id, session_id, data JSON {type,text,tool,callID,state}, time_created)
+//!
+//! v2 (opencode 2.x):
+//!   session_v2(id, parent_id, directory, title, ...)
+//!   session_message(id, session_id, type 'user'|'assistant', seq, time_created ms,
+//!                   data JSON) -- user: {text}; assistant: {model:{id},
+//!                   content:[{type:'reasoning'|'text'|'tool', ...}]}; a tool part
+//!                   carries {id,name,state:{status,input,content:[{type:'text',text}]}}
+//!
+//! the user's text = concat of text parts whose message has role=="user". opencode v1
+//! bundles non-user content into the SAME user message as extra "text" parts:
+//! tool-call narration ("Called the <X> tool with the following input: {...}"),
+//! tool results ("Image read successfully"), and file attachments
+//! (`<path>...</path><type>file</type><content>...`). Real corpora mix these with a
+//! genuine typed part in the same message, so filtering is done per PART (drop
+//! injected wrappers, then concatenate survivors) - never per message. We
+//! under-include rather than risk labeling agent/system text as the user's.
 
 use crate::ingest::registry::{metadata_is_link, path_eq, relative_path};
 use crate::ingest::{
@@ -247,11 +257,101 @@ fn flush_text(
     }
 }
 
-/// Pull messages and tool events from one opencode database in one `part` table scan.
-///
-/// SQLite filters, extracts, and caps fields before they cross the FFI. SQLite text
-/// functions stop at embedded NUL, so only those exceptional outputs cross as a full
-/// BLOB and are capped losslessly in Rust.
+/// One row per readable text/tool unit, shaped identically for both schemas so the
+/// accumulation pipeline below stays shared. SQLite filters, extracts, and caps
+/// fields before they cross the FFI. SQLite text functions stop at embedded NUL,
+/// so only those exceptional outputs cross as a full BLOB and are capped losslessly
+/// in Rust.
+const PART_SQL_V1: &str = "SELECT m.session_id, s.directory, m.time_created, m.id, \
+            CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.role') END, \
+            CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.modelID') END, \
+            CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.type') END, \
+            CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.text') END, \
+            CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.tool') END, \
+            CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.callID') END, \
+            CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.state.status') END, \
+            CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.state.input') END, \
+            CAST(CASE WHEN instr(CAST(coalesce(CASE WHEN json_valid(p.data) \
+                THEN json_extract(p.data,'$.state.output') END,'') AS BLOB),X'00') > 0 \
+                THEN coalesce(CASE WHEN json_valid(p.data) \
+                    THEN json_extract(p.data,'$.state.output') END,'') \
+                ELSE substr(coalesce(CASE WHEN json_valid(p.data) \
+                    THEN json_extract(p.data,'$.state.output') END,''),1,4000) \
+                END AS BLOB), \
+            length(coalesce(CASE WHEN json_valid(p.data) \
+                THEN json_extract(p.data,'$.state.output') END,'')), \
+            length(CAST(coalesce(CASE WHEN json_valid(p.data) \
+                THEN json_extract(p.data,'$.state.output') END,'') AS BLOB)), \
+            p.time_created, p.id, COALESCE(s.parent_id,''), s.id IS NOT NULL, \
+            json_valid(m.data), json_valid(p.data) \
+     FROM part p \
+     JOIN message m ON p.message_id = m.id \
+     LEFT JOIN session s ON m.session_id = s.id \
+     WHERE (p.data LIKE '%\"type\":\"text\"%' OR p.data LIKE '%\"type\":\"tool\"%') \
+       AND CASE WHEN json_valid(p.data) \
+           THEN json_extract(p.data,'$.type') IN ('text','tool') ELSE 1 END \
+     ORDER BY m.session_id, m.time_created, m.id, p.time_created, p.id";
+
+const CHILD_SQL_V1: &str = "SELECT id, parent_id, COALESCE(title,''), time_created \
+     FROM session WHERE parent_id IS NOT NULL AND parent_id != ''";
+
+/// v2 keeps every column position/type of v1: content parts live inline in
+/// session_message.data, so the assistant side expands through json_each while the
+/// user side is one synthetic 'text' row. A tool part's output is state.output when
+/// present (older shape) else its state.content text blocks joined by newline.
+const PART_SQL_V2: &str = "SELECT m.session_id, s.directory, m.time_created, m.id, \
+            m.type, \
+            CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.model.id') END, \
+            CASE WHEN m.type='user' THEN 'text' \
+                 ELSE COALESCE(json_extract(c.value,'$.type'),'') END, \
+            CASE WHEN m.type='user' THEN CASE WHEN json_valid(m.data) \
+                     THEN json_extract(m.data,'$.text') END \
+                 ELSE json_extract(c.value,'$.text') END, \
+            json_extract(c.value,'$.name'), \
+            json_extract(c.value,'$.id'), \
+            json_extract(c.value,'$.state.status'), \
+            json_extract(c.value,'$.state.input'), \
+            CAST(CASE WHEN instr(CAST(coalesce(json_extract(c.value,'$.state.output'), \
+                    (SELECT group_concat(json_extract(j.value,'$.text'), char(10)) \
+                     FROM json_each(c.value,'$.state.content') j \
+                     WHERE json_extract(j.value,'$.type')='text'),'') AS BLOB),X'00') > 0 \
+                THEN coalesce(json_extract(c.value,'$.state.output'), \
+                    (SELECT group_concat(json_extract(j.value,'$.text'), char(10)) \
+                     FROM json_each(c.value,'$.state.content') j \
+                     WHERE json_extract(j.value,'$.type')='text'),'') \
+                ELSE substr(coalesce(json_extract(c.value,'$.state.output'), \
+                    (SELECT group_concat(json_extract(j.value,'$.text'), char(10)) \
+                     FROM json_each(c.value,'$.state.content') j \
+                     WHERE json_extract(j.value,'$.type')='text'),''),1,4000) \
+                END AS BLOB), \
+            length(coalesce(json_extract(c.value,'$.state.output'), \
+                (SELECT group_concat(json_extract(j.value,'$.text'), char(10)) \
+                 FROM json_each(c.value,'$.state.content') j \
+                 WHERE json_extract(j.value,'$.type')='text'),'')), \
+            length(CAST(coalesce(json_extract(c.value,'$.state.output'), \
+                (SELECT group_concat(json_extract(j.value,'$.text'), char(10)) \
+                 FROM json_each(c.value,'$.state.content') j \
+                 WHERE json_extract(j.value,'$.type')='text'),'') AS BLOB)), \
+            COALESCE(json_extract(c.value,'$.time.created'), m.time_created), \
+            m.id || ':' || COALESCE(c.key,'u'), \
+            COALESCE(s.parent_id,''), s.id IS NOT NULL, \
+            json_valid(m.data), \
+            CASE WHEN m.type='assistant' AND json_valid(m.data) \
+                 THEN CASE WHEN c.value IS NULL THEN 0 ELSE json_valid(c.value) END \
+                 ELSE json_valid(m.data) END \
+     FROM session_message m \
+     LEFT JOIN session_v2 s ON m.session_id = s.id \
+     LEFT JOIN json_each(CASE WHEN m.type='assistant' AND json_valid(m.data) \
+               THEN json_extract(m.data,'$.content') END) c \
+     WHERE m.type='user' \
+        OR (m.type='assistant' AND NOT json_valid(m.data)) \
+        OR json_extract(c.value,'$.type') IN ('text','tool') \
+     ORDER BY m.session_id, m.time_created, m.id, COALESCE(c.key,-1)";
+
+const CHILD_SQL_V2: &str = "SELECT id, parent_id, COALESCE(title,''), time_created \
+     FROM session_v2 WHERE parent_id IS NOT NULL AND parent_id != ''";
+
+/// Pull messages and tool events from one opencode database in one scan.
 fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
     // seen = message-query part rows plus inspected child-session rows
     let tally = crate::intake::file("opencode", path);
@@ -268,40 +368,27 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
         }
     };
-
-    // CASE is lazy in SQLite, so malformed candidate rows remain countable without
-    // letting json_extract abort the statement and hide later valid rows.
-    let mut stmt = match conn.prepare(
-        "SELECT m.session_id, s.directory, m.time_created, m.id, \
-                CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.role') END, \
-                CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.modelID') END, \
-                CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.type') END, \
-                CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.text') END, \
-                CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.tool') END, \
-                CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.callID') END, \
-                CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.state.status') END, \
-                CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.state.input') END, \
-                CAST(CASE WHEN instr(CAST(coalesce(CASE WHEN json_valid(p.data) \
-                    THEN json_extract(p.data,'$.state.output') END,'') AS BLOB),X'00') > 0 \
-                    THEN coalesce(CASE WHEN json_valid(p.data) \
-                        THEN json_extract(p.data,'$.state.output') END,'') \
-                    ELSE substr(coalesce(CASE WHEN json_valid(p.data) \
-                        THEN json_extract(p.data,'$.state.output') END,''),1,4000) \
-                    END AS BLOB), \
-                length(coalesce(CASE WHEN json_valid(p.data) \
-                    THEN json_extract(p.data,'$.state.output') END,'')), \
-                length(CAST(coalesce(CASE WHEN json_valid(p.data) \
-                    THEN json_extract(p.data,'$.state.output') END,'') AS BLOB)), \
-                p.time_created, p.id, COALESCE(s.parent_id,''), s.id IS NOT NULL, \
-                json_valid(m.data), json_valid(p.data) \
-         FROM part p \
-         JOIN message m ON p.message_id = m.id \
-         LEFT JOIN session s ON m.session_id = s.id \
-         WHERE (p.data LIKE '%\"type\":\"text\"%' OR p.data LIKE '%\"type\":\"tool\"%') \
-           AND CASE WHEN json_valid(p.data) \
-               THEN json_extract(p.data,'$.type') IN ('text','tool') ELSE 1 END \
-         ORDER BY m.session_id, m.time_created, m.id, p.time_created, p.id",
+    // opencode 2.x migrates in place and drops the v1 tables, so table presence is
+    // the schema authority; an unreadable sqlite_master is a failed read, not v1.
+    let v2 = match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type='table' AND name='session_message')",
+        [],
+        |row| row.get::<_, i64>(0),
     ) {
+        Ok(flag) => flag != 0,
+        Err(e) => {
+            tally.error(&format!("schema probe: {e}"));
+            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+        }
+    };
+    let (part_sql, child_sql) = if v2 {
+        (PART_SQL_V2, CHILD_SQL_V2)
+    } else {
+        (PART_SQL_V1, CHILD_SQL_V1)
+    };
+
+    let mut stmt = match conn.prepare(part_sql) {
         Ok(s) => s,
         Err(e) => {
             tally.error(&format!("part query: {e}"));
@@ -541,10 +628,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
 
     // Subagent sessions: a child session (parent_id set) becomes a subagent_start event
     // in the parent. The child is independently viewable, so just link it.
-    let child_query = conn.prepare(
-        "SELECT id, parent_id, COALESCE(title,''), time_created \
-         FROM session WHERE parent_id IS NOT NULL AND parent_id != ''",
-    );
+    let child_query = conn.prepare(child_sql);
     // A child row or query the reader could not decode leaves that link unobserved, not
     // absent; the subagent scope is then uncovered and cannot license wholesale replacement.
     let mut child_scope_covered = true;

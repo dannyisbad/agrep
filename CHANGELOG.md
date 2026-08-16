@@ -38,6 +38,16 @@
   `pi.live` registry capability is flipped to supported and `--agent omp`
   aliases to pi everywhere. Previously the board was blind to a box full of
   working omp agents.
+- opencode 2.x is supported alongside 1.x: opencode 2 migrates its SQLite
+  store in place (session_v2/session_message with inline content parts,
+  replacing session/message/part), which made the source unreadable and -
+  because an unreadable source retains the whole prior generation rather
+  than silently deleting its chats - froze ALL agents' freshness on any box
+  that upgraded opencode. Ingest and the live reader now detect the schema
+  per database and read both; verified against a real opencode 2 store.
+- pi and oh-my-pi sessions resume natively: `agrep resume <id>` runs
+  `omp -r <id>` (or `pi -r`, whichever fork owns the session's store root)
+  from the session's recorded working directory.
 - `postcompact` now recovers on pi/oh-my-pi compacted resumes. Four fixes,
   each observed live on omp: staleness-shaped boundary misses retry on a
   short bounded schedule (one immediate ingest, then ~1s and ~3s later)

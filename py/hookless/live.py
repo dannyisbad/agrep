@@ -181,6 +181,40 @@ def _opencode_noise(t: str) -> bool:
     ))
 
 
+def _opencode_model_id(message: dict, session_model) -> str:
+    for candidate in (message.get("model"), session_model):
+        if isinstance(candidate, dict):
+            model = candidate.get("id")
+            if isinstance(model, str):
+                return model
+        elif isinstance(candidate, str) and candidate:
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                return candidate
+            if isinstance(decoded, dict) and isinstance(decoded.get("id"), str):
+                return decoded["id"]
+            if isinstance(decoded, str):
+                return decoded
+    return ""
+
+
+def _opencode_v2_output(state: dict):
+    output = state.get("output")
+    if isinstance(output, str):
+        return output
+    content = state.get("content")
+    if isinstance(content, list):
+        texts = [
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        ]
+        if texts:
+            return "".join(texts)
+    return output or ""
+
+
 def _snip(s, n=SNIP):
     s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False)
     s = " ".join(s.split())
@@ -511,6 +545,7 @@ class LiveWatcher(threading.Thread):
         self._oc_mutable_parts: dict[str, set[str]] = {}    # db path -> in-place part ids
         self._oc_unfinished_messages: dict[str, set[str]] = {}  # db path -> message ids
         self._oc_session_meta: dict[str, tuple[str, str]] = {}  # session -> (dir, title)
+        self._oc_schema: dict[str, str] = {}                  # db path -> v1/v2
         # cursor (the editor's built-in agent): state.vscdb `cursorDiskKV`, tailed by
         # bubble rowid the same way opencode is polled by part.time_updated. See _tick_cursor.
         self._cur_rowid: dict[str, int] = {}       # db path -> consumed bubbleId rowid watermark
@@ -1825,6 +1860,25 @@ class LiveWatcher(threading.Thread):
                 continue
             self._poll_opencode_db(path, first)
 
+    def _opencode_schema_for(self, conn: sqlite3.Connection, path: str) -> str:
+        """Identify the live database generation once per path.
+
+        OpenCode's v2 migration drops every v1 table, so the presence of
+        ``session_message`` is the unambiguous cutover signal.
+        """
+        cached = self._oc_schema.get(path)
+        if cached:
+            return cached
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name IN ('session_message','part')")
+        }
+        schema = "v2" if "session_message" in tables else "v1" if "part" in tables else ""
+        if schema:
+            self._oc_schema[path] = schema
+        return schema
+
     def _poll_opencode_db(self, path: str, first: bool) -> None:
         # read-only WITHOUT immutable: we *want* to see the writer's new pages.
         try:
@@ -1836,6 +1890,12 @@ class LiveWatcher(threading.Thread):
         conn = None
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=0.25)
+            schema = self._opencode_schema_for(conn, path)
+            if schema == "v2":
+                self._poll_opencode_v2(conn, path, first)
+                return
+            if schema != "v1":
+                return
             if first:
                 row = conn.execute("SELECT COALESCE(MAX(time_updated),0) FROM part").fetchone()
                 # seed: start from 2 minutes back so a just-started session shows context
@@ -2005,6 +2065,175 @@ class LiveWatcher(threading.Thread):
                 self._oc_done[sess] = done_ts
                 self._emit({"agent": "opencode", "session": sess, "ts": done_ts,
                             "type": "done"})
+
+    def _poll_opencode_v2(
+            self, conn: sqlite3.Connection, path: str, first: bool) -> None:
+        """Poll OpenCode 2's message envelopes while preserving v1 live semantics.
+
+        Unlike v1, each row owns every text and tool part for one message and mutates
+        in place while streaming. Unfinished rows therefore replace v1's mutable-part
+        rechecks, while the updated/id watermark still drains bounded backlogs safely.
+        """
+        if first:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(time_updated),0) FROM session_message"
+            ).fetchone()
+            seed = max(0, (row[0] or 0) - 120_000)
+            self._oc_watermark[path] = (seed, "")
+            self._oc_msg_wm[path] = (seed, "")
+
+        message_select = (
+            "SELECT sm.id, sm.session_id, sm.type, sm.time_created, sm.time_updated, "
+            "       sm.data, COALESCE(s.directory,''), COALESCE(s.title,''), "
+            "       s.parent_id, s.id IS NOT NULL, COALESCE(s.model,'') "
+            "FROM session_message sm "
+            "LEFT JOIN session_v2 s ON sm.session_id = s.id ")
+        wm_ts, wm_id = self._oc_watermark[path]
+        primary_rows = conn.execute(
+            message_select +
+            "WHERE sm.time_updated > ? OR (sm.time_updated = ? AND sm.id > ?) "
+            "ORDER BY sm.time_updated, sm.id LIMIT 800",
+            (wm_ts, wm_ts, wm_id)).fetchall()
+
+        unfinished = self._oc_unfinished_messages.setdefault(path, set())
+        row_ids = {row[0] for row in primary_rows}
+        recheck_rows = []
+        for mid in tuple(unfinished - row_ids):
+            row = conn.execute(
+                message_select + "WHERE sm.id = ?", (mid,)).fetchone()
+            if row is None:
+                unfinished.discard(mid)
+            else:
+                recheck_rows.append(row)
+
+        for mid, _sess, _role, _tc, tu, *_rest in primary_rows:
+            watermark = (tu, mid)
+            self._oc_watermark[path] = max(
+                self._oc_watermark[path], watermark)
+            self._oc_msg_wm[path] = max(self._oc_msg_wm[path], watermark)
+
+        if len(self._oc_part_st) > 8000:
+            self._oc_part_st.clear()
+            self._oc_text_messages.clear()
+        mutable_parts = self._oc_mutable_parts.setdefault(path, set())
+        for row in (*primary_rows, *recheck_rows):
+            self._opencode_v2_message(row, unfinished, mutable_parts)
+
+    def _opencode_v2_message(
+            self, row: tuple, unfinished: set[str],
+            mutable_parts: set[str]) -> None:
+        (mid, sess, role, time_created, time_updated, raw_message, directory,
+         title, parent_id, has_session, session_model) = row
+        try:
+            message = json.loads(raw_message)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(message, dict):
+            return
+
+        timing = message.get("time")
+        timing = timing if isinstance(timing, dict) else {}
+        ts = timing.get("created") or time_created
+        if role == "assistant":
+            ts = time_updated
+        base = {
+            "agent": "opencode", "session": sess, "ts": ts,
+            "project": _project_of(directory) if directory else "",
+            "title": title,
+        }
+        model = _opencode_model_id(message, session_model)
+        if model:
+            base["model"] = model
+        if parent_id:
+            base["sub_session"] = True
+
+        if role == "user":
+            unfinished.discard(mid)
+            text = message.get("text")
+            previous = self._oc_text_messages.get(mid)
+            if (isinstance(text, str) and text.strip()
+                    and not _opencode_noise(text) and previous is None
+                    and has_session):
+                self._oc_text_messages[mid] = text
+                self._emit({**base, "type": "user", "text": _snip(text, MSG)})
+            return
+        if role != "assistant":
+            unfinished.discard(mid)
+            return
+
+        done_ts = timing.get("completed")
+        if done_ts:
+            unfinished.discard(mid)
+        else:
+            unfinished.add(mid)
+        content = message.get("content")
+        content = content if isinstance(content, list) else []
+        text = "\n".join(
+            part["text"] for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str) and part["text"].strip())
+        text_handled = False
+
+        for index, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if (part_type == "text" and not text_handled
+                    and isinstance(part.get("text"), str)
+                    and part["text"].strip()):
+                text_handled = True
+                previous = self._oc_text_messages.get(mid)
+                if text and previous != text and has_session:
+                    self._oc_text_messages[mid] = text
+                    self._emit({
+                        **base, "type": "reply", "text": _snip(text, MSG),
+                    })
+                continue
+            if part_type != "tool":
+                continue
+
+            state = part.get("state")
+            state = state if isinstance(state, dict) else {}
+            status = state.get("status", "")
+            running = status in ("pending", "running")
+            call_id = part.get("id") or f"{mid}:{index}"
+            if running:
+                mutable_parts.add(call_id)
+            else:
+                mutable_parts.discard(call_id)
+            previous = self._oc_part_st.get(call_id)
+            if (previous == status
+                    or (running and previous in ("pending", "running"))):
+                continue
+            self._oc_part_st[call_id] = status
+
+            part_time = part.get("time")
+            part_time = part_time if isinstance(part_time, dict) else {}
+            start = part_time.get("ran") or part_time.get("created")
+            end = part_time.get("completed")
+            event = {
+                **base,
+                "type": "tool" if running else "tool_done",
+                "name": part.get("name", "?"),
+                "input": _summarize_input(state.get("input")),
+                "output": _snip(_opencode_v2_output(state)),
+                "ok": {"completed": True, "error": False}.get(status),
+                "call_id": call_id,
+            }
+            if running and start:
+                event["ts"] = start
+            elif not running and end:
+                event["ts"] = end
+            if not running and start and end:
+                event["dur"] = max(0, end - start)
+            self._emit(event)
+
+        if done_ts and self._oc_done.get(sess) != done_ts:
+            self._oc_done[sess] = done_ts
+            self._emit({
+                "agent": "opencode", "session": sess, "ts": done_ts,
+                "type": "done",
+            })
 
     # ------------------------------------------------------------- cursor
 

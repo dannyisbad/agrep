@@ -6523,8 +6523,7 @@ mod tests {
         let messages = vec![message("root-a"), message("root-b")];
         let count = write_session_index(&messages, &sessions, &meta, "2:conflict").unwrap();
         assert_eq!(count, 1);
-        let row: serde_json::Value =
-            serde_json::from_slice(&fs::read(&sessions).unwrap()).unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&fs::read(&sessions).unwrap()).unwrap();
         assert_eq!(row["parent"], "root-a");
         assert!(meta.exists());
         fs::remove_dir_all(root).ok();

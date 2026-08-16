@@ -44,6 +44,7 @@ from hookless.locators import (
     opencode_db_name as _opencode_db_name,
     opencode_explicit_db,
     store_root,
+    store_roots,
 )
 from hookless.registry import (
     NATIVE_RESUME_AGENTS,
@@ -62,7 +63,74 @@ _RESUME = {
     "codex":       ("codex", ["resume"]),
     "opencode":    ("opencode", ["--session"]),
     "antigravity": ("agy", ["--conversation"]),
+    "pi":          ("omp", ["-r"]),
 }
+
+
+def _pi_session_file(session: str) -> tuple[str, str] | None:
+    """The pi/omp transcript owning ``session`` and its store root.
+
+    Layout is <root>/<slug-dir>/<stamp>_<session>.jsonl under both ~/.pi and
+    ~/.omp; the file name carries the full session id, so one bounded scandir
+    walk resolves it without opening transcripts."""
+    suffix = f"_{session}.jsonl"
+    for root in store_roots("pi"):
+        try:
+            slugs = list(os.scandir(root))
+        except OSError:
+            continue
+        for slug in slugs:
+            try:
+                if not slug.is_dir(follow_symlinks=False):
+                    continue
+                with os.scandir(slug.path) as files:
+                    for entry in files:
+                        if (entry.name.endswith(suffix)
+                                and entry.is_file(follow_symlinks=False)):
+                            return entry.path, root
+            except OSError:
+                continue
+    return None
+
+
+def _pi_cwd(session: str) -> str:
+    """The session header row carries the launch cwd (`type: session`)."""
+    found = _pi_session_file(session)
+    if not found:
+        return ""
+    try:
+        with open(found[0], encoding="utf-8", errors="replace") as stream:
+            for _ in range(64):
+                line = stream.readline()
+                if not line:
+                    break
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("type") == "session":
+                    cwd = row.get("cwd")
+                    return cwd if isinstance(cwd, str) else ""
+    except OSError:
+        return ""
+    return ""
+
+
+def _resume_exe(agent: str, session: str) -> str:
+    """pi sessions resume with the binary owning their store root (oh-my-pi is
+    a pi fork sharing the CLI surface, `-r <id>` included); when the owner is
+    not installed the sibling fork can open the shared format. Every other
+    agent is the static table."""
+    exe = _RESUME[agent][0]
+    if agent != "pi":
+        return exe
+    found = _pi_session_file(session)
+    parts = found[1].split(os.sep) if found else []
+    owner = "omp" if ".omp" in parts else "pi"
+    if shutil.which(owner):
+        return owner
+    sibling = "pi" if owner == "omp" else "omp"
+    return sibling if shutil.which(sibling) else owner
 
 
 def opencode_db_paths(home: str = HOME, *, include_default: bool = False) -> list[str]:
@@ -242,7 +310,8 @@ def _antigravity_cwd(session: str) -> str:
 
 
 _RESOLVERS = {"claude": _claude_cwd, "codex": _codex_cwd,
-              "opencode": _opencode_cwd, "antigravity": _antigravity_cwd}
+              "opencode": _opencode_cwd, "antigravity": _antigravity_cwd,
+              "pi": _pi_cwd}
 require_exact("native resume commands", _RESUME, NATIVE_RESUME_AGENTS)
 require_exact("native cwd resolvers", _RESOLVERS, NATIVE_RESUME_AGENTS)
 
@@ -660,7 +729,7 @@ def resume_in_place(agent: str, session: str) -> int:
     if _ID_RE.fullmatch(session or "") is None:
         print("invalid session id", file=sys.stderr)
         return 2
-    exe = _RESUME[agent][0]
+    exe = _resume_exe(agent, session)
     exe_path = shutil.which(exe)
     if not exe_path:
         print(f"the {agent} CLI ('{exe}') isn't on your PATH - install it to resume here.",
@@ -774,7 +843,7 @@ def open_session(agent: str, session: str, same_window: bool = True) -> dict:
         return {"ok": False, "error": unsupported}
     if _ID_RE.fullmatch(session or "") is None:
         return {"ok": False, "error": "invalid session id"}
-    exe = _RESUME[agent][0]
+    exe = _resume_exe(agent, session)
     exe_path = shutil.which(exe)
     if not exe_path:
         return {"ok": False,
