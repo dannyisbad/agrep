@@ -120,6 +120,24 @@ class TeachSafetyTest(unittest.TestCase):
                                create=True):
             self.assertTrue(Path(teach._pythonw()).exists())
 
+    def test_bus_unavailable_wording_survives_systemd_rewordings(self) -> None:
+        """Both observed generations of the no-user-bus refusal must prove
+        manager absence; unrelated failures must not."""
+        for wording in (
+            "Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and "
+            "$XDG_RUNTIME_DIR not defined",
+            "Failed to connect to user scope bus via local transport: "
+            "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined "
+            "(consider using --machine=<user>@.host --user)",
+        ):
+            self.assertTrue(teach._bus_unavailable_wording(wording), wording)
+        for wording in (
+            "Unit nonexistent.timer does not exist",
+            "Failed to enable unit: Access denied",
+            "",
+        ):
+            self.assertFalse(teach._bus_unavailable_wording(wording), wording)
+
     def test_compaction_handoff_is_an_explicit_recall_trigger(self) -> None:
         # The claude block must keep the same-session recovery route: the
         # measured failure is a resumed agent reaching for recall out of

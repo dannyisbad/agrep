@@ -1634,6 +1634,18 @@ def _sentinel_install_mac(targets: list[Path]) -> bool:
     return r.returncode == 0 and sentinel_armed()
 
 
+def _bus_unavailable_wording(text: str) -> bool:
+    """systemctl's no-user-bus refusal across systemd generations.
+
+    systemd 255 says "Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and
+    $XDG_RUNTIME_DIR not defined"; 259 reworded it to "Failed to connect to
+    user scope bus via local transport: ..." (observed: the reworded refusal
+    stopped proving absence, so `agrep remove` failed on every bus-less CI
+    box). Match the stable stem plus the bus subject, not the exact tail."""
+    lowered = text.lower()
+    return "failed to connect to" in lowered and "bus" in lowered
+
+
 def _sentinel_install_linux(targets: list[Path]) -> bool:
     if _data_dir_readonly():
         return False
@@ -1675,8 +1687,8 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
     _systemctl_user("disable", "--now", timer.name, path_unit.name)
     manager_unavailable = all(
         observed.get("state") == "unavailable"
-        or "failed to connect to bus" in (
-            f"{observed.get('stdout', '')} {observed.get('stderr', '')}".lower())
+        or _bus_unavailable_wording(
+            f"{observed.get('stdout', '')} {observed.get('stderr', '')}")
         for observed in (path_enable, timer_enable)
     )
     proven_unarmed = (
