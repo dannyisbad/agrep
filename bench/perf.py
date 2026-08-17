@@ -154,6 +154,7 @@ def _median_wall(cmd: list[str], n: int, *, require_success: bool = False,
 
 _MAX_PERF_SLACK = 10.0
 _METRIC_SLACK_ENVS = {
+    "ingest_cold_ms": "AGREP_PERF_INGEST_COLD_SLACK",
     "ingest_one_changed_ms": "AGREP_PERF_INGEST_ONE_CHANGED_SLACK",
     "streamed_first_hit_ms": "AGREP_PERF_STREAMED_FIRST_HIT_SLACK",
     "streamed_completion_ms": "AGREP_PERF_STREAMED_COMPLETION_SLACK",
