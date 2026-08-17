@@ -70,6 +70,28 @@ class EventByteLoadingTests(unittest.TestCase):
         self.assertNotEqual(before, main_after)
         self.assertNotEqual(before, wal_after)
 
+    @staticmethod
+    def _rewrite_past_change_tick(path, payload, restore_ns, store, member,
+                                  before):
+        """Rewrite with restored mtime until ChangeTime visibly ticks.
+
+        NTFS ChangeTime quantizes to the system-timer tick (~15.6ms): a fast
+        runner can complete a rewrite inside the tick that produced `before`,
+        which tests the clock, not the fence. The contract under test is that
+        a rewrite moves ChangeTime despite the restored mtime, so retry the
+        same mutation until the tick advances, bounded."""
+        import time as _time
+        deadline = _time.monotonic() + 10.0
+        while True:
+            path.write_bytes(payload)
+            os.utime(path, ns=(restore_ns, restore_ns))
+            after = events._event_store_stamp(store)
+            if dict(after)[member][1] != dict(before)[member][1]:
+                return after
+            if _time.monotonic() > deadline:
+                return after
+            _time.sleep(0.02)
+
     @unittest.skipUnless(
         sys.platform == "win32", "native Windows ChangeTime contract")
     def test_windows_event_store_rejects_restored_mtime_rewrites(self) -> None:
@@ -81,17 +103,15 @@ class EventByteLoadingTests(unittest.TestCase):
             baseline = events._event_store_stamp(store)
 
             original = store.stat().st_mtime_ns
-            store.write_bytes(b"main-after!")
-            os.utime(store, ns=(original, original))
-            main_after = events._event_store_stamp(store)
+            main_after = self._rewrite_past_change_tick(
+                store, b"main-after!", original, store, "", baseline)
 
             store.write_bytes(b"main-before")
             os.utime(store, ns=(original, original))
             restored_main = events._event_store_stamp(store)
             original_wal = wal.stat().st_mtime_ns
-            wal.write_bytes(b"wal-after!")
-            os.utime(wal, ns=(original_wal, original_wal))
-            wal_after = events._event_store_stamp(store)
+            wal_after = self._rewrite_past_change_tick(
+                wal, b"wal-after!", original_wal, store, "-wal", restored_main)
 
         baseline_members = dict(baseline)
         main_members = dict(main_after)
