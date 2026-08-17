@@ -60,7 +60,10 @@ _WRITER_ENV_KEYS = (
 BUDGETS = {
     "idle_cpu_percent": 5.0,       # percent of one logical CPU
     "rss_mib": 384.0,              # idle indexd tree; legacy key retained
-    "handles": 256,                # idle indexd tree; FDs on POSIX
+    # Idle indexd tree: FDs on POSIX (measured single-digit); Windows counts
+    # kernel objects (threads, events, keys - onnxruntime's pool alone is
+    # dozens), first real Windows run measured 310 with green RSS/CPU.
+    "handles": 256 if os.name != "nt" else 512,
     "ingest_peak_rss_mib": 512.0,
     "ingest_peak_handles": 512,
     "semantic_resident_rss_mib": 512.0,
