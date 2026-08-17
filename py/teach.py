@@ -1634,16 +1634,21 @@ def _sentinel_install_mac(targets: list[Path]) -> bool:
     return r.returncode == 0 and sentinel_armed()
 
 
-def _bus_unavailable_wording(text: str) -> bool:
-    """systemctl's no-user-bus refusal across systemd generations.
+def _user_manager_unavailable() -> bool:
+    """Positive probe: no systemd user manager is reachable at all.
 
-    systemd 255 says "Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and
-    $XDG_RUNTIME_DIR not defined"; 259 reworded it to "Failed to connect to
-    user scope bus via local transport: ..." (observed: the reworded refusal
-    stopped proving absence, so `agrep remove` failed on every bus-less CI
-    box). Match the stable stem plus the bus subject, not the exact tail."""
-    lowered = text.lower()
-    return "failed to connect to" in lowered and "bus" in lowered
+    Deliberately wording-independent - the no-bus refusal text was reworded
+    across systemd generations (255 vs 259) and containers with systemctl
+    answer differently again, and each variant broke a substring match in
+    turn. `is-system-running` is the stable discriminator: a reachable
+    manager prints its state word (running, degraded, starting, stopping);
+    no reachable manager prints nothing (bus-less shell) or "offline"
+    (container), and a missing/hung systemctl cannot answer at all."""
+    observed: dict = {}
+    _systemctl_user("is-system-running", timeout_s=10.0, observation=observed)
+    if observed.get("state") != "complete":
+        return True
+    return (observed.get("stdout") or "").strip().lower() in ("", "offline")
 
 
 def _sentinel_install_linux(targets: list[Path]) -> bool:
@@ -1676,21 +1681,12 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
     _atomic_write_text(timer, _SYSTEMD_TIMER)
     _atomic_write_text(path_unit, _SYSTEMD_PATH.format(cli=REPO / "cli.py"))
     _systemctl_user("daemon-reload")
-    path_enable: dict = {}
-    timer_enable: dict = {}
-    ok_path = _systemctl_user(
-        "enable", "--now", path_unit.name, observation=path_enable) == 0
-    ok_timer = _systemctl_user(
-        "enable", "--now", timer.name, observation=timer_enable) == 0
+    ok_path = _systemctl_user("enable", "--now", path_unit.name) == 0
+    ok_timer = _systemctl_user("enable", "--now", timer.name) == 0
     if ok_path and ok_timer and sentinel_armed():
         return True
     _systemctl_user("disable", "--now", timer.name, path_unit.name)
-    manager_unavailable = all(
-        observed.get("state") == "unavailable"
-        or _bus_unavailable_wording(
-            f"{observed.get('stdout', '')} {observed.get('stderr', '')}")
-        for observed in (path_enable, timer_enable)
-    )
+    manager_unavailable = _user_manager_unavailable()
     proven_unarmed = (
         not preexisting and not ok_path and not ok_timer and manager_unavailable)
     if proven_unarmed:

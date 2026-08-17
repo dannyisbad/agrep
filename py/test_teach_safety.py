@@ -120,23 +120,25 @@ class TeachSafetyTest(unittest.TestCase):
                                create=True):
             self.assertTrue(Path(teach._pythonw()).exists())
 
-    def test_bus_unavailable_wording_survives_systemd_rewordings(self) -> None:
-        """Both observed generations of the no-user-bus refusal must prove
-        manager absence; unrelated failures must not."""
-        for wording in (
-            "Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and "
-            "$XDG_RUNTIME_DIR not defined",
-            "Failed to connect to user scope bus via local transport: "
-            "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined "
-            "(consider using --machine=<user>@.host --user)",
-        ):
-            self.assertTrue(teach._bus_unavailable_wording(wording), wording)
-        for wording in (
-            "Unit nonexistent.timer does not exist",
-            "Failed to enable unit: Access denied",
-            "",
-        ):
-            self.assertFalse(teach._bus_unavailable_wording(wording), wording)
+    def test_manager_probe_survives_wordings_and_containers(self) -> None:
+        """The unarmed proof must not depend on systemctl's error wording:
+        a missing binary, a bus-less shell (empty state), and a container's
+        "offline" all prove absence; any live state word does not."""
+        def probed(state: str, stdout: str) -> bool:
+            def fake(*_args, observation=None, **_kwargs):
+                if observation is not None:
+                    observation.update(state=state, stdout=stdout, stderr="")
+                return 1
+            with mock.patch.object(teach, "_systemctl_user",
+                                   side_effect=fake):
+                return teach._user_manager_unavailable()
+
+        self.assertTrue(probed("unavailable", ""))
+        self.assertTrue(probed("complete", ""))
+        self.assertTrue(probed("complete", "offline"))
+        self.assertTrue(probed("budget-exceeded", ""))
+        for live in ("running", "degraded", "starting", "stopping"):
+            self.assertFalse(probed("complete", live), live)
 
     def test_compaction_handoff_is_an_explicit_recall_trigger(self) -> None:
         # The claude block must keep the same-session recovery route: the
