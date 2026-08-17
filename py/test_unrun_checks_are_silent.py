@@ -18,6 +18,7 @@ import io
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -149,6 +150,34 @@ class RoutineAndDeepAgree(unittest.TestCase):
         built = cls._cli("index")
         if built.returncode != 0:
             raise AssertionError(f"fixture ingest failed: {built.stderr[-400:]}")
+        cls._settle_search_index()
+
+    @classmethod
+    def _settle_search_index(cls) -> None:
+        """Wait out the fixture's handed-off derived build before verdicts.
+
+        `index` returns once the corpus publishes; the FTS build may still be
+        landing (or, on slow Windows runners, its finished child's pid may be
+        reused by a foreign process the ownership check cannot verify). The
+        verdict tests are about tier AGREEMENT on settled bytes, so settle
+        first, and retake with the documented remedy - one more `index` run -
+        when the transient ownership story lingers."""
+        deadline = time.monotonic() + 90.0
+        retaken = False
+        while time.monotonic() < deadline:
+            machine = cls._cli("status", "--json")
+            state = ""
+            if machine.returncode == 0:
+                try:
+                    state = json.loads(machine.stdout)["search_index_state"]
+                except (ValueError, KeyError):
+                    state = ""
+            if state and state not in ("building", "owned-elsewhere"):
+                return
+            if state == "owned-elsewhere" and not retaken:
+                retaken = True
+                cls._cli("index")
+            time.sleep(2.0)
 
     @classmethod
     def tearDownClass(cls) -> None:
