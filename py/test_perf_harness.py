@@ -78,12 +78,16 @@ class PerfHarnessTests(unittest.TestCase):
             json.dumps(meta), json.dumps(meta), json.dumps(hit)))))
 
     def test_stream_completion_limit_cannot_undercut_cold_ingest(self):
+        # Cold's slack is pinned explicitly: CI calibrates it via env, and an
+        # ambient override would silently defuse the undercut premise.
         with mock.patch.dict(os.environ, {
+            "AGREP_PERF_INGEST_COLD_SLACK": "4",
             "AGREP_PERF_STREAMED_COMPLETION_SLACK": "3.5",
         }):
             with self.assertRaisesRegex(ValueError, "must cover"):
                 self.perf._effective_limits(4.0)
         with mock.patch.dict(os.environ, {
+            "AGREP_PERF_INGEST_COLD_SLACK": "4",
             "AGREP_PERF_STREAMED_COMPLETION_SLACK": "4",
         }):
             limits = self.perf._effective_limits(4.0)
