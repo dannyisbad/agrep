@@ -385,8 +385,9 @@ chat, and links indexed live chats back to History. It polls only while visible;
 it has no resume, command, raw-output, or mutation controls. `agrep serve` starts
 the same authenticated loopback UI without opening a browser.
 
-`agrep run <agent> [-- <agent args...>]` launches Claude, Codex, OpenCode, or
-Antigravity while recording child-process liveness from process start.
+`agrep run <agent> [-- <agent args...>]` launches any agent with native resume -
+Claude, Codex, OpenCode, Antigravity, or pi/oh-my-pi - while recording
+child-process liveness from process start.
 `--cwd <path>` selects its working directory; arguments after `--` pass through
 to that agent.
 
