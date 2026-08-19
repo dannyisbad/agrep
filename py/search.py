@@ -1353,14 +1353,24 @@ def _close_boundary_worker(state: list | None) -> None:
                 pass
 
 
-def _native_boundary_scores(hits: list[dict], context, *, worker=None) -> bool:
-    """Attach certified or batch-evaluated factors; unresolved failures stay clean."""
+def _native_boundary_scores(hits: list[dict], context, *, worker=None,
+                            unresolved: list[dict] | None = None) -> bool:
+    """Attach certified or batch-evaluated factors; unresolved failures stay clean.
+
+    A caller holding the certification partition passes ``unresolved`` rather
+    than letting it be recomputed: certification is deterministic, so a second
+    pass rescans every snippet and retests every token edge only to reproduce
+    the split the caller already has.
+    """
     global _NATIVE_BOUNDARY_IDENTITY, _NATIVE_BOUNDARY_AVAILABLE
     if context is None or len(context) < 4:
         return False
-    unresolved, certified = _certify_ascii_aligned_phrases(hits, context)
-    if not unresolved:
-        return bool(certified)
+    if unresolved is None:
+        unresolved, certified = _certify_ascii_aligned_phrases(hits, context)
+        if not unresolved:
+            return bool(certified)
+    elif not unresolved:
+        return False
     path = common.ingest_bin()
     identity = _native_boundary_identity(path)
     if identity != _NATIVE_BOUNDARY_IDENTITY:
@@ -1466,7 +1476,8 @@ def _boundary_batch(rows: list[dict], context, state: list) -> bool:
         except OSError:
             state[:] = ["python", None, None]
             return False
-    native = _native_boundary_scores(rows, context, worker=state[2])
+    native = _native_boundary_scores(rows, context, worker=state[2],
+                                     unresolved=unresolved)
     if native:
         identity = _NATIVE_BOUNDARY_IDENTITY
         if state[0] == "native" and state[1] != identity:
