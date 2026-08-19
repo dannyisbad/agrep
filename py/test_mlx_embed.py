@@ -496,18 +496,27 @@ class LaneChangeRebuild(unittest.TestCase):
 
 
 class VectorSpaceOnRealHardware(unittest.TestCase):
-    """The only test that needs a GPU; it is the one that matters most."""
+    """The only test that needs a GPU; it is the one that matters most.
+
+    It used to skip on exactly the failure it exists to catch. Naming the metal
+    lane makes a refusal raise, and the raise was caught as "unavailable here",
+    so a parity regression turned this green instead of red - which is how mlx
+    0.32.0 shipping 0.98955 against a 0.995 floor stayed invisible. Absent
+    hardware still skips; hardware that is present and DISAGREES now fails.
+    """
 
     def test_metal_and_cpu_agree_on_real_text(self) -> None:
         ok, reason = mlx_embed.available()
         if not ok:
             self.skipTest(f"metal lane unavailable here: {reason}")
-        try:
-            e = embedder.Embedder(download=False, lane=embedder.LANE_METAL)
-        except embedder.EmbedderUnavailable as exc:
-            self.skipTest(f"metal lane unavailable: {exc}")
-        if e._metal is None:
-            self.skipTest("metal lane did not open on this box")
+        lane, refusal = embedder.probe_default_lane()
+        if lane != embedder.LANE_METAL:
+            # A pinned ONNX provider is a local choice and not this test's
+            # business; a parity refusal is the regression itself.
+            if refusal and "parity" in refusal:
+                self.fail(f"metal is installed but disagrees with onnx: {refusal}")
+            self.skipTest(f"metal lane did not open on this box: {refusal}")
+        e = embedder.Embedder(download=False, lane=embedder.LANE_METAL)
         texts = list(embedder._METAL_PROBES)
         metal = e.embed_texts(texts)
         e._metal = None

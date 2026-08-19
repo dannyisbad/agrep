@@ -144,6 +144,24 @@ def resolve_lane(model_id: str | None) -> str:
     return default_lane()
 
 
+def probe_default_lane(*, download: bool = False) -> tuple[str, str | None]:
+    """The lane this machine would actually open, and why not, if not metal.
+
+    `default_lane` answers the capability question cheaply; it cannot know that
+    the parity gate will decline, or that an ONNX provider is pinned. Only
+    building the thing proves it, which costs a model load - so this is for
+    diagnostics that already pay that cost, never for the query path.
+    """
+    if default_lane() != LANE_METAL:
+        ok, reason = mlx_embed.available()
+        return LANE_CPU, None if ok else reason
+    try:
+        probe = Embedder(download=download, lane=None)
+    except EmbedderUnavailable as exc:
+        return LANE_CPU, f"the embedder did not load: {exc}"
+    return probe.lane, probe.metal_refusal
+
+
 def store_profile_string(model_id: str | None) -> str:
     """The identity this process reads and writes for a store recording ``model_id``."""
     return profile_string(resolve_lane(model_id))
@@ -622,6 +640,10 @@ class Embedder:
                 f"tokenizer could not initialize: {type(exc).__name__}: {exc}") from exc
         self._metal = None
         self.lane = LANE_CPU
+        # Why this instance is not on metal, when it tried and could not be.
+        # The reason used to exist only as a debug line, so a box that wanted
+        # metal and silently got cpu looked identical to one that never asked.
+        self.metal_refusal: str | None = None
         # An unnamed lane is this machine's default and may quietly land on CPU;
         # a named one came from a store's recorded identity, so failing to open
         # it must be an error rather than a different vector space.
@@ -649,6 +671,7 @@ class Embedder:
                     f"{reason}; run where metal is available, or use the cpu "
                     f"lane (AGREP_MLX=off, and `agrep reindex --full` to rebuild "
                     f"a metal store)")
+            self.metal_refusal = reason
             common.dbg(f"metal lane unavailable: {reason}", "~")
 
         if self.profile.get("provider", "CPUExecutionProvider") != "CPUExecutionProvider":

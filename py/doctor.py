@@ -835,14 +835,35 @@ def _store_lane_notice() -> str | None:
                 "results may differ from the default cpu lane")
     try:
         import mlx_embed
-        faster_available = bool(mlx_embed.available()[0])
+        installed = bool(mlx_embed.available()[0])
     except Exception:  # noqa: BLE001 -- absence is the common, unremarkable case
-        faster_available = False
-    if faster_available:
-        return ("store built on the cpu lane, but this machine can open the "
-                "metal lane (~10x faster to embed); `agrep reindex --full` "
-                "rebuilds onto it")
+        installed = False
+    if installed:
+        # "installed", not "will open": the parity gate and a pinned ONNX
+        # provider can still decline, and this tier does not pay a model load
+        # to find out. `--deep` probes for real and names the refusal.
+        return ("store built on the cpu lane; this machine has the metal lane "
+                "installed (~10x faster to embed) - `agrep reindex --full` "
+                "rebuilds onto it, `agrep doctor --deep` confirms it opens")
     return "store built on the cpu lane"
+
+
+def _runtime_lane_facts(*, deep: bool, model_cached: bool) -> dict:
+    """Which lane this machine would actually open, for the tier that can pay.
+
+    Only the deep tier, and only once the model is already cached: the probe
+    builds a real embedder, which is the only thing that proves the parity gate
+    passes here. Routine stays silent rather than guess, because a capability
+    check cannot see a declined lane.
+    """
+    if not deep or not model_cached:
+        return {}
+    try:
+        import embedder
+        lane, refusal = embedder.probe_default_lane()
+    except Exception:  # noqa: BLE001 -- a failed probe is a diagnostic state
+        return {}
+    return {"runtime_lane": lane, "runtime_lane_refusal": refusal}
 
 
 def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
@@ -1036,6 +1057,7 @@ def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
             "deps": deps, "model_cached": model_cached,
             "model_integrity": model_integrity,
             "embedding_lane": _store_embedding_lane(),
+            **_runtime_lane_facts(deep=deep, model_cached=model_cached),
             "embeddings": coherence.get("state", "unknown"),
             "embedding_integrity": integrity,
             "embedding_coverage": coherence.get("coverage"),
@@ -3287,6 +3309,15 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
             model_detail += f"; {model_integrity['detail']}"
         if smart.get("embedding_lane"):
             model_detail += f"; store lane {smart['embedding_lane']}"
+        runtime_lane = smart.get("runtime_lane")
+        if runtime_lane:
+            # The store's lane says what was written; this says what this box
+            # would write now. When they differ the reason matters, because a
+            # declined metal lane is otherwise indistinguishable from one that
+            # was never offered.
+            model_detail += f"; this machine opens {runtime_lane}"
+            if smart.get("runtime_lane_refusal"):
+                model_detail += f" ({smart['runtime_lane_refusal']})"
         _row("model", OK if smart["model_cached"] else OPT, model_detail)
         coverage = smart.get("embedding_coverage")
         cov = (f" ({coverage['indexed']:,}/{coverage['total']:,} rows)"
