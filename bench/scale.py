@@ -31,6 +31,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -225,10 +226,15 @@ def _write_fixture(data: Path, rows: int) -> dict[str, object]:
             who = ("user" if ordinal < short_decoys or ordinal >= mid_old_start else
                    ("user", "agent", "subagent", "tool")[ordinal % 4])
             text = _base_text(ordinal)
+            # The possessive defeats the ASCII-aligned certification fast
+            # path (an apostrophe between letters is never a certifiable
+            # edge), so these lanes keep measuring the native boundary
+            # scorer their budgets were calibrated against; the trigram
+            # index still matches the bare token.
             if ordinal >= old_dense_start:
-                text += f" {OLD_DENSE_QUERY}"
+                text += f" {OLD_DENSE_QUERY}'s"
             if ordinal >= mid_old_start:
-                text += f" {MID_OLD_QUERY}"
+                text += f" {MID_OLD_QUERY}'s"
             timestamp = (now_ms - 365 * 86_400_000 - (ordinal - mid_old_start) * 1000
                          if ordinal >= mid_old_start else
                          now_ms - 180 * 86_400_000 - (ordinal - old_dense_start) * 1000
@@ -292,6 +298,20 @@ def _write_fixture(data: Path, rows: int) -> dict[str, object]:
         encoding="utf-8",
     )
     (data / "replies.jsonl").write_text("", encoding="utf-8")
+    # The derived-generation proof census covers these artifacts too. The
+    # synthetic corpus has no compaction boundaries and no tool events, so
+    # valid-empty stats keep the freshness proof honest without real ingest.
+    (data / "boundary_stats.json").write_text(
+        json.dumps({"schema": 2, "generation": signature,
+                    "families": 0, "tokens": {}}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    (data / ".boundary_stats.bin").write_bytes(b"")
+    (data / "event_stats.json").write_text(
+        json.dumps({"total": 0, "fails": 0, "subagents": 0,
+                    "by_agent": {}, "by_tool": []}, separators=(",", ":")),
+        encoding="utf-8",
+    )
     (data / ".ingest.sig").write_text(signature + "\n", encoding="utf-8")
     return {
         "rows": rows,
@@ -304,7 +324,9 @@ def _write_fixture(data: Path, rows: int) -> dict[str, object]:
         "selective_session": f"scale-child-{SPECIAL_ROWS - 1:03d}",
         "source_bytes": sum(path.stat().st_size for path in (
             messages, sessions, data / "session_family.meta.json",
-            data / "replies.jsonl", data / ".ingest.sig")),
+            data / "replies.jsonl", data / ".ingest.sig",
+            data / "boundary_stats.json", data / ".boundary_stats.bin",
+            data / "event_stats.json")),
         "wall_ms": round((time.perf_counter() - started) * 1000, 3),
         "cpu_ms": round((time.process_time() - cpu_started) * 1000, 3),
     }
@@ -371,7 +393,65 @@ def _build_database(data: Path) -> int:
         encoding="utf-8")
     if os.name != "nt":
         owner.chmod(0o600)
+    _write_generation_proof(data)
     return 0
+
+
+def _write_generation_proof(data: Path) -> None:
+    """Commit the derived-generation proof the freshness verdict demands.
+
+    Mirrors the Rust derived writer bit-for-bit via corpusdb's own proof
+    helpers, so both the Python and Rust freshness validators read this
+    synthetic corpus as a complete, current generation.
+    """
+    import corpusdb
+
+    signature = (data / ".ingest.sig").read_text(encoding="utf-8").strip()
+    files = []
+    for name in corpusdb._DERIVED_PROOF_NAMES:
+        path = data / name
+        identity = corpusdb._proof_file_identity(path)
+        if os.name == "posix":
+            token: dict[str, object] = {
+                "Metadata": corpusdb._unix_change_token(identity[2])}
+        elif os.name == "nt":
+            try:
+                token = {"Metadata": corpusdb._windows_file_state(
+                    path, include_usn=True)[1]}
+            except OSError:
+                token = {"ContentSha256": list(
+                    corpusdb._content_sha256(path, identity))}
+        else:
+            token = {"Metadata": 0}
+        files.append({
+            "name": name,
+            "len": identity[0],
+            "modified_ns": identity[1],
+            "change_token": token,
+            "edge_hash": corpusdb._edge_hash(path, identity[0], identity),
+        })
+    (data / ".derived_generation.json").write_text(
+        json.dumps({"version": corpusdb._DERIVED_PROOF_VERSION,
+                    "signature": signature, "files": files},
+                   separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _write_live_store(home: Path) -> None:
+    """Give the census a live codex store matching the published agent set.
+
+    The fixture's sessions.jsonl publishes agent "codex"; without a live
+    store the record-less drift fallback counts it as vanished and every
+    zero-hit query hedges to exit 2. One old rollout file is a complete
+    store to the census (it reads file counts and mtimes, never content).
+    """
+    day = home / ".codex" / "sessions" / "2020" / "01" / "01"
+    day.mkdir(parents=True)
+    rollout = day / "rollout-2020-01-01T00-00-00-scale.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    moment = 1_577_836_800  # 2020-01-01, firmly older than any ingest signal
+    os.utime(rollout, (moment, moment))
 
 
 def _resource_module():
@@ -387,6 +467,19 @@ def _resource_module():
     return _RESOURCE_MODULE
 
 
+def _drain_stream(stream, name: str, sink: dict[str, str]) -> None:
+    """Read one child pipe to EOF so the child never blocks on a full buffer."""
+    try:
+        sink[name] = stream.read()
+    except (ValueError, OSError):
+        sink.setdefault(name, "")
+    finally:
+        try:
+            stream.close()
+        except (ValueError, OSError):
+            pass
+
+
 def _sampled_process(cmd: list[str], *, cwd: Path, env: dict[str, str],
                      timeout: float, interval: float,
                      ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
@@ -399,17 +492,38 @@ def _sampled_process(cmd: list[str], *, cwd: Path, env: dict[str, str],
         text=True, encoding="utf-8", errors="replace",
         **({"creationflags": subprocess.CREATE_NO_WINDOW}
            if os.name == "nt" else {}))
+    # The sampling loop must never be the reason the child stops running:
+    # a debug-heavy lane writes far more than one pipe buffer, and polling
+    # without draining would block the child on its own stderr until the
+    # timeout. Reader threads keep both pipes empty for the whole run.
+    collected: dict[str, str] = {}
+    readers = [threading.Thread(target=_drain_stream, args=(stream, name, collected),
+                                daemon=True)
+               for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))]
+    for reader in readers:
+        reader.start()
+
+    def finish(join_timeout: float | None = None) -> tuple[str, str]:
+        for reader in readers:
+            reader.join(join_timeout)
+        # Reap unconditionally. On the timeout path the child is already
+        # SIGKILLed, so this cannot block, and skipping it would leave a
+        # zombie whose CPU later lands in this process's children_* delta
+        # and inflates a subsequent run's cpu_seconds.
+        proc.wait()
+        return collected.get("stdout", ""), collected.get("stderr", "")
+
     accumulator = resources._TreeAccumulator(proc.pid, new_process=True)
     deadline = time.monotonic() + timeout
     while proc.poll() is None:
         if time.monotonic() >= deadline:
             proc.kill()
-            stdout, stderr = proc.communicate()
+            stdout, stderr = finish(join_timeout=5.0)
             raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
         time.sleep(interval)
         accumulator.observe()
     accumulator.observe()
-    stdout, stderr = proc.communicate()
+    stdout, stderr = finish()
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     measured = accumulator.metrics()
     after_times = os.times()
@@ -1000,6 +1114,7 @@ def _campaign(rows: int, args: argparse.Namespace) -> dict[str, object]:
         data, home = root / "data", root / "home"
         data.mkdir(mode=0o700)
         home.mkdir(mode=0o700)
+        _write_live_store(home)
         env = _private_env(home, data)
         source = _write_fixture(data, rows)
         build = _build_index(data, env, args.build_timeout)
