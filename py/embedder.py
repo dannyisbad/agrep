@@ -579,6 +579,49 @@ _METAL_PROBES = (
 )
 
 
+def _parity_cache_path():
+    return common.EMBEDDINGS_PATH.parent / ".metal_parity.json"
+
+
+def _parity_key() -> str | None:
+    """What the verdict is about: this mlx build against this model profile."""
+    try:
+        import importlib.metadata as md
+        return f"{md.version('mlx')}/{PROFILE_STRING}"
+    except Exception:  # noqa: BLE001 -- no key means no caching, never a wrong hit
+        return None
+
+
+def _cached_parity() -> float | None:
+    key = _parity_key()
+    if key is None:
+        return None
+    try:
+        record = json.loads(_parity_cache_path().read_bytes())
+        if record.get("key") != key:
+            return None
+        value = float(record["cosine"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _store_parity(cosine: float) -> None:
+    """Best-effort: a read-only or racing data dir just means we measure again."""
+    key = _parity_key()
+    if key is None or not math.isfinite(cosine):
+        return
+    path = _parity_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"key": key, "cosine": round(float(cosine), 6)}),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 class Embedder:
     """One loaded ONNX session and tokenizer; callers own its lifetime."""
 
@@ -683,12 +726,24 @@ class Embedder:
         if not ok:
             refuse(reason)
             return
+        cached = _cached_parity()
+        if cached is not None and cached < _METAL_MIN_COSINE:
+            # Loading MLX and re-running the probe to reach the same verdict
+            # cost ~150ms on every construction, on exactly the machines where
+            # metal is installed and does not qualify. The verdict is keyed to
+            # the mlx build and the model profile, so it re-runs when either
+            # moves and never outlives the thing it measured.
+            refuse(f"its parity cosine {cached:.5f} is below "
+                   f"{_METAL_MIN_COSINE} against the onnx lane (cached)")
+            return
         try:
             lane = mlx_embed.MLXEmbedder()
-            agreement = self._metal_parity(lane)
+            agreement = cached if cached is not None else self._metal_parity(lane)
         except Exception as exc:
             refuse(f"it did not load: {type(exc).__name__}: {exc}")
             return
+        if cached is None:
+            _store_parity(agreement)
         if agreement < _METAL_MIN_COSINE:
             refuse(f"its parity cosine {agreement:.5f} is below "
                    f"{_METAL_MIN_COSINE} against the onnx lane")
