@@ -107,19 +107,21 @@ def default_lane() -> str:
     variable to earn its keep. AGREP_MLX=off opts out entirely and AGREP_MLX=on
     pins it on. Existing stores are untouched either way - resolve_lane conforms
     to the rows already on disk, so only a store with no recorded lane lands
-    here. The courtesy check runs HERE, exactly once, instead of before every
-    batch: a machine too busy to share the GPU should start a CPU store, not a
-    store that alternates engines by load.
+    here.
+
+    This asks whether Metal opens, never whether the machine is busy this
+    second. A lane is a vector space the store keeps for its whole life, so a
+    momentary load spike must not decide it: the old courtesy check read one
+    load average and could strand a store on the slow engine permanently.
+    Politeness belongs to scheduling, where indexer._embedding_backfill_policy
+    already paces batches on activity, battery, memory and CPU - and it is the
+    better place for it, because declining Metal does not spare a busy machine,
+    it keeps the same work on the CPU for roughly ten times longer.
     """
     if not mlx_embed.available()[0]:
         # available() also answers False under AGREP_MLX=off.
         return LANE_CPU
-    if os.environ.get("AGREP_MLX") == "on":
-        # An explicit pin skips the courtesy: mlx_embed.should_use
-        # short-circuits to (True, 'pinned on') under it too, so load never
-        # overrides a foreground index the owner is already waiting for.
-        return LANE_METAL
-    return LANE_METAL if mlx_embed.should_use()[0] else LANE_CPU
+    return LANE_METAL
 
 
 def resolve_lane(model_id: str | None) -> str:

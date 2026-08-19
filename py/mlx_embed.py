@@ -24,8 +24,11 @@ RESOURCE ETIQUETTE. On Apple Silicon the GPU is also the display compositor -
 WindowServer was measured at 46% GPU during this work. A background backfill
 that saturates Metal does not just compete for FLOPs, it makes scrolling and
 window animation stutter, which reads to the owner as "agrep broke my Mac".
-So this backend is gated on live load and yields the GPU back rather than
-holding it: see `should_use`.
+So this backend yields the GPU back rather than holding it - but through
+pacing, not lane choice: indexer._embedding_backfill_policy widens the gap
+between batches while the owner is active, on battery, or under memory
+pressure. Lane choice cannot carry that duty, because a store keeps one
+vector space for life and alternating engines by load would mix them.
 """
 from __future__ import annotations
 
@@ -55,12 +58,6 @@ FILES = {
 # stays one place a user can delete to reclaim everything.
 SUBDIR = "granite-small-r2-mlx"
 
-# Load per core is a free but imprecise proxy for Metal/compositor contention;
-# macOS exposes no unprivileged GPU-utilization metric. A measured 0.9 ceiling
-# yields only under real saturation, while 0.7 flapped and a flat 6.0 stayed off.
-DEFAULT_LOAD_PER_CORE = 0.9
-
-
 class MLXUnavailable(RuntimeError):
     """This machine, build, or library cannot serve the Metal lane."""
 
@@ -84,31 +81,6 @@ def available() -> tuple[bool, str]:
     except ImportError as exc:
         return False, f"mlx missing: {exc}"
     return True, "available"
-
-
-def should_use(per_core: float | None = None) -> tuple[bool, str]:
-    """Per-batch decision: is taking the GPU polite RIGHT NOW?
-
-    Cheap enough to call before every batch (one getloadavg), which is the
-    point - a boot-time choice cannot know that the owner started a render
-    ten minutes later. An explicit AGREP_MLX=on pins the lane on and skips
-    the courtesy check, because a foreground `agrep index` is work the owner
-    is already waiting for.
-    """
-    if os.environ.get("AGREP_MLX") == "on":
-        return True, "pinned on"
-    ceiling = DEFAULT_LOAD_PER_CORE if per_core is None else per_core
-    try:
-        load1 = os.getloadavg()[0]
-        cores = os.cpu_count() or 1
-    except (OSError, AttributeError):
-        # No load signal is not permission to take the GPU.
-        return False, "load unreadable"
-    ratio = load1 / max(cores, 1)
-    if ratio > ceiling:
-        return False, (f"machine busy ({load1:.1f} over {cores} cores "
-                       f"= {ratio:.2f} > {ceiling:.2f})")
-    return True, f"idle enough ({load1:.1f}/{cores} = {ratio:.2f})"
 
 
 def weights_dir(root=None):

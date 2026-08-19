@@ -68,9 +68,12 @@ One pinned model, two engines that can run it:
   scores about 0.77. Weights are pinned by size and SHA-256 like the ONNX
   artifacts and live under the shared model root, so an accelerator is not a
   softer path into the model directory. On Apple silicon the GPU is also the
-  display compositor, so `should_use` re-checks load per core before each batch
-  and yields above 0.9; `AGREP_MLX=on` skips that courtesy because a foreground
-  index is work the caller is already waiting on.
+  display compositor, so a backfill paces itself: `_embedding_backfill_policy`
+  widens the interval between batches while the owner is active, on battery,
+  or under memory pressure. Lane choice is a capability question, not a load
+  one - a store keeps its vector space for life, so `AGREP_MLX=off` opts out
+  and `AGREP_MLX=on` pins on, but a passing load spike never strands a store
+  on the slow engine.
 - `embed.py` - messages + replies to immutable semantic segments. Incremental by
   default; `--full` re-embeds; `--max-new N` bounds one background pass. Holds a
   cross-process claim so embedders never stack, and binds each segmented

@@ -44,60 +44,6 @@ class CapabilityGate(unittest.TestCase):
         self.assertIn("off", reason)
 
 
-class CourtesyGate(unittest.TestCase):
-    """should_use() decides whether taking the GPU is polite, once per lane pick."""
-
-    def _load(self, value, cores=8):
-        return mock.patch.object(
-            mlx_embed.os, "getloadavg",
-            return_value=(value, value, value), create=True), \
-            mock.patch.object(mlx_embed.os, "cpu_count", return_value=cores)
-
-    def test_idle_machine_takes_the_gpu(self) -> None:
-        load, cores = self._load(1.0, cores=8)
-        with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": ""}):
-            ok, _ = mlx_embed.should_use()
-        self.assertTrue(ok)
-
-    def test_busy_machine_yields_the_gpu(self) -> None:
-        # The compositor shares this silicon; a backfill must not make the
-        # owner's windows stutter just because it can go faster.
-        load, cores = self._load(7.6, cores=8)
-        with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": ""}):
-            ok, reason = mlx_embed.should_use()
-        self.assertFalse(ok)
-        self.assertIn("busy", reason)
-
-    def test_load_is_judged_per_core_not_absolute(self) -> None:
-        # The bug this pins: a flat ceiling tuned on one box switched the lane
-        # off permanently on an 18-core machine that idles around 5-11. The
-        # same absolute load must read as busy on 4 cores and fine on 32.
-        load_small, cores_small = self._load(8.0, cores=4)
-        with load_small, cores_small, mock.patch.dict("os.environ", {"AGREP_MLX": ""}):
-            busy, _ = mlx_embed.should_use()
-        load_big, cores_big = self._load(8.0, cores=32)
-        with load_big, cores_big, mock.patch.dict("os.environ", {"AGREP_MLX": ""}):
-            roomy, _ = mlx_embed.should_use()
-        self.assertFalse(busy)
-        self.assertTrue(roomy)
-
-    def test_pinned_on_ignores_load(self) -> None:
-        # A foreground `agrep index` is work the owner is already waiting on.
-        load, cores = self._load(99.0, cores=1)
-        with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": "on"}):
-            ok, reason = mlx_embed.should_use()
-        self.assertTrue(ok)
-        self.assertIn("pinned", reason)
-
-    def test_unreadable_load_is_not_permission(self) -> None:
-        with mock.patch.object(
-                mlx_embed.os, "getloadavg",
-                side_effect=OSError("no"), create=True):
-            ok, reason = mlx_embed.should_use()
-        self.assertFalse(ok)
-        self.assertIn("unreadable", reason)
-
-
 class _FakeLane:
     """A Metal lane whose numerics the test controls."""
 
@@ -170,12 +116,19 @@ class ParityGate(unittest.TestCase):
 class LaneSelection(unittest.TestCase):
     """The lane is chosen ONCE, and the store's own identity outranks the machine.
 
-    The bug: `should_use` used to be re-asked before every batch, so a backfill
-    took the GPU while the machine was idle and dropped to CPU when it was busy,
-    leaving one store holding rows from two vector spaces. On a 24-row fixture
-    that flipped 3 of 45 queries - a different top-1, and a hit that became "no
-    confident match" - which is why lane selection now happens up front and the
-    chosen lane is written into embeddings.meta.
+    Two bugs live here. First, `should_use` was re-asked before every batch, so
+    a backfill took the GPU while the machine was idle and dropped to CPU when
+    it was busy, leaving one store holding rows from two vector spaces. On a
+    24-row fixture that flipped 3 of 45 queries - a different top-1, and a hit
+    that became "no confident match" - which is why lane selection happens up
+    front and the chosen lane is written into embeddings.meta.
+
+    Moving it up front then created the opposite failure: one load average,
+    read once, permanently stranded a store on the slow engine, and a CPU
+    backfill is ~10x longer so it kept the machine busy enough to justify
+    itself. Lane choice now asks only whether Metal opens. Load belongs to
+    indexer._embedding_backfill_policy, which re-reads it continuously and can
+    change its mind.
     """
 
     def _machine(self, load, cores=8):
@@ -208,24 +161,19 @@ class LaneSelection(unittest.TestCase):
         with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": "off"}):
             self.assertEqual(embedder.default_lane(), embedder.LANE_CPU)
 
-    def test_explicit_mlx_pin_stays_metal_even_under_load(self) -> None:
-        # AGREP_MLX=on pins the lane on; should_use short-circuits to True
-        # under it, so load never overrides an explicit pin (the load courtesy
-        # lives on the auto path where should_use actually checks it).
-        load, cores = self._machine(7.6)
-        with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": "on"}), \
-                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")):
-            self.assertEqual(embedder.default_lane(), embedder.LANE_METAL)
-
-    def test_auto_path_defers_metal_to_a_busy_machine(self) -> None:
-        # The courtesy is real on the auto path: AGREP_MLX unset, should_use
-        # checks load and declines when the machine is busy.
-        load, cores = self._machine(7.6)
-        with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": ""}), \
-                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")), \
-                mock.patch.object(mlx_embed, "should_use",
-                                  return_value=(False, "machine busy")):
-            self.assertEqual(embedder.default_lane(), embedder.LANE_CPU)
+    def test_load_never_decides_the_lane(self) -> None:
+        # The regression this replaces: a single load average, read once at
+        # store creation, stranded the store on the slow engine for its whole
+        # life. A lane is a vector space, so only capability may decide it -
+        # a machine pinned at 7.6 over 8 cores still starts on metal, with or
+        # without the explicit pin.
+        for pin in ("", "on"):
+            with self.subTest(pin=pin or "auto"):
+                load, cores = self._machine(7.6)
+                with load, cores, mock.patch.dict("os.environ", {"AGREP_MLX": pin}), \
+                        mock.patch.object(mlx_embed, "available",
+                                          return_value=(True, "ok")):
+                    self.assertEqual(embedder.default_lane(), embedder.LANE_METAL)
 
     def test_full_rebuild_re_decides_the_lane(self) -> None:
         # `reindex --full` is the one sanctioned lane move: with the fresh-lane
@@ -238,8 +186,6 @@ class LaneSelection(unittest.TestCase):
                 mock.patch.dict("os.environ", {"AGREP_MLX": ""}), \
                 mock.patch.object(mlx_embed, "available",
                                   return_value=(True, "ok")), \
-                mock.patch.object(mlx_embed, "should_use",
-                                  return_value=(True, "idle")), \
                 mock.patch.dict(embed._ACTIVE_LANE, clear=True):
             with mock.patch.object(embed, "_FRESH_LANE", False):
                 self.assertEqual(embed._active_lane(), embedder.LANE_CPU)
@@ -257,8 +203,7 @@ class LaneSelection(unittest.TestCase):
     def test_a_cpu_store_stays_cpu_under_agrep_mlx_on(self) -> None:
         # An increment must not switch an existing store to the other engine.
         with mock.patch.dict("os.environ", {"AGREP_MLX": "on"}), \
-                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")), \
-                mock.patch.object(mlx_embed, "should_use", return_value=(True, "idle")):
+                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")):
             self.assertEqual(
                 embedder.resolve_lane(embedder.PROFILE_STRING), embedder.LANE_CPU)
 
@@ -282,9 +227,7 @@ class LaneSelection(unittest.TestCase):
                              embedder.LANE_CPU)
         with mock.patch.dict("os.environ", {"AGREP_MLX": ""}), \
                 mock.patch.object(mlx_embed, "available",
-                                  return_value=(True, "ok")), \
-                mock.patch.object(mlx_embed, "should_use",
-                                  return_value=(True, "idle")):
+                                  return_value=(True, "ok")):
             self.assertEqual(embedder.resolve_lane("some-other-model"),
                              embedder.LANE_METAL)
 
@@ -305,10 +248,8 @@ class FallbackBehaviour(unittest.TestCase):
         # now spent at lane selection; here the answer is always the metal lane.
         lane = _FakeLane()
         e = self._embedder(lane)
-        with mock.patch.object(mlx_embed, "should_use",
-                               return_value=(False, "machine busy")):
-            out = e._metal_pooled(np.zeros((2, 4), np.int64),
-                                  np.ones((2, 4), np.int64))
+        out = e._metal_pooled(np.zeros((2, 4), np.int64),
+                              np.ones((2, 4), np.int64))
         self.assertEqual(out.shape, (2, 384))
         self.assertEqual(lane.calls, 1)
 
@@ -423,11 +364,30 @@ class LaneDisclosure(unittest.TestCase):
         self.assertIn("near-threshold", row)
         self.assertIn("cpu", row)
 
-    def test_doctor_says_nothing_about_an_ordinary_cpu_store(self) -> None:
-        # The bare profile string is every pre-lane store on disk; a row here
-        # would tell millions of ordinary stores they are approximate.
+    def test_doctor_names_the_cpu_lane_and_the_upgrade_when_one_exists(self) -> None:
+        # A cpu store used to say nothing, so the case that most needed the
+        # disclosure was the silent one: stranded on the slow engine looks
+        # exactly like healthy, only slower. The row must not call an ordinary
+        # store approximate - that caveat belongs to metal alone - so it states
+        # the lane, and names the rebuild only where metal could actually open.
         import doctor
-        for identity in (embedder.PROFILE_STRING, None, ""):
+        cpu = embedder.PROFILE_STRING
+        with mock.patch.object(doctor, "_store_embedding_identity", return_value=cpu), \
+                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")):
+            upgradable = doctor._store_lane_notice()
+        self.assertIn("cpu lane", upgradable)
+        self.assertIn("metal", upgradable)
+        self.assertIn("reindex --full", upgradable)
+        self.assertNotIn("near-threshold", upgradable)
+
+        with mock.patch.object(doctor, "_store_embedding_identity", return_value=cpu), \
+                mock.patch.object(mlx_embed, "available", return_value=(False, "no")):
+            plain = doctor._store_lane_notice()
+        self.assertIn("cpu lane", plain)
+        self.assertNotIn("reindex", plain)
+
+        # No store, nothing to disclose.
+        for identity in (None, ""):
             with mock.patch.object(doctor, "_store_embedding_identity",
                                    return_value=identity):
                 self.assertIsNone(doctor._store_lane_notice())
