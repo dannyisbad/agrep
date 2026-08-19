@@ -815,20 +815,34 @@ _LANE_IDENTITY_SUFFIX = ":lane-"
 
 
 def _store_lane_notice() -> str | None:
-    """The disclosure a store built on a non-default lane owes its reader.
+    """Which engine wrote this store's vectors, always said out loud.
 
-    Without this row, reading embeddings.meta by hand is the only way to learn
-    that a store holds the faster engine's vectors - which agree with the CPU
-    lane to ~0.9993 and therefore still rank near-threshold queries differently.
+    Reading embeddings.meta by hand used to be the only way to learn this, and
+    only a non-default lane said anything at all - so the case that most needs
+    the disclosure stayed silent: a store stranded on the slow engine looks
+    exactly like a healthy one, just inexplicably slower. Both lanes get a row
+    now. The metal row keeps its near-threshold caveat (the lanes agree to
+    ~0.9993, so they can still order borderline hits differently); the cpu row
+    names the faster engine when this machine could open it, because that is
+    the only moment the reader can act on it.
     """
     identity = _store_embedding_identity()
     if not identity:
         return None
     _, _, lane = str(identity).partition(_LANE_IDENTITY_SUFFIX)
-    if not lane:
-        return None
-    return (f"store built on the {lane} lane (experimental): near-threshold "
-            "results may differ from the default cpu lane")
+    if lane:
+        return (f"store built on the {lane} lane (experimental): near-threshold "
+                "results may differ from the default cpu lane")
+    try:
+        import mlx_embed
+        faster_available = bool(mlx_embed.available()[0])
+    except Exception:  # noqa: BLE001 -- absence is the common, unremarkable case
+        faster_available = False
+    if faster_available:
+        return ("store built on the cpu lane, but this machine can open the "
+                "metal lane (~10x faster to embed); `agrep reindex --full` "
+                "rebuilds onto it")
+    return "store built on the cpu lane"
 
 
 def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
