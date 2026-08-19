@@ -228,6 +228,27 @@ class ScaleHarnessTests(unittest.TestCase):
                 newer = self.scale._newer_rust_sources(binary)
         self.assertEqual(newer, [source])
 
+    def test_sampled_run_survives_more_output_than_one_pipe_buffer(self):
+        # A debug-heavy lane writes far past the OS pipe buffer. If the
+        # sampler polls without draining, the child blocks on its own stderr
+        # and the workload dies on the query timeout instead of reporting.
+        line = "boundary: Rust scored 160 occurrence(s)\n"
+        repeats = 40_000
+        program = (
+            "import sys\n"
+            f"sys.stderr.write({line!r} * {repeats})\n"
+            "sys.stdout.write('done')\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, measured = self.scale._sampled_process(
+                [sys.executable, "-c", program], cwd=Path(tmp), env=dict(os.environ),
+                timeout=15.0, interval=0.005)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "done")
+        self.assertEqual(len(result.stderr), len(line) * repeats)
+        self.assertGreater(len(result.stderr), 1 << 16)
+        self.assertIn("wall_ms", measured)
+
 
 if __name__ == "__main__":
     unittest.main()
