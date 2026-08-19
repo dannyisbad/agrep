@@ -6405,8 +6405,8 @@ def t_pipe_gone_windows():
     return ("PASS" if ok else "FAIL", f"premise={premise} cases={got}")
 
 
-# AGREP_CI: CI has no live corpus, agent procs, or platform binary - a few tests would
-# hard-fail rather than SKIP, so run only the pure-logic tests; `cargo test` is CI's real coverage.
+# AGREP_CI: hosted runners have no live corpus or agent procs, so a few tests would
+# hard-fail rather than SKIP. Run only tests independent of those live resources.
 _CI = bool(os.environ.get("AGREP_CI"))
 _CI_SAFE = {
     t_clean_agent_environment,
@@ -6424,6 +6424,7 @@ _CI_SAFE = {
     t_terms_spread_ranking,
     t_archive,
     t_archive_sqlite,
+    t_binary,
     t_embed_governor,
     t_block_version,
     t_boundary_compact_contract,
@@ -6609,7 +6610,7 @@ def _run() -> int:
         if _CI and test not in _CI_SAFE:
             results.append((
                 name, "SKIP",
-                "ci: needs live corpus / processes / platform binary"))
+                "ci: needs live corpus / processes"))
             continue
         check(name, test)
 
