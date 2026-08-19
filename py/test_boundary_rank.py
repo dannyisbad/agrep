@@ -219,6 +219,38 @@ class BoundaryRankTests(unittest.TestCase):
         self.assertEqual(interior["_boundary_score_factor"], 0.25)
         self.assertEqual(fallback["_boundary_score_factor"], 0.5)
 
+    def test_row_lane_certifies_once_per_batch(self):
+        # _boundary_batch partitions the rows, then hands them to the native
+        # scorer. Certification is deterministic, so a second pass would
+        # rescan every snippet to rebuild the identical split.
+        path = Path(__file__)
+        identity = search._native_boundary_identity(path)
+        context = search._prepare_boundary("akd", "keyword")
+        rows = [{"snippet": "say akd now"}, {"snippet": "peakDetect"}]
+        response = json.dumps({
+            "protocol": search._NATIVE_BOUNDARY_PROTOCOL,
+            "results": [{"factor": 0.25, "match_class": "interior"}],
+        })
+        real_certify = search._certify_ascii_aligned_phrases
+        calls = []
+
+        def counting_certify(hits, ctx):
+            calls.append(len(hits))
+            return real_certify(hits, ctx)
+
+        state = ["native", identity, mock.Mock()]
+        with mock.patch.object(search.common, "ingest_bin", return_value=path), \
+                mock.patch.object(search, "_NATIVE_BOUNDARY_IDENTITY", identity), \
+                mock.patch.object(search, "_NATIVE_BOUNDARY_AVAILABLE", None), \
+                mock.patch.object(search, "_certify_ascii_aligned_phrases",
+                                  counting_certify), \
+                mock.patch.object(search, "_boundary_worker_request",
+                                  return_value=json.loads(response)):
+            self.assertTrue(search._boundary_batch(rows, context, state))
+        self.assertEqual(calls, [2])
+        self.assertEqual(rows[0]["_boundary_score_factor"], 1.0)
+        self.assertEqual(rows[1]["_boundary_score_factor"], 0.25)
+
     def test_fully_certified_batch_never_starts_a_worker(self):
         hit = {"snippet": "say akd now"}
         context = search._prepare_boundary("akd", "keyword")
