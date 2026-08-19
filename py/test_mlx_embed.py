@@ -14,6 +14,7 @@ structurally.
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,6 +112,48 @@ class ParityGate(unittest.TestCase):
         # of the contract, not an accident of how the list was written.
         longest = max(len(p) for p in embedder._METAL_PROBES)
         self.assertGreater(longest, 200)
+
+
+class ParityVerdictCache(unittest.TestCase):
+    """A declined lane must not re-prove itself on every construction.
+
+    Making metal the default meant every Embedder on Apple silicon loaded mlx
+    and re-ran the probe to reach the same refusal - measured at ~149ms each,
+    on exactly the machines where metal is installed and does not qualify.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patch = mock.patch.object(
+            embedder.common, "EMBEDDINGS_PATH",
+            Path(self.tmp.name) / "embeddings.f32")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_verdict_round_trips_and_is_keyed_to_what_it_measured(self) -> None:
+        # The key is pinned rather than real: _parity_key reads the installed
+        # mlx distribution, which is absent on every CI suite job, and a None
+        # key makes both halves no-op - so the real thing would assert nothing
+        # there while passing here, where mlx happens to be installed.
+        with mock.patch.object(embedder, "_parity_key", return_value="mlx-1.2/profile-a"):
+            self.assertIsNone(embedder._cached_parity())
+            embedder._store_parity(0.98955)
+            self.assertAlmostEqual(embedder._cached_parity(), 0.98955, places=5)
+
+        # A different mlx build or model profile invalidates it: the verdict
+        # describes those two things and must never outlive either.
+        with mock.patch.object(embedder, "_parity_key", return_value="mlx-9.9/profile-b"):
+            self.assertIsNone(embedder._cached_parity())
+
+    def test_unkeyable_or_corrupt_state_measures_again_rather_than_guessing(self) -> None:
+        with mock.patch.object(embedder, "_parity_key", return_value=None):
+            embedder._store_parity(0.999)
+            self.assertIsNone(embedder._cached_parity())
+        embedder._parity_cache_path().write_text("{not json", encoding="utf-8")
+        self.assertIsNone(embedder._cached_parity())
+        embedder._store_parity(float("nan"))
+        self.assertIsNone(embedder._cached_parity())
 
 
 class LaneSelection(unittest.TestCase):
