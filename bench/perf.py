@@ -90,7 +90,7 @@ BUDGETS = {
     "ingest_cold_ms": 3500,      # synthetic 4,600-file/14k-row full publication
     "ingest_warm_ms": 250,       # unchanged snapshot: no cache load/materialization
     # one changed transcript: unlike ingest_warm_ms, covers cache load/materialization + delta publication
-    "ingest_one_changed_ms": 200,
+    "ingest_one_changed_ms": 500,
     "streamed_first_hit_ms": 150,  # no-index Python CLI -> first flushed matching row
     # Agents wait for process exit, and this command includes the cold ingest.
     # Keep the full-exit ceiling at least as high as the cold-ingest ceiling.

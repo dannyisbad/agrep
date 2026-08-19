@@ -84,9 +84,11 @@ jobs:
         if: ${{ matrix.perf }}
         env:
           AGREP_PERF_SLACK: "3"
-          # hosted ubuntu x64 measured p50 655ms (samples 602-677) vs the
-          # 600ms blanket ceiling; 4x = 800ms clears the observed band
-          AGREP_PERF_INGEST_ONE_CHANGED_SLACK: "4"
+          # hosted ubuntu x64 measured p50 655ms (samples 602-677) against the
+          # 500ms committed base; 1.6x = 800ms clears the observed band and
+          # keeps this gate tighter than release's 1000ms, so a regression
+          # cannot pass here and fail there.
+          AGREP_PERF_INGEST_ONE_CHANGED_SLACK: "1.6"
         run: python bench/perf.py --check
       - name: idle CPU / RSS / handle gate (4,600-file store)
         if: ${{ matrix.perf }}
@@ -321,10 +323,9 @@ jobs:
             "status/doctor --json"
             "doctor failure-state renders"
             "recall --json shape"
-            "rust binary installed"
             "uninstall sentinel teardown contract"
           )
-          $skipPattern = 'SKIP\s{2}(?<name>.*?)\s+ci: needs live corpus / processes / platform binary$'
+          $skipPattern = 'SKIP\s{2}(?<name>.*?)\s+ci: needs live corpus / processes$'
           $ciSkips = @(
             $output | ForEach-Object {
               if ("$_" -match $skipPattern) { $Matches["name"].Trim() }

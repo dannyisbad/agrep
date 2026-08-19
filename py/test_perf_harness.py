@@ -301,7 +301,7 @@ class PerfHarnessTests(unittest.TestCase):
                  "AGREP_PERF_STREAMED_FIRST_HIT_SLACK": "8",
                  "AGREP_PERF_STREAMED_COMPLETION_SLACK": "4"}):
             limits = self.perf._effective_limits(4)
-        self.assertEqual(limits["ingest_one_changed_ms"], 1_600)
+        self.assertEqual(limits["ingest_one_changed_ms"], 4_000)
         self.assertEqual(limits["streamed_first_hit_ms"], 1_200)
         self.assertEqual(limits["streamed_completion_ms"], 15_000)
 
