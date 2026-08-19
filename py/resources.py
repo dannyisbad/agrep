@@ -255,14 +255,21 @@ def semantic_idle_seconds(requests: int) -> float:
                     for segment in record.get("segments", ()))
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             pass
-        # Repeated use earns a longer lease; one-off use releases private model
-        # memory quickly while file-backed vectors remain OS-reclaimable.
+        # Size the lease by what residency actually holds, not by the matrix:
+        # the vectors are file-backed and stay OS-reclaimable, while the model
+        # session is ~100 MiB of private memory against a 512 MiB resident
+        # budget. Reloading it costs 0.6-2.2 s, so releasing it to reclaim a
+        # fifth of a budget we are not short of is a bad trade - and the
+        # availability clamps below already surrender the whole lease the
+        # moment memory is genuinely scarce. A first query therefore has to
+        # outlive ordinary think time, or a caller working at human pace never
+        # reaches the repeat tier and pays the cold load every single query.
         if matrix_bytes >= 1024 ** 3:
-            base = 90.0 if requests >= 2 else 30.0
+            base = 300.0 if requests >= 2 else 180.0
         elif matrix_bytes >= 256 * 1024 ** 2:
-            base = 180.0 if requests >= 2 else 60.0
+            base = 600.0 if requests >= 2 else 300.0
         else:
-            base = 600.0 if requests >= 2 else 120.0
+            base = 900.0 if requests >= 2 else 600.0
     available = available_memory_fraction()
     if available is not None and available < 0.10:
         return 5.0

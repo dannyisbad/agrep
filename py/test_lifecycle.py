@@ -2096,20 +2096,24 @@ class LifecycleTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGREP_SEM_IDLE_S": ""}):
             with mock.patch.object(resources, "available_memory_fraction", return_value=0.50):
                 for size, one, repeated in (
-                        (255 * 1024 ** 2, 120.0, 600.0),
-                        (256 * 1024 ** 2, 60.0, 180.0),
-                        (1024 * 1024 ** 2, 30.0, 90.0)):
+                        (255 * 1024 ** 2, 600.0, 900.0),
+                        (256 * 1024 ** 2, 300.0, 600.0),
+                        (1024 * 1024 ** 2, 180.0, 300.0)):
                     with common.EMBEDDINGS_PATH.open("wb") as handle:
                         handle.truncate(size)
                     self.assertEqual(common.semantic_idle_seconds(1), one)
                     self.assertEqual(common.semantic_idle_seconds(2), repeated)
+                    # A first query must outlive ordinary think time, or a
+                    # caller working at human pace never reaches the repeat
+                    # tier and reloads the model on every single query.
+                    self.assertGreaterEqual(common.semantic_idle_seconds(1), 180.0)
                 meta = common.EMBEDDINGS_PATH.parent / "embeddings.meta"
                 meta.write_text(json.dumps({
                     "version": 2,
                     "segments": [{"artifacts": {"f32": {"size": 1024 ** 3}}}],
                 }), encoding="utf-8")
                 try:
-                    self.assertEqual(common.semantic_idle_seconds(1), 30.0)
+                    self.assertEqual(common.semantic_idle_seconds(1), 180.0)
                 finally:
                     meta.unlink(missing_ok=True)
             with mock.patch.object(resources, "available_memory_fraction", return_value=0.05):
