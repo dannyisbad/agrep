@@ -552,14 +552,15 @@ def ensure_model(download: bool = True) -> Path:
 
 
 # int8 CPU vs BF16 metal: ~0.99 is quantization cost, and 0.995 admitted none
-# of 240 real messages. Ranking is what matters and holds - top-1 agrees 89/89
-# wherever the margin clears 0.02, and only ties reshuffle. A pooling
-# mismatch, the failure this catches, still scores ~0.77.
+# of 240 real messages. A pooling mismatch scores ~0.77. Near-threshold
+# surfaces calibrated on int8 scores (the 0.82/0.84 bands) can still judge
+# metal scores differently; doctor's lane row discloses that.
 _METAL_MIN_COSINE = 0.97
 
-# Fixed probe text, deliberately spanning short and long rows: the pooling
-# failure this gate exists to catch grows with sequence length, so a probe
-# set of only short strings would score 0.999 and pass a broken lane.
+# Fixed probe text spanning short rows AND rows past the local-attention
+# window (128 tokens, +/-64): below it, local and global layers are
+# identical and a wrong global RoPE base - the failure the model docs call
+# "silently degrades long rows" - is invisible to this gate.
 _METAL_PROBES = (
     "index",
     "the daemon wedged during a warm index pass",
@@ -568,6 +569,22 @@ _METAL_PROBES = (
     "from the compositor while a backfill is running in the background, given "
     "that the display and the model share one piece of silicon and the owner "
     "is actively scrolling a window at the same time",
+    # ~190 tokens: exercises the global-attention layers and both RoPE bases.
+    "the release gate failed at the two million row campaign because the "
+    "sampled process held both of the child's pipes without draining them, "
+    "so a lane that emitted more debug output than one pipe buffer blocked "
+    "on its own stderr until the query timeout expired and the campaign "
+    "died before a single budget was compared. the fix keeps reader threads "
+    "on both pipes for the whole run and reaps the child unconditionally, "
+    "because a zombie's cpu time lands in the parent's children rusage and "
+    "inflates the next run's measurement. separately, the derived stores "
+    "were owned by a different build identity after cargo rebuilt the "
+    "release binary between corpus construction and the embedding pass, so "
+    "the reindex refused to touch them and the semantic store never "
+    "published its generation. none of this was visible from the exit code "
+    "alone: the harness reported a timeout, the freshness validator "
+    "reported a vanished agent, and the actual defect sat in the benchmark "
+    "runner rather than in the search engine it was measuring.",
 )
 
 
@@ -576,10 +593,12 @@ def _parity_cache_path():
 
 
 def _parity_key() -> str | None:
-    """What the verdict is about: this mlx build against this model profile."""
+    """What the verdict is about: this mlx build, model, and probe set."""
     try:
         import importlib.metadata as md
-        return f"{md.version('mlx')}/{PROFILE_STRING}"
+        probes = hashlib.sha256(
+            "\0".join(_METAL_PROBES).encode("utf-8")).hexdigest()[:12]
+        return f"{md.version('mlx')}/{PROFILE_STRING}/{probes}"
     except Exception:  # noqa: BLE001 -- no key means no caching, never a wrong hit
         return None
 

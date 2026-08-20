@@ -520,6 +520,36 @@ class LaneChangeRebuild(unittest.TestCase):
         self.assertIsNone(embed._inherited_lane_change())
 
 
+class RopeWiring(unittest.TestCase):
+    """The one failure the parity gate cannot see, pinned structurally.
+
+    A single RoPE base for both layer kinds shifts same-text cosine by only
+    ~0.004 - inside int8-vs-BF16 quantization noise at ANY floor - so no
+    statistical gate catches it. The config is SHA-pinned, which leaves the
+    encoder's wiring as the only place the bug can arrive.
+    """
+
+    def test_global_and_local_layers_use_their_own_rope_base(self) -> None:
+        ok, reason = mlx_embed.available()
+        if not ok:
+            self.skipTest(f"metal lane unavailable here: {reason}")
+        import mlx_modernbert
+        cfg = {
+            "hidden_size": 64, "num_hidden_layers": 6, "intermediate_size": 128,
+            "num_attention_heads": 2, "global_attn_every_n_layers": 3,
+            "global_rope_theta": 80000.0, "local_rope_theta": 10000.0,
+            "local_attention": 128, "vocab_size": 128, "pad_token_id": 0,
+            "max_position_embeddings": 512,
+        }
+        encoder = mlx_modernbert.ModernBertEncoder(cfg)
+        self.assertEqual(len(encoder.layers), 6)
+        for index, layer in enumerate(encoder.layers):
+            expect_global = index % 3 == 0
+            expected = 80000.0 if expect_global else 10000.0
+            self.assertEqual(layer.attn.is_global, expect_global, f"layer {index}")
+            self.assertEqual(layer.attn.rope.base, expected, f"layer {index}")
+
+
 class VectorSpaceOnRealHardware(unittest.TestCase):
     """The only test that needs a GPU; it is the one that matters most.
 
