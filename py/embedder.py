@@ -551,16 +551,14 @@ def ensure_model(download: bool = True) -> Path:
     return root
 
 
-# int8 CPU vs BF16 metal: ~0.99 is quantization cost, and 0.995 admitted none
-# of 240 real messages. A pooling mismatch scores ~0.77. Near-threshold
-# surfaces calibrated on int8 scores (the 0.82/0.84 bands) can still judge
-# metal scores differently; doctor's lane row discloses that.
+# int8 CPU vs BF16 metal: ~0.99 is quantization cost; 0.995 admitted none of
+# 240 real messages, and a pooling mismatch scores ~0.77. The 0.82/0.84 score
+# bands are int8-calibrated; doctor's lane row discloses the difference.
 _METAL_MIN_COSINE = 0.97
 
-# Fixed probe text spanning short rows AND rows past the local-attention
-# window (128 tokens, +/-64): below it, local and global layers are
-# identical and a wrong global RoPE base - the failure the model docs call
-# "silently degrades long rows" - is invisible to this gate.
+# Probes span short rows AND one past the 128-token local-attention window:
+# below it local and global layers are identical, so a wrong global RoPE base
+# ("silently degrades long rows") would be invisible to this gate.
 _METAL_PROBES = (
     "index",
     "the daemon wedged during a warm index pass",
