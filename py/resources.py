@@ -255,15 +255,9 @@ def semantic_idle_seconds(requests: int) -> float:
                     for segment in record.get("segments", ()))
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             pass
-        # Size the lease by what residency actually holds, not by the matrix:
-        # the vectors are file-backed and stay OS-reclaimable, while the model
-        # session is ~100 MiB of private memory against a 512 MiB resident
-        # budget. Reloading it costs 0.6-2.2 s, so releasing it to reclaim a
-        # fifth of a budget we are not short of is a bad trade - and the
-        # availability clamps below already surrender the whole lease the
-        # moment memory is genuinely scarce. A first query therefore has to
-        # outlive ordinary think time, or a caller working at human pace never
-        # reaches the repeat tier and pays the cold load every single query.
+        # Sized by what residency holds - a ~100 MiB model session against a
+        # 512 MiB budget - not by the file-backed matrix. A first query must
+        # outlive think time or a caller never reaches the repeat tier.
         if matrix_bytes >= 1024 ** 3:
             base = 300.0 if requests >= 2 else 180.0
         elif matrix_bytes >= 256 * 1024 ** 2:

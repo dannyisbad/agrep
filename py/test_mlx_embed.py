@@ -132,10 +132,8 @@ class ParityVerdictCache(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def test_verdict_round_trips_and_is_keyed_to_what_it_measured(self) -> None:
-        # The key is pinned rather than real: _parity_key reads the installed
-        # mlx distribution, which is absent on every CI suite job, and a None
-        # key makes both halves no-op - so the real thing would assert nothing
-        # there while passing here, where mlx happens to be installed.
+        # Pinned, not real: _parity_key reads the installed mlx distribution,
+        # absent on every CI job, where a None key makes both halves no-op.
         with mock.patch.object(embedder, "_parity_key", return_value="mlx-1.2/profile-a"):
             self.assertIsNone(embedder._cached_parity())
             embedder._store_parity(0.98955)
@@ -159,19 +157,9 @@ class ParityVerdictCache(unittest.TestCase):
 class LaneSelection(unittest.TestCase):
     """The lane is chosen ONCE, and the store's own identity outranks the machine.
 
-    Two bugs live here. First, `should_use` was re-asked before every batch, so
-    a backfill took the GPU while the machine was idle and dropped to CPU when
-    it was busy, leaving one store holding rows from two vector spaces. On a
-    24-row fixture that flipped 3 of 45 queries - a different top-1, and a hit
-    that became "no confident match" - which is why lane selection happens up
-    front and the chosen lane is written into embeddings.meta.
-
-    Moving it up front then created the opposite failure: one load average,
-    read once, permanently stranded a store on the slow engine, and a CPU
-    backfill is ~10x longer so it kept the machine busy enough to justify
-    itself. Lane choice now asks only whether Metal opens. Load belongs to
-    indexer._embedding_backfill_policy, which re-reads it continuously and can
-    change its mind.
+    Re-asking per batch mixed two vector spaces into one store and flipped 3 of
+    45 fixture queries. Asking once from a load average then stranded stores on
+    the slow engine for life. Only capability decides it now.
     """
 
     def _machine(self, load, cores=8):
@@ -205,11 +193,8 @@ class LaneSelection(unittest.TestCase):
             self.assertEqual(embedder.default_lane(), embedder.LANE_CPU)
 
     def test_load_never_decides_the_lane(self) -> None:
-        # The regression this replaces: a single load average, read once at
-        # store creation, stranded the store on the slow engine for its whole
-        # life. A lane is a vector space, so only capability may decide it -
-        # a machine pinned at 7.6 over 8 cores still starts on metal, with or
-        # without the explicit pin.
+        # A load average read once at store creation used to strand the store
+        # on the slow engine for life. Only capability may decide a lane.
         for pin in ("", "on"):
             with self.subTest(pin=pin or "auto"):
                 load, cores = self._machine(7.6)
@@ -408,11 +393,8 @@ class LaneDisclosure(unittest.TestCase):
         self.assertIn("cpu", row)
 
     def test_doctor_names_the_cpu_lane_and_the_upgrade_when_one_exists(self) -> None:
-        # A cpu store used to say nothing, so the case that most needed the
-        # disclosure was the silent one: stranded on the slow engine looks
-        # exactly like healthy, only slower. The row must not call an ordinary
-        # store approximate - that caveat belongs to metal alone - so it states
-        # the lane, and names the rebuild only where metal could actually open.
+        # A cpu store used to say nothing, so the case needing the disclosure
+        # most was the silent one. "approximate" belongs to metal alone.
         import doctor
         cpu = embedder.PROFILE_STRING
         with mock.patch.object(doctor, "_store_embedding_identity", return_value=cpu), \
@@ -541,11 +523,9 @@ class LaneChangeRebuild(unittest.TestCase):
 class VectorSpaceOnRealHardware(unittest.TestCase):
     """The only test that needs a GPU; it is the one that matters most.
 
-    It used to skip on exactly the failure it exists to catch. Naming the metal
-    lane makes a refusal raise, and the raise was caught as "unavailable here",
-    so a parity regression turned this green instead of red - which is how mlx
-    0.32.0 shipping 0.98955 against a 0.995 floor stayed invisible. Absent
-    hardware still skips; hardware that is present and DISAGREES now fails.
+    It used to skip on exactly the failure it catches: naming the metal lane
+    makes a refusal raise, and the raise read as "no hardware here". Absent
+    hardware still skips; hardware that disagrees now fails.
     """
 
     def test_metal_and_cpu_agree_on_real_text(self) -> None:

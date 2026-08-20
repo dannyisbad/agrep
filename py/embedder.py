@@ -102,21 +102,12 @@ def lane_of(model_id: str | None) -> str | None:
 def default_lane() -> str:
     """The lane a store gets when nothing on disk decides it yet.
 
-    Metal is the default wherever it can actually open (Apple silicon with the
-    `metal` extra installed): the ~10x lane should not require an environment
-    variable to earn its keep. AGREP_MLX=off opts out entirely and AGREP_MLX=on
-    pins it on. Existing stores are untouched either way - resolve_lane conforms
-    to the rows already on disk, so only a store with no recorded lane lands
-    here.
+    Metal is the default wherever it can open; AGREP_MLX=off opts out. Only a
+    store with no recorded lane lands here - resolve_lane conforms to the rest.
 
-    This asks whether Metal opens, never whether the machine is busy this
-    second. A lane is a vector space the store keeps for its whole life, so a
-    momentary load spike must not decide it: the old courtesy check read one
-    load average and could strand a store on the slow engine permanently.
-    Politeness belongs to scheduling, where indexer._embedding_backfill_policy
-    already paces batches on activity, battery, memory and CPU - and it is the
-    better place for it, because declining Metal does not spare a busy machine,
-    it keeps the same work on the CPU for roughly ten times longer.
+    Capability decides this, never current load: a lane is a vector space the
+    store keeps for life, and one load average used to strand it on the slow
+    engine permanently. Pacing belongs to _embedding_backfill_policy.
     """
     if not mlx_embed.available()[0]:
         # available() also answers False under AGREP_MLX=off.
@@ -560,10 +551,9 @@ def ensure_model(download: bool = True) -> Path:
     return root
 
 
-# Both lanes share weights and differ only by int8-vs-fp16 numerics. The measured
-# 40-message floor was 0.99875; a pooling mismatch scores about 0.77, leaving this
-# gate wide enough to separate arithmetic drift from a different vector space.
-_METAL_MIN_COSINE = 0.995
+# int8 CPU vs BF16 metal: ~0.99 is quantization cost. 240 real messages span
+# 0.981-0.994; a pooling mismatch, the failure this catches, scores ~0.77.
+_METAL_MIN_COSINE = 0.97
 
 # Fixed probe text, deliberately spanning short and long rows: the pooling
 # failure this gate exists to catch grows with sequence length, so a probe
@@ -728,11 +718,8 @@ class Embedder:
             return
         cached = _cached_parity()
         if cached is not None and cached < _METAL_MIN_COSINE:
-            # Loading MLX and re-running the probe to reach the same verdict
-            # cost ~150ms on every construction, on exactly the machines where
-            # metal is installed and does not qualify. The verdict is keyed to
-            # the mlx build and the model profile, so it re-runs when either
-            # moves and never outlives the thing it measured.
+            # Re-proving this verdict cost ~150ms per construction. The key
+            # covers the mlx build and model, so it cannot outlive either.
             refuse(f"its parity cosine {cached:.5f} is below "
                    f"{_METAL_MIN_COSINE} against the onnx lane (cached)")
             return

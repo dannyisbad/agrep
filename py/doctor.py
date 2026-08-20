@@ -817,14 +817,9 @@ _LANE_IDENTITY_SUFFIX = ":lane-"
 def _store_lane_notice() -> str | None:
     """Which engine wrote this store's vectors, always said out loud.
 
-    Reading embeddings.meta by hand used to be the only way to learn this, and
-    only a non-default lane said anything at all - so the case that most needs
-    the disclosure stayed silent: a store stranded on the slow engine looks
-    exactly like a healthy one, just inexplicably slower. Both lanes get a row
-    now. The metal row keeps its near-threshold caveat (the lanes agree to
-    ~0.9993, so they can still order borderline hits differently); the cpu row
-    names the faster engine when this machine could open it, because that is
-    the only moment the reader can act on it.
+    Only a non-default lane used to speak, so a store stranded on the slow
+    engine read exactly like a healthy one. Both lanes get a row now; the
+    near-threshold caveat stays with metal, which alone earns it.
     """
     identity = _store_embedding_identity()
     if not identity:
@@ -3311,10 +3306,8 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
             model_detail += f"; store lane {smart['embedding_lane']}"
         runtime_lane = smart.get("runtime_lane")
         if runtime_lane:
-            # The store's lane says what was written; this says what this box
-            # would write now. When they differ the reason matters, because a
-            # declined metal lane is otherwise indistinguishable from one that
-            # was never offered.
+            # A declined lane is otherwise indistinguishable from one that was
+            # never offered.
             model_detail += f"; this machine opens {runtime_lane}"
             if smart.get("runtime_lane_refusal"):
                 model_detail += f" ({smart['runtime_lane_refusal']})"
