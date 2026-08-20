@@ -3477,8 +3477,10 @@ def t_semantic_resident_worker():
             one_off_lease = server._idle_limit()
             server.requests = 2
             repeated_lease = server._idle_limit()
+            # 300 MiB matrix = the middle tier; still shorter than the small
+            # tier's 600/900, which is the ordering this check defends.
             checks["large_matrix_short_lease"] = (
-                one_off_lease == 60.0 and repeated_lease == 180.0)
+                one_off_lease == 300.0 and repeated_lease == 600.0)
             server.request_stop()
             thread.join(timeout=2)
             checks["cleanup"] = (
