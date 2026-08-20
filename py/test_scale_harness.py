@@ -191,6 +191,14 @@ class ScaleHarnessTests(unittest.TestCase):
         )
         self.assertEqual(self.scale._budget_failures([report], "portable-ci"), [])
 
+    def test_portable_latency_slack_is_pinned_without_moving_targets(self):
+        portable, _campaign = self.scale.SCALE_BUDGET_PROFILES["portable-ci"]
+        self.assertEqual(self.scale.PORTABLE_LATENCY_SLACK, 3.25)
+        self.assertEqual(self.scale.SCALE_BUDGETS_MS[2_000_000]["old_mid_density"],
+                         500)
+        self.assertEqual(portable[2_000_000]["old_mid_density"], 1625.0)
+        self.assertEqual(portable[2_000_000]["old_dense"], 7475.0)
+
     def test_budget_gate_rejects_unbudgeted_and_incomplete_campaigns(self):
         unbudgeted = {"rows": 30_000, "workloads": {}}
         self.assertEqual(
