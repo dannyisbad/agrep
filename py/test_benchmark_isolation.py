@@ -120,6 +120,33 @@ class BenchmarkIsolationTests(unittest.TestCase):
             env = scale._private_env(root / "home", root / "data", root / "model")
         self.assertNotIn("AGREP_DATA_READONLY", env)
 
+    def test_semantic_scale_tolerates_one_transient_owner_observation(self) -> None:
+        scale = self._semantic_scale_module()
+        process = mock.Mock(pid=41, returncode=None)
+        process.poll.return_value = None
+        healthy = {"running": True, "responsive": True, "pid": 41}
+        with mock.patch.object(
+                scale, "_freshener_status",
+                side_effect=({"running": False, "blocked": True,
+                              "state": "hostile"}, healthy)) as status, \
+                mock.patch.object(scale.time, "sleep") as sleep:
+            self.assertEqual(scale._assert_freshener(process, {}), healthy)
+        self.assertEqual(status.call_count, 2)
+        sleep.assert_called_once_with(0.05)
+
+    def test_semantic_scale_rejects_persistent_owner_degradation(self) -> None:
+        scale = self._semantic_scale_module()
+        process = mock.Mock(pid=41, returncode=None)
+        process.poll.return_value = None
+        hostile = {"running": False, "blocked": True, "state": "hostile"}
+        with mock.patch.object(
+                scale, "_freshener_status", return_value=hostile) as status, \
+                mock.patch.object(scale.time, "sleep") as sleep, \
+                self.assertRaisesRegex(RuntimeError, "ownership moved or degraded"):
+            scale._assert_freshener(process, {})
+        self.assertEqual(status.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_semantic_scale_requests_stop_before_waiting(self) -> None:
         scale = self._semantic_scale_module()
 

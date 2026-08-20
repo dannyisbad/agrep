@@ -675,16 +675,23 @@ def _freshener_status(env: dict[str, str]) -> dict:
 
 def _assert_freshener(
         process: subprocess.Popen, env: dict[str, str]) -> dict:
-    if process.poll() is not None:
-        raise RuntimeError(
-            f"synthetic freshness owner exited early ({process.returncode})")
-    status = _freshener_status(env)
-    if (status.get("running") is not True
-            or status.get("responsive") is not True
-            or status.get("pid") != process.pid):
-        raise RuntimeError(
-            f"synthetic freshness ownership moved or degraded: {status}")
-    return status
+    observed = []
+    for attempt in range(3):
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"synthetic freshness owner exited early ({process.returncode})")
+        status = _freshener_status(env)
+        if (status.get("running") is True
+                and status.get("responsive") is True
+                and status.get("pid") == process.pid):
+            return status
+        observed.append(status)
+        if attempt < 2:
+            # The controlled owner self-verifies and heartbeats every 50 ms.
+            # Require degradation to survive three of those periods.
+            time.sleep(0.05)
+    raise RuntimeError(
+        f"synthetic freshness ownership moved or degraded: {observed}")
 
 
 def _request_freshener_stop(
