@@ -918,8 +918,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--force-low-space", action="store_true")
     args = parser.parse_args(argv)
+    if args.check and args.quick:
+        parser.error("--check and --quick are mutually exclusive: the 10M "
+                     "projections are affine fits, and one measured row count "
+                     "books every fixed cost as per-row")
     if args.quick:
         args.rows = list(QUICK_ROWS)
+    if args.check and len(set(args.rows)) < 2:
+        parser.error("--check requires at least two distinct row counts")
     if (any(rows <= 0 for rows in args.rows) or args.dim <= 0
             or args.repeats <= 0 or not 1 <= args.parity_queries <= 3
             or args.block_rows <= 0 or args.topup_rows <= 0):
