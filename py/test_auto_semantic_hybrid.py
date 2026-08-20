@@ -157,11 +157,14 @@ class AutoSemanticHybridTests(unittest.TestCase):
             "AGREP_PROFILE": "compact" if compact_profile else "",
             # Keep caller resolution independent of whichever agent runs this
             # test process; individual cases opt into an identity explicitly.
+            # calling_identity reads exactly three vars - keep this in step.
             "CODEX_THREAD_ID": current_session or "",
             "CLAUDE_CODE_SESSION_ID": "",
+            "AGREP_PI_SESSION_ID": "",
             "CLAUDECODE": "",
             "CLAUDE_CODE": "",
             "CLAUDE_CODE_ENTRYPOINT": "",
+            "OMPCODE": "",
             **(extra_env or {}),
         }
         stdout = _TtyBuffer()

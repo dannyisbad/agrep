@@ -32,6 +32,8 @@ class ScaleHarnessTests(unittest.TestCase):
         inherited = {
             "AGREP_RS_BIN": "/wrong/agrep-rs",
             "CODEX_THREAD_ID": "would-hide-a-row",
+            "CLAUDE_CODE_SESSION_ID": "would-hide-a-row",
+            "AGREP_PI_SESSION_ID": "would-hide-a-row",
             "CLAUDECODE": "1",
             "CLINE_DIR": "/real/cline",
             "OPENCODE_DB": "/real/opencode.db",
@@ -41,7 +43,10 @@ class ScaleHarnessTests(unittest.TestCase):
             root = Path(tmp)
             env = self.scale._private_env(root / "home", root / "data")
         self.assertEqual(env["AGREP_RS_BIN"], str(self.scale.RUST_BIN))
+        # every var calling_identity reads, or self-exclusion hides a row
         self.assertNotIn("CODEX_THREAD_ID", env)
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", env)
+        self.assertNotIn("AGREP_PI_SESSION_ID", env)
         self.assertNotIn("CLAUDECODE", env)
         self.assertNotIn("CLINE_DIR", env)
         self.assertNotIn("OPENCODE_DB", env)
