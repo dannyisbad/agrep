@@ -226,11 +226,9 @@ def _write_fixture(data: Path, rows: int) -> dict[str, object]:
             who = ("user" if ordinal < short_decoys or ordinal >= mid_old_start else
                    ("user", "agent", "subagent", "tool")[ordinal % 4])
             text = _base_text(ordinal)
-            # The possessive defeats the ASCII-aligned certification fast
-            # path (an apostrophe between letters is never a certifiable
-            # edge), so these lanes keep measuring the native boundary
-            # scorer their budgets were calibrated against; the trigram
-            # index still matches the bare token.
+            # The possessive defeats the ASCII certification fast path, so
+            # these lanes keep measuring the native scorer their budgets were
+            # set against; the trigram index still matches the bare token.
             if ordinal >= old_dense_start:
                 text += f" {OLD_DENSE_QUERY}'s"
             if ordinal >= mid_old_start:
@@ -492,10 +490,8 @@ def _sampled_process(cmd: list[str], *, cwd: Path, env: dict[str, str],
         text=True, encoding="utf-8", errors="replace",
         **({"creationflags": subprocess.CREATE_NO_WINDOW}
            if os.name == "nt" else {}))
-    # The sampling loop must never be the reason the child stops running:
-    # a debug-heavy lane writes far more than one pipe buffer, and polling
-    # without draining would block the child on its own stderr until the
-    # timeout. Reader threads keep both pipes empty for the whole run.
+    # Polling without draining blocks a debug-heavy child on its own stderr
+    # once the pipe buffer fills, until the timeout.
     collected: dict[str, str] = {}
     readers = [threading.Thread(target=_drain_stream, args=(stream, name, collected),
                                 daemon=True)
@@ -506,10 +502,8 @@ def _sampled_process(cmd: list[str], *, cwd: Path, env: dict[str, str],
     def finish(join_timeout: float | None = None) -> tuple[str, str]:
         for reader in readers:
             reader.join(join_timeout)
-        # Reap unconditionally. On the timeout path the child is already
-        # SIGKILLed, so this cannot block, and skipping it would leave a
-        # zombie whose CPU later lands in this process's children_* delta
-        # and inflates a subsequent run's cpu_seconds.
+        # Reap unconditionally: the child is already SIGKILLed on the timeout
+        # path, and a zombie's CPU lands in a later run's children_* delta.
         proc.wait()
         return collected.get("stdout", ""), collected.get("stderr", "")
 
