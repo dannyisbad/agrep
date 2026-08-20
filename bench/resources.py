@@ -1292,7 +1292,7 @@ def _stop_process(proc: subprocess.Popen) -> None:
         _close_process_pipes(proc)
 
 
-def measure(*, settle_s: float = 2.0, sample_s: float = 5.0,
+def measure(*, settle_s: float = 10.0, sample_s: float = 5.0,
             idle_timeout_s: float = 30.0, measure_semantic: bool = True) -> dict:
     model_root = _default_model_root()  # Resolve before installing the fixture HOME.
     with tempfile.TemporaryDirectory(prefix="agrep-resource-") as tmp:
@@ -1414,8 +1414,8 @@ def main() -> int:
     parser.add_argument("--no-semantic", action="store_true",
                         help="do not attempt the optional local semantic lane")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--settle-s", type=float, default=2.0,
-                        help="minimum wait before CPU-based idle detection")
+    parser.add_argument("--settle-s", type=float, default=10.0,
+                        help="minimum wait past daemon startup before idle detection")
     parser.add_argument("--sample-s", type=float, default=5.0,
                         help="idle sampling duration")
     parser.add_argument("--idle-timeout-s", type=float, default=60.0)
