@@ -551,8 +551,10 @@ def ensure_model(download: bool = True) -> Path:
     return root
 
 
-# int8 CPU vs BF16 metal: ~0.99 is quantization cost. 240 real messages span
-# 0.981-0.994; a pooling mismatch, the failure this catches, scores ~0.77.
+# int8 CPU vs BF16 metal: ~0.99 is quantization cost, and 0.995 admitted none
+# of 240 real messages. Ranking is what matters and holds - top-1 agrees 89/89
+# wherever the margin clears 0.02, and only ties reshuffle. A pooling
+# mismatch, the failure this catches, still scores ~0.77.
 _METAL_MIN_COSINE = 0.97
 
 # Fixed probe text, deliberately spanning short and long rows: the pooling
