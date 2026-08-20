@@ -136,11 +136,14 @@ class Case:
 
 def _private_env(home: Path, data: Path) -> dict[str, str]:
     env = dict(os.environ)
+    # calling_identity reads CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID and
+    # AGREP_PI_SESSION_ID; leaking any one lets self-exclusion hide a row.
     for name in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_DATA_HOME",
                  "XDG_CONFIG_HOME", "AGREP_PROFILE", "AGREP_RS_BIN", "CODEX_THREAD_ID",
+                 "CLAUDE_CODE_SESSION_ID", "AGREP_PI_SESSION_ID",
                  "CODEX_SANDBOX", "CLAUDECODE",
                  "CLAUDE_CODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE", "GEMINI_CLI",
-                 "CLINE_ACTIVE", "CURSOR_AGENT", "CLINE_DIR", "OPENCODE_DB"):
+                 "CLINE_ACTIVE", "CURSOR_AGENT", "CLINE_DIR", "OPENCODE_DB", "OMPCODE"):
         env.pop(name, None)
     env.update({
         "HOME": str(home),
