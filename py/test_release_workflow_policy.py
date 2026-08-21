@@ -281,6 +281,13 @@ class ReleaseBodyTests(unittest.TestCase):
         self.assertIn("--engine-prefix semantic:", block)
         self.assertNotIn('row.get("engine")', block)
 
+    def test_npm_publish_marks_reconciled_tarballs_as_local_paths(self):
+        text = (ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8")
+        block = _job(text, "publish-npm")
+        self.assertIn('npm publish "./$package"', block)
+        self.assertNotIn('npm publish "$package"', block)
+
 
 class ReleaseRepositoryPolicyTests(unittest.TestCase):
     def setUp(self):
