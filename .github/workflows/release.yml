@@ -931,7 +931,7 @@ jobs:
               "mundy-agrep-$version.tgz"|"agrep-cli-$version.tgz") ;;
               *) echo "::error::unexpected npm artifact: $package"; exit 1 ;;
             esac
-            npm publish "$package" --access public --provenance --ignore-scripts
+            npm publish "./$package" --access public --provenance --ignore-scripts
           done
 
   verify-npm-release:
