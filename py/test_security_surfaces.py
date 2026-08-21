@@ -403,7 +403,7 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
         self.assertIn(
             "needs.reconcile-npm-dist.outputs.artifact-digest != ''",
             npm_privileged)
-        self.assertIn("npm publish \"$package\" --access public "
+        self.assertIn("npm publish \"./$package\" --access public "
                       "--provenance --ignore-scripts", npm_privileged)
         self.assertNotIn("actions/checkout@", npm_privileged)
         self.assertNotIn("bench/npm_release.py", npm_privileged)
