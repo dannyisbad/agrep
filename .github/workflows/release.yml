@@ -12,6 +12,12 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      recover_v030:
+        description: "Recover npm + GitHub publication from run 32439830885"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -1013,3 +1019,56 @@ jobs:
           elif [ "$expected_prerelease" = "false" ]; then
             gh release edit "$GITHUB_REF_NAME" --latest
           fi
+
+  recover-v030:
+    name: recover the sealed v0.3.0 release
+    if: >-
+      ${{ github.repository == 'dannyisbad/agrep'
+          && github.event_name == 'workflow_dispatch'
+          && inputs.recover_v030 }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          registry-url: "https://registry.npmjs.org"
+      - name: download the original sealed bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: 9432637862,9432089589,9432602099,9432137022
+          path: recovery
+          merge-multiple: false
+          run-id: 32439830885
+          github-token: ${{ github.token }}
+      - name: verify, publish the missing npm tarballs, and expose the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.3.0
+          missing=recovery/npm-missing-32439830885-1
+          sealed=recovery/npm-sealed-32439830885-1
+          pypi=recovery/pypi-validated-32439830885-1
+          assets=recovery/release-assets-32439830885-1/assets
+          test "$(npm --version)" = "11.16.0"
+          for package in "$missing"/*.tgz; do
+            name=${package##*/}
+            cmp "$package" "$sealed/$name"
+            npm publish "./$package" --access public --provenance --ignore-scripts
+          done
+          python bench/npm_release.py --dist-dir "$sealed" --version "$version" \
+            --require-complete --wait-seconds 120
+          python bench/pypi_release.py --dist-dir "$pypi" --version "$version" \
+            --require-complete --wait-seconds 120
+          mkdir live
+          gh release download "v$version" --dir live
+          diff --recursive --brief "$assets" live
+          gh release edit "v$version" --draft=false --prerelease=false --latest

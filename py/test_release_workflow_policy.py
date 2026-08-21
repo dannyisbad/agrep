@@ -139,6 +139,15 @@ def _has_release_context_guard(condition: str | None) -> bool:
     return remainder.startswith(" }}") or remainder.startswith(" && ")
 
 
+def _has_v030_recovery_guard(condition: str | None) -> bool:
+    if condition is None:
+        return False
+    return " ".join(condition.split()) == (
+        "${{ github.repository == 'dannyisbad/agrep' "
+        "&& github.event_name == 'workflow_dispatch' "
+        "&& inputs.recover_v030 }}")
+
+
 def _release_context_allowed(
     condition: str | None,
     repository: str,
@@ -318,15 +327,19 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
         })
         for name in sorted(sensitive):
             with self.subTest(job=name):
+                condition = _job_field(jobs[name], "if")
+                guarded = (_has_v030_recovery_guard(condition)
+                           if name == "recover-v030" else
+                           _has_release_context_guard(condition))
                 self.assertTrue(
-                    _has_release_context_guard(_job_field(jobs[name], "if")),
+                    guarded,
                     f"publication-sensitive job lacks release guard: {name}",
                 )
 
     def test_release_context_truth_table_rejects_dispatch_and_foreign_repos(self):
         sensitive = {
             name: block for name, block in _jobs(self.text).items()
-            if _is_publication_sensitive(block)
+            if _is_publication_sensitive(block) and name != "recover-v030"
         }
         cases = (
             ("dannyisbad/agrep", "push", "refs/tags/v0.2.0", True),
@@ -345,6 +358,16 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
                             condition, repository, event, ref),
                         expected,
                     )
+
+    def test_v030_recovery_is_manual_canonical_and_artifact_pinned(self):
+        block = _jobs(self.text)["recover-v030"]
+        self.assertTrue(_has_v030_recovery_guard(_job_field(block, "if")))
+        self.assertIn("run-id: 32439830885", block)
+        self.assertIn(
+            "artifact-ids: 9432637862,9432089589,9432602099,9432137022",
+            block)
+        self.assertIn('npm publish "./$package"', block)
+        self.assertIn("--require-complete --wait-seconds 120", block)
 
     def test_branch_dispatch_remains_available_for_read_only_builds(self):
         trigger = self.text[:self.text.index("\npermissions:\n")]
