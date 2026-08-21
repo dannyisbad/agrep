@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   release-preflight:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.recover_v030 }}
     name: release identity preflight
     runs-on: ubuntu-latest
     permissions:
@@ -1047,7 +1048,7 @@ jobs:
           merge-multiple: false
           run-id: 32439830885
           github-token: ${{ github.token }}
-      - name: verify, publish the missing npm tarballs, and expose the draft
+      - name: verify immutable registries and draft before publishing npm
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1058,17 +1059,34 @@ jobs:
           sealed=recovery/npm-sealed-32439830885-1
           pypi=recovery/pypi-validated-32439830885-1
           assets=recovery/release-assets-32439830885-1/assets
-          test "$(npm --version)" = "11.16.0"
-          for package in "$missing"/*.tgz; do
-            name=${package##*/}
-            cmp "$package" "$sealed/$name"
-            npm publish "./$package" --access public --provenance --ignore-scripts
+          mapfile -t packages < <(find "$missing" -maxdepth 1 -type f -name '*.tgz' | sort)
+          expected=("$missing/agrep-cli-$version.tgz" "$missing/mundy-agrep-$version.tgz")
+          if [ "${packages[*]}" != "${expected[*]}" ]; then
+            echo "::error::recovery npm tarball set is not exact"
+            exit 1
+          fi
+          for package in "${packages[@]}"; do
+            cmp "$package" "$sealed/${package##*/}"
           done
-          python bench/npm_release.py --dist-dir "$sealed" --version "$version" \
-            --require-complete --wait-seconds 120
           python bench/pypi_release.py --dist-dir "$pypi" --version "$version" \
             --require-complete --wait-seconds 120
           mkdir live
           gh release download "v$version" --dir live
           diff --recursive --brief "$assets" live
-          gh release edit "v$version" --draft=false --prerelease=false --latest
+      - name: publish and verify the original sealed npm bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.3.0
+          missing=recovery/npm-missing-32439830885-1
+          sealed=recovery/npm-sealed-32439830885-1
+          test "$(npm --version)" = "11.16.0"
+          for package in "$missing"/*.tgz; do
+            npm publish "./$package" --access public --provenance --ignore-scripts
+          done
+          python bench/npm_release.py --dist-dir "$sealed" --version "$version" \
+            --require-complete --wait-seconds 120
+      - name: expose the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit v0.3.0 --draft=false --prerelease=false --latest

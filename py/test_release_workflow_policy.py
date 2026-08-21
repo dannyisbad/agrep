@@ -360,14 +360,24 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
                     )
 
     def test_v030_recovery_is_manual_canonical_and_artifact_pinned(self):
-        block = _jobs(self.text)["recover-v030"]
+        jobs = _jobs(self.text)
+        block = jobs["recover-v030"]
         self.assertTrue(_has_v030_recovery_guard(_job_field(block, "if")))
         self.assertIn("run-id: 32439830885", block)
         self.assertIn(
             "artifact-ids: 9432637862,9432089589,9432602099,9432137022",
             block)
-        self.assertIn('npm publish "./$package"', block)
+        self.assertIn('expected=("$missing/agrep-cli-$version.tgz" '
+                      '"$missing/mundy-agrep-$version.tgz")', block)
+        verify = block.index("verify immutable registries and draft")
+        publish = block.index('npm publish "./$package"')
+        self.assertLess(verify, publish)
         self.assertIn("--require-complete --wait-seconds 120", block)
+        preflight = jobs["release-preflight"]
+        self.assertEqual(
+            _job_field(preflight, "if"),
+            "${{ github.event_name != 'workflow_dispatch' "
+            "|| !inputs.recover_v030 }}")
 
     def test_branch_dispatch_remains_available_for_read_only_builds(self):
         trigger = self.text[:self.text.index("\npermissions:\n")]
