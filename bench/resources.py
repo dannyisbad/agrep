@@ -1292,6 +1292,11 @@ def _stop_process(proc: subprocess.Popen) -> None:
         _close_process_pipes(proc)
 
 
+def _write_fixture_settings(data: Path) -> None:
+    (data / "settings.json").write_text(
+        '{"embeddings":"off"}\n', encoding="utf-8")
+
+
 def measure(*, settle_s: float = 10.0, sample_s: float = 5.0,
             idle_timeout_s: float = 30.0, measure_semantic: bool = True) -> dict:
     model_root = _default_model_root()  # Resolve before installing the fixture HOME.
@@ -1302,6 +1307,7 @@ def measure(*, settle_s: float = 10.0, sample_s: float = 5.0,
         data = root / "data"
         project.mkdir(parents=True)
         data.mkdir()
+        _write_fixture_settings(data)
         made = _write_store(project)
         if made != ROWS:
             raise RuntimeError(f"resource fixture made {made} messages, expected {ROWS}")

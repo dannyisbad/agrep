@@ -84,6 +84,13 @@ class ResourceHarnessTests(unittest.TestCase):
             time.time() - mtime >= self.resources._IDLE_SOURCE_AGE_S - 2
             for mtime in mtimes))
 
+    def test_idle_fixture_disables_background_semantic_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td)
+            self.resources._write_fixture_settings(data)
+            settings = (data / "settings.json").read_text(encoding="utf-8")
+        self.assertEqual(settings, '{"embeddings":"off"}\n')
+
     def test_windows_console_host_is_not_idle_work(self):
         with mock.patch.object(sys, "platform", "win32"), \
                 mock.patch.object(self.resources, "_tree_pids", return_value=[10, 11]), \
