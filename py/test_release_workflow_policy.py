@@ -364,14 +364,21 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
         block = jobs["recover-v030"]
         self.assertTrue(_has_v030_recovery_guard(_job_field(block, "if")))
         self.assertIn("run-id: 32439830885", block)
-        self.assertIn(
-            "artifact-ids: 9432637862,9432089589,9432602099,9432137022",
-            block)
-        self.assertIn('expected=("$missing/agrep-cli-$version.tgz" '
-                      '"$missing/mundy-agrep-$version.tgz")', block)
-        verify = block.index("verify immutable registries and draft")
+        for artifact_id in (
+                "9432129380", "9432086119", "9432081544", "9432074585",
+                "9432072099", "9432037226", "9432004230", "9432130449",
+                "9432086951", "9432082306", "9432075495", "9432072596",
+                "9432037777"):
+            self.assertIn(artifact_id, block)
+        verify = block.index("verify PyPI and repair the draft")
         publish = block.index('npm publish "./$package"')
         self.assertLess(verify, publish)
+        self.assertIn('node npm/publish.js --out-dir sealed', block)
+        self.assertIn('node --test npm/test_publish.js', block)
+        self.assertIn('test -f "sealed/agrep-cli-$version.tgz"', block)
+        self.assertIn('test -f "sealed/mundy-agrep-$version.tgz"', block)
+        self.assertIn("gh release upload \"v$version\" expected/* --clobber",
+                      block)
         self.assertIn("--require-complete --wait-seconds 120", block)
         preflight = jobs["release-preflight"]
         self.assertEqual(
