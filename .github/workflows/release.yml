@@ -1087,7 +1087,17 @@ jobs:
           python bench/npm_release.py \
             --dist-dir sealed --version "$version" --offline
           for package in sealed/*.tgz; do
-            npm publish "./$package" --access public --provenance --ignore-scripts
+            case "${package##*/}" in
+              "agrep-cli-$version.tgz") name="agrep-cli" ;;
+              "mundy-agrep-$version.tgz") name="@mundy/agrep" ;;
+              *) echo "::error::unexpected npm artifact: $package"; exit 1 ;;
+            esac
+            published=$(npm view "$name@$version" version 2>/dev/null || true)
+            if [ "$published" = "$version" ]; then
+              echo "already published: $name@$version - verifying only"
+            else
+              npm publish "./$package" --access public --provenance --ignore-scripts
+            fi
           done
           python bench/npm_release.py --dist-dir sealed --version "$version" \
             --require-complete --wait-seconds 120
