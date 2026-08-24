@@ -1380,7 +1380,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         if "freshness" in said_once:
             return
         said_once.add("freshness")
-        notice = indexd_runtime.agent_freshness_notice()
+        notice = search.escalated_freshness_notice()
         if notice:
             common.log(notice)
 

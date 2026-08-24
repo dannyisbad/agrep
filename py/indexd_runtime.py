@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, NamedTuple
@@ -23,6 +24,7 @@ from typing import Callable, Mapping, NamedTuple
 import common
 import events
 import fileops
+from hookless import locators
 import ownerfile
 import removal_fence
 import surface_policy as surface
@@ -1409,6 +1411,7 @@ class _IndexdOwnerState(Enum):
     ABSENT = "absent"
     COMPATIBLE = "compatible"
     INCOMPATIBLE = "incompatible"
+    MISMATCHED = "mismatched"
     ORPHANED_GROUP = "orphaned-group"
     DEAD = "dead"
     REUSED = "reused"
@@ -1423,9 +1426,16 @@ _INDEXD_RECLAIMABLE_STATES = frozenset({
     _IndexdOwnerState.REUSED,
     _IndexdOwnerState.MALFORMED_STALE,
 })
+# Live exact owners this build may displace: a wire-incompatible upgrade
+# predecessor, or a daemon certifying a divergent home/data world against
+# this data dir (the poisoned-environment incident).
+_INDEXD_RETIRABLE_EXACT_STATES = frozenset({
+    _IndexdOwnerState.INCOMPATIBLE,
+    _IndexdOwnerState.MISMATCHED,
+})
 _INDEXD_EXACT_STATES = frozenset({
     _IndexdOwnerState.COMPATIBLE,
-    _IndexdOwnerState.INCOMPATIBLE,
+    *_INDEXD_RETIRABLE_EXACT_STATES,
 })
 _INDEXD_UNRETIRABLE_STATES = frozenset({
     _IndexdOwnerState.HOSTILE,
@@ -1434,7 +1444,7 @@ _INDEXD_UNRETIRABLE_STATES = frozenset({
 })
 _INDEXD_INLINE_BLOCKING_STATES = frozenset({
     *_INDEXD_UNRETIRABLE_STATES,
-    _IndexdOwnerState.INCOMPATIBLE,
+    *_INDEXD_RETIRABLE_EXACT_STATES,
     _IndexdOwnerState.ORPHANED_GROUP,
 })
 _INDEXD_DELEGATING_STATES = frozenset({
@@ -1452,6 +1462,9 @@ class _IndexdOwnerInspection(NamedTuple):
     snapshot: ownerfile.Snapshot | None
     pid: int | None
     process_start: str | None
+    home: str | None = None
+    data: str | None = None
+    mismatch: str | None = None
 
 
 def indexd_generation_token(owner_snapshot: ownerfile.Snapshot) -> str:
@@ -1608,6 +1621,51 @@ def _retire_indexd_child(
     return _remove_indexd_child(record)
 
 
+def _world_stamp(path: object) -> str:
+    """Encode one resolved world path as a single ownership token.
+
+    The lock body is space-separated ``field=value`` tokens, so a macOS path
+    with spaces must be percent-encoded to round-trip through
+    ``common._owner_field``; ``_owner_world_field`` decodes it back.
+    """
+    return urllib.parse.quote(os.path.abspath(os.fspath(path)), safe="/")
+
+
+def _owner_world_field(body: str, field: str) -> str | None:
+    """Decode one optional world stamp; pre-stamp locks simply lack it."""
+    value = common._owner_field(body, field)
+    return urllib.parse.unquote(value) if value is not None else None
+
+
+def _same_world_path(recorded: str, resolved: str) -> bool:
+    return (os.path.normcase(os.path.abspath(recorded))
+            == os.path.normcase(os.path.abspath(resolved)))
+
+
+def _owner_world_mismatch(
+        pid: int | None, home_stamp: str | None,
+        data_stamp: str | None) -> str | None:
+    """Name a live owner certifying a different world than this invocation.
+
+    A daemon keeps whatever home and data dir its spawn environment resolved
+    for its whole lifetime; a lock stamped with either from another world is
+    the poisoned-environment failure, not a version skew. Locks without the
+    stamps (older daemons) never infer a mismatch from absence.
+    """
+    local_home = os.path.abspath(locators.discovery_home())
+    local_data = os.path.abspath(os.fspath(common.DATA_DIR))
+    if ((home_stamp is None or _same_world_path(home_stamp, local_home))
+            and (data_stamp is None
+                 or _same_world_path(data_stamp, local_data))):
+        return None
+    return (
+        f"freshness daemon (pid {pid}) is watching "
+        f"home {home_stamp or '(unstamped)'} / "
+        f"data {data_stamp or '(unstamped)'}; "
+        f"this invocation resolves home {local_home} / data {local_data}; "
+        "stop that daemon or unset the divergent environment")
+
+
 def _inspect_indexd_owner(
         *, current_writer_id: str | None = None, settle_child: bool = True,
 ) -> _IndexdOwnerInspection:
@@ -1631,6 +1689,9 @@ def _inspect_indexd_owner(
     token = common._owner_field(body, "token")
     group_text = common._owner_field(body, "group")
     tree_text = common._owner_field(body, "tree")
+    home_stamp = _owner_world_field(body, "home")
+    data_stamp = _owner_world_field(body, "data")
+    mismatch: str | None = None
     try:
         pid = int(pid_text) if pid_text is not None else None
     except ValueError:
@@ -1663,7 +1724,9 @@ def _inspect_indexd_owner(
                 state = _IndexdOwnerState.MALFORMED_STALE
         else:
             state = _IndexdOwnerState.MALFORMED_STALE
-        return _IndexdOwnerInspection(state, observed, pid, process_start)
+        return _IndexdOwnerInspection(
+            state, observed, pid, process_start,
+            home=home_stamp, data=data_stamp)
     process_owner = ownerfile.classify_process(
         pid, process_start, pid_alive=common.pid_alive,
         process_start=lambda owner_pid: common.process_start_identity(owner_pid))
@@ -1672,11 +1735,13 @@ def _inspect_indexd_owner(
         if child_active is True:
             return _IndexdOwnerInspection(
                 _IndexdOwnerState.ORPHANED_GROUP,
-                observed, pid, process_start)
+                observed, pid, process_start,
+                home=home_stamp, data=data_stamp)
         if child_active is None:
             return _IndexdOwnerInspection(
                 _IndexdOwnerState.UNVERIFIABLE,
-                observed, pid, process_start)
+                observed, pid, process_start,
+                home=home_stamp, data=data_stamp)
         if common.WIN:
             state = _IndexdOwnerState.DEAD
         else:
@@ -1764,9 +1829,16 @@ def _inspect_indexd_owner(
         elif not topology:
             state = _IndexdOwnerState.HOSTILE
         else:
-            state = (_IndexdOwnerState.COMPATIBLE
-                     if wire_compatible else _IndexdOwnerState.INCOMPATIBLE)
-    return _IndexdOwnerInspection(state, observed, pid, process_start)
+            mismatch = _owner_world_mismatch(pid, home_stamp, data_stamp)
+            if mismatch is not None:
+                state = _IndexdOwnerState.MISMATCHED
+            elif wire_compatible:
+                state = _IndexdOwnerState.COMPATIBLE
+            else:
+                state = _IndexdOwnerState.INCOMPATIBLE
+    return _IndexdOwnerInspection(
+        state, observed, pid, process_start,
+        home=home_stamp, data=data_stamp, mismatch=mismatch)
 
 
 def _indexd_ready_path(owner_snapshot: ownerfile.Snapshot) -> Path:
@@ -2147,7 +2219,7 @@ def _settle_indexd_owner(
     retire_deadline = time.monotonic() + max(0.0, retire_budget_s)
     for _ in range(3):
         inspected = _inspect_indexd_owner()
-        if inspected.state is _IndexdOwnerState.INCOMPATIBLE:
+        if inspected.state in _INDEXD_RETIRABLE_EXACT_STATES:
             if inspected.pid is None or inspected.process_start is None:
                 return inspected
             if (common.WIN and inspected.snapshot is not None
@@ -2572,7 +2644,9 @@ def indexd_resource_status(
                     "state": "legacy-owner"}
         if inspected.state is not _IndexdOwnerState.COMPATIBLE:
             return {"running": False, "blocked": True,
-                    "state": inspected.state.value}
+                    "state": inspected.state.value,
+                    **({"reason": inspected.mismatch}
+                       if inspected.mismatch else {})}
         if not _indexd_ready(inspected):
             age = (max(0.0, time.time() - inspected.snapshot.mtime)
                    if inspected.snapshot is not None else 0.0)
@@ -2609,7 +2683,9 @@ def indexd_resource_status(
         retire_budget_s=_INDEXD_FOREGROUND_RETIRE_S)
     if inspected.state in _INDEXD_INLINE_BLOCKING_STATES:
         return {"running": False, "blocked": True,
-                "state": inspected.state.value}
+                "state": inspected.state.value,
+                **({"reason": inspected.mismatch}
+                   if inspected.mismatch else {})}
     if inspected.state is not _IndexdOwnerState.COMPATIBLE:
         if not _retire_legacy_indexd():
             return {"running": False, "blocked": True,
@@ -2662,7 +2738,9 @@ def indexd_owner_body() -> str:
         f"protocol={INDEXD_PROTOCOL} package={common.package_version()} "
         f"build={INDEXD_BUILD_ID} writer={writer} "
         f"group={lifetime.group}{tree} token={secrets.token_hex(16)} "
-        f"time={time.time():.3f}\n"
+        f"time={time.time():.3f} "
+        f"home={_world_stamp(locators.discovery_home())} "
+        f"data={_world_stamp(common.DATA_DIR)}\n"
     )
 
 
@@ -3293,7 +3371,7 @@ def kick_background_repair() -> RepairKick:
             info = derived_writer_mutation_info()
             inspected = _inspect_indexd_owner(settle_child=False)
             if (not derived_writer_launchable(info)
-                    or inspected.state is not _IndexdOwnerState.INCOMPATIBLE):
+                    or inspected.state not in _INDEXD_RETIRABLE_EXACT_STATES):
                 return RepairKick(
                     False,
                     "held-foreign-owner" if derived_writer_launchable(info)
@@ -3316,7 +3394,7 @@ def kick_background_repair() -> RepairKick:
         except Exception:  # noqa: BLE001 - disclosure probing stays bounded
             return RepairKick(False, "owner-unverifiable")
         if (derived_writer_launchable(info)
-                and inspected.state is _IndexdOwnerState.INCOMPATIBLE):
+                and inspected.state in _INDEXD_RETIRABLE_EXACT_STATES):
             return RepairKick(False, "held-foreign-owner")
         if inspected.state in _INDEXD_UNRETIRABLE_STATES:
             return RepairKick(False, "owner-unverifiable")
@@ -4194,9 +4272,10 @@ def indexing_failure(
         if state is not _IndexdOwnerState.MALFORMED_FRESH
     }
     if daemon_state in blocking_states:
+        detail = str(daemon.get("reason") or "")
         return surface.FreshnessFailure(
             "blocked-owner",
-            f"the freshness owner is blocked ({daemon_state})")
+            detail or f"the freshness owner is blocked ({daemon_state})")
     ingest = common.ingest_bin()
     if not ingest.exists():
         return surface.FreshnessFailure(
@@ -4698,7 +4777,7 @@ def _spawn_indexd() -> _IndexdSpawnResult:
         ownership = derived_writer_mutation_info()
         inspected = _inspect_indexd_owner(settle_child=False)
         if (not derived_writer_launchable(ownership)
-                or inspected.state is not _IndexdOwnerState.INCOMPATIBLE):
+                or inspected.state not in _INDEXD_RETIRABLE_EXACT_STATES):
             return _IndexdSpawnResult.BLOCKED
         inspected = _settle_indexd_owner(
             allow_retire=True, retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
@@ -4773,7 +4852,7 @@ def _spawn_indexd() -> _IndexdSpawnResult:
                             return _IndexdSpawnResult.BLOCKED
                     if inspected.state in _INDEXD_UNRETIRABLE_STATES:
                         return _IndexdSpawnResult.BLOCKED
-                    if inspected.state is _IndexdOwnerState.INCOMPATIBLE:
+                    if inspected.state in _INDEXD_RETIRABLE_EXACT_STATES:
                         inspected = _settle_indexd_owner(
                             allow_retire=True,
                             retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
@@ -4808,11 +4887,11 @@ def _spawn_indexd() -> _IndexdSpawnResult:
             _retain_spawn_guard(guard)
             return _IndexdSpawnResult.BLOCKED
         inspected = _settle_indexd_owner()
-    if inspected.state is _IndexdOwnerState.INCOMPATIBLE:
+    if inspected.state in _INDEXD_RETIRABLE_EXACT_STATES:
         inspected = _settle_indexd_owner(
             allow_retire=True, retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
     if (inspected.state in _INDEXD_UNRETIRABLE_STATES
-            or inspected.state is _IndexdOwnerState.INCOMPATIBLE):
+            or inspected.state in _INDEXD_RETIRABLE_EXACT_STATES):
         _release_spawn_guard(guard)
         return _IndexdSpawnResult.BLOCKED
     if inspected.state is _IndexdOwnerState.ORPHANED_GROUP:

@@ -639,5 +639,42 @@ class DoctorRowLanguageTests(unittest.TestCase):
                 self.assertEqual(rendered.count("doctor --deep"), 1)
 
 
+class DoctorCensusContradictionTests(unittest.TestCase):
+    """The corpus row may never stay green across a census/cache contradiction.
+
+    The live incident's face: `[ok ] corpus 1 messages · 1 sessions` printed
+    beside an 853-source parse cache after a poisoned publication clobbered
+    the census. The contradiction outranks the green row; an agreeing census
+    keeps today's rendering byte for byte.
+    """
+
+    def _contradicted_snapshot(self) -> dict:
+        snapshot = _report_snapshot()
+        snapshot["core"]["indexed"] = {
+            "state": "ready", "sessions": 1, "messages": 1, "age_s": 0,
+            "census_contradiction": True, "parse_cache_sources": 853,
+        }
+        return snapshot
+
+    def test_a_clobbered_corpus_breaks_the_green_corpus_row(self) -> None:
+        rendered = _render_report(self._contradicted_snapshot())
+        line = next(row for row in rendered.splitlines() if "] corpus" in row)
+        self.assertIn("[!! ]", line)
+        self.assertIn(
+            "corpus census (1 sessions) contradicts parse cache "
+            "(853 sources)", line)
+        self.assertIn("the published snapshot lost most of the corpus", line)
+        self.assertIn("run agrep reindex --full", line)
+        self.assertNotIn("[ok ] corpus", rendered)
+
+    def test_an_agreeing_census_keeps_todays_row_unchanged(self) -> None:
+        rendered = _render_report(_report_snapshot())
+        line = next(row for row in rendered.splitlines() if "] corpus" in row)
+        self.assertIn("[ok ]", line)
+        self.assertIn("1 messages · 1 sessions", line)
+        self.assertNotIn("contradicts", rendered)
+        self.assertNotIn("reindex --full", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

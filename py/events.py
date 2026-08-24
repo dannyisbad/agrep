@@ -28,24 +28,41 @@ import fileops
 from proc import WIN
 
 
-def _user_data_dir() -> Path:
+def _user_data_dir(home: Path | None = None) -> Path:
     """Per-OS writable home for the index when agrep is installed as a package.
     Stdlib only (no platformdirs dep): XDG on linux, Application Support on mac,
-    LOCALAPPDATA on windows."""
+    LOCALAPPDATA on windows.
+
+    With *home* (an AGREP_HOME override) the same relative layout is rooted at
+    the override, and env redirects like LOCALAPPDATA/XDG_DATA_HOME are ignored:
+    they point inside the real home, and honoring them would leak sandboxed
+    writes into the production dir."""
+    overridden = home is not None
+    root = home if overridden else Path.home()
     if WIN:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        base = (None if overridden else os.environ.get("LOCALAPPDATA")) or str(
+            root / "AppData" / "Local")
     elif sys.platform == "darwin":
-        base = str(Path.home() / "Library" / "Application Support")
+        base = str(root / "Library" / "Application Support")
     else:
-        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        base = (None if overridden else os.environ.get("XDG_DATA_HOME")) or str(
+            root / ".local" / "share")
     return Path(base) / "agrep"
 
 
-# $AGREP_DATA_DIR wins (wheel launcher, test/dev fixtures); else one shared per-user dir.
+# $AGREP_DATA_DIR wins (wheel launcher, test/dev fixtures); else a non-empty
+# $AGREP_HOME isolates the derived dir under the overridden home — a redirected
+# store discovery must never write the production data dir; else one shared
+# per-user dir.
 _env_data = os.environ.get("AGREP_DATA_DIR")
+_env_home = os.environ.get("AGREP_HOME")
 _env_data_source = os.environ.get("AGREP_DATA_DIR_SOURCE")
-DATA_DIR_SOURCE = _env_data_source if _env_data_source in ("default", "env") else (
-    "env" if _env_data else "default"
+DATA_DIR_SOURCE = _env_data_source if _env_data_source in (
+    "default", "env", "agrep-home-isolated"
+) else (
+    "env" if _env_data
+    else "agrep-home-isolated" if _env_home
+    else "default"
 )
 DEFAULT_DATA_DIR = _user_data_dir()
 if _env_data:
@@ -62,6 +79,19 @@ if _env_data:
                 "or start agrep from an existing directory"
             ) from exc
         DATA_DIR = (startup_dir / configured).resolve(strict=False)
+elif _env_home:
+    _home_base = Path(_env_home).expanduser()
+    if not _home_base.is_absolute():
+        try:
+            startup_dir = Path.cwd()
+        except OSError as exc:
+            raise OSError(
+                "relative AGREP_HOME cannot be resolved because the startup "
+                "working directory is unavailable; use an absolute AGREP_HOME "
+                "or start agrep from an existing directory"
+            ) from exc
+        _home_base = (startup_dir / _home_base).resolve(strict=False)
+    DATA_DIR = _user_data_dir(_home_base)
 else:
     DATA_DIR = DEFAULT_DATA_DIR
 
