@@ -2497,6 +2497,15 @@ def probe(
         indexed.update(sessions=int(summary["sessions"]),
                        messages=int(summary["messages"]),
                        age_s=int(summary.get("age_s") or 0))
+        # The census and the parse cache are both agrep's own product; a
+        # cache that knows dramatically more sources than the published
+        # snapshot retained is corpus loss, and a green census row beside it
+        # would be a lie (the live incident: 1 session next to 853 sources).
+        cached_sources = surface.parse_cache_source_count(
+            indexd_runtime.INGEST_CACHE_PATH)
+        if surface.census_contradiction(indexed["sessions"], cached_sources):
+            indexed["census_contradiction"] = True
+            indexed["parse_cache_sources"] = cached_sources
     attribution = _model_attribution(
         summary, search_db, deep=deep,
         timeout_s=(
@@ -2779,7 +2788,17 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
     summary = render["summary"]
     summary_state = str(snapshot["core"]["indexed"]["state"])
     detected = snapshot["detected"]
-    if summary_state == "ready":
+    if summary_state == "ready" and snapshot["core"]["indexed"].get(
+            "census_contradiction"):
+        # A green "1 messages · 1 sessions" beside an 853-source parse cache
+        # was the incident's face; the contradiction outranks the census row.
+        cached_sources = int(
+            snapshot["core"]["indexed"].get("parse_cache_sources") or 0)
+        _row("corpus", WARN,
+             f"corpus census ({summary['sessions']:,} sessions) contradicts "
+             f"parse cache ({cached_sources:,} sources) - the published "
+             "snapshot lost most of the corpus; run agrep reindex --full")
+    elif summary_state == "ready":
         age_s = summary.get("age_s")
         age = ("" if age_s is None else
                " · updated just now" if age_s < 60 else

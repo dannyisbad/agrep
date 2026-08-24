@@ -24,6 +24,7 @@ import ownerfile  # noqa: E402
 import proc  # noqa: E402
 import indexd  # noqa: E402
 from hookless import _log  # noqa: E402
+from hookless import locators  # noqa: E402
 
 
 PY_DIR = Path(__file__).resolve().parent
@@ -86,12 +87,21 @@ class IndexdOwnerTests(unittest.TestCase):
             build: str | None = None, writer: str | None = None,
             token: str = "a" * 32,
             group: int | str | None = None, tree: str | None = None,
+            home: str | None = None, data: str | None = None,
+            stamped: bool = True,
             created_at: float = 100.0) -> bytes:
         process_group = ("job" if common.WIN else pid) if group is None else group
         tree_name = (
             common.WINDOWS_DESCENDANT_TREE
             if tree is None and common.WIN else (tree or ""))
         tree_field = f" tree={tree_name}" if tree_name else ""
+        world_fields = ""
+        if stamped:
+            home_stamp = indexd_runtime._world_stamp(
+                locators.discovery_home() if home is None else home)
+            data_stamp = indexd_runtime._world_stamp(
+                common.DATA_DIR if data is None else data)
+            world_fields = f" home={home_stamp} data={data_stamp}"
         return (
             f"pid={pid} start={process_start} "
             f"protocol={indexd_runtime.INDEXD_PROTOCOL if protocol is None else protocol} "
@@ -99,7 +109,7 @@ class IndexdOwnerTests(unittest.TestCase):
             f"build={indexd_runtime.INDEXD_BUILD_ID if build is None else build} "
             f"writer={indexd_runtime.derived_writer_build_id(common._resolved_ingest_bin()) if writer is None else writer} "
             f"group={process_group}{tree_field} token={token} "
-            f"time={created_at:.3f}\n"
+            f"time={created_at:.3f}{world_fields}\n"
         ).encode("ascii")
 
     def _write(self, raw: bytes, *, age: float = 0.0,
@@ -229,6 +239,75 @@ class IndexdOwnerTests(unittest.TestCase):
         self.assertIsNone(handle)
         terminate.assert_not_called()
         self.assertEqual(self.path.read_bytes(), raw)
+
+    def _inspect_live_exact(self) -> indexd_runtime._IndexdOwnerInspection:
+        with mock.patch.object(common, "pid_alive", return_value=True), \
+                mock.patch.object(
+                    common, "process_start_identity", return_value="birth"), \
+                mock.patch.object(
+                    common.os, "getpgid", return_value=4242, create=True), \
+                mock.patch.object(
+                    common.os, "getsid", return_value=4242, create=True):
+            return indexd_runtime._inspect_indexd_owner()
+
+    def test_matching_world_stamps_stay_compatible(self) -> None:
+        raw = self._raw()
+        self._write(raw)
+        inspection = self._inspect_live_exact()
+        self.assertIs(
+            inspection.state, indexd_runtime._IndexdOwnerState.COMPATIBLE)
+        self.assertIsNone(inspection.mismatch)
+        self.assertEqual(
+            inspection.home, os.path.abspath(locators.discovery_home()))
+        self.assertEqual(
+            inspection.data, os.path.abspath(os.fspath(common.DATA_DIR)))
+
+    def test_divergent_home_stamp_is_mismatched_naming_both_worlds(
+            self) -> None:
+        foreign = os.path.join(os.sep, "poisoned sandbox", "home")
+        raw = self._raw(home=foreign)
+        self._write(raw)
+        stamp = indexd_runtime._world_stamp(foreign)
+        self.assertNotIn(" ", stamp)
+        self.assertIn(f" home={stamp} ".encode("ascii"), raw)
+        inspection = self._inspect_live_exact()
+        self.assertIs(
+            inspection.state, indexd_runtime._IndexdOwnerState.MISMATCHED)
+        # The percent-encoded space survives the single-token parser.
+        self.assertEqual(inspection.home, os.path.abspath(foreign))
+        self.assertIn("freshness daemon (pid 4242)", inspection.mismatch)
+        self.assertIn(f"home {os.path.abspath(foreign)}", inspection.mismatch)
+        self.assertIn(
+            f"this invocation resolves home "
+            f"{os.path.abspath(locators.discovery_home())}",
+            inspection.mismatch)
+        self.assertIn(
+            "stop that daemon or unset the divergent environment",
+            inspection.mismatch)
+
+    def test_divergent_data_stamp_is_mismatched_naming_both_worlds(
+            self) -> None:
+        foreign = os.path.join(os.sep, "other world", "data")
+        raw = self._raw(data=foreign)
+        self._write(raw)
+        inspection = self._inspect_live_exact()
+        self.assertIs(
+            inspection.state, indexd_runtime._IndexdOwnerState.MISMATCHED)
+        self.assertEqual(inspection.data, os.path.abspath(foreign))
+        self.assertIn(f"data {os.path.abspath(foreign)}", inspection.mismatch)
+        self.assertIn(
+            f"data {os.path.abspath(os.fspath(common.DATA_DIR))}",
+            inspection.mismatch)
+
+    def test_legacy_lock_without_stamps_never_infers_mismatch(self) -> None:
+        raw = self._raw(stamped=False)
+        self._write(raw)
+        inspection = self._inspect_live_exact()
+        self.assertIs(
+            inspection.state, indexd_runtime._IndexdOwnerState.COMPATIBLE)
+        self.assertIsNone(inspection.mismatch)
+        self.assertIsNone(inspection.home)
+        self.assertIsNone(inspection.data)
 
     def test_process_states_are_classified_from_one_snapshot(self) -> None:
         cases = (

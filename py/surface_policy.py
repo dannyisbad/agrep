@@ -1536,6 +1536,95 @@ def freshness_story_line(story: FreshnessStory) -> str:
     return f"history may be stale: {story.detail or 'unknown ingest state'}"
 
 
+# The clobbered-corpus tell: a published census dramatically smaller than the
+# parse cache's own source cardinality is corpus loss, not staleness. Both
+# numbers are agrep's own product - the cache counts every source the ingest
+# parsed, the census counts what the published snapshot retained - so a 90%+
+# gap under a non-trivial cache is a contradiction no mild hedge may soften.
+CENSUS_CONTRADICTION_MIN_SOURCES = 20
+CENSUS_CONTRADICTION_RATIO = 0.10
+# The one mild hedge this contradiction escalates; both the bare and the
+# "(daemon-state)"-suffixed renderings carry this exact clause.
+BLOCKED_OWNER_STALE_MARKER = "the freshness owner is blocked"
+
+# Parse-cache base layout, mirroring Rust's fixed base header: [12:20] magic,
+# [20:24] storage version, a version-dependent remainder, then the bincode
+# payload whose fixed-width prelude is `version: u32` followed by the entry
+# map's length as u64. The probe reads only this prefix, never an entry.
+_PARSE_CACHE_MAGIC = b"AGRPCB01"
+# storage version -> (header length, raw-len offset, codec offset)
+_PARSE_CACHE_LAYOUTS = {2: (64, 40, None), 3: (80, 40, 64), 4: (100, 60, 84)}
+
+
+def parse_cache_source_count(path: os.PathLike | str) -> int | None:
+    """How many sources the parse cache itself knows, or None.
+
+    A bounded, read-only probe of the cache base: the fixed header plus the
+    12-byte payload prelude. Any unexpected shape - missing file, foreign
+    magic, compressed payload, torn length - declines with None rather than
+    guessing. Committed journal frames may shift the exact count, which is
+    why every caller renders it as an approximation.
+    """
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            prefix = fh.read(112)
+    except OSError:
+        return None
+    if len(prefix) < 24 or prefix[12:20] != _PARSE_CACHE_MAGIC:
+        return None
+    layout = _PARSE_CACHE_LAYOUTS.get(int.from_bytes(prefix[20:24], "little"))
+    if layout is None:
+        return None
+    header_len, raw_len_offset, codec_offset = layout
+    if len(prefix) < header_len + 12:
+        return None
+    if codec_offset is not None and int.from_bytes(
+            prefix[codec_offset:codec_offset + 4], "little") != 0:
+        # a compressed payload keeps its count out of reach; decline honestly
+        return None
+    raw_len = int.from_bytes(
+        prefix[raw_len_offset:raw_len_offset + 8], "little")
+    if header_len + raw_len != size:
+        return None
+    count = int.from_bytes(prefix[header_len + 4:header_len + 12], "little")
+    # every cached entry occupies at least one payload byte; a larger claim
+    # is a torn or foreign payload, not a cardinality
+    return count if count <= raw_len else None
+
+
+def census_contradiction(published_sessions: int | None,
+                         cached_sources: int | None) -> bool:
+    """Did the published census retain under 10% of a non-trivial cache?"""
+    return (published_sessions is not None and cached_sources is not None
+            and cached_sources >= CENSUS_CONTRADICTION_MIN_SOURCES
+            and published_sessions
+            < cached_sources * CENSUS_CONTRADICTION_RATIO)
+
+
+def census_contradiction_line(published_sessions: int,
+                              cached_sources: int) -> str:
+    """The escalated staleness banner: the loss magnitude and the remedy."""
+    return (f"serving a snapshot with {published_sessions} of "
+            f"~{cached_sources} known sessions - the index lost most of "
+            "the corpus (freshness owner blocked); run agrep reindex --full")
+
+
+def escalate_blocked_owner_notice(
+        notice: str, published_sessions: int | None,
+        cached_sources: int | None) -> str:
+    """Escalate the mild blocked-owner hedge into the corpus-loss banner.
+
+    Only the blocked-owner hedge beside a census/cache contradiction
+    escalates; genuinely mild staleness and every other notice pass through
+    untouched, so the mild wording stays the common rendering.
+    """
+    if (BLOCKED_OWNER_STALE_MARKER not in notice
+            or not census_contradiction(published_sessions, cached_sources)):
+        return notice
+    return census_contradiction_line(published_sessions, cached_sources)
+
+
 def freshness_behind_disclosure(story: FreshnessStory) -> dict:
     """Machine shape of the catching-up state: honest, but not a failure."""
     out = {

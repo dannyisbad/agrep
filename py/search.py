@@ -6402,6 +6402,29 @@ def _indexed_corpus_counts() -> dict | None:
         return None
 
 
+def escalated_freshness_notice(notice: str | None = None) -> str:
+    """The one stderr freshness line, escalated for a clobbered corpus.
+
+    The mild blocked-owner hedge is honest for mild staleness, but a
+    published census that contradicts the parse cache's own source count
+    means the served snapshot lost most of the corpus - the banner must
+    name the magnitude and the remedy, not murmur "may be stale". The
+    contradiction probe runs only when the mild hedge already rendered,
+    so every healthy invocation pays nothing.
+    """
+    if notice is None:
+        notice = indexd_runtime.agent_freshness_notice()
+    if notice and surface.BLOCKED_OWNER_STALE_MARKER in notice:
+        summary = _indexed_corpus_counts()
+        notice = surface.escalate_blocked_owner_notice(
+            notice,
+            None if summary is None else summary.get("sessions"),
+            surface.parse_cache_source_count(
+                indexd_runtime.INGEST_CACHE_PATH))
+    return notice
+
+
+
 def _indexed_message_total() -> int | None:
     """The corpus size the zero-hit line names.
 
@@ -6789,7 +6812,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         if "freshness" in said_once:
             return
         said_once.add("freshness")
-        notice = indexd_runtime.agent_freshness_notice()
+        notice = escalated_freshness_notice()
         if notice:
             common.log(notice)
 
@@ -8247,7 +8270,8 @@ def chats_main(argv: list[str] | None = None) -> int:
                    f"{order}{scope}{cut}")
         for empty_dimension in coverage["empty_dimensions"]:
             common.log(surface.empty_dimension_line(empty_dimension))
-        notice = surface.freshness_story_line(story)
+        notice = escalated_freshness_notice(
+            surface.freshness_story_line(story))
         if notice:
             common.log(notice)
     if shown:

@@ -1346,12 +1346,39 @@ fn encode_journal_header(instance: [u8; 16]) -> Vec<u8> {
     bytes
 }
 
-fn encode_journal_frame(from: u64, to: u64, delta: &JournalDelta) -> anyhow::Result<Vec<u8>> {
+#[cfg(test)]
+thread_local! {
+    /// 0 = use `MAX_FRAME_BYTES`; tests set a small limit on their own thread to
+    /// exercise the oversized-delta base-rewrite fallback without materializing
+    /// a real half-gigabyte delta.
+    static TEST_MAX_FRAME_BYTES: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+fn max_frame_bytes() -> u64 {
+    #[cfg(test)]
+    {
+        let limit = TEST_MAX_FRAME_BYTES.with(std::cell::Cell::get);
+        if limit != 0 {
+            return limit;
+        }
+    }
+    MAX_FRAME_BYTES
+}
+
+/// Encode a journal frame, or `None` when the serialized delta exceeds the frame
+/// limit. A delta that large (e.g. the first publication after a derived-store
+/// adoption, which re-upserts the whole corpus against a near-empty base) can
+/// never fit one frame no matter how often the writer retries, so the caller
+/// must rewrite the cache base instead of erroring forever.
+fn encode_bounded_journal_frame(
+    from: u64,
+    to: u64,
+    delta: &JournalDelta,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let payload = bincode::serialize(delta)?;
-    anyhow::ensure!(
-        payload.len() as u64 <= MAX_FRAME_BYTES,
-        "ingest cache delta is too large"
-    );
+    if payload.len() as u64 > max_frame_bytes() {
+        return Ok(None);
+    }
     let digest = cache_digest(&payload);
     let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + payload.len() + FRAME_FOOTER_LEN);
     bytes.extend_from_slice(CACHE_FRAME_MAGIC);
@@ -1364,7 +1391,16 @@ fn encode_journal_frame(from: u64, to: u64, delta: &JournalDelta) -> anyhow::Res
     bytes.extend_from_slice(&to.to_le_bytes());
     bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&digest);
-    Ok(bytes)
+    Ok(Some(bytes))
+}
+
+/// Test-only frame builder keeping the size invariant as a hard error. Production
+/// append paths go through [`encode_bounded_journal_frame`] instead, whose `None`
+/// routes an oversized delta to a base rewrite rather than failing the save.
+#[cfg(test)]
+fn encode_journal_frame(from: u64, to: u64, delta: &JournalDelta) -> anyhow::Result<Vec<u8>> {
+    encode_bounded_journal_frame(from, to, delta)?
+        .ok_or_else(|| anyhow::anyhow!("ingest cache delta is too large"))
 }
 
 fn compact_size_bound(
@@ -3212,6 +3248,18 @@ impl IngestCache {
         for key in &delta_deletes {
             delta_upserts.remove(key);
         }
+        // Any refusal to journal this save (compaction budget, or a delta too
+        // large for one frame) rewrites the base against the state observed above.
+        let rebase_expectation = || BaseExpectation {
+            instance: *instance,
+            witness: witness.clone(),
+            cursor: cursor.clone(),
+            sequence: expected_sequence,
+            observed_len: expected_observed_len,
+            valid_len: expected_valid_len,
+            reset: expected_reset,
+            frames: expected_frames,
+        };
         let make_delta = |upserts: &HashSet<String>, deletes: &HashSet<String>| {
             let mut upsert_keys: Vec<&String> = upserts.iter().collect();
             upsert_keys.sort_unstable();
@@ -3241,32 +3289,16 @@ impl IngestCache {
                 deletes.insert(key.clone());
             }
             if compact_size_bound(&self.entries, &upserts, &deletes) > JOURNAL_COMPACT_BUDGET {
-                return stage_base(Some(BaseExpectation {
-                    instance: *instance,
-                    witness: witness.clone(),
-                    cursor: cursor.clone(),
-                    sequence: expected_sequence,
-                    observed_len: expected_observed_len,
-                    valid_len: expected_valid_len,
-                    reset: expected_reset,
-                    frames: expected_frames,
-                }));
+                return stage_base(Some(rebase_expectation()));
             }
             let delta = make_delta(&upserts, &deletes);
-            let frame = encode_journal_frame(0, 1, &delta)?;
+            let Some(frame) = encode_bounded_journal_frame(0, 1, &delta)? else {
+                return stage_base(Some(rebase_expectation()));
+            };
             let mut bytes = encode_journal_header(*instance);
             bytes.extend_from_slice(&frame);
             if bytes.len() > JOURNAL_COMPACT_BUDGET {
-                return stage_base(Some(BaseExpectation {
-                    instance: *instance,
-                    witness: witness.clone(),
-                    cursor: cursor.clone(),
-                    sequence: expected_sequence,
-                    observed_len: expected_observed_len,
-                    valid_len: expected_valid_len,
-                    reset: expected_reset,
-                    frames: expected_frames,
-                }));
+                return stage_base(Some(rebase_expectation()));
             }
             Some((bytes, upserts, deletes))
         } else {
@@ -3274,7 +3306,9 @@ impl IngestCache {
         };
         let (bytes, mode, next_sequence, staged_upserts, staged_deletes) = if expected_reset {
             let delta = make_delta(&delta_upserts, &delta_deletes);
-            let frame = encode_journal_frame(0, 1, &delta)?;
+            let Some(frame) = encode_bounded_journal_frame(0, 1, &delta)? else {
+                return stage_base(Some(rebase_expectation()));
+            };
             let mut bytes = encode_journal_header(*instance);
             bytes.extend_from_slice(&frame);
             (
@@ -3291,8 +3325,11 @@ impl IngestCache {
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("ingest cache journal sequence overflow"))?;
             let delta = make_delta(&delta_upserts, &delta_deletes);
+            let Some(frame) = encode_bounded_journal_frame(expected_sequence, next, &delta)? else {
+                return stage_base(Some(rebase_expectation()));
+            };
             (
-                encode_journal_frame(expected_sequence, next, &delta)?,
+                frame,
                 JournalWrite::Append,
                 next,
                 delta_upserts,
@@ -5417,6 +5454,82 @@ mod tests {
         let stage = next.stage_save(&cache_path).unwrap();
         assert!(matches!(stage.kind, super::StagedCacheKind::Journal { .. }));
         stage.commit().unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_delta_rewrites_base_instead_of_erroring() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-cache-frame-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let kept = root.join("kept.jsonl");
+        let adopted = root.join("adopted.jsonl");
+        let cache_path = root.join("cache.bin");
+        let journal_path = super::cache_journal_path(&cache_path);
+        fs::write(&kept, b"kept").unwrap();
+
+        let mut cold = IngestCache::cold();
+        collect_cached(&mut cold, &root, std::slice::from_ref(&kept), |_| {
+            (vec![test_message("kept")], Vec::new())
+        });
+        cold.save(&cache_path).unwrap();
+
+        // Adoption-scale publication: the delta cannot fit one journal frame under
+        // the (test-lowered) limit, so the save must rewrite the base instead of
+        // failing "ingest cache delta is too large" on every retry forever.
+        super::TEST_MAX_FRAME_BYTES.with(|limit| limit.set(64));
+        fs::write(&adopted, b"adopted").unwrap();
+        let files = [kept.clone(), adopted.clone()];
+        let mut warm = IngestCache::load(&cache_path);
+        collect_cached(&mut warm, &root, &files, |path| {
+            let text = if path.ends_with("adopted.jsonl") {
+                "adopted"
+            } else {
+                "kept"
+            };
+            (vec![test_message(text)], Vec::new())
+        });
+        let stage = warm.stage_save(&cache_path).unwrap();
+        assert!(matches!(stage.kind, super::StagedCacheKind::Base { .. }));
+        stage.commit().unwrap();
+        assert!(!journal_path.exists());
+
+        let reopened = IngestCache::load(&cache_path);
+        assert_eq!(reopened.entries.len(), 2);
+        assert_eq!(
+            reopened.entries[&source_key(&kept)].msgs[0].text.as_ref(),
+            "kept"
+        );
+        assert_eq!(
+            reopened.entries[&source_key(&adopted)].msgs[0].text.as_ref(),
+            "adopted"
+        );
+
+        // A small delta under the real limit still appends a journal frame.
+        super::TEST_MAX_FRAME_BYTES.with(|limit| limit.set(0));
+        fs::write(&kept, b"kept grew larger").unwrap();
+        let mut small = IngestCache::load(&cache_path);
+        collect_cached(&mut small, &root, &files, |_| {
+            (vec![test_message("small")], Vec::new())
+        });
+        let stage = small.stage_save(&cache_path).unwrap();
+        assert!(matches!(stage.kind, super::StagedCacheKind::Journal { .. }));
+        stage.commit().unwrap();
+        assert!(fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let reopened = IngestCache::load(&cache_path);
+        assert_eq!(reopened.entries.len(), 2);
+        assert_eq!(
+            reopened.entries[&source_key(&kept)].msgs[0].text.as_ref(),
+            "small"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

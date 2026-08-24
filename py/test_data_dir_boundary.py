@@ -255,6 +255,80 @@ class DataDirBoundaryTests(unittest.TestCase):
                           completed.stderr)
             self.assertIn("use an absolute AGREP_DATA_DIR", completed.stderr)
 
+    _INHERITED_OVERRIDES = (
+        "AGREP_DATA_DIR", "AGREP_DATA_DIR_SOURCE", "AGREP_DATA_READONLY",
+        "AGREP_HOME", "XDG_DATA_HOME", "LOCALAPPDATA",
+    )
+
+    @classmethod
+    def _resolve_layout(cls, home: Path, extra: dict[str, str]) -> dict:
+        env = {**os.environ, "PYTHONPATH": str(PY_DIR)}
+        for key in cls._INHERITED_OVERRIDES:
+            env.pop(key, None)
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        env.update(extra)
+        completed = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json,events; print(json.dumps({"
+                "'data': str(events.DATA_DIR),"
+                "'default': str(events.DEFAULT_DATA_DIR),"
+                "'source': events.DATA_DIR_SOURCE}))",
+            ],
+            env=env, capture_output=True, text=True, check=True, timeout=15)
+        return json.loads(completed.stdout)
+
+    @staticmethod
+    def _platform_default(home: Path) -> Path:
+        if sys.platform == "win32":
+            return home / "AppData" / "Local" / "agrep"
+        if sys.platform == "darwin":
+            return home / "Library" / "Application Support" / "agrep"
+        return home / ".local" / "share" / "agrep"
+
+    def test_agrep_home_without_data_dir_stays_inside_the_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            production = root / "production-home"
+            sandbox = root / "sandbox-home"
+            production.mkdir()
+            sandbox.mkdir()
+            result = self._resolve_layout(
+                production, {"AGREP_HOME": str(sandbox)})
+            expected = self._platform_default(sandbox)
+            self.assertEqual(result["data"], str(expected))
+            self.assertEqual(result["source"], "agrep-home-isolated")
+            self.assertEqual(
+                result["default"], str(self._platform_default(production)))
+            self.assertTrue(expected.is_dir())
+            self.assertFalse(self._platform_default(production).exists())
+
+    def test_explicit_data_dir_still_beats_agrep_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            production = root / "production-home"
+            sandbox = root / "sandbox-home"
+            chosen = root / "chosen-data"
+            production.mkdir()
+            sandbox.mkdir()
+            result = self._resolve_layout(production, {
+                "AGREP_HOME": str(sandbox),
+                "AGREP_DATA_DIR": str(chosen),
+            })
+            self.assertEqual(result["data"], str(chosen))
+            self.assertEqual(result["source"], "env")
+            self.assertFalse(self._platform_default(sandbox).exists())
+
+    def test_no_overrides_resolve_the_platform_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            production = Path(temporary) / "production-home"
+            production.mkdir()
+            result = self._resolve_layout(production, {})
+            self.assertEqual(
+                result["data"], str(self._platform_default(production)))
+            self.assertEqual(result["source"], "default")
+
 
 if __name__ == "__main__":
     unittest.main()

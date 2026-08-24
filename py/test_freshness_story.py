@@ -1138,5 +1138,101 @@ class AbsorbedDriftObservation(unittest.TestCase):
         self.assertNotIn("index current", verdict.tail)
 
 
+def _parse_cache_base(sources: int) -> bytes:
+    """A minimal v4 parse-cache base whose payload prelude claims `sources`."""
+    payload = ((22).to_bytes(4, "little")
+               + sources.to_bytes(8, "little") + b"\0" * sources)
+    header = bytearray(100)
+    header[0:4] = (22).to_bytes(4, "little")
+    header[12:20] = b"AGRPCB01"
+    header[20:24] = (4).to_bytes(4, "little")
+    header[24:44] = b"0123456789abcdef0123"
+    header[44:60] = b"\x07" * 16
+    header[60:68] = len(payload).to_bytes(8, "little")
+    header[92:100] = len(payload).to_bytes(8, "little")
+    return bytes(header) + payload
+
+
+class CensusContradictionSignals(unittest.TestCase):
+    """A snapshot that lost the corpus must say so, not murmur "may be stale".
+
+    The live incident: a poisoned publication clobbered the census to one
+    session while the parse cache still knew 853 sources, and recall printed
+    only the mild blocked-owner hedge. The contradiction escalates exactly
+    that hedge; genuinely mild staleness keeps the mild wording.
+    """
+
+    NOTICE = "history may be stale: the freshness owner is blocked"
+
+    def test_blocked_owner_hedge_escalates_under_contradiction(self) -> None:
+        self.assertEqual(
+            surface.escalate_blocked_owner_notice(self.NOTICE, 1, 853),
+            "serving a snapshot with 1 of ~853 known sessions - the index "
+            "lost most of the corpus (freshness owner blocked); "
+            "run agrep reindex --full")
+        # the daemon-state-suffixed rendering carries the same clause
+        suffixed = f"{self.NOTICE} (unresponsive)"
+        self.assertIn("~853 known sessions",
+                      surface.escalate_blocked_owner_notice(suffixed, 1, 853))
+
+    def test_mild_staleness_keeps_the_mild_wording(self) -> None:
+        # >=10% retained, a trivial cache, or an unknown side never escalate
+        for published, cached in (
+                (90, 853), (86, 853), (2, 19), (None, 853), (1, None)):
+            with self.subTest(published=published, cached=cached):
+                self.assertEqual(
+                    surface.escalate_blocked_owner_notice(
+                        self.NOTICE, published, cached),
+                    self.NOTICE)
+        # only the blocked-owner hedge escalates, whatever the numbers say
+        other = "history may be stale: fixture index failure"
+        self.assertEqual(
+            surface.escalate_blocked_owner_notice(other, 1, 853), other)
+
+    def test_parse_cache_source_count_is_a_bounded_honest_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cache = Path(raw) / ".ingest_cache.bin"
+            cache.write_bytes(_parse_cache_base(853))
+            self.assertEqual(surface.parse_cache_source_count(cache), 853)
+            # a torn tail declines instead of guessing
+            cache.write_bytes(_parse_cache_base(853)[:-1])
+            self.assertIsNone(surface.parse_cache_source_count(cache))
+            # pre-owner legacy bytes carry no addressable count
+            cache.write_bytes(b"pre-owner legacy parse cache")
+            self.assertIsNone(surface.parse_cache_source_count(cache))
+            cache.unlink()
+            self.assertIsNone(surface.parse_cache_source_count(cache))
+
+    def test_the_rendered_banner_names_the_loss_and_the_remedy(self) -> None:
+        import search
+        with tempfile.TemporaryDirectory() as raw:
+            cache = Path(raw) / ".ingest_cache.bin"
+            cache.write_bytes(_parse_cache_base(853))
+            with (
+                mock.patch.object(indexd_runtime, "agent_freshness_notice",
+                                  return_value=self.NOTICE),
+                mock.patch.object(indexd_runtime, "INGEST_CACHE_PATH", cache),
+                mock.patch.object(
+                    search.common, "index_summary",
+                    return_value={"sessions": 1, "messages": 1}),
+            ):
+                escalated = search.escalated_freshness_notice()
+            with (
+                mock.patch.object(indexd_runtime, "agent_freshness_notice",
+                                  return_value=self.NOTICE),
+                mock.patch.object(indexd_runtime, "INGEST_CACHE_PATH", cache),
+                mock.patch.object(
+                    search.common, "index_summary",
+                    return_value={"sessions": 400, "messages": 4000}),
+            ):
+                mild = search.escalated_freshness_notice()
+        self.assertEqual(
+            escalated,
+            "serving a snapshot with 1 of ~853 known sessions - the index "
+            "lost most of the corpus (freshness owner blocked); "
+            "run agrep reindex --full")
+        self.assertEqual(mild, self.NOTICE)
+
+
 if __name__ == "__main__":
     unittest.main()
