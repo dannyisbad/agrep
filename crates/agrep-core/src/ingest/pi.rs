@@ -17,7 +17,8 @@
 //! forward. Reasoning (`thinking`) is excluded like every other adapter.
 //! The fork adds fields (shortSummary, fromExtension, developer role, named
 //! sessions like advisor sidecars); unknown records and roles are skipped, not
-//! failed on.
+//! failed on. Sidecars receive `synthetic: true` user-role mirrors of the
+//! watched session's transcript; those are sidechain copies, never user rows.
 
 use std::collections::HashMap;
 use std::fs;
@@ -316,6 +317,20 @@ fn parse_with_limits(
                         .or_else(|| record.value.get("timestamp").and_then(|t| t.as_str())),
                 );
                 if is_role(message, "user") {
+                    // The fork mirrors the watched session into sidecar streams
+                    // (advisor and friends) as user-role records flagged
+                    // `synthetic: true` (attribution: agent). They re-embed
+                    // transcript text that is already indexed from the session
+                    // it was copied from - a runaway sidecar once re-broadcast
+                    // 24.8M of them - so they are sidechain copies, not prompts.
+                    if message
+                        .get("synthetic")
+                        .and_then(|s| s.as_bool())
+                        .unwrap_or(false)
+                    {
+                        tally.skip(crate::intake::Skip::Sidechain);
+                        continue;
+                    }
                     let text = text_of(message.get("content"));
                     if text.trim().is_empty() {
                         tally.skip(crate::intake::Skip::EmptyText);
@@ -793,6 +808,91 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(messages.len(), 1);
         assert_eq!(&*messages[0].text, "only turn");
+    }
+
+    #[test]
+    fn a_synthetic_transcript_mirror_is_not_a_user_row() {
+        // The mirror (m2) sits on the active branch between the genuine prompt
+        // and the reply; m1x is an abandoned sibling of m1 (duplicate ancestry),
+        // so it is counted-and-skipped, never re-walked. Exactly one user row
+        // and one recap may come out of these six records.
+        let path = write(concat!(
+            r#"{"type":"session","id":"s4","version":3,"cwd":"/work/app"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"real question"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m1x","parentId":null,"timestamp":"2026-01-02T03:04:06.500Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"abandoned branch"}]}}"#,
+            "\n",
+            r####"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**user**:\nreal question\n"}]}}"####,
+            "\n",
+            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-01-02T03:04:08.000Z","message":{"role":"assistant","model":"pi-1","content":[{"type":"text","text":"an answer"}]}}"#,
+            "\n",
+            r#"{"type":"compaction","id":"c1","parentId":"m3","timestamp":"2026-01-02T03:04:09.000Z","summary":"recap of earlier context"}"#,
+            "\n",
+        ));
+        let (messages, _events, _outcome) = parse_with("pi", &path, None);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(messages.len(), 2, "one genuine prompt plus one recap");
+        assert_eq!(&*messages[0].who, "user");
+        assert_eq!(&*messages[0].text, "real question");
+        // the reply lands on the genuine row, not on a mirror row
+        assert_eq!(&*messages[0].reply, "an answer");
+        assert_eq!(&*messages[1].who, "recap");
+        assert!(
+            !messages.iter().any(|m| m.text.contains("Session update")),
+            "a synthetic mirror leaked into the user lane"
+        );
+    }
+
+    #[test]
+    fn an_advisor_sidecar_of_mirrors_yields_no_user_rows() {
+        // An advisor sidecar is a child-dir stream of synthetic user-role
+        // mirrors of the watched session (a runaway once re-broadcast 24.8M of
+        // them). Its tool events survive; its mirrors never become rows.
+        let root = std::env::temp_dir().join(format!(
+            "agrep-omp-advisor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sessions = root.join("agent").join("sessions");
+        let container = "2026-08-18T03-34-43-541Z_01a012ef-8a55-7000-b9ca-8ab44ce2a383";
+        let child = sessions
+            .join("project")
+            .join(container)
+            .join("__advisor.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(
+            &child,
+            concat!(
+                r#"{"type":"session","id":"advisor","version":3,"cwd":"/work/app"}"#,
+                "\n",
+                r####"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**user**:\nhi\n"}]}}"####,
+                "\n",
+                r####"{"type":"message","id":"m2","parentId":"m1","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**agent**:\nhello\n"}]}}"####,
+                "\n",
+                r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"assistant","content":[{"type":"text","text":"advice"},{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"a.rs"}}]}}"#,
+                "\n",
+                r#"{"type":"message","id":"m4","parentId":"m3","message":{"role":"toolResult","toolCallId":"tc1","content":[{"type":"text","text":"fn main() {}"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let parent = side_parent_in(&sessions, &child);
+        assert_eq!(parent.as_deref(), Some("01a012ef-8a55-7000-b9ca-8ab44ce2a383"));
+        let (messages, events, outcome) = parse_with("pi", &child, parent);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
+        assert!(
+            messages.is_empty(),
+            "mirror records must not become user rows: {:?}",
+            messages.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "read");
+        assert_eq!(events[0].output, "fn main() {}");
     }
 
     #[test]
