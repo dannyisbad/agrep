@@ -377,6 +377,14 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
         self.assertIn('node --test npm/test_publish.js', block)
         self.assertIn('test -f "sealed/agrep-cli-$version.tgz"', block)
         self.assertIn('test -f "sealed/mundy-agrep-$version.tgz"', block)
+        self.assertIn(
+            'published=$(npm view "$name@$version" version 2>/dev/null || true)',
+            block)
+        self.assertIn('echo "already published: $name@$version - verifying only"',
+                      block)
+        publish = block.index('npm publish "./$package"')
+        skip = block.index('already published')
+        self.assertLess(skip, publish)
         self.assertIn("gh release upload \"v$version\" expected/* --clobber",
                       block)
         self.assertIn("--require-complete --wait-seconds 120", block)
