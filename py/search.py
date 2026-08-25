@@ -27,7 +27,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import boundary_rank
 import common
@@ -3272,6 +3272,10 @@ class QuerySpec:
     allow_model_download: bool = False
     exclude_project: str | None = None
     exclude_family: bool = True
+    # Serve the last-published pinned generation even mid-republish: set by
+    # the movement retry in _keyword_candidates so a query never chases a
+    # moving generation into the publication wait window.
+    pin_last_good: bool = False
 
 
 @dataclass(slots=True)
@@ -4075,11 +4079,14 @@ class NativeEventFallback(RuntimeError):
     pass
 
 
-_QUERY_PUBLICATION_WAIT_S = 4.0
+# Publications land in tens-to-hundreds of ms; queries over a readable
+# last-good snapshot never wait at all (they pin it), so this window only
+# covers the atomic-swap gap when no snapshot exists yet (first-ever build).
+_QUERY_PUBLICATION_WAIT_S = 1.0
 _QUERY_PUBLICATION_WAIT_MIN_S = 0.02
 _QUERY_PUBLICATION_WAIT_MAX_S = 0.25
 _QUERY_PUBLICATION_TIMEOUT = (
-    "history is still updating after 4s - "
+    "history is still publishing its first searchable snapshot after 1s - "
     "rerun the same agrep command")
 # ranked rows a --deeper replay resumes past: the frozen chain served them
 _DEEPER_SKIP_ROWS: int = 0
@@ -4405,10 +4412,11 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
     db = corpusdb.connect(allow_stale=True)
     if (db is not None and spec.exhaustive
             and getattr(db, "_source_stamp_current", None) is False):
-        if corpusdb.query_publication_active():
+        if spec.pin_last_good or corpusdb.query_publication_active():
             # A busy box republishes every few seconds, invalidating the direct
-            # scan until the 4s "rerun" refusal: last-good counts with their
-            # freshness disclosure beat that; the quiet path still scans exact.
+            # scan on every attempt: last-good counts with their freshness
+            # disclosure beat chasing the moving generation into the "rerun"
+            # refusal; the quiet path still scans exact.
             common.dbg("exhaustive lane keeping a behind snapshot: "
                        "publisher active, counts are generation-aged")
         else:
@@ -4758,6 +4766,14 @@ def _keyword_candidates(spec: QuerySpec) -> LaneResult:
                     continue
             elif not publisher_active:
                 raise
+            if not spec.pin_last_good:
+                # NEVER chase a moving generation: a last-published snapshot
+                # is readable right now, so serve it generation-aged (the
+                # existing freshness disclosure names the lag) instead of
+                # sleeping toward the "rerun" refusal. The wait window below
+                # is reached only when even the pinned read found nothing.
+                spec = replace(spec, pin_last_good=True)
+                continue
             publication_error = exc
         except (DirectSnapshotQueryError, NativeEventScanError):
             raise

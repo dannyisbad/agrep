@@ -104,6 +104,31 @@ class PublicationRaceRetry(unittest.TestCase):
         self.assertEqual(publishing.call_count, 2)
         sleep.assert_not_called()
 
+    def test_moving_generation_over_last_good_serves_without_waiting(
+            self) -> None:
+        for error in (
+                search.DirectSnapshotQueryMoved("direct generation moved"),
+                search.NativeEventScanMoved("native generation moved")):
+            with self.subTest(error=type(error).__name__):
+                expected = search.LaneResult(
+                    hits=[_hit("one", "needle")], engine="corpusdb")
+                with mock.patch.object(search, "corpusdb", corpusdb), \
+                        mock.patch.object(
+                        search, "_keyword_candidates_once",
+                        side_effect=[error, expected]) as query, \
+                        mock.patch.object(
+                            corpusdb, "query_publication_active",
+                            return_value=True) as publishing, \
+                        mock.patch.object(search.time, "sleep") as sleep:
+                    actual = search._keyword_candidates(_spec())
+                self.assertIs(actual, expected)
+                self.assertEqual(query.call_args_list, [
+                    mock.call(_spec()),
+                    mock.call(_spec(pin_last_good=True)),
+                ])
+                publishing.assert_called_once_with()
+                sleep.assert_not_called()
+
     def test_direct_and_native_restart_past_a_third_observation(self) -> None:
         for error in (
                 search.DirectSnapshotQueryMoved("direct generation moved"),
@@ -120,10 +145,15 @@ class PublicationRaceRetry(unittest.TestCase):
                         mock.patch.object(search.time, "sleep") as sleep:
                     actual = search._keyword_candidates(_spec())
                 self.assertIs(actual, expected)
-                self.assertEqual(query.call_count, 4)
+                self.assertEqual(query.call_args_list, [
+                    mock.call(_spec()),
+                    mock.call(_spec(pin_last_good=True)),
+                    mock.call(_spec(pin_last_good=True)),
+                    mock.call(_spec(pin_last_good=True)),
+                ])
                 self.assertEqual(publishing.call_count, 3)
                 self.assertEqual(sleep.call_args_list, [
-                    mock.call(0.02), mock.call(0.04), mock.call(0.08),
+                    mock.call(0.02), mock.call(0.04),
                 ])
 
     def test_stable_snapshot_damage_fails_without_retry(self) -> None:
@@ -141,25 +171,20 @@ class PublicationRaceRetry(unittest.TestCase):
             query.assert_called_once_with(_spec())
             sleep.assert_not_called()
 
-    def test_live_publication_wait_is_bounded(self) -> None:
-        error = search.DirectSnapshotQueryMoved("generation moved")
-        self.assertEqual(search._QUERY_PUBLICATION_WAIT_S, 4.0)
-        with mock.patch.object(search, "corpusdb", corpusdb), \
-                mock.patch.object(
+    def test_first_snapshot_wait_is_bounded_to_one_second(self) -> None:
+        error = search.SnapshotPublicationActive(
+            "a verified publisher is updating the query generation")
+        self.assertEqual(search._QUERY_PUBLICATION_WAIT_S, 1.0)
+        with mock.patch.object(
                 search, "_keyword_candidates_once",
                 side_effect=error) as query, \
-                mock.patch.object(
-                    corpusdb, "query_publication_active",
-                    return_value=True), \
-                mock.patch.object(
-                    search, "_QUERY_PUBLICATION_WAIT_S", 1.0), \
                 mock.patch.object(
                     search.time, "monotonic",
                     side_effect=[10.0, 10.5, 11.0]), \
                 mock.patch.object(search.time, "sleep") as sleep, \
                 self.assertRaisesRegex(
                     search.SnapshotPublicationTimeout,
-                    "history is still updating after 4s"):
+                    "still publishing its first searchable snapshot after 1s"):
             search._keyword_candidates(_spec())
         self.assertEqual(query.call_count, 3)
         self.assertEqual(sleep.call_args_list, [mock.call(0.02), mock.call(0.04)])
@@ -179,6 +204,25 @@ class PublicationRaceRetry(unittest.TestCase):
             search._keyword_candidates_once(_spec())
         active.assert_called_once_with()
         boundary.assert_not_called()
+
+    def test_pinned_exhaustive_count_keeps_the_behind_snapshot(self) -> None:
+        db = mock.Mock()
+        db._source_stamp_current = False
+        db.in_transaction = True
+        stop = RuntimeError("stop after the snapshot election")
+        with mock.patch.object(search, "corpusdb", corpusdb), \
+                mock.patch.object(corpusdb, "connect", return_value=db), \
+                mock.patch.object(
+                    corpusdb, "query_publication_active",
+                    return_value=False) as active, \
+                mock.patch.object(
+                    search, "_prepare_boundary",
+                    side_effect=stop) as boundary, \
+                self.assertRaises(RuntimeError):
+            search._keyword_candidates_once(
+                _spec(exhaustive=True, pin_last_good=True))
+        active.assert_not_called()
+        boundary.assert_called_once_with("needle", "keyword", db)
 
 
 class NativeShape(unittest.TestCase):
