@@ -79,7 +79,13 @@ class ReleaseCIProofTests(unittest.TestCase):
         job = text[start:end]
 
         self.assertIn("  workflow_dispatch:\n", text[:text.index("\njobs:\n")])
-        self.assertNotIn("\n    if:", job[:job.index("\n    steps:\n")])
+        # The one allowed job-level condition: the manual v0.3.0 recovery
+        # dispatch skips the build DAG; every push - all tags - still runs.
+        header = job[:job.index("\n    steps:\n")]
+        self.assertEqual(header.count("\n    if:"), 1)
+        self.assertIn(
+            "    if: ${{ github.event_name != 'workflow_dispatch' "
+            "|| !inputs.recover_v030 }}\n", header)
         self.assertIn("permissions:\n      actions: read\n      contents: read", job)
         self.assertIn("if: startsWith(github.ref, 'refs/tags/v')", job)
         self.assertIn('"repos/$GITHUB_REPOSITORY/actions/runs"', job)

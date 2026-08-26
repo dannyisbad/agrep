@@ -259,7 +259,7 @@ class JsonlSnapshotTruthTests(unittest.TestCase):
         self.assertEqual((rc, stdout, stderr), (0, "2\n", ""))
         self.assertEqual(reads, 2)
         self.assertEqual(publishing.call_count, 3)
-        sleep.assert_called_once_with(0.02)
+        sleep.assert_not_called()
 
     def test_same_signature_body_rewrite_does_not_starve_a_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
