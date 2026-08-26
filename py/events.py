@@ -50,10 +50,9 @@ def _user_data_dir(home: Path | None = None) -> Path:
     return Path(base) / "agrep"
 
 
-# $AGREP_DATA_DIR wins (wheel launcher, test/dev fixtures); else a non-empty
-# $AGREP_HOME isolates the derived dir under the overridden home — a redirected
-# store discovery must never write the production data dir; else one shared
-# per-user dir.
+# $AGREP_DATA_DIR wins (wheel launcher, fixtures); else a non-empty $AGREP_HOME
+# isolates the derived dir under the overridden home, so redirected store
+# discovery never writes the production data dir; else one shared per-user dir.
 _env_data = os.environ.get("AGREP_DATA_DIR")
 _env_home = os.environ.get("AGREP_HOME")
 _env_data_source = os.environ.get("AGREP_DATA_DIR_SOURCE")

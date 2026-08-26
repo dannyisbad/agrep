@@ -4414,9 +4414,8 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
             and getattr(db, "_source_stamp_current", None) is False):
         if spec.pin_last_good or corpusdb.query_publication_active():
             # A busy box republishes every few seconds, invalidating the direct
-            # scan on every attempt: last-good counts with their freshness
-            # disclosure beat chasing the moving generation into the "rerun"
-            # refusal; the quiet path still scans exact.
+            # scan each attempt: last-good counts with their freshness disclosure
+            # beat chasing the moving generation; the quiet path still scans exact.
             common.dbg("exhaustive lane keeping a behind snapshot: "
                        "publisher active, counts are generation-aged")
         else:
@@ -4767,11 +4766,9 @@ def _keyword_candidates(spec: QuerySpec) -> LaneResult:
             elif not publisher_active:
                 raise
             if not spec.pin_last_good:
-                # NEVER chase a moving generation: a last-published snapshot
-                # is readable right now, so serve it generation-aged (the
-                # existing freshness disclosure names the lag) instead of
-                # sleeping toward the "rerun" refusal. The wait window below
-                # is reached only when even the pinned read found nothing.
+                # NEVER chase a moving generation: a last-published snapshot is
+                # readable now, so serve it generation-aged (freshness disclosure
+                # names the lag); the wait below only fires with nothing pinned.
                 spec = replace(spec, pin_last_good=True)
                 continue
             publication_error = exc

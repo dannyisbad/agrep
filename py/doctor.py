@@ -2497,10 +2497,9 @@ def probe(
         indexed.update(sessions=int(summary["sessions"]),
                        messages=int(summary["messages"]),
                        age_s=int(summary.get("age_s") or 0))
-        # The census and the parse cache are both agrep's own product; a
-        # cache that knows dramatically more sources than the published
-        # snapshot retained is corpus loss, and a green census row beside it
-        # would be a lie (the live incident: 1 session next to 853 sources).
+        # Census and parse cache are both agrep's own product: a cache that
+        # knows far more sources than the published snapshot retained is
+        # corpus loss (observed: 1 session beside 853 sources), never [ok].
         cached_sources = surface.parse_cache_source_count(
             indexd_runtime.INGEST_CACHE_PATH)
         if surface.census_contradiction(indexed["sessions"], cached_sources):
