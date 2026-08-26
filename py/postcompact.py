@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from collections import OrderedDict
 from typing import Mapping
@@ -49,7 +50,8 @@ def _authority() -> dict:
     }
 
 
-def _failure(status: str, reason: str, *, json_output: bool) -> int:
+def _failure(status: str, reason: str, *, json_output: bool,
+             absence_proof: str | None = None) -> int:
     record = {
         "kind": "agrep-postcompact",
         "schema_version": SCHEMA_VERSION,
@@ -58,10 +60,14 @@ def _failure(status: str, reason: str, *, json_output: bool) -> int:
         "authority": _authority(),
         "implicit_widening": False,
     }
+    if absence_proof:
+        record["absence_proof"] = absence_proof
     if json_output:
         _stdout(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     else:
         common.log(f"postcompact unavailable: {reason}")
+        if absence_proof:
+            common.dbg(f"absence verified without a freshen: {absence_proof}")
     return 2
 
 
@@ -422,12 +428,26 @@ def main(argv: list[str] | None = None) -> int:
             "index_unavailable", "the materialized history index is unavailable",
             json_output=args.json)
 
-    outcome = _serve(args, retry_pending=not args.no_auto)
+    miss: dict[str, str] = {}
+    outcome = _serve(args, retry_pending=not args.no_auto, miss=miss)
     if outcome is not None:
         return outcome
+    # A boundary-shaped miss whose caller transcript the published generation
+    # provably covers cannot be cured by re-ingesting the same bytes: absence
+    # is already verified, so the refusal serves now instead of paying the
+    # freshen pass below.
+    if miss.get("status") == "boundary_unavailable":
+        proof = _published_absence_proof(miss.get("session", ""))
+        if proof is not None:
+            outcome = _serve(args, retry_pending=False, absence_proof=proof)
+            assert outcome is not None
+            return outcome
     # The primary moment is seconds after a compaction: the snapshot trails
     # live files AND the boundary row may not be flushed yet (seen on omp).
     # Ingests close the index lag; the bounded waits close the flush lag.
+    # An uncovered transcript pays this full pass: the only fenced ingest
+    # primitive is the all-agent build_index (the Rust per-agent filter is
+    # not exposed through the Python writer fences).
     can_ingest = common.ingest_bin().exists()
     for pause_s in _RETRY_PAUSES_S:
         if pause_s:
@@ -440,6 +460,69 @@ def main(argv: list[str] | None = None) -> int:
     outcome = _serve(args, retry_pending=False)
     assert outcome is not None
     return outcome
+
+
+# Bounded budget for the absence-evidence member listing: generous next to
+# the interactive drift probe (0.45s) because it replaces a multi-second
+# freshen pass, and bounded so a hung probe degrades to that pass instead of
+# stalling the refusal.
+_ABSENCE_EVIDENCE_TIMEOUT_S = 2.0
+
+
+def _published_absence_proof(session: str) -> str | None:
+    """Durable publication evidence that already covers the caller's
+    transcript at its current on-disk identity - or None, which claims
+    nothing.
+
+    The freshness daemon stamps verified-current.json only after verifying
+    that a publication absorbed the live store census, recording per-store
+    member digests (sha256 over every member's path, size, mtime). When the
+    caller's transcript is a live member of a store whose recorded digest
+    matches one recomputed from the live members now, that store's bytes are
+    the bytes a publication provably absorbed - and every later publication
+    retains rows whose sources did not move (the removal fence withholds
+    deletions; this is the same monotone-coverage inference the daemon's own
+    stamp_verified_current restamp branch commits to disk). The record's
+    global ingest-signature pin is deliberately NOT required: it vouches the
+    whole census for one generation, while this claim is per-store, and on a
+    busy box the rate-limited restamp always trails the live generation.
+    Re-ingesting unchanged bytes cannot surface a boundary the index does
+    not hold. Every shortfall returns None and the caller pays the full
+    freshen pass - under-proving is the designed failure mode; a fast wrong
+    "nothing here" is forbidden.
+    """
+    if not session:
+        return None
+    try:
+        record = indexd_runtime._read_verified_record()
+        if record is None or not record.digests:
+            return None
+        if record.ts > time.time() + indexd_runtime.FRESHNESS_WRITE_RATE_S:
+            # A future-dated record could green-light anything.
+            return None
+        members_by_store = indexd_runtime._store_paths_census(
+            timeout_s=_ABSENCE_EVIDENCE_TIMEOUT_S)
+        if not members_by_store:
+            return None
+        hosts = [
+            name for name, members in members_by_store.items()
+            if any(session in os.path.basename(member) for member in members)]
+        if not hosts:
+            # The transcript is not a censused store member, so the
+            # publication evidence says nothing about its bytes (and the
+            # ingest below consumes the same registry, so it could not
+            # index the transcript either).
+            return None
+        for name in hosts:
+            recorded = record.digests.get(name)
+            if recorded is None:
+                return None
+            live = indexd_runtime._store_change_digest(members_by_store[name])
+            if live is None or live != recorded:
+                return None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return "publication-covered"
 
 
 _FAMILY_CHURN_NOTICE = (
@@ -509,19 +592,28 @@ def _serve_lenient(args, session: str) -> int | None:
     return 2
 
 
-def _serve(args, *, retry_pending: bool) -> int | None:
+def _serve(args, *, retry_pending: bool, miss: dict | None = None,
+           absence_proof: str | None = None) -> int | None:
     """One resolution attempt. None = staleness-shaped miss worth one retry."""
     caller_session = [args.session]
 
     def stale(status: str, reason: str) -> int | None:
         if retry_pending:
+            if miss is not None:
+                miss["status"] = status
+                miss["session"] = caller_session[0] or ""
             return None
         session = caller_session[0]
         if session:
             outcome = _serve_lenient(args, session)
             if outcome is not None:
                 return outcome
-        return _failure(status, reason, json_output=args.json)
+        return _failure(
+            status, reason, json_output=args.json,
+            # The proof explains a verified boundary absence only; any other
+            # refusal shape must not carry it.
+            absence_proof=(absence_proof
+                           if status == "boundary_unavailable" else None))
 
     if args.session:
         db = session_context._open_session_family_index()

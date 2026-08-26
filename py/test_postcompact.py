@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import sqlite3
+import time
 import unittest
 from unittest import mock
 
@@ -653,6 +654,209 @@ class CliTests(unittest.TestCase):
             packet["coverage"]["index_freshness"],
             postcompact._FAMILY_CHURN_NOTICE)
         self.assertEqual(stderr.getvalue(), "")
+
+
+_UNSET = object()
+
+
+class AbsenceEvidenceTests(unittest.TestCase):
+    """An exit-2 absence consumes the daemon's durable publication evidence
+    (verified-current per-store member digests) before paying the freshen
+    pass - and never serves from evidence that does not cover the caller's
+    transcript at its current identity."""
+
+    _DIGEST = "ab" * 32
+
+    @classmethod
+    def _record(cls, digests=_UNSET, signature="sig-1", ts=1_000.0):
+        return postcompact.indexd_runtime._VerifiedRecord(
+            ts, {"codex": (1, 999)},
+            {"codex": cls._DIGEST} if digests is _UNSET else digests,
+            signature)
+
+    def _run_missing_boundary(self, argv, *, record, live_digest,
+                              members=_UNSET):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        build_index = mock.Mock(return_value=True)
+        ingest_bin = mock.Mock(return_value=mock.Mock(exists=lambda: True))
+        if members is _UNSET:
+            members = {"codex": ["/stores/codex/root.jsonl"]}
+        with mock.patch.object(postcompact, "_RETRY_PAUSES_S", (0.0,)), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "ensure_index",
+                    return_value=True), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "agent_freshness_notice",
+                    return_value=None), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "build_index", build_index), \
+                mock.patch.object(postcompact.common, "ingest_bin",
+                                  ingest_bin), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_read_verified_record",
+                    return_value=record), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_store_paths_census",
+                    return_value=members), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_store_change_digest",
+                    return_value=live_digest), \
+                mock.patch.object(
+                    postcompact.session_context, "calling_family_snapshot",
+                    side_effect=lambda: CliTests._snapshot(None)), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = postcompact.main(argv)
+        return rc, stdout.getvalue(), stderr.getvalue(), build_index, \
+            ingest_bin
+
+    def test_covered_evidence_refuses_without_any_freshen(self) -> None:
+        rc, stdout, stderr, build_index, ingest_bin = \
+            self._run_missing_boundary(
+                ["--json"], record=self._record(), live_digest=self._DIGEST)
+        build_index.assert_not_called()
+        ingest_bin.assert_not_called()
+        self.assertEqual((rc, stderr), (2, ""))
+        refusal = json.loads(stdout)
+        self.assertEqual(refusal["status"], "boundary_unavailable")
+        self.assertEqual(refusal["absence_proof"], "publication-covered")
+        self.assertIn("no structural compaction boundary", refusal["reason"])
+
+    def test_covered_evidence_keeps_the_user_facing_refusal(self) -> None:
+        rc, stdout, stderr, build_index, _ = self._run_missing_boundary(
+            [], record=self._record(), live_digest=self._DIGEST)
+        build_index.assert_not_called()
+        self.assertEqual((rc, stdout), (2, ""))
+        self.assertIn("no structural compaction boundary", stderr)
+
+    def test_grown_transcript_freshens_before_the_verdict(self) -> None:
+        # The live member identity moved past the recorded coverage: the
+        # evidence claims nothing, so the freshen pass runs before refusing.
+        rc, stdout, stderr, build_index, _ = self._run_missing_boundary(
+            ["--json"], record=self._record(), live_digest="cd" * 32)
+        self.assertTrue(build_index.called)
+        self.assertEqual(rc, 2)
+        self.assertNotIn("absence_proof", json.loads(stdout))
+
+    def test_missing_evidence_keeps_the_full_freshen_pass(self) -> None:
+        rc, stdout, stderr, build_index, _ = self._run_missing_boundary(
+            ["--json"], record=None, live_digest=self._DIGEST)
+        self.assertTrue(build_index.called)
+        self.assertEqual(rc, 2)
+        self.assertNotIn("absence_proof", json.loads(stdout))
+
+    def test_found_boundary_never_consults_the_evidence(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        proof = mock.Mock()
+        build_index = mock.Mock()
+        with mock.patch.object(
+                postcompact.indexd_runtime, "ensure_index",
+                return_value=True), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "agent_freshness_notice",
+                    return_value=None), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "build_index", build_index), \
+                mock.patch.object(
+                    postcompact, "_published_absence_proof", proof), \
+                mock.patch.object(
+                    postcompact.session_context, "calling_family_snapshot",
+                    side_effect=lambda: CliTests._snapshot(8)), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = postcompact.main(["--json"])
+        proof.assert_not_called()
+        build_index.assert_not_called()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "recovered")
+        self.assertEqual(stderr.getvalue(), "")
+
+
+class PublishedAbsenceProofTests(unittest.TestCase):
+    """_published_absence_proof claims nothing unless the caller's transcript
+    is a live member of a store whose verified-current recorded digest
+    matches one recomputed from the members on disk now - the same
+    monotone-coverage vouching the daemon's restamp branch commits."""
+
+    _DIGEST = "ab" * 32
+
+    def _proof(self, session="root", *, record=_UNSET,
+               members=_UNSET, live_digest=_UNSET):
+        record = (AbsenceEvidenceTests._record()
+                  if record is _UNSET else record)
+        if members is _UNSET:
+            members = {"codex": ["/stores/codex/root.jsonl"]}
+        if live_digest is _UNSET:
+            live_digest = self._DIGEST
+        with mock.patch.object(
+                postcompact.indexd_runtime, "_read_verified_record",
+                return_value=record), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_store_paths_census",
+                    return_value=members), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_store_change_digest",
+                    return_value=live_digest):
+            return postcompact._published_absence_proof(session)
+
+    def test_covered_transcript_yields_the_proof(self) -> None:
+        self.assertEqual(self._proof(), "publication-covered")
+
+    def test_no_session_claims_nothing(self) -> None:
+        self.assertIsNone(self._proof(""))
+
+    def test_missing_record_claims_nothing(self) -> None:
+        self.assertIsNone(self._proof(record=None))
+
+    def test_record_without_digests_claims_nothing(self) -> None:
+        self.assertIsNone(
+            self._proof(record=AbsenceEvidenceTests._record(digests={})))
+
+    def test_record_trailing_the_live_generation_still_vouches(self) -> None:
+        # The busy-box shape: publications land every few seconds while the
+        # rate-limited restamp trails, so the record pins an older ingest
+        # signature. Vouching is the per-store digest match, not the global
+        # signature pin - an unchanged store is covered by every later
+        # publication (the removal fence withholds deletions).
+        for signature in ("sig-0", None):
+            record = AbsenceEvidenceTests._record(signature=signature)
+            self.assertEqual(
+                self._proof(record=record), "publication-covered")
+
+    def test_future_dated_record_claims_nothing(self) -> None:
+        record = AbsenceEvidenceTests._record(ts=time.time() + 10_000.0)
+        self.assertIsNone(self._proof(record=record))
+
+    def test_unavailable_member_listing_claims_nothing(self) -> None:
+        self.assertIsNone(self._proof(members=None))
+
+    def test_unlisted_transcript_claims_nothing(self) -> None:
+        self.assertIsNone(
+            self._proof(members={"codex": ["/stores/codex/other.jsonl"]}))
+
+    def test_host_store_without_recorded_digest_claims_nothing(self) -> None:
+        # The transcript's store is live but the record never digested it:
+        # the publication evidence says nothing about those bytes.
+        record = AbsenceEvidenceTests._record(digests={"claude": self._DIGEST})
+        self.assertIsNone(self._proof(record=record))
+
+    def test_moved_member_identity_claims_nothing(self) -> None:
+        self.assertIsNone(self._proof(live_digest="cd" * 32))
+
+    def test_undigestable_store_claims_nothing(self) -> None:
+        self.assertIsNone(self._proof(live_digest=None))
+
+    def test_every_matching_store_must_be_covered(self) -> None:
+        # A same-named transcript in a second store: whichever one is the
+        # caller's real file must be covered, so both must be.
+        members = {"codex": ["/stores/codex/root.jsonl"],
+                   "claude": ["/stores/claude/root.jsonl"]}
+        self.assertIsNone(self._proof(members=members))
+        record = AbsenceEvidenceTests._record(
+            digests={"codex": self._DIGEST, "claude": self._DIGEST})
+        self.assertEqual(
+            self._proof(members=members, record=record),
+            "publication-covered")
 
 
 if __name__ == "__main__":
