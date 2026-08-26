@@ -44,8 +44,9 @@ PROFILE = {
     "repo": "onnx-community/granite-embedding-small-english-r2-ONNX",
     "revision": "1dc7835ba0cb9c76a3618d0bf0c427c97671b3c8",
     "dim": 384,
-    # Frozen ranking A/B: 1,024 tied 2,048 at far lower backfill cost; long pastes
-    # still embed their head, where the request/instructions live.
+    # Frozen ranking A/B: 1,024 tied 2,048 at far lower backfill cost; rows
+    # beyond the window embed as '#cN' chunk vectors (embed.py) so long
+    # pastes stay retrievable past their head.
     "max_seq": 1024,
     "files": {
         "model_quantized.onnx": (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -52,6 +53,20 @@ def semantic_text_hash(text: str) -> str:
     import hashlib
     return hashlib.blake2b(
         text.encode("utf-8", "replace"), digest_size=8).hexdigest()
+
+
+_SEMANTIC_CHUNK_SUFFIX = re.compile(r"#c([0-9]+)$")
+
+
+def semantic_chunk_split(mid: str) -> "tuple[str, int]":
+    """(logical row id, chunk ordinal) for one semantic store id.
+
+    A long row embeds as several vectors: the unsuffixed id keeps the head
+    chunk and '#cN' siblings carry the rest, following the '#r' reply-suffix
+    convention. Ordinal 0 names the base vector; ids without the suffix are
+    their own logical row."""
+    match = _SEMANTIC_CHUNK_SUFFIX.search(mid)
+    return (mid[:match.start()], int(match.group(1))) if match else (mid, 0)
 
 
 class Message(NamedTuple):

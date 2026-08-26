@@ -813,11 +813,9 @@ class PublishedAbsenceProofTests(unittest.TestCase):
             self._proof(record=AbsenceEvidenceTests._record(digests={})))
 
     def test_record_trailing_the_live_generation_still_vouches(self) -> None:
-        # The busy-box shape: publications land every few seconds while the
-        # rate-limited restamp trails, so the record pins an older ingest
-        # signature. Vouching is the per-store digest match, not the global
-        # signature pin - an unchanged store is covered by every later
-        # publication (the removal fence withholds deletions).
+        # Busy-box shape: publications land every few seconds while the
+        # rate-limited restamp trails and pins an older ingest signature;
+        # vouching is the per-store digest match, never the global pin.
         for signature in ("sig-0", None):
             record = AbsenceEvidenceTests._record(signature=signature)
             self.assertEqual(

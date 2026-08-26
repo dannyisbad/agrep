@@ -14,6 +14,7 @@ from _test_support import isolate_data_dir
 
 isolate_data_dir()
 
+import ask
 import common
 import corpusdb
 import embed
@@ -623,6 +624,219 @@ class SegmentedEmbedPublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected planning failure"):
                 embed._run(self._args())
         self.assertTrue(catalog.closed)
+
+
+_PHRASE = "the zanzibar quokka ledger reconciliation"
+
+
+class _CapturingEmbedder(_Embedder):
+    """Deterministic vectors; the buried phrase gets a distinctive direction."""
+
+    def __init__(self) -> None:
+        self.captured: list[str] = []
+
+    def embed_texts(self, texts):
+        self.captured.extend(str(text) for text in texts)
+        rows = np.zeros(
+            (len(texts), int(embedder.PROFILE["dim"])), dtype=np.float32)
+        rows[:, 0] = 1.0
+        for index, text in enumerate(texts):
+            if _PHRASE in text:
+                rows[index, 1] = 5.0
+        rows /= np.linalg.norm(rows, axis=1, keepdims=True)
+        return rows
+
+
+class ChunkedRowPublicationTests(unittest.TestCase):
+    """One logical row published as several '#cN' chunk vectors."""
+
+    def setUp(self) -> None:
+        segment_query.close_cache()
+        ask.clear_artifact_cache()
+        shutil.rmtree(common.DATA_DIR, ignore_errors=True)
+        common.DATA_DIR.mkdir(parents=True, mode=0o700)
+        build_id = indexd_runtime.derived_writer_build_id(
+            common.ingest_bin(), require_binary=True)
+        indexd_runtime.DERIVED_OWNER_PATH.write_text(
+            json.dumps(
+                {"version": 1, "build_id": build_id},
+                separators=(",", ":")),
+            encoding="utf-8")
+        self.source = {"ingest_signature": "chunked-one"}
+        filler = "\n".join(
+            f"filler line {index} " + "pad " * 12 for index in range(400))
+        self.long_text = filler + "\n" + _PHRASE + "\n" + filler
+        self.chunk_count = len(embed._row_chunks("user", self.long_text))
+        self.rows = [
+            _row("codex:a:1", "alpha short row", session="a", turn=1),
+            _row("codex:b:2", self.long_text, session="b", turn=2),
+        ]
+
+    def tearDown(self) -> None:
+        segment_query.close_cache()
+        ask.clear_artifact_cache()
+        indexd_runtime.DERIVED_OWNER_PATH.unlink(missing_ok=True)
+
+    def _pass(self, embedder_instance, *, max_new=None) -> int:
+        args = types.SimpleNamespace(
+            smoke=None, full=False, max_new=max_new, background=False)
+        with (mock.patch.object(
+                  semantic, "source_generation", return_value=self.source),
+              mock.patch.object(
+                  embedder, "get", return_value=embedder_instance),
+              mock.patch.object(
+                  common, "strict_family_parent_map", return_value={}),
+              mock.patch.object(
+                  common, "indexed_family_roots", side_effect=_roots),
+              mock.patch.object(embed, "_schedule_segment_compaction",
+                                return_value=False),
+              mock.patch.object(common, "log")):
+            return embed._run(args)
+
+    def _write_rows(self) -> None:
+        SegmentedEmbedPublicationTests._write(self.rows)
+
+    def _corpus_for_rows(self):
+        path = common.DATA_DIR / "chunk-test-corpus.db"
+        path.unlink(missing_ok=True)
+        db = sqlite3.connect(path)
+        try:
+            db.execute(
+                "CREATE TABLE msgs(agent TEXT,project TEXT,session TEXT,"
+                "ts INTEGER,turn INTEGER,who TEXT,model TEXT,"
+                "model_source TEXT,text TEXT)")
+            db.execute("CREATE INDEX msgs_session ON msgs(session,turn)")
+            db.executemany(
+                "INSERT INTO msgs VALUES(?,?,?,?,?,?,?,?,?)",
+                [(row["agent"], row["project"], row["session"], row["ts"],
+                  row["turn"], row["who"], row["model"], row["model_source"],
+                  row["text"]) for row in self.rows])
+            db.commit()
+        finally:
+            db.close()
+        return path
+
+    def test_buried_phrase_returns_the_long_row_once_via_chunk_max_pool(
+            self) -> None:
+        import corpusdb
+
+        self.assertGreater(self.chunk_count, 4)
+        self._write_rows()
+        self.assertEqual(self._pass(_CapturingEmbedder()), 0)
+        meta = common.EMBEDDINGS_PATH.parent / "embeddings.meta"
+        manifest = embedding_segments.load_manifest(
+            meta, verify_hashes=True, validate_liveness=True)
+        mids = [row["mid"] for row in embedding_segments.active_rows(manifest)]
+        self.assertEqual(manifest["live_rows"], 1 + self.chunk_count)
+        self.assertIn("codex:b:2", mids)
+        self.assertIn(f"codex:b:2#c{self.chunk_count - 1}", mids)
+        self.assertEqual(
+            sum(1 for mid in mids if mid.startswith("codex:b:2")),
+            self.chunk_count)
+
+        segment_query.close_cache()
+        corpus_path = self._corpus_for_rows()
+        query = np.zeros(int(embedder.PROFILE["dim"]), dtype=np.float32)
+        query[1] = 1.0
+        with (mock.patch.object(
+                  common, "transcript_generation", return_value=self.source),
+              mock.patch.object(ask, "_embed_query", return_value=query),
+              mock.patch.object(
+                  corpusdb, "connect",
+                  side_effect=lambda *a, **k: sqlite3.connect(
+                      f"file:{corpus_path}?mode=ro", uri=True))):
+            _, matrix, refs, coverage = segment_query.open_current(
+                meta, need_matrix=True)
+            self.assertEqual(
+                {key: coverage[key] for key in ("indexed", "total", "pending")},
+                {"indexed": 1 + self.chunk_count,
+                 "total": 1 + self.chunk_count, "pending": 0})
+            # the phrase is retrievable only through a chunk vector
+            sims = matrix @ query
+            top = int(np.argmax(sims))
+            self.assertTrue(mids[top].startswith("codex:b:2#c"))
+            # a chunk hit maps back to its logical row
+            resolved = refs.resolve([top])
+            self.assertEqual(resolved[0]["mid"], "codex:b:2")
+            self.assertEqual(resolved[0]["text"], self.long_text)
+
+            payload = json.loads(ask.tool_search_messages(
+                _PHRASE, k=5, envelope=True))
+        hits = [(row["session"], row["turn"]) for row in payload["results"]]
+        # the long row appears exactly once, at its best chunk's score
+        self.assertEqual(hits.count(("b", 2)), 1)
+        self.assertEqual(hits[0], ("b", 2))
+        self.assertGreater(payload["results"][0]["score"], 0.9)
+        for row in payload["results"][1:]:
+            self.assertLess(row["score"], 0.5)
+
+    def test_partial_chunk_coverage_never_marks_the_store_complete(
+            self) -> None:
+        self._write_rows()
+        self.assertEqual(self._pass(_CapturingEmbedder(), max_new=4), 0)
+        meta = common.EMBEDDINGS_PATH.parent / "embeddings.meta"
+        manifest = embedding_segments.load_manifest(
+            meta, verify_hashes=True, validate_liveness=True)
+        self.assertEqual(manifest["live_rows"], 4)
+        segment_query.close_cache()
+        with mock.patch.object(
+                common, "transcript_generation", return_value=self.source):
+            _, _, _, coverage = segment_query.open_current(meta)
+        # a partially chunk-written row keeps the store partial: pending
+        # counts every unwritten chunk id of the logical row
+        self.assertEqual(coverage["indexed"], 4)
+        self.assertEqual(coverage["total"], 1 + self.chunk_count)
+        self.assertEqual(coverage["pending"], self.chunk_count - 3)
+        self.assertFalse(coverage.get("complete", False))
+
+        for _ in range((self.chunk_count // 4) + 2):
+            self.assertEqual(self._pass(_CapturingEmbedder(), max_new=4), 0)
+        final = embedding_segments.load_manifest(
+            meta, verify_hashes=True, validate_liveness=True)
+        self.assertEqual(final["live_rows"], 1 + self.chunk_count)
+        segment_query.close_cache()
+        with mock.patch.object(
+                common, "transcript_generation", return_value=self.source):
+            _, _, _, coverage = segment_query.open_current(meta)
+        self.assertEqual(coverage["pending"], 0)
+
+    def test_unchanged_chunked_store_is_not_rechurned(self) -> None:
+        self._write_rows()
+        self.assertEqual(self._pass(_CapturingEmbedder()), 0)
+        second = _CapturingEmbedder()
+        self.assertEqual(self._pass(second), 0)
+        self.assertEqual(second.captured, [])
+
+        # shrinking the row below the window prunes every chunk sibling
+        self.rows[1]["text"] = "now a short replacement row"
+        self._write_rows()
+        self.source = {"ingest_signature": "chunked-two"}
+        self.assertEqual(self._pass(_CapturingEmbedder()), 0)
+        meta = common.EMBEDDINGS_PATH.parent / "embeddings.meta"
+        manifest = embedding_segments.load_manifest(
+            meta, verify_hashes=True, validate_liveness=True)
+        self.assertEqual(
+            sorted(row["mid"] for row in embedding_segments.active_rows(
+                manifest)),
+            ["codex:a:1", "codex:b:2"])
+
+    def test_recap_rows_embed_stripped_content(self) -> None:
+        preamble = (
+            "Continue from the archive that follows; read it fully first.\n\n"
+            "- markers label archived scopes.\n\n"
+            "Prefer re-deriving details from the workspace over guessing.\n\n")
+        content = (
+            "FILES\n===================\nsrc/app.py (Read)\n\n"
+            "HISTORY\n===================\nreal recap content lives here\n")
+        self.rows.append({**_row(
+            "pi:c:3", preamble + content, session="c", turn=3),
+            "who": "recap"})
+        self._write_rows()
+        capturing = _CapturingEmbedder()
+        self.assertEqual(self._pass(capturing), 0)
+        # the recap's vector text starts at content, not the instructions
+        self.assertIn(content, capturing.captured)
+        self.assertNotIn(preamble + content, capturing.captured)
 
 
 if __name__ == "__main__":

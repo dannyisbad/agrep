@@ -196,6 +196,41 @@ class PendingEmbeddingPlanTests(unittest.TestCase):
         self.assertEqual([(row.id, row.text) for row in resolved],
                          [("codex:s:7", "prompt"), ("codex:s:7#r", "reply")])
 
+    def test_resolver_proves_chunk_ids_against_their_logical_row(self) -> None:
+        import corpusdb
+
+        long_text = "\n".join(
+            f"line {index} " + "x" * 60
+            for index in range(3 * embed._CHUNK_CHARS // 60))
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE msgs(session,turn,ts,agent,project,model,"
+                   "model_source,who,text)")
+        db.execute("CREATE INDEX msgs_session ON msgs(session,turn)")
+        db.executemany("INSERT INTO msgs VALUES(?,?,?,?,?,?,?,?,?)", (
+            ("s", 7, 10, "codex", "p", "m", "explicit", "user", long_text),
+            ("s", 7, 10, "codex", "p", "m", "explicit", "agent", long_text),
+        ))
+        digest = embed._text_hash(long_text)
+        rows = [
+            ("codex:s:7", digest, 10, 0),
+            ("codex:s:7#c2", digest, 10, 1),
+            ("codex:s:7#r#c1", digest, 10, 2),
+        ]
+        with mock.patch.object(corpusdb, "connect", return_value=db):
+            resolved = embed._resolve_pending_messages(rows)
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        # Chunk ids resolve through their logical row and keep the full text;
+        # the chunk-specific input is derived only at inference time.
+        self.assertEqual([row.id for row in resolved],
+                         ["codex:s:7", "codex:s:7#c2", "codex:s:7#r#c1"])
+        self.assertEqual([row.who for row in resolved],
+                         ["user", "user", "agent"])
+        self.assertTrue(all(row.text == long_text for row in resolved))
+        self.assertNotEqual(embed._embed_input(resolved[1]),
+                            embed._embed_input(resolved[0]))
+
     def test_second_bounded_run_uses_plan_and_publishes_aligned_rows(self) -> None:
         source = {"ingest_signature": "generation-a"}
 

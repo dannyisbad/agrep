@@ -29,7 +29,7 @@ shared per-user model cache instead; `AGREP_MODEL_DIR` overrides its root.
 | `data/embedding-segments/seg-<generation>.f32` | little-endian normalized `f32` vectors retained for incremental publication and compatibility checks. The production Granite profile is 384-dimensional; its 1,024 value is the token cap, not the vector width. |
 | `data/embedding-segments/seg-<generation>.q8` / `.q8g` | native int8 candidate index and root-family grouping used for bounded top-k retrieval. |
 | `data/embedding-segments/seg-<generation>.f16` | exact-rerank source for candidates returned by the q8 index. |
-| `data/embedding-segments/seg-<generation>.ids` / `.hashes` | row ids and source-text fingerprints aligned to each immutable segment. Reply ids use `#r`. |
+| `data/embedding-segments/seg-<generation>.ids` / `.hashes` | row ids and source-text fingerprints aligned to each immutable segment. Reply ids use `#r`. Rows longer than the model window embed as several vectors: the unsuffixed id keeps the head chunk and `#cN` siblings carry the rest, each fingerprinting the full source text. |
 | `data/embedding-segments/seg-<generation>.refs.sqlite` | sealed source locators and filter metadata for resolving only winning rows. |
 
 The reader still recognizes the earlier flat `embeddings.f32/.ids/.hashes`

@@ -432,22 +432,18 @@ def main(argv: list[str] | None = None) -> int:
     outcome = _serve(args, retry_pending=not args.no_auto, miss=miss)
     if outcome is not None:
         return outcome
-    # A boundary-shaped miss whose caller transcript the published generation
-    # provably covers cannot be cured by re-ingesting the same bytes: absence
-    # is already verified, so the refusal serves now instead of paying the
-    # freshen pass below.
+    # A boundary-shaped miss whose transcript the published generation
+    # provably covers cannot be cured by re-ingesting the same bytes:
+    # absence is verified, so the refusal skips the freshen pass below.
     if miss.get("status") == "boundary_unavailable":
         proof = _published_absence_proof(miss.get("session", ""))
         if proof is not None:
             outcome = _serve(args, retry_pending=False, absence_proof=proof)
             assert outcome is not None
             return outcome
-    # The primary moment is seconds after a compaction: the snapshot trails
-    # live files AND the boundary row may not be flushed yet (seen on omp).
-    # Ingests close the index lag; the bounded waits close the flush lag.
-    # An uncovered transcript pays this full pass: the only fenced ingest
-    # primitive is the all-agent build_index (the Rust per-agent filter is
-    # not exposed through the Python writer fences).
+    # Seconds after a compaction the snapshot trails live files AND the
+    # boundary row may be unflushed (seen on omp): ingests close the index
+    # lag, bounded waits the flush lag; uncovered transcripts pay in full.
     can_ingest = common.ingest_bin().exists()
     for pause_s in _RETRY_PAUSES_S:
         if pause_s:
@@ -462,10 +458,9 @@ def main(argv: list[str] | None = None) -> int:
     return outcome
 
 
-# Bounded budget for the absence-evidence member listing: generous next to
-# the interactive drift probe (0.45s) because it replaces a multi-second
-# freshen pass, and bounded so a hung probe degrades to that pass instead of
-# stalling the refusal.
+# Absence-evidence listing budget: generous next to the drift probe (0.45s)
+# since it replaces a multi-second freshen, and bounded so a hung probe
+# degrades to that pass instead of stalling the refusal.
 _ABSENCE_EVIDENCE_TIMEOUT_S = 2.0
 
 
@@ -508,10 +503,9 @@ def _published_absence_proof(session: str) -> str | None:
             name for name, members in members_by_store.items()
             if any(session in os.path.basename(member) for member in members)]
         if not hosts:
-            # The transcript is not a censused store member, so the
-            # publication evidence says nothing about its bytes (and the
-            # ingest below consumes the same registry, so it could not
-            # index the transcript either).
+            # An uncensused transcript: publication evidence says nothing
+            # about its bytes, and the ingest below consumes the same
+            # registry, so it could not index the transcript either.
             return None
         for name in hosts:
             recorded = record.digests.get(name)

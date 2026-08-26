@@ -568,7 +568,10 @@ class SegmentRefStore:
                     raise SegmentQueryError(
                         "current corpus content digest is invalid") from exc
                 found[row_ref] = {
-                    "ordinal": row_ref, "mid": record["mid"],
+                    # A '#cN' chunk hit maps back to its logical row: callers
+                    # see the base id, never the chunk-vector store id.
+                    "ordinal": row_ref,
+                    "mid": common.semantic_chunk_split(record["mid"])[0],
                     "agent": record["agent"], "project": record["project"],
                     "session": record["session"], "ts": int(record["ts"]),
                     "turn": int(record["turn"]), "who": record["who"],

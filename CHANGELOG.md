@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Semantic search chunks long rows instead of embedding only their opening
+  bytes. The embedder truncates at its model window, so a multi-megabyte
+  row (a compaction recap, a giant paste) used to embed as its first ~4KB
+  — for pi/omp recaps that is a fixed harness preamble, making every
+  mega-recap score like generic instructions against unrelated queries and
+  surface as a top hit. Rows beyond the window now embed as capped,
+  overlapping `#cN` chunk vectors (head chunk keeps the unsuffixed id, the
+  `#r` reply convention extended); recap rows additionally skip the
+  structural resume-instruction preamble so their vectors carry content.
+  Query-side, chunk hits max-pool back to their logical row, which appears
+  at most once in results.
+- `agrep postcompact` proves a no-boundary refusal from the freshness
+  daemon's published coverage evidence instead of re-running up to three
+  full ingests with bounded sleeps: verified absence now answers in ~0.4s
+  instead of ~8s. Every evidence shortfall - a grown transcript, a missing
+  or future-dated record, an oversized store - still pays the full pass;
+  absence stays verified absence.
+
 ## 0.3.1 — 2026-08-26
 
 - pi/oh-my-pi advisor sidecars mirror every transcript row as a synthetic

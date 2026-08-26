@@ -1958,9 +1958,14 @@ def _q8_flat_pool(query: np.ndarray, refs: _MessageRefStore,
     resolved = refs.resolve(ordinals)
     position_by_ordinal = {
         int(ordinal): position for position, ordinal in enumerate(ordinals)}
-    seen_text, rows, kept = set(), [], []
+    # Candidates arrive score-descending, so keeping a row's first surviving
+    # ordinal max-pools its '#cN' chunk vectors into one logical result.
+    seen_mid, seen_text, rows, kept = set(), set(), [], []
     for resolved_index, row in enumerate(resolved):
         if not _matches(row, row_filters):
+            continue
+        mid = str(row.get("mid") or "")
+        if mid and mid in seen_mid:
             continue
         key = " ".join((row.get("text") or "").split())[:140].lower()
         if key in seen_text:
@@ -1969,6 +1974,8 @@ def _q8_flat_pool(query: np.ndarray, refs: _MessageRefStore,
         position = position_by_ordinal.get(ordinal)
         if position is None:
             continue
+        if mid:
+            seen_mid.add(mid)
         seen_text.add(key)
         rows.append(row)
         kept.append(position)
@@ -2336,11 +2343,18 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
         local = _top_indices(sims[eligible], pool_n)
         ordered = eligible[local]
         resolved = refs.resolve(ordered)
-        seen_text, cand, kept = set(), [], []
+        # Score-descending resolution: a row's first surviving ordinal
+        # max-pools its '#cN' chunk vectors into one logical result.
+        seen_mid, seen_text, cand, kept = set(), set(), [], []
         for resolved_index, m in enumerate(resolved):
+            mid = str(m.get("mid") or "")
+            if mid and mid in seen_mid:
+                continue
             key = " ".join(m["text"].split())[:140].lower()
             if key in seen_text:
                 continue
+            if mid:
+                seen_mid.add(mid)
             seen_text.add(key)
             cand.append(m)
             kept.append(int(m.get("ordinal", ordered[resolved_index])))

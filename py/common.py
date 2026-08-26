@@ -444,6 +444,7 @@ from embedding_store import (
     MESSAGES_PATH,
     IDS_PATH,
     semantic_text_hash,
+    semantic_chunk_split,
     Message,
     iter_messages,
     write_index_meta,
