@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.1 — 2026-08-26
+
+- pi/oh-my-pi advisor sidecars mirror every transcript row as a synthetic
+  user-role record; the parser classified those mirrors as genuine user
+  prompts. One observed box inflated a 588k-record store into 24.9M user
+  rows, an 11.6GB parse cache, and a 15.5GB search db. Synthetic mirrors
+  are sidechain now: skipped with their tool events intact, never rows.
+- An ingest-cache delta too large for one journal frame now rebuilds the
+  cache base atomically instead of erroring. Previously a recovery-scale
+  publication (say, adopting a full corpus) could never commit: the
+  freshness daemon retried a doomed append every cycle, discarding minutes
+  of work each time, forever, while searches silently served the stale
+  snapshot.
+- `AGREP_HOME` without `AGREP_DATA_DIR` now resolves the data dir inside
+  the overridden home (disclosed as `agrep-home-isolated`). A sandboxed
+  invocation could previously read a synthetic home while writing the
+  production derived stores - observed live, clobbering a real corpus
+  census down to one session.
+- The freshness daemon stamps its resolved home and data dir into its
+  owner lock. A live daemon watching a divergent world (for example one
+  spawned with a leaked environment) is now named with both worlds and the
+  remedy, is retirable, and blocks inline writers - instead of posing as a
+  generic version conflict.
+- Doctor cross-checks the published corpus census against the parse
+  cache: a corpus that lost most of its sessions renders a `[!!]` line
+  carrying both numbers and the `agrep reindex --full` remedy, never a
+  green checkmark. The recall/search blocked-owner hedge escalates the
+  same way, naming the loss magnitude instead of whispering "history may
+  be stale".
+- Queries never wait on an in-flight publication when a last-good snapshot
+  exists: they pin the published generation and serve it immediately with
+  the standard freshness disclosure. The old behavior could stall up to 4s
+  chasing a moving generation on a busy box and then refuse with "rerun".
+  The bounded wait survives only for a box publishing its first-ever
+  searchable snapshot, capped at 1s.
+- Release plumbing: sealed npm tarballs publish as local files, the publish
+  step skips identities that already exist (idempotent across partial
+  publishes), the empty-token registry config that suppressed OIDC trusted
+  publishing is gone, and a manual recovery job can verify and backfill a
+  partially published release from surviving original build artifacts
+  without rebuilding anything.
+
 ## 0.3.0 — 2026-08-15
 
 - `agrep setup` renders its five steps with colored boundaries and opens with
