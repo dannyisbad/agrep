@@ -1537,9 +1537,7 @@ def freshness_story_line(story: FreshnessStory) -> str:
 
 
 # The clobbered-corpus tell: a published census dramatically smaller than the
-# parse cache's own source cardinality is corpus loss, not staleness. Both
-# numbers are agrep's own product - the cache counts every source the ingest
-# parsed, the census counts what the published snapshot retained - so a 90%+
+# parse cache's own source cardinality is corpus loss, not staleness - a 90%+
 # gap under a non-trivial cache is a contradiction no mild hedge may soften.
 CENSUS_CONTRADICTION_MIN_SOURCES = 20
 CENSUS_CONTRADICTION_RATIO = 0.10
@@ -1547,10 +1545,9 @@ CENSUS_CONTRADICTION_RATIO = 0.10
 # "(daemon-state)"-suffixed renderings carry this exact clause.
 BLOCKED_OWNER_STALE_MARKER = "the freshness owner is blocked"
 
-# Parse-cache base layout, mirroring Rust's fixed base header: [12:20] magic,
-# [20:24] storage version, a version-dependent remainder, then the bincode
-# payload whose fixed-width prelude is `version: u32` followed by the entry
-# map's length as u64. The probe reads only this prefix, never an entry.
+# Parse-cache base layout mirroring Rust's fixed header: [12:20] magic, [20:24]
+# storage version, version-dependent remainder, then the bincode payload prelude
+# (`version: u32`, entry-map length as u64). The probe reads only this prefix.
 _PARSE_CACHE_MAGIC = b"AGRPCB01"
 # storage version -> (header length, raw-len offset, codec offset)
 _PARSE_CACHE_LAYOUTS = {2: (64, 40, None), 3: (80, 40, 64), 4: (100, 60, 84)}

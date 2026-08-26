@@ -317,12 +317,9 @@ fn parse_with_limits(
                         .or_else(|| record.value.get("timestamp").and_then(|t| t.as_str())),
                 );
                 if is_role(message, "user") {
-                    // The fork mirrors the watched session into sidecar streams
-                    // (advisor and friends) as user-role records flagged
-                    // `synthetic: true` (attribution: agent). They re-embed
-                    // transcript text that is already indexed from the session
-                    // it was copied from - a runaway sidecar once re-broadcast
-                    // 24.8M of them - so they are sidechain copies, not prompts.
+                    // Sidecar streams (advisor and friends) mirror the watched session
+                    // as user-role records flagged `synthetic: true`: transcript copies
+                    // already indexed at their source, so sidechain, never prompts.
                     if message
                         .get("synthetic")
                         .and_then(|s| s.as_bool())
@@ -812,10 +809,9 @@ mod tests {
 
     #[test]
     fn a_synthetic_transcript_mirror_is_not_a_user_row() {
-        // The mirror (m2) sits on the active branch between the genuine prompt
-        // and the reply; m1x is an abandoned sibling of m1 (duplicate ancestry),
-        // so it is counted-and-skipped, never re-walked. Exactly one user row
-        // and one recap may come out of these six records.
+        // The mirror (m2) sits on the active branch between prompt and reply;
+        // m1x is an abandoned sibling of m1, counted-and-skipped, never
+        // re-walked. Six records may yield exactly one user row plus one recap.
         let path = write(concat!(
             r#"{"type":"session","id":"s4","version":3,"cwd":"/work/app"}"#,
             "\n",

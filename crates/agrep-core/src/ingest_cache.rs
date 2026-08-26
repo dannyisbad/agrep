@@ -1351,7 +1351,7 @@ thread_local! {
     /// 0 = use `MAX_FRAME_BYTES`; tests set a small limit on their own thread to
     /// exercise the oversized-delta base-rewrite fallback without materializing
     /// a real half-gigabyte delta.
-    static TEST_MAX_FRAME_BYTES: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    static TEST_MAX_FRAME_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn max_frame_bytes() -> u64 {
