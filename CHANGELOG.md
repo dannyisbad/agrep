@@ -13,6 +13,15 @@
   structural resume-instruction preamble so their vectors carry content.
   Query-side, chunk hits max-pool back to their logical row, which appears
   at most once in results.
+- The omp/pi advisor sidecar's own voice is indexed. Advisor streams hold
+  synthetic transcript mirrors (skipped as sidechain duplicates) plus the
+  advisor's assistant records; because assistant text previously attached
+  only as a reply to the preceding user row, and every user row in an
+  advisor stream is a skipped mirror, the advisor's entire analysis was
+  unsearchable. Text-bearing advisor messages are now their own side-stream
+  rows under the watched session's family; pure-thinking records and the
+  mirrors still index nothing. On one real 71k-line sidecar: 2,542 advisory
+  rows surface, 8,172 mirrors stay skipped.
 - `agrep postcompact` proves a no-boundary refusal from the freshness
   daemon's published coverage evidence instead of re-running up to three
   full ingests with bounded sleeps: verified absence now answers in ~0.4s
