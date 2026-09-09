@@ -767,6 +767,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     raw = path.read_text(encoding="ascii")
                 except OSError:
                     continue
+                state["record"] = raw
                 match = re.search(
                     r"(?:^| )target=(\d+)(?: |\n).*?"
                     r"target_start=([^ \n]+)(?: |\n)", raw)
@@ -774,7 +775,9 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     continue
                 pid = int(match.group(1))
                 birth = match.group(2)
-                if common.process_start_identity(pid) != birth:
+                observed_start = common.process_start_identity(pid)
+                state.update(candidate=pid, observed_start=observed_start)
+                if observed_start != birth:
                     continue
                 try:
                     os.kill(pid, signal.SIGSTOP)
@@ -787,6 +790,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                             capture_output=True, text=True, timeout=1)
                     except (OSError, subprocess.TimeoutExpired):
                         break
+                    state["status"] = (status.returncode, status.stdout, status.stderr)
                     if (status.returncode == 0 and status.stdout.strip().startswith("T")
                             and common.process_start_identity(pid) == birth):
                         state.update(pid=pid, start=birth, fence=path, stopped=True)
@@ -997,12 +1001,19 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     monitor.start()
                     kick = subprocess.run(
                         [sys.executable, "-c",
-                         "import indexd_runtime; indexd_runtime.kick_background_repair()"],
+                         "import indexd_runtime; print(indexd_runtime.kick_background_repair())"],
                         cwd=PY_DIR, env=env, capture_output=True, text=True, timeout=10)
                     self.assertEqual(kick.returncode, 0, kick.stderr)
-                    self._wait_for(
-                        paused.is_set, 5.0,
-                        "did not pause the exact successor ingest target")
+                    try:
+                        self._wait_for(
+                            paused.is_set, 5.0,
+                            "did not pause the exact successor ingest target")
+                    except AssertionError as exc:
+                        log = data / "indexd.log"
+                        detail = log.read_text(encoding="utf-8") if log.exists() else ""
+                        self.fail(
+                            f"{exc}; kick={kick.stdout!r}; "
+                            f"pause={pause_state!r}; log={detail!r}")
                     target_pid = int(pause_state["pid"])
                     target_start = str(pause_state["start"])
                     self.assertIs(
