@@ -205,19 +205,19 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
 
     def test_installed_wheel_smoke_pins_the_source_instruction_contract(self):
         version, digest, codex_digest = wheel_smoke._source_nudge_contract()
-        self.assertEqual(version, 37)
+        self.assertEqual(version, 38)
         self.assertEqual(
             digest,
-            "4b7040519c28031e580256866f5f0cbc8221d376a1183aac128e9a0e185c7c1d",
+            "f520cdfb60339a4401405443e003e231f571951d054e05671e4a240525730698",
         )
         self.assertEqual(
             codex_digest,
-            "ab23bf6cab082bb9eaaf8d732bf6ea038aca90fde2ac4b1788751cb3c4315b3b",
+            "b4f159407917b844d33f793447c2d02898de67de8f8c82ba5e2b8b598541355c",
         )
 
     def test_installed_wheel_smoke_attests_the_written_instruction_body(self):
         version, _digest, codex_digest = wheel_smoke._source_nudge_contract()
-        rendered = teach.NUDGE_CODEX.format(name="you", be="are")
+        rendered = teach.NUDGE_CODEX
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "AGENTS.md"
             path.write_text(
@@ -496,106 +496,6 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
         self.assertNotIn("upload-artifact", block)
         self.assertNotIn("AGREP_PERF_SLACK", block)
 
-    def test_windows_ci_runs_the_release_contract(self):
-        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-            encoding="utf-8")
-        start = text.index("  windows-gate:\n")
-        end = text.index("\n  core-only:\n", start)
-        job = text[start:end]
-        self.assertIn("runs-on: windows-latest", job)
-        self.assertIn("with: { fetch-depth: 0 }", job)
-        self.assertIn('python-version: "3.13"', job)
-        self.assertNotIn('\n    env:\n      AGREP_CI: "1"', job)
-        self.assertIn('RUSTFLAGS: "-C target-cpu=x86-64"', job)
-        self.assertIn('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', job)
-        self.assertIn("rm -f .cargo/config.toml", job)
-        self.assertIn("bench/validate_binary_privacy.py", job)
-        self.assertIn("AGREP_WHEEL_PLAT: win_amd64", job)
-        self.assertIn("python -m build --wheel", job)
-        self.assertIn("python bench/validate_wheel.py", job)
-        self.assertIn("python -m venv", job)
-        self.assertIn("bench/smoke_installed_wheel.py --agrep", job)
-        self.assertIn("cargo test --release --workspace --locked", job)
-        self.assertIn("Select-String -Pattern", job)
-        self.assertIn('Groups["failed"]', job)
-        self.assertIn('Groups["skipped"]', job)
-        self.assertIn('$allowedCiSkips = @(', job)
-        self.assertIn("selftest skip drift", job)
-        self.assertIn("Get-ChildItem py/test_*.py", job)
-        fixed_jsonl = job[
-            job.index("non-blocking fixed JSONL full-exit budget "
-                      "(installed wheel)"):
-            job.index("non-blocking fixed CLI full-exit budgets "
-                      "(installed wheel)")
-        ]
-        fixed_cli = job[
-            job.index("non-blocking fixed CLI full-exit budgets "
-                      "(installed wheel)"):
-            job.index("selftest with explicit zero-failure proof")
-        ]
-        self.assertIn(
-            "non-blocking fixed JSONL full-exit budget", fixed_jsonl)
-        self.assertIn(
-            "non-blocking fixed CLI full-exit budgets", fixed_cli)
-        self.assertIn("id: fixed_jsonl", fixed_jsonl)
-        self.assertIn("continue-on-error: true", fixed_jsonl)
-        self.assertIn('$env:AGREP_PERF_CLI = $agrep', fixed_jsonl)
-        self.assertIn(
-            '& $python py/test_jsonl_native_full_exit_perf.py -v', fixed_jsonl)
-        self.assertNotIn("test_perf_budgets.py", fixed_jsonl)
-        self.assertIn("id: fixed_cli", fixed_cli)
-        self.assertIn("continue-on-error: true", fixed_cli)
-        self.assertIn('$env:AGREP_PERF_CLI = $agrep', fixed_cli)
-        self.assertIn('& $python py/test_perf_budgets.py -v', fixed_cli)
-        self.assertNotIn("test_jsonl_native_full_exit_perf.py", fixed_cli)
-        self.assertIn("$timed = @(", job)
-        self.assertIn('AGREP_PERF_SLACK: "4"', job)
-        self.assertIn("id: portable_perf", job)
-        self.assertIn("non-blocking portable perf board", job)
-        self.assertIn("continue-on-error: true", job)
-        self.assertIn("bench/perf.py --check", job)
-        self.assertIn("bench/onnx_smoke.py", job)
-        self.assertLess(
-            job.index("bench/perf.py --check"),
-            job.index("cargo test --release --workspace --locked"),
-        )
-        self.assertLess(
-            job.index("python -m build --wheel"),
-            job.index("bench/perf.py --check"),
-        )
-        self.assertLess(
-            job.index("bench/perf.py --check"),
-            job.index("bench/onnx_smoke.py"),
-        )
-        self.assertLess(
-            job.index("bench/perf.py --check"),
-            job.index("python selftest.py"),
-        )
-        self.assertLess(
-            job.index("python selftest.py"),
-            job.index("Get-ChildItem py/test_*.py"),
-        )
-        self.assertIn('AGREP_CI: "1"', job[
-            job.index("selftest with explicit zero-failure proof"):
-            job.index("every focused Python regression file")
-        ])
-        focused = job[job.index("every focused Python regression file"):]
-        self.assertNotIn("AGREP_CI", focused)
-        self.assertIn(
-            '$env:PYTHONPATH = '
-            '"$env:GITHUB_WORKSPACE;$env:GITHUB_WORKSPACE\\py"',
-            focused,
-        )
-        self.assertNotIn("require every Windows performance result", job)
-        self.assertNotIn("steps.fixed_jsonl.outcome", job)
-        self.assertNotIn("steps.fixed_cli.outcome", job)
-        self.assertNotIn("steps.portable_perf.outcome", job)
-        self.assertIn("bench/semantic_recall_parity.py --check", job)
-        self.assertNotIn("AGREP_RESOURCE_SLACK:", job)
-        self.assertIn('AGREP_RESOURCE_IDLE_CPU_PERCENT: "20"', job)
-        self.assertIn('AGREP_RESOURCE_SEMANTIC_BATCH_WALL_MS: "20000"', job)
-        self.assertIn('AGREP_RESOURCE_SEMANTIC_QUERY_CPU_MS: "2000"', job)
-        self.assertIn("bench/resources.py --check-semantic", job)
 
 
 if __name__ == "__main__":

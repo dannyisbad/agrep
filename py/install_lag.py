@@ -1,10 +1,12 @@
 """Bounded local-install provenance for the doctor lag warning.
 
-The check deliberately has no ambient-cwd or network fallback.  It only compares
-an installed distribution with the local checkout named by that distribution's
-PEP 610 ``direct_url.json``.  A normal ``uv tool install --from /path agrep``
-records that relationship.  Missing, remote, malformed, or divergent provenance
-is ``unavailable`` rather than a guessed warning.
+The check deliberately has no ambient-cwd or network fallback.  It compares an
+installed distribution with the local checkout named by that distribution's
+PEP 610 ``direct_url.json`` (a normal ``uv tool install --from /path agrep``
+records that relationship) or, when the install carries no provenance at all
+(a wheel), with the checkout an operator names explicitly in
+``AGREP_SOURCE_DIR``.  Missing, remote, malformed, or divergent provenance is
+``unavailable`` rather than a guessed warning.
 """
 
 from __future__ import annotations
@@ -217,6 +219,10 @@ def _local_source(payload: object) -> Path | None:
             return None
     # direct_url establishes the relationship; these cheap markers prevent a
     # stale/replaced path from being mistaken for the agrep source checkout.
+    return _verified_checkout(path)
+
+
+def _verified_checkout(path: Path) -> Path | None:
     project = path / "pyproject.toml"
     init = path / "agrep" / "__init__.py"
     git_marker = path / ".git"
@@ -238,6 +244,65 @@ def _local_source(payload: object) -> Path | None:
     if not re.search(rb"(?m)^name\s*=\s*[\"']agrep[\"']\s*$", prefix):
         return None
     return path
+
+
+def _named_source_checkout() -> Path | None:
+    """The checkout ``AGREP_SOURCE_DIR`` names: explicit, absolute, verified
+    exactly like a PEP 610 local source - never the cwd."""
+    value = os.environ.get("AGREP_SOURCE_DIR") or ""
+    if not value or "\0" in value or len(value) > 8192:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        return None
+    try:
+        path = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not path.is_dir():
+        return None
+    return _verified_checkout(path)
+
+
+_CHANGELOG_MAX_BYTES = 256 * 1024
+_CHANGELOG_HEADLINE_CHARS = 96
+
+
+def changelog_unreleased(source: Path) -> dict | None:
+    """What a checkout's ``CHANGELOG.md`` lists under ``## Unreleased``: entry
+    count, the newest headline, and the release heading it sits above."""
+    opened = _read_regular(source / "CHANGELOG.md", _CHANGELOG_MAX_BYTES)
+    if opened is None:
+        return None
+    try:
+        text = opened[0].decode("utf-8")
+    except UnicodeError:
+        return None
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines)
+                  if line.strip().lower() == "## unreleased"), None)
+    if start is None:
+        return None
+    count = 0
+    newest = ""
+    since = ""
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            since = line[3:].strip()
+            break
+        if line.startswith("- "):
+            count += 1
+            if not newest:
+                newest = line[2:].strip()
+        elif newest and count == 1 and line.startswith("  ") and (
+                len(newest) < _CHANGELOG_HEADLINE_CHARS):
+            newest += " " + line.strip()
+    if newest:
+        sentence = re.match(r"(.+?[.!?])(?:\s|$)", newest)
+        newest = sentence.group(1) if sentence else newest
+        if len(newest) > _CHANGELOG_HEADLINE_CHARS:
+            newest = newest[:_CHANGELOG_HEADLINE_CHARS - 1].rstrip() + "…"
+    return {"count": count, "newest": newest, "since": since}
 
 
 def _git_environment() -> dict[str, str]:
@@ -450,6 +515,80 @@ def _local_distribution_ids(
     return installed, source_id, problem
 
 
+def _unreleased_summary(source: Path) -> tuple[str, dict]:
+    unreleased = changelog_unreleased(source)
+    if not unreleased or not unreleased["count"]:
+        return "", {}
+    count = unreleased["count"]
+    since = f" since {unreleased['since']}" if unreleased["since"] else ""
+    newest = (f'; newest: "{unreleased["newest"]}"'
+              if unreleased["newest"] else "")
+    return (f"; the checkout lists {count} unreleased "
+            f"change{'s' if count != 1 else ''}{since}{newest}",
+            {"unreleased": unreleased})
+
+
+def _content_comparison(
+        runtime: Path, source: Path, *, deadline: float | None,
+        source_label: str) -> dict:
+    """Exact distribution-content identity of the install against a checkout."""
+    installed_id, source_id, problem = _local_distribution_ids(
+        runtime, source, deadline=deadline)
+    if installed_id is None or source_id is None:
+        if _caller_budget_expired(deadline):
+            return _budget_result()
+        return _result(
+            "unavailable",
+            problem or "exact local-source comparison is unavailable",
+            installed_basis="distribution-content",
+            installed_commit=None,
+            source=os.fspath(source),
+        )
+    exact = {
+        "installed_basis": "distribution-content",
+        "installed_commit": None,
+        "installed_distribution_id": installed_id,
+        "source_distribution_id": source_id,
+        "source": os.fspath(source),
+    }
+    if installed_id == source_id:
+        return _result(
+            "current",
+            f"matches {source_label} exactly (distribution {installed_id})",
+            **exact,
+        )
+    summary, fields = _unreleased_summary(source)
+    return _result(
+        "lagging",
+        f"installed distribution {installed_id} differs from "
+        f"{source_label} {source_id}{summary}",
+        remedy="replace-installed-tool",
+        remedy_argv=[
+            "uv", "tool", "install", "--force", "--from",
+            os.fspath(source), "agrep",
+        ],
+        **exact, **fields,
+    )
+
+
+def _source_checkout_result(runtime: Path) -> dict:
+    """Not an install; the checkout's own unreleased list is what every
+    released build lacks."""
+    checkout = None
+    if runtime.parent.name == "py":
+        try:
+            checkout = _verified_checkout(
+                runtime.parent.parent.resolve(strict=True))
+        except (OSError, RuntimeError):
+            checkout = None
+    if checkout is None:
+        return _result("not-installed", "running from a source checkout")
+    summary, fields = _unreleased_summary(checkout)
+    return _result(
+        "not-installed", f"running from a source checkout{summary}",
+        source=os.fspath(checkout), **fields)
+
+
 def installed_master_lag(
         *, now: float | None = None, module_path: Path | None = None,
         distribution: object | None = None,
@@ -479,15 +618,22 @@ def installed_master_lag(
         try:
             distribution = metadata.distribution("agrep")
         except metadata.PackageNotFoundError:
-            return _result("not-installed", "running from a source checkout")
+            return _source_checkout_result(runtime)
         except (OSError, TypeError, ValueError):
             return _result("unavailable", "installed package metadata is unreadable")
     distribution_state, direct_url = _distribution_direct_url(distribution, runtime)
     if distribution_state == "not-installed":
-        return _result("not-installed", "running from a source checkout")
+        return _source_checkout_result(runtime)
     if direct_url is None:
-        return _result(
-            "unavailable", "installed package has no unique local-source provenance")
+        named = _named_source_checkout()
+        if named is None:
+            return _result(
+                "unavailable",
+                "installed package has no unique local-source provenance",
+                reason="no-local-source-provenance")
+        return _content_comparison(
+            runtime, named, deadline=deadline,
+            source_label="the AGREP_SOURCE_DIR checkout")
     opened = _read_regular(direct_url, _DIRECT_URL_MAX_BYTES)
     if opened is None:
         return _result("unavailable", "installed source provenance is unreadable")
@@ -502,43 +648,9 @@ def installed_master_lag(
         return _result("unavailable", "installed build has no verified local source checkout")
     installed_commit = _payload_commit(payload)
     if installed_commit is None:
-        installed_id, source_id, problem = _local_distribution_ids(
-            runtime, source, deadline=deadline)
-        if installed_id is None or source_id is None:
-            if _caller_budget_expired(deadline):
-                return _budget_result()
-            return _result(
-                "unavailable",
-                problem or "exact local-source comparison is unavailable",
-                installed_basis="distribution-content",
-                installed_commit=None,
-                source=os.fspath(source),
-            )
-        exact = {
-            "installed_basis": "distribution-content",
-            "installed_commit": None,
-            "installed_distribution_id": installed_id,
-            "source_distribution_id": source_id,
-            "source": os.fspath(source),
-        }
-        if installed_id == source_id:
-            return _result(
-                "current",
-                f"matches recorded local source exactly "
-                f"(distribution {installed_id})",
-                **exact,
-            )
-        return _result(
-            "lagging",
-            f"installed distribution {installed_id} differs from recorded "
-            f"local source {source_id}",
-            remedy="replace-installed-tool",
-            remedy_argv=[
-                "uv", "tool", "install", "--force", "--from",
-                os.fspath(source), "agrep",
-            ],
-            **exact,
-        )
+        return _content_comparison(
+            runtime, source, deadline=deadline,
+            source_label="recorded local source")
 
     git_started = time.monotonic()
     git_deadline = git_started + _GIT_TOTAL_SECONDS

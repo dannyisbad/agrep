@@ -116,6 +116,8 @@ class LiveDeleteJournalRule(unittest.TestCase):
             script = "\n".join((
                 "import sqlite3, sys, time",
                 "db = sqlite3.connect(sys.argv[1], timeout=0)",
+                # no fsync: the bounded wait measures the lock handoff, not the disk
+                "db.execute('PRAGMA synchronous=OFF')",
                 "db.execute('BEGIN EXCLUSIVE')",
                 f"db.execute(\"UPDATE meta SET value='{BUILD_B}' "
                 "WHERE key='build_id'\")",
@@ -245,6 +247,8 @@ class LiveDeleteJournalRule(unittest.TestCase):
             path = Path(raw) / "corpus.db"
             _database(path)
             writer = sqlite3.connect(path, timeout=0, check_same_thread=False)
+            # no fsync: the bounded wait measures the lock handoff, not the disk
+            writer.execute("PRAGMA synchronous=OFF")
             writer.execute("BEGIN EXCLUSIVE")
             writer.execute("UPDATE payload SET value='committed' WHERE id=1")
 

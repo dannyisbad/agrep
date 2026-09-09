@@ -207,7 +207,11 @@ _INDEXD_REFRESH_EXPECTED_WRITER = os.environ.pop(
     _INDEXD_REFRESH_EXPECTED_WRITER_ENV, "")
 _BINARY_DIGEST_LOCK = threading.Lock()
 _BINARY_DIGEST_CACHE: tuple[
-    tuple[str, fileops.FileIdentity], bytes] | None = None
+    tuple[str, fileops.FileIdentity], tuple[bytes, str]] | None = None
+_BINARY_IDENTITY_NAME = ".binary-identity.json"
+_BINARY_IDENTITY_MAX_BYTES = 4096
+_BINARY_IDENTITY_VERSION = 1
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]+$")
 
 
 class DerivedOwnerInfo(NamedTuple):
@@ -304,6 +308,96 @@ def _fenced_reason(exc: OSError) -> str:
     return str(getattr(info, "reason", "") or exc) or type(exc).__name__
 
 
+def _binary_identity_path() -> Path:
+    return common.DATA_DIR / _BINARY_IDENTITY_NAME
+
+
+def record_binary_identity(binary: Path) -> None:
+    """Persist a verified binary identity only after a writable publication."""
+    if _data_dir_readonly():
+        return
+    with _BINARY_DIGEST_LOCK:
+        cached = _BINARY_DIGEST_CACHE
+    if cached is None:
+        return
+    key, (md5_digest, sha256_hex) = cached
+    try:
+        resolved = binary.resolve(strict=True)
+        if key != (os.fspath(resolved), fileops.file_identity(resolved)):
+            return
+    except OSError:
+        return
+    build_id = _writer_build_id_from_digest(md5_digest)
+    if not derived_writer_mutation_info(build_id).writable:
+        return
+    if _recorded_binary_digests(key) == (md5_digest, sha256_hex):
+        return
+    path = _binary_identity_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "version": _BINARY_IDENTITY_VERSION, "binary": key[0],
+        "identity": list(key[1]), "md5": md5_digest.hex(),
+        "sha256": sha256_hex,
+    }
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        common.replace_with_retry(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _recorded_binary_digests(
+        key: tuple[str, fileops.FileIdentity]) -> tuple[bytes, str] | None:
+    try:
+        observed = ownerfile.snapshot(
+            _binary_identity_path(), max_bytes=_BINARY_IDENTITY_MAX_BYTES)
+        record = json.loads(
+            observed.raw.decode("utf-8"),
+            object_pairs_hook=_unique_json_object)
+    except (OSError, RecursionError, UnicodeError, ValueError):
+        return None
+    if (not isinstance(record, dict)
+            or set(record) != {"version", "binary", "identity", "md5", "sha256"}
+            or record["version"] != _BINARY_IDENTITY_VERSION
+            or record["binary"] != key[0]
+            or record["identity"] != list(key[1])
+            or not isinstance(record["md5"], str)
+            or len(record["md5"]) != 32
+            or _HEX_DIGEST_RE.fullmatch(record["md5"]) is None
+            or not isinstance(record["sha256"], str)
+            or len(record["sha256"]) != 64
+            or _HEX_DIGEST_RE.fullmatch(record["sha256"]) is None):
+        return None
+    return bytes.fromhex(record["md5"]), record["sha256"]
+
+
+def _writer_build_id_from_digest(binary_digest: bytes) -> str:
+    digest = hashlib.md5()
+    digest.update(b"agrep-derived-writer-v2\0")
+    digest.update(INDEXD_BUILD_ID.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(binary_digest)
+    return digest.hexdigest()[:20]
+
+
+def recorded_binary_identity(binary: Path) -> tuple[str, str] | None:
+    """(writer, native) build ids recorded by an earlier in-process hash of
+    exactly this binary generation; diagnostics only - writers hash the bytes."""
+    try:
+        resolved = Path(binary).resolve(strict=True)
+        key = (os.fspath(resolved), fileops.file_identity(resolved))
+    except OSError:
+        return None
+    recorded = _recorded_binary_digests(key)
+    if recorded is None:
+        return None
+    md5_digest, sha256_hex = recorded
+    return _writer_build_id_from_digest(md5_digest), sha256_hex[:20]
+
+
 def _ingest_binary_digest(path: Path | None = None) -> bytes:
     """Hash one stable resolved executable, caching by its exact change identity."""
     global _BINARY_DIGEST_CACHE
@@ -313,7 +407,7 @@ def _ingest_binary_digest(path: Path | None = None) -> bytes:
     key = (os.fspath(binary), before)
     with _BINARY_DIGEST_LOCK:
         if _BINARY_DIGEST_CACHE is not None and _BINARY_DIGEST_CACHE[0] == key:
-            return _BINARY_DIGEST_CACHE[1]
+            return _BINARY_DIGEST_CACHE[1][0]
     flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
              | getattr(os, "O_NONBLOCK", 0)
              | getattr(os, "O_NOFOLLOW", 0))
@@ -322,8 +416,10 @@ def _ingest_binary_digest(path: Path | None = None) -> bytes:
         if fileops.file_identity_fd(fd) != before:
             raise OSError(f"ingest binary changed before hashing: {binary}")
         digest = hashlib.md5()
+        native = hashlib.sha256()
         for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
             digest.update(chunk)
+            native.update(chunk)
         value = digest.digest()
         if (fileops.file_identity_fd(fd) != before
                 or fileops.file_identity(binary) != before):
@@ -331,7 +427,7 @@ def _ingest_binary_digest(path: Path | None = None) -> bytes:
     finally:
         os.close(fd)
     with _BINARY_DIGEST_LOCK:
-        _BINARY_DIGEST_CACHE = (key, value)
+        _BINARY_DIGEST_CACHE = (key, (value, native.hexdigest()))
     return value
 
 
@@ -378,12 +474,7 @@ def derived_writer_build_id(
             if require_binary:
                 raise
             binary_digest = b"unavailable"
-    digest = hashlib.md5()
-    digest.update(b"agrep-derived-writer-v2\0")
-    digest.update(INDEXD_BUILD_ID.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(binary_digest)
-    return digest.hexdigest()[:20]
+    return _writer_build_id_from_digest(binary_digest)
 
 
 def assert_python_runtime_unchanged() -> None:
@@ -669,14 +760,7 @@ def derived_mutation_info(
 def derived_writer_mutation_info(
         current_build_id: str | None = None, *,
         allow_legacy_adoption: bool = False) -> DerivedMutationInfo:
-    """Extend the low owner/cache fence through the derived DB publication.
-
-    corpusdb owns SQLite-format probing, so writer entrypoints call it lazily
-    without a module cycle. Explicit DB ownership always wins. Only callers
-    launching the Rust ingest may opt into ownerless legacy adoption; semantic
-    and daemon coordination writers require a current family (or a truly empty
-    store with nothing yet to own).
-    """
+    """Extend the owner/cache fence through the DB, reserving unanchored adoption for Rust."""
     current = current_build_id or derived_writer_build_id()
     low = derived_mutation_info(current)
     if not low.writable:
@@ -701,7 +785,9 @@ def derived_writer_mutation_info(
                 str(db_error)
                 if db_error else "corpus.db ownership cannot be verified")
         if (allow_legacy_adoption
-                and db_state in {"absent", "unowned"}):
+                and (db_state in {"absent", "unowned"}
+                     or (low.state == "absent"
+                         and db_state == "owned" and db_owner == current))):
             return low
         # A truly empty store has no family to conflict with. Once any legacy
         # derived publication exists, only the Rust adoption path may establish
@@ -1059,6 +1145,7 @@ def build_index(
         if r.returncode != 0 or explicit_index_declined():
             # a declined ingest published nothing for the census below to vouch for
             return False
+    record_binary_identity(ingest)
     if census_before is not None and not unreadable_before:
         # The pre-pass census under-claims what the ingest consumed, so a
         # green verdict from this record can never cover unconsumed changes.
@@ -1229,6 +1316,116 @@ def serve_search_index_request(
             path, before, tombstone=True, require_stable_mtime=True)
     except OSError:
         pass
+    return True
+
+
+_RECOVERY_REQUEST_DIR = ".recovery_requests"
+_RECOVERY_REQUEST_MAX_BYTES = 1024
+
+
+def request_recovery_refresh() -> ownerfile.Handle | None:
+    """Queue source ingest and FTS publication without entering either writer."""
+    if (os.environ.get("AGREP_NO_DAEMON") or _data_dir_readonly()
+            or removal_fence.background_removal_active()):
+        return None
+    token = secrets.token_hex(16)
+    directory = common.DATA_DIR / _RECOVERY_REQUEST_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return ownerfile.create_exclusive(
+            directory / f"{token}.json",
+            json.dumps({"version": 1, "token": token, "pid": os.getpid()}).encode())
+    except OSError:
+        return None
+
+
+def _read_recovery_request(path: Path) -> tuple[ownerfile.Snapshot, dict] | None:
+    try:
+        observed = ownerfile.snapshot(path, max_bytes=_RECOVERY_REQUEST_MAX_BYTES)
+        record = json.loads(observed.raw)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or not isinstance(record.get("token"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", record["token"]) is None
+            or type(record.get("pid")) is not int or record["pid"] <= 0):
+        return None
+    return observed, record
+
+
+def recovery_refresh_complete(request: ownerfile.Handle) -> bool:
+    entry = _read_recovery_request(request.path.with_suffix(".done"))
+    return entry is not None and entry[0].raw == request.snapshot.raw
+
+
+def release_recovery_request(request: ownerfile.Handle) -> None:
+    try:
+        request.release(tombstone=True, require_stable_mtime=True)
+        path = request.path.with_suffix(".done")
+        entry = _read_recovery_request(path)
+        if entry is not None and entry[0].raw == request.snapshot.raw:
+            ownerfile.remove_exact(path, entry[0], require_stable_mtime=True)
+    except OSError:
+        pass
+    finally:
+        request.close()
+
+
+def serve_recovery_requests(ingest: Callable[[], bool]) -> bool:
+    """Acknowledge only requests captured before a successful source/FTS pass."""
+    directory = common.DATA_DIR / _RECOVERY_REQUEST_DIR
+    pending, expired = [], []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if path.suffix not in {".json", ".done"}:
+                    continue
+                request = _read_recovery_request(path)
+                if request is None:
+                    continue
+                observed, record = request
+                if path.stem != record["token"]:
+                    continue
+                if path.suffix == ".done":
+                    if not common.pid_alive(record["pid"]):
+                        expired.append((path, observed))
+                    continue
+                pending.append((path, observed, record))
+                if len(pending) == 64:
+                    break
+    except OSError:
+        return False
+    if not pending and not expired:
+        return False
+    if not derived_writes_permitted():
+        return False
+    for path, observed in expired:
+        try:
+            ownerfile.remove_exact(path, observed, require_stable_mtime=True)
+        except OSError:
+            pass
+    if not pending:
+        return False
+    if not ingest():
+        return True
+    for path, observed, record in pending:
+        receipt = path.with_suffix(".done")
+        try:
+            published = ownerfile.create_exclusive(receipt, observed.raw).snapshot
+        except FileExistsError:
+            existing = _read_recovery_request(receipt)
+            if existing is None or existing[1] != record:
+                continue
+            published = existing[0]
+        except OSError:
+            continue
+        try:
+            if not ownerfile.remove_exact(path, observed, require_stable_mtime=True):
+                ownerfile.remove_exact(
+                    receipt, published, require_stable_mtime=True)
+        except OSError:
+            pass
     return True
 
 
@@ -4507,8 +4704,7 @@ def freshness_story() -> surface.FreshnessStory:
             "unverified", code=deferred.code,
             detail=_bounded_freshness_reason(deferred.reason),
             converging=_daemon_will_converge())
-    return surface.FreshnessStory(
-        "current", absorbed_drift=bool(getattr(drift, "absorbed", 0)))
+    return surface.FreshnessStory("current")
 
 
 def agent_freshness_notice(environ: Mapping[str, str] | None = None) -> str:
@@ -5028,14 +5224,13 @@ def _maybe_freshen() -> None:
     spawned = _reclassify_indexd_spawn_failure(_spawn_indexd())
     # Materialized JSONL is the nonblocking fallback while the daemon publishes FTS.
     # Mark this process too, or a second first-run search would rebuild FTS inline.
-    if (spawned in {
+    if spawned in {
             _IndexdSpawnResult.READY,
             _IndexdSpawnResult.IN_FLIGHT,
-    }
-            and common.MESSAGES_PATH.exists()):
+    }:
         _set_fts_delegated(True)
         defer_foreground_refresh(REFRESH_DELEGATED_REASON)
-        common.dbg("freshen: serving published messages while the new daemon catches up")
+        common.dbg("freshen: background publication requested")
         return
     if spawned is _IndexdSpawnResult.BLOCKED:
         if common.MESSAGES_PATH.exists():
@@ -5052,27 +5247,21 @@ def _maybe_freshen() -> None:
         defer_foreground_refresh("the background indexer failed to start")
         return
 
-    # ensure_index calls this function only after observing messages.jsonl. Reaching
-    # an inline build here would redefine an existing publication as a first run.
     defer_foreground_refresh("background refresh is unavailable")
 
 
-def ensure_index(auto: bool = True, *, quiet: bool = False) -> bool:
-    """Make sure data/messages.jsonl exists and is reasonably fresh, building it on
-    first use (and re-ingesting stale indexes) when we can.
-
-    Returns True when the materialized corpus is present (already there, or freshly
-    ingested), False when it's missing and we couldn't build it. The CLI's keyword
-    paths call this so a fresh clone's first `agrep <pattern>` indexes itself instead
-    of dead-ending on "no index yet", and so a later search picks up new sessions
-    instead of serving a stale snapshot. `auto=False` (the --no-auto flag) skips both
-    the build and the freshen: script-friendly, no daemon spawn, no surprise ingest.
-    `quiet=True` keeps the first build's child output off structured stdout.
-    """
+def ensure_index(
+        auto: bool = True, *, quiet: bool = False,
+        background_only: bool = False) -> bool:
+    """Ensure a corpus exists; background-only readers never start an inline build."""
     _clear_freshen_failure()
     common.dbg(
         f"ensure_index(auto={auto}): "
         f"messages.jsonl exists={common.MESSAGES_PATH.exists()}")
+    if auto and background_only:
+        _arm_drift_probe()
+        _maybe_freshen()
+        return common.MESSAGES_PATH.exists()
     if common.MESSAGES_PATH.exists():
         if auto:
             # The census answers "did the sources drift?" at render time;

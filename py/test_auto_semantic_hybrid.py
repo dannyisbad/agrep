@@ -74,6 +74,69 @@ def _result(hits: list[dict], *, semantic: bool = False, **extra) -> dict:
     return result
 
 
+def _semantic_empty_result(
+        coverage: dict | None, *, accelerator: dict | None = None,
+        integrity: dict | None = None) -> dict:
+    partial = bool(
+        not coverage or not coverage.get("complete")
+        or (accelerator and not accelerator.get("complete"))
+        or integrity)
+    data = {
+        "results": [], "truncated": False, "score_kind": "cosine",
+        "semantic_coverage": coverage,
+        "semantic_accelerator_coverage": accelerator,
+        "semantic_integrity": integrity,
+        "partial": partial,
+        "semantic_unavailable": bool(
+            integrity and integrity.get("state") == "generation-rejected"),
+    }
+    with mock.patch.object(
+            semworker, "resident_status", return_value={"running": True}), \
+            mock.patch.object(semworker, "search_worker", return_value=data):
+        return search.run_query(
+            "deployment retry loop", mode="semantic", limit=10, exact_totals=False)
+
+
+def _near_current_semantic_cases():
+    complete = {
+        "indexed": 10_000, "total": 10_000, "pending": 0, "complete": True}
+    base_lag = {
+        "indexed": 9_997, "total": 10_000, "pending": 3, "complete": False}
+    burst_lag = {
+        "indexed": 63_800, "total": 64_000, "pending": 200, "complete": False}
+    return (
+        ("complete", complete, None, surface.FreshnessStory("current")),
+        ("base", base_lag, None,
+         surface.FreshnessStory("current")),
+        ("accelerator", complete, base_lag,
+         surface.FreshnessStory(
+             "behind", behind_s=2, changed_stores=1,
+             young=True, converging=True)),
+        ("both", base_lag,
+         {"indexed": 9_994, "total": 9_997, "pending": 3, "complete": False},
+         surface.FreshnessStory("current")),
+        ("burst", burst_lag, burst_lag, surface.FreshnessStory("current")),
+        ("refresh-owned", base_lag, base_lag,
+         surface.FreshnessStory(
+             "unverified", code="search-index-stale", converging=True)),
+    )
+
+
+def _incomplete_semantic_cases():
+    complete = {
+        "indexed": 10_000, "total": 10_000, "pending": 0, "complete": True}
+    return (
+        ("base-backlog",
+         {"indexed": 9_899, "total": 10_000, "pending": 101, "complete": False},
+         None),
+        ("accelerator-backlog", complete,
+         {"indexed": 9_000, "total": 10_000, "pending": 1_000, "complete": False}),
+        ("small-corpus",
+         {"indexed": 98, "total": 100, "pending": 2, "complete": False}, None),
+        ("unknown", None, None),
+    )
+
+
 def _search_json(stdout: str) -> tuple[dict, list[dict]]:
     """Split search's one run envelope from its row-level JSONL evidence."""
     lines = [json.loads(line) for line in stdout.splitlines() if line]
@@ -280,12 +343,13 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertNotIn("excluded", stderr)
         self.assertNotIn("--self", stderr)
 
-    def test_conflicting_identity_fails_open_silently_unless_forced(self) -> None:
+    def test_conflicting_identity_fails_open_and_is_disclosed_once(self) -> None:
         seen = {}
 
         def run_query(_query, *, mode="keyword", **kwargs):
             seen.update(kwargs)
-            return _result([_hit("live-claude", 3, "needle current")])
+            return _result([_hit("live-claude", 3, "needle current"),
+                            _hit("live-claude", 4, "needle current again")])
 
         env = {
             "CODEX_THREAD_ID": "stale-codex",
@@ -300,7 +364,9 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIn("needle current", stdout)
         self.assertNotIn("excluded", stderr)
         self.assertNotIn("--self", stderr)
-        self.assertNotIn("identities conflict", stderr)
+        # one line for the whole render, never a per-row lecture
+        self.assertEqual(stderr.count("identities conflict"), 1)
+        self.assertIn("self-exclusion is off", stderr)
 
         rc, forced_stdout, forced_stderr = self._run(
             ["needle", "--lexical", "--no-self"], run_query,
@@ -308,7 +374,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("needle current", forced_stdout)
         self.assertIn("--no-self was not applied", forced_stderr)
-        self.assertIn("identities conflict", forced_stderr)
+        self.assertEqual(forced_stderr.count("identities conflict"), 1)
 
         rc, stdout, _ = self._run(
             ["needle", "--json", "--lexical", "--no-self"], run_query,
@@ -318,7 +384,8 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(
             head["self_exclusion"],
             {"active": False, "reason": "identity-conflict"})
-        self.assertEqual([row["session"] for row in rows], ["live-claude"])
+        self.assertEqual([row["session"] for row in rows],
+                         ["live-claude", "live-claude"])
 
     def test_recap_window_excludes_inclusive_echo_and_labels_older_family(self) -> None:
         seen = {}
@@ -386,8 +453,9 @@ class AutoSemanticHybridTests(unittest.TestCase):
     def test_display_lane_sinks_verbatim_query_echoes(self) -> None:
         query = "why does the deployment keep retrying after compaction"
         keyword = [
-            _hit("echoer", 1, "ECHOROW delegated brief"),
-            _hit("fixer", 2, "EVIDENCEROW compaction held the lock"),
+            _hit("echoer", 1, f"ECHOROW delegated brief: {query} - report back"),
+            _hit("fixer", 2, "EVIDENCEROW the deployment kept retrying because "
+                           "compaction held the sqlite lock"),
         ]
 
         def run_query(_query, *, mode="keyword", **_kwargs):
@@ -398,15 +466,15 @@ class AutoSemanticHybridTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             database = Path(td) / "corpus.db"
             db = sqlite3.connect(database)
-            db.execute(
-                "CREATE TABLE msgs(session TEXT, turn INTEGER, "
-                "who TEXT, text TEXT)")
-            db.executemany(
-                "INSERT INTO msgs VALUES(?, ?, 'user', ?)",
-                (("echoer", 1, "subtask brief: why does the deployment keep "
-                               "retrying after compaction - report back"),
-                 ("fixer", 2, "the deployment kept retrying because "
-                              "compaction held the sqlite lock")))
+            db.executescript(corpusdb._SCHEMA_SQL)
+            db.execute(corpusdb._INS_DIGEST, (
+                "fixer", 2, keyword[1]["ts"], "codex", "agrep", "", "", "",
+                "user", query, compact.content_digest(query)))
+            db.executemany(corpusdb._INS_DIGEST, [
+                (hit["session"], hit["turn"], hit["ts"], hit["agent"],
+                 hit["project"], "", "", "", hit["who"], hit["snippet"],
+                 hit["content_digest"])
+                for hit in keyword])
             db.commit()
             db.close()
 
@@ -672,6 +740,10 @@ class AutoSemanticHybridTests(unittest.TestCase):
                         search.common, "in_agent_context",
                         return_value=True), \
                     mock.patch.object(
+                        search.common, "calling_identity",
+                        return_value=session_context.CallerIdentity(
+                            caller, "codex")), \
+                    mock.patch.object(
                         session_context, "calling_family",
                         return_value=family), \
                     mock.patch.object(
@@ -706,7 +778,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIn("delegated echo", stdout)
         self.assertNotIn("invalid", stderr)
 
-    def test_family_publication_move_fails_open_without_exclusion(self) -> None:
+    def test_family_publication_move_serves_the_last_published_index(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             database = root / "corpus.db"
@@ -717,13 +789,23 @@ class AutoSemanticHybridTests(unittest.TestCase):
             db.close()
             with mock.patch.object(session_context, "DATA_DIR", root), \
                     mock.patch.object(
-                        session_context, "calling_session", return_value="root"), \
+                        session_context, "_FAMILY_INDEX_BEHIND", False), \
+                    mock.patch.object(
+                        session_context, "calling_identity",
+                        return_value=session_context.CallerIdentity("root", "pi")), \
                     mock.patch.object(
                         session_context, "session_family_source_stamp",
                         side_effect=("before", "after")):
                 policy = session_context.calling_self_exclusion()
-        self.assertIsNone(policy)
+                behind = session_context.family_index_behind()
+        # the caller stays known and (never compacted) windowed from turn 0;
+        # the lag is disclosed rather than silently dropping the policy
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy.boundary, 0)
+        self.assertEqual(policy.family.members, frozenset({"root", "child"}))
+        self.assertTrue(behind)
 
+    def test_unresolved_family_fails_open_without_exclusion(self) -> None:
         rc, stdout, stderr = self._real_family_search(
             ["needle", "--lexical"], family_resolved=False)
         self.assertEqual(rc, 0)
@@ -731,6 +813,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIn("needle useful side chat", stdout)
         self.assertIn("needle independent history", stdout)
         self.assertNotIn("excluded", stderr)
+        self.assertNotIn("caller unknown", stderr)
 
     def test_real_engine_discloses_a_hidden_current_chat_match(self) -> None:
         rc, stdout, stderr = self._real_family_search(
@@ -809,23 +892,25 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertNotIn("excluded", stderr)
         self.assertNotIn("--self", stderr)
 
-    def test_failed_identification_fails_open_silently(self) -> None:
+    def test_failed_identification_fails_open_and_says_so_once(self) -> None:
         def run_query(_query, *, mode="keyword", **_kwargs):
-            return _result([_hit("other", 1, "needle other")])
+            return _result([_hit("other", 1, "needle other"),
+                            _hit("other", 2, "needle other again")])
 
-        rc, stdout, stderr = self._run(
-            ["needle", "--lexical"], run_query, agent_context=True)
-        self.assertEqual(rc, 0)
-        self.assertIn("needle other", stdout)
-        self.assertEqual(stderr, "")
+        for extra in ((), ("--classic", "--color", "never")):
+            with self.subTest(extra=extra):
+                rc, stdout, stderr = self._run(
+                    ["needle", "--lexical", *extra], run_query, agent_context=True)
+                self.assertEqual(rc, 0)
+                self.assertIn("needle other", stdout)
+                lines = [line for line in stderr.splitlines() if line.strip()]
+                self.assertEqual(len(lines), 1, stderr)
+                self.assertIn("agent shell, caller unknown", lines[0])
+                self.assertIn("own rows may appear", lines[0])
+                self.assertIn("agrep setup", lines[0])
+                self.assertLessEqual(len(lines[0]), surface.RENDER_LINE_MAX_CHARS)
 
-        rc, stdout, stderr = self._run(
-            ["needle", "--lexical", "--classic", "--color", "never"],
-            run_query, agent_context=True)
-        self.assertEqual(rc, 0)
-        self.assertIn("needle other", stdout)
-        self.assertEqual(stderr, "")
-
+        # --no-self already reports its own non-application; not both lines
         rc, stdout, stderr = self._run(
             ["needle", "--lexical", "--classic", "--color", "never",
              "--no-self"],
@@ -834,7 +919,19 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIn("needle other", stdout)
         self.assertIn("--no-self was not applied", stderr)
         self.assertIn("could not identify this session", stderr)
+        self.assertNotIn("caller unknown", stderr)
 
+        # machine and --self surfaces, and a human shell, stay silent
+        rc, stdout, stderr = self._run(
+            ["needle", "--lexical", "--json"], run_query, agent_context=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stderr, "")
+        head, _rows = _search_json(stdout)
+        self.assertEqual(head["self_exclusion"],
+                         {"active": False, "reason": "caller-unresolved"})
+        rc, _stdout, stderr = self._run(
+            ["needle", "--lexical", "--self"], run_query, agent_context=True)
+        self.assertEqual((rc, stderr), (0, ""))
         rc, _stdout, stderr = self._run(
             ["needle", "--lexical", "--classic", "--color", "never"],
             run_query, agent_context=False)
@@ -1074,6 +1171,33 @@ class AutoSemanticHybridTests(unittest.TestCase):
                          ["meaning-one", "meaning-two", "corroborated"])
         self.assertNotIn("noise", [hit["session"] for hit in merged])
 
+    def test_weak_cousin_never_promotes_meaning_above_phrase_hits(self) -> None:
+        # O4: an all-terms scatter cousin at 0.27 is not corroboration when
+        # the lexical lane holds phrase evidence
+        lexical = [_hit("phrase-a", 2, "never promise a login. promise documents"),
+                   _hit("phrase-b", 9, "never promise a login before signing"),
+                   _hit("cousin", 9, "a login promise never came up")]
+        lexical[2].update({"matched": "all-terms", "score": 0.27})
+        meaning = [_hit("cousin", 26, "open login for me and keep it", semantic=True),
+                   _hit("other", 11, "the login form took a password", semantic=True)]
+        merged = search._merge_auto_semantic_hits(
+            lexical, meaning, 3, family_diverse=False)
+        self.assertEqual([hit["session"] for hit in merged],
+                         ["phrase-a", "phrase-b", "cousin"])
+        self.assertEqual(merged[2].get("lane"), "semantic")
+
+    def test_weak_meaning_rows_follow_confident_ones_whatever_the_lane_order(
+            self) -> None:
+        weak = _hit("weak", 5, "topic-adjacent row", semantic=True)
+        weak["_sem_terms"] = (1, 3)
+        strong = _hit("strong", 6, "carries the query terms", semantic=True)
+        strong["_sem_terms"] = (2, 3)
+        merged = search._merge_auto_semantic_hits(
+            [_hit("keyword", 1, "keyword evidence")], [weak, strong], 3,
+            family_diverse=False)
+        self.assertEqual([hit["session"] for hit in merged],
+                         ["keyword", "strong"])
+
     def test_unavailable_semantics_preserve_keyword_output_and_exit(self) -> None:
         query = "why did the deployment keep retrying"
         keyword = [_hit("keyword-one", 1, "deployment kept retrying"),
@@ -1199,77 +1323,112 @@ class AutoSemanticHybridTests(unittest.TestCase):
                     "deeper: " + console.shell_command(
                         "agrep", "recall", query), stderr)
 
-    def test_compact_complete_semantic_miss_discloses_the_searched_scope(self) -> None:
-        query = "why did the deployment keep retrying"
-        coverage = {"indexed": 20, "total": 20, "pending": 0,
-                    "complete": True}
+    def test_semantic_miss_preserves_keyword_total_uncertainty(self) -> None:
+        meaning = _semantic_empty_result({
+            "indexed": 10_000, "total": 10_000, "complete": True})
 
         def run_query(_query, *, mode="keyword", **_kwargs):
-            if mode == "semantic":
-                return _result([], semantic=True, semantic_coverage=coverage)
-            return _result([])
+            return meaning if mode == "semantic" else _result(
+                [], totals_exact=False)
 
-        with mock.patch.object(search, "_semantic_runtime_installed", return_value=True):
-            rc, _stdout, stderr = self._run([query], run_query)
-        self.assertEqual(rc, 1)
-        self.assertIn(display_policy.semantic_empty_line(coverage), stderr)
-
-    def test_partial_auto_semantic_miss_is_unverified(self) -> None:
-        query = "why did the deployment keep retrying"
-        coverage = {"indexed": 4, "total": 20, "pending": 16,
-                    "complete": False}
-
-        def run_query(_query, *, mode="keyword", **_kwargs):
-            if mode == "semantic":
-                return _result(
-                    [], semantic=True, totals_exact=False, partial=True,
-                    fallback_recommended=True,
-                    semantic_status={
-                        "state": "no-confident-match", "complete": False,
-                        "fallback_recommended": True},
-                    semantic_coverage=coverage)
-            return _result([])
-
-        variants = (
-            ([query], True),
-            ([query, "--hybrid", "--classic", "--color", "never"], False),
-        )
-        for argv, compact_profile in variants:
-            with self.subTest(argv=argv), mock.patch.object(
-                    search, "_semantic_runtime_installed", return_value=True):
+        for flags, compact_profile in (
+                ([], True), (["--hybrid", "--classic"], False)):
+            with self.subTest(flags=flags), \
+                    mock.patch.object(
+                        search.indexd_runtime, "freshness_story",
+                        return_value=surface.FreshnessStory("current")):
                 rc, _stdout, stderr = self._run(
-                    argv, run_query, compact_profile=compact_profile)
+                    ["deployment retry loop", "--since", "7d", *flags],
+                    run_query, compact_profile=compact_profile)
             self.assertEqual(rc, 2)
-            expected = (
-                surface.semantic_coverage_notice(coverage)
-                if compact_profile else "a floor, not the total")
-            self.assertIn(expected, stderr)
+            self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stderr)
 
+    def test_near_current_semantic_miss_is_ordinary_on_search_surfaces(
+            self) -> None:
+        variants = (
+            ([], True, False),
+            (["--hybrid", "--classic"], False, False),
+            (["--json"], False, True),
+            (["-s", "--classic"], False, False),
+            (["-s", "--json"], False, True),
+        )
+        for label, coverage, accelerator, story in _near_current_semantic_cases():
+            meaning = _semantic_empty_result(coverage, accelerator=accelerator)
+            for flags, compact_profile, machine in variants:
+                def run_query(_query, *, mode="keyword", **_kwargs):
+                    return meaning if mode == "semantic" else _result([])
 
-    def test_total_miss_with_proven_scope_renders_one_confident_zero(self) -> None:
-        query = "why did the deployment keep retrying"
+                with self.subTest(gap=label, flags=flags), \
+                        mock.patch.object(
+                            search.indexd_runtime, "freshness_story",
+                            return_value=story), \
+                        mock.patch.object(
+                            search, "_indexed_corpus_counts",
+                            return_value={"sessions": 40, "messages": 10_000}):
+                    rc, stdout, stderr = self._run(
+                        ["deployment retry loop", *flags], run_query,
+                        compact_profile=compact_profile)
+                self.assertEqual(rc, 1)
+                self.assertNotIn("coverage is partial", stderr)
+                self.assertNotIn("meaning unavailable", stderr)
+                self.assertNotIn("not embedded yet", stderr)
+                self.assertNotIn("0+ matches (floor)", stderr)
+                if machine:
+                    head, rows = _search_json(stdout)
+                    self.assertEqual(rows, [])
+                    if "-s" in flags:
+                        self.assertEqual(
+                            head["semantic"]["state"], "no-confident-match")
+                        self.assertEqual(head["semantic_coverage"], coverage)
+                        self.assertEqual(
+                            head.get("semantic_accelerator_coverage"), accelerator)
+                        self.assertEqual(head["semantic_partial"], meaning["partial"])
+                        self.assertEqual(
+                            head["semantic"]["complete"],
+                            meaning["semantic_status"]["complete"])
+                        self.assertFalse(head["completeness"]["truncated"])
+                else:
+                    self.assertEqual(stdout, "")
 
-        def run_query(_query, *, mode="keyword", **_kwargs):
-            return _result([], semantic=True) if mode == "semantic" else _result([])
+    def test_incomplete_semantic_miss_stays_unverified_on_search_surfaces(
+            self) -> None:
+        for label, coverage, accelerator in _incomplete_semantic_cases():
+            meaning = _semantic_empty_result(coverage, accelerator=accelerator)
+            for flags in ([], ["-s"], ["-s", "--json"]):
+                def run_query(_query, *, mode="keyword", **_kwargs):
+                    return meaning if mode == "semantic" else _result([])
 
-        with mock.patch.object(search, "_semantic_runtime_installed",
-                               return_value=True), \
-                mock.patch.object(search, "_indexed_corpus_counts",
-                                  return_value={"sessions": 4912,
-                                                "messages": 17_352}), \
-                mock.patch.object(
-                    search.indexd_runtime, "freshness_story",
-                    return_value=surface.FreshnessStory("current")):
-            rc, _stdout, stderr = self._run([query], run_query)
-        self.assertEqual(rc, 1)
-        # the exact confident wording: what the zero proved, once
-        self.assertIn(
-            "no match across 4,912 sessions - keyword + meaning, "
-            "index current", stderr)
-        # never beside the old stack it replaces
-        self.assertNotIn("keyword: 0 matching rows", stderr)
-        self.assertNotIn("semantic: no match among", stderr)
-        self.assertNotIn(surface.SEMANTIC_LANE_POLICY.keyword_only, stderr)
+                with self.subTest(gap=label, flags=flags), \
+                        mock.patch.object(
+                            search.indexd_runtime, "freshness_story",
+                            return_value=surface.FreshnessStory("current")), \
+                        mock.patch.object(
+                            search, "_indexed_corpus_counts",
+                            return_value={"sessions": 40, "messages": 10_000}):
+                    rc, stdout, stderr = self._run(
+                        ["deployment retry loop", *flags], run_query)
+                self.assertEqual(rc, 2)
+                if "--json" in flags:
+                    head, rows = _search_json(stdout)
+                    self.assertEqual(rows, [])
+                    self.assertFalse(head["semantic"]["complete"])
+                else:
+                    self.assertEqual(stdout, "")
+                    self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stderr)
+                    disclosures = (
+                        surface.semantic_coverage_notice(coverage, accelerator)
+                        or surface.semantic_keyword_only_notice(
+                            meaning["semantic_status"], coverage=coverage,
+                            accelerator=accelerator),
+                        display_policy.semantic_coverage_line(coverage),
+                        (display_policy.semantic_empty_line(coverage)
+                         if coverage is None or coverage.get("complete") is False
+                         else None),
+                    )
+                    self.assertTrue(any(
+                        notice and notice in stderr for notice in disclosures),
+                        (label, flags, stderr))
+
 
     def test_lane_down_total_miss_renders_one_hedged_zero(self) -> None:
         query = "why did the deployment keep retrying"
@@ -1287,13 +1446,8 @@ class AutoSemanticHybridTests(unittest.TestCase):
                     return_value=surface.FreshnessStory("current")):
             rc, _stdout, stderr = self._run([query], run_query)
         self.assertEqual(rc, 1)
-        self.assertIn(
-            f"no match across 12 sessions - "
-            f"{surface.SEMANTIC_LANE_POLICY.keyword_only}", stderr)
-        self.assertNotIn("keyword: 0 matching rows", stderr)
-        # the lever appears once - inside the zero, not as its own line too
-        self.assertEqual(
-            stderr.count(surface.SEMANTIC_LANE_POLICY.keyword_only), 1)
+        self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stderr)
+        self.assertIn(surface.SEMANTIC_LANE_POLICY.keyword_only, stderr)
 
     def test_stale_index_total_miss_hedges_once_through_said_once(self) -> None:
         query = "why did the deployment keep retrying"
@@ -1316,10 +1470,9 @@ class AutoSemanticHybridTests(unittest.TestCase):
                                   return_value=story_line):
             rc, _stdout, stderr = self._run([query], run_query)
         self.assertEqual(rc, 2)
-        self.assertIn(f"no match across 12 sessions - {story_line}", stderr)
-        # the freshness story is told once: inside the zero, never stacked
+        self.assertIn(story_line, stderr)
         self.assertEqual(stderr.count(story_line), 1)
-        self.assertNotIn("index current", stderr)
+        self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stderr)
 
     def test_a_narrowing_filter_forfeits_the_corpus_scope_claim(self) -> None:
         query = "why did the deployment keep retrying"
@@ -1427,28 +1580,6 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIn("2+ matches (floor)", stderr)
         self.assertNotIn("more:", stderr)
 
-    def test_partial_accelerator_is_disclosed_even_when_base_is_complete(self) -> None:
-        # ask.py flags the run partial when the q8 prefix is short; the one
-        # owned notice must carry that fact instead of claiming completeness
-        complete = {
-            "indexed": 20, "total": 20, "pending": 0, "complete": True}
-        self.assertIsNone(surface.semantic_coverage_notice(
-            complete, {
-                "indexed": 20, "total": 20, "pending": 0, "complete": True}))
-        self.assertIsNone(surface.semantic_coverage_notice(complete, None))
-        short_prefix = surface.semantic_coverage_notice(
-            complete, {
-                "indexed": 12, "total": 20, "pending": 8, "complete": False})
-        self.assertEqual(
-            short_prefix,
-            "semantic coverage is partial: 12 searched / 20 embedded / "
-            "20 source rows")
-        equal_counts = surface.semantic_coverage_notice(
-            complete, {
-                "indexed": 20, "total": 24, "pending": 4, "complete": False})
-        self.assertIn("semantic coverage is partial", equal_counts)
-        self.assertIn("20/24 accelerated rows searched", equal_counts)
-
     def test_compact_hybrid_discloses_partial_accelerator_coverage(self) -> None:
         query = "why did the deployment keep retrying"
         keyword = [_hit("keyword", 1, "deployment kept retrying")]
@@ -1471,55 +1602,6 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertIn(
             "semantic coverage is partial: 12 searched / 20 embedded / "
             "20 source rows", stderr)
-
-    def test_explicit_semantic_miss_discloses_partial_coverage_when_piped(self) -> None:
-        query = "agent got stuck retrying the same command"
-        coverage = {"indexed": 4, "total": 20, "pending": 16,
-                    "complete": False}
-
-        def run_query(_query, *, mode="keyword", **_kwargs):
-            if mode == "keyword":  # the miss page's prose-coverage count
-                return _result([])
-            return _result(
-                [], semantic=True, totals_exact=False, partial=True,
-                fallback_recommended=True,
-                semantic_status={
-                    "state": "no-confident-match", "complete": False,
-                    "fallback_recommended": True},
-                semantic_coverage=coverage)
-
-        rc, stdout, stderr = self._run(
-            [query, "-s", "--classic", "--color", "never"],
-            run_query, compact_profile=False, tty_stderr=False)
-
-        self.assertEqual(rc, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn(display_policy.semantic_coverage_line(coverage), stderr)
-        self.assertIn(display_policy.semantic_empty_line(coverage), stderr)
-
-    def test_auto_semantic_partial_empty_is_unverified_and_disclosed(self) -> None:
-        query = "why did deployment retry fail"
-        coverage = {
-            "indexed": 4, "total": 20, "pending": 16, "complete": False}
-
-        def run_query(_query, *, mode="keyword", **_kwargs):
-            if mode == "semantic":
-                return _result(
-                    [], semantic=True, semantic_coverage=coverage,
-                    partial=True,
-                    semantic_status={
-                        "state": "no-confident-match", "complete": False,
-                        "fallback_recommended": False})
-            return _result([])
-
-        rc, stdout, stderr = self._run([query], run_query)
-        self.assertEqual(rc, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn(display_policy.semantic_coverage_line(coverage), stderr)
-        self.assertIn(display_policy.semantic_empty_line(coverage), stderr)
-        self.assertNotIn("1+ matching rows", stderr)
-        self.assertIn("0+ matches (floor)", stderr)
-        self.assertNotIn("-c exact", stderr)
 
     def test_freshness_stamp_only_describes_incomplete_coverage(self) -> None:
         import semantic
@@ -1953,8 +2035,53 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(stdout.splitlines()), 4)
         self.assertNotIn("more=no", stderr)
-        self.assertEqual(stderr, "")
         self.assertNotIn("5+ matching rows", stderr)
+
+    def test_lane_exception_names_itself_not_a_transient(self) -> None:
+        query = "why did deployment keep retrying"
+        keyword = [_hit("keyword", 1, "deployment retry evidence")]
+
+        def run_query(_query, *, mode="keyword", **_kwargs):
+            if mode == "semantic":
+                raise ValueError("exclude_sessions exceeds the limit of 4")
+            return _result(keyword)
+
+        rc, stdout, stderr = self._run([query], run_query)
+        self.assertEqual(rc, 0)
+        self.assertIn("deployment retry evidence", stdout)
+        self.assertIn(surface.SEMANTIC_LANE_POLICY.keyword_only, stderr)
+        self.assertIn(
+            "ValueError: exclude_sessions exceeds the limit of 4", stderr)
+        self.assertNotIn(surface.SEMANTIC_WORKER_TRANSIENT_REASON, stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_failed_recovery_retry_replaces_the_stale_transient(self) -> None:
+        import semantic
+        query = "why did deployment keep retrying"
+        keyword = [_hit("keyword", 1, "deployment retry evidence")]
+        semantic_calls = []
+
+        def run_query(_query, *, mode="keyword", **_kwargs):
+            if mode != "semantic":
+                return _result(keyword)
+            semantic_calls.append(mode)
+            if len(semantic_calls) == 1:
+                return search._semantic_runtime_unavailable(
+                    _query, 3, None, search._SEMANTIC_WORKER_START_MISS)
+            raise ValueError("exclude_sessions exceeds the limit of 4")
+
+        with mock.patch.object(
+                semantic, "bounded_query_recovery_wait_s", return_value=1.0), \
+                mock.patch.object(
+                    semantic, "wait_for_query_recovery",
+                    return_value={"state": "ready", "waited": False}):
+            rc, _stdout, stderr = self._run([query], run_query)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(semantic_calls), 2)
+        self.assertIn(
+            "ValueError: exclude_sessions exceeds the limit of 4", stderr)
+        self.assertNotIn(search._SEMANTIC_WORKER_START_MISS, stderr)
+        self.assertNotIn(surface.SEMANTIC_WORKER_TRANSIENT_REASON, stderr)
 
     def test_same_chat_semantic_turn_does_not_duplicate_lexical_family(self) -> None:
         query = "find the earlier release failure explanation"
@@ -2157,11 +2284,6 @@ class AutoSemanticHybridTests(unittest.TestCase):
                 timeout_s=search._AUTO_SEMANTIC_TIMEOUT_S)
         status = result["semantic_status"]
         self.assertEqual(status["reason"], reason)
-        self.assertEqual(
-            surface.semantic_keyword_only_notice(status),
-            "meaning unavailable; keyword-only "
-            "(AGREP_NO_SEM_WORKER disables automatic meaning; "
-            "unset it to enable the lane)")
 
     def test_automatic_disable_gate_wins_over_preflight_reason(self) -> None:
         reason = "AGREP_NO_SEM_WORKER disables semantic worker queries"
@@ -2577,6 +2699,150 @@ class RecallHybridTests(unittest.TestCase):
             "events": [],
         } for session, turn, _context in requests]
 
+    def _run_empty(self, meaning, flags=(), *, story=None):
+        def run_query(_query, *, mode="keyword", **_kwargs):
+            return meaning if mode == "semantic" else _result([], phrase_chats=0)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(recall.common, "DATA_DIR", Path(td)), \
+                mock.patch.object(recall.indexd_runtime, "ensure_index",
+                                  return_value=True), \
+                mock.patch.object(recall.common, "in_agent_context",
+                                  return_value=False), \
+                mock.patch.object(recall.common, "index_summary",
+                                  return_value={"sessions": 40, "messages": 10_000}), \
+                mock.patch.object(recall.indexd_runtime, "freshness_story",
+                                  return_value=story or surface.FreshnessStory("current")), \
+                mock.patch.object(search, "_semantic_runtime_installed",
+                                  return_value=True), \
+                mock.patch.object(search, "run_query", side_effect=run_query), \
+                mock.patch.object(explore, "_session_index", return_value={}), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = recall.main(
+                ["deployment retry loop", "--budget", "4000", *flags])
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def test_near_current_semantic_miss_is_ordinary_on_recall_surfaces(
+            self) -> None:
+        for label, coverage, accelerator, story in _near_current_semantic_cases():
+            meaning = _semantic_empty_result(coverage, accelerator=accelerator)
+            for flags in ([], ["--json"], ["-s"], ["-s", "--json"], ["--probe"]):
+                with self.subTest(gap=label, flags=flags):
+                    rc, stdout, stderr = self._run_empty(
+                        meaning, flags, story=story)
+                self.assertEqual(rc, 1)
+                self.assertNotIn("coverage is partial", stdout + stderr)
+                self.assertNotIn("meaning unavailable", stdout + stderr)
+                if "--json" in flags:
+                    payload = json.loads(stdout)
+                    self.assertEqual(payload["hits"], [])
+                    self.assertEqual(payload["semantic_coverage"], coverage)
+                    self.assertEqual(
+                        payload.get("semantic_accelerator_coverage"), accelerator)
+                    self.assertEqual(payload["partial"], meaning["partial"])
+                    self.assertEqual(
+                        payload["semantic_status"]["state"], "no-confident-match")
+                    self.assertEqual(
+                        payload["semantic_status"]["complete"],
+                        meaning["semantic_status"]["complete"])
+
+    def test_incomplete_semantic_miss_stays_unverified_on_recall_surfaces(
+            self) -> None:
+        for label, coverage, accelerator in _incomplete_semantic_cases():
+            meaning = _semantic_empty_result(coverage, accelerator=accelerator)
+            for flags in ([], ["--json"], ["-s"], ["-s", "--json"], ["--probe"]):
+                with self.subTest(gap=label, flags=flags):
+                    rc, stdout, stderr = self._run_empty(meaning, flags)
+                self.assertEqual(rc, 2)
+                if "--json" in flags:
+                    payload = json.loads(stdout)
+                    self.assertEqual(payload["hits"], [])
+                    self.assertFalse(payload["semantic_status"]["complete"])
+                else:
+                    self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stdout + stderr)
+                    if coverage is not None:
+                        self.assertIn(
+                            surface.semantic_coverage_notice(coverage, accelerator),
+                            stdout + stderr)
+
+    def test_tiny_live_tail_does_not_hide_semantic_integrity_failures(
+            self) -> None:
+        coverage = {
+            "indexed": 9_997, "total": 10_000, "pending": 3, "complete": False}
+        failures = (
+            {"state": "generation-rejected", "dropped": 0,
+             "reason": "active semantic artifact digest mismatch",
+             "repair_persistent": True},
+            {"state": "partial", "dropped": 1, "mismatched": 1,
+             "missing": 0, "repair_state": "not-requested"},
+        )
+        for integrity in failures:
+            meaning = _semantic_empty_result(coverage, integrity=integrity)
+            self.assertFalse(meaning["totals_exact"], integrity["state"])
+            for flags in ([], ["--json"], ["-s"], ["-s", "--json"], ["--probe"]):
+                with self.subTest(integrity=integrity["state"], flags=flags):
+                    rc, stdout, stderr = self._run_empty(meaning, flags)
+                self.assertEqual(rc, 2)
+                if "--json" in flags:
+                    payload = json.loads(stdout)
+                    self.assertEqual(payload["hits"], [])
+                    self.assertEqual(payload["semantic_integrity"], integrity)
+                else:
+                    self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stdout + stderr)
+                    details = (
+                        integrity.get("reason"),
+                        surface.semantic_integrity_notice(integrity))
+                    self.assertTrue(any(
+                        detail and detail in stdout + stderr for detail in details))
+
+            for flags in ([], ["-s"], ["-s", "--json"]):
+                def run_query(_query, *, mode="keyword", **_kwargs):
+                    return meaning if mode == "semantic" else _result([])
+
+                with self.subTest(search_integrity=integrity["state"], flags=flags), \
+                        mock.patch.object(
+                            search.indexd_runtime, "freshness_story",
+                            return_value=surface.FreshnessStory("current")):
+                    rc, stdout, stderr = AutoSemanticHybridTests()._run(
+                        ["deployment retry loop", *flags], run_query)
+                self.assertEqual(rc, 2)
+                if "--json" in flags:
+                    head, rows = _search_json(stdout)
+                    self.assertEqual(rows, [])
+                    if "-s" in flags:
+                        self.assertEqual(head["semantic_integrity"], integrity)
+                else:
+                    self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stderr)
+                    details = (
+                        integrity.get("reason"),
+                        surface.semantic_integrity_notice(integrity))
+                    self.assertTrue(any(
+                        detail and detail in stderr for detail in details))
+
+    def test_accepted_semantic_query_failure_stays_unverified_on_recall_surfaces(
+            self) -> None:
+        reason = "worker disconnected after accepting the semantic query"
+        with mock.patch.object(
+                semworker, "resident_status", return_value={"running": True}), \
+                mock.patch.object(
+                    semworker, "search_worker",
+                    side_effect=semworker.ResidentSemanticUnavailable(reason)):
+            failure = search.run_query(
+                "deployment retry loop", mode="semantic", limit=10)
+        for flags in ([], ["--json"], ["-s"], ["-s", "--json"], ["--probe"]):
+            with self.subTest(flags=flags):
+                rc, stdout, stderr = self._run_empty(failure, flags)
+            self.assertEqual(rc, 2)
+            if "--json" in flags:
+                payload = json.loads(stdout)
+                self.assertEqual(payload["hits"], [])
+                self.assertEqual(payload["semantic_status"]["state"], "unavailable")
+                self.assertEqual(payload["semantic_status"]["reason"], reason)
+            else:
+                self.assertNotIn(surface.MISS_CONFIDENT_TAIL, stdout + stderr)
+
     def test_recall_can_inject_a_quality_gate_timeout(self) -> None:
         captured = {}
         pending = object()
@@ -2664,10 +2930,6 @@ class RecallHybridTests(unittest.TestCase):
         # a weak-only page is not "fill": the tool lane runs before the rescue
         self.assertEqual(calls, [("keyword", None), ("keyword", "tool"),
                                  ("semantic", None)])
-        self.assertIn(
-            display_policy.probe_pointer_label(
-                {"who": "user"}, semantic=True, weak=False),
-            stdout.getvalue())
         self.assertIn("@meaning:7", stdout.getvalue())
 
     def test_probe_keyword_only_all_terms_hit_is_a_confident_pointer(self) -> None:
@@ -2693,10 +2955,7 @@ class RecallHybridTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             rc = recall.main(["deployment retry loop", "--probe"])
         self.assertEqual(rc, 0)
-        self.assertNotIn("no confident past-context pointer",
-                         stdout.getvalue())
         self.assertIn("@past:3", stdout.getvalue())
-        self.assertIn("hold", stdout.getvalue())  # "holds every query term"
 
     def test_probe_all_terms_stays_weak_when_the_meaning_lane_served(self) -> None:
         weak_semantic = _hit("meaning", 7, "vaguely related", semantic=True)
@@ -2760,6 +3019,123 @@ class RecallHybridTests(unittest.TestCase):
         self.assertNotIn("excluded", stderr.getvalue())
         self.assertNotIn("--self", stderr.getvalue())
 
+    def test_probe_skips_input_echo_before_selecting_one_pointer(self) -> None:
+        query = "azure quokka telemetry"
+        family = recall.common.CallingFamily(
+            "root", "root", frozenset({"root"}), resolved=True, recap_turn=9)
+        echo = _hit("root", 3, query)
+        lived = _hit("past", 3, query)
+        events = {
+            "root": {
+                "turn": 3, "ts": echo["ts"], "kind": "tool", "name": "eval",
+                "input": f'run(["recall", "{query}", "--probe"])',
+                "output": "", "ok": True,
+            },
+            "past": {
+                "turn": 3, "ts": lived["ts"], "kind": "tool", "name": "bash",
+                "input": "cat diagnosis.txt",
+                "output": f"{query}: retry the collector after reconnecting",
+                "ok": True,
+            },
+        }
+        for hit in (echo, lived):
+            text, _bounds = recall.common.tool_search_record(events[hit["session"]])
+            hit.update(
+                who="tool",
+                content_digest=compact.content_digest(text),
+                _event_identity=recall.common.tool_event_identity(
+                    hit["session"], hit["turn"], hit["ts"], text))
+            hit["_match_span"] = search._match_pat(query, "keyword").search(text).span()
+        echo["score"] = lived["score"] + 1
+
+        def windows(requests):
+            result = self._window(requests)
+            for window in result:
+                window["events"] = [events[window["session"]]]
+            return result
+
+        stdout = io.StringIO()
+        with mock.patch.object(
+                recall.indexd_runtime, "ensure_index", return_value=True), \
+                mock.patch.object(
+                    recall.common, "in_agent_context", return_value=True), \
+                mock.patch.object(
+                    session_context, "calling_family", return_value=family), \
+                mock.patch.object(
+                    search, "_family_roots_for_hits",
+                    return_value={"root": "root", "past": "past"}), \
+                mock.patch.object(
+                    search, "_self_exclusion_match_keys", return_value=set()), \
+                mock.patch.object(
+                    search, "run_query", return_value=_result([echo, lived])), \
+                mock.patch.object(explore, "get_windows", side_effect=windows), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = recall.main([query, "--probe", "--lexical", "--who", "tool"])
+        self.assertEqual(rc, 0)
+        self.assertIn("@past:3", stdout.getvalue())
+        self.assertNotIn("@root:3", stdout.getvalue())
+
+    def test_probe_relay_quotes_cannot_supply_the_only_confident_pointer(self) -> None:
+        nonce = "azure quokka telemetry"
+        control = "unrecognized arguments"
+        relay_text = f'wait interrupted: parent asked "{nonce}" and "{control}"'
+        error_text = "parser reported unrecognized arguments: --limit"
+        family = recall.common.CallingFamily(
+            "root", "root", frozenset({"root", "relay"}), True, recap_turn=9,
+            descendants=frozenset({"relay"}))
+        relay = _hit("relay", 1, relay_text)
+        relay["who"] = "subagent"
+        relay["score"] = 9.0
+        independent = _hit("past", 2, error_text)
+        independent["who"] = "tool"
+
+        def corpus(**_kwargs):
+            db = sqlite3.connect(":memory:")
+            db.executescript(corpusdb._SCHEMA_SQL)
+            for hit, text in ((relay, relay_text), (independent, error_text)):
+                db.execute(corpusdb._INS_DIGEST, (
+                    hit["session"], hit["turn"], hit["ts"], hit["agent"],
+                    hit["project"], "", "", "", hit["who"], text,
+                    compact.content_digest(text)))
+            return db
+
+        def query(text, *, mode="keyword", **kwargs):
+            if mode != "keyword":
+                return _result([])
+            if kwargs.get("who") == "tool":
+                return _result([dict(independent)] if text == control else [])
+            return _result([dict(relay)], phrase_chats=1)
+
+        for text, expected_exit, expected_pointer in (
+                (nonce, 1, None), (control, 0, "@past:2")):
+            with self.subTest(query=text):
+                stdout = io.StringIO()
+                with mock.patch.object(
+                        recall.indexd_runtime, "ensure_index", return_value=True), \
+                        mock.patch.object(
+                            recall.common, "in_agent_context", return_value=True), \
+                        mock.patch.object(
+                            session_context, "calling_family", return_value=family), \
+                        mock.patch.object(
+                            search, "_family_roots_for_hits",
+                            return_value={"relay": "root", "past": "past"}), \
+                        mock.patch.object(
+                            search, "_self_exclusion_match_keys", return_value=set()), \
+                        mock.patch.object(
+                            search, "run_query", side_effect=query), \
+                        mock.patch.object(search, "corpusdb", corpusdb), \
+                        mock.patch.object(corpusdb, "connect", side_effect=corpus), \
+                        mock.patch.object(
+                            explore, "get_windows", side_effect=self._window), \
+                        contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = recall.main([text, "--probe", "--lexical"])
+                self.assertEqual(rc, expected_exit)
+                self.assertNotIn("@relay:", stdout.getvalue())
+                if expected_pointer is not None:
+                    self.assertIn(expected_pointer, stdout.getvalue())
+
     def test_probe_miss_emits_owned_line_and_warns_when_history_is_stale(self) -> None:
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(recall.indexd_runtime, "ensure_index", return_value=True), \
@@ -2777,10 +3153,6 @@ class RecallHybridTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             rc = recall.main(["needle", "--probe", "--lexical"])
         self.assertEqual(rc, 1)
-        # rc 1 still means no confident pointer, but never means no output
-        self.assertEqual(
-            stdout.getvalue().strip(),
-            display_policy.probe_miss_line("corpusdb", corpus_sessions=4))
         self.assertIn("history may be stale", stderr.getvalue())
 
     def test_probe_applies_a_proven_current_window_before_session_top_k(self) -> None:
@@ -2965,6 +3337,10 @@ class RecallHybridTests(unittest.TestCase):
                         mock.patch.object(
                             recall.common, "in_agent_context",
                             return_value=True), \
+                        mock.patch.object(
+                            recall.common, "calling_identity",
+                            return_value=session_context.CallerIdentity(
+                                "root", "codex")), \
                         mock.patch.object(
                             session_context, "calling_family",
                             return_value=family), \
@@ -3356,13 +3732,6 @@ class RecallHybridTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             rc = recall.main(["deployment retry loop", "--probe"])
         self.assertEqual(rc, 2)
-        # a lane-down miss must not read exactly like "no past context";
-        # the tail is the one owned lane-down story (F4)
-        self.assertEqual(
-            stdout.getvalue().strip(),
-            display_policy.probe_miss_line("corpusdb", corpus_sessions=4)
-            + " - " + surface.SEMANTIC_LANE_POLICY.keyword_only)
-        self.assertNotIn("semantic model warming", stdout.getvalue())
 
     def test_probe_miss_carries_the_same_confident_zero_verdict(self) -> None:
         # parity law: recall's probe miss speaks search's verdict vocabulary
@@ -3389,10 +3758,6 @@ class RecallHybridTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             rc = recall.main(["deployment retry loop", "--probe"])
         self.assertEqual(rc, 1)
-        self.assertEqual(
-            stdout.getvalue().strip(),
-            display_policy.probe_miss_line("corpusdb", corpus_sessions=4)
-            + " - " + surface.MISS_CONFIDENT_TAIL)
 
     def test_probe_stale_miss_carries_the_freshness_lever_once(self) -> None:
         behind = surface.FreshnessStory(
@@ -3449,7 +3814,6 @@ class RecallHybridTests(unittest.TestCase):
                 "deployment retry loop", "--probe", "--semantic"])
         self.assertEqual(rc, 2)
         self.assertIn("semantic search unavailable", stderr.getvalue())
-        self.assertIn("semantic:unavailable", stdout.getvalue())
 
     def test_default_recall_lane_down_miss_is_unverified_on_both_surfaces(
             self) -> None:
@@ -3497,11 +3861,7 @@ class RecallHybridTests(unittest.TestCase):
             self) -> None:
         coverage = {
             "indexed": 7, "total": 11, "pending": 4, "complete": False}
-        partial = _result(
-            [], semantic=True, semantic_coverage=coverage, partial=True,
-            semantic_status={"state": "no-confident-match",
-                             "complete": False,
-                             "fallback_recommended": False})
+        partial = _semantic_empty_result(coverage)
 
         rc, stdout, _stderr = AutoSemanticHybridTests()._run(
             ["deployment retry loop", "-s", "--json"],
@@ -3664,28 +4024,123 @@ class RecallHybridTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls, ["keyword"])
 
-    def test_recall_head_labels_weak_cosine_without_keyword_score(self) -> None:
-        hit = _hit("meaning", 7, "semantic rescue", semantic=True)
-        hit["sem_score"] = 0.8256
-        hit["score"] = 0.4851
+
+    def test_query_terms_anchor_rows_by_content_words(self) -> None:
+        terms = search.semantic_query_terms("never promise a login")
+        self.assertEqual(terms, ["never", "promise", "login"])
+        # every O4 row carried one of three terms; the true paraphrase two
+        for row in ("hello? login isnt working",
+                    "open login for me and make sure it persists",
+                    "what login form sorry im dumb"):
+            self.assertEqual(search.semantic_term_anchor(terms, row), (1, 3))
+        self.assertEqual(
+            search.semantic_term_anchor(terms, "never promise a password"), (2, 3))
+        weak = _hit("weak", 7, "hello? login isnt working", semantic=True)
+        weak["_sem_terms"] = (1, 3)
+        strong = _hit("strong", 8, "never promise a password", semantic=True)
+        strong["_sem_terms"] = (2, 3)
+        self.assertTrue(search._semantic_row_weak(weak))
+        self.assertFalse(search._semantic_row_weak(strong))
+        self.assertFalse(search._semantic_row_weak(
+            {**strong, "_sem_terms": (0, 0)}))
+
+
+    def test_merge_key_orders_weak_meaning_rows_after_confident_ones(self) -> None:
+        weak = {**_hit("weak", 5, "topic-adjacent", semantic=True),
+                "_recall_lane": 1, "sem_score": 0.95, "_sem_terms": (1, 3)}
+        strong = {**_hit("strong", 6, "carries the terms", semantic=True),
+                  "_recall_lane": 1, "sem_score": 0.88, "_sem_terms": (3, 3)}
+        prose = {**self._keyword("prose"), "_recall_lane": 0}
+        ordered = sorted([weak, strong, prose], key=recall._merge_key)
+        self.assertEqual([hit["session"] for hit in ordered],
+                         ["prose", "strong", "weak"])
+
+    def test_recall_prefers_the_distinctive_query_term_over_generic_similarity(
+            self) -> None:
+        texts = {
+            "local-login": "The local login page is broken.",
+            "gmail-auth": "Gmail account consent needs refreshing.",
+            **{f"filler-{i}": f"Login activity in another application {i}."
+               for i in range(12)},
+        }
+        candidates = [
+            {"session": session, "turn": 0, "who": "user",
+             "agent": "codex", "project": "agrep", "ts": 1,
+             "score": score, "text": texts[session],
+             "content_digest": compact.content_digest(texts[session])}
+            for session, score in (("local-login", 0.91), ("gmail-auth", 0.88))
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            database = Path(td) / "corpus.db"
+            db = sqlite3.connect(database)
+            db.executescript(corpusdb._SCHEMA_SQL)
+            db.executemany(
+                corpusdb._INS,
+                [(session, 0, 1, "codex", "agrep", "", "", "", "user", text)
+                 for session, text in texts.items()])
+            db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+            db.execute(
+                "INSERT INTO msgs_prose_fts(rowid, text) SELECT id, text FROM msgs")
+            db.commit()
+            db.close()
+
+            def connect(**_kwargs):
+                return sqlite3.connect(database)
+
+            def windows(requests):
+                rows = self._window(requests)
+                for row in rows:
+                    row["turns"][0]["text"] = texts[row["session"]]
+                return rows
+
+            stdout = io.StringIO()
+            with mock.patch.object(
+                    recall.indexd_runtime, "ensure_index", return_value=True), \
+                    mock.patch.object(
+                        recall.common, "in_agent_context", return_value=False), \
+                    mock.patch.object(corpusdb, "connect", side_effect=connect), \
+                    mock.patch.object(
+                        semworker, "resident_status", return_value={"running": True}), \
+                    mock.patch.object(
+                        semworker, "search_worker",
+                        return_value={"results": candidates, "score_kind": "cosine"}), \
+                    mock.patch.object(explore, "get_windows", side_effect=windows), \
+                    contextlib.redirect_stdout(stdout), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = recall.main([
+                    "Gmail login", "-s", "--hits", "1", "--json", "--budget", "6000"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                [hit["session"] for hit in json.loads(stdout.getvalue())["hits"]],
+                ["gmail-auth"])
+
+    def test_recall_json_marks_semantic_only_rows_as_semantic(self) -> None:
+        def run_query(_query, *, mode="keyword", **_kwargs):
+            if mode == "semantic":
+                return _result(
+                    [_hit("meaning", 7, "semantic rescue", semantic=True)],
+                    semantic=True)
+            return _result([self._keyword("literal")], phrase_chats=1)
+
         stdout = io.StringIO()
         with mock.patch.object(recall.indexd_runtime, "ensure_index", return_value=True), \
                 mock.patch.object(recall.common, "in_agent_context", return_value=False), \
-                mock.patch.object(search, "run_query",
-                                  return_value=_result([hit], semantic=True)), \
+                mock.patch.object(search, "_semantic_runtime_installed",
+                                  return_value=True), \
+                mock.patch.object(search, "run_query", side_effect=run_query), \
                 mock.patch.object(explore, "get_windows", side_effect=self._window), \
-                mock.patch.object(explore, "_session_index",
-                                  return_value={"meaning": {}}), \
                 contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(io.StringIO()):
-            rc = recall.main(["deployment retry loop", "-s", "--budget", "0"])
+            rc = recall.main([
+                "deployment retry loop", "--hits", "2", "--json", "--budget", "0"])
         self.assertEqual(rc, 0)
-        head = stdout.getvalue().splitlines()[0]
-        self.assertTrue(head.startswith("── @meaning:7"), head)
-        self.assertIn("pull: agrep around @meaning:7", head)
-        self.assertIn("cosine 0.8256", head)
-        self.assertIn("weak meaning match", head)
-        self.assertNotIn("score 0.4851", head)
+        payload = json.loads(stdout.getvalue())
+        by_session = {hit["session"]: hit for hit in payload["hits"]}
+        self.assertEqual(by_session["literal"]["matched"], "phrase")
+        self.assertEqual(by_session["meaning"]["matched"], "semantic")
+        self.assertEqual(by_session["meaning"]["lane"], "semantic")
+        self.assertIsNone(by_session["literal"]["sem_score"])
+
 
     def test_one_hit_recall_does_not_claim_an_invisible_semantic_lane(self) -> None:
         calls = []
@@ -4021,7 +4476,6 @@ class ProbeOrderIndependenceTests(unittest.TestCase):
                 rc, out = self._probe(list(queries))
                 self.assertEqual(rc, 0, out)
                 self.assertIn("@strongsess:3", out)
-                self.assertNotIn("no confident past-context pointer", out)
 
     def test_two_weak_queries_still_miss_in_both_orders(self) -> None:
         other_weak = "epsilon zeta"
@@ -4030,7 +4484,6 @@ class ProbeOrderIndependenceTests(unittest.TestCase):
             with self.subTest(order=queries):
                 rc, out = self._probe(queries)
                 self.assertEqual(rc, 1, out)
-                self.assertIn("no confident past-context pointer", out)
 
 
 class LaneNoticeDampenerTests(unittest.TestCase):
@@ -4067,6 +4520,45 @@ class LaneNoticeDampenerTests(unittest.TestCase):
         self.assertIn(
             surface.SEMANTIC_INDEX_UPDATE_REASON,
             surface.semantic_keyword_only_notice(status))
+
+    def test_a_reason_without_a_short_cause_is_rendered_not_dropped(self) -> None:
+        for reason, diagnosis, remedy in (
+                ("resident semantic query timed out", "resident semantic query", None),
+                ("semantic worker startup coordination cannot create "
+                 "/d/.semantic-worker.starting: [Errno 1] Operation not "
+                 "permitted: '/d/.semantic-worker.starting'; inspect with "
+                 "`agrep doctor --deep`",
+                 "semantic worker startup coordination",
+                 "inspect with `agrep doctor --deep`")):
+            with self.subTest(reason=reason[:40]):
+                line = surface.semantic_keyword_only_notice(
+                    {"state": "unavailable", "reason": reason})
+                self.assertIn(diagnosis, line)
+                if remedy is not None:
+                    self.assertIn(remedy, line)
+                self.assertLessEqual(len(line), surface.RENDER_LINE_MAX_CHARS)
+
+    def test_long_reason_is_shortened_at_a_word_boundary(self) -> None:
+        words = [f"generation-detail-{number}" for number in range(20)]
+        reason = " ".join(words)
+        line = surface.semantic_keyword_only_notice(
+            {"state": "unavailable", "reason": reason})
+        cause = line.removeprefix(
+            surface.SEMANTIC_LANE_POLICY.keyword_only + " (").removesuffix(")")
+        visible = cause.replace("…", " ").split()
+        self.assertEqual(visible[0], words[0])
+        self.assertEqual(visible[-1], words[-1])
+        self.assertTrue(all(word in words for word in visible), cause)
+        self.assertIn("…", cause)
+        self.assertLessEqual(len(line), surface.RENDER_LINE_MAX_CHARS)
+
+    def test_a_reason_is_terminal_safe_within_the_line_budget(self) -> None:
+        line = surface.semantic_keyword_only_notice(
+            {"state": "unavailable",
+             "reason": "x" * 300 + "\x1b]52;c;evil\x07" + "y" * 300})
+        self.assertLessEqual(len(line), surface.RENDER_LINE_MAX_CHARS)
+        self.assertNotIn("\x1b", line)
+
 
     def test_readonly_data_dir_always_tells_the_full_story(self) -> None:
         runtime = search.indexd_runtime

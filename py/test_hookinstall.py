@@ -430,7 +430,14 @@ class PiOmpExtensionTests(unittest.TestCase):
         self.assertEqual(hookinstall.PRIOR_PI_EXTENSION_HASHES, frozenset({
             "34c99ac023bca77e457359c36bc57f698e364e49aece0100c3135a4fe22ea55b",
             "127c3cf0cc2afc4bd3d2aee86b589ec3a80810b896413e3b6e3f084869186e32",
+            "4b26c969f97e57607fc8d8d21666442ac162dcdcf3d083ae6a2a9c72050b656f",
+            "7f9fd2e3910ffa76c9b928aa14a98651f3809fdb55a0ac37c71bfc2e9efde114",
+            "6cfdf55fd59ba3834f9557804b79da19930ea14e803b267a5cf04e2690033a94",
         }))
+        # the shipped payload is a new version, never one already pinned
+        self.assertNotIn(
+            hashlib.sha256(hookinstall.PI_EXTENSION.read_bytes()).hexdigest(),
+            hookinstall.PRIOR_PI_EXTENSION_HASHES)
 
     def test_user_extension_is_preserved_while_other_agent_installs(
             self) -> None:

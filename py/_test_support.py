@@ -54,6 +54,9 @@ def isolate_data_dir() -> Path:
     # the shared sandbox after their test; suites about either opt back in.
     os.environ["AGREP_NO_DAEMON"] = "1"
     os.environ["AGREP_NO_SEM_WORKER"] = "1"
+    # A live agent process above the test runner publishes its caller record;
+    # identity tests must see only what they write themselves.
+    os.environ["AGREP_CALLER_PUBLICATION_DIR"] = str(_DATA_ROOT / "caller")
     # Tree purity: the venv's editable .pth serves the MAIN checkout's cli.py
     # to worktree runs, which then prepends ITS py/ and mixes two source
     # trees. This tree's root goes first; a crossing resolution is an error.
@@ -146,7 +149,7 @@ def publish_derived_generation(
         "version": corpusdb_api._DERIVED_PROOF_VERSION,
         "signature": signature, "files": proof_rows,
     }, separators=(",", ":")), encoding="utf-8")
-    (root / ".ingest.sig").write_text(signature + "\n", encoding="utf-8")
+    (root / ".ingest.sig").write_bytes((signature + "\n").encode("utf-8"))
     (root / "settings.json").write_text(
         '{"tools":"off"}', encoding="utf-8")
     if mode is not None:

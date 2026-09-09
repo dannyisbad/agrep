@@ -32,12 +32,13 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
 from typing import Iterable, Mapping, NamedTuple
 
+import boundary_rank
 import common
 import compact
 import fileops
@@ -553,8 +554,9 @@ def _derived_write_ownership(
         current_build = indexd_runtime.derived_writer_build_id(
             require_binary=True)
     except OSError as exc:
+        # nobody's ownership is proven here: this build cannot even name itself
         return _DerivedWriteOwnership(
-            "refused",
+            "unavailable",
             "derived writer identity is unavailable because the ingest "
             f"binary cannot be verified ({exc})")
     anchor = indexd_runtime.derived_owner_info(current_build)
@@ -1698,6 +1700,9 @@ class _SessionFamilySnapshot:
     source_stamp: str | None
     sessions: frozenset[str]
     parents: Mapping[str, str]
+    # filename id -> indexed session; each alias gets a session_family row rooted at the
+    # session it names (so family joins see it) and the map itself lands in meta
+    aliases: Mapping[str, str] = field(default_factory=dict)
 
 
 def _read_session_families() -> _SessionFamilySnapshot:
@@ -1714,7 +1719,27 @@ def _read_session_families() -> _SessionFamilySnapshot:
         census.proof.stamp,
         census.sessions,
         census.parents,
+        census.aliases,
     )
+
+
+def _session_family_rows(
+        snapshot: _SessionFamilySnapshot, sessions: Iterable[str],
+        memo: dict[str, str],
+) -> Iterable[tuple[str, str, int]]:
+    for session in sessions:
+        if session in snapshot.aliases:
+            yield (
+                session,
+                common.family_root(snapshot.aliases[session], snapshot.parents, memo),
+                0,
+            )
+        else:
+            yield (
+                session,
+                common.family_root(session, snapshot.parents, memo),
+                int(session in snapshot.parents),
+            )
 
 
 def _replace_session_families(
@@ -1726,22 +1751,29 @@ def _replace_session_families(
         raise _SourceMoved("session-family publication is invalid")
     extras = {
         str(session) for session in known_sessions if session
-    } | set(snapshot.parents.values())
+    } | set(snapshot.parents.values()) | set(snapshot.aliases)
     extras.difference_update(snapshot.sessions)
     memo: dict[str, str] = {}
     db.execute("DELETE FROM session_family")
     db.executemany(
         "INSERT INTO session_family(session, root, side) VALUES(?, ?, ?)",
-        (
-            (session, common.family_root(session, snapshot.parents, memo),
-             int(session in snapshot.parents))
-            for session in chain(snapshot.sessions, sorted(extras))
-        ),
+        _session_family_rows(
+            snapshot, chain(snapshot.sessions, sorted(extras)), memo),
     )
-    db.execute(
-        "INSERT INTO meta(key, value) VALUES('family_stamp', ?) "
+    _publish_family_meta(db, snapshot)
+
+
+def _publish_family_meta(
+        db: sqlite3.Connection, snapshot: _SessionFamilySnapshot) -> None:
+    db.executemany(
+        "INSERT INTO meta(key, value) VALUES(?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (snapshot.source_stamp or "",),
+        (
+            ("family_stamp", snapshot.source_stamp or ""),
+            (common.FAMILY_ALIASES_META_KEY, json.dumps(
+                dict(sorted(snapshot.aliases.items())),
+                separators=(",", ":"), sort_keys=True)),
+        ),
     )
 
 
@@ -1753,7 +1785,7 @@ def _reconcile_session_families(
     """Apply a family publication without rewriting unchanged sidecar rows."""
     if snapshot.source_stamp is None:
         raise _SourceMoved("session-family publication is invalid")
-    extras = set(snapshot.parents.values())
+    extras = set(snapshot.parents.values()) | set(snapshot.aliases)
     extras.difference_update(snapshot.sessions)
     changed_set = changed if isinstance(changed, set) else set()
     affected = set(changed_set)
@@ -1781,15 +1813,16 @@ def _reconcile_session_families(
     memo: dict[str, str] = {}
 
     def rows(sessions):
-        for session in sessions:
-            if session in snapshot.sessions or session in extras:
-                yield (
-                    session,
-                    common.family_root(session, snapshot.parents, memo),
-                    int(session in snapshot.parents),
-                )
+        yield from _session_family_rows(
+            snapshot,
+            (session for session in sessions
+             if session in snapshot.sessions or session in extras),
+            memo,
+        )
 
-    full = changed == "*" or not changed_set
+    # a new or retired alias re-roots children whose own rows never changed
+    full = (changed == "*" or not changed_set
+            or common._indexed_aliases_in_db(db) != dict(snapshot.aliases))
     wanted = chain(snapshot.sessions, extras) if full else chain(affected, extras)
     db.executemany(
         "INSERT INTO session_family(session,root,side) VALUES(?,?,?) "
@@ -1813,11 +1846,7 @@ def _reconcile_session_families(
         if actual != expected:
             raise _SourceMoved(
                 "session-family reconciliation did not publish every session")
-    db.execute(
-        "INSERT INTO meta(key,value) VALUES('family_stamp',?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (snapshot.source_stamp,),
-    )
+    _publish_family_meta(db, snapshot)
 
 
 def boundary_token_stats(db: sqlite3.Connection,
@@ -3403,6 +3432,8 @@ def _register_functions(db: sqlite3.Connection) -> None:
             (actual or "").lower().startswith((needle or "").lower()))),
         ("agrep_equal_ci", lambda actual, needle: int(
             (actual or "").lower() == (needle or "").lower())),
+        ("agrep_project_match", lambda actual, needle: int(
+            surface.project_label_matches(actual, needle))),
     )
     for name, function in functions:
         if name not in installed:
@@ -3419,7 +3450,7 @@ def _filter_sql(flt: dict | None) -> tuple[list[str], list]:
         where.append("agrep_contains_ci(agent, ?)")
         params.append(flt["agent"])
     if flt.get("project"):
-        where.append("agrep_contains_ci(project, ?)")
+        where.append("agrep_project_match(project, ?)")
         params.append(flt["project"])
     if flt.get("chat"):  # 8-char id prefix or full session uuid
         where.append("agrep_starts_ci(session, ?)")
@@ -4058,11 +4089,7 @@ class ShortKeywordCandidateStream:
                     break
             text = row[_TEXT]
             lowered = text.lower() if text.isascii() else None
-            if lowered is None:
-                span = common.insensitive_span(text, self._query)
-            else:
-                start = lowered.find(self._query)
-                span = None if start < 0 else (start, start + len(self._query))
+            span = common.insensitive_span(text, self._query, lowered)
             if span is not None:
                 self._observed_total += 1
                 self._observed_chats.add(row[0])
@@ -4476,7 +4503,7 @@ def count_tokens(q: str) -> list[str]:
     if not toks:
         return []
     return ([q.strip().lower()] if len(toks) == 1 else
-            list(dict.fromkeys(t.lower() for t in toks)))
+            list(dict.fromkeys(boundary_rank.term_anchor(t) for t in toks)))
 
 
 def count_rides_the_index(q: str) -> bool:
@@ -4495,17 +4522,26 @@ def keyword_count(db: sqlite3.Connection, q: str,
     ``cap`` stops the count once that many rows are confirmed: the answer then
     carries ``exact`` False and its numbers are floors of the result set (never
     of the scan). An uncapped count is always exact."""
+    raw_toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
     lows = count_tokens(q)
     if not lows:
         return {"total": 0, "chats": 0, "tool_hits": 0, "exact": True}
-    raw_toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
+    term_specs = []
+    seen_variants: set[tuple[str, ...]] = set()
+    for token in raw_toks:
+        variants = ((token.lower(),) if len(raw_toks) == 1
+                    else boundary_rank.term_variants(token))
+        if variants not in seen_variants:
+            seen_variants.add(variants)
+            term_specs.append((token, variants))
     _register_functions(db)
     where, params = _candidate_where(lows, flt)
     ceiling = None if cap is None else max(1, int(cap))
     direct = all(
-        token.isascii() and token.isalnum() and len(token) >= 3
+        variants == (token.lower(),)
+        and token.isascii() and token.isalnum() and len(token) >= 3
         and not _needs_re_i_rare(token)
-        for token in lows
+        for token, variants in term_specs
     )
     if direct:
         rows = "SELECT session, who FROM msgs" + where
@@ -4527,7 +4563,9 @@ def keyword_count(db: sqlite3.Connection, q: str,
     for session, who, text in db.execute(select, params):
         matched = (common.insensitive_span(text, needle) is not None
                    if needle is not None else
-                   all(common.insensitive_span(text, token) is not None for token in lows))
+                   all(common.insensitive_span(
+                       text, token, variants=variants) is not None
+                       for token, variants in term_specs))
         if not matched:
             continue
         total += 1
@@ -4735,26 +4773,24 @@ def keyword_terms(db: sqlite3.Connection, q: str, k: int, flt: dict | None = Non
         return {"phrase": keyword(db, q, k, flt, position_order=position_order),
                 "terms": {"hits": [], "total": 0, "chats": 0}}
     lows = [t.lower() for t in toks]
+    variant_groups = [boundary_rank.term_variants(token) for token in toks]
+    anchors = [boundary_rank.term_anchor(token) for token in toks]
     pat = re.compile(r"[\W_]*".join(re.escape(t) for t in toks), re.I)
     min_phrase_chars = sum(len(t) for t in toks)
     phrase_hits: list[dict] = []
     term_hits: list[dict] = []
-    # Hot at corpus scale: the precomputed lowered tokens feed the span fast
-    # path directly, and a phrase twin of an all-terms row copies its dict
-    # (same fields, same digest) instead of re-deriving both from the raw row.
     search = pat.search
-    span_map = common.original_span_for_lowered
-    fallback_span = common.insensitive_span
-    token_pairs = list(dict.fromkeys(zip(toks, lows)))
-    for row_key, row in enumerate(_candidates(db, toks, flt)):
+    token_specs = list(dict.fromkeys(
+        (token, low, variants)
+        for token, low, variants in zip(toks, lows, variant_groups)))
+    for row_key, row in enumerate(_candidates(db, anchors, flt)):
         text = row[_TEXT]
         low = text.lower()
         spans = []
         complete = True
-        for token, token_low in token_pairs:
-            start = low.find(token_low)
-            span = (span_map(text, low, start, start + len(token_low))
-                    if start >= 0 else fallback_span(text, token, low))
+        for token, _token_low, variants in token_specs:
+            span = common.insensitive_span(
+                text, token, low, variants=variants)
             if span is None:
                 complete = False
                 break

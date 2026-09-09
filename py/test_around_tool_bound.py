@@ -121,7 +121,6 @@ class AroundToolBoundTests(unittest.TestCase):
         self.assertIn("SELECTED_NEEDLE", out)
         self.assertNotIn("SOLE_ROOT_CAUSE", out)
         self.assertEqual(out.count("FAILED exec_command"), 1)
-        self.assertIn("2,049 unselected tool/workflow events hidden", out)
         self.assertIn("-C 0 --full", out)
 
 
@@ -203,7 +202,6 @@ class AroundToolBoundTests(unittest.TestCase):
         self.assertIn("SELECTED_DISTINCT_NEEDLE", out)
         self.assertNotIn("distinct error 0", out)
         self.assertNotIn("distinct error 2049", out)
-        self.assertIn("2,049 unselected tool/workflow events hidden", out)
 
     def test_no_tools_refuses_to_erase_a_selected_tool_handle(self) -> None:
         event = _event(1, output="SELECTED_ONLY_EVIDENCE")

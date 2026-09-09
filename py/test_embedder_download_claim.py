@@ -246,6 +246,29 @@ class DownloadClaimTests(unittest.TestCase):
         sleep.assert_any_call(embedder._DOWNLOAD_POLL_S)
         self.assertFalse(self.claim_path.exists())
 
+    def test_a_long_wait_on_a_peer_download_is_disclosed_once(self) -> None:
+        # `-s` used to sit on a live peer's claim for up to 600s in silence.
+        raw = self._claim_raw(pid=4242, at=time.time())
+        self.claim_path.write_bytes(raw)
+        embedder.MODEL_DOWNLOAD_WAIT_S = 10.0
+        clock = iter((0.0, 0.0, 2.5, 5.0, 11.0))
+        said: list[str] = []
+        with mock.patch.object(common, "pid_alive", return_value=True), \
+                mock.patch.object(
+                    common, "process_start_identity", return_value="birth"), \
+                mock.patch.object(embedder.time, "monotonic",
+                                  side_effect=clock), \
+                mock.patch.object(embedder.time, "sleep"), \
+                mock.patch.object(common, "log", side_effect=said.append), \
+                self.assertRaisesRegex(
+                    embedder.EmbedderUnavailable,
+                    "^timed out waiting for another model download$"):
+            embedder._acquire_download_claim(self.root)
+        self.assertEqual(said, [
+            "embedder: waiting for another agrep process (pid 4242) to finish "
+            "the model download; giving up after 10s (Ctrl-C interrupts the wait)"])
+        self.claim_path.unlink()
+
     def test_peer_completion_at_deadline_wins_without_claiming(self) -> None:
         calls = 0
 

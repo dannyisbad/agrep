@@ -25,25 +25,119 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import cli
-import dist
-import surface_policy as surface
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
+import cli  # noqa: E402
+import dist  # noqa: E402
+import surface_policy as surface  # noqa: E402
 
 
-class IndexOutputTests(unittest.TestCase):
-    def test_index_has_one_owned_slow_timing_line(self) -> None:
-        stdout = io.StringIO()
-        with mock.patch.object(
-                cli.indexd_runtime, "build_index", return_value=True), \
-                mock.patch.object(cli.common, "lap") as lap, \
-                contextlib.redirect_stdout(stdout):
-            self.assertTrue(cli._index())
-        self.assertIn("=== indexing transcripts ===", stdout.getvalue())
-        self.assertNotRegex(stdout.getvalue(), r"(?m)^\s*\([0-9.]+s\)$")
-        lap.assert_called_once_with("index")
+
+class IdentityRecordTests(unittest.TestCase):
+    def test_reader_preserves_files_and_replaced_binary_invalidates_record(self) -> None:
+        runtime = cli.indexd_runtime
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "agrep-rs"
+            binary.write_bytes(b"fixture ingest binary bytes")
+            with mock.patch.object(runtime.common, "DATA_DIR", root), \
+                    mock.patch.object(runtime, "_BINARY_DIGEST_CACHE", None), \
+                    mock.patch.object(
+                        runtime.common, "data_dir_readonly",
+                        return_value=False):
+                self.assertIsNone(runtime.recorded_binary_identity(binary))
+                writer = runtime.derived_writer_build_id(
+                    binary, require_binary=True)
+                self.assertIsNone(runtime.recorded_binary_identity(binary))
+                self.assertEqual(set(root.iterdir()), {binary})
+                with mock.patch.object(
+                        runtime, "derived_writer_mutation_info",
+                        return_value=runtime.DerivedMutationInfo("current", writer, "")):
+                    runtime.record_binary_identity(binary)
+                recorded = runtime.recorded_binary_identity(binary)
+                self.assertEqual(
+                    recorded, (writer, dist.native_binary_build_id(binary)))
+                # a replaced binary must never inherit the old record
+                binary.write_bytes(b"different ingest binary bytes")
+                self.assertIsNone(runtime.recorded_binary_identity(binary))
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # the fallback tests below model a box with no identity record
+        no_record = mock.patch.object(
+            cli.indexd_runtime, "recorded_binary_identity", return_value=None)
+        no_record.start()
+        self.addCleanup(no_record.stop)
+
+    def test_recorded_identity_answers_without_a_hashing_child(self) -> None:
+        with (mock.patch.object(
+                  cli.indexd_runtime, "recorded_binary_identity",
+                  return_value=("a" * 20, "b" * 20)),
+              mock.patch.object(
+                  cli, "_bounded_binary_identity",
+                  side_effect=AssertionError("spawned a hashing child"))):
+            identity = cli._build_identity(timeout_s=0.0)
+        self.assertEqual(identity["writer_build_id"], "a" * 20)
+        self.assertEqual(identity["writer_build_state"], "verified")
+        self.assertEqual(identity["native_binary_build_id"], "b" * 20)
+        self.assertEqual(identity["native_binary_build_state"], "verified")
+
+    def test_unverified_identity_defers_ownership_verdicts(self) -> None:
+        identity = {
+            "runtime_build_id": "e" * 20,
+            "writer_build_id": None,
+            "writer_build_state": "unavailable",
+            "writer_build_detail": "TimeoutError: fixture deadline",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "corpus.db").write_bytes(b"not consulted")
+            with (
+                mock.patch.object(cli.common, "DATA_DIR", root),
+                mock.patch.object(
+                    cli.common, "MESSAGES_PATH", root / "messages.jsonl"),
+                mock.patch.object(
+                    cli.common, "data_dir_source", return_value="fixture"),
+                mock.patch.object(
+                    cli.common, "data_dir_warnings", return_value=[]),
+                mock.patch.object(
+                    cli.settings, "setting_observation",
+                    return_value={"state": "verified", "value": "auto",
+                                  "source": "default"}),
+                mock.patch.object(
+                    cli.indexd_runtime, "indexd_resource_status",
+                    side_effect=AssertionError("judged daemon compatibility")),
+                mock.patch.object(
+                    cli.indexd_runtime, "observe_store_drift",
+                    return_value=([], cli.indexd_runtime.DriftReport("current"))),
+                mock.patch.object(
+                    cli.indexd_runtime, "indexing_failure", return_value=None),
+                mock.patch.object(
+                    cli.indexd_runtime, "machine_freshness",
+                    return_value={"state": "no-known-failure"}),
+                mock.patch.object(
+                    cli.common, "index_summary",
+                    return_value={"sessions": 1, "messages": 2, "agents": [],
+                                  "per_agent": []}),
+                mock.patch.object(
+                    cli.common, "detected_stores", return_value=[]),
+                mock.patch("doctor._corpus_db_readiness",
+                           side_effect=AssertionError("judged ownership")),
+            ):
+                observed = cli._status_core(
+                    deadline=time.monotonic() + 1.0, identity=identity)
+        self.assertIsNone(observed["search_index_ready"])
+        self.assertEqual(observed["search_index_state"], "status-deferred")
+        self.assertEqual(observed["index_state"], "not-verified")
+        self.assertEqual(observed["daemon"]["state"], "status-deferred")
+        self.assertFalse(observed["daemon"].get("blocked"))
+        details = observed["diagnostics"]["details"]
+        for label in ("daemon resource observation",
+                      "search database readiness"):
+            self.assertIn("TimeoutError: fixture deadline", details[label])
+
     def test_native_identity_depends_only_on_exact_binary_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -657,8 +751,6 @@ class IndexingAdviceTests(unittest.TestCase):
 
 
 class CrashBoundaryTests(unittest.TestCase):
-    """An unhandled exception is a user surface too: no class names, no
-    internal message, always a command."""
 
     def line(self, exc: BaseException) -> str:
         return surface.crash_advice_line(exc, "agrep")
@@ -682,17 +774,14 @@ class CrashBoundaryTests(unittest.TestCase):
         self.assertIn(
             "`agrep index --full`", self.line(sqlite3.DatabaseError("x")))
 
-    def test_no_exception_class_or_internal_message_reaches_the_line(self) -> None:
-        for exc in (RuntimeError("event generation changed during bulk read"),
-                    ValueError("__internal_marker__"),
-                    OSError("__internal_marker__")):
-            line = self.line(exc)
-            self.assertNotIn("__internal_marker__", line)
-            self.assertNotIn(type(exc).__name__, line)
-            self.assertFalse(re.search(r"\b[A-Za-z]+Error\b", line), line)
-
-    def test_an_unknown_failure_still_routes_somewhere(self) -> None:
-        self.assertIn("`agrep doctor`", self.line(ValueError("surprise")))
+    def test_unknown_failure_retains_its_cause_without_terminal_controls(self) -> None:
+        line = self.line(AttributeError(
+            "module 'session_context' has no attribute 'open_sqlite_snapshot'\n\x1b[2J"))
+        self.assertIn("AttributeError", line)
+        self.assertIn("open_sqlite_snapshot", line)
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\x1b", line)
+        self.assertNotIn("`agrep doctor`", line)
 
 
 if __name__ == "__main__":

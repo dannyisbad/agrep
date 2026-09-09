@@ -415,6 +415,58 @@ class SearchGenerationFreshnessContracts(unittest.TestCase):
                 health = corpusdb.search_generation_health()
         self.assertEqual(health["state"], "generation-moving")
 
+    def test_chat_list_keeps_side_marks_from_a_lagging_family_index(self) -> None:
+        # sessions.jsonl moved past the published family_stamp mid-write
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _publish(root)
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+            """)
+            db.execute("INSERT INTO meta VALUES('family_stamp', 'published')")
+            db.executemany(
+                "INSERT INTO session_family VALUES(?, ?, ?)",
+                (("aaaa1111-root", "aaaa1111-root", 0),
+                 ("bbbb2222-scout", "aaaa1111-root", 1)))
+            db.commit()
+            db.close()
+            hits = [
+                {"session": "aaaa1111-root", "turn": 2, "who": "user",
+                 "agent": "pi", "project": "erinos", "ts": 1,
+                 "text": "needle", "content_digest": "d2e7"},
+                {"session": "bbbb2222-scout", "turn": 0, "who": "user",
+                 "agent": "pi", "project": "erinos", "ts": 2,
+                 "text": "needle", "content_digest": "d2e7"},
+            ]
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(session_context, "DATA_DIR", root), \
+                    mock.patch.object(
+                        session_context, "_FAMILY_INDEX_BEHIND", False), \
+                    mock.patch.object(
+                        search, "_FAMILY_INDEX_BEHIND_ANNOUNCED", False), \
+                    mock.patch.object(
+                        session_context, "session_family_source_stamp",
+                        return_value="moved past the publication"), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                self.assertIsNone(common.indexed_family_roots(("bbbb2222-scout",)))
+                search._emit_chats(hits, False)
+                search._note_family_index_behind()
+                search._note_family_index_behind()
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("[side chat]", lines[0])
+        self.assertIn("[side chat]", lines[1])
+        self.assertIn("[@bbbb2222:0", lines[1])
+        self.assertEqual(
+            err.getvalue().strip(),
+            "family index behind: side-chat marks and short handles may lag")
+
     def _stale_reader(self, root: Path) -> sqlite3.Connection:
         """A readable published snapshot whose stamp predates the sources."""
         path = root / "corpus.db"

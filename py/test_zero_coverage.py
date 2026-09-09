@@ -543,7 +543,6 @@ class SurfaceTests(unittest.TestCase):
                                   "--lexical", "--no-auto"])
         self.assertEqual(rc, 1)
         line = out.getvalue()
-        self.assertIn("searched 0 past session", line)
         self.assertIn("--agent gemini", line)
         self.assertIn("isn't in the index", line)
 

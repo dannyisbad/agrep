@@ -12,17 +12,21 @@ hyphens, and underscores.
 
 For a multi-token query, two lanes always run independently:
 
-1. **Phrase:** every token appears in query order, joined by zero or more
-   non-word/underscore characters. For example, `cyber filter` matches
-   `cyber_filter`.
-2. **All terms:** every raw token appears as a substring in any order.
+1. **Phrase:** every original token appears in query order, joined by zero or
+   more non-word/underscore characters. For example, `cyber filter` matches
+   `cyber_filter`. Inflection folding never changes this lane.
+2. **All terms:** every token appears as a substring in any order. ASCII word
+   tokens also accept a minimal singular/plural spelling (`s`, `es`, or `ies`);
+   the original spelling is always retained, and short or non-alphabetic tokens
+   stay exact. Thus `don calls` can recover prose containing `don` and `call`.
 
 The all-terms lane never depends on how many phrase hits exist. A row found by
-both lanes is emitted once as a phrase hit; phrase hits sort structurally ahead
-of all-terms hits. On porcelain output, a natural-language-only content fallback
-may run when both raw token lanes are empty. It is a third, lower tier based on
-informative query terms, not a relaxation of identifier-shaped grep. Plumbing
-surfaces (`--flat`, piped TSV, `--json`, `-l`, `-c`, and `--lexical`) never run it.
+both lanes is emitted once as a phrase hit. Row search keeps phrase hits
+structurally ahead of all-terms hits. On porcelain output, a
+natural-language-only content fallback may run when both token lanes are empty.
+It is a third, lower tier based on informative query terms, not a relaxation of
+identifier-shaped grep. Plumbing surfaces (`--flat`, piped TSV, `--json`, `-l`,
+`-c`, and `--lexical`) never run it.
 
 `-w` requests literal whole-word matching and `-E` requests the supplied regular
 expression. Those explicit modes bypass boundary ranking. `--sort time` uses
@@ -30,8 +34,8 @@ recency instead of the default score order.
 
 ## Default score order
 
-Lane order is lexicographic: phrase, all-terms, then content fallback. Within a
-lane, the relevance score is:
+For row output, lane order is lexicographic: phrase, all-terms, then content
+fallback. Within a lane, the relevance score is:
 
 ```text
 S = T * R * W * B
@@ -39,8 +43,11 @@ S = T * R * W * B
 
 - `T` is match tightness and repetition. For the tightest matching span,
   `tight = min(1, query_characters / span_characters)`, and `n` occurrences
-  contribute `T = tight * (1 - 0.5^n)`. All-terms rows also use matched-term
-  coverage and spread.
+  contribute `T = tight * (1 - 0.5^n)`. All-terms rows measure coverage and
+  spread from the same best-aligned occurrence selected for `B`. If any selected
+  occurrence has only one or no aligned edge, its quality removes the adjacency
+  bonus down to the `0.5` proximity floor; an interior fragment cannot earn a
+  near-phrase score merely because it sits beside another query term.
 - `R = 0.5^(age_days / 14)`. Human prompts retain a floor above the fresh
   recap/tool score ceilings. Explicit `-w` and `-E` searches also retain a
   recency floor.
@@ -53,6 +60,16 @@ Final ties are deterministic by timestamp, session, turn, and speaker. Because
 `B` can never raise a score, an unseen candidate can safely be bounded with
 `B = 1`; broad candidate walks may therefore stop once their score ceiling
 cannot enter the requested page.
+
+Session-head views (`-l` and content-ranked `chats`) choose the best row per
+session by a lane-folded score instead of row output's lane-first key:
+
+```text
+S_view = S * L, where L = 1.0 (phrase), 0.7 (all terms), 0.5 (content fallback)
+```
+
+This lets strong human prose represent a chat ahead of a weak phrase found in
+tool output without changing ordinary row-search ordering.
 
 ## Code-aware boundary factor
 
@@ -125,10 +142,29 @@ running machine cannot open degrades exactly like a stale generation: keyword
 results with one disclosure, never a query answered across two vector spaces.
 See `py/README.md` for the lane contract.
 
-In the automatic hybrid merge, weak lexical evidence never vetoes strong
-meaning evidence: only a strong visible row of the same conversation family
-may suppress the semantic lead as already-covered, and a weak lexical copy of
-the exact same row yields its slot to the semantic-labeled twin (shown once).
+A meaning row is trusted at or above the strong band (cosine 0.84) and shown at
+all from the floor (0.82); between them it is labeled a weak meaning match.
+`bench/semantic_calibration.py` places those bands against a committed text
+baseline: unrelated short rows reach 0.79, rows sharing one content noun reach
+0.85, paraphrases start at 0.85 and centre near 0.93. Scores carry about ±0.02
+of int8 batch-padding noise on the CPU lane (a row embedded alone and the same
+row embedded in a padded batch agree to ~0.99 cosine); a query always embeds
+alone, so a row within that distance of a band may land on either side.
+
+Each meaning row is also anchored on the query's content words (three or more
+characters, not a stopword): a row whose full indexed text carries fewer than
+half of them is a weak meaning match whatever its cosine, because one shared
+noun buys a strong-band score on its own. Weak meaning rows sort after
+confident ones and never lead a page.
+
+In the automatic hybrid merge, a meaning row is corroborated when its
+conversation family also holds a strong lexical row; bag-of-words scatter
+cousins corroborate only when the lexical lane is itself all scatter. Weak
+lexical evidence never vetoes strong meaning evidence: only a strong visible
+row of the same family may suppress the semantic lead as already-covered, and
+a weak lexical copy of the exact same row yields its slot to the
+semantic-labeled twin (shown once). With strong lexical rows and no
+corroborated meaning row, exact matches lead and one meaning row follows them.
 
 ## Recall lane hierarchy
 
@@ -146,36 +182,65 @@ lane. `--who tool` forces the tool lane directly.
 
 ## Over-specification recovery
 
-A wordy natural-language keyword query whose page holds no strong independent
-row - every hit is a weak-tier match, a semantic assist, a `~self` family row,
-or a verbatim quote of the query itself (an echo, judged on row text, never
-the rendered snippet) - retries once with a coverage lane: the query's terms
-are OR-ed and rows ranked by FTS5 `bm25()`, so the corpus's own document
-frequencies decide which terms are informative. Narration the corpus holds
-everywhere weighs approximately nothing; rare evidence terms dominate; length
-normalization keeps giant blobs from outranking focused rows. There is
+A multi-term keyword query (a query with a space that splits on whitespace,
+`-` and `_` into five or more distinct terms) whose page holds no strong
+independent row - every hit is a weak-tier match, a meaning row, a `~self`
+family row, or a verbatim quote of the query itself (an echo, judged on row
+text, never the rendered snippet) - retries once with a coverage lane: the
+query's terms are OR-ed and rows ranked by FTS5 `bm25()`, so the corpus's own
+document frequencies decide which terms are informative. Narration the corpus
+holds everywhere weighs approximately nothing; rare evidence terms dominate;
+length normalization keeps giant blobs from outranking focused rows. There is
 deliberately no curated stopword list in this lane.
 
-The recovered rows render as a labeled block after the page, capped at five
-family-diverse sessions not already shown, and the disclosure names the
-reformulation that was actually measured ("top row matched 13/17 terms -
-dropped: …"). Echo rows never enter the block. Code-shaped queries keep the
-pure-grep carve-out: identifier-shaped input and bare keyword bags are never
-retried, and `--lexical`, `-w`, `-E`, `-s`, machine modes, and non-score sorts
-never run the retry.
+An empty or echo-only page retries whatever the query's shape, because nothing
+else is left to show. A page that already carries weak scatter is partial
+evidence, so it retries only when the query has narration to shed: a stop
+word, or a term the corpus holds in a quarter or more of its sessions. A
+single joined identifier is one grep pattern and never retries. Meaning rows
+never suppress the retry: a page filled only by the automatic semantic lane is
+a masked page, and `agrep recall` runs the same lane after a pack whose rows
+are all meaning rows, weak scatter or echoes, and on a zero page.
+
+The recovered rows render as a labeled block on stderr after the page, capped
+at five family-diverse sessions not already shown, and the disclosure names
+the reformulation that was actually measured ("top row matched 5/7 terms -
+dropped: …"). Every row is a weak `content-terms` match: the block never
+enters the pack, `--json`, counts, or exit status, and it honours every scope
+filter of the query, including `--exclude-project`, `--no-side` and the
+caller's self-exclusion. Echo rows never enter the block. Explicit lanes stay
+pure: `--lexical`, `-w`, `-E`, `-s`, `--probe`, machine modes, and non-score
+sorts never run the retry; `--coverage` forces the lane on a porcelain page.
+
+Concise recall skips `~self` tool rows when selecting the recovered row; the full
+coverage view retains them. It keeps the selected evidence, measured term coverage,
+and scoped command rather than replacing retrieved evidence with another command.
 
 ## Caller-window identity and echo demotion
 
-Automatic self-exclusion requires two independent facts: a directly exported
-caller session identity and a numeric recap boundary indexed for that session.
-It hides only rows in that caller transcript at or after the boundary. A recap
-does not prove where a child or sibling transcript's active window begins, so
-family members remain ordinary evidence; their names are never used as a scope
-heuristic. Missing, malformed, or unavailable boundaries fail open and hide
-nothing. `--self` includes the proven current window, while explicit
-`--no-self` excludes the caller and every structurally indexed family member.
-The rule holds identically in the SQL pre-top-k filter, JSONL fallback scan,
-semantic filter, and post-top-k defensive check.
+Automatic self-exclusion resolves the exported or process-published caller before
+calculating its window. A numeric recap sets the inclusive start; a session proved
+never compacted starts at turn zero. Descendants with proven membership in that
+active window are excluded too. Older family members remain ordinary evidence.
+Missing, malformed, or unavailable window proof hides nothing automatically.
+`--self` includes the current window; explicit `--no-self` excludes the complete
+structurally indexed family. SQL, JSONL, semantic, and post-top-k checks share
+this scope.
+
+When a pi/OMP root header changes ID, its stamped source filename still identifies
+the sidechat container. Ingest derives that filename alias from the existing parse
+cache, publishes it on the canonical session row, and reattaches child parents.
+The version-3 family digest includes aliases. Both spellings resolve to the header
+ID before caller/window lookup; verified census fallback also preserves aliases
+when the query database is unavailable. Source transcripts are not rewritten.
+
+Lexical probe candidates cannot establish confidence from `~self` tool inputs
+alone, including relay messages and search arguments. The check binds to the exact
+event and selected match in the canonical tool record, using the active matcher.
+Matching output remains eligible even when the selected occurrence is in the input.
+Prose that repeats a multi-term query also cannot supply `~self` probe confidence.
+Classification precedes tool/meaning fallback decisions and pointer selection.
+Ordinary recall rows and explicit handle retrieval remain available.
 
 On the compact display lane, a row whose text verbatim-quotes a wordy
 natural-language query (the same echo judgment the over-specification retry

@@ -27,6 +27,7 @@ import common  # noqa: E402
 import corpusdb  # noqa: E402
 import indexd_runtime  # noqa: E402
 import indexer  # noqa: E402
+import index_lock  # noqa: E402
 import ownerfile  # noqa: E402
 
 
@@ -454,7 +455,6 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
 
                 search.corpusdb = corpusdb
                 explore._messages_by_session_read.cache_clear()
-                explore._messages_by_session.cache_clear()
                 with mock.patch.object(common, "DATA_DIR", path.parent), \
                         mock.patch.object(common, "MESSAGES_PATH", messages), \
                         mock.patch.object(explore, "_freshen"), \
@@ -506,7 +506,6 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
                             "--classic"])
                     rendered["miss"] = (rc, stdout.getvalue(), stderr.getvalue())
                 explore._messages_by_session_read.cache_clear()
-                explore._messages_by_session.cache_clear()
                 self.assertEqual(counted["engine"], "jsonl")
                 self.assertEqual(counted["total"], 2)
                 self.assertTrue(counted.get("totals_exact", True))
@@ -602,7 +601,6 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
 
                 search.corpusdb = corpusdb
                 explore._messages_by_session_read.cache_clear()
-                explore._messages_by_session.cache_clear()
                 with mock.patch.object(explore, "_freshen"), \
                         mock.patch.object(
                             explore, "direct_snapshot_attempt",
@@ -620,7 +618,6 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
                 release.set()
                 worker.join(5.0)
                 explore._messages_by_session_read.cache_clear()
-                explore._messages_by_session.cache_clear()
 
             self.assertFalse(worker.is_alive())
             self.assertNotIn("error", result)
@@ -763,7 +760,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
 
     @staticmethod
     def _pause_owned_ingest(data: Path, found: threading.Event,
-                            state: dict[str, object]) -> None:
+                            state: dict[str, object], barrier: index_lock.IndexLock) -> None:
         while not found.is_set():
             for path in data.glob(".indexd.v*.child.*"):
                 try:
@@ -776,13 +773,27 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                 if match is None:
                     continue
                 pid = int(match.group(1))
+                birth = match.group(2)
+                if common.process_start_identity(pid) != birth:
+                    continue
                 try:
                     os.kill(pid, signal.SIGSTOP)
                 except OSError:
                     continue
-                state.update(pid=pid, start=match.group(2), fence=path)
-                found.set()
-                return
+                while not found.is_set() and common.process_start_identity(pid) == birth:
+                    try:
+                        status = subprocess.run(
+                            ["/bin/ps", "-p", str(pid), "-o", "stat="],
+                            capture_output=True, text=True, timeout=1)
+                    except (OSError, subprocess.TimeoutExpired):
+                        break
+                    if (status.returncode == 0 and status.stdout.strip().startswith("T")
+                            and common.process_start_identity(pid) == birth):
+                        state.update(pid=pid, start=birth, fence=path, stopped=True)
+                        barrier.__exit__(None, None, None)
+                        found.set()
+                        return
+                    time.sleep(0.005)
             time.sleep(0.0005)
 
     @staticmethod
@@ -824,6 +835,122 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             raise AssertionError("search JSON emitted multiple agrep-meta records")
         return records[1:]
 
+    def test_successor_publishes_rebuilt_cache_before_daemon_start(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-rebuilt-adoption-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            data.mkdir()
+            self._sources(home, OLD_TEXT, 1, 1)
+            initial_env = self._env(home, data, RELEASE_BIN)
+            initial_env["AGREP_NO_DAEMON"] = "1"
+            initial_env["AGREP_NO_FETCH"] = "1"
+            initial = subprocess.run(
+                [sys.executable, os.fspath(CLI), "index"],
+                cwd=ROOT, env=initial_env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            cache_path = data / ".ingest_cache.bin"
+            cache = bytearray(cache_path.read_bytes())
+            cache[-1] ^= 0xFF
+            cache_path.write_bytes(cache)
+            (data / ".events_complete.cline.json").unlink()
+            self._sources(home, NEW_TEXT, 2, 1)
+            successor = self._successor_binary(root)
+            env = self._env(home, data, successor)
+            env["AGREP_NO_DAEMON"] = "1"
+            env["AGREP_NO_FETCH"] = "1"
+            try:
+                rebuilt = subprocess.run(
+                    [sys.executable, os.fspath(CLI), "index"],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+                with closing(sqlite3.connect(data / "corpus.db")) as db:
+                    self.assertEqual(
+                        db.execute("SELECT text FROM msgs WHERE who='user'").fetchone()[0],
+                        NEW_TEXT)
+                env.pop("AGREP_NO_DAEMON")
+
+                def recovered() -> bool:
+                    latest, _elapsed = self._run_search(env, NEW_TEXT)
+                    return latest.returncode == 0 and any(
+                        NEW_TEXT in row.get("snippet", "") for row in self._json_rows(latest))
+
+                self._wait_for(
+                    recovered, 20,
+                    "successor daemon could not serve the rebuilt publication")
+                status = subprocess.run(
+                    [sys.executable, os.fspath(CLI), "status", "--json"],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(status.returncode, 0, status.stderr)
+                packet = json.loads(status.stdout)
+                self.assertTrue(packet["daemon"]["running"], packet)
+                self.assertTrue(packet["search_index_ready"], packet)
+            finally:
+                stopped = subprocess.run(
+                    [sys.executable, os.fspath(CLI), "remove"],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_search_reads_old_publication_while_successor_adoption_is_active(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-active-adoption-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            data.mkdir()
+            self._sources(home, OLD_TEXT, 1, 8)
+            initial_env = self._env(home, data, RELEASE_BIN)
+            initial_env["AGREP_RUNTIME_BUILD_ID"] = OLD_BUILD
+            initial = subprocess.run(
+                [str(RELEASE_BIN), "index", "--agent", "cline"],
+                cwd=ROOT, env=initial_env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            published = (data / "messages.jsonl").read_bytes()
+            self._sources(home, NEW_TEXT, 2, 8)
+            successor = self._successor_binary(root)
+            env = self._env(home, data, successor)
+            process = None
+            try:
+                with mock.patch.object(
+                        index_lock, "INDEX_LOCK_PATH", data / ".index.lock"), \
+                        index_lock.IndexLock("adoption-barrier"):
+                    process = subprocess.Popen(
+                        [str(successor), "index", "--agent", "cline"],
+                        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True)
+
+                    def adopting():
+                        for path in data.glob(".indexd*.lock"):
+                            try:
+                                text = path.read_text(encoding="ascii")
+                            except OSError:
+                                continue
+                            if (f"pid={process.pid} " in text
+                                    and "state=derived-adoption " in text):
+                                return True
+                        return False
+
+                    self._wait_for(adopting, 5.0, "successor did not enter adoption")
+                    result, _elapsed = self._run_search(env, OLD_TEXT)
+                    self.assertEqual((data / "messages.jsonl").read_bytes(), published)
+                    self.assertEqual(self._owner_build(data), OLD_BUILD)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    self.assertTrue(any(
+                        OLD_TEXT in str(row.get("snippet") or "")
+                        for row in self._json_rows(result)))
+                stdout, stderr = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn(NEW_TEXT, (data / "messages.jsonl").read_text(encoding="utf-8"))
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                subprocess.run(
+                    [sys.executable, "-c",
+                     "import indexd_runtime; "
+                     "indexd_runtime.stop_indexd_owner(wait_s=5.0)"],
+                    cwd=PY_DIR, env=env, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=10,
+                    check=False)
+
     def test_slow_successor_adoption_outlives_foreground_search(self) -> None:
         self.assertTrue(RELEASE_BIN.is_file(), RELEASE_BIN)
         with tempfile.TemporaryDirectory(
@@ -854,33 +981,56 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             env = self._env(home, data, successor)
             paused = threading.Event()
             pause_state: dict[str, object] = {}
+            barrier = index_lock.IndexLock("takeover-pause")
             monitor = threading.Thread(
                 target=self._pause_owned_ingest,
-                args=(data, paused, pause_state), daemon=True)
-            monitor.start()
+                args=(data, paused, pause_state, barrier), daemon=True)
             child_pid = None
             target_pid = None
             continued = False
             guards: list[Path] = []
             child_path = data / "missing-spawn-child"
             try:
+                with mock.patch.object(
+                        index_lock, "INDEX_LOCK_PATH", data / ".index.lock"), \
+                        barrier:
+                    monitor.start()
+                    kick = subprocess.run(
+                        [sys.executable, "-c",
+                         "import indexd_runtime; indexd_runtime.kick_background_repair()"],
+                        cwd=PY_DIR, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(kick.returncode, 0, kick.stderr)
+                    self._wait_for(
+                        paused.is_set, 5.0,
+                        "did not pause the exact successor ingest target")
+                    target_pid = int(pause_state["pid"])
+                    target_start = str(pause_state["start"])
+                    self.assertIs(
+                        ownerfile.classify_process(
+                            target_pid, target_start, pid_alive=common.pid_alive,
+                            process_start=common.process_start_identity),
+                        ownerfile.ProcessOwner.EXACT_LIVE)
+                    self.assertEqual(self._owner_build(data), OLD_BUILD)
+                    self.assertIn(
+                        OLD_TEXT,
+                        (data / "messages.jsonl").read_text(encoding="utf-8"))
+
                 foreground, elapsed = self._run_search(env, OLD_TEXT)
-                self.assertEqual(foreground.returncode, 0, foreground.stderr)
+                self.assertEqual(
+                    foreground.returncode, 0,
+                    foreground.stderr + "\n" + foreground.stdout + "\n" + json.dumps({
+                        "paused": paused.is_set(),
+                        "owner": self._owner_build(data),
+                        "messages_bytes": (data / "messages.jsonl").stat().st_size,
+                        "old_rows_present": OLD_TEXT in (
+                            data / "messages.jsonl").read_text(encoding="utf-8"),
+                        "new_rows_present": NEW_TEXT in (
+                            data / "messages.jsonl").read_text(encoding="utf-8"),
+                    }))
                 self.assertLess(elapsed, 3.0, foreground.stderr)
                 self.assertTrue(any(
                     OLD_TEXT in str(row.get("snippet") or "")
                     for row in self._json_rows(foreground)))
-                self._wait_for(
-                    paused.is_set, 5.0,
-                    "did not pause the exact successor ingest target")
-                target_pid = int(pause_state["pid"])
-                target_start = str(pause_state["start"])
-                self.assertIs(
-                    ownerfile.classify_process(
-                        target_pid, target_start, pid_alive=common.pid_alive,
-                        process_start=common.process_start_identity),
-                    ownerfile.ProcessOwner.EXACT_LIVE)
-                self.assertEqual(self._owner_build(data), OLD_BUILD)
 
                 guards = list(data.glob(".indexd.v*.spawn"))
                 self.assertEqual(len(guards), 1)

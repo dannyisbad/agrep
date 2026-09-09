@@ -992,6 +992,80 @@ raise SystemExit(rc)
                 self.assertFalse(unavailable.writable)
                 self.assertEqual(unavailable.state, "unavailable")
 
+    def test_unanchored_current_database_permits_only_rust_adoption(
+            self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-owner-stranded-") as raw:
+            root = Path(raw)
+            with self._paths(root) as (_messages, db_path, _owner_path):
+                self._database(db_path, owner=BUILD_A)
+                before = self._census(root)
+                ordinary = indexd_runtime.derived_writer_mutation_info()
+                self.assertFalse(ordinary.writable)
+                self.assertFalse(
+                    indexd_runtime.derived_writer_launchable(ordinary))
+                adoption = indexd_runtime.derived_writer_mutation_info(
+                    allow_legacy_adoption=True)
+                self.assertTrue(adoption.writable)
+                self.assertEqual(adoption.state, "absent")
+                self.assertFalse(indexd_runtime.derived_writes_permitted())
+                self.assertEqual(
+                    semantic.ensure_fresh_async()["state"], "read-only")
+                with self.assertRaises(OSError):
+                    semantic.write_generation_marker({"fixture": True})
+                self.assertEqual(self._census(root), before)
+
+    def test_unanchored_foreign_database_refuses_mutation_with_adoption(
+            self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-owner-stranded-foreign-") as raw:
+            root = Path(raw)
+            with self._paths(root) as (_messages, db_path, _owner_path):
+                self._database(db_path, owner=BUILD_B)
+                before = self._census(root)
+                for allow_adoption in (False, True):
+                    with self.subTest(allow_adoption=allow_adoption):
+                        ownership = indexd_runtime.derived_writer_mutation_info(
+                            allow_legacy_adoption=allow_adoption)
+                        self.assertFalse(ownership.writable)
+                        self.assertEqual(ownership.state, "foreign")
+                        self.assertEqual(ownership.build_id, BUILD_B)
+                self.assertEqual(self._census(root), before)
+
+    def test_unanchored_database_recovery_refuses_unverified_owner(
+            self) -> None:
+        for state in ("malformed", "unreadable"):
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory(
+                        prefix="agrep-owner-stranded-unverified-") as raw:
+                    root = Path(raw)
+                    with self._paths(root) as (_messages, db_path, _owner_path):
+                        if state == "malformed":
+                            self._database(db_path, owner="invalid-owner")
+                        else:
+                            db_path.mkdir()
+                        before = self._census(root)
+                        ownership = indexd_runtime.derived_writer_mutation_info(
+                            allow_legacy_adoption=True)
+                        self.assertFalse(ownership.writable)
+                        self.assertFalse(
+                            indexd_runtime.derived_writer_launchable(ownership))
+                        self.assertEqual(self._census(root), before)
+
+    def test_current_database_with_legacy_cache_refuses_unanchored_recovery(
+            self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-owner-stranded-cache-") as raw:
+            root = Path(raw)
+            with self._paths(root) as (_messages, db_path, _owner_path):
+                self._database(db_path, owner=BUILD_A)
+                (root / ".ingest_cache.bin").write_bytes(
+                    b"pre-owner legacy parse cache")
+                before = self._census(root)
+                ownership = indexd_runtime.derived_writer_mutation_info(
+                    allow_legacy_adoption=True)
+                self.assertFalse(ownership.writable)
+                self.assertFalse(
+                    indexd_runtime.derived_writer_launchable(ownership))
+                self.assertEqual(self._census(root), before)
+
     def test_foreign_build_fences_daemon_semantic_and_housekeeping_writers(
             self) -> None:
         class Watcher:
@@ -1924,6 +1998,31 @@ raise SystemExit(rc)
         # a locked database reports busy, not an indistinguishable shrug.
         self.assertEqual(readiness["state"], "busy")
         self.assertIn("index writer", readiness["detail"])
+
+    def test_unverifiable_writer_identity_is_not_an_ownership_verdict(
+            self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="agrep-owner-identity-gap-") as raw:
+            root = Path(raw)
+            with self._paths(root) as (_messages, db_path, owner_path):
+                self._database(db_path, owner=BUILD_A)
+                self._owner(owner_path, BUILD_A)
+                self._cache(root / ".ingest_cache.bin", BUILD_A)
+                with mock.patch.object(
+                        indexd_runtime, "derived_writer_build_id",
+                        side_effect=OSError(
+                            "TimeoutError: binary identity exceeded "
+                            "0.25s deadline")):
+                    ownership = corpusdb._derived_write_ownership(
+                        for_write=True)
+                    readiness = doctor._corpus_db_readiness()
+
+        self.assertEqual(ownership.state, "unavailable")
+        self.assertFalse(ownership.writable)
+        self.assertNotEqual(readiness["state"], "owned-elsewhere")
+        self.assertEqual(readiness["code"], "writer-identity-unavailable")
+        self.assertFalse(doctor._concluded(readiness))
+        self.assertIn("0.25s deadline", readiness["detail"])
 
     def test_private_owner_probe_recovers_hot_journal_only_in_alias(
             self) -> None:

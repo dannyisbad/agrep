@@ -11,11 +11,11 @@ still indexed and partly recoverable.
   state, run `agrep postcompact` FIRST - before acting or reconstructing
   from memory. It returns this session's newest pre-boundary turns as
   verbatim excerpts, bounded, marking what it omits, no query needed.
-- Do not use `agrep recall` for facts from this session: recall hides the
-  current context window, demotes this session's turns to ~self
-  side-evidence (`--self` overrides), and ranks your own tail against
-  lookalikes from all history. postcompact quotes the tail and needs no
-  query.
+- Do not use `agrep recall` for facts from this session: when it can
+  identify the calling session it hides the current context window and
+  demotes this session's older turns to ~self side-evidence (`--self`
+  overrides), and it always ranks your own tail against lookalikes from
+  all history. postcompact quotes the tail and needs no query.
 - If postcompact reports it cannot identify the calling session, rerun as
   `agrep postcompact --session <id>`.
 

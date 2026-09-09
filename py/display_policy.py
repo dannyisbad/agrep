@@ -17,6 +17,8 @@ from types import MappingProxyType
 from typing import NamedTuple
 import zlib
 
+from surface_policy import semantic_coverage_usable
+
 
 # F7 role taxonomy. Search/recall own the labels they print; this artifact keeps
 # their source classification structural and gives the Claude lane one object
@@ -103,10 +105,10 @@ _HISTORY_VALUE_OPTIONS = frozenset({
 })
 _HISTORY_FLAG_OPTIONS = frozenset({
     "-E", "-c", "-i", "-l", "-s", "-w", "--all-side-chats", "--classic",
-    "--count", "--count-by-tier", "--coverage", "--flat", "--ignore-case",
-    "--json", "--lexical", "--model-soft", "--no-auto", "--no-meta",
-    "--no-self", "--no-tools", "--probe", "--self", "--semantic", "--soft",
-    "--strict-semantic",
+    "--count", "--count-by-tier", "--coverage", "--flat", "--here",
+    "--ignore-case", "--json", "--lexical", "--model-soft", "--no-auto",
+    "--no-meta", "--no-self", "--no-side", "--no-tools", "--probe", "--self",
+    "--semantic", "--soft", "--strict-semantic",
 })
 _HISTORY_READ_VERBS = frozenset({"pack", "recall", "search"})
 _HISTORY_EVENT_VERBS = frozenset({
@@ -436,6 +438,30 @@ def history_read_invoked(event: Mapping, query: object) -> bool:
     normalized = _history_query(query)
     return (event.get("ok") is True and normalized is not None
             and normalized in history_read_queries(event))
+
+
+def tool_input_echo(
+        event: Mapping, record: tuple[str, tuple[int, int] | None],
+        pattern: re.Pattern | None,
+        match_span: tuple[int, int] | None,
+) -> bool:
+    """Check whether a selected tool match lacks matching output evidence."""
+    if event.get("kind") != "tool":
+        return False
+    if (pattern is None or type(event.get("output")) is not str
+            or not isinstance(match_span, (tuple, list))
+            or len(match_span) != 2
+            or any(type(value) is not int for value in match_span)):
+        return False
+    text, bounds = record
+    start, end = match_span
+    if not 0 <= start < end <= len(text):
+        return False
+    if bounds is None:
+        return True
+    if bounds[0] <= start < end <= bounds[1]:
+        return False
+    return pattern.search(text, bounds[0], bounds[1]) is None
 
 
 _NEAR_FOLD_ORIGINS = frozenset({"sidechain", "tool-output", "synthetic", "fixture"})
@@ -1290,7 +1316,7 @@ def _coverage_counts(
 
 
 def semantic_coverage_line(coverage: Mapping | None) -> str | None:
-    """Render partial semantic coverage without implying full-corpus search."""
+    """Render material semantic coverage gaps."""
     counts = _coverage_counts(coverage) if coverage is not None else None
     if counts is None:
         return (
@@ -1298,7 +1324,7 @@ def semantic_coverage_line(coverage: Mapping | None) -> str | None:
             "searched scope is not verified"
         )
     indexed, total, percent, complete = counts
-    if complete:
+    if complete or semantic_coverage_usable(coverage):
         return None
     return f"semantic: searched {indexed}/{total} embedded rows ({percent}%)"
 
@@ -1309,8 +1335,8 @@ def semantic_empty_line(coverage: Mapping | None) -> str:
     if counts is None:
         return "semantic: no match; embedding coverage is unavailable"
     indexed, total, _, complete = counts
-    if complete:
-        return f"semantic: no match among {total} embedded rows"
+    if complete or semantic_coverage_usable(coverage):
+        return f"semantic: no match among {indexed} embedded rows"
     waiting = total - indexed
     if indexed == 0:
         return ("semantic: no embedded rows were searchable yet; "
@@ -1349,36 +1375,22 @@ def probe_pointer_label(
 ) -> str:
     """A top pointer is evidence to inspect, never a claimed conclusion."""
     evidence_kind = (
-        "semantic evidence" if semantic is True else
-        "prose evidence" if semantic is False else
-        "unverified evidence"
+        "meaning" if semantic is True else
+        "" if semantic is False else "unverified"
     )
     # A malformed hedge marker cannot strengthen a pointer.
-    evidence = f"weak {evidence_kind}" if weak is not False else evidence_kind
-    kind = _event_kind(row)
-    who = _display_token(
-        kind or row.get("who") or row.get("event_kind")
-        or row.get("kind"),
-        "unknown",
-    )
-    meta = ", ~meta" if row.get("_meta_row") is True else ""
-    return (f"top candidate ({evidence}; provenance: "
-            f"{row_origin(row)}/{who}{meta})")
+    evidence = f"weak {evidence_kind or 'text'}" if weak is not False else evidence_kind
+    origin = row_origin(row)
+    provenance = {
+        "lived": "", "sidechain": "side chat", "tool-output": "tool",
+    }.get(origin, origin)
+    meta = "~meta" if row.get("_meta_row") is True else ""
+    return " · ".join(part for part in (evidence, provenance, meta) if part)
 
 
-def probe_miss_line(
-    engine: str, *, corpus_sessions: int | None = None,
-    semantic_warming: bool = False,
-) -> str:
-    """The enrollment/miss edge remains judgeable even when rc is one."""
+def probe_miss_line(*, corpus_sessions: int | None = None) -> str:
     session_count = _source_count(corpus_sessions)
-    searched = (
-        "corpus session count unavailable"
-        if session_count is None else
-        f"searched {session_count} past session(s)"
-    )
-    lane = ("; semantic model warming, keyword evidence only"
-            if semantic_warming is True else "")
-    engine_label = _display_token(engine, "unknown engine")
-    return (f"recall: no confident past-context pointer "
-            f"({engine_label}; {searched}{lane})")
+    searched = ("" if session_count is None else
+                f" in {session_count:,} past conversation"
+                f"{'s' if session_count != 1 else ''}")
+    return f"recall: no confident match{searched}"

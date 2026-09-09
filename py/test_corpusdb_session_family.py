@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -18,6 +19,7 @@ from _test_support import isolate_data_dir
 isolate_data_dir()
 import common  # noqa: E402
 import corpusdb  # noqa: E402
+import explore  # noqa: E402
 import session_context  # noqa: E402
 
 
@@ -33,7 +35,8 @@ class CorpusSessionFamilyTests(unittest.TestCase):
     def _write_family_meta(
             root: Path, rows: list[dict], signature: str = "2:fixture") -> None:
         pairs = [
-            (str(row["session"]), str(row.get("parent") or ""))
+            (str(row["session"]), str(row.get("parent") or ""),
+             str(row.get("alias") or ""))
             for row in rows
         ]
         (root / common.SESSION_FAMILY_META_FILE).write_text(
@@ -57,7 +60,7 @@ class CorpusSessionFamilyTests(unittest.TestCase):
             "".join(json.dumps(row) + "\n" for row in rows),
             encoding="utf-8",
         )
-        (root / ".ingest.sig").write_text(signature + "\n", encoding="utf-8")
+        (root / ".ingest.sig").write_bytes((signature + "\n").encode("utf-8"))
 
     def _paths(self, root: Path):
         return (
@@ -235,6 +238,52 @@ class CorpusSessionFamilyTests(unittest.TestCase):
             self.assertEqual(policy.excludes(session, turn), excluded,
                              (session, turn))
 
+    def test_recap_state_separates_no_rows_from_malformed_rows(self) -> None:
+        db = sqlite3.connect(":memory:")
+        db.executescript("""
+            CREATE TABLE msgs(session TEXT, turn INTEGER, who TEXT);
+            CREATE TABLE session_family(
+                session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                side INTEGER NOT NULL CHECK(side IN (0, 1))) WITHOUT ROWID;
+        """)
+        db.executemany(
+            "INSERT INTO session_family VALUES(?, ?, ?)",
+            (("fresh", "fresh", 0), ("compacted", "compacted", 0),
+             ("malformed", "malformed", 0), ("negative", "negative", 0)))
+        db.executemany(
+            "INSERT INTO msgs VALUES(?, ?, ?)",
+            (("fresh", 0, "user"), ("fresh", 1, "agent"),
+             ("compacted", 3, "recap"), ("compacted", 9, "recap"),
+             ("compacted", 10, "user"),
+             ("malformed", 7.5, "recap"),
+             ("negative", -1, "recap")))
+        cases = {
+            "fresh": (None, True),
+            "compacted": (9, False),
+            "malformed": (None, False),
+            "negative": (None, False),
+            "unknown": (None, True),
+        }
+        for session, expected in cases.items():
+            with self.subTest(session=session):
+                self.assertEqual(
+                    session_context._indexed_recap_boundary_in_db(db, session),
+                    expected)
+        # the resolved never-compacted caller becomes a window from turn 0
+        state = session_context._indexed_calling_family_full_state_in_db(
+            db, "fresh")
+        self.assertEqual(
+            state, ("fresh", "fresh", frozenset({"fresh"}), None, True))
+        where, params = corpusdb._filter_sql(
+            {"exclude_session": "fresh", "exclude_session_from_turn": 0})
+        rows = {row[0] for row in db.execute(
+            "SELECT session || ':' || turn FROM msgs WHERE "
+            + " AND ".join(where), params)}
+        db.close()
+        self.assertNotIn("fresh:0", rows)
+        self.assertNotIn("fresh:1", rows)
+        self.assertIn("compacted:10", rows)
+
     def test_awaited_read_recovers_from_a_torn_republish(self) -> None:
         import threading
 
@@ -306,9 +355,18 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                 )
 
     def test_family_digest_matches_the_rust_fixture(self) -> None:
+        # pinned by cache.rs session_family_proof_tracks_only_the_parent_census
         self.assertEqual(
             common.session_family_digest([("child", "root")]),
-            "c1c7707327949139ce23522fdb772b08d9e8ff0345f42200",
+            "c2e7baea9bc8402efb6ddd59b11482b4158cdbe4544c6200",
+        )
+        self.assertEqual(
+            common.session_family_digest([("child", "root", "")]),
+            common.session_family_digest([("child", "root")]),
+        )
+        self.assertNotEqual(
+            common.session_family_digest([("root", "", "file-id")]),
+            common.session_family_digest([("root", "")]),
         )
 
     def test_restored_mtime_invalidates_the_cached_family_census(self) -> None:
@@ -333,12 +391,13 @@ class CorpusSessionFamilyTests(unittest.TestCase):
         import hashlib
 
         rows = [
-            (f"session-{index:05d}", f"parent-{index // 7:05d}")
+            (f"session-{index:05d}", f"parent-{index // 7:05d}",
+             f"alias-{index:05d}" if index % 11 == 0 else "")
             for index in range(5_000)
         ]
         canonical = bytearray(b"agrep-session-family-v1\0")
-        for session, parent in rows:
-            for value in (session, parent):
+        for row in rows:
+            for value in row:
                 encoded = value.encode()
                 canonical.extend(len(encoded).to_bytes(8, "little"))
                 canonical.extend(encoded)
@@ -385,6 +444,177 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                 corpusdb._reconcile_session_families(db, snapshot, "*")
             self.assertIsNone(db.execute(
                 "SELECT value FROM meta WHERE key='family_stamp'").fetchone())
+
+    _ALIASED_ROWS = [
+        # a pi root whose header id was rewritten: the filename (and every
+        # sidechat child) still names the old id
+        {"session": "header-id", "alias": "file-id"},
+        {"session": "child", "parent": "header-id"},
+        {"session": "later-child", "parent": "header-id"},
+        {"session": "other"},
+    ]
+    _FAMILY_SCHEMA = """
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE session_family(
+            session TEXT PRIMARY KEY, root TEXT NOT NULL,
+            side INTEGER NOT NULL CHECK(side IN (0, 1))) WITHOUT ROWID;
+        CREATE INDEX session_family_root ON session_family(root);
+        CREATE TABLE msgs(session TEXT, who TEXT, turn INTEGER, ts INTEGER,
+                          text TEXT);
+    """
+
+    def _family_table(self, db) -> dict[str, tuple[str, int]]:
+        return {
+            str(session): (str(root), int(side))
+            for session, root, side in db.execute(
+                "SELECT session, root, side FROM session_family")
+        }
+
+    def test_alias_rows_attach_the_filename_id_to_the_header_family(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._publish_families(root, self._ALIASED_ROWS)
+            with _data_dir(root):
+                census = common.read_session_family_census(root)
+                self.assertEqual(dict(census.aliases), {"file-id": "header-id"})
+                self.assertEqual(
+                    dict(census.parents),
+                    {"child": "header-id", "later-child": "header-id"})
+                snapshot = corpusdb._read_session_families()
+            expected = {
+                "header-id": ("header-id", 0),
+                "child": ("header-id", 1),
+                "later-child": ("header-id", 1),
+                "other": ("other", 0),
+                "file-id": ("header-id", 0),
+            }
+            with closing(sqlite3.connect(":memory:")) as db:
+                db.executescript(self._FAMILY_SCHEMA)
+                corpusdb._replace_session_families(db, snapshot)
+                self.assertEqual(self._family_table(db), expected)
+                self.assertEqual(
+                    json.loads(db.execute(
+                        "SELECT value FROM meta WHERE key=?",
+                        (common.FAMILY_ALIASES_META_KEY,)).fetchone()[0]),
+                    {"file-id": "header-id"})
+                # the index built before the header rewrite: children hang off
+                # the filename id as a parent-only extra
+                db.execute("DELETE FROM session_family")
+                before = corpusdb._SessionFamilySnapshot(
+                    "old-stamp", snapshot.sessions,
+                    {"child": "file-id", "later-child": "file-id"})
+                corpusdb._replace_session_families(db, before)
+                self.assertEqual(
+                    self._family_table(db)["later-child"], ("file-id", 1))
+                # the alias arrives on a delta that names none of the children;
+                # they re-root anyway
+                corpusdb._reconcile_session_families(db, snapshot, {"other"})
+                self.assertEqual(self._family_table(db), expected)
+                # the stable alias keeps the incremental path incremental
+                db.execute(
+                    "UPDATE session_family SET root='file-id' "
+                    "WHERE session='later-child'")
+                corpusdb._reconcile_session_families(
+                    db, snapshot, {"later-child"})
+                self.assertEqual(self._family_table(db), expected)
+                # an alias the publication dropped disappears with it
+                plain = corpusdb._SessionFamilySnapshot(
+                    "plain-stamp", snapshot.sessions, snapshot.parents)
+                corpusdb._reconcile_session_families(db, plain, {"other"})
+                self.assertNotIn("file-id", self._family_table(db))
+                self.assertEqual(
+                    json.loads(db.execute(
+                        "SELECT value FROM meta WHERE key=?",
+                        (common.FAMILY_ALIASES_META_KEY,)).fetchone()[0]),
+                    {})
+
+    def test_census_refuses_an_alias_that_collides_with_a_session(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for rows in (
+                    [{"session": "a", "alias": "b"}, {"session": "b"}],
+                    [{"session": "a", "alias": "x"}, {"session": "b", "alias": "x"}],
+                    [{"session": "a", "alias": "a"}],
+            ):
+                with self.subTest(rows=rows):
+                    self._publish_families(root, rows)
+                    with _data_dir(root):
+                        self.assertIsNone(common.read_session_family_census(root))
+
+    def test_both_ids_resolve_to_the_canonical_family(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._publish_families(root, self._ALIASED_ROWS)
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript(self._FAMILY_SCHEMA)
+            with _data_dir(root):
+                corpusdb._replace_session_families(
+                    db, corpusdb._read_session_families())
+                db.executemany(
+                    "INSERT INTO msgs VALUES(?, ?, ?, ?, ?)",
+                    (("header-id", "user", 0, 10, "before"),
+                     ("header-id", "recap", 5, 50, "recap"),
+                     ("header-id", "user", 6, 60, "after"),
+                     ("child", "user", 0, 20, "early child"),
+                     ("later-child", "user", 0, 70, "post-surgery child"),
+                     ("other", "user", 0, 30, "unrelated")))
+                db.commit()
+                db.close()
+                for query in ("file-id", "header-id", "file", "header"):
+                    self.assertEqual(
+                        common.indexed_session_matches(query), ["header-id"],
+                        query)
+                self.assertEqual(
+                    common.indexed_family_roots(("file-id", "later-child")),
+                    {"file-id": "header-id", "later-child": "header-id"})
+                members = frozenset({"header-id", "child", "later-child"})
+                for caller in ("file-id", "header-id"):
+                    self.assertEqual(
+                        common.indexed_calling_family(caller),
+                        ("header-id", members), caller)
+                    with mock.patch.object(
+                            session_context, "calling_identity",
+                            return_value=common.CallerIdentity(caller, "pi")):
+                        family = common.calling_family()
+                        policy = common.calling_self_exclusion()
+                    self.assertEqual(family.session, "header-id", caller)
+                    self.assertEqual(family.root, "header-id")
+                    self.assertEqual(family.members, members)
+                    self.assertEqual(
+                        family.descendants, frozenset({"child", "later-child"}))
+                    # the live window starts at the header session's recap and
+                    # hides only the child spawned after it
+                    self.assertEqual(policy.boundary, 5)
+                    self.assertTrue(policy.excludes("header-id", 6))
+                    self.assertFalse(policy.excludes("header-id", 0))
+                    self.assertTrue(policy.excludes("later-child", 0))
+                    self.assertFalse(policy.excludes("child", 0))
+                    self.assertFalse(policy.excludes("other", 0))
+                    self.assertEqual(
+                        policy.query_filters()["exclude_session"], "header-id")
+                # SQL family exclusion accepts either spelling of the caller
+                with closing(sqlite3.connect(root / "corpus.db")) as db:
+                    for caller in ("file-id", "header-id"):
+                        where, params = corpusdb._filter_sql(
+                            {"exclude_session": caller})
+                        remaining = {row[0] for row in db.execute(
+                            "SELECT text FROM msgs WHERE " + " AND ".join(where),
+                            params)}
+                        self.assertEqual(remaining, {"unrelated"}, caller)
+
+    def test_source_census_preserves_aliases_without_the_query_database(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._publish_families(root, self._ALIASED_ROWS)
+            servable = {row["session"]: row for row in self._ALIASED_ROWS}
+            with _data_dir(root), \
+                    mock.patch.object(explore, "_freshen"), \
+                    mock.patch.object(explore, "_session_index", return_value=servable):
+                for query in ("file-id", "file", "header-id"):
+                    self.assertEqual(explore.resolve_session(query), ["header-id"])
+                members, sides = explore._native_family_members("file-id")
+                self.assertEqual(members, frozenset({"header-id", "child", "later-child"}))
+                self.assertEqual(sides, frozenset({"child", "later-child"}))
 
     def test_hot_family_stamp_never_opens_the_census(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -856,6 +1086,161 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                         ).fetchall(),
                         [("10",)],
                     )
+
+    def test_family_index_serves_the_committed_snapshot_under_a_live_writer(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._publish_families(root, [
+                {"session": "root"},
+                {"session": "child", "parent": "root"},
+            ])
+            path = root / "corpus.db"
+            with _data_dir(root):
+                stamp = common.session_family_source_stamp()
+                with closing(sqlite3.connect(path)) as db:
+                    db.executescript("""
+                        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                        CREATE TABLE session_family(
+                            session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                            side INTEGER NOT NULL CHECK(side IN (0, 1))
+                        ) WITHOUT ROWID;
+                    """)
+                    db.execute(
+                        "INSERT INTO meta VALUES('family_stamp', ?)", (stamp,))
+                    db.executemany(
+                        "INSERT INTO session_family VALUES(?, ?, ?)",
+                        (("root", "root", 0), ("child", "root", 1)))
+                    db.commit()
+                writer = sqlite3.connect(path, isolation_level=None)
+                try:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute(
+                        "INSERT INTO session_family VALUES('twig', 'root', 1)")
+                    self.assertGreater(
+                        Path(f"{path}-journal").stat().st_size, 0,
+                        "fixture must hold a live rollback journal")
+                    with mock.patch.object(
+                            session_context, "_FAMILY_INDEX_BEHIND", False):
+                        snapshot = session_context._open_session_family_index()
+                        self.assertIsNotNone(snapshot)
+                        try:
+                            self.assertEqual(
+                                sorted(row[0] for row in snapshot.execute(
+                                    "SELECT session FROM session_family")),
+                                ["child", "root"])
+                        finally:
+                            snapshot.close()
+                        self.assertFalse(session_context.family_index_behind())
+                    writer.execute("COMMIT")
+                finally:
+                    writer.close()
+                self.assertEqual(
+                    common.indexed_family_roots(("twig",)), {"twig": "root"})
+
+    def test_outputs_ahead_of_the_commit_marker_keep_the_committed_generation(
+            self) -> None:
+        from _test_support import publish_derived_generation
+
+        rows = [
+            {
+                "id": f"codex:{session}:1", "session": session,
+                "agent": "codex", "project": "p", "turn": 1, "ts": 1,
+                "who": "user", "text": f"needle {session}",
+                "parent": parent,
+            }
+            for session, parent in (("child", "root"), ("root", ""))
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            publish_derived_generation(
+                root, rows, common, corpusdb, signature="2:committed")
+            path = root / "corpus.db"
+            with _data_dir(root):
+                committed = common.session_family_source_stamp()
+                publication = common.read_family_publication()
+                self.assertEqual(
+                    publication,
+                    common.FamilyPublication(
+                        "2:committed",
+                        hashlib.sha256(b"2:committed\n").hexdigest(),
+                        committed, False))
+                generation = common.transcript_generation(root)
+                with closing(sqlite3.connect(path)) as db:
+                    db.executescript("""
+                        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                        CREATE TABLE session_family(
+                            session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                            side INTEGER NOT NULL CHECK(side IN (0, 1))
+                        ) WITHOUT ROWID;
+                    """)
+                    db.execute(
+                        "INSERT INTO meta VALUES('family_stamp', ?)",
+                        (committed,))
+                    db.executemany(
+                        "INSERT INTO session_family VALUES(?, ?, ?)",
+                        (("root", "root", 0), ("child", "root", 1)))
+                    db.commit()
+
+                (root / "messages.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows)
+                    + json.dumps({**rows[0], "session": "twig",
+                                  "id": "codex:twig:1"}) + "\n",
+                    encoding="utf-8")
+                (root / "sessions.jsonl").write_text(
+                    json.dumps({"session": "child", "parent": "root"}) + "\n"
+                    + json.dumps({"session": "root"}) + "\n"
+                    + json.dumps({"session": "twig", "parent": "root"}) + "\n",
+                    encoding="utf-8")
+
+                self.assertEqual(common.session_family_source_stamp(), committed)
+                moving = common.read_family_publication()
+                self.assertEqual(
+                    moving, publication._replace(moving=True))
+                with self.assertRaisesRegex(
+                        common.TranscriptPublicationRace,
+                        "outputs precede their ingest signature"):
+                    common.transcript_generation(root, attempts=1)
+                self.assertIsNone(common.strict_family_parent_map(root))
+                with mock.patch.object(
+                        session_context, "_FAMILY_INDEX_BEHIND", False):
+                    self.assertEqual(
+                        common.indexed_family_roots(("child",)),
+                        {"child": "root"})
+                    self.assertFalse(session_context.family_index_behind())
+
+                publish_derived_generation(
+                    root, rows + [{**rows[0], "session": "twig",
+                                   "id": "codex:twig:1"}],
+                    common, corpusdb, signature="3:next")
+                landed = common.read_family_publication()
+                self.assertEqual(landed.signature, "3:next")
+                self.assertFalse(landed.moving)
+                self.assertNotEqual(landed.stamp, committed)
+                self.assertNotEqual(common.transcript_generation(root), generation)
+                self.assertIsNone(common.indexed_family_roots(("child",)))
+                with mock.patch.object(
+                        session_context, "_FAMILY_INDEX_BEHIND", False):
+                    self.assertEqual(
+                        common.indexed_family_roots(
+                            ("child",), allow_behind=True),
+                        {"child": "root"})
+                    self.assertTrue(session_context.family_index_behind())
+
+    def test_family_meta_ahead_of_the_signature_reads_as_moving(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._publish_families(root, [{"session": "root"}], "2:gen0")
+            self._write_family_meta(
+                root, [{"session": "root"}, {"session": "twig", "parent": "root"}],
+                "2:gen1")
+            with _data_dir(root):
+                self.assertIsNone(common.session_family_source_stamp())
+                self.assertEqual(
+                    common.read_family_publication(),
+                    common.FamilyPublication(
+                        "2:gen0", hashlib.sha256(b"2:gen0\n").hexdigest(),
+                        None, True))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@
 //! watched session's transcript; those are sidechain copies, never user rows.
 //! A sidecar assistant left anchorless by those skips is the sidecar's own
 //! voice (advisor advisories): its text is indexed as its own row.
+//! A sidechat container is keyed off the root's filename, not its header, so a root whose
+//! header id was rewritten keeps the filename id as a session alias (`session_alias`).
 
 use std::collections::HashMap;
 use std::fs;
@@ -558,6 +560,49 @@ fn side_parent(path: &Path) -> Option<String> {
     })
 }
 
+/// `YYYY-MM-DDTHH-MM-SS-mmmZ`, the prefix pi gives every session file it creates.
+fn is_session_stamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 24
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 | 13 | 16 | 19 => *byte == b'-',
+            10 => *byte == b'T',
+            23 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// The id a slug-level `<timestamp>_<id>.jsonl[.gz]` filename carries; the sidechat container
+/// is keyed off this name, so it outlives a header edit. Nested sidecars are named freely.
+fn session_file_id<'p>(root: &Path, path: &'p Path) -> Option<&'p str> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = relative.components();
+    let std::path::Component::Normal(_slug) = parts.next()? else {
+        return None;
+    };
+    let std::path::Component::Normal(file) = parts.next()? else {
+        return None;
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let file = file.to_str()?;
+    let stem = file
+        .strip_suffix(".jsonl.gz")
+        .or_else(|| file.strip_suffix(".jsonl"))?;
+    let (stamp, id) = stem.rsplit_once('_')?;
+    (is_session_stamp(stamp) && !id.is_empty()).then_some(id)
+}
+
+fn session_alias(path: &Path, session: &str) -> Option<String> {
+    PI_HOMES
+        .iter()
+        .flat_map(|home_dir| [sessions_root(home_dir), archived_sessions_root(home_dir)])
+        .find_map(|root| session_file_id(&root, path))
+        .filter(|id| *id != session)
+        .map(str::to_owned)
+}
+
 fn parse_pi(path: &Path) -> Parsed {
     parse_with("pi", path, side_parent(path))
 }
@@ -726,16 +771,20 @@ impl crate::ingest::registry::Adapter for Pi {
     fn store_content(&self, path: &Path) -> bool {
         is_session_file(path)
     }
+    fn session_alias(&self, path: &Path, session: &str) -> Option<String> {
+        session_alias(path, session)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        active_branch, parse_with, parse_with_limits, parse_with_tally, session_files,
-        side_parent_in, Record, GZIP_COMPRESSED_MAX_BYTES, GZIP_DECOMPRESSED_MAX_BYTES,
+        active_branch, parse_with, parse_with_limits, parse_with_tally, session_file_id,
+        session_files, side_parent_in, Record, GZIP_COMPRESSED_MAX_BYTES,
+        GZIP_DECOMPRESSED_MAX_BYTES,
     };
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn records(lines: &[&str]) -> Vec<Record> {
         lines
@@ -932,7 +981,10 @@ mod tests {
         )
         .unwrap();
         let parent = side_parent_in(&sessions, &child);
-        assert_eq!(parent.as_deref(), Some("01a012ef-8a55-7000-b9ca-8ab44ce2a383"));
+        assert_eq!(
+            parent.as_deref(),
+            Some("01a012ef-8a55-7000-b9ca-8ab44ce2a383")
+        );
         let tally = std::sync::Arc::new(crate::intake::Tally::default());
         let (messages, events, outcome) = parse_with_tally(
             "pi",
@@ -1011,6 +1063,49 @@ mod tests {
         assert!(messages[0].side);
         assert_eq!(&*messages[0].parent, "019fe852-b0ad-7000-b68f-f054af8dff14");
     }
+
+    #[test]
+    fn a_root_filename_id_is_the_id_its_sidechat_container_hands_to_children() {
+        let sessions = Path::new("/work/fixture/sessions");
+        let container = "2026-04-05T06-07-08-000Z_file-id";
+        let slug = sessions.join("project");
+        let root = slug.join(format!("{container}.jsonl"));
+        let child = slug.join(container).join("worker.jsonl");
+        assert_eq!(
+            session_file_id(sessions, &root),
+            side_parent_in(sessions, &child).as_deref()
+        );
+        assert_eq!(
+            session_file_id(sessions, &slug.join(format!("{container}.jsonl.gz"))),
+            Some("file-id")
+        );
+    }
+
+    #[test]
+    fn only_stamped_slug_level_filenames_carry_an_id() {
+        let sessions = Path::new("/work/fixture/sessions");
+        let slug = sessions.join("project");
+        let container = "2026-04-05T06-07-08-000Z_file-id";
+        for named in [
+            slug.join(container).join("__advisor.jsonl"),
+            slug.join(container).join("worker.jsonl"),
+            slug.join(container).join(format!("{container}.jsonl")),
+            slug.join("session.jsonl.gz"),
+            slug.join("my_notes.jsonl"),
+            slug.join("2026-04-05_file-id.jsonl"),
+            slug.join("2026-04-05T06-07-08-000Z_.jsonl"),
+            slug.join(format!("{container}.pre-surgery.jsonl.bak")),
+            Path::new("/elsewhere").join(format!("{container}.jsonl")),
+        ] {
+            assert_eq!(
+                session_file_id(sessions, &named),
+                None,
+                "{}",
+                named.display()
+            );
+        }
+    }
+
     #[test]
     fn cold_archive_sessions_and_nested_sidecars_remain_discoverable() {
         let root = std::env::temp_dir().join(format!(

@@ -74,6 +74,37 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
         self.assertTrue(partial["searchable"])
         self.assertEqual((partial["state"], partial["coverage"]["pending"]), ("partial", 1))
 
+    def test_committed_segment_snapshot_stays_queryable_during_family_publish(
+            self) -> None:
+        source = _source("committed-signature")
+        self._publish(source, total=3)
+        race = common.TranscriptPublicationRace(
+            "session-family publication precedes its ingest signature")
+        publication = common.FamilyPublication(
+            signature="committed", signature_sha256=source["ingest_signature"],
+            stamp="stable", moving=True)
+        with mock.patch.object(
+                common, "transcript_generation", side_effect=race), \
+                mock.patch.object(
+                    common, "read_family_publication",
+                    return_value=publication):
+            coherence = semantic.embedding_coherence()
+
+        self.assertFalse(coherence["coherent"])
+        self.assertTrue(coherence["searchable"])
+        self.assertEqual(coherence["state"], "published")
+        self.assertEqual(coherence["basis"], "published-generation")
+        self.assertFalse(coherence["source_current"])
+        self.assertEqual(
+            {key: coherence["coverage"][key]
+             for key in ("indexed", "total", "pending", "complete")},
+            {"indexed": 2, "total": 3, "pending": 1, "complete": False},
+        )
+        readiness = semantic.query_readiness(coherence)
+        self.assertEqual(readiness["state"], "ready")
+        self.assertFalse(readiness["current_generation"])
+        self.assertFalse(readiness["complete"])
+
     def test_v2_stale_corrupt_and_movement_fail_closed(self) -> None:
         source = _source("published")
         self._publish(source)

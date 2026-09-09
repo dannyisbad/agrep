@@ -50,7 +50,7 @@ _LIMITS = tuple(
 ESTABLISHED = (
     "AGREP_DATA_DIR", "AGREP_DATA_DIR_SOURCE", "AGREP_HOME",
     "AGREP_PYTHON_RUNTIME_BUILD_ID", "AGREP_NO_DAEMON",
-    "AGREP_NO_SEM_WORKER")
+    "AGREP_NO_SEM_WORKER", "AGREP_CALLER_PUBLICATION_DIR")
 
 # events.py:98 writes the source it resolved back to the environment on import,
 # so the harness's "test" becomes the product's "env" once. Only that pair.

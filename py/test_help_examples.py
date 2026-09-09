@@ -28,16 +28,6 @@ import recall  # noqa: E402
 import search  # noqa: E402
 
 
-REVIEWED_CORE_EVIDENCE_PATH = """\
-CORE EVIDENCE PATH
-
-1. Recover a missing prior fact, decision, artifact, or result:
-
-   agrep recall "<faithful clue-preserving description>" --hits 2 --budget 5000
-
-2. Open zero or one qualifying result at its source:
-
-   agrep around <handle>"""
 
 
 def _help_of(main, argv):
@@ -97,8 +87,30 @@ class VerbHelpExamples(unittest.TestCase):
 
     def test_search_help_documents_the_new_filters(self) -> None:
         rendered = _help_of(search.main, ["--help"])
-        for flag in ("--no-who", "--no-meta", "--who"):
+        for flag in ("--no-who", "--no-meta", "--who", "--no-side", "--here"):
             self.assertIn(flag, rendered)
+
+    def test_side_chat_vocabulary_is_told_apart(self) -> None:
+        # the old --no-who help promised to hide side chats a row filter cannot
+        for rendered in (_help_of(search.main, ["--help"]),
+                         _help_of(lambda a: recall.main(a, prog="recall"),
+                                  ["--help"])):
+            flat = " ".join(rendered.split())
+            self.assertNotIn("hides side-chat turns", flat)
+            self.assertIn("--no-side", flat)
+            self.assertIn("hide side chats", flat)
+            self.assertIn("ranking only", flat)
+
+    def test_chats_help_describes_the_content_lookup_it_runs(self) -> None:
+        flat = " ".join(_help_of(search.chats_main, ["--help"]).split())
+        for detail in ("adjacent phrase first", "all words anywhere",
+                       "best turn per chat", "max(20, 2N)", "--project",
+                       "--exclude-project", "--since", "--until", "--here",
+                       "--self", "--no-self", "--side"):
+            self.assertIn(detail, flat)
+        top = _cli_help(["--help"])
+        self.assertNotIn("by name, not content", top)
+        self.assertIn("agrep chats webapp", top)
 
     def test_search_examples_are_windows_safe_and_dependency_free(self) -> None:
         rendered = _help_of(search.main, ["--help"])
@@ -180,37 +192,6 @@ class VerbHelpExamples(unittest.TestCase):
 
 
 class TopLevelHelpGrouping(unittest.TestCase):
-    def test_top_level_help_carries_exact_core_evidence_path_only(self) -> None:
-        self.assertEqual(cli._CORE_EVIDENCE_PATH,
-                         REVIEWED_CORE_EVIDENCE_PATH)
-        rendered = _cli_help(["--help"])
-        self.assertIn(REVIEWED_CORE_EVIDENCE_PATH, rendered)
-        self.assertNotIn("AGREP EVERYDAY USE", rendered)
-        self.assertNotIn("OTHER INTENTS", rendered)
-
-    def test_setup_confirmation_carries_exact_core_evidence_path(self) -> None:
-        stdout = io.StringIO()
-        args = SimpleNamespace(
-            rest=[], yes=True, no_teach=False, no_hook=True, no_semantic=True,
-            archive=False, no_archive=True,
-        )
-        with mock.patch("doctor.main", return_value=0), \
-                mock.patch("teach.teach", return_value=0), \
-                mock.patch.object(cli.common, "lap"), \
-                mock.patch.object(
-                    cli, "_setup_index_state",
-                    return_value=({"messages": 1, "sessions": 1}, False)), \
-                mock.patch.object(cli, "_setup_archive"), \
-                mock.patch("teach.detected_agents", return_value=[]), \
-                mock.patch.object(cli.common, "cli_name", return_value="agrep"), \
-                mock.patch("hookinstall.install") as hook_install, \
-                contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.cmd_setup(args), 0)
-        hook_install.assert_not_called()
-        rendered = stdout.getvalue()
-        self.assertIn(REVIEWED_CORE_EVIDENCE_PATH, rendered)
-        self.assertNotIn("AGREP EVERYDAY USE", rendered)
-        self.assertNotIn("OTHER INTENTS", rendered)
 
     def test_verbs_are_grouped_by_task(self) -> None:
         rendered = _cli_help(["--help"])

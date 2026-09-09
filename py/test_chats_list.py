@@ -86,6 +86,11 @@ def _run(argv):
     return rc, stdout.getvalue(), stderr.getvalue()
 
 
+def _heads(out: str) -> list[str]:
+    """Each printed row's 8-char handle prefix, in order."""
+    return [line.split()[0][:9] for line in out.splitlines()]
+
+
 class ChatsListTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -176,6 +181,72 @@ class ChatsListTests(unittest.TestCase):
         _rc, _out, err = _run(["-n", "1", "--no-auto"])
         larger = err.split("larger page: ", 1)[1]
         self.assertIn("--no-auto", larger)
+
+    def test_larger_page_carries_every_scope_flag(self) -> None:
+        with mock.patch.object(search, "_parse_when",
+                               side_effect=lambda w: {"a": 0, "b": 10**13}[w]):
+            _rc, _out, err = _run([
+                "-n", "1", "--exclude-project", "bench", "--since", "a",
+                "--until", "b", "--no-self"])
+        larger = err.split("larger page: ", 1)[1].split("\n", 1)[0]
+        for flag in ("--exclude-project bench", "--since a", "--until b",
+                     "--no-self", "-n 80"):
+            self.assertIn(flag, larger)
+
+    def test_project_filter_is_exact_on_the_label_or_its_leaf(self) -> None:
+        rc, out, _err = _run(["--project", "webapp"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(_heads(out), ["@0199aaaa"])
+        rc, out, _err = _run(["--project", "/home/u/apartment-hunt"])
+        self.assertEqual(_heads(out), ["@0199bbbb"])
+        # a bare substring is not a project; a glob is
+        with mock.patch.object(
+                indexd_runtime, "freshness_story",
+                return_value=search.surface.FreshnessStory("current")):
+            rc, out, err = _run(["--project", "apart"])
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out, "")
+        rc, out, _err = _run(["--project", "apart*"])
+        self.assertEqual(_heads(out), ["@0199bbbb"])
+        rc, out, _err = _run(["--exclude-project", "WEBAPP"])
+        self.assertEqual(_heads(out), ["@0199bbbb"])
+
+    def test_here_scopes_to_the_working_directory_name(self) -> None:
+        with mock.patch.object(search.surface.os, "getcwd",
+                               return_value="/somewhere/else/Apartment-Hunt"):
+            rc, out, _err = _run(["--here"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(_heads(out), ["@0199bbbb"])
+        with mock.patch.object(search.surface.os, "getcwd", return_value="/"):
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as stopped:
+                search.chats_main(["--here"])
+        self.assertEqual(stopped.exception.code, 2)
+
+    def test_since_and_until_bound_chat_activity(self) -> None:
+        # webapp last_ts 9000; apartment last_ts 8000, first_ts 2000
+        with mock.patch.object(search, "_parse_when",
+                               side_effect=lambda w: {"a": 8500, "b": 1500}[w]):
+            _rc, out, _err = _run(["--since", "a"])
+            self.assertEqual(_heads(out), ["@0199aaaa"])
+            _rc, out, _err = _run(["--until", "b"])
+            self.assertEqual(_heads(out), ["@0199aaaa"])
+            rc, _out, err = _run(["--since", "a", "--until", "b"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--since", err)
+
+    def test_content_lane_receives_the_scope_filters(self) -> None:
+        result = {"hits": [], "chats": 0, "totals_exact": True}
+        with mock.patch.object(search, "_parse_when",
+                               side_effect=lambda w: {"7d": 8500}[w]), \
+                mock.patch.object(search, "run_query", return_value=result) as query:
+            _run(["login", "race", "--project", "webapp",
+                  "--exclude-project", "bench", "--since", "7d"])
+        filters = query.call_args.kwargs
+        self.assertEqual((filters["project"], filters["exclude_project"],
+                          filters["since_ms"]), ("webapp", "bench", 8500))
+        self.assertTrue(filters["session_view_rank"])
+        self.assertNotIn("until_ms", filters)
 
     def test_pattern_matches_project_opening_line_and_id_prefix(self) -> None:
         for pattern, expected in (
@@ -484,7 +555,7 @@ class ChatsDamagedAggregateTests(unittest.TestCase):
             records = explore._reply_records_by_id()
         self.assertEqual(records[good_id]["reply"], "the real reply")
         kicked.assert_called()
-        explore._reply_records_by_id.cache_clear()
+        explore._reply_records_by_id_read.cache_clear()
 
     def test_unproved_empty_files_never_claim_an_exact_zero(self) -> None:
         (common.DATA_DIR / "sessions.jsonl").write_text("", encoding="utf-8")
@@ -627,6 +698,150 @@ class ChatsHandlePasteTests(unittest.TestCase):
         self.assertIn("login race", row["match_text"])
         self.assertRegex(
             row["match_handle"], r"^@0199aaaa[^:]*:\d+\.[0-9a-f]{4}$")
+
+    def test_content_rows_carry_the_ranking_facts_and_the_matched_age(self) -> None:
+        text = "turn 2 about the login race"
+        hit = {
+            "session": SESSIONS[0]["session"], "turn": 2, "who": "user",
+            "ts": 1002, "score": 0.4321, "matched": "all-terms", "text": text,
+            "snippet": text, "content_digest": search.compact.content_digest(text),
+        }
+        result = {"hits": [hit], "chats": 1, "totals_exact": True}
+        recent = int(search.time.time() * 1000) - 3 * 3600 * 1000
+        index = {row["session"]: dict(row) for row in SESSIONS}
+        index[SESSIONS[0]["session"]]["last_ts"] = recent
+        with mock.patch.object(search, "run_query", return_value=result), \
+                mock.patch.object(explore, "_session_index", return_value=index), \
+                mock.patch.object(explore, "_session_concept", return_value={}):
+            rc, out, err = _run(["login", "race", "--json"])
+            self.assertEqual(rc, 0, err)
+            row = json.loads(out.splitlines()[1])
+            self.assertEqual(
+                (row["score"], row["matched"], row["who"], row["match_ts"],
+                 row["match_turn"]),
+                (0.4321, "all-terms", "user", 1002, 2))
+            _rc, human, _err = _run(["login", "race", "--color", "never"])
+            _rc, bare, _err = _run(["--color", "never"])
+        # the age column follows the matched turn (1970), not the chat's
+        # last turn three hours ago; a bare listing keeps the chat's own age
+        matched_row = next(line for line in human.splitlines()
+                           if line.startswith("@0199aaaa"))
+        bare_row = next(line for line in bare.splitlines()
+                        if line.startswith("@0199aaaa"))
+        self.assertRegex(matched_row, r" \d+y 12t ")
+        self.assertIn(" 3h 12t ", bare_row)
+
+    def test_equal_rank_bands_break_ties_on_recency(self) -> None:
+        hits = [
+            {"session": SESSIONS[1]["session"], "turn": 1, "ts": 5},
+            {"session": SESSIONS[0]["session"], "turn": 1, "ts": 5},
+        ]
+        result = {"hits": hits, "chats": 2, "totals_exact": True}
+        fixture = {row["session"]: row for row in SESSIONS}
+        with mock.patch.object(search, "run_query", return_value=result), \
+                mock.patch.object(explore, "_session_index", return_value=fixture), \
+                mock.patch.object(explore, "_session_concept", return_value={}):
+            _rc, out, _err = _run(["needle", "--json"])
+        rows = [json.loads(line) for line in out.splitlines()[1:]]
+        # content rank is the engine's order: apartment (rank 0) before webapp
+        self.assertEqual([row["session"][:9] for row in rows],
+                         ["0199bbbb-", "0199aaaa-"])
+        identity_only = {
+            **{row["session"]: row for row in SESSIONS},
+            "0199cccc-3333-7000-8000-000000000003": {
+                **SESSIONS[1], "session": "0199cccc-3333-7000-8000-000000000003",
+                "last_ts": 8500, "first_text": "needle in the opener"},
+        }
+        with mock.patch.object(search, "run_query", return_value=result), \
+                mock.patch.object(explore, "_session_index",
+                                  return_value=identity_only), \
+                mock.patch.object(explore, "_session_concept", return_value={}):
+            _rc, out, _err = _run(["needle", "--json"])
+        rows = [json.loads(line) for line in out.splitlines()[1:]]
+        # the identity-only tail rides behind every content hit, newest first
+        self.assertEqual([row["match_source"] for row in rows],
+                         ["content", "content", "identity"])
+
+    def test_self_flags_drop_and_mark_the_calling_chat(self) -> None:
+        current = SESSIONS[0]["session"]
+        family = search.common.CallingFamily(
+            current, current, frozenset({current}), True, 5)
+        live_hit = {"session": current, "turn": 4, "ts": 1004, "who": "user",
+                    "snippet": "turn 4 about the login race"}
+        other = {"session": SESSIONS[1]["session"], "turn": 1, "ts": 5,
+                 "who": "user", "snippet": "login race elsewhere"}
+
+        def run(argv, policy, hits=(live_hit, other)):
+            result = {"hits": list(hits), "chats": len(hits), "totals_exact": True}
+            with mock.patch.object(
+                    search.common, "in_agent_context", return_value=True), \
+                    mock.patch.object(
+                        search.common, "calling_self_exclusion",
+                        return_value=policy) as resolve, \
+                    mock.patch.object(
+                        explore, "_session_index",
+                        return_value={row["session"]: row for row in SESSIONS}), \
+                    mock.patch.object(explore, "_session_concept", return_value={}), \
+                    mock.patch.object(search, "run_query", return_value=result):
+                rc, out, err = _run(argv)
+            return rc, out, err, resolve
+
+        windowed = search.common.SelfExclusion(family, 3, "window")
+        rc, out, err, _resolve = run(["login", "race", "--color", "never"], windowed)
+        self.assertEqual(rc, 0, err)
+        # the caller's content hit sits inside the live window (turn 4 >= 3):
+        # the row is dropped, counted, and the other chat stays
+        self.assertNotIn("@0199aaaa", out)
+        self.assertIn("@0199bbbb", out)
+        self.assertIn("excluded 1 chat from the current window", err)
+
+        # the caller's hit below the window stays, marked ~self
+        older = {**live_hit, "turn": 1, "ts": 1001}
+        rc, out, err, _resolve = run(
+            ["login", "race", "--color", "never"], windowed, hits=(older, other))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("@0199aaaa", out)
+        self.assertIn("~self", out)
+        self.assertNotIn("excluded", err)
+
+        # boundary 0 means the whole session is the live window
+        whole = search.common.SelfExclusion(family, 0, "window")
+        rc, out, err, _resolve = run(
+            ["login", "race", "--color", "never"], whole, hits=(older, other))
+        self.assertNotIn("@0199aaaa", out)
+        self.assertIn("excluded 1 chat", err)
+
+        # --self waives the policy without resolving it
+        rc, out, err, resolve = run(
+            ["login", "race", "--self", "--color", "never"], windowed)
+        self.assertIn("@0199aaaa", out)
+        resolve.assert_not_called()
+
+        # --no-self forces the conservative family scope on a bare listing too
+        forced = search.common.SelfExclusion(family, None, "forced")
+        rc, out, err, resolve = run(["--no-self", "--color", "never"], forced)
+        self.assertEqual(resolve.call_args.kwargs, {"conservative": True})
+        self.assertNotIn("@0199aaaa", out)
+        self.assertIn("@0199bbbb", out)
+        self.assertIn("excluded 1 chat from this session family", err)
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            search.chats_main(["--self", "--no-self"])
+
+    def test_no_self_without_an_identity_says_so(self) -> None:
+        identity = search.common.calling_identity({})
+        with mock.patch.object(
+                search.common, "calling_self_exclusion", return_value=None), \
+                mock.patch.object(
+                    search.common, "calling_identity", return_value=identity), \
+                mock.patch.object(
+                    explore, "_session_index",
+                    return_value={row["session"]: row for row in SESSIONS}), \
+                mock.patch.object(explore, "_session_concept", return_value={}):
+            rc, out, err = _run(["--no-self"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("@0199aaaa", out)
+        self.assertIn("--no-self was not applied", err)
 
     def test_topic_lookup_without_recap_does_not_invent_exclusion(
             self) -> None:

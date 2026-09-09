@@ -1,7 +1,170 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-09-09
 
+- Caller identity reaches tool shells. Under oh-my-pi, `agrep search`/`recall`
+  run from tool shells never knew which session was calling: omp's tool shells
+  inherit a one-time environment snapshot, so the extension's
+  `AGREP_PI_SESSION_ID` export never reached them, and every search returned
+  the current conversation's own rows ranked first, silently. The pi/omp
+  extension now also publishes `{pid, sessions[]}` for its process to
+  `/tmp/agrep-caller-v1-<uid>/<pid>.json` (0600, atomic, deleted when the
+  last session leaves) and agrep resolves the caller by walking its own parent
+  chain; a record with a recycled pid is refused. Several sessions in one
+  process (root, advisor, subagents) share one record instead of overwriting
+  one env var.
+- Never-compacted sessions get a live window. Automatic self-exclusion
+  required an indexed compaction recap, so it did nothing for ~95% of sessions
+  even with a known caller. A resolved caller with no recap row is windowed
+  from turn 0; a malformed recap row still fails open. `--self` help and the
+  codex/Claude compaction payloads state that labeling depends on identifying
+  the caller.
+- An agent shell with an unknown caller is disclosed: search and recall prose
+  surfaces print one stderr line (`agent shell, caller unknown: ...`, or the
+  identity-conflict variant) instead of failing open silently. `--no-self`,
+  `--json` and `--self` renders are unchanged.
+- The family index no longer degrades silently. While a store drifted past the
+  published `family_stamp`, `-l`/search/chats rows lost `[side chat]` marks and
+  printed full 36-char ids. Display readers now serve the last published family
+  index and print one line (`family index behind: side-chat marks and short
+  handles may lag`); generation-bound readers (`postcompact`, query-time family
+  expansion) stay strict.
+- `--project` and `--exclude-project` (search, recall, pack, chats) match a
+  chat's stored project label exactly, or its last path segment,
+  case-insensitively, instead of as a substring: `--project shop` reaches a
+  pi label of `~/projects/shop` and a claude label of `shop`, and no longer
+  admits `shop-admin`. A `*` or `?` in the value makes it a glob
+  (`--project 'shop*'`). One predicate (`surface_policy.project_label_matches`)
+  backs the SQL lane, the JSONL scans, the semantic metadata filter, the
+  zero-coverage disclosure and the `chats` identity filter. `recall`/`pack`
+  gain `--exclude-project`.
+- `--here` on search, recall, pack and chats is `--project <basename of the
+  current directory>`; mutually exclusive with `--project`, refused at a
+  filesystem root; continuation and larger-page commands re-spell it as the
+  resolved `--project=`.
+- `--no-side` on search and recall hides side-chat sessions using the same
+  hidden set `chats` builds, so `agrep <q> -l --no-side` lists no `[side chat]`
+  rows. `--no-who subagent` remains a speaker-row filter and its help no longer
+  claims to hide side chats; `--all-side-chats` is documented as the semantic
+  ranking-slot switch.
+- `agrep chats` gains `--project`, `--exclude-project`, `--here`, `--since`,
+  `--until`, `--self` and `--no-self`; the scope applies to the identity
+  listing and the content lane, and the larger-page command carries every
+  flag. In an agent shell the calling chat's live-window rows are dropped (the
+  previous branch never fired), counted, and disclosed on stderr; kept rows
+  from the caller's family carry `~self`. `chats --json` content rows carry
+  `score`, `matched`, `who` and `match_ts`, so "best match first" is
+  explainable from the output. The human age column shows the matched turn's
+  age when a pattern was given; equal bands tie-break newest first. `chats
+  --help` and the top-level help describe the lookup (adjacent phrase first,
+  then all words anywhere, best turn per chat, top max(20, 2N) chats
+  content-ranked). `AGREP_TIMING=1 agrep chats ...` attributes identity-index
+  build, content query and render as separate laps.
+- `-l` rows end with the head row's age, so `--sort time` is readable from the
+  terminal. The piped `-l` footer no longer splices a row count into the chat
+  sentence: it reads `showing 8 of 290 chats (941 matching rows are tool
+  output)`; row-unit footers keep `(N of them in tool output)`; `--json`
+  completeness carries the same number as `tool_rows`.
+- Copyable commands on POSIX shells print result handles bare
+  (`agrep around @01a046db:10.2685~a8f7...:214-222`) instead of single-quoted;
+  a `~` after a digit never tilde-expands. Matches the Windows renderer.
+- Multi-word keyword search folds minimal singular/plural spellings (`s`,
+  `es`, `ies`) in the all-terms lane, so `don calls` finds a chat that said
+  `before this call`. The original spelling is always kept, short and
+  non-alphabetic tokens stay exact, and the adjacent-phrase lane never folds.
+- All-terms scoring measures term proximity from the same best-aligned
+  occurrence the boundary factor grades, scaled by that occurrence's edge
+  quality. A word fragment next to another query term (`calls dont` for `don
+  calls`) no longer earns a near-phrase bonus; the row keeps the 0.5 proximity
+  floor. Snippets anchor on the aligned occurrence rather than the first
+  substring, in every engine: single-token snippets from the SQL lane, the
+  JSONL scan and the Rust fallback scanner now pick the same occurrence. The
+  Rust scanner and the Python scorer agree via the updated exact-score
+  conformance fixture.
+- Session views (`-l` and content-ranked `chats`) pick and order chat heads by
+  a lane-folded score (phrase x1.0, all-terms x0.7, content fallback x0.5)
+  instead of lane-first, so a strong human prose hit represents a chat ahead
+  of a weak phrase echo inside tool output. Row search keeps its structural
+  phrase-first order. Exposed as `run_query(session_view_rank=True)`.
+- Claude sessions under a repository container such as `~/Desktop/projects/<repo>`
+  or a macOS temp root (`/private/tmp/<repo>`, `$TMPDIR/<repo>`) are labelled by
+  the repository (`shop`), not the container (`projects`, `private`), matching
+  the other adapters. Takes effect after `agrep reindex --full`.
+- Meaning rows no longer displace exact-phrase hits on a weak cousin's say-so.
+  In the automatic hybrid merge a semantic row counted as corroborated when
+  any lexical row shared its conversation family, including scatter scoring
+  0.26, and every meaning row up to that one was emitted first; under
+  `--project` that pushed both exact-phrase hits off a three-row page.
+  Corroboration now requires a strong lexical row in the family whenever the
+  lexical lane has one. The recall preamble says where the rows landed (`N
+  semantic rows placed after exact matches` / `... lead: no exact match`).
+- Semantic rows are anchored on the query's content words. A row whose full
+  indexed text carries fewer than half of the query's content terms is labeled
+  a weak meaning match at any cosine and sorts after confident meaning rows,
+  because one shared noun buys a strong-band score on its own (`never promise
+  a login` scored 0.86 against `hello? login isnt working`).
+- Semantic score bands have a committed calibration baseline.
+  `bench/semantic_calibration.py` with `bench/fixtures/semantic_calibration.json`
+  measures unrelated, same-topic, shared-noun and paraphrase cosine levels on
+  the pinned model and reports where the floor (0.82) and strong (0.84) bands
+  sit against them; the numbers are recorded in `bench/SEMANTIC_SCALE.md`. The
+  bands themselves are unchanged pending a rerun of the private 20-task
+  fixture. Measured int8 batch-padding drift (up to 0.021 on a row's score) is
+  documented beside the bands.
+- Recall `--json` reports `matched: "semantic"` on semantic-only hits instead
+  of the `"phrase"` default; `sem_score` remains the cosine and `score` the
+  display prior.
+- `agrep doctor --deep` no longer aborts (SIGABRT) on a Mac without a Metal
+  device: `mlx_embed.available()` imports `mlx.core` once per process and
+  remembers the answer, so doctor's second capability check never re-runs the
+  extension init that nanobind refuses. `--no-semantic` is accepted with
+  `--deep` and keeps the semantic tier at routine depth.
+- The `embedding lane` row on `agrep status`/`doctor` is informational
+  (`[-- ]`) while the lane that built the store opens on this machine; it warns
+  only when a metal store cannot open here. Every healthy box used to carry a
+  permanent `[!! ]` for a lane fact.
+- `agrep status` explains a stale wheel install: a package with no PEP 610
+  local-source provenance is compared against the checkout named by
+  `AGREP_SOURCE_DIR`; a lagging result lists the checkout's unreleased
+  CHANGELOG entries beside the replace remedy. Running from a checkout renders
+  its own `source checkout` row.
+- Forced meaning search (`-s`) can no longer wait forever in silence: when the
+  resident semantic worker is unreachable the read-only local pass is bounded
+  at 30 s, and after 2 s stderr names what it is waiting on. Waiting on another
+  process's model download discloses the holder pid and the bound after 2 s.
+- `agrep around` gains `--whole` (also `-C all`): the entire chat, root prose,
+  the usual per-message cap; `--whole --who user` is the compact transcript.
+  Every `[+N chars - ...]` cap marker in `around` and `recall` points at the
+  lever that lifts it, `agrep around <session> <turn> -C 0 --max-chars 0`,
+  instead of the forensic `--full` stream; the tool-collapse pointer keeps
+  `--full`. Under `--who`, the scope line points at the same read without
+  `--who` rather than at `--full`.
+- The uninstall sentinel waits five minutes, not twenty seconds, before it
+  treats a missing `cli.py` as an uninstall. A reinstall that rebuilds from
+  source (`uv tool install --reinstall --from .`, an upgrade without a
+  matching wheel) keeps the file gone for a minute or more, and the sentinel
+  stripped every agent's taught block in that window; `agrep setup` then
+  re-added them as new blocks, so an edited block's disclosure was lost.
+- Empty semantic coordination namespaces under `/tmp` are reaped. Every
+  sandboxed data dir mints `agrep-semantic-v1-<uid>-<digest>/` and nothing
+  deleted it (286 on one development box); a starting worker now removes
+  sibling namespaces that hold no record and were last touched over an hour
+  ago, never a non-empty or foreign-owned one.
+- Instruction block v38 speaks to every agent in the second person (the
+  per-agent name slots are gone, so each non-codex target receives identical
+  bytes) and teaches the cross-project index: read the project and age on
+  every `chats` and `-l` row, scope with `--project`/`--here`/`--since`, hide
+  side chats with `--no-side`, treat meaning-match rows as leads and use
+  `--lexical` for exact phrases, open whole chats with `around --whole`, and
+  rely on the fixed self-echo behavior. Examples are generic. The codex block
+  carries the same facts.
+- `agrep setup` and the background reconcile tell an edited instruction block
+  from a shipped one by hashing its body against the digests agrep has shipped
+  (v37 onward). A same-version block whose text was edited is reported as
+  `edited` in `teach-reconcile.json` and `agrep status` (kept as is, never
+  rewritten in the background) instead of being classified clean; an explicit
+  `agrep setup` that ships a newer version prints `replacing an edited v37
+  block with v38 in <path>`. The status remedy says what a re-sync does.
 - Semantic search chunks long rows instead of embedding only their opening
   bytes. The embedder truncates at its model window, so a multi-megabyte
   row (a compaction recap, a giant paste) used to embed as its first ~4KB

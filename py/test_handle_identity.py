@@ -150,6 +150,8 @@ class RenderedHandleIdentity(unittest.TestCase):
         head = search._chat_head(
             self._hit(), 1, False, session_index=index)
         self.assertIn(f"@abcdef01:7.{self.DIGEST}", head)
+        # -l rows carry the head row's age, so --sort time is readable
+        self.assertRegex(head, r"\[@abcdef01:7\.[0-9a-f]{4} · 1 hit · \d+[mhdy]\]$")
         output = io.StringIO()
         with mock.patch.object(
                 search.common, "indexed_session_prefix_candidates",
@@ -561,6 +563,53 @@ class RecallRescueAndDisclosureParity(DirectHandleConsumers):
             f"@abcdef01:5.{digest}", {5: window}, extra=("--json",))
         self.assertEqual(rc, 0)
         self.assertNotIn("served", json.loads(out))
+
+
+class HandleWidthUnderFamilyIndexLag(unittest.TestCase):
+    """A drifting store must not flip handles between prefix and full id."""
+
+    def test_stamp_behind_index_keeps_prefix_handles_and_discloses_once(
+            self) -> None:
+        import sqlite3
+        import tempfile
+        import session_context
+        import surface_policy as surface
+
+        session = "abcdef01-2345-6789-abcd-ef0123456789"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+            """)
+            db.execute("INSERT INTO meta VALUES('family_stamp', 'published')")
+            db.execute("INSERT INTO session_family VALUES(?, ?, 0)",
+                       (session, session))
+            db.commit()
+            db.close()
+            err = io.StringIO()
+            with mock.patch.object(session_context, "DATA_DIR", root), \
+                    mock.patch.object(
+                        session_context, "_FAMILY_INDEX_BEHIND", False), \
+                    mock.patch.object(
+                        search, "_FAMILY_INDEX_BEHIND_ANNOUNCED", False), \
+                    mock.patch.object(
+                        session_context, "session_family_source_stamp",
+                        return_value="the store moved on"), \
+                    contextlib.redirect_stderr(err):
+                hit = {"session": session, "turn": 7, "who": "user",
+                       "text": "claimed", "ts": 1_750_000_000_000}
+                row = search.public_rows([hit], result_handles=True)[0]
+                search._note_family_index_behind()
+                search._note_family_index_behind()
+        # last published index still shortens the id
+        self.assertTrue(row["handle"].startswith("@abcdef01:7."))
+        self.assertEqual(err.getvalue().count(surface.FAMILY_INDEX_BEHIND_LINE), 1)
+
 
 
 if __name__ == "__main__":

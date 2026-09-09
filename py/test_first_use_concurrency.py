@@ -262,7 +262,8 @@ class FirstUsePublicationTests(unittest.TestCase):
         for story, expected in (
                 (surface.FreshnessStory("current"), 1),
                 (surface.FreshnessStory("unverified"), 2),
-                (surface.FreshnessStory("current", absorbed_drift=True), 2)):
+                (surface.FreshnessStory(
+                    "unverified", code="search-index-stale", converging=True), 1)):
             with self.subTest(freshness=story), \
                     mock.patch.object(
                         search.subprocess, "Popen",

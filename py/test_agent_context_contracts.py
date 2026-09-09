@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -153,6 +154,224 @@ class AgentContextContracts(unittest.TestCase):
             self.assertEqual(identity.reason, "caller-unresolved")
             self.assertIsNone(common.calling_session())
 
+    def _publication_dir(self, stack, records: dict[int, object]) -> Path:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        root.chmod(0o700)
+        for pid, record in records.items():
+            (root / f"{pid}.json").write_text(
+                record if isinstance(record, str) else json.dumps(record),
+                encoding="utf-8")
+        stack.enter_context(mock.patch.object(
+            session_context, "CALLER_PUBLICATION_DIR", root))
+        return root
+
+    def test_published_ancestor_names_the_caller_when_no_env_does(self) -> None:
+        # omp's tool shell: presence key only, no identity var, but the agent
+        # process three levels up published its sessions
+        chain = {4000: 3000, 3000: 2000, 2000: 1000, 1000: 1}
+        with contextlib.ExitStack() as stack:
+            self._publication_dir(stack, {
+                2000: {"version": 1, "pid": 2000,
+                       "sessions": ["omp-root-session"],
+                       "cwd": "/work", "updated": int(time.time() * 1000)},
+            })
+            stack.enter_context(mock.patch.dict(
+                os.environ, {"CLAUDECODE": "1"}, clear=True))
+            stack.enter_context(mock.patch.object(os, "getppid", return_value=4000))
+            stack.enter_context(mock.patch.object(
+                session_context.hookless_proc, "parent_pid",
+                side_effect=lambda pid: chain.get(pid)))
+            stack.enter_context(mock.patch.object(
+                session_context.hookless_proc, "process_start_time",
+                return_value=None))
+            stack.enter_context(mock.patch.object(
+                session_context.os, "scandir",
+                side_effect=AssertionError("mtime discovery ran")))
+            identity = common.calling_identity()
+            self.assertEqual(identity.session, "omp-root-session")
+            self.assertEqual(identity.reason, "pi-process")
+            self.assertTrue(common.in_agent_context())
+            # a direct export still outranks the publication
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "direct"}):
+                self.assertEqual(common.calling_identity().reason, "codex")
+            # a supplied environment never consults the process tree
+            self.assertEqual(
+                common.calling_identity({"CLAUDECODE": "1"}).reason,
+                "caller-unresolved")
+
+    def test_publication_without_an_agent_env_still_counts_as_agent_context(
+            self) -> None:
+        with contextlib.ExitStack() as stack:
+            self._publication_dir(stack, {
+                77: {"pid": 77, "sessions": ["s"], "updated": int(time.time() * 1000)},
+            })
+            stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+            stack.enter_context(mock.patch.object(os, "getppid", return_value=77))
+            stack.enter_context(mock.patch.object(
+                session_context.hookless_proc, "process_start_time",
+                return_value=None))
+            self.assertTrue(common.in_agent_context())
+            self.assertEqual(common.calling_session(), "s")
+
+    def test_publication_is_refused_for_a_recycled_or_foreign_pid(self) -> None:
+        now_ms = int(time.time() * 1000)
+        cases = {
+            # exact birth identity disagrees with the live process
+            "start-mismatch": (
+                {"pid": 500, "sessions": ["s"], "start": "proc_1",
+                 "updated": now_ms},
+                {"process_start_identity": "proc_2"}),
+            # no birth identity, record older than the live process
+            "older-than-process": (
+                {"pid": 500, "sessions": ["s"], "updated": now_ms - 60_000},
+                {"process_start_time": time.time()}),
+            # record names another pid
+            "wrong-pid": (
+                {"pid": 501, "sessions": ["s"], "updated": now_ms}, {}),
+            "no-sessions": ({"pid": 500, "sessions": [], "updated": now_ms}, {}),
+            "unsafe-session": (
+                {"pid": 500, "sessions": ["s;rm -rf /"], "updated": now_ms}, {}),
+            "no-timestamp": ({"pid": 500, "sessions": ["s"]}, {}),
+            "not-json": ("{not json", {}),
+        }
+        for label, (record, probes) in cases.items():
+            with self.subTest(label=label), contextlib.ExitStack() as stack:
+                self._publication_dir(stack, {500: record})
+                stack.enter_context(mock.patch.object(
+                    session_context.hookless_proc, "process_start_identity",
+                    return_value=probes.get("process_start_identity")))
+                stack.enter_context(mock.patch.object(
+                    session_context.hookless_proc, "process_start_time",
+                    return_value=probes.get("process_start_time")))
+                self.assertIsNone(session_context.read_caller_publication(500))
+        with contextlib.ExitStack() as stack:
+            self._publication_dir(stack, {
+                500: {"pid": 500, "sessions": ["s"], "start": "proc_1",
+                      "updated": now_ms}})
+            stack.enter_context(mock.patch.object(
+                session_context.hookless_proc, "process_start_identity",
+                return_value="proc_1"))
+            self.assertEqual(
+                session_context.read_caller_publication(500).sessions, ("s",))
+
+    def test_multi_session_publication_picks_the_indexed_root(self) -> None:
+        # advisor + scouts + root all published from one omp process
+        sessions = ["scout-b", "advisor", "root-session", "scout-a"]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _publish_family_meta(root, [
+                {"session": "root-session"},
+                {"session": "advisor", "parent": "root-session"},
+                {"session": "scout-a", "parent": "root-session"},
+                {"session": "scout-b", "parent": "root-session"},
+            ])
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+                CREATE TABLE msgs(session TEXT, turn INTEGER, who TEXT);
+            """)
+            with mock.patch.object(session_context, "DATA_DIR", root), \
+                    contextlib.ExitStack() as stack:
+                db.execute(
+                    "INSERT INTO meta VALUES('family_stamp', ?)",
+                    (common.session_family_source_stamp(),),
+                )
+                db.executemany(
+                    "INSERT INTO session_family VALUES(?, ?, ?)",
+                    (("root-session", "root-session", 0),
+                     ("advisor", "root-session", 1),
+                     ("scout-a", "root-session", 1),
+                     ("scout-b", "root-session", 1)),
+                )
+                db.commit()
+                self._publication_dir(stack, {
+                    9: {"pid": 9, "sessions": sessions,
+                        "updated": int(time.time() * 1000)}})
+                stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+                stack.enter_context(mock.patch.object(os, "getppid", return_value=9))
+                stack.enter_context(mock.patch.object(
+                    session_context.hookless_proc, "process_start_time",
+                    return_value=None))
+                identity = common.calling_identity()
+                family = common.calling_family()
+                policy = common.calling_self_exclusion()
+            db.close()
+        self.assertEqual(identity.session, "root-session")
+        self.assertEqual(family.source, "pi-process")
+        self.assertEqual(
+            family.members,
+            frozenset({"root-session", "advisor", "scout-a", "scout-b"}))
+        self.assertEqual(
+            family.side_members, frozenset({"advisor", "scout-a", "scout-b"}))
+        # every published peer is live in the caller's process: current context
+        self.assertEqual(
+            family.window_members, frozenset({"advisor", "scout-a", "scout-b"}))
+        self.assertEqual(policy.boundary, 0)
+        self.assertTrue(policy.excludes("root-session", 3))
+        self.assertTrue(policy.excludes("scout-a", 3))
+        self.assertFalse(policy.labels("scout-a", 3))
+        self.assertEqual(
+            policy.query_filters()["_exclude_sessions"],
+            ("advisor", "scout-a", "scout-b"))
+        # not indexed yet: the first published session stands in
+        with mock.patch.object(
+                session_context, "_open_session_family_index",
+                return_value=None):
+            self.assertEqual(
+                session_context._published_caller_session(tuple(sessions)),
+                "scout-b")
+
+    def test_stamp_behind_index_still_serves_display_lookups(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _publish_family_meta(root, [
+                {"session": "root"},
+                {"session": "child", "parent": "root"},
+            ])
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+                CREATE TABLE msgs(session TEXT, turn INTEGER, who TEXT);
+            """)
+            db.execute("INSERT INTO meta VALUES('family_stamp', 'published')")
+            db.executemany(
+                "INSERT INTO session_family VALUES(?, ?, ?)",
+                (("root", "root", 0), ("child", "root", 1)))
+            db.commit()
+            db.close()
+            with mock.patch.object(session_context, "DATA_DIR", root), \
+                    mock.patch.object(session_context, "_FAMILY_INDEX_BEHIND", False), \
+                    mock.patch.object(
+                        session_context, "session_family_source_stamp",
+                        return_value="drifted"):
+                self.assertIsNone(common.indexed_family_roots(("child",)))
+                self.assertFalse(session_context.family_index_behind())
+                self.assertEqual(
+                    common.indexed_family_roots(("child",), allow_behind=True),
+                    {"child": "root"})
+                self.assertTrue(session_context.family_index_behind())
+                prefixes = common.indexed_session_prefix_candidates(("child",))
+                self.assertEqual(prefixes.force_full, frozenset())
+                with mock.patch.object(
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root", "pi")):
+                    family = common.calling_family()
+                    with session_context.calling_family_snapshot() as (
+                            _identity, snapshot_family, snapshot_db):
+                        # the generation-bound reader stays strict
+                        self.assertIsNone(snapshot_family)
+                        self.assertIsNone(snapshot_db)
+        self.assertTrue(family.resolved)
+        self.assertEqual(family.members, frozenset({"root", "child"}))
+
     def test_calling_family_materializes_every_related_session(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -198,7 +417,8 @@ class AgentContextContracts(unittest.TestCase):
                 )
                 db.commit()
                 with mock.patch.object(
-                        session_context, "calling_session", return_value="child"):
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("child", "codex")):
                     family = common.calling_family()
                 self.assertEqual(
                     common.indexed_family_roots(
@@ -245,6 +465,9 @@ class AgentContextContracts(unittest.TestCase):
         )
         self.assertTrue(family.contains("grandchild"))
         self.assertFalse(family.contains("other-child"))
+        # a delegated caller owns its own spawn only; root and sibling stay history
+        self.assertEqual(family.descendants, frozenset({"grandchild"}))
+        self.assertEqual(family.window_members, frozenset({"grandchild"}))
 
     def test_retained_schema_14_family_roots_group_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -354,7 +577,8 @@ class AgentContextContracts(unittest.TestCase):
                 )
                 db.commit()
                 with mock.patch.object(
-                        session_context, "calling_session", return_value="root"):
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root", "codex")):
                     policy = common.calling_self_exclusion()
             db.close()
         self.assertIsNotNone(policy)
@@ -362,8 +586,9 @@ class AgentContextContracts(unittest.TestCase):
         self.assertFalse(policy.excludes("root", 10))
         self.assertTrue(policy.excludes("root", 11))
         self.assertTrue(policy.labels("root", 10))
+        # an unproven spawn time keeps the child visible, marked as the caller's own
         self.assertFalse(policy.excludes("child", 99))
-        self.assertFalse(policy.labels("child", 99))
+        self.assertTrue(policy.labels("child", 99))
 
     def test_malformed_recap_turn_cannot_create_a_window(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -390,7 +615,8 @@ class AgentContextContracts(unittest.TestCase):
                     "INSERT INTO msgs VALUES('root', 7.5, 'recap')")
                 db.commit()
                 with mock.patch.object(
-                        session_context, "calling_session", return_value="root"):
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root", "codex")):
                     family = common.calling_family()
                     policy = common.calling_self_exclusion()
             db.close()
@@ -402,7 +628,9 @@ class AgentContextContracts(unittest.TestCase):
         family = common.CallingFamily(
             "root", "root",
             frozenset({"root", "child", "custom-side", "agent-name-only"}),
-            True, 7, frozenset({"custom-side"}))
+            True, 7, frozenset({"custom-side"}),
+            descendants=frozenset({"child", "agent-a1b2c3"}),
+            window_members=frozenset({"agent-a1b2c3"}))
         policy = common.SelfExclusion(family, 7, "window")
         # Only the caller's proven current window is excluded.
         self.assertFalse(policy.excludes("root", 6))
@@ -422,20 +650,37 @@ class AgentContextContracts(unittest.TestCase):
         self.assertFalse(policy.labels("root", True))
         malformed_policy = common.SelfExclusion(family, "7", "window")
         self.assertFalse(malformed_policy.excludes("root", 9))
+        self.assertFalse(malformed_policy.excludes("agent-a1b2c3", 0))
+        self.assertFalse(malformed_policy.labels("child", 0))
         self.assertEqual(malformed_policy.query_filters(), {})
-        # Related children and sidechains are ordinary history. Family shape
-        # alone is not evidence that their independently numbered turns are in
-        # the caller's current context window.
-        self.assertFalse(policy.excludes("agent-a1b2c3", 0))
-        self.assertFalse(policy.excludes("agent-a1b2c3", 99))
+        # A descendant spawned inside the window is hidden whole: its turns
+        # restart at zero, so no caller boundary can split it.
+        self.assertTrue(policy.excludes("agent-a1b2c3", 0))
+        self.assertTrue(policy.excludes("agent-a1b2c3", 99))
+        self.assertTrue(policy.excludes("agent-a1b2c3", None))
         self.assertFalse(policy.labels("agent-a1b2c3", 0))
+        # A descendant from before the recap is recoverable history: kept,
+        # marked as the caller's own like its pre-boundary turns.
         self.assertFalse(policy.excludes("child", 99))
-        self.assertFalse(policy.labels("child", 99))
+        self.assertTrue(policy.labels("child", 99))
+        # Siblings, ancestors, and foreign sidechains are ordinary history.
+        self.assertFalse(policy.excludes("custom-side", 0))
+        self.assertFalse(policy.labels("custom-side", 0))
         self.assertFalse(policy.excludes("agent-foreign", 0))
         self.assertFalse(policy.labels("agent-foreign", 0))
+        self.assertEqual(policy.query_filters(), {
+            "exclude_session": "root", "exclude_session_from_turn": 7,
+            "_exclude_sessions": ("agent-a1b2c3",)})
+        merged = policy.apply_filters(
+            {"_exclude_sessions": ("hidden-side",), "project": "p"})
+        self.assertEqual(merged, {
+            "project": "p", "exclude_session": "root",
+            "exclude_session_from_turn": 7,
+            "_exclude_sessions": ("agent-a1b2c3", "hidden-side")})
 
-    def test_auto_policy_requires_a_proven_boundary_but_forced_is_structural(
+    def test_auto_policy_needs_a_recap_state_but_forced_is_structural(
             self) -> None:
+        # resolved family, recap rows exist but none is a usable boundary
         family = common.CallingFamily(
             "root", "root", frozenset({"root", "child", "sibling"}),
             True, None)
@@ -452,6 +697,187 @@ class AgentContextContracts(unittest.TestCase):
         self.assertTrue(forced.excludes("sibling", None))
         self.assertFalse(forced.excludes("other", 1))
         self.assertEqual(forced.query_filters(), {"exclude_session": "root"})
+
+    def test_never_compacted_caller_is_windowed_from_turn_zero(self) -> None:
+        family = common.CallingFamily(
+            "root", "root", frozenset({"root", "child"}), True, None,
+            frozenset({"child"}), never_compacted=True, source="pi-process",
+            descendants=frozenset({"child"}),
+            window_members=frozenset({"child"}))
+        with mock.patch.object(
+                session_context, "calling_family", return_value=family):
+            policy = common.calling_self_exclusion()
+        self.assertIsNotNone(policy)
+        self.assertEqual((policy.boundary, policy.reason), (0, "window"))
+        self.assertTrue(policy.excludes("root", 0))
+        self.assertTrue(policy.excludes("root", 41))
+        self.assertFalse(policy.labels("root", 0))
+        self.assertTrue(policy.excludes("child", 0))
+        self.assertEqual(
+            policy.query_filters(),
+            {"exclude_session": "root", "exclude_session_from_turn": 0,
+             "_exclude_sessions": ("child",)})
+        # an unresolved family never becomes a window, compacted or not
+        unresolved = family._replace(resolved=False)
+        with mock.patch.object(
+                session_context, "calling_family", return_value=unresolved):
+            self.assertIsNone(common.calling_self_exclusion())
+
+    def test_indexed_no_recap_rows_resolve_as_never_compacted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _publish_family_meta(root, [
+                {"session": "root"},
+                {"session": "child", "parent": "root"},
+            ])
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+                CREATE TABLE msgs(session TEXT, turn INTEGER, who TEXT);
+            """)
+            with mock.patch.object(session_context, "DATA_DIR", root):
+                db.execute(
+                    "INSERT INTO meta VALUES('family_stamp', ?)",
+                    (common.session_family_source_stamp(),),
+                )
+                db.executemany(
+                    "INSERT INTO session_family VALUES(?, ?, ?)",
+                    (("root", "root", 0), ("child", "root", 1)),
+                )
+                db.executemany(
+                    "INSERT INTO msgs VALUES(?, ?, ?)",
+                    (("root", 0, "user"), ("root", 1, "user"),
+                     ("child", 0, "subagent")),
+                )
+                db.commit()
+                with mock.patch.object(
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root", "pi")):
+                    family = common.calling_family()
+                    policy = common.calling_self_exclusion()
+                    with session_context.calling_family_snapshot() as (
+                            _identity, snapshot_family, snapshot_db):
+                        # postcompact keeps reading the same state: no recap
+                        # boundary to serve, so it stays a proven absence
+                        self.assertIsNotNone(snapshot_db)
+                        self.assertTrue(snapshot_family.never_compacted)
+                        self.assertIsNone(snapshot_family.recap_turn)
+            db.close()
+        self.assertTrue(family.resolved)
+        self.assertTrue(family.never_compacted)
+        self.assertIsNone(family.recap_turn)
+        self.assertEqual(family.source, "pi")
+        self.assertEqual(family.descendants, frozenset({"child"}))
+        self.assertEqual(family.window_members, frozenset({"child"}))
+        self.assertEqual(policy.boundary, 0)
+        self.assertTrue(policy.excludes("child", 0))
+
+    def test_recap_window_hides_descendants_spawned_after_the_recap(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _publish_family_meta(root, [
+                {"session": "root"},
+                {"session": "child-old", "parent": "root"},
+                {"session": "child-new", "parent": "root"},
+                {"session": "child-unstamped", "parent": "root"},
+                {"session": "root2"},
+                {"session": "child2", "parent": "root2"},
+            ])
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+                CREATE TABLE msgs(session TEXT, turn INTEGER, ts INTEGER, who TEXT);
+            """)
+            with mock.patch.object(session_context, "DATA_DIR", root):
+                db.execute(
+                    "INSERT INTO meta VALUES('family_stamp', ?)",
+                    (common.session_family_source_stamp(),),
+                )
+                db.executemany(
+                    "INSERT INTO session_family VALUES(?, ?, ?)",
+                    (("root", "root", 0), ("child-old", "root", 1),
+                     ("child-new", "root", 1), ("child-unstamped", "root", 1),
+                     ("root2", "root2", 0), ("child2", "root2", 1)),
+                )
+                db.executemany(
+                    "INSERT INTO msgs VALUES(?, ?, ?, ?)",
+                    (("root", 0, 100, "user"), ("root", 6, 900, "agent"),
+                     ("root", 7, 1000, "recap"), ("root", 8, 1100, "user"),
+                     ("root", None, 2000, "user"),
+                     ("child-old", 0, 500, "subagent"),
+                     ("child-old", 1, 1200, "tool"),
+                     ("child-new", 0, 1500, "subagent"),
+                     ("child-unstamped", 0, None, "subagent"),
+                     ("peer-old", 0, 200, "subagent"),
+                     ("peer-new", 0, 1200, "subagent"),
+                     ("root2", 3, None, "recap"),
+                     ("child2", 0, 100, "subagent")),
+                )
+                db.commit()
+                with mock.patch.object(
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root", "codex")):
+                    family = common.calling_family()
+                    policy = common.calling_self_exclusion()
+                    self.assertTrue(
+                        common.indexed_self_exclusion_has_rows(policy))
+                    # the notice speaks for exactly the applied set: no
+                    # NULL-turn caller row and no retained descendant
+                    quiet = common.SelfExclusion(
+                        family._replace(window_members=frozenset()), 9,
+                        "window")
+                    self.assertFalse(
+                        common.indexed_self_exclusion_has_rows(quiet))
+                    widened = common.SelfExclusion(
+                        family._replace(
+                            window_members=frozenset({"child-old"})),
+                        9, "window")
+                    self.assertTrue(
+                        common.indexed_self_exclusion_has_rows(widened))
+                with mock.patch.object(
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root", "pi-process")), \
+                        mock.patch.object(
+                            session_context, "published_caller",
+                            return_value=mock.Mock(sessions=(
+                                "root", "child-old", "peer-old", "peer-new"))):
+                    published_policy = common.calling_self_exclusion()
+                with mock.patch.object(
+                        session_context, "calling_identity",
+                        return_value=common.CallerIdentity("root2", "codex")):
+                    unstamped_recap = common.calling_family()
+            db.close()
+        self.assertEqual(family.recap_turn, 7)
+        self.assertEqual(
+            family.descendants,
+            frozenset({"child-old", "child-new", "child-unstamped"}))
+        self.assertEqual(family.window_members, frozenset({"child-new"}))
+        self.assertEqual(policy.boundary, 7)
+        self.assertTrue(policy.excludes("child-new", 0))
+        self.assertFalse(policy.excludes("child-old", 1))
+        self.assertTrue(policy.labels("child-old", 1))
+        self.assertFalse(policy.excludes("child-unstamped", 0))
+        self.assertTrue(policy.labels("child-unstamped", 0))
+        self.assertEqual(policy.query_filters(), {
+            "exclude_session": "root", "exclude_session_from_turn": 7,
+            "_exclude_sessions": ("child-new",)})
+        # a recap without a timestamp proves nothing about spawn order
+        self.assertEqual(unstamped_recap.recap_turn, 3)
+        self.assertEqual(unstamped_recap.descendants, frozenset({"child2"}))
+        self.assertEqual(unstamped_recap.window_members, frozenset())
+        self.assertFalse(published_policy.excludes("child-old", 1))
+        self.assertFalse(published_policy.excludes("peer-old", 0))
+        self.assertTrue(published_policy.labels("peer-old", 0))
+        self.assertTrue(published_policy.excludes("peer-new", 0))
 
     def test_family_lookup_rejects_a_source_move_after_database_open(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -591,9 +1017,10 @@ class AgentContextContracts(unittest.TestCase):
 
     def test_unresolved_family_does_not_create_an_automatic_policy(self) -> None:
         with mock.patch.object(
-                session_context, "calling_session", return_value="child"), \
+                session_context, "calling_identity",
+                return_value=common.CallerIdentity("child", "codex")), \
                 mock.patch.object(
-                    session_context, "_indexed_calling_family_state",
+                    session_context, "_indexed_calling_family_details",
                     return_value=None):
             family = common.calling_family()
             policy = common.calling_self_exclusion()

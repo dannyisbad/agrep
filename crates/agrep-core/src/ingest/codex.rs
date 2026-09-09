@@ -1,4 +1,4 @@
-//! Codex CLI adapter: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+//! Codex CLI/Desktop adapter: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
 //! One JSONL file per session. The first line is `session_meta` (gives cwd -> project,
 //! and the session id). Real human turns are `response_item` lines with
 //! payload.type=="message" and payload.role=="user", text in `input_text`/`text` blocks.
@@ -6,8 +6,8 @@
 //! Much of what arrives under `role:user` is codex's own composition: AGENTS.md and the
 //! environment block, plugin and skill catalogs, delegation payloads, system notifications.
 //! Their shape is indistinguishable from typed prose, so eligibility comes from the rollout's
-//! `event_msg`/`user_message` log (`Submissions`), which records keyboard submissions and
-//! nothing else. `is_wrapper`/`is_codex_injected` still veto client echoes the log does carry,
+//! `event_msg` submission log (`Submissions`), in legacy and Desktop schemas.
+//! `is_wrapper`/`is_codex_injected` still veto client echoes the log does carry,
 //! such as slash-command markup. Prefer under-including over mislabeling.
 //!
 //! NOTE: only `~/.codex/sessions/` is walked. `~/.codex/.tmp/**` (plugin test fixtures),
@@ -361,34 +361,47 @@ struct SubmissionLine<'a> {
     payload: Option<SubmissionPayload<'a>>,
 }
 
-/// `message` is a string only on `user_message`; other payloads type it as an
-/// object, and those lines fail this borrow and are skipped rather than coerced.
+/// Legacy `message` values must be strings; object-valued event messages are not submissions.
 #[derive(Deserialize)]
 struct SubmissionPayload<'a> {
     #[serde(rename = "type", borrow)]
     ty: Option<Cow<'a, str>>,
     #[serde(borrow)]
     message: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    thread_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    turn_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    item: Option<SubmissionItem<'a>>,
 }
 
-/// What the rollout records the human as having submitted.
-///
-/// Codex composes the `role:user` response_items it sends to the model: AGENTS.md,
-/// the environment block, plugin and skill catalogs, delegation payloads and typed
-/// prose all arrive under the same role, and nothing in their shape separates a
-/// config file from a sentence. The rollout's own `event_msg`/`user_message` log is
-/// the seam: it exists once per keyboard submission and never for injected input.
+#[derive(Deserialize)]
+struct SubmissionItem<'a> {
+    #[serde(rename = "type", borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    content: Option<Vec<Block<'a>>>,
+}
+
+/// Only native submission events attest composed `role:user` input as human prose.
 struct Submissions {
     /// Sorted and deduped, so `attests` binary-searches instead of scanning.
     texts: Vec<String>,
+    /// Desktop text is scoped to its thread and turn so routed copies cannot attest it.
+    desktop: Vec<(String, String, String)>,
 }
 
 impl Submissions {
     fn collect(data: &str) -> Self {
-        let finder = memmem::Finder::new(b"\"user_message\"");
+        let legacy_finder = memmem::Finder::new(b"\"user_message\"");
+        let desktop_finder = memmem::Finder::new(b"\"UserMessage\"");
         let mut texts: Vec<String> = Vec::new();
+        let mut desktop = Vec::new();
         for line in data.lines() {
-            if finder.find(line.as_bytes()).is_none() {
+            if legacy_finder.find(line.as_bytes()).is_none()
+                && desktop_finder.find(line.as_bytes()).is_none()
+            {
                 continue;
             }
             let parsed: SubmissionLine = match serde_json::from_str(line) {
@@ -398,34 +411,83 @@ impl Submissions {
             if parsed.ty.as_deref() != Some("event_msg") {
                 continue;
             }
-            let text = parsed
-                .payload
-                .as_ref()
-                .filter(|p| p.ty.as_deref() == Some("user_message"))
-                .and_then(|p| p.message.as_deref())
-                .map(str::trim)
-                .filter(|t| !t.is_empty());
-            if let Some(text) = text {
-                texts.push(text.to_string());
+            let Some(payload) = parsed.payload else {
+                continue;
+            };
+            match payload.ty.as_deref() {
+                Some("user_message") => {
+                    if let Some(text) = payload
+                        .message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                    {
+                        texts.push(text.to_string());
+                    }
+                }
+                Some("item_completed") => {
+                    let (Some(thread_id), Some(turn_id), Some(item)) =
+                        (payload.thread_id, payload.turn_id, payload.item)
+                    else {
+                        continue;
+                    };
+                    if thread_id.is_empty()
+                        || turn_id.is_empty()
+                        || item.ty.as_deref() != Some("UserMessage")
+                    {
+                        continue;
+                    }
+                    let mut parts = item
+                        .content
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|block| block.ty.as_deref() == Some("text"))
+                        .filter_map(|block| block.text);
+                    let Some(first) = parts.next() else {
+                        continue;
+                    };
+                    let mut text = first.into_owned();
+                    for part in parts {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&part);
+                    }
+                    text.truncate(text.trim_end().len());
+                    text.replace_range(..text.len() - text.trim_start().len(), "");
+                    if !text.is_empty() {
+                        desktop.push((thread_id.into_owned(), turn_id.into_owned(), text));
+                    }
+                }
+                _ => {}
             }
         }
         texts.sort_unstable();
         texts.dedup();
-        Self { texts }
+        desktop.sort_unstable();
+        desktop.dedup();
+        Self { texts, desktop }
     }
 
     fn is_empty(&self) -> bool {
-        self.texts.is_empty()
+        self.texts.is_empty() && self.desktop.is_empty()
     }
 
-    /// A response_item is the human's turn when the log carries its text. Codex
-    /// appends paste markers after the typed prose, so a logged submission that
-    /// starts the item attests it; in sort order the only candidate prefix is the
-    /// item's immediate predecessor.
-    fn attests(&self, text: &str) -> bool {
+    /// Legacy submissions allow appended paste markers; Desktop requires matching thread, turn and text.
+    fn attests(&self, text: &str, session: Option<&str>, turn_id: Option<&str>) -> bool {
         let text = text.trim();
         let after = self.texts.partition_point(|s| s.as_str() <= text);
-        after > 0 && text.starts_with(self.texts[after - 1].as_str())
+        if after > 0 && text.starts_with(self.texts[after - 1].as_str()) {
+            return true;
+        }
+        let (Some(session), Some(turn_id)) = (session, turn_id) else {
+            return false;
+        };
+        self.desktop
+            .binary_search_by(|(thread, turn, submitted)| {
+                (thread.as_str(), turn.as_str(), submitted.as_str()).cmp(&(session, turn_id, text))
+            })
+            .is_ok()
     }
 }
 
@@ -1067,6 +1129,11 @@ fn parse_file_with_tally(
             continue;
         }
 
+        let message_turn_id = payload
+            .internal_chat_message_metadata_passthrough
+            .as_ref()
+            .and_then(|m| m.turn_id.as_deref());
+
         // Legacy/native subagents with no routing path carry a real plaintext task.
         // Require its passthrough turn id to match the child-owned task_started marker;
         // without that proof, keep suppressing the inherited parent transcript.
@@ -1083,14 +1150,15 @@ fn parse_file_with_tally(
                         delegated_input(&text).or_else(|| {
                             (!is_wrapper(&text)
                                 && !is_codex_injected(&text)
-                                && (submissions.is_empty() || submissions.attests(&text)))
+                                && (submissions.is_empty()
+                                    || submissions.attests(
+                                        &text,
+                                        session.as_deref(),
+                                        message_turn_id,
+                                    )))
                             .then_some(text)
                         })
                     });
-                let message_turn_id = payload
-                    .internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|m| m.turn_id.as_deref());
                 let turn_matches = ctx.started
                     // both ids present and equal - None == None is absence matching
                     // absence, not proof, and must never open the boundary
@@ -1336,7 +1404,7 @@ fn parse_file_with_tally(
         // An absent submission is not evidence of a human turn: a subagent thread
         // logs none because nobody is at the keyboard, and its real inbound work
         // arrives on the handoff paths above.
-        if !submissions.attests(&text) {
+        if !submissions.attests(&text, session.as_deref(), message_turn_id) {
             tally.skip(crate::intake::Skip::NonHuman);
             continue;
         }
@@ -1537,6 +1605,89 @@ mod tests {
         })
     }
 
+    fn desktop_submitted(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z", "ordinal": 9, "type": "event_msg",
+            "payload": {
+                "type": "item_completed", "thread_id": "session-desktop", "turn_id": "turn-1",
+                "item": {
+                    "type": "UserMessage", "id": "item-1", "client_id": "client-1",
+                    "content": [{"type": "text", "text": text, "text_elements": []}]
+                },
+                "completed_at_ms": 1767225601000u64
+            }
+        })
+    }
+
+    #[test]
+    fn desktop_submission_survives_replyless_task_completion() {
+        let root = scratch("desktop-replyless");
+        let mut user = user_item("test\n");
+        user["payload"]["internal_chat_message_metadata_passthrough"] =
+            serde_json::json!({"turn_id": "turn-1"});
+        let path = rollout(
+            &root,
+            "rollout-desktop.jsonl",
+            &[
+                meta(
+                    "session-desktop",
+                    serde_json::json!({"thread_source": "user", "source": "vscode"}),
+                ),
+                user_item(INSTALLED_BLOCK),
+                user_item("test\n"),
+                user,
+                desktop_submitted("test\n"),
+                serde_json::json!({
+                    "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete", "turn_id": "turn-1", "last_agent_message": null,
+                        "error": {"message": "Usage limit reached", "codex_error_info": "usage_limit_exceeded"}
+                    }
+                }),
+            ],
+        );
+        let (msgs, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(&*msgs[0].text, "test\n");
+        assert_eq!(&*msgs[0].session, "session-desktop");
+        assert_eq!(&*msgs[0].who, "user");
+        assert!(msgs[0].reply.is_empty());
+        assert!(events.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn desktop_attestation_requires_submission_kind_and_matching_identity() {
+        let mut agent = desktop_submitted("model text");
+        agent["payload"]["item"]["type"] = serde_json::json!("AgentMessage");
+        let mut routed = desktop_submitted("routed text");
+        routed["payload"]["thread_id"] = serde_json::json!("other-thread");
+        let mut tool = desktop_submitted("tool text");
+        tool["payload"]["item"]["content"][0]["type"] = serde_json::json!("output_text");
+        let mut nested = desktop_submitted("nested text");
+        nested["type"] = serde_json::json!("response_item");
+        let data = [desktop_submitted("test\n"), agent, routed, tool, nested]
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let submissions = Submissions::collect(&data);
+        assert!(submissions.attests("test\n", Some("session-desktop"), Some("turn-1")));
+        assert!(!submissions.attests("test\n", Some("session-desktop"), Some("other-turn")));
+        assert!(!submissions.attests("test\n", Some("session-desktop"), None));
+        for text in [
+            "test\ninjected instructions",
+            "model text",
+            "routed text",
+            "tool text",
+            "nested text",
+            INSTALLED_BLOCK,
+        ] {
+            assert!(!submissions.attests(text, Some("session-desktop"), Some("turn-1")));
+        }
+    }
+
     fn meta(id: &str, extra: serde_json::Value) -> serde_json::Value {
         let mut payload =
             serde_json::json!({"type": "session_meta", "id": id, "cwd": "/work/agrep"});
@@ -1594,8 +1745,8 @@ mod tests {
             ]
             .join("\n"),
         );
-        assert!(submissions.attests("hi"));
-        assert!(!submissions.attests(&format!("{INSTALLED_BLOCK}\ncontinue")));
+        assert!(submissions.attests("hi", None, None));
+        assert!(!submissions.attests(&format!("{INSTALLED_BLOCK}\ncontinue"), None, None));
     }
 
     #[test]

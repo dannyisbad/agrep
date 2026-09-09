@@ -1017,6 +1017,66 @@ class ADelegatedBuildIsAQueuedWorkItem(unittest.TestCase):
             owner._serve_index_request()
         busy.assert_not_called()
 
+    def test_recovery_acknowledgment_requires_a_successful_source_pass(self) -> None:
+        with self._data_dir(), \
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(indexd_runtime, "derived_writes_permitted",
+                                  return_value=True):
+            token = indexd_runtime.request_recovery_refresh()
+            self.assertIsNotNone(token)
+            indexd_runtime.serve_recovery_requests(lambda: False)
+            self.assertFalse(indexd_runtime.recovery_refresh_complete(token))
+            indexd_runtime.serve_recovery_requests(lambda: True)
+            self.assertTrue(indexd_runtime.recovery_refresh_complete(token))
+            indexd_runtime.release_recovery_request(token)
+            self.assertFalse(indexd_runtime.recovery_refresh_complete(token))
+
+    def test_recovery_arriving_during_ingest_requires_the_next_source_pass(self) -> None:
+        with self._data_dir(), \
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(indexd_runtime, "derived_writes_permitted",
+                                  return_value=True):
+            first = indexd_runtime.request_recovery_refresh()
+            later = []
+
+            def ingest():
+                later.append(indexd_runtime.request_recovery_refresh())
+                return True
+
+            indexd_runtime.serve_recovery_requests(ingest)
+            self.assertTrue(indexd_runtime.recovery_refresh_complete(first))
+            self.assertFalse(indexd_runtime.recovery_refresh_complete(later[0]))
+            indexd_runtime.serve_recovery_requests(lambda: True)
+            self.assertTrue(indexd_runtime.recovery_refresh_complete(later[0]))
+
+    def test_canceled_recovery_does_not_force_a_later_ingest(self) -> None:
+        with self._data_dir(), \
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(indexd_runtime, "derived_writes_permitted",
+                                  return_value=True):
+            request = indexd_runtime.request_recovery_refresh()
+            self.assertIsNotNone(request)
+            indexd_runtime.release_recovery_request(request)
+            with mock.patch.object(
+                    indexd_runtime, "refresh_search_index",
+                    side_effect=AssertionError("cancelled recovery performed work")) as ingest:
+                self.assertFalse(indexd_runtime.serve_recovery_requests(ingest))
+            self.assertFalse(indexd_runtime.recovery_refresh_complete(request))
+
+    def test_cancel_during_ingest_does_not_leave_a_late_receipt(self) -> None:
+        with self._data_dir(), \
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(indexd_runtime, "derived_writes_permitted",
+                                  return_value=True):
+            request = indexd_runtime.request_recovery_refresh()
+
+            def ingest():
+                indexd_runtime.release_recovery_request(request)
+                return True
+
+            self.assertTrue(indexd_runtime.serve_recovery_requests(ingest))
+            self.assertFalse(indexd_runtime.recovery_refresh_complete(request))
+
 
 class ColdBuildBulkLoad(unittest.TestCase):
     """The cold build's temp file is unlinked on every exit, so it trades the
@@ -1119,7 +1179,7 @@ class AbsorbedDriftObservation(unittest.TestCase):
         self.assertEqual(report.state, "current")
         self.assertEqual(report.absorbed, 1)
 
-    def test_freshness_story_carries_the_absorbed_fact_silently(self) -> None:
+    def test_absorbed_drift_allows_a_silent_snapshot_miss(self) -> None:
         observed = indexd_runtime.DriftReport("current", absorbed=1)
         with mock.patch.object(indexd_runtime, "indexing_failure",
                                return_value=None), \
@@ -1127,15 +1187,13 @@ class AbsorbedDriftObservation(unittest.TestCase):
                                   return_value=observed):
             story = indexd_runtime.freshness_story()
         self.assertEqual(story.state, "current")
-        self.assertTrue(story.absorbed_drift)
-        # display stays green (law 3); only the zero's verdict reads the fact
         self.assertEqual(surface.freshness_story_line(story), "")
         verdict = surface.miss_verdict(
             story, meaning_served=True,
             meaning_coverage={"indexed": 5, "total": 5, "complete": True},
             sessions=5)
-        self.assertFalse(verdict.confident)
-        self.assertNotIn("index current", verdict.tail)
+        self.assertTrue(verdict.confident)
+        self.assertEqual(surface.grep_absence_exit(exact=True, freshness=story), 1)
 
 
 def _parse_cache_base(sources: int) -> bytes:

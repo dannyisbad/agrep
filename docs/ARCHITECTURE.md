@@ -41,10 +41,10 @@ allowlist fell from four rows to one.
   `embedder.profile_string` suffixes only the Metal lane, which leaves every
   pre-lane store byte-valid and re-embeds nothing; `resolve_lane` conforms to
   the lane already on disk instead of re-deciding per process; and
-  `_start_metal_lane` refuses to open below a 0.995 cosine floor against the
-  ONNX vectors for a fixed short-and-long probe set, because a pooling
-  mismatch scores about 0.77 while shared-weight arithmetic drift measured
-  0.99875. Pinned in `py/test_mlx_embed.py`. See `py/README.md` for the
+  `_start_metal_lane` refuses to open below the 0.97 cosine floor against
+  ONNX int8 vectors for a fixed short-and-long probe set. Passing that guard
+  does not guarantee identical rankings near a score threshold; stores keep
+  their lane identity. Pinned in `py/test_mlx_embed.py`. See `py/README.md` for the
   operational contract.
 - **Semantic process split**: the meaning lane is three processes, not one
   module, and the split is deliberate: a one-shot agent command must not pay
@@ -66,28 +66,43 @@ allowlist fell from four rows to one.
   the caller falls back to keyword rather than stacking a second in-process
   inference.
 - **Teaching surface**: the taught block text lives in `py/nudge_default.md`
-  and `py/nudge_codex.md`, not in `py/teach.py`. Selftest hash-pins the default
-  block against its version number, so changing that file without bumping the
-  version fails; it also asserts both blocks still name every command they
-  route to. The demo-line byte-compare against live probe output binds only
-  when a block carries a demo line, and the current lean blocks carry none, so
-  the codex block's text is asserted by route coverage rather than by hash.
+  and `py/nudge_codex.md`, not in `py/teach.py`. Both blocks address the agent
+  in the second person and carry no template slots, so every non-codex target
+  receives the same bytes. Selftest hash-pins the default block against its
+  version number, so changing that file without bumping the version fails; it
+  also asserts both blocks still name every command they route to, and that
+  the outgoing version's body digests were moved into
+  `teach._PRIOR_BLOCK_DIGESTS`, the provenance record that tells a shipped
+  block from an edited one. The demo-line byte-compare against live probe
+  output binds only when a block carries a demo line, and the current lean
+  blocks carry none, so the codex block's text is asserted by route coverage
+  rather than by hash.
 - **Artifacts installed outside the repo**: two surface classes write into
   files agrep does not own: taught blocks, and compaction integrations that
   point a resumed agent at `agrep postcompact` (`py/hookinstall.py`: Claude
   `PreCompact`, Codex compact-only `SessionStart`, and a shared pi/oh-my-pi
-  extension). The pi-family extension also exports the exact live session ID
-  and adds recovery instructions through the native compaction-summary context.
+  extension). The pi-family extension also names the live session two ways -
+  an environment export for harnesses whose tool shells inherit a live
+  environment, and a per-process `{pid, sessions[]}` publication
+  (`docs/COORDINATION.md`) that `session_context.calling_identity` finds by
+  walking its own parent chain, because oh-my-pi's tool shells carry a
+  pre-session environment snapshot - and adds recovery instructions through
+  the native compaction-summary context.
   Every artifact obeys preserve-and-disclose: a drifted artifact is reported,
   never repaired by a background snapshot-and-replace, because that pattern
   erases an edit made between the snapshot and the write. A taught block is
-  versioned by its marker; hook and extension ownership is decided by hashing
-  installed bytes against payloads agrep has shipped. A match may be upgraded;
-  anything else is the user's and is left alone. A pre-existing integration is
-  never displaced, removal takes out only agrep-owned entries, and an
-  unparseable settings file or unreadable extension root is treated as the
-  user's. Pinned in `py/test_teach_safety.py`, `py/test_hookinstall.py`, and the
-  executable lifecycle contract in `py/test_pi_omp_extension.py`.
+  versioned by its marker and its body is hashed against the shipped digests:
+  an older block is `drifted` (explicit setup upgrades it, and says
+  `replacing an edited vN block` when its body was not shipped text), a
+  same-version block with a foreign body is `edited` (reported, kept until a
+  newer setup replaces it), and a newer block is preserved. Hook and extension
+  ownership is decided by hashing installed bytes against payloads agrep has
+  shipped. A match may be upgraded; anything else is the user's and is left
+  alone. A pre-existing integration is never displaced, removal takes out only
+  agrep-owned entries, and an unparseable settings file or unreadable
+  extension root is treated as the user's. Pinned in `py/test_teach_safety.py`,
+  `py/test_hookinstall.py`, and the executable lifecycle contract in
+  `py/test_pi_omp_extension.py`.
 - **Test worlds**: `test_*.py` are hermetic units; `selftest.py` is the
   installed-reality gate (real binary, daemons, HOME, generated-surface
   pins). Every contract belongs to exactly one world; selftest stays one

@@ -175,14 +175,15 @@ _SEARCH_INERT = {
     "--color": "one number has nothing to style",
 }
 _SEARCH_HONORED = frozenset({
-    "-E", "-w", "--agent", "--project", "--exclude-project", "--model",
-    "--soft", "--who", "--no-who", "--chat", "--since", "--until",
-    "--no-self", "--no-auto",
+    "-E", "-w", "--agent", "--project", "--here", "--exclude-project",
+    "--model", "--soft", "--who", "--no-who", "--no-side", "--chat",
+    "--since", "--until", "--no-self", "--no-auto",
 })
 _ROW_SURFACE_HONORED = frozenset({
     "-E", "-w", "-n", "-s", "--sort", "--lexical", "--agent", "--project",
-    "--exclude-project", "--model", "--soft", "--who", "--no-who", "--chat",
-    "--since", "--until", "--no-self", "--no-meta", "--no-auto", "--color",
+    "--here", "--exclude-project", "--model", "--soft", "--who", "--no-who",
+    "--no-side", "--chat", "--since", "--until", "--no-self", "--no-meta",
+    "--no-auto", "--color",
 })
 # --more's generic refusal names the option class, not the base flag
 _ROW_SURFACE_ELSEWHERE = {**_SEMANTIC_ONLY, "--more": "output options"}
@@ -209,7 +210,8 @@ SURFACES = (
     Surface(recall.main, ["deadlock", "--probe"], "--probe",
             frozenset({"--hits", "--json"}), {},
             frozenset({"--budget", "-C", "-s", "--lexical", "--self",
-                       "--no-self", "--all-side-chats", "--agent", "--project",
+                       "--no-self", "--all-side-chats", "--no-side", "--agent",
+                       "--project", "--here", "--exclude-project",
                        "--model", "--soft", "--who", "--no-who", "--no-meta",
                        "--chat", "--since", "--until", "--no-auto", "--color"})),
     Surface(resume.main, ["-l"], "-l",
@@ -509,9 +511,10 @@ class ReportedCaseTests(unittest.TestCase):
 # refusal live. -l beside --json is HONORED - one json row per chat
 # (selftest pins the shape) - a combined surface, not a drop.
 _MACHINE_HONORED = frozenset({
-    "-E", "-w", "--agent", "--project", "--exclude-project", "--model",
-    "--soft", "--who", "--no-who", "--chat", "--since", "--until",
-    "--no-self", "--no-auto", "-n", "--sort", "-s", "--no-meta",
+    "-E", "-w", "--agent", "--project", "--here", "--exclude-project",
+    "--model", "--soft", "--who", "--no-who", "--no-side", "--chat",
+    "--since", "--until", "--no-self", "--no-auto", "-n", "--sort", "-s",
+    "--no-meta",
 })
 _MACHINE_SELF_INERT = ("machine rows already include the calling family and "
                        "carry a per-row self field; the flag asks for the "
@@ -656,15 +659,16 @@ class ContinuationGateTests(unittest.TestCase):
                 self.assertIn("--deeper", err)
                 self.assertIn(flag, err)
 
-    def test_both_verbs_refuse_exclude_project(self) -> None:
+    def test_both_verbs_refuse_narrowing_flags(self) -> None:
         for verb in ("--more", "--deeper"):
-            with self.subTest(verb=verb):
-                rc, err = _exit_code(
-                    search.main,
-                    [verb, self.HANDLE, "--exclude-project", "work"])
-                self.assertEqual(rc, 2, err)
-                self.assertIn(verb, err)
-                self.assertIn("filter", err)
+            for narrowing in (["--exclude-project", "work"], ["--here"],
+                              ["--no-side"]):
+                with self.subTest(verb=verb, flag=narrowing[0]):
+                    rc, err = _exit_code(
+                        search.main, [verb, self.HANDLE, *narrowing])
+                    self.assertEqual(rc, 2, err)
+                    self.assertIn(verb, err)
+                    self.assertIn("filter", err)
 
 
 class NonsenseValueTests(unittest.TestCase):

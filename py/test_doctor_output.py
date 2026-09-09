@@ -318,6 +318,97 @@ class DoctorRowLanguageTests(unittest.TestCase):
             call.args == (output,) for call in color_enabled.call_args_list))
         self.assertNotIn("\x1b", output.getvalue())
 
+    def test_embedding_lane_row_is_informational_unless_the_lane_mismatches(
+            self) -> None:
+        # A healthy box carried a permanent `[!! ]` for an informational fact;
+        # agents reading status treat `!!` as action-needed.
+        snapshot = _report_snapshot()
+        with mock.patch.object(
+                doctor, "_store_lane_notice",
+                return_value=(doctor.OPT, "store built on the cpu lane")):
+            rendered = _render_report(snapshot)
+        lane_rows = [line for line in rendered.splitlines()
+                     if "embedding lane" in line]
+        self.assertEqual(len(lane_rows), 1)
+        self.assertIn("[-- ] embedding lane", lane_rows[0])
+
+        with mock.patch.object(
+                doctor, "_store_lane_notice",
+                return_value=(doctor.WARN, "store built on the metal lane, "
+                              "which does not open here (no)")):
+            rendered = _render_report(snapshot)
+        self.assertIn("[!! ] embedding lane", rendered)
+
+    def test_deep_no_semantic_keeps_the_semantic_tier_at_routine_depth(
+            self) -> None:
+        snapshot = _report_snapshot()
+        with (
+            mock.patch.object(doctor, "probe", return_value=snapshot) as probe,
+            mock.patch.object(doctor, "_deep_notice") as notice,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(doctor.main(["--deep", "--no-semantic"]), 0)
+        self.assertEqual(probe.call_args.kwargs["deep"], True)
+        self.assertEqual(probe.call_args.kwargs["semantic"], False)
+        notice.assert_called_once_with(semantic=False)
+        with mock.patch.object(doctor, "_semantic_probe") as semantic_probe, \
+                mock.patch.object(doctor.indexd_runtime, "arm_store_census"), \
+                mock.patch.object(doctor, "_orphan_inventory",
+                                  side_effect=RuntimeError("stop here")):
+            semantic_probe.return_value = {}
+            with self.assertRaises(RuntimeError):
+                doctor.probe(deep=True, semantic=False)
+        semantic_probe.assert_called_once_with(deep=False, fix=False)
+
+    def test_deep_notice_names_the_skipped_semantic_runtime(self) -> None:
+        output = io.StringIO()
+        doctor._deep_notice(stream=output, semantic=False)
+        self.assertIn("deep diagnostics: verifying SQLite integrity",
+                      output.getvalue())
+        self.assertIn("--no-semantic", output.getvalue())
+        plain = io.StringIO()
+        doctor._deep_notice(stream=plain)
+        self.assertNotIn("--no-semantic", plain.getvalue())
+
+    def test_installed_build_names_the_binary_date_and_the_checkout_hook(
+            self) -> None:
+        snapshot = _report_snapshot(install_lag={
+            "state": "unavailable",
+            "detail": "installed package has no unique local-source provenance",
+            "reason": "no-local-source-provenance",
+        })
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "agrep-rs"
+            binary.write_bytes(b"")
+            os.utime(binary, (1_756_166_400, 1_756_166_400))
+            with mock.patch.object(doctor, "INGEST_BIN", binary):
+                rendered = _render_report(snapshot)
+        row = next(line for line in rendered.splitlines()
+                   if "installed build" in line)
+        self.assertIn("[-- ]", row)
+        self.assertIn("(a wheel install); native binary dated 2025-08-26", row)
+        self.assertIn("AGREP_SOURCE_DIR=<checkout>", row)
+
+    def test_a_checkout_renders_its_unreleased_tail_as_one_row(self) -> None:
+        snapshot = _report_snapshot(install_lag={
+            "state": "not-installed",
+            "detail": "running from a source checkout; the checkout lists "
+                      "3 unreleased changes",
+            "source": "/fixture/checkout",
+            "unreleased": {"count": 3, "newest": "Semantic search chunks "
+                           "long rows.", "since": "0.3.1 — 2026-08-26"},
+        })
+        rendered = _render_report(snapshot)
+        self.assertNotIn("] installed build", rendered)
+        row = next(line for line in rendered.splitlines()
+                   if "] source checkout" in line)
+        self.assertIn("[-- ]", row)
+        self.assertIn("3 unreleased changes in CHANGELOG.md since 0.3.1 — "
+                      '2026-08-26; newest: "Semantic search chunks long rows."',
+                      row)
+        plain = _render_report(_report_snapshot())
+        self.assertNotIn("] source checkout", plain)
+
     def test_permission_denied_renders_one_line_even_with_a_repair_queued(
             self) -> None:
         # Law 2's exact class: only the reader can fix a permission. The

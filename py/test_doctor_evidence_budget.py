@@ -868,7 +868,6 @@ class DoctorObservationSharingTests(unittest.TestCase):
         self.assertIn("installed build", rendered)
         self.assertIn("lags local master by 8.0 days", rendered)
         self.assertIn("uv tool install --force --from", rendered)
-        self.assertIn("without your consent", rendered)
         self.assertIn("first semantic search", rendered)
         self.assertIn(
             f"`{doctor._cli_command('doctor', '--fix')}`", rendered)
@@ -949,7 +948,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
                 side_effect=AssertionError("duplicate detected-stores probe")),
         ):
             result = doctor._json_report()
-        probe.assert_called_once_with(deep=False)
+        probe.assert_called_once_with(deep=False, semantic=True)
         self.assertIs(result["detected_not_indexed"], detected)
         # the deleted drift clock must not resurface as a machine field
         self.assertNotIn("drift", result)
@@ -1461,13 +1460,20 @@ class DoctorObservationSharingTests(unittest.TestCase):
             mock.patch.object(doctor, "fix", return_value=0) as fix,
         ):
             self.assertEqual(doctor.main([]), 0)
-            report.assert_called_once_with(deep=False, fix_actions=False)
+            report.assert_called_once_with(
+                deep=False, fix_actions=False, semantic=True)
             report.reset_mock()
             self.assertEqual(doctor.main(["--deep"]), 0)
-            report.assert_called_once_with(deep=True, fix_actions=False)
+            report.assert_called_once_with(
+                deep=True, fix_actions=False, semantic=True)
+            report.reset_mock()
+            self.assertEqual(doctor.main(["--deep", "--no-semantic"]), 0)
+            report.assert_called_once_with(
+                deep=True, fix_actions=False, semantic=False)
             report.reset_mock()
             self.assertEqual(doctor.main(["--fix"]), 0)
-            report.assert_called_once_with(deep=False, fix_actions=True)
+            report.assert_called_once_with(
+                deep=False, fix_actions=True, semantic=True)
             fix.assert_called_once_with()
             report.reset_mock()
             fix.reset_mock()
@@ -1487,7 +1493,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
             contextlib.redirect_stdout(output),
         ):
             self.assertEqual(doctor.main(["--json", "--deep"]), 0)
-        machine.assert_called_once_with(deep=True)
+        machine.assert_called_once_with(deep=True, semantic=True)
         self.assertEqual(json.loads(output.getvalue()), {"ok": True})
 
     def test_main_refuses_action_combos_instead_of_dropping_one(self) -> None:

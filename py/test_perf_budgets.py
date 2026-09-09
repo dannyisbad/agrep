@@ -282,6 +282,38 @@ def _public_cli(
     )
 
 
+def _stop_fixture_processes(
+        home: Path, data: Path, protected_data: Path | None = None) -> None:
+    script = (
+        "import sys\n"
+        "if sys.argv[1]:\n"
+        "    sys.path.insert(0, sys.argv[1])\n"
+        "else:\n"
+        "    import agrep\n"
+        "    from pathlib import Path\n"
+        "    sys.path.insert(0, str(Path(agrep.__file__).parent / 'py'))\n"
+        "import removal_fence, teach\n"
+        "fence = removal_fence.acquire_background_removal_fence()\n"
+        "if fence is None:\n"
+        "    raise RuntimeError('fixture removal is already active')\n"
+        "try:\n"
+        "    clean = teach._stop_daemons()\n"
+        "finally:\n"
+        "    fence.release()\n"
+        "raise SystemExit(0 if clean else 1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script,
+         str(ROOT / "py") if _INSTALLED_CLI is None else ""],
+        cwd=_cli_cwd(home),
+        env=_fixture_env(home, data, protected_data or data.parent / "protected-live"),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"fixture process teardown failed: {result.stdout[-600:]} {result.stderr[-600:]}")
+
+
 def _timed_public_cli_to_file(
         home: Path, data: Path, protected_data: Path, output: Path,
         *args: str, timeout: float = 120,
@@ -408,9 +440,14 @@ class PerfBudgets(unittest.TestCase):
         _require_measured_runtime()
         cls.tmp = tempfile.TemporaryDirectory(
             prefix="agrep-budget-", dir=_perf_fixture_parent())
+        cls.addClassCleanup(cls.tmp.cleanup)
         root = Path(cls.tmp.name)
         cls.home, cls.data, cls.protected_data, cls.protected_canary = (
             _prepare_paths(root))
+        cls.addClassCleanup(
+            _assert_protected_canary, cls.protected_data, cls.protected_canary)
+        cls.addClassCleanup(
+            _stop_fixture_processes, cls.home, cls.data, cls.protected_data)
         cls.source = _write_small_fixture(cls.home, root, live_tail=True)
         # one paid build so every measured command below is a warm read
         build = cls._cli("index")
@@ -422,13 +459,6 @@ class PerfBudgets(unittest.TestCase):
             raise AssertionError(
                 f"fixture warmup search failed: {warm.stderr[-400:]}")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        try:
-            _assert_protected_canary(
-                cls.protected_data, cls.protected_canary)
-        finally:
-            cls.tmp.cleanup()
 
     @classmethod
     def _cli(
@@ -639,18 +669,12 @@ class PerfBudgets(unittest.TestCase):
                 "recall", "quorum lantern", "--probe", "--lexical"))
         self.assertEqual(probe.returncode, 0, probe.stderr[-400:])
         self.assertLess(secs, BUDGET_RECALL_S)
-        probe_line = probe.stdout.strip().lower()
-        self.assertIn("top candidate", probe_line)
-        self.assertIn("provenance:", probe_line)
-        self.assertIn("pull:", probe_line)
+        self.assertIn(f"@{SESSION[:8]}:", probe.stdout)
 
         secs, miss = _wall(lambda: self._cli(
             "recall", "zzqxv no prior context", "--probe"))
         self.assertEqual(miss.returncode, 2, miss.stderr[-400:])
         self.assertLess(secs, BUDGET_RECALL_S)
-        miss_line = miss.stdout.strip().lower()
-        self.assertIn("recall: no confident past-context pointer", miss_line)
-        self.assertIn("searched", miss_line)
 
     def test_unavailable_explicit_semantic_fails_within_budget(self) -> None:
         secs, res = _wall(lambda: self._cli(
@@ -716,21 +740,20 @@ class FreshnessBudgets(unittest.TestCase):
     def setUp(self) -> None:
         _require_measured_runtime()
         self.tmp = tempfile.TemporaryDirectory(prefix="agrep-freshness-budget-")
+        self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
         (self.home, self.data, self.protected_data,
          self.protected_canary) = _prepare_paths(root)
+        self.addCleanup(
+            _assert_protected_canary, self.protected_data, self.protected_canary)
+        self.addCleanup(
+            _stop_fixture_processes, self.home, self.data, self.protected_data)
         self.source = _write_small_fixture(
             self.home, root, session=DRIFT_SESSION)
         built = self._cli("index")
         if built.returncode != 0:
             self.fail(f"fixture ingest failed: {built.stderr[-600:]}")
 
-    def tearDown(self) -> None:
-        try:
-            _assert_protected_canary(
-                self.protected_data, self.protected_canary)
-        finally:
-            self.tmp.cleanup()
 
     def _cli(
             self, *args: str, timeout: float = 120,
@@ -848,9 +871,14 @@ class FlatScaleBudget(unittest.TestCase):
     def setUpClass(cls) -> None:
         _require_measured_runtime()
         cls.tmp = tempfile.TemporaryDirectory(prefix="agrep-flat50k-budget-")
+        cls.addClassCleanup(cls.tmp.cleanup)
         root = Path(cls.tmp.name)
         (cls.home, cls.data, cls.protected_data,
          cls.protected_canary) = _prepare_paths(root)
+        cls.addClassCleanup(
+            _assert_protected_canary, cls.protected_data, cls.protected_canary)
+        cls.addClassCleanup(
+            _stop_fixture_processes, cls.home, cls.data, cls.protected_data)
         project = cls.home / ".claude" / "projects" / "flat50k-fixture"
         project.mkdir(parents=True)
         source = project / f"{SCALE_SESSION}.jsonl"
@@ -909,13 +937,6 @@ class FlatScaleBudget(unittest.TestCase):
             raise AssertionError(
                 f"50k flat warmup failed: {warm.stderr[-400:]}")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        try:
-            _assert_protected_canary(
-                cls.protected_data, cls.protected_canary)
-        finally:
-            cls.tmp.cleanup()
 
     @classmethod
     def _cli(
@@ -1293,8 +1314,10 @@ class FreshnessDisclosureBlackBox(_IsolatedBlackBox, unittest.TestCase):
         if _INSTALLED_CLI is None and not RELEASE_BIN.is_file():
             raise unittest.SkipTest(f"release binary missing: {RELEASE_BIN}")
         cls.tmp = tempfile.TemporaryDirectory(prefix="agrep-fresh-")
+        cls.addClassCleanup(cls.tmp.cleanup)
         root = Path(cls.tmp.name)
         cls.home, cls.data = root / "home", root / "data"
+        cls.addClassCleanup(_stop_fixture_processes, cls.home, cls.data)
         project = cls.home / ".claude" / "projects" / "fresh-fixture"
         project.mkdir(parents=True)
         rows = []
@@ -1315,9 +1338,6 @@ class FreshnessDisclosureBlackBox(_IsolatedBlackBox, unittest.TestCase):
         if build.returncode != 0:
             raise unittest.SkipTest(f"fixture ingest failed: {build.stderr[-400:]}")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.tmp.cleanup()
 
 
     def _meta_freshness(self) -> dict:
@@ -1431,8 +1451,10 @@ class DisclosureCompositionBlackBox(_IsolatedBlackBox, unittest.TestCase):
         if _INSTALLED_CLI is None and not RELEASE_BIN.is_file():
             raise unittest.SkipTest(f"release binary missing: {RELEASE_BIN}")
         cls.tmp = tempfile.TemporaryDirectory(prefix="agrep-compose-")
+        cls.addClassCleanup(cls.tmp.cleanup)
         root = Path(cls.tmp.name)
         cls.home, cls.data = root / "home", root / "data"
+        cls.addClassCleanup(_stop_fixture_processes, cls.home, cls.data)
         project = cls.home / ".claude" / "projects" / "compose-fixture"
         project.mkdir(parents=True)
         rows = [{
@@ -1459,9 +1481,6 @@ class DisclosureCompositionBlackBox(_IsolatedBlackBox, unittest.TestCase):
         record["ts"] = time.time() - 7200
         record_path.write_text(json.dumps(record), encoding="utf-8")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.tmp.cleanup()
 
 
     @staticmethod

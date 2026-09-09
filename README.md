@@ -184,9 +184,22 @@ family, retaining whichever root or child holds the strongest evidence; this
 prevents one large agent swarm from consuming the result page without deleting
 the child answers from the index. Meaning search returns up to 10 confident
 conversation families by default (`-n` overrides the cap; weak nearest-neighbor
-tail rows stay silent). `--all-side-chats` expands sibling children into independent ranked
-slots; ordinary keyword search is already exhaustive. Codex's automatic guardian
-approval-review rollouts are internal control traffic and are not indexed as chats.
+tail rows stay silent). Codex's automatic guardian approval-review rollouts are
+internal control traffic and are not indexed as chats.
+
+Three flags touch side chats and mean three different things: `--no-side`
+(search, recall) hides side-chat *sessions* - the same set `chats` hides by
+default and `chats --side` includes; `--no-who subagent` drops only the rows a
+subagent *spoke* and leaves its chat listed; `--all-side-chats` (with `-s`) is a
+ranking switch that lets sibling children take separate slots instead of one
+best hit per family.
+
+`--project` matches a chat's stored project label exactly, or its last path
+segment, case-insensitively - so `--project shop` reaches both a pi label of
+`~/projects/shop` and a claude label of `shop`, and not
+`shop-admin`. `*` or `?` in the value make it a glob (`--project 'shop*'`);
+`--exclude-project` follows the same rule, and `--here` is shorthand for
+`--project <basename of the current directory>`.
 
 ## `around`
 
@@ -198,6 +211,8 @@ transcript:
 agrep around 11111111 144        # ±4 turns around turn 144 of that session
 agrep around 11111111:144 -C 10  # wider window; colon form pastes from --json
 agrep around @11111111:144       # compact result handle
+agrep around 11111111 --whole --who user   # the entire chat as the user's turns
+agrep around 11111111 144 -C 0 --max-chars 0   # one turn with its text uncapped
 agrep around 11111111 144 --full # same-window all-event forensic view
 ```
 
@@ -206,7 +221,10 @@ context inside human recall results; generic tool and delegated-workflow events
 stay out of the agent's attention path. A selected tool-result handle keeps that
 exact event visible and centers its preview on an input or output match.
 `--who tool` or `--tool-output N` explicitly opts into tool evidence, while
-`--full` restores the same-window forensic stream.
+`--full` restores the same-window forensic stream. `--whole` (also `-C all`)
+reads every turn of a chat under the usual per-message cap; a capped message
+ends in `[+N chars - agrep around <session> <turn> -C 0 --max-chars 0]`, the
+one pointer `around` and `recall` share for printing that message whole.
 Ingest safety caps remain labeled.
 
 ## `postcompact`
@@ -226,9 +244,12 @@ agrep postcompact --json          # one bounded structured packet
 
 The compaction integrations (installed by setup, `--no-hook` to skip) make the
 summary itself carry the recovery route, so resumed agents reach for it without
-being told. The pi/oh-my-pi extension also exports the exact live session ID,
-lets their summarizer carry the same recovery schema, and injects hidden
-next-turn guidance only when it observes a real compaction boundary.
+being told. The pi/oh-my-pi extension also names the live session for every
+`agrep` call made from its tool shells (it publishes the session per process,
+so search and recall can hide that session's live context window and label
+its older turns `~self`), lets their summarizer carry the same recovery
+schema, and injects hidden next-turn guidance only when it observes a real
+compaction boundary.
 
 
 ## Meaning search
@@ -260,10 +281,12 @@ Embeddings maintain themselves newest-first in the background:
 the first searchable publication is capped at 128 rows, then reports partial
 coverage until the backfill finishes. Background work adapts its batch size, priority,
 and CPU use to activity, battery, and memory pressure. Old or mismatched vectors
-are never served. The model is English-only and embeds the first 1,024 model tokens
-of each message or reply row; keyword search still indexes full text. If semantic
-artifacts are incomplete, automatic recall falls back to keyword results rather
-than waiting.
+are never served. The model is English-only with a 1,024-token window; a message
+or reply longer than one window embeds as several overlapping chunks (about 4,096
+characters each, 10% overlap, capped at 32 chunks per row with the tail sampled),
+so a phrase deep in a long reply is still reachable by meaning. Keyword search
+indexes full text regardless. If semantic artifacts are incomplete, automatic
+recall falls back to keyword results rather than waiting.
 
 ## Agentic-first design
 

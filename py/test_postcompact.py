@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime
 import io
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from _test_support import isolate_data_dir
@@ -15,6 +22,8 @@ from _test_support import isolate_data_dir
 isolate_data_dir()
 
 import postcompact  # noqa: E402
+import corpusdb  # noqa: E402
+import index_lock  # noqa: E402
 import session_context  # noqa: E402
 
 
@@ -313,6 +322,17 @@ class PacketTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for target, name, value in (
+                (postcompact.indexd_runtime, "request_recovery_refresh", "fixture"),
+                (postcompact.indexd_runtime, "recovery_refresh_complete", True),
+                (postcompact.indexd_runtime, "release_recovery_request", None),
+                (postcompact.indexd_runtime, "kick_background_repair", None),
+                (postcompact, "_snapshot_current", True)):
+            patch = mock.patch.object(target, name, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
     @staticmethod
     @contextlib.contextmanager
     def _snapshot(boundary: int | None = 8):
@@ -370,7 +390,7 @@ class CliTests(unittest.TestCase):
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        return_value=("root",
+                        return_value=("root", "root",
                                       frozenset({"root", "child"}), 8)):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
@@ -398,7 +418,7 @@ class CliTests(unittest.TestCase):
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        return_value=("root",
+                        return_value=("root", "root",
                                       frozenset({"root", "child"}), 0)):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
@@ -423,7 +443,7 @@ class CliTests(unittest.TestCase):
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        return_value=("root",
+                        return_value=("root", "root",
                                       frozenset({"root", "child"}), 8)):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
@@ -461,29 +481,19 @@ class CliTests(unittest.TestCase):
 
     def test_explicit_session_with_family_but_no_recap_retries_then_names_it(
             self) -> None:
-        """A session indexed before its compaction landed has a family but
-        no recap turn (the omp report): every scheduled retry re-ingests
-        without sleeping the suite, then the refusal names the session,
-        never "this caller"."""
+        """A missing recap remains scoped to the requested session."""
         opened = []
 
-        def _fresh_db():
+        def _fresh_db(*, allow_behind=False):
             opened.append(_db())
             return opened[-1]
 
-        ingested = []
         try:
             with mock.patch.object(
-                    postcompact, "_RETRY_PAUSES_S", (0.0, 0.0)), \
+                    postcompact, "_REFRESH_WAIT_S", 0.0), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "ensure_index",
                         return_value=True), \
-                    mock.patch.object(
-                        postcompact.indexd_runtime, "build_index",
-                        side_effect=lambda quiet: ingested.append(True)), \
-                    mock.patch.object(
-                        postcompact.common, "ingest_bin",
-                        return_value=mock.Mock(exists=lambda: True)), \
                     mock.patch.object(
                         postcompact.session_context,
                         "_open_session_family_index",
@@ -491,7 +501,7 @@ class CliTests(unittest.TestCase):
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        return_value=("root", frozenset({"root"}), None)):
+                        return_value=("root", "root", frozenset({"root"}), None)):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
                         contextlib.redirect_stderr(stderr):
@@ -500,24 +510,22 @@ class CliTests(unittest.TestCase):
             for db in opened:
                 db.close()
         self.assertEqual(rc, 2)
-        self.assertEqual(ingested, [True, True])
         self.assertIn("session root", stderr.getvalue())
         self.assertNotIn("this caller", stderr.getvalue())
 
     def test_boundary_landing_during_the_retry_window_recovers(self) -> None:
-        # The observed race: the hook fires before the freshly-compacted
-        # session flushes its first store write. The boundary appears between
-        # attempts; the bounded retry serves it instead of refusing.
         opened = []
 
-        def _fresh_db():
+        def _fresh_db(*, allow_behind=False):
             opened.append(_db())
             return opened[-1]
 
-        states = [None, None, ("root", frozenset({"root", "child"}), 8)]
         try:
             with mock.patch.object(
-                    postcompact, "_RETRY_PAUSES_S", (0.0, 0.0)), \
+                    postcompact, "_REFRESH_WAIT_S", 1.0), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "recovery_refresh_complete",
+                        side_effect=[False, False, True]), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "ensure_index",
                         return_value=True), \
@@ -525,19 +533,13 @@ class CliTests(unittest.TestCase):
                         postcompact.indexd_runtime, "agent_freshness_notice",
                         return_value=None), \
                     mock.patch.object(
-                        postcompact.indexd_runtime, "build_index",
-                        side_effect=lambda quiet: True), \
-                    mock.patch.object(
-                        postcompact.common, "ingest_bin",
-                        return_value=mock.Mock(exists=lambda: True)), \
-                    mock.patch.object(
                         postcompact.session_context,
                         "_open_session_family_index",
                         side_effect=_fresh_db), \
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        side_effect=lambda db, session: states.pop(0)):
+                        return_value=("root", "root", frozenset({"root", "child"}), 8)):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
                         contextlib.redirect_stderr(stderr):
@@ -550,33 +552,22 @@ class CliTests(unittest.TestCase):
             json.loads(stdout.getvalue())["status"], "recovered")
         self.assertEqual(stderr.getvalue(), "")
 
-    def test_explicit_session_freshness_story_degrades_to_a_partial_packet(
-            self) -> None:
-        """A live freshness story is staleness-shaped first (each retry
-        re-ingests), then disclosure: the proven boundary still serves as an
-        explicitly partial packet carrying the story, never a confident
-        'recovered' and never a refusal (the omp report: the compacting
-        session's own churn kept the index "behind" at exactly the moment
-        the packet exists for)."""
+    def test_unfinished_refresh_serves_a_partial_packet(self) -> None:
         opened = []
 
-        def _fresh_db():
+        def _fresh_db(*, allow_behind=False):
             opened.append(_db())
             return opened[-1]
 
-        ingested = []
         try:
             with mock.patch.object(
-                    postcompact, "_RETRY_PAUSES_S", (0.0,)), \
+                    postcompact, "_REFRESH_WAIT_S", 0.0), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "recovery_refresh_complete",
+                        return_value=False), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "ensure_index",
                         return_value=True), \
-                    mock.patch.object(
-                        postcompact.indexd_runtime, "build_index",
-                        side_effect=lambda quiet: ingested.append(True)), \
-                    mock.patch.object(
-                        postcompact.common, "ingest_bin",
-                        return_value=mock.Mock(exists=lambda: True)), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "agent_freshness_notice",
                         return_value="index is tearing down"), \
@@ -587,7 +578,7 @@ class CliTests(unittest.TestCase):
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        return_value=("root",
+                        return_value=("root", "root",
                                       frozenset({"root", "child"}), 8)):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
@@ -597,73 +588,315 @@ class CliTests(unittest.TestCase):
             for db in opened:
                 db.close()
         self.assertEqual(rc, 2)
-        self.assertEqual(ingested, [True])
         packet = json.loads(stdout.getvalue())
         self.assertEqual(packet["status"], "partial")
         self.assertEqual(
             packet["coverage"]["index_freshness"], "index is tearing down")
         self.assertEqual(stderr.getvalue(), "")
 
-    def test_unresolvable_generation_serves_the_last_published_snapshot(
+
+    def test_requested_compaction_is_not_replaced_by_a_later_boundary(self) -> None:
+        rc, stdout, stderr = self._run(["--json", "--boundary-ms", "2"])
+        packet = json.loads(stdout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(packet["selection"]["boundary_turn"], 2)
+        self.assertEqual([row["text"] for row in packet["rows"]], ["older phase"])
+        self.assertEqual(stderr, "")
+
+    def test_silent_notice_cannot_mark_a_pending_refresh_fresh(self) -> None:
+        with mock.patch.object(
+                postcompact.indexd_runtime, "recovery_refresh_complete",
+                return_value=False), \
+                mock.patch.object(postcompact, "_REFRESH_WAIT_S", 0.0):
+            rc, stdout, stderr = self._run(["--json"])
+        packet = json.loads(stdout)
+        self.assertEqual(rc, 2)
+        self.assertEqual(packet["status"], "partial")
+        self.assertNotEqual(packet["coverage"]["index_freshness"], "fresh")
+        self.assertEqual(packet["selection"]["boundary_turn"], 8)
+        self.assertEqual(stderr, "")
+
+    def test_timestamped_recovery_needs_a_published_snapshot_not_global_freshness(
             self) -> None:
-        """A continuously writing conversation can starve the strict
-        generation-stable open forever (the second omp report): the final
-        attempt serves the boundary from the last published snapshot as an
-        explicitly partial packet naming the churn."""
+        for current, expected_exit in ((True, 0), (False, 2)):
+            with self.subTest(snapshot_current=current), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "recovery_refresh_complete",
+                        return_value=False), \
+                    mock.patch.object(
+                        postcompact, "_snapshot_current", return_value=current), \
+                    mock.patch.object(postcompact, "_REFRESH_WAIT_S", 0.0):
+                rc, stdout, stderr = self._run(
+                    ["--json", "--boundary-ms", "2"])
+            packet = json.loads(stdout)
+            self.assertEqual(rc, expected_exit)
+            self.assertEqual(packet["selection"]["boundary_turn"], 2)
+            self.assertEqual(
+                [row["text"] for row in packet["rows"]], ["older phase"])
+            self.assertNotEqual(packet["coverage"]["index_freshness"], "fresh")
+            self.assertEqual(
+                packet["coverage"]["index_freshness"] == "indexed-snapshot",
+                current)
+            self.assertEqual(stderr, "")
+
+    def test_unresolvable_generation_never_substitutes_another_boundary(
+            self) -> None:
         opened = []
 
-        def _fresh_db():
+        def _fresh_db(*, allow_behind=False):
+            if not allow_behind:
+                return None
             opened.append(_db())
             return opened[-1]
 
         try:
             with mock.patch.object(
-                    postcompact, "_RETRY_PAUSES_S", (0.0,)), \
+                    postcompact, "_REFRESH_WAIT_S", 0.0), \
                     mock.patch.object(
                         postcompact.indexd_runtime, "ensure_index",
                         return_value=True), \
                     mock.patch.object(
-                        postcompact.indexd_runtime, "build_index",
-                        side_effect=lambda quiet: True), \
-                    mock.patch.object(
-                        postcompact.common, "ingest_bin",
-                        return_value=mock.Mock(exists=lambda: True)), \
-                    mock.patch.object(
                         postcompact.session_context,
                         "_open_session_family_index",
-                        return_value=None), \
-                    mock.patch.object(
-                        postcompact, "_lenient_family_snapshot",
                         side_effect=_fresh_db), \
                     mock.patch.object(
                         postcompact.session_context,
                         "_indexed_calling_family_state_in_db",
-                        return_value=("root",
+                        return_value=("root", "root",
                                       frozenset({"root", "child"}), 8)):
-                stdout, stderr = io.StringIO(), io.StringIO()
-                with contextlib.redirect_stdout(stdout), \
-                        contextlib.redirect_stderr(stderr):
-                    rc = postcompact.main(["--session", "root", "--json"])
+                for boundary, expected in ((None, 8), (2, 2), (3, None)):
+                    with self.subTest(boundary=boundary):
+                        argv = ["--session", "root", "--json"]
+                        if boundary is not None:
+                            argv.extend(["--boundary-ms", str(boundary)])
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(stdout), \
+                                contextlib.redirect_stderr(stderr):
+                            rc = postcompact.main(argv)
+                        self.assertEqual(rc, 2)
+                        packet = json.loads(stdout.getvalue())
+                        if expected is None:
+                            self.assertNotIn("selection", packet)
+                            self.assertNotIn("rows", packet)
+                        else:
+                            self.assertEqual(
+                                packet["selection"]["boundary_turn"], expected)
+                            self.assertEqual(packet["status"], "partial")
+                            self.assertEqual(
+                                packet["coverage"]["index_freshness"],
+                                postcompact._FAMILY_CHURN_NOTICE)
+                        self.assertEqual(stderr.getvalue(), "")
         finally:
             for db in opened:
                 db.close()
-        self.assertEqual(rc, 2)
-        packet = json.loads(stdout.getvalue())
-        self.assertEqual(packet["status"], "partial")
-        self.assertEqual(
-            packet["coverage"]["index_freshness"],
-            postcompact._FAMILY_CHURN_NOTICE)
-        self.assertEqual(stderr.getvalue(), "")
+
+
+class SnapshotCurrencyTests(unittest.TestCase):
+    def test_startup_failure_cancels_the_pending_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, \
+                mock.patch.object(postcompact.common, "DATA_DIR", Path(raw)), \
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(postcompact.indexd_runtime, "kick_background_repair"), \
+                mock.patch.object(
+                    postcompact.indexd_runtime, "ensure_index",
+                    side_effect=RuntimeError("startup failed")):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                postcompact.main(["--session", "root", "--json"])
+            self.assertEqual(
+                list((Path(raw) / ".recovery_requests").iterdir()), [])
+
+    def test_completed_refresh_cannot_validate_old_message_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            messages = root / "messages.jsonl"
+            messages.write_text("old publication\n", encoding="utf-8")
+            db = _db()
+            try:
+                db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+                with mock.patch.object(postcompact.common, "DATA_DIR", root):
+                    db.execute("INSERT INTO meta VALUES('stamp', ?)", (corpusdb._stamp(),))
+                    self.assertTrue(postcompact._snapshot_current(db))
+                    messages.write_text("new publication with another recap\n", encoding="utf-8")
+                    current = postcompact._snapshot_current(db)
+                    self.assertFalse(current)
+                    packet = postcompact.read_packet(db, _family())
+                    stdout = io.StringIO()
+                    with mock.patch.object(
+                            postcompact.indexd_runtime, "agent_freshness_notice",
+                            return_value=""), contextlib.redirect_stdout(stdout):
+                        rc = postcompact._finish(
+                            mock.Mock(no_auto=False, json=True, boundary_ms=None), packet,
+                            retry_pending=False, refresh_complete=True,
+                            snapshot_current=current)
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(json.loads(stdout.getvalue())["status"], "partial")
+            finally:
+                db.close()
+
+
+class RecoveryReadPathTests(unittest.TestCase):
+    @staticmethod
+    def _environment(root: Path, binary: Path, *, automatic: bool) -> dict[str, str]:
+        home, data = root / "home", root / "data"
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("AGREP_")}
+        env.update({
+            "HOME": str(home), "USERPROFILE": str(home),
+            "AGREP_HOME": str(home), "AGREP_DATA_DIR": str(data),
+            "AGREP_MODEL_DIR": str(root / "models"), "AGREP_RS_BIN": str(binary),
+            "AGREP_NO_FETCH": "1", "APPDATA": str(root / "appdata"),
+            "LOCALAPPDATA": str(root / "localappdata"),
+            "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_DATA_HOME": str(root / "share"),
+            "CODEX_HOME": str(home / ".codex"), "CLINE_DIR": str(root / "cline"),
+            "CRUSH_GLOBAL_DATA": str(root / "crush"), "OPENCODE_DB": "",
+        })
+        if automatic:
+            env["AGREP_INDEXD_IDLE_S"] = "10"
+        if not automatic:
+            env["AGREP_NO_DAEMON"] = "1"
+        return env
+
+    def test_new_compactions_replace_an_existing_boundary_with_a_live_daemon(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        binary = repo / "target" / "release" / (
+            "agrep-rs.exe" if os.name == "nt" else "agrep-rs")
+        if not binary.is_file():
+            self.skipTest("release ingest binary is required")
+        with tempfile.TemporaryDirectory(prefix="agrep-new-boundary-") as raw:
+            root = Path(raw)
+            folder = root / "home/.omp/agent/sessions/project"
+            folder.mkdir(parents=True)
+            source = folder / "2026-04-05T06-07-08-000Z_file-id.jsonl"
+            rows = [
+                {"type": "session", "id": "header-id", "version": 3,
+                 "cwd": "/work/fixture", "timestamp": "2026-04-05T06:07:08.000Z"},
+                {"type": "message", "id": "m0", "parentId": None,
+                 "timestamp": "2026-04-05T06:07:09.000Z",
+                 "message": {"role": "user", "content": "obsolete window"}},
+                {"type": "compaction", "id": "c0", "parentId": "m0",
+                 "timestamp": "2026-04-05T06:07:10.000Z", "summary": "old recap"},
+            ]
+            source.write_text("".join(json.dumps(row) + "\n" for row in rows),
+                              encoding="utf-8")
+            cli = [sys.executable, str(repo / "cli.py")]
+            built = subprocess.run(
+                cli + ["index"], cwd=root,
+                env=self._environment(root, binary, automatic=False),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            env = self._environment(root, binary, automatic=True)
+            stop_flush = threading.Event()
+            flush_thread = None
+            try:
+                for number, session in ((1, "file-id"), (2, "header-id")):
+                    text = f"current-window-{number}"
+                    added = [
+                        {"type": "message", "id": f"m{number}",
+                         "parentId": f"c{number - 1}",
+                         "timestamp": f"2026-04-05T06:07:{10 + 2 * number}.000Z",
+                         "message": {"role": "user", "content": text}},
+                        {"type": "compaction", "id": f"c{number}",
+                         "parentId": f"m{number}",
+                         "timestamp": f"2026-04-05T06:07:{11 + 2 * number}.000Z",
+                         "summary": f"recap-{number}"},
+                    ]
+                    body = "".join(json.dumps(row) + "\n" for row in added).encode()
+                    expected_source = source.read_bytes() + body
+                    if number == 1:
+                        def delayed_flush():
+                            requests = root / "data/.recovery_requests"
+                            first = None
+                            while not stop_flush.wait(0.005):
+                                if first is None:
+                                    first = next(requests.glob("*.json"), None)
+                                elif not first.exists():
+                                    with source.open("ab") as stream:
+                                        stream.write(body)
+                                    return
+
+                        flush_thread = threading.Thread(target=delayed_flush)
+                        flush_thread.start()
+                    else:
+                        with source.open("ab") as stream:
+                            stream.write(body)
+                    boundary_ms = int(datetime.fromisoformat(
+                        added[-1]["timestamp"].replace("Z", "+00:00")).timestamp() * 1000)
+                    result = subprocess.run(
+                        cli + ["postcompact", "--session", session, "--json",
+                               "--boundary-ms", str(boundary_ms)],
+                        cwd=root, env=env, capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    packet = json.loads(result.stdout)
+                    self.assertEqual(packet["selection"]["boundary_turn"], 2 * number + 1)
+                    self.assertEqual([row["text"] for row in packet["rows"]], [text])
+                    self.assertEqual(source.read_bytes(), expected_source)
+            finally:
+                stop_flush.set()
+                if flush_thread is not None:
+                    flush_thread.join(timeout=1)
+                stop = (
+                    "import sys;sys.path.insert(0," + repr(str(repo / "py")) + ");"
+                    "import indexd_runtime,semworker;"
+                    "indexd_runtime.stop_indexd_owner();semworker.stop_worker_and_wait()")
+                subprocess.run(
+                    [sys.executable, "-I", "-c", stop], cwd=root, env=env,
+                    capture_output=True, text=True, timeout=20)
+
+    def test_published_packet_survives_an_exclusive_index_holder(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        binary = repo / "target" / "release" / (
+            "agrep-rs.exe" if os.name == "nt" else "agrep-rs")
+        if not binary.is_file():
+            self.skipTest("release ingest binary is required")
+        with tempfile.TemporaryDirectory(prefix="agrep-recovery-lock-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            home.mkdir()
+            data.mkdir()
+            source = _db()
+            try:
+                source.executescript("""
+                    CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                    INSERT INTO meta VALUES('family_stamp', 'fixture');
+                    CREATE TABLE session_family(
+                        session TEXT PRIMARY KEY, root TEXT NOT NULL, side INTEGER);
+                    INSERT INTO session_family VALUES('root', 'root', 0);
+                """)
+                source.commit()
+                with contextlib.closing(sqlite3.connect(data / "corpus.db")) as published:
+                    source.backup(published)
+            finally:
+                source.close()
+            (data / "messages.jsonl").write_text("", encoding="utf-8")
+            env = self._environment(root, binary, automatic=False)
+            lock_path = data / ".index.lock"
+            with mock.patch.object(index_lock, "INDEX_LOCK_PATH", lock_path), \
+                    index_lock.IndexLock("agrep-rs"):
+                owner = lock_path.read_bytes()
+                started = time.monotonic()
+                result = subprocess.run(
+                    [sys.executable, str(repo / "cli.py"), "postcompact",
+                     "--session", "root", "--json"],
+                    env=env, cwd=home, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=12, check=False)
+                elapsed = time.monotonic() - started
+                self.assertEqual(lock_path.read_bytes(), owner)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertLess(elapsed, 8.0)
+            packet = json.loads(result.stdout)
+            self.assertEqual(packet["status"], "partial")
+            self.assertEqual(packet["selection"]["boundary_turn"], 8)
+            self.assertEqual(
+                {(row["turn"], row["who"]) for row in packet["rows"]},
+                {(3, "user"), (3, "agent"), (7, "user"), (7, "agent")})
 
 
 _UNSET = object()
 
 
 class AbsenceEvidenceTests(unittest.TestCase):
-    """An exit-2 absence consumes the daemon's durable publication evidence
-    (verified-current per-store member digests) before paying the freshen
-    pass - and never serves from evidence that does not cover the caller's
-    transcript at its current identity."""
+    """Boundary absence requires current source evidence."""
 
     _DIGEST = "ab" * 32
 
@@ -677,21 +910,15 @@ class AbsenceEvidenceTests(unittest.TestCase):
     def _run_missing_boundary(self, argv, *, record, live_digest,
                               members=_UNSET):
         stdout, stderr = io.StringIO(), io.StringIO()
-        build_index = mock.Mock(return_value=True)
-        ingest_bin = mock.Mock(return_value=mock.Mock(exists=lambda: True))
         if members is _UNSET:
             members = {"codex": ["/stores/codex/root.jsonl"]}
-        with mock.patch.object(postcompact, "_RETRY_PAUSES_S", (0.0,)), \
+        with mock.patch.object(postcompact, "_REFRESH_WAIT_S", 0.0), \
                 mock.patch.object(
                     postcompact.indexd_runtime, "ensure_index",
                     return_value=True), \
                 mock.patch.object(
                     postcompact.indexd_runtime, "agent_freshness_notice",
                     return_value=None), \
-                mock.patch.object(
-                    postcompact.indexd_runtime, "build_index", build_index), \
-                mock.patch.object(postcompact.common, "ingest_bin",
-                                  ingest_bin), \
                 mock.patch.object(
                     postcompact.indexd_runtime, "_read_verified_record",
                     return_value=record), \
@@ -707,15 +934,12 @@ class AbsenceEvidenceTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(stderr):
             rc = postcompact.main(argv)
-        return rc, stdout.getvalue(), stderr.getvalue(), build_index, \
-            ingest_bin
+        return rc, stdout.getvalue(), stderr.getvalue()
 
-    def test_covered_evidence_refuses_without_any_freshen(self) -> None:
-        rc, stdout, stderr, build_index, ingest_bin = \
+    def test_covered_transcript_proves_boundary_absence(self) -> None:
+        rc, stdout, stderr = \
             self._run_missing_boundary(
                 ["--json"], record=self._record(), live_digest=self._DIGEST)
-        build_index.assert_not_called()
-        ingest_bin.assert_not_called()
         self.assertEqual((rc, stderr), (2, ""))
         refusal = json.loads(stdout)
         self.assertEqual(refusal["status"], "boundary_unavailable")
@@ -723,53 +947,23 @@ class AbsenceEvidenceTests(unittest.TestCase):
         self.assertIn("no structural compaction boundary", refusal["reason"])
 
     def test_covered_evidence_keeps_the_user_facing_refusal(self) -> None:
-        rc, stdout, stderr, build_index, _ = self._run_missing_boundary(
+        rc, stdout, stderr = self._run_missing_boundary(
             [], record=self._record(), live_digest=self._DIGEST)
-        build_index.assert_not_called()
         self.assertEqual((rc, stdout), (2, ""))
         self.assertIn("no structural compaction boundary", stderr)
 
-    def test_grown_transcript_freshens_before_the_verdict(self) -> None:
-        # The live member identity moved past the recorded coverage: the
-        # evidence claims nothing, so the freshen pass runs before refusing.
-        rc, stdout, stderr, build_index, _ = self._run_missing_boundary(
+    def test_grown_transcript_does_not_claim_verified_absence(self) -> None:
+        rc, stdout, stderr = self._run_missing_boundary(
             ["--json"], record=self._record(), live_digest="cd" * 32)
-        self.assertTrue(build_index.called)
         self.assertEqual(rc, 2)
         self.assertNotIn("absence_proof", json.loads(stdout))
 
-    def test_missing_evidence_keeps_the_full_freshen_pass(self) -> None:
-        rc, stdout, stderr, build_index, _ = self._run_missing_boundary(
+    def test_missing_evidence_does_not_claim_verified_absence(self) -> None:
+        rc, stdout, stderr = self._run_missing_boundary(
             ["--json"], record=None, live_digest=self._DIGEST)
-        self.assertTrue(build_index.called)
         self.assertEqual(rc, 2)
         self.assertNotIn("absence_proof", json.loads(stdout))
 
-    def test_found_boundary_never_consults_the_evidence(self) -> None:
-        stdout, stderr = io.StringIO(), io.StringIO()
-        proof = mock.Mock()
-        build_index = mock.Mock()
-        with mock.patch.object(
-                postcompact.indexd_runtime, "ensure_index",
-                return_value=True), \
-                mock.patch.object(
-                    postcompact.indexd_runtime, "agent_freshness_notice",
-                    return_value=None), \
-                mock.patch.object(
-                    postcompact.indexd_runtime, "build_index", build_index), \
-                mock.patch.object(
-                    postcompact, "_published_absence_proof", proof), \
-                mock.patch.object(
-                    postcompact.session_context, "calling_family_snapshot",
-                    side_effect=lambda: CliTests._snapshot(8)), \
-                contextlib.redirect_stdout(stdout), \
-                contextlib.redirect_stderr(stderr):
-            rc = postcompact.main(["--json"])
-        proof.assert_not_called()
-        build_index.assert_not_called()
-        self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(stdout.getvalue())["status"], "recovered")
-        self.assertEqual(stderr.getvalue(), "")
 
 
 class PublishedAbsenceProofTests(unittest.TestCase):

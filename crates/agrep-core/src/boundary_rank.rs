@@ -35,8 +35,8 @@ impl StatValue {
 
 #[derive(Clone, Debug)]
 struct BoundaryTerm {
-    folded: Vec<char>,
-    folded_ascii: Option<String>,
+    variants: Vec<Vec<char>>,
+    ascii_variants: Option<Vec<String>>,
     ambiguity: f64,
 }
 
@@ -204,10 +204,17 @@ pub fn prepare_query(query: &str, stats: &Stats) -> PreparedQuery {
         let ambiguity = *resolved
             .entry(folded_string.clone())
             .or_insert_with(|| ambiguity(cold_prior(original), stats.get(&folded_string)));
-        let folded_ascii = folded_string.is_ascii().then(|| folded_string.clone());
+        let variant_strings = term_variants(original);
+        let ascii_variants = variant_strings
+            .iter()
+            .all(|variant| variant.is_ascii())
+            .then(|| variant_strings.clone());
         terms.push(BoundaryTerm {
-            folded: folded_string.chars().collect(),
-            folded_ascii,
+            variants: variant_strings
+                .iter()
+                .map(|variant| variant.chars().collect())
+                .collect(),
+            ascii_variants,
             ambiguity,
         });
     }
@@ -228,6 +235,80 @@ pub fn normalize_token(token: &str) -> String {
         out.push_str(&unicode_v16::case_fold(&compatible));
     }
     out
+}
+
+pub fn term_variants(token: &str) -> Vec<String> {
+    let folded = normalize_token(token);
+    if folded.is_empty() {
+        return Vec::new();
+    }
+    if !folded.is_ascii() || !folded.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return vec![folded];
+    }
+    let mut variants = vec![folded.clone()];
+    let hissing = |value: &str| {
+        ["s", "x", "z", "ch", "sh"]
+            .iter()
+            .any(|suffix| value.ends_with(suffix))
+    };
+    if folded.len() >= 5 && folded.ends_with("ies") {
+        variants.push(format!("{}y", &folded[..folded.len() - 3]));
+    } else if folded.len() >= 5
+        && folded.ends_with("es")
+        && (["x", "z", "ch", "sh", "ss"]
+            .iter()
+            .any(|suffix| folded[..folded.len() - 2].ends_with(suffix))
+            || (folded.len() >= 7
+                && ["us", "is"]
+                    .iter()
+                    .any(|suffix| folded[..folded.len() - 2].ends_with(suffix))))
+    {
+        variants.push(folded[..folded.len() - 2].to_string());
+    } else if folded.len() >= 5
+        && folded.ends_with('s')
+        && !["ss", "us", "is"]
+            .iter()
+            .any(|suffix| folded.ends_with(suffix))
+    {
+        variants.push(folded[..folded.len() - 1].to_string());
+    } else if folded.len() >= 4
+        && folded.ends_with('y')
+        && !matches!(
+            folded.as_bytes()[folded.len() - 2],
+            b'a' | b'e' | b'i' | b'o' | b'u'
+        )
+    {
+        variants.push(format!("{}ies", &folded[..folded.len() - 1]));
+    } else if folded.len() >= 4 && !hissing(&folded) {
+        variants.push(format!("{folded}s"));
+    } else if folded.len() >= 4
+        && ["x", "z", "ch", "sh", "ss", "us"]
+            .iter()
+            .any(|suffix| folded.ends_with(suffix))
+    {
+        variants.push(format!("{folded}es"));
+    }
+    variants.retain(|variant| variant == &folded || variant.len() >= 3);
+    variants.dedup();
+    variants
+}
+
+pub fn term_anchor(token: &str) -> String {
+    let variants = term_variants(token);
+    let Some(first) = variants.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for variant in variants.iter().skip(1) {
+        while !prefix.is_empty() && !variant.starts_with(&prefix) {
+            prefix.pop();
+        }
+    }
+    if prefix.len() >= 3 {
+        prefix
+    } else {
+        first.clone()
+    }
 }
 
 pub fn cold_prior(token: &str) -> f64 {
@@ -290,7 +371,7 @@ impl PreparedQuery {
         if spans.is_some_and(|values| values.len() != self.terms.len()) {
             return Err(BoundaryError("one span is required per query token"));
         }
-        if text.is_ascii() && self.terms.iter().all(|term| term.folded_ascii.is_some()) {
+        if text.is_ascii() && self.terms.iter().all(|term| term.ascii_variants.is_some()) {
             return self.evaluate_ascii_compact(text, spans, validate_spans);
         }
         if let Some(spans) = spans.filter(|_| !validate_spans) {
@@ -298,7 +379,7 @@ impl PreparedQuery {
         }
         if spans.is_none()
             && !self.terms.is_empty()
-            && self.terms.iter().all(|term| term.folded_ascii.is_some())
+            && self.terms.iter().all(|term| term.ascii_variants.is_some())
         {
             let prepared = BoundaryOnlyText::new(text);
             if prepared.can_score_ascii(&self.terms) {
@@ -324,17 +405,22 @@ impl PreparedQuery {
         let mut all_aligned = !self.terms.is_empty();
         let mut all_interior = !self.terms.is_empty();
         for (index, term) in self.terms.iter().enumerate() {
-            let needle = term.folded_ascii.as_deref().unwrap();
+            let variants = term.ascii_variants.as_ref().unwrap();
             let quality = match spans.and_then(|values| values[index]) {
                 None if spans.is_some() => 0.0,
-                None => best_ascii_quality(bytes, &folded, needle),
+                None => variants
+                    .iter()
+                    .map(|needle| best_ascii_quality(bytes, &folded, needle))
+                    .fold(0.0, f64::max),
                 Some([start, end]) => {
                     let (start, end) = checked_span(start, end, bytes.len())?;
                     if spans.is_some()
                         && validate_spans
-                        && !folded.as_bytes()[start..end]
-                            .windows(needle.len())
-                            .any(|window| window == needle.as_bytes())
+                        && !variants.iter().any(|needle| {
+                            folded.as_bytes()[start..end]
+                                .windows(needle.len())
+                                .any(|window| window == needle.as_bytes())
+                        })
                     {
                         return Err(BoundaryError("span does not identify its query token"));
                     }
@@ -411,7 +497,13 @@ impl PreparedQuery {
         let mut all_aligned = true;
         let mut all_interior = true;
         for term in &self.terms {
-            let quality = prepared.best_ascii_quality(text, term.folded_ascii.as_deref().unwrap());
+            let quality = term
+                .ascii_variants
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|needle| prepared.best_ascii_quality(text, needle))
+                .fold(0.0, f64::max);
             all_aligned &= quality == 1.0;
             all_interior &= quality == 0.0;
             product *= (1.0 - term.ambiguity * (1.0 - quality)).max(0.12);
@@ -437,12 +529,7 @@ impl PreparedQuery {
         if spans.is_some_and(|values| values.len() != self.terms.len()) {
             return Err(BoundaryError("one span is required per query token"));
         }
-        if text.is_ascii()
-            && self
-                .terms
-                .iter()
-                .all(|term| term.folded.iter().all(char::is_ascii))
-        {
+        if text.is_ascii() && self.terms.iter().all(|term| term.ascii_variants.is_some()) {
             self.evaluate_ascii(text, spans, validate_spans)
         } else {
             self.evaluate_unicode(text, spans, validate_spans)
@@ -460,11 +547,31 @@ impl PreparedQuery {
         let mut selected = Vec::with_capacity(self.terms.len());
         let mut matched = true;
         for (index, term) in self.terms.iter().enumerate() {
-            let needle = term.folded_ascii.as_deref().unwrap();
+            let variants = term.ascii_variants.as_ref().unwrap();
             let span = if let Some(values) = spans {
                 values[index]
             } else {
-                best_ascii_span(text, &folded, needle)
+                variants.iter().fold(None, |best, needle| {
+                    let candidate = best_ascii_span(text, &folded, needle);
+                    match (best, candidate) {
+                        (None, candidate) => candidate,
+                        (best, None) => best,
+                        (Some(best), Some(candidate))
+                            if ascii_quality(
+                                text.as_bytes(),
+                                candidate[0] as usize,
+                                candidate[1] as usize,
+                            ) > ascii_quality(
+                                text.as_bytes(),
+                                best[0] as usize,
+                                best[1] as usize,
+                            ) =>
+                        {
+                            Some(candidate)
+                        }
+                        (best, Some(_)) => best,
+                    }
+                })
             };
             let quality = match span {
                 None => {
@@ -473,7 +580,12 @@ impl PreparedQuery {
                 }
                 Some([start, end]) => {
                     let (start, end) = checked_span(start, end, text.len())?;
-                    if spans.is_some() && validate_spans && !folded[start..end].contains(needle) {
+                    if spans.is_some()
+                        && validate_spans
+                        && !variants
+                            .iter()
+                            .any(|needle| folded[start..end].contains(needle))
+                    {
                         return Err(BoundaryError("span does not identify its query token"));
                     }
                     ascii_quality(text.as_bytes(), start, end)
@@ -499,7 +611,20 @@ impl PreparedQuery {
             let span = if let Some(values) = spans {
                 values[index]
             } else {
-                prepared.best_span(&term.folded)
+                term.variants.iter().fold(None, |best, variant| {
+                    let candidate = prepared.best_span(variant);
+                    match (best, candidate) {
+                        (None, candidate) => candidate,
+                        (best, None) => best,
+                        (Some(best), Some(candidate))
+                            if prepared.quality(candidate[0] as usize, candidate[1] as usize)
+                                > prepared.quality(best[0] as usize, best[1] as usize) =>
+                        {
+                            Some(candidate)
+                        }
+                        (best, Some(_)) => best,
+                    }
+                })
             };
             let quality = match span {
                 None => {
@@ -510,9 +635,11 @@ impl PreparedQuery {
                     let (start, end) = checked_span(start, end, prepared.original.len())?;
                     if spans.is_some()
                         && validate_spans
-                        && !prepared
-                            .folded_slice(start, end)
-                            .contains(&term.folded.iter().collect::<String>())
+                        && !term.variants.iter().any(|variant| {
+                            prepared
+                                .folded_slice(start, end)
+                                .contains(&variant.iter().collect::<String>())
+                        })
                     {
                         return Err(BoundaryError("span does not identify its query token"));
                     }
@@ -688,11 +815,11 @@ impl BoundaryOnlyText {
     fn can_score_ascii(&self, terms: &[BoundaryTerm]) -> bool {
         !self.normalization_can_delete
             && terms.iter().all(|term| {
-                term.folded_ascii
-                    .as_deref()
-                    .unwrap()
-                    .bytes()
-                    .all(|byte| !self.unstable_ascii.contains(&byte))
+                term.ascii_variants.as_ref().unwrap().iter().all(|variant| {
+                    variant
+                        .bytes()
+                        .all(|byte| !self.unstable_ascii.contains(&byte))
+                })
             })
     }
 
@@ -959,7 +1086,8 @@ fn finish_score(
 #[cfg(test)]
 mod tests {
     use super::{
-        cold_prior, decut_text, normalize_token, prepare_query, query_tokens, BoundaryScore, Stats,
+        cold_prior, decut_text, normalize_token, prepare_query, query_tokens, term_anchor,
+        term_variants, BoundaryScore, Stats,
     };
 
     #[test]
@@ -981,6 +1109,46 @@ mod tests {
             .unwrap();
         assert_eq!(score.match_class, "aligned");
         assert_eq!(score.spans, [Some([2, 6])]);
+    }
+
+    #[test]
+    fn folds_only_minimal_s_es_and_ies_variants() {
+        // Mirrors py/test_boundary_rank.py
+        // test_term_variants_are_minimal_and_keep_short_terms_exact word for word.
+        let expected: &[(&str, &[&str])] = &[
+            ("calls", &["calls", "call"]),
+            ("call", &["call", "calls"]),
+            ("policies", &["policies", "policy"]),
+            ("policy", &["policy", "policies"]),
+            ("status", &["status", "statuses"]),
+            ("statuses", &["statuses", "status"]),
+            ("boxes", &["boxes", "box"]),
+            ("glass", &["glass", "glasses"]),
+            ("branches", &["branches", "branch"]),
+            ("houses", &["houses", "house"]),
+            ("cases", &["cases", "case"]),
+            ("tries", &["tries", "try"]),
+            ("days", &["days"]),
+            ("this", &["this"]),
+            ("does", &["does"]),
+            ("try", &["try"]),
+            ("don", &["don"]),
+            ("t", &["t"]),
+            ("id", &["id"]),
+            ("Straße", &["strasse", "strasses"]),
+            ("東京", &["東京"]),
+        ];
+        for (token, variants) in expected {
+            assert_eq!(term_variants(token), *variants, "{token}");
+        }
+        assert_eq!(term_anchor("policies"), "polic");
+        assert_eq!(term_anchor("tries"), "tries");
+
+        let score = prepare_query("don calls", &Stats::new())
+            .evaluate("calls dont", None, true)
+            .unwrap();
+        assert_eq!(score.spans, [Some([6, 9]), Some([0, 5])]);
+        assert_eq!(score.qualities, [0.5, 1.0]);
     }
 
     #[test]

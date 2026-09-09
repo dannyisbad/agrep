@@ -66,21 +66,38 @@ def _apple_silicon() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
+# Without a Metal device the first `import mlx.core` raises ImportError and a
+# second one SIGABRTs inside nanobind (duplicate DeviceType enum): ask once.
+_IMPORT_VERDICT: tuple[bool, str] | None = None
+
+
+def _import_verdict() -> tuple[bool, str]:
+    global _IMPORT_VERDICT
+    if _IMPORT_VERDICT is None:
+        try:
+            import mlx.core  # noqa: F401
+        except ModuleNotFoundError as exc:
+            _IMPORT_VERDICT = (False, f"mlx missing: {exc}")
+        except ImportError as exc:
+            _IMPORT_VERDICT = (
+                False, f"mlx installed but no metal device opened: {exc}")
+        else:
+            _IMPORT_VERDICT = (True, "available")
+    return _IMPORT_VERDICT
+
+
 def available() -> tuple[bool, str]:
     """Capability only - never a benchmark. Returns (ok, reason).
 
     Kept to imports and platform facts so it can run on every load without
     costing anything; how FAST the lane is belongs to calibration, not here.
+    The import itself is asked of the interpreter once per process.
     """
     if not _apple_silicon():
         return False, "metal lane requires apple silicon"
     if os.environ.get("AGREP_MLX") == "off":
         return False, "disabled by AGREP_MLX=off"
-    try:
-        import mlx.core  # noqa: F401
-    except ImportError as exc:
-        return False, f"mlx missing: {exc}"
-    return True, "available"
+    return _import_verdict()
 
 
 def weights_dir(root=None):

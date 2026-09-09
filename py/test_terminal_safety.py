@@ -90,11 +90,17 @@ class TerminalSafetyTests(unittest.TestCase):
         with mock.patch.object(console, "WIN", False):
             self.assertEqual(
                 shlex.split(around._expand_command(session, 7)),
+                ["agrep", "around", session, "7", "-C", "0", "--max-chars", "0"])
+            self.assertEqual(
+                shlex.split(around._forensic_command(session, 7, 0)),
                 ["agrep", "around", session, "7", "-C", "0", "--full"])
         with mock.patch.object(console, "WIN", True):
             self.assertEqual(
                 around._expand_command(session, 7),
-                "agrep around <session> <turn> -C 0 --full")
+                "agrep around <session> <turn> -C 0 --max-chars 0")
+            self.assertEqual(
+                around._forensic_command(session, 7, 0),
+                "agrep around <session> <turn> -C <N> --full")
 
     def test_translate_path_matches_slow_reference(self):
         alphabet = (

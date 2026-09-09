@@ -31,10 +31,8 @@ TEXT_BUDGET_BYTES = 5_000
 MAX_BLOCKS = 8
 MIN_ROW_BYTES = 320
 MAX_ROW_BYTES = 2_400
-# Staleness-shaped misses re-ingest and re-serve on this schedule (seconds of
-# sleep before each attempt): immediate covers index lag, the waits cover a
-# boundary row not yet flushed to its transcript. Once per compaction.
-_RETRY_PAUSES_S = (0.0, 1.0, 3.0)
+# The compaction record may be flushed after the recovery hook.
+_REFRESH_WAIT_S = 8.0
 
 
 def _stdout(value: object) -> None:
@@ -120,6 +118,14 @@ def _boundary_ts(db, session: str, boundary: int) -> int | None:
         "SELECT ts FROM msgs WHERE session=? AND who='recap' AND turn=? "
         "ORDER BY ts LIMIT 1",
         (session, boundary),
+    ).fetchone()
+    return None if not row or row[0] is None else int(row[0])
+
+
+def _recap_at_timestamp(db, session: str, timestamp: int) -> int | None:
+    row = db.execute(
+        "SELECT max(turn) FROM msgs WHERE session=? AND who='recap' AND ts=?",
+        (session, timestamp),
     ).fetchone()
     return None if not row or row[0] is None else int(row[0])
 
@@ -420,42 +426,65 @@ def main(argv: list[str] | None = None) -> int:
         help="recover a specific session's tail when the caller cannot be "
              "auto-identified (e.g. under opencode); requires the session to "
              "have an indexed structural compaction boundary")
+    parser.add_argument(
+        "--boundary-ms", type=int, metavar="TIMESTAMP",
+        help="wait for the compaction timestamp supplied by the recovery hook")
     args = parser.parse_args(argv)
+    if args.boundary_ms is not None and not 0 <= args.boundary_ms <= 2**63 - 1:
+        parser.error("--boundary-ms must be a non-negative 64-bit timestamp")
 
-    if not indexd_runtime.ensure_index(
-            auto=not args.no_auto, quiet=bool(args.json)):
-        return _failure(
-            "index_unavailable", "the materialized history index is unavailable",
-            json_output=args.json)
-
-    miss: dict[str, str] = {}
-    outcome = _serve(args, retry_pending=not args.no_auto, miss=miss)
-    if outcome is not None:
-        return outcome
-    # A boundary-shaped miss whose transcript the published generation
-    # provably covers cannot be cured by re-ingesting the same bytes:
-    # absence is verified, so the refusal skips the freshen pass below.
-    if miss.get("status") == "boundary_unavailable":
-        proof = _published_absence_proof(miss.get("session", ""))
-        if proof is not None:
-            outcome = _serve(args, retry_pending=False, absence_proof=proof)
-            assert outcome is not None
-            return outcome
-    # Seconds after a compaction the snapshot trails live files AND the
-    # boundary row may be unflushed (seen on omp): ingests close the index
-    # lag, bounded waits the flush lag; uncovered transcripts pay in full.
-    can_ingest = common.ingest_bin().exists()
-    for pause_s in _RETRY_PAUSES_S:
-        if pause_s:
-            time.sleep(pause_s)
-        if can_ingest:
-            indexd_runtime.build_index(quiet=True)
-        outcome = _serve(args, retry_pending=True)
+    if args.boundary_ms is not None and not args.no_auto:
+        outcome = _serve(args, retry_pending=True, refresh_complete=False)
         if outcome is not None:
             return outcome
-    outcome = _serve(args, retry_pending=False)
-    assert outcome is not None
-    return outcome
+
+    request = (None if args.no_auto
+               else indexd_runtime.request_recovery_refresh())
+
+    deadline = time.monotonic() + _REFRESH_WAIT_S
+    try:
+        if request is not None:
+            indexd_runtime.kick_background_repair()
+        index_ready = indexd_runtime.ensure_index(
+            auto=not args.no_auto, quiet=bool(args.json), background_only=True)
+        if not index_ready and args.no_auto:
+            return _failure(
+                "index_unavailable", "the materialized history index is unavailable",
+                json_output=args.json)
+        while True:
+            refreshed = (None if request is None
+                         else indexd_runtime.recovery_refresh_complete(request))
+            retry = request is not None and time.monotonic() < deadline
+            if (args.boundary_ms is not None or request is None
+                    or refreshed or not retry):
+                miss: dict[str, str] = {}
+                outcome = _serve(
+                    args, retry_pending=retry or (request is None and not args.no_auto),
+                    miss=miss,
+                    refresh_complete=refreshed)
+                if outcome is not None:
+                    return outcome
+                if miss.get("status") == "boundary_unavailable":
+                    proof = _published_absence_proof(miss.get("session", ""))
+                    if proof is not None:
+                        outcome = _serve(
+                            args, retry_pending=False, absence_proof=proof,
+                            refresh_complete=refreshed)
+                        assert outcome is not None
+                        return outcome
+                if request is None:
+                    outcome = _serve(args, retry_pending=False)
+                    assert outcome is not None
+                    return outcome
+                if refreshed:
+                    indexd_runtime.release_recovery_request(request)
+                    request = indexd_runtime.request_recovery_refresh()
+                    if request is not None:
+                        indexd_runtime.kick_background_repair()
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    finally:
+        if request is not None:
+            indexd_runtime.release_recovery_request(request)
 
 
 # Absence-evidence listing budget: generous next to the drift probe (0.45s)
@@ -523,41 +552,11 @@ _FAMILY_CHURN_NOTICE = (
     "family index trails live stores; served from the last published snapshot")
 
 
-def _lenient_family_snapshot():
-    """Last published corpus snapshot, without the live-stamp equality gate.
-
-    The strict open needs one quiescent instant; a conversation that writes
-    continuously may never offer one - each retry's own ingest advances the
-    generation the daemon is also advancing (the second omp report). The
-    snapshot stays one internally consistent SQLite view; only "reflects this
-    exact instant" is given up, and the served packet says so.
-    """
-    import sqlite3
-    path = common.DATA_DIR / "corpus.db"
-    if not path.exists():
-        return None
-    db = None
-    try:
-        db = session_context.open_sqlite_snapshot(path, 0)
-        db.execute("PRAGMA busy_timeout=0")
-        db.execute("PRAGMA query_only=ON")
-        db.execute("BEGIN")
-        row = db.execute(
-            "SELECT value FROM meta WHERE key='family_stamp'").fetchone()
-        if row and row[0]:
-            return db
-    except (OSError, sqlite3.DatabaseError):
-        pass
-    if db is not None:
-        db.close()
-    return None
-
-
 def _serve_lenient(args, session: str) -> int | None:
     """Final-attempt fallback when the generation-stable open kept losing its
     race: serve the boundary from the last published snapshot as an
     explicitly partial packet. None = nothing usable there either."""
-    db = _lenient_family_snapshot()
+    db = session_context._open_session_family_index(allow_behind=True)
     if db is None:
         return None
     try:
@@ -565,11 +564,13 @@ def _serve_lenient(args, session: str) -> int | None:
             db, session)
         if indexed is None:
             return None
-        root, members, recap_turn = indexed
+        caller, root, members, recap_turn = indexed
+        if args.boundary_ms is not None:
+            recap_turn = _recap_at_timestamp(db, caller, args.boundary_ms)
         if recap_turn is None:
             return None
         family = session_context.CallingFamily(
-            session=session, root=root, members=members | {session},
+            session=caller, root=root, members=members | {caller},
             resolved=True, recap_turn=recap_turn)
         try:
             packet = read_packet(db, family)
@@ -585,14 +586,27 @@ def _serve_lenient(args, session: str) -> int | None:
         _stdout(_human(packet))
     return 2
 
+def _snapshot_current(db) -> bool:
+    import corpusdb
+    try:
+        before = corpusdb._stamp()
+        stored = db.execute("SELECT value FROM meta WHERE key='stamp'").fetchone()
+        return bool(
+            stored and corpusdb._stamps_equal(stored[0], before)
+            and corpusdb._stamps_equal(before, corpusdb._stamp()))
+    except (OSError, RuntimeError, ValueError, corpusdb.sqlite3.DatabaseError):
+        return False
+
+
 
 def _serve(args, *, retry_pending: bool, miss: dict | None = None,
-           absence_proof: str | None = None) -> int | None:
+           absence_proof: str | None = None,
+           refresh_complete: bool | None = None) -> int | None:
     """One resolution attempt. None = staleness-shaped miss worth one retry."""
     caller_session = [args.session]
 
     def stale(status: str, reason: str) -> int | None:
-        if retry_pending:
+        if retry_pending and not (refresh_complete and status == "boundary_unavailable"):
             if miss is not None:
                 miss["status"] = status
                 miss["session"] = caller_session[0] or ""
@@ -616,34 +630,48 @@ def _serve(args, *, retry_pending: bool, miss: dict | None = None,
                 "index_unavailable",
                 "the generation-bound caller family could not be resolved")
         try:
+            if refresh_complete and not _snapshot_current(db):
+                return stale(
+                    "index_unavailable",
+                    "the recovery database is behind the completed source refresh")
             indexed = session_context._indexed_calling_family_state_in_db(
                 db, args.session)
             if indexed is None:
                 return stale(
-                    "boundary_unavailable",
-                    "no structural compaction boundary is indexed for "
-                    f"session {args.session}")
-            root, members, recap_turn = indexed
+                    "boundary_pending" if args.boundary_ms is not None
+                    else "boundary_unavailable",
+                    ("the requested session identity is not in the published "
+                     f"recovery snapshot: {args.session}")
+                    if args.boundary_ms is not None else
+                    ("no structural compaction boundary is indexed for "
+                     f"session {args.session}"))
+            caller, root, members, recap_turn = indexed
+            caller_session[0] = caller
+            if args.boundary_ms is not None:
+                recap_turn = _recap_at_timestamp(db, caller, args.boundary_ms)
+                if recap_turn is None:
+                    return stale(
+                        "boundary_pending",
+                        "the requested compaction has not reached the recovery database")
             if recap_turn is None:
-                # a known family with no indexed recap is the same
-                # staleness-shaped miss as an unknown session: the boundary
-                # was written seconds ago and one ingest closes the race
                 return stale(
                     "boundary_unavailable",
                     "no structural compaction boundary is indexed for "
                     f"session {args.session}")
             family = session_context.CallingFamily(
-                session=args.session, root=root,
-                members=members | {args.session},
+                session=caller, root=root,
+                members=members | {caller},
                 resolved=True, recap_turn=recap_turn)
             try:
                 packet = read_packet(db, family)
+                snapshot_current = _snapshot_current(db)
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                return _failure(
-                    "index_unavailable", str(exc), json_output=args.json)
+                return stale("index_unavailable", str(exc))
         finally:
             db.close()
-        return _finish(args, packet, retry_pending=retry_pending)
+        return _finish(
+            args, packet, retry_pending=retry_pending,
+            refresh_complete=refresh_complete, snapshot_current=snapshot_current)
 
     with session_context.calling_family_snapshot() as (identity, family, db):
         caller_session[0] = identity.session
@@ -658,41 +686,58 @@ def _serve(args, *, retry_pending: bool, miss: dict | None = None,
             return stale(
                 "index_unavailable",
                 "the generation-bound caller family could not be resolved")
+        caller_session[0] = family.session
+        if refresh_complete and not _snapshot_current(db):
+            return stale(
+                "index_unavailable",
+                "the recovery database is behind the completed source refresh")
+        if args.boundary_ms is not None:
+            requested = _recap_at_timestamp(db, family.session, args.boundary_ms)
+            if requested is None:
+                return stale(
+                    "boundary_pending",
+                    "the requested compaction has not reached the recovery database")
+            family = family._replace(recap_turn=requested)
         if family.recap_turn is None:
             return stale(
                 "boundary_unavailable",
                 "no structural compaction boundary is indexed for this caller")
         try:
             packet = read_packet(db, family)
+            snapshot_current = _snapshot_current(db)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            return _failure(
-                "index_unavailable", str(exc), json_output=args.json)
+            return stale("index_unavailable", str(exc))
 
-    return _finish(args, packet, retry_pending=retry_pending)
+    return _finish(
+        args, packet, retry_pending=retry_pending,
+        refresh_complete=refresh_complete, snapshot_current=snapshot_current)
 
 
-def _finish(args, packet: dict, *, retry_pending: bool) -> int | None:
-    """Render one packet under the shared exit contract (0 recovered, 1
-    proven empty, 2 partial). A live freshness story is staleness-shaped
-    first (one ingest usually clears it), and disclosure last: the boundary
-    is proven and the rows are verbatim, so global store churn only makes
-    "newest boundary" uncertain. Refusing here starved the exact moment the
-    packet exists for (observed on omp: the compacting session's own churn
-    kept the index permanently "behind" right after its compaction).
-    """
+def _finish(args, packet: dict, *, retry_pending: bool,
+            refresh_complete: bool | None = None,
+            snapshot_current: bool = False) -> int | None:
+    """Serve an exact published boundary or prove an untargeted refresh current."""
     if args.no_auto:
         packet["status"] = "partial"
         packet["coverage"]["index_freshness"] = "unchecked"
     else:
-        notice = indexd_runtime.agent_freshness_notice()
-        if notice and retry_pending:
+        requested_snapshot = args.boundary_ms is not None and snapshot_current
+        current = refresh_complete and snapshot_current
+        if (refresh_complete is None and snapshot_current
+                and not requested_snapshot):
+            drift = indexd_runtime._drift_report()
+            current = drift.state == "current" and not drift.absorbed
+        if not current and not requested_snapshot and retry_pending:
             return None
-        if notice:
-            # An unverified empty page is not a proven zero either: partial.
-            packet["status"] = "partial"
-            packet["coverage"]["index_freshness"] = notice
-        else:
+        if current:
             packet["coverage"]["index_freshness"] = "fresh"
+        elif requested_snapshot:
+            packet["coverage"]["index_freshness"] = "indexed-snapshot"
+        else:
+            packet["status"] = "partial"
+            packet["coverage"]["index_freshness"] = (
+                indexd_runtime.agent_freshness_notice()
+                or "recovery refresh has not completed; served the last published snapshot")
     if args.json:
         _stdout(json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
     else:

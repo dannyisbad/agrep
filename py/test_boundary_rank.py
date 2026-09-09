@@ -202,8 +202,10 @@ class BoundaryRankTests(unittest.TestCase):
         response = json.dumps({
             "protocol": search._NATIVE_BOUNDARY_PROTOCOL,
             "results": [
-                {"factor": 0.25, "match_class": "interior"},
-                {"factor": 0.5, "match_class": "partial"},
+                {"factor": 0.25, "match_class": "interior",
+                 "qualities": [0.0], "spans": [[2, 5]]},
+                {"factor": 0.5, "match_class": "partial",
+                 "qualities": [1.0], "spans": [[4, 7]]},
             ],
         })
         completed = mock.Mock(returncode=0, stdout=response, stderr="")
@@ -338,6 +340,42 @@ class BoundaryRankTests(unittest.TestCase):
         self.assertEqual(aligned.qualities, (1.0,))
         self.assertEqual(suffix.qualities, (0.5,))
         self.assertEqual(apostrophe.qualities, (0.5,))
+
+    def test_all_terms_proximity_uses_the_boundary_selected_spans(self):
+        text = "calls dont"
+        score = boundary_rank.prepare_query("don calls").evaluate(text)
+        self.assertEqual(score.spans, ((6, 9), (0, 5)))
+        self.assertEqual(score.qualities, (0.5, 1.0))
+        self.assertEqual(
+            search._terms_proximity(
+                text, ["don", "calls"], 8,
+                spans=score.spans, qualities=score.qualities),
+            0.5)
+
+        text = "dude dont we already have a don of cases then calls"
+        score = boundary_rank.prepare_query("don calls").evaluate(text)
+        self.assertEqual(text[slice(*score.spans[0])], "don")
+        self.assertEqual(score.qualities, (1.0, 1.0))
+
+    def test_term_variants_are_minimal_and_keep_short_terms_exact(self):
+        # Mirrors crates/agrep-core/src/boundary_rank.rs
+        # folds_only_minimal_s_es_and_ies_variants word for word.
+        expected = {
+            "calls": ("calls", "call"), "call": ("call", "calls"),
+            "policies": ("policies", "policy"), "policy": ("policy", "policies"),
+            "status": ("status", "statuses"), "statuses": ("statuses", "status"),
+            "boxes": ("boxes", "box"), "glass": ("glass", "glasses"),
+            "branches": ("branches", "branch"), "houses": ("houses", "house"),
+            "cases": ("cases", "case"), "tries": ("tries", "try"),
+            "days": ("days",), "this": ("this",), "does": ("does",),
+            "try": ("try",), "don": ("don",), "t": ("t",), "id": ("id",),
+            "Straße": ("strasse", "strasses"), "東京": ("東京",),
+        }
+        for token, variants in expected.items():
+            with self.subTest(token=token):
+                self.assertEqual(boundary_rank.term_variants(token), variants)
+        self.assertEqual(boundary_rank.term_anchor("policies"), "polic")
+        self.assertEqual(boundary_rank.term_anchor("tries"), "tries")
 
     def test_normalized_offsets_cover_original_graphemes(self):
         sharp_s = boundary_rank.prepare_query("STRASSE").evaluate("Straße")

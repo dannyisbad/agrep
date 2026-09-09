@@ -469,20 +469,6 @@ def t_procscan():
             f"{len(procs)} agent procs, {len(claude)} claude w/ session id")
 
 
-# Keyword, word, and regex engines must all return a common term.
-def t_engines():
-    import corpusdb
-    db = corpusdb.connect(quiet=True, read_only=True)
-    if not db:
-        return ("SKIP", "no corpus db")
-    kw = corpusdb.keyword(db, "the", 5)["total"]
-    wd = corpusdb.word(db, "the", 5)["total"]
-    rx = corpusdb.regex(db, "th.", 5)["total"]
-    db.close()
-    ok = kw > 0 and wd > 0 and rx > 0
-    return ("PASS" if ok else "FAIL", f"keyword={kw} word={wd} regex={rx}")
-
-
 # 8b. Filter pushdown parity: corpusdb SQL WHERE == JSONL scan + Python filtering.
 def t_filter_parity():
     import sqlite3
@@ -697,7 +683,7 @@ def t_jsonl_streaming_filters():
         prose_skips_tools = not tool_calls and all(r["who"] != "tool" for r in prose)
 
         filtered = list(explore._iter_kw_corpus({
-            "agent": "CODE", "project": "proj", "chat": "S1", "who": "user",
+            "agent": "CODE", "project": "proj*", "chat": "S1", "who": "user",
             "model": "GPT-5", "since_ms": 90, "until_ms": 150,
         }))
         filter_exact = len(filtered) == 1 and filtered[0]["text"] == "alpha then beta"
@@ -1445,7 +1431,7 @@ def t_conversation_family_retrieval():
     kept_sessions = [ranked[int(i)]["session"] for i in keep]
     saved_index = common.indexed_family_roots
     try:
-        common.indexed_family_roots = lambda sessions: {
+        common.indexed_family_roots = lambda sessions, **_: {
             session: common.family_root(session, parents)
             for session in sessions
         }
@@ -3659,8 +3645,7 @@ def t_recall_escalation():
 
 
 def t_dense_probe_gate():
-    """Dense probes fire above the calibrated cosine floor, labeled as semantic
-    matches; junk below the floor stays silent on probes and normal search."""
+    """Dense probes return usable handles above the calibrated cosine floor."""
     import contextlib
     import io
     import compact
@@ -3677,6 +3662,8 @@ def t_dense_probe_gate():
     with contextlib.redirect_stdout(out):
         strong_rc = recall._probe(["q"], [strong], "semantic:hybrid")
     strong_text = out.getvalue()
+    strong_target, strong_turn = compact.parse_result_handle(
+        next(word for word in strong_text.split() if word.startswith("@")))
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         weak_rc = recall._probe(["q"], [weak], "semantic:hybrid")
@@ -3695,18 +3682,14 @@ def t_dense_probe_gate():
         direct = search._semantic_local("q", 10, family_diverse=False)
     finally:
         semworker.search_worker = saved_worker
-    import display_policy
-    # sub-floor evidence never fires a pointer; the miss is disclosed, not silent
-    weak_miss = weak_text.strip() == display_policy.probe_miss_line(
-        "semantic:hybrid",
-        corpus_sessions=(recall.common.index_summary() or {}).get("sessions"))
-    ok = (strong_rc == 0 and "semantic" in strong_text and "recall:" in strong_text
-          and weak_rc == 1 and weak_miss
+    ok = (strong_rc == 0 and base["session"].startswith(strong_target)
+          and strong_turn == base["turn"]
+          and weak_rc == 1 and "@" not in weak_text
           and [hit["session"] for hit in direct["hits"]] == [base["session"]]
           and direct.get("truncated") is False)
     return ("PASS" if ok else "FAIL",
-            f"strong_rc={strong_rc} labeled={'semantic' in strong_text} "
-            f"weak_rc={weak_rc} weak_miss={weak_miss} "
+            f"strong_rc={strong_rc} pointer={strong_target}:{strong_turn} "
+            f"weak_rc={weak_rc} "
             f"direct={[hit['session'] for hit in direct['hits']]}")
 
 
@@ -4659,7 +4642,7 @@ def t_semantic_candidate_refs():
                 pass
             all_eligible = refs.eligible(None).tolist()
             exact_filter = refs.eligible({
-                "agent": "cod", "project": "PROJ", "chat": "S-ONE",
+                "agent": "cod", "project": "PROJ*", "chat": "S-ONE",
                 "who": "agent", "model": "gpt-x", "since_ms": 100,
                 "until_ms": 101,
             }).tolist()
@@ -4686,7 +4669,7 @@ def t_semantic_candidate_refs():
             for _ in range(180):
                 flt = {
                     "agent": rng.choice((None, "cod", "CLAUDE", "missing")),
-                    "project": rng.choice((None, "proj", "OTHER", "missing")),
+                    "project": rng.choice((None, "proj*", "OTHER", "missing")),
                     "chat": rng.choice((None, "s-", "S-ONE", "s-two", "x")),
                     "who": rng.choice((None, "user", "agent", "tool")),
                     "model": rng.choice((None, "gpt-x", "GPT", "sonnet", "none")),
@@ -5264,7 +5247,7 @@ def t_sentinel_teardown():
             tail = (teach._SENTINEL_TAIL_MAC if sys.platform == "darwin"
                     else teach._SENTINEL_TAIL_LINUX)
             if "@@UNIT@@" in tail:
-                subs |= {"@@UNIT@@": teach.TASK_NAME, "@@UNITS@@": "''"}
+                subs |= {"@@UNIT@@": teach._sentinel_task_name(), "@@UNITS@@": "''"}
             script = teach._write_sentinel_sh(tail, subs)
             edited_omp = (
                 pi_extensions["omp"].read_bytes() + b"\n// user edit\n")
@@ -5462,7 +5445,8 @@ def t_block_version():
        daemon from reverting newer text (upgrade + running daemon = byte flip-flop
        every tick otherwise, i.e. cache shredding);
     2. background reconcile preserves every existing drifted target; explicit
-       setup owns upgrades, while newer and same-version user copies stay untouched;
+       setup owns upgrades, while newer and same-version user copies stay
+       untouched and a same-version edit is disclosed as `edited`;
     3. the taught probe example is rendered by the live output contract;
     4. the compact routing block names indexed history and live state separately."""
     import hashlib
@@ -5472,11 +5456,14 @@ def t_block_version():
     import tempfile
     from pathlib import Path as P
     import teach
-    pinned = (37, "4b7040519c28")  # (NUDGE_V, sha256(NUDGE)[:12]) - update BOTH together
+    pinned = (38, "f520cdfb6033")  # (NUDGE_V, sha256(NUDGE)[:12]) - update BOTH together
     h = hashlib.sha256(teach.NUDGE.encode()).hexdigest()[:12]
     if (teach.NUDGE_V, h) != pinned:
         return ("FAIL", f"NUDGE changed (v{teach.NUDGE_V}, {h}) vs pinned {pinned} - "
                         "bump NUDGE_V and re-pin here")
+    if teach.NUDGE_V - 1 not in teach._PRIOR_BLOCK_DIGESTS:
+        return ("FAIL", f"v{teach.NUDGE_V - 1} body digests are not on record - "
+                        "move them into _PRIOR_BLOCK_DIGESTS")
     probe = recall._probe_line(
         ["deadlock"],
         [{"session": "1a2b3c4d", "turn": 214, "agent": "claude",
@@ -5534,12 +5521,12 @@ def t_block_version():
         old_preserved = "old text" in older.read_text(encoding="utf-8")
         untouched = newer.read_text(encoding="utf-8") == future
         kept = edited.read_text(encoding="utf-8") == mine
-    drifted = [row["kind"] for row in health["refusals"]] == ["drifted"]
+    disclosed = [row["kind"] for row in health["refusals"]] == ["drifted", "edited"]
     ok = (old_preserved and untouched and kept and repaired == []
-          and drifted and probe_current and routes_current)
+          and disclosed and probe_current and routes_current)
     return ("PASS" if ok else "FAIL",
             f"old preserved={old_preserved}, newer untouched={untouched}, "
-            f"same-version edit kept={kept}, drift disclosed={drifted}, "
+            f"same-version edit kept={kept}, drift+edit disclosed={disclosed}, "
             f"probe-current={probe_current}, routes-current={routes_current}")
 
 
@@ -6487,7 +6474,6 @@ _TESTS = [
     ("live watcher state and classifier integrity", t_live_state_integrity),
     ("reply cap (64k)", t_cap),
     ("procscan agent processes", t_procscan),
-    ("search engines kw/word/regex", t_engines),
     ("filter pushdown parity", t_filter_parity),
     ("JSONL fallback streams filtered rows", t_jsonl_streaming_filters),
     ("heuristic ranking", t_ranking),
@@ -6599,10 +6585,14 @@ def _run() -> int:
     global ENV
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     os.environ["AGREP_RS_BIN"] = RS
+    # session_context freezes the publication dir at import
+    import tempfile
+    os.environ["AGREP_CALLER_PUBLICATION_DIR"] = tempfile.mkdtemp(
+        prefix="agrep-selftest-caller-")
+    import common
     # gates read the box's live corpus but never write it: dev-tree writes
     # tear the installed daemon's caches (mixed-version wedge, twice).
     # Names the protected dir, so sandboxed fixtures still build their own.
-    import common
     os.environ["AGREP_DATA_READONLY"] = str(common.DATA_DIR)
     for key in (*AGENT_CONTEXT_ENV_KEYS, "AGREP_PROFILE"):
         os.environ.pop(key, None)

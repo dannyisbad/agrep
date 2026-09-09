@@ -62,6 +62,23 @@ class SegmentArtifactMoved(SegmentQueryError):
     generation and degrade this one answer rather than discarding the bundle."""
 
 
+def semantic_source_status(source: object) -> tuple[bool, bool]:
+    """Return (queryable, newest); only a typed family-publication race may use
+    the still-committed ingest signature."""
+    try:
+        current = common.transcript_generation()
+    except common.TranscriptPublicationRace:
+        publication = common.read_family_publication()
+        queryable = bool(
+            publication is not None
+            and publication.moving
+            and isinstance(source, dict)
+            and source.get("ingest_signature") == publication.signature_sha256)
+        return queryable, False
+    newest = current == source
+    return newest, newest
+
+
 # Publication replaces artifacts atomically, so a vanished path or a new inode
 # under it is a republication; a mutation inside the SAME inode is damage.
 _REPUBLISH_ATTEMPTS = 3
@@ -118,10 +135,10 @@ def metadata_where(filters: dict | None) -> tuple[str, list]:
         clauses.append("agrep_contains_ci(agent, ?)")
         params.append(filters["agent"])
     if filters.get("project"):
-        clauses.append("agrep_contains_ci(project, ?)")
+        clauses.append("agrep_project_match(project, ?)")
         params.append(filters["project"])
     if filters.get("exclude_project"):
-        clauses.append("NOT agrep_contains_ci(project, ?)")
+        clauses.append("NOT agrep_project_match(project, ?)")
         params.append(filters["exclude_project"])
     if filters.get("chat"):
         clauses.append("agrep_starts_ci(session, ?)")
@@ -187,6 +204,8 @@ def register_metadata_functions(db: sqlite3.Connection) -> None:
         (actual or "").lower().startswith((needle or "").lower())), deterministic=True)
     db.create_function("agrep_equal_ci", 2, lambda actual, needle: int(
         (actual or "").lower() == (needle or "").lower()), deterministic=True)
+    db.create_function("agrep_project_match", 2, lambda actual, needle: int(
+        surface.project_label_matches(actual, needle)), deterministic=True)
 
 
 _text_hash = common.semantic_text_hash
@@ -660,10 +679,10 @@ class _SegmentIndex:
 
     def assert_current(self) -> None:
         try:
-            current = common.transcript_generation()
+            queryable, _newest = semantic_source_status(self.manifest["source"])
         except (OSError, RuntimeError, ValueError) as exc:
             raise SegmentQueryError("semantic source generation is unavailable") from exc
-        if current != self.manifest["source"]:
+        if not queryable:
             raise SegmentQueryError("segmented semantic source is stale")
 
     def assert_artifacts_current(self) -> None:

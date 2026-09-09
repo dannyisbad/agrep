@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shlex
 import sqlite3
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from _test_support import isolate_data_dir
 isolate_data_dir()
 import ask
 import common
+import compact
 import corpusdb
 import explore
 import recall
@@ -374,25 +376,46 @@ class SearchCorrectnessTests(unittest.TestCase):
         self.assertTrue(result["semantic_status"]["truncated"])
 
     def test_partial_semantic_coverage_never_claims_exact_totals(self):
-        response = {
-            "hits": [], "total": 0, "chats": 0, "truncated": False,
-            "semantic_coverage": {"indexed": 2, "total": 10, "complete": False},
-            "partial": True, "score_kind": "cosine",
-            "semantic_status": {"state": "no-confident-match", "complete": False,
-                                "partial": True, "truncated": False},
-            "fallback_recommended": False,
-        }
-        with mock.patch.object(search, "_semantic_local", return_value=response):
-            result = search.run_query(
-                "why did deployment keep retrying", mode="semantic", limit=10)
-        self.assertIsNotNone(result)
-        self.assertFalse(result["totals_exact"])
-        self.assertTrue(result["partial"])
+        complete = {"indexed": 10_000, "total": 10_000, "complete": True}
+        tiny_gap = {
+            "indexed": 9_997, "total": 10_000, "pending": 3, "complete": False}
+        backlog = {
+            "indexed": 2_000, "total": 10_000, "pending": 8_000, "complete": False}
+        cases = (
+            ("tiny-base", tiny_gap, None),
+            ("tiny-accelerator", complete, tiny_gap),
+            ("material-backlog", backlog, None),
+        )
+        for label, coverage, accelerator in cases:
+            data = {
+                "results": [], "truncated": False, "score_kind": "cosine",
+                "semantic_coverage": coverage,
+                "semantic_accelerator_coverage": accelerator,
+                "partial": True,
+            }
+            with self.subTest(gap=label), \
+                    mock.patch.object(
+                        semworker, "resident_status", return_value={"running": True}), \
+                    mock.patch.object(semworker, "search_worker", return_value=data):
+                result = search.run_query(
+                    "why did deployment keep retrying", mode="semantic", limit=10)
+            self.assertEqual(result["hits"], [])
+            self.assertFalse(result["totals_exact"])
+            self.assertTrue(result["partial"])
+            self.assertFalse(result["semantic_status"]["complete"])
+            self.assertTrue(search._semantic_result_incomplete(result))
+            self.assertEqual(
+                search._semantic_result_incomplete(result, allow_live_tail=True),
+                label == "material-backlog")
+            self.assertEqual(result["semantic_coverage"], coverage)
+            self.assertEqual(result["semantic_accelerator_coverage"], accelerator)
 
     def test_hidden_semantic_window_never_claims_complete(self):
-        self.assertTrue(search._semantic_result_incomplete({
-            "self_exclusion_more_unknown": True,
-        }))
+        for allow_live_tail in (False, True):
+            with self.subTest(allow_live_tail=allow_live_tail):
+                self.assertTrue(search._semantic_result_incomplete(
+                    {"self_exclusion_more_unknown": True},
+                    allow_live_tail=allow_live_tail))
 
     def test_semantic_time_sort_fetches_full_bounded_pool_before_cap(self):
         hits = [{"session": f"session-{index}", "turn": index, "who": "user",
@@ -420,7 +443,7 @@ class SearchCorrectnessTests(unittest.TestCase):
             search.main(["deployment retry loop", "-s", "--sort", "position"])
         self.assertEqual(stopped.exception.code, 2)
 
-    def test_partial_zero_confidence_requests_lexical_fallback(self):
+    def test_partial_semantic_miss_keeps_low_confidence_rows_out(self):
         data = {
             "results": [{"session": "weak", "turn": 1, "who": "user",
                          "text": "unrelated", "score": 0.2}],
@@ -430,18 +453,16 @@ class SearchCorrectnessTests(unittest.TestCase):
                                   "complete": False},
             "partial": True,
         }
-        with mock.patch.object(semworker, "search_worker", return_value=data):
+        with mock.patch.object(
+                semworker, "resident_status", return_value={"running": True}), \
+                mock.patch.object(semworker, "search_worker", return_value=data):
             result = search._semantic_local("deployment retry loop", 10)
         self.assertIsNotNone(result)
         self.assertEqual(result["hits"], [])
-        self.assertTrue(result["fallback_recommended"])
-        self.assertTrue(result["semantic_status"]["fallback_recommended"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["semantic_status"]["filtered"]["weak"], 1)
         self.assertFalse(result["semantic_status"]["complete"])
 
-        complete = search.semantic_result_policy(
-            "deployment retry loop", [], requested=10,
-            coverage={"indexed": 100, "total": 100, "complete": True})
-        self.assertFalse(complete["semantic_status"]["fallback_recommended"])
 
     def test_terse_prose_miss_is_semantic_but_identifiers_and_junk_are_not(self):
         self.assertTrue(recall._auto_semantic_query("deployment retry loop"))
@@ -811,6 +832,46 @@ class SearchCorrectnessTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_all_terms_fold_plurals_and_anchor_on_aligned_occurrences(self):
+        rows = [
+            ("aligned", 0, 1, "pi", "p", "", "", "", "user",
+             "dude dont we already have a don of cases and calls"),
+            ("singular", 0, 2, "pi", "p", "", "", "", "user",
+             "state of affairs with don before this call"),
+        ]
+        db = sqlite3.connect(":memory:")
+        db.executescript(corpusdb._SCHEMA_SQL)
+        db.executemany(corpusdb._INS, rows)
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        db.execute("INSERT INTO msgs_prose_fts(rowid,text) "
+                   "SELECT id,text FROM msgs WHERE who <> 'tool'")
+        legacy = [{"session": session, "turn": turn, "ts": ts, "agent": agent,
+                   "project": project, "concept": concept, "model": model,
+                   "model_source": source, "who": who, "text": text,
+                   "low": text.lower()}
+                  for session, turn, ts, agent, project, concept, model,
+                  source, who, text in rows]
+        try:
+            indexed = corpusdb.keyword_terms(db, "don calls", 10)["terms"]["hits"]
+            self.assertEqual(
+                corpusdb.keyword_count(db, "don calls")["total"],
+                2)
+            with mock.patch.object(explore, "_freshen"), \
+                    mock.patch.object(explore, "_iter_kw_corpus",
+                                      side_effect=lambda _flt=None: iter(legacy)):
+                scanned = explore.keyword_search(
+                    "don calls", 10, terms=True)["term_hits"]
+            self.assertEqual(
+                {hit["session"] for hit in indexed},
+                {"aligned", "singular"})
+            self.assertEqual(
+                {hit["session"] for hit in scanned},
+                {"aligned", "singular"})
+            aligned = next(hit for hit in indexed if hit["session"] == "aligned")
+            self.assertIn("a don of cases", aligned["snippet"])
+        finally:
+            db.close()
+
     def test_re_i_widening_uses_the_sparse_partial_index(self):
         db = sqlite3.connect(":memory:")
         db.executescript(corpusdb._SCHEMA_SQL)
@@ -853,10 +914,11 @@ class CorpusAnchorTests(unittest.TestCase):
         finally:
             db.close()
 
-    def _semantic_rows(self, score: float = 0.95) -> dict:
+    def _semantic_rows(self, score: float = 0.95,
+                       text: str = "unrelated neighbor {index}") -> dict:
         return {
             "results": [{"session": f"s-{index}", "turn": index, "who": "user",
-                         "text": f"unrelated neighbor {index}", "score": score}
+                         "text": text.format(index=index), "score": score}
                         for index in range(3)],
             "truncated": False, "score_kind": "cosine",
             "semantic_coverage": {"indexed": 3, "total": 3, "complete": True},
@@ -878,8 +940,9 @@ class CorpusAnchorTests(unittest.TestCase):
                       surface.semantic_anchor_notice(status))
 
     def test_anchored_query_keeps_confident_labels_and_stays_quiet(self):
+        rows = self._semantic_rows(text="the publication race kept retrying {index}")
         with self._probe(), mock.patch.object(
-                semworker, "search_worker", return_value=self._semantic_rows()):
+                semworker, "search_worker", return_value=rows):
             result = search._semantic_local(
                 "publication race retrying", 10, who="user")
         status = result["semantic_status"]
@@ -888,6 +951,17 @@ class CorpusAnchorTests(unittest.TestCase):
         for hit in result["hits"]:
             self.assertFalse(search._semantic_row_weak(hit))
         self.assertIsNone(surface.semantic_anchor_notice(status))
+
+    def test_rows_missing_most_query_terms_are_weak_even_when_anchored(self):
+        # the corpus holds the words, but this neighbor carries none of them:
+        # topic-adjacent text at a high cosine is the O4 failure shape
+        with self._probe(), mock.patch.object(
+                semworker, "search_worker", return_value=self._semantic_rows()):
+            result = search._semantic_local(
+                "publication race retrying", 10, who="user")
+        self.assertEqual(result["semantic_status"]["corpus_anchor"]["anchored"], True)
+        for hit in result["hits"]:
+            self.assertTrue(search._semantic_row_weak(hit))
 
     def test_sub_strong_scores_stay_weak_when_the_query_anchors(self):
         rows = self._semantic_rows(score=search._RECALL_STRONG_SEM - 0.01)
@@ -981,7 +1055,9 @@ class OverspecRecoveryTests(unittest.TestCase):
                "use a smaller model to cut disk but today")
               for n in range(30)],
         ]
-        db.executemany(corpusdb._INS, rows)
+        db.executemany(
+            corpusdb._INS_DIGEST,
+            [(*row, compact.content_digest(row[-1])) for row in rows])
         db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
         return db
 
@@ -1074,13 +1150,74 @@ class OverspecRecoveryTests(unittest.TestCase):
         self.assertNotIn("echo-two", sessions)
         self.assertTrue(all(hit["matched"] == "content-terms"
                             for hit in block))
-        disclosure = search._overspec_disclosure(block)
-        self.assertRegex(disclosure, r"matched \d+/\d+ terms")
-        self.assertIn("dropped:", disclosure)
-        terse = search._overspec_disclosure(block, self.QUERY)
-        self.assertTrue(terse.startswith("~coverage "))
-        self.assertIn(" · more: agrep --coverage -- ", terse)
-        self.assertNotIn("only echo/weak rows", terse)
+
+    def test_brief_retry_skips_caller_tools_for_independent_evidence(self):
+        db = self._corpus()
+        runner_up = "smaller embedding publication rejects vectors"
+        db.execute(corpusdb._INS_DIGEST, (
+            "runnerup", 0, 49, "codex", "p", "", "", "", "tool",
+            runner_up, compact.content_digest(runner_up)))
+        echo = "eval: " + "embedding publication rejects extra vectors smaller " * 3
+        db.execute(corpusdb._INS_DIGEST, (
+            "self-echo", 0, 99, "codex", "p", "", "", "", "tool",
+            echo, compact.content_digest(echo)))
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        stderr = io.StringIO()
+        full = io.StringIO()
+        family = common.CallingFamily(
+            "self-echo", "self-echo", frozenset({"self-echo"}), True, 4)
+        policy = common.SelfExclusion(family, 4, "window")
+        try:
+            with mock.patch.object(search, "corpusdb") as fake, \
+                    mock.patch.object(
+                        common, "indexed_session_prefix_candidates",
+                        return_value=("evidence", "runnerup", "self-echo")), \
+                    contextlib.redirect_stderr(stderr):
+                fake.connect.return_value = db
+                fake.coverage_rank = corpusdb.coverage_rank
+                fake.term_session_df = corpusdb.term_session_df
+                attempt = search._overspec_retry_attempt(
+                    self.QUERY, {}, [], policy)
+                search._emit_overspec_block(
+                    self.QUERY, {}, [], policy, brief=True, attempt=attempt)
+                with contextlib.redirect_stderr(full):
+                    search._emit_overspec_block(
+                        self.QUERY, {}, [], policy, attempt=attempt)
+        finally:
+            db.close()
+        rendered = stderr.getvalue()
+        handles = [compact.parse_result_handle_parts(token)[:2]
+                   for token in rendered.split() if token.startswith("@")]
+        self.assertEqual(handles, [("evidence", 0)])
+        self.assertIn(self.TARGET_TEXT, rendered)
+        full_handles = [compact.parse_result_handle_parts(token)[:2]
+                        for token in full.getvalue().split()
+                        if token.startswith("@")]
+        self.assertEqual(
+            [session for session in ("evidence", "runnerup", "self-echo")
+             if session.startswith(full_handles[0][0])],
+            ["self-echo"])
+        self.assertEqual(full_handles[0][1], 0)
+        self.assertIn(("evidence", 0), full_handles)
+
+    def test_empty_retry_keeps_the_scoped_coverage_command_available(self):
+        db = self._corpus()
+        db.execute("DELETE FROM msgs")
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        stderr = io.StringIO()
+        try:
+            with mock.patch.object(search, "corpusdb") as fake, \
+                    contextlib.redirect_stderr(stderr):
+                fake.connect.return_value = db
+                fake.coverage_rank = corpusdb.coverage_rank
+                fake.term_session_df = corpusdb.term_session_df
+                search._emit_overspec_block(self.QUERY, {}, [], None)
+        finally:
+            db.close()
+        output = stderr.getvalue()
+        command = shlex.split(output[output.index("agrep "):])[:4]
+        self.assertEqual(command, ["agrep", "--coverage", "--", self.QUERY])
+        self.assertNotRegex(output, r"@\S+:\d+")
 
     def test_identifier_query_never_reaches_the_corpus(self):
         with mock.patch.object(search, "corpusdb") as fake:
@@ -1110,36 +1247,6 @@ class OverspecRecoveryTests(unittest.TestCase):
             "--coverage",
             search._overspec_disclosure(block, self.QUERY, force=True))
 
-    def test_empty_retry_is_disclosed_not_silent(self):
-        # law 1: "retried, empty" must not be byte-identical to "never retried"
-        db = self._corpus()
-        sessions = ["evidence", "echo-src", "echo-two",
-                    *[f"filler-{n}" for n in range(30)]]
-        page = [{"session": s, "turn": 0, "who": "user",
-                 "matched": "all-terms"} for s in sessions]
-        logged: list[str] = []
-        try:
-            with mock.patch.object(search, "corpusdb") as fake, \
-                    mock.patch.object(search.common, "log", logged.append):
-                fake.connect.return_value = db
-                fake.coverage_rank = corpusdb.coverage_rank
-                fake.term_session_df = corpusdb.term_session_df
-                out = search._overspec_retry_rows(self.QUERY, {}, page, None)
-        finally:
-            db.close()
-        self.assertEqual(out, (None, True))
-        db = self._corpus()
-        try:
-            with mock.patch.object(search, "corpusdb") as fake, \
-                    mock.patch.object(search.common, "log", logged.append):
-                fake.connect.return_value = db
-                fake.coverage_rank = corpusdb.coverage_rank
-                fake.term_session_df = corpusdb.term_session_df
-                search._emit_overspec_block(self.QUERY, {}, page, None)
-        finally:
-            db.close()
-        self.assertTrue(any("coverage retry found no new sessions" in line
-                            and "--coverage" in line for line in logged))
 
     def test_corpus_df_admits_narration_the_stoplist_cannot_see(self):
         # B4 guard: eligibility may not hang on _STOP membership alone - on a
@@ -1169,9 +1276,11 @@ class OverspecRecoveryTests(unittest.TestCase):
         self.assertTrue(block)
         self.assertIn("evidence", [hit["session"] for hit in block])
 
-    def test_keyword_bag_still_never_retries(self):
-        # rare-everywhere terms: the corpus reports no narration to shed, so
-        # strict AND semantics stand even though the shape gate passed
+    def test_keyword_bag_with_weak_rows_still_never_retries(self):
+        # rare-everywhere terms: the corpus reports no narration to shed, and
+        # the weak page is already partial evidence, so strict AND stands
+        weak = [{"session": "w", "turn": 0, "who": "user",
+                 "matched": "all-terms"}]
         db = self._corpus()
         try:
             with mock.patch.object(search, "corpusdb") as fake:
@@ -1179,10 +1288,93 @@ class OverspecRecoveryTests(unittest.TestCase):
                 fake.coverage_rank = corpusdb.coverage_rank
                 fake.term_session_df = corpusdb.term_session_df
                 out = search._overspec_retry_rows(
-                    "embed publication rejects vectors segments", {}, [], None)
+                    "embed publication rejects vectors segments", {}, weak, None)
         finally:
             db.close()
         self.assertEqual(out, (None, False))
+
+    def test_empty_or_echo_only_page_retries_a_keyword_bag(self):
+        # seven pasted identifiers with no row carrying all of them: the
+        # labelled coverage block is the only answer left, so it runs
+        q = "embedding publication rejects extra vectors zzqx_token 203.0.113.9"
+        self.assertFalse(search._overspec_query(q))
+        for page in ([], [{"session": "echo-q", "turn": 0, "who": "user"}]):
+            db = self._corpus()
+            db.execute(corpusdb._INS, ("echo-q", 0, 95, "claude", "p", "",
+                                       "", "", "user", f"ran: {q}"))
+            db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+            try:
+                with mock.patch.object(search, "corpusdb") as fake:
+                    fake.connect.return_value = db
+                    fake.coverage_rank = corpusdb.coverage_rank
+                    fake.term_session_df = corpusdb.term_session_df
+                    block, scanned = search._overspec_retry_rows(
+                        q, {}, page, None)
+            finally:
+                db.close()
+            self.assertTrue(scanned, page)
+            self.assertTrue(block, page)
+            self.assertIn("dropped:", search._overspec_disclosure(block))
+
+    def test_coverage_block_honours_exclude_project(self):
+        q = "embedding publication rejects extra vectors zzqx_token 203.0.113.9"
+        db = self._corpus()
+        db.execute(corpusdb._INS, ("elsewhere", 0, 60, "codex", "/w/other",
+                                   "", "", "", "tool", self.TARGET_TEXT))
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        try:
+            with mock.patch.object(search, "corpusdb") as fake:
+                fake.connect.return_value = db
+                fake.coverage_rank = corpusdb.coverage_rank
+                fake.term_session_df = corpusdb.term_session_df
+                block, scanned = search._overspec_retry_rows(
+                    q, {"exclude_project": "p"}, [], None)
+        finally:
+            db.close()
+        self.assertTrue(scanned)
+        self.assertEqual([hit["session"] for hit in block], ["elsewhere"])
+
+    def test_compact_hybrid_page_still_runs_the_coverage_retry(self):
+        # meaning rows filled the page while the lexical lane found nothing:
+        # the tool row holding most of the pasted terms must still be disclosed
+        q = "embedding publication rejects extra vectors zzqx_token 203.0.113.9"
+        meaning = {"session": "neighbor", "turn": 7, "ts": 1, "who": "user",
+                   "agent": "codex", "project": "p", "sem_score": 0.9,
+                   "snippet": "adjacent topic",
+                   "content_digest": search.compact.content_digest("adjacent")}
+
+        def run_query(_query, *, mode="keyword", **_kwargs):
+            if mode == "semantic":
+                return {"hits": [dict(meaning)], "total": 1, "chats": 1,
+                        "engine": "semantic:hybrid", "mode": "semantic",
+                        "tool_hits": 0, "fallback_recommended": False}
+            return {"hits": [], "total": 0, "chats": 0, "tool_hits": 0,
+                    "engine": "corpusdb", "mode": "keyword",
+                    "totals_exact": True}
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict("os.environ", {"AGREP_PROFILE": "compact"}), \
+                mock.patch.object(search.common, "DATA_DIR", Path(td)), \
+                mock.patch.object(search.indexd_runtime, "ensure_index",
+                                  return_value=True), \
+                mock.patch.object(search, "run_query", side_effect=run_query), \
+                mock.patch.object(search, "_stream_first_run",
+                                  return_value=None), \
+                mock.patch.object(search, "corpusdb") as fake, \
+                mock.patch("explore._session_index",
+                           return_value={"neighbor": {}}), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            fake.connect.side_effect = lambda **_kw: self._corpus()
+            fake.coverage_rank = corpusdb.coverage_rank
+            fake.term_session_df = corpusdb.term_session_df
+            rc = search.main([q, "--color", "never"])
+        self.assertEqual(rc, 0)
+        self.assertIn("@neighbor:7", stdout.getvalue())
+        self.assertNotIn("@evidence", stdout.getvalue())
+        self.assertIn("~coverage top row matched", stderr.getvalue())
+        self.assertRegex(stderr.getvalue(), r"(?m)^@evidence:0\S* codex/tool ")
 
     def test_coverage_flag_is_porcelain_only(self):
         for extra in (["--json"], ["--flat"], ["-c"], ["--chats"],

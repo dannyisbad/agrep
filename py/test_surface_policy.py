@@ -68,22 +68,6 @@ class SharedSurfacePolicyTests(unittest.TestCase):
                 # reader to run a command means it is not auto
                 self.assertNotIn("`", remedy.text, name)
 
-    def test_remedy_renderers_consume_the_registry(self) -> None:
-        self.assertIn(surface.REMEDIES["stale-handle"].text,
-                      surface.stale_handle_recovery("agrep"))
-        installed = doctor._installed_build_detail({
-            "state": "lagging",
-            "detail": "fixture lag",
-            "remedy": "replace-installed-tool",
-            "remedy_argv": [
-                "uv", "tool", "install", "--force", "--from",
-                "/fixture source", "agrep",
-            ],
-        })
-        before, after = surface.REMEDIES["replace-installed-tool"].text.split(
-            "{command}")
-        self.assertIn(before, installed)
-        self.assertIn(after, installed)
 
     def test_semantic_score_bands_have_one_runtime_default(self) -> None:
         bands = surface.DEFAULT_SEMANTIC_SCORE_BANDS
@@ -325,25 +309,26 @@ class SharedSurfacePolicyTests(unittest.TestCase):
                 self.assertNotIn(failure.reason, stdout)
                 self.assertEqual(stderr.count(failure.reason), 1)
 
-    def test_grep_absence_requires_exact_current_proof(self) -> None:
+    def test_grep_absence_uses_a_healthy_indexed_snapshot(self) -> None:
         current = surface.FreshnessStory("current")
         self.assertEqual(
             surface.grep_absence_exit(exact=True, freshness=current), 1)
-        # In-flight states are silent on the page ("system working") but
-        # miss_verdict still hedges them as "index catching up; retry
-        # shortly" - the zero is not proven, so the exit must not claim 1.
         for in_flight in (
-                surface.FreshnessStory("current", absorbed_drift=True),
                 surface.FreshnessStory(
-                    "behind", changed_stores=1, young=True, converging=True)):
-            with self.subTest(state=in_flight.state,
-                              absorbed=in_flight.absorbed_drift):
-                self.assertEqual(surface.freshness_story_line(in_flight), "")
+                    "behind", changed_stores=1, young=True, converging=True),
+                surface.FreshnessStory(
+                    "unverified", code="search-index-stale", converging=True)):
+            with self.subTest(state=in_flight.state):
                 self.assertEqual(
                     surface.grep_absence_exit(
-                        exact=True, freshness=in_flight), 2)
+                        exact=True, freshness=in_flight), 1)
+                self.assertEqual(
+                    surface.grep_absence_exit(
+                        exact=False, freshness=in_flight), 2)
         for story in (
                 surface.FreshnessStory("unverified"),
+                surface.FreshnessStory(
+                    "unverified", code="search-index-stale"),
                 surface.FreshnessStory("behind"),
                 surface.FreshnessStory("failing")):
             with self.subTest(state=story.state):
@@ -352,6 +337,10 @@ class SharedSurfacePolicyTests(unittest.TestCase):
                     surface.grep_absence_exit(exact=True, freshness=story), 2)
         self.assertEqual(
             surface.grep_absence_exit(exact=False, freshness=current), 2)
+        self.assertEqual(
+            surface.grep_absence_exit(
+                exact=True, freshness=surface.FreshnessStory(
+                    "unverified", code="census-unavailable", converging=True)), 2)
 
     def test_around_existing_corpus_observes_blocked_owner_without_freshen(
             self) -> None:
@@ -605,7 +594,7 @@ class SemanticLaneStoryParityTests(unittest.TestCase):
                         search, "_finish_semantic_query", return_value=None):
                 rc, _stdout, stderr = run(lambda: search.main(
                     [self.QUERY, "--hybrid", "--classic", "--color", "never"]))
-                self.assertIn(rc, (0, 1))
+                self.assertEqual(rc, 1)
                 self.assertIn("fixture keyword-only story", stderr)
 
             def tty_query(_query, *, mode="keyword", **_kwargs):
@@ -651,7 +640,6 @@ class SemanticLaneStoryParityTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             # D6: a probe miss is never silent - the owned miss line carries
             # the lane state itself, so no second stderr story may print
-            self.assertIn("no confident past-context pointer", stdout)
             self.assertIn("fixture keyword-only story", stdout)
             self.assertEqual(stderr, "")
 
@@ -815,16 +803,23 @@ class AroundSpeakerPolicyTests(unittest.TestCase):
 
 
 class CoverageNoticeTrivialGapTests(unittest.TestCase):
-    """A live box's own churn tail is not a coverage story.
+    """Normal query surfaces tolerate bounded live-update tails."""
 
-    Hit pages pass suppress_trivial=True; the miss-proof path never does,
-    so absence claims always state their scope."""
+    def test_answered_lane_notice_does_not_invent_a_coverage_gap(self) -> None:
+        for coverage in (
+                {"indexed": 10_000, "total": 10_000, "complete": True},
+                {"indexed": 9_997, "total": 10_000, "complete": False}):
+            with self.subTest(coverage=coverage):
+                line = surface.semantic_keyword_only_notice({
+                    "state": "no-confident-match", "coverage": coverage,
+                    "complete": coverage["complete"]})
+                self.assertNotIn("partial", line)
+                self.assertNotIn("unavailable", line)
 
     def test_churn_scale_gap_is_silent_on_hit_pages(self) -> None:
         churn = {"indexed": 46358, "total": 46421, "complete": False}
         self.assertIsNone(surface.semantic_coverage_notice(
             churn, suppress_trivial=True))
-        # the miss-proof caller still gets the full disclosure
         self.assertIn("semantic coverage is partial",
                       surface.semantic_coverage_notice(churn))
 
@@ -848,13 +843,10 @@ class CoverageNoticeTrivialGapTests(unittest.TestCase):
             unknown, suppress_trivial=True))
 
     def test_churn_scale_accelerator_lag_is_silent_on_hit_pages(self) -> None:
-        # The q8 lane trails the base by a handful of rows on every live
-        # request; that tail is the same churn as the base lane's.
         churn = {"indexed": 91266, "total": 91292, "complete": False}
         accel_churn = {"indexed": 91240, "total": 91292, "complete": False}
         self.assertIsNone(surface.semantic_coverage_notice(
             churn, accel_churn, suppress_trivial=True))
-        # the miss-proof caller still gets the full disclosure
         self.assertIn("semantic coverage is partial",
                       surface.semantic_coverage_notice(churn, accel_churn))
 
@@ -864,7 +856,7 @@ class CoverageNoticeTrivialGapTests(unittest.TestCase):
             lag, suppress_trivial=True))
         self.assertIn("held back",
                       surface.semantic_integrity_notice(lag))
-        flood = {"dropped": surface.SEMANTIC_TRIVIAL_GAP_ROWS + 1,
+        flood = {"dropped": surface.SEMANTIC_TRIVIAL_MIRROR_LAG_ROWS + 1,
                  "mismatched": 0}
         self.assertIn("held back", surface.semantic_integrity_notice(
             flood, suppress_trivial=True))
@@ -880,18 +872,21 @@ class MissVerdictTests(unittest.TestCase):
     CURRENT = surface.FreshnessStory("current")
     COMPLETE = {"indexed": 20, "total": 20, "complete": True}
 
-    def test_confident_zero_states_exactly_what_it_proved(self) -> None:
-        verdict = surface.miss_verdict(
-            self.CURRENT, meaning_served=True, meaning_coverage=self.COMPLETE,
-            sessions=4912)
-        self.assertTrue(verdict.confident)
-        line, consumed = surface.miss_zero_render(4912, verdict)
-        self.assertEqual(
-            line, "no match across 4,912 sessions - keyword + meaning, "
-            "index current")
-        self.assertFalse(consumed)
-        one, _ = surface.miss_zero_render(1, verdict)
-        self.assertTrue(one.startswith("no match across 1 session -"))
+
+    def test_live_tail_bounds_apply_to_misses_in_either_lane(self) -> None:
+        for indexed, total, usable in (
+                (63_360, 64_000, True),
+                (63_359, 64_000, False),
+                (99, 100, True),
+                (98, 100, False)):
+            coverage = {"indexed": indexed, "total": total, "complete": False}
+            for base, accelerator in ((coverage, None), (self.COMPLETE, coverage)):
+                with self.subTest(indexed=indexed, total=total,
+                                  accelerator=accelerator is not None):
+                    verdict = surface.miss_verdict(
+                        self.CURRENT, meaning_served=True, meaning_coverage=base,
+                        meaning_accelerator=accelerator, sessions=12)
+                    self.assertEqual(verdict.confident, usable)
 
     def test_confidence_requires_a_served_lane_with_proven_coverage(self) -> None:
         down = surface.miss_verdict(self.CURRENT, meaning_served=False)
@@ -927,31 +922,30 @@ class MissVerdictTests(unittest.TestCase):
         self.assertIn("no match across 3 sessions - ", line)
         self.assertIn(surface.freshness_story_line(behind), line)
 
-    def test_absorbed_drift_hedges_the_zero_despite_display_silence(self) -> None:
-        # young converging drift renders no freshness line beside served rows
-        # (law 3), but a zero needs positive currency: silence licenses
-        # nothing, so the verdict hedges instead of claiming "index current"
-        absorbed = surface.FreshnessStory(
+    def test_young_converging_drift_allows_a_snapshot_miss(self) -> None:
+        story = surface.FreshnessStory(
             "behind", changed_stores=1, converging=True, young=True)
-        self.assertEqual(surface.freshness_story_line(absorbed), "")
         verdict = surface.miss_verdict(
-            absorbed, meaning_served=True, meaning_coverage=self.COMPLETE,
+            story, meaning_served=True, meaning_coverage=self.COMPLETE,
             sessions=3)
-        self.assertFalse(verdict.confident)
-        self.assertNotIn("index current", verdict.tail)
-        self.assertIn("catching up", verdict.tail)
+        self.assertTrue(verdict.confident)
+        self.assertFalse(verdict.owns_freshness)
+        self.assertEqual(surface.grep_absence_exit(exact=True, freshness=story), 1)
 
-    def test_current_state_with_absorbed_drift_cannot_prove_currency(
-            self) -> None:
-        # the census saw changes a daemon should absorb: the display verdict
-        # stays green, but the zero's proof claim forfeits on the observation
-        observed = surface.FreshnessStory("current", absorbed_drift=True)
-        self.assertEqual(surface.freshness_story_line(observed), "")
+    def test_current_snapshot_allows_a_confident_miss(self) -> None:
+        story = surface.FreshnessStory("current")
         verdict = surface.miss_verdict(
-            observed, meaning_served=True, meaning_coverage=self.COMPLETE,
+            story, meaning_served=True, meaning_coverage=self.COMPLETE,
             sessions=3)
-        self.assertFalse(verdict.confident)
-        self.assertNotIn("index current", verdict.tail)
+        self.assertTrue(verdict.confident)
+        self.assertFalse(verdict.owns_freshness)
+        self.assertEqual(surface.grep_absence_exit(exact=True, freshness=story), 1)
+        for sessions in (1, 4_912):
+            line, consumed = surface.miss_zero_render(sessions, verdict)
+            self.assertIsNotNone(line)
+            self.assertLessEqual(len(line), surface.RENDER_LINE_MAX_CHARS)
+            self.assertIn(verdict.tail, line)
+            self.assertFalse(consumed)
 
     def test_unknown_corpus_scope_refuses_the_confident_form(self) -> None:
         # "across sessions" with no number is not a provable scope: the

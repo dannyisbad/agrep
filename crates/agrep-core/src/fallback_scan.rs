@@ -275,6 +275,7 @@ fn default_candidate_limit() -> usize {
 #[derive(Clone, Debug)]
 struct LiteralMatcher {
     query: Vec<u8>,
+    variants: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -375,7 +376,21 @@ impl EventView<'_> {
 impl LiteralMatcher {
     fn new(query: &str) -> Self {
         let query = query.to_ascii_lowercase().into_bytes();
-        Self { query }
+        Self {
+            variants: vec![query.clone()],
+            query,
+        }
+    }
+
+    fn new_term(query: &str) -> Self {
+        let query_bytes = query.to_ascii_lowercase().into_bytes();
+        Self {
+            variants: crate::boundary_rank::term_variants(query)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            query: query_bytes,
+        }
     }
 
     fn count(&self, text: &str) -> usize {
@@ -383,7 +398,19 @@ impl LiteralMatcher {
     }
 
     fn first_span(&self, text: &str) -> Option<crate::boundary_rank::Span> {
-        self.match_stats(text, true).1
+        let mut best = None;
+        let mut best_quality = -1.0;
+        for variant in &self.variants {
+            let Some(span) = self.match_stats_for(text, true, variant).1 else {
+                continue;
+            };
+            let quality = anchor_quality(text, span);
+            if quality > best_quality {
+                best = Some(span);
+                best_quality = quality;
+            }
+        }
+        best
     }
 
     fn match_stats(
@@ -391,61 +418,84 @@ impl LiteralMatcher {
         text: &str,
         first_only: bool,
     ) -> (usize, Option<crate::boundary_rank::Span>) {
+        self.match_stats_for(text, first_only, &self.query)
+    }
+
+    fn match_stats_for(
+        &self,
+        text: &str,
+        first_only: bool,
+        query: &[u8],
+    ) -> (usize, Option<crate::boundary_rank::Span>) {
         if text.is_ascii() {
-            return self.match_ascii(text.as_bytes(), first_only);
+            return self.match_ascii(text, first_only, query);
         }
         let folded: Vec<u8> = text.chars().map(python_regex_ascii_fold).collect();
         let mut count = 0;
-        let mut first = None;
+        let mut best = None;
+        let mut best_quality = -1.0;
         let mut offset = 0;
-        while offset + self.query.len() <= folded.len() {
+        while offset + query.len() <= folded.len() {
             let Some(relative) = folded[offset..]
-                .windows(self.query.len())
-                .position(|window| window == self.query)
+                .windows(query.len())
+                .position(|window| window == query)
             else {
                 break;
             };
             let start = offset + relative;
-            let end = start + self.query.len();
+            let end = start + query.len();
             count += 1;
-            first.get_or_insert([start as i64, end as i64]);
-            if first_only {
+            let span = [start as i64, end as i64];
+            let quality = anchor_quality(text, span);
+            if quality > best_quality {
+                best = Some(span);
+                best_quality = quality;
+            }
+            if first_only && quality == 1.0 {
                 break;
             }
             offset = end;
         }
-        (count, first)
+        (count, best)
     }
 
     fn match_ascii(
         &self,
-        text: &[u8],
+        text: &str,
         first_only: bool,
+        query: &[u8],
     ) -> (usize, Option<crate::boundary_rank::Span>) {
+        let bytes = text.as_bytes();
         let mut count = 0;
-        let mut first = None;
+        let mut best = None;
+        let mut best_quality = -1.0;
         let mut offset = 0;
-        let needle_first = self.query[0];
+        let needle_first = query[0];
         let needle_other = if needle_first.is_ascii_alphabetic() {
             needle_first.to_ascii_uppercase()
         } else {
             needle_first
         };
-        while offset + self.query.len() <= text.len() {
+        while offset + query.len() <= bytes.len() {
             let found = if needle_first == needle_other {
-                memchr::memchr(needle_first, &text[offset..])
+                memchr::memchr(needle_first, &bytes[offset..])
             } else {
-                memchr::memchr2(needle_first, needle_other, &text[offset..])
+                memchr::memchr2(needle_first, needle_other, &bytes[offset..])
             };
             let Some(relative) = found else {
                 break;
             };
             let start = offset + relative;
-            let end = start + self.query.len();
-            if end <= text.len() && text[start..end].eq_ignore_ascii_case(&self.query) {
+            let end = start + query.len();
+            if end <= bytes.len() && bytes[start..end].eq_ignore_ascii_case(query) {
                 count += 1;
-                first.get_or_insert([start as i64, end as i64]);
-                if first_only {
+                let span = [start as i64, end as i64];
+                let quality = anchor_quality(text, span);
+                if quality > best_quality {
+                    best = Some(span);
+                    best_quality = quality;
+                }
+                if first_only && quality == 1.0 {
                     break;
                 }
                 offset = end;
@@ -453,8 +503,55 @@ impl LiteralMatcher {
                 offset = start + 1;
             }
         }
-        (count, first)
+        (count, best)
     }
+}
+
+fn anchor_quality(text: &str, [start, end]: crate::boundary_rank::Span) -> f64 {
+    let chars: Vec<char> = text.chars().collect();
+    let start = usize::try_from(start).unwrap_or(usize::MAX);
+    let end = usize::try_from(end).unwrap_or(usize::MAX);
+    if end > chars.len() {
+        return 0.0;
+    }
+    let boundary = |index: usize| {
+        if index == 0 || index == chars.len() {
+            return true;
+        }
+        let left = chars[index - 1];
+        let right = chars[index];
+        if right == '\''
+            && index + 1 < chars.len()
+            && crate::unicode_v16::is_alpha(left)
+            && crate::unicode_v16::is_alpha(chars[index + 1])
+        {
+            return false;
+        }
+        if left == '\''
+            && index >= 2
+            && crate::unicode_v16::is_alpha(chars[index - 2])
+            && crate::unicode_v16::is_alpha(right)
+        {
+            return false;
+        }
+        if !crate::unicode_v16::is_alphanumeric(left) || !crate::unicode_v16::is_alphanumeric(right)
+        {
+            return true;
+        }
+        if crate::unicode_v16::is_lower(left) && crate::unicode_v16::is_upper(right) {
+            return true;
+        }
+        if crate::unicode_v16::is_upper(left)
+            && crate::unicode_v16::is_upper(right)
+            && index + 1 < chars.len()
+            && crate::unicode_v16::is_lower(chars[index + 1])
+        {
+            return true;
+        }
+        (crate::unicode_v16::is_alpha(left) && crate::unicode_v16::is_digit(right))
+            || (crate::unicode_v16::is_digit(left) && crate::unicode_v16::is_alpha(right))
+    };
+    (u8::from(boundary(start)) as f64 + u8::from(boundary(end)) as f64) / 2.0
 }
 
 pub struct Scanner {
@@ -544,7 +641,7 @@ impl Scanner {
                     .collect(),
                 terms: tokens
                     .iter()
-                    .map(|token| LiteralMatcher::new(token))
+                    .map(|token| LiteralMatcher::new_term(token))
                     .collect(),
             }
         };
@@ -1750,18 +1847,11 @@ fn exact_rank_score(
     let snippet = exact_snippet(rendered, query, lane, &tokens)?;
     let phrase = phrase_occurrences(&snippet, &tokens);
     let qlen = query.min_phrase_len();
-    let mut strength = phrase_strength(&phrase, qlen);
-    if lane == MatchLane::AllTerms {
-        let terms = match query {
-            QueryPlan::Multi { terms, .. } => terms,
-            QueryPlan::Single(_) => return None,
-        };
-        strength = strength.max(terms_proximity(&snippet, terms, qlen));
-    }
-    let boundary_factor = match lane {
+    let phrase_strength = phrase_strength(&phrase, qlen);
+    let (strength, boundary_factor) = match lane {
         MatchLane::Phrase => {
             let decut = crate::boundary_rank::decut_text(&snippet, false);
-            phrase
+            let factor = phrase
                 .iter()
                 .filter_map(|found| {
                     boundary
@@ -1774,11 +1864,14 @@ fn exact_rank_score(
                         .total_cmp(&right.0)
                         .then_with(|| right.1.cmp(&left.1))
                 })?
-                .0
+                .0;
+            (phrase_strength, factor)
         }
         MatchLane::AllTerms => {
             let decut = crate::boundary_rank::decut_text(&snippet, true);
-            boundary.evaluate(&decut, None, true).ok()?.factor
+            let score = boundary.evaluate(&decut, None, true).ok()?;
+            let proximity = terms_proximity(&snippet, &score.spans, &score.qualities, qlen);
+            (phrase_strength.max(proximity), score.factor)
         }
     };
     let age_days = (inputs.now_ms - inputs.ts as f64).max(0.0) / 86_400_000.0;
@@ -1812,13 +1905,18 @@ fn exact_snippet(
 ) -> Option<String> {
     let snippet = match lane {
         MatchLane::Phrase => {
-            let first = first_phrase_occurrence(&rendered.text, tokens)?;
-            payload_snip_supported(
-                &rendered.text,
-                first.start,
-                first.end,
-                rendered.output_bounds,
-            )?
+            // Single tokens anchor like Python's insensitive_span; phrases keep regex-first.
+            let (start, end) = match query {
+                QueryPlan::Single(matcher) => {
+                    let [start, end] = matcher.first_span(&rendered.text)?;
+                    (start as usize, end as usize)
+                }
+                QueryPlan::Multi { .. } => {
+                    let first = first_phrase_occurrence(&rendered.text, tokens)?;
+                    (first.start, first.end)
+                }
+            };
+            payload_snip_supported(&rendered.text, start, end, rendered.output_bounds)?
         }
         MatchLane::AllTerms => {
             let terms = match query {
@@ -1850,28 +1948,31 @@ fn phrase_strength(found: &[PhraseOccurrence], qlen: usize) -> f64 {
     tightness * (1.0 - 0.5f64.powi(found.len().min(i32::MAX as usize) as i32))
 }
 
-fn terms_proximity(snippet: &str, terms: &[LiteralMatcher], qlen: usize) -> f64 {
-    let mut found = 0usize;
-    let mut first = 0usize;
-    let mut last = 0usize;
-    for term in terms {
-        let Some([start, end]) = term.first_span(snippet) else {
-            continue;
-        };
-        let (start, end) = (start as usize, end as usize);
-        if found == 0 {
-            first = start;
-            last = end;
-        } else {
-            first = first.min(start);
-            last = last.max(end);
-        }
-        found += 1;
-    }
-    let fraction = found as f64 / terms.len() as f64;
-    if found < 2 {
+fn terms_proximity(
+    snippet: &str,
+    spans: &[Option<crate::boundary_rank::Span>],
+    qualities: &[f64],
+    qlen: usize,
+) -> f64 {
+    let selected: Vec<_> = spans
+        .iter()
+        .zip(qualities)
+        .filter_map(|(span, quality)| span.map(|span| (span, *quality)))
+        .collect();
+    let fraction = if qualities.is_empty() {
+        1.0
+    } else {
+        selected.len() as f64 / qualities.len() as f64
+    };
+    if selected.len() < 2 {
         return fraction;
     }
+    let first = selected
+        .iter()
+        .map(|([start, _], _)| *start)
+        .min()
+        .unwrap_or(0) as usize;
+    let last = selected.iter().map(|([_, end], _)| *end).max().unwrap_or(0) as usize;
     let cuts = snippet
         .chars()
         .skip(first)
@@ -1879,7 +1980,11 @@ fn terms_proximity(snippet: &str, terms: &[LiteralMatcher], qlen: usize) -> f64 
         .filter(|character| *character == '…')
         .count();
     let spread = last.saturating_sub(first).saturating_add(80 * cuts);
-    fraction * (0.5 + 0.5 * (qlen as f64 / spread.max(1) as f64).min(1.0))
+    let quality_scale = selected
+        .iter()
+        .map(|(_, quality)| (2.0 * quality - 1.0).max(0.0))
+        .fold(1.0, f64::min);
+    fraction * (0.5 + 0.5 * (qlen as f64 / spread.max(1) as f64).min(1.0) * quality_scale)
 }
 
 fn first_phrase_occurrence(text: &str, tokens: &[&[u8]]) -> Option<PhraseOccurrence> {
@@ -2196,7 +2301,7 @@ fn raw_anchors(tokens: &[&str]) -> Vec<Vec<u8>> {
     let mut anchors: Vec<Vec<u8>> = tokens
         .iter()
         .filter_map(|token| {
-            token
+            crate::boundary_rank::term_anchor(token)
                 .split(|character: char| matches!(character.to_ascii_lowercase(), 'i' | 's' | 'k'))
                 .filter(|run| run.len() >= 3)
                 .map(str::to_ascii_lowercase)
@@ -2402,6 +2507,14 @@ mod tests {
     }
 
     #[test]
+    fn plural_matchers_prefer_aligned_occurrences() {
+        let matcher = LiteralMatcher::new_term("don");
+        assert_eq!(matcher.first_span("dont and a don"), Some([11, 14]));
+        let matcher = LiteralMatcher::new_term("calls");
+        assert_eq!(matcher.first_span("before this call"), Some([12, 16]));
+    }
+
+    #[test]
     fn unicode_and_json_escapes_follow_python_re_ignorecase() {
         let matcher = LiteralMatcher::new("isk");
         assert_eq!(matcher.count("\u{130}\u{17f}\u{212a}"), 1);
@@ -2512,7 +2625,7 @@ mod tests {
                 .collect();
             let terms: Vec<_> = tokens
                 .iter()
-                .map(|token| LiteralMatcher::new(token))
+                .map(|token| LiteralMatcher::new_term(token))
                 .collect();
             let raw = serde_json::to_vec(&case["event"]).unwrap();
             let event: EventView<'_> = serde_json::from_slice(&raw).unwrap();
@@ -2557,7 +2670,7 @@ mod tests {
                         .collect(),
                     terms: tokens
                         .iter()
-                        .map(|token| LiteralMatcher::new(token))
+                        .map(|token| LiteralMatcher::new_term(token))
                         .collect(),
                 }
             };

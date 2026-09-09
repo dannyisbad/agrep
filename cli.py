@@ -44,14 +44,9 @@ os.environ["AGREP_T0"] = repr(time.perf_counter())
 
 
 _CORE_EVIDENCE_PATH = """\
-CORE EVIDENCE PATH
+Search past conversations:
 
-1. Recover a missing prior fact, decision, artifact, or result:
-
-   agrep recall "<faithful clue-preserving description>" --hits 2 --budget 5000
-
-2. Open zero or one qualifying result at its source:
-
+   agrep recall "index lock" --hits 2 --budget 5000
    agrep around <handle>"""
 
 
@@ -229,9 +224,18 @@ def _build_identity(*, timeout_s: float = _BINARY_IDENTITY_TIMEOUT_S) -> dict:
             f"{type(exc).__name__}: {common.terminal_safe(exc)}")
     else:
         identity["distribution_build_state"] = "verified"
+    binary = common.ingest_bin()
     try:
-        identity.update(_bounded_binary_identity(
-            common.ingest_bin(), timeout_s=timeout_s))
+        recorded = indexd_runtime.recorded_binary_identity(binary)
+        if recorded is not None:
+            writer, native = recorded
+            identity.update(
+                writer_build_id=writer, writer_build_state="verified",
+                native_binary_build_id=native,
+                native_binary_build_state="verified")
+        else:
+            identity.update(_bounded_binary_identity(
+                binary, timeout_s=timeout_s))
     except Exception as exc:  # noqa: BLE001 -- identity is diagnostic, not execution
         rendered = f"{type(exc).__name__}: {common.terminal_safe(exc)}"
         identity["native_binary_build_detail"] = rendered
@@ -390,10 +394,22 @@ def _fmt_age(seconds: float) -> str:
 
 
 def _status_core(*, deadline: float | None = None,
-                 writer_build_id: str | None = None) -> dict:
+                 identity: dict | None = None) -> dict:
     """The fast half of the status probe: sessions.jsonl summary (never the
     ~50 MB messages.jsonl), db/teach stats, and freshness observations. Every
-    potentially scaling read shares one routine deadline."""
+    potentially scaling read shares one routine deadline. ``identity`` is this
+    run's _build_identity(); without a verified writer id, daemon
+    compatibility and database ownership have no verdict and are deferred."""
+    writer_build_id: str | None = None
+    identity_gap: str | None = None
+    if identity is not None:
+        if identity.get("writer_build_state") == "verified":
+            writer_build_id = str(identity.get("writer_build_id") or "")
+        else:
+            identity_gap = (
+                "this run did not verify its ingest binary identity ("
+                + str(identity.get("writer_build_detail")
+                      or "writer identity is unavailable") + ")")
     deadline = _status_deadline() if deadline is None else deadline
     d: dict = {
         "version": _version(),
@@ -417,7 +433,12 @@ def _status_core(*, deadline: float | None = None,
             d, "embeddings setting",
             str(embeddings_setting.get("detail")
                 or "embeddings setting is unavailable"))
-    if _status_remaining(deadline, _STATUS_ROUTINE_TIMEOUT_S) > 0.0:
+    if identity_gap is not None:
+        daemon = {
+            "running": False, "state": "status-deferred",
+            "detail": identity_gap}
+        _status_defer(d, "daemon resource observation", identity_gap)
+    elif _status_remaining(deadline, _STATUS_ROUTINE_TIMEOUT_S) > 0.0:
         resource_args = {"observe_only": True, "include_rss": False}
         if writer_build_id is not None:
             resource_args["current_writer_id"] = writer_build_id
@@ -559,6 +580,10 @@ def _status_core(*, deadline: float | None = None,
                     d, "search database readiness",
                     "search database exists but is empty; it is not a verified "
                     "missing or ready index")
+            elif identity_gap is not None:
+                d["search_index_ready"] = None
+                d["search_index_state"] = "status-deferred"
+                _status_defer(d, "search database readiness", identity_gap)
             else:
                 # ~14ms of metadata reads behind a clone-bounded open. Skipping
                 # them is what let this surface answer "ready" while the deep
@@ -723,9 +748,7 @@ def _status_data() -> dict:
     detail = str(identity.get("writer_build_detail") or "")
     with indexd_runtime.use_observed_writer_build_id(
             binary, identity.get("writer_build_id"), detail):
-        d = _status_core(
-            deadline=deadline,
-            writer_build_id=str(identity.get("writer_build_id") or ""))
+        d = _status_core(deadline=deadline, identity=identity)
         d.update(identity)
         semantic = _status_semantic(deadline=deadline)
         d.update(semantic)
@@ -751,9 +774,7 @@ def _status_lines(cli: str, color: bool = False):
     detail = str(identity.get("writer_build_detail") or "")
     with indexd_runtime.use_observed_writer_build_id(
             binary, identity.get("writer_build_id"), detail):
-        d = _status_core(
-            deadline=deadline,
-            writer_build_id=str(identity.get("writer_build_id") or ""))
+        d = _status_core(deadline=deadline, identity=identity)
         repair = _kick_repair_if_damaged(d)
     d.setdefault(
         "diagnostics",
@@ -1020,6 +1041,7 @@ def cmd_index(a) -> int:
         if indexd_runtime.explicit_index_declined():
             common.lap("index")
             return 1
+        indexd_runtime.record_binary_identity(ingest)
         ok = indexd_runtime.hand_off_search_index()
         common.lap("index")
         return 0 if ok else 1
@@ -1214,8 +1236,7 @@ def _setup_consent_screen(*, no_semantic: bool) -> str:
                      "--no-semantic skips it this run")
         if sys.platform == "darwin" and platform.machine() == "arm64":
             lines.append("  Metal GPU weights (~91 MiB, on first GPU embed)")
-            lines.append("    reason: GPU embedding, measured ~10.9x the CPU "
-                         "lane; AGREP_MLX=off opts out")
+            lines.append("    reason: GPU embedding; AGREP_MLX=off opts out")
     lines += ["", "agent instructions (first consent choice; "
               "undone by `agrep remove`):"]
     found = [(agent, target)
@@ -1226,10 +1247,10 @@ def _setup_consent_screen(*, no_semantic: bool) -> str:
     if found:
         lines.append("    reason: an agent only reaches for a tool it knows "
                      "exists; the block says what agrep is and when")
-        where = ("a launchd agent (com.agrep.sentinel)"
+        where = (f"a launchd agent ({teach._launchd_label()})"
                  if sys.platform == "darwin" else
-                 "a scheduled task (agrep-sentinel)" if os.name == "nt" else
-                 "systemd user units (agrep-sentinel)")
+                 f"a scheduled task ({teach._sentinel_task_name()})" if os.name == "nt" else
+                 f"systemd user units ({teach._sentinel_task_name()})")
         lines.append(f"  cleanup sentinel: {where}")
         lines.append("    reason: takes agrep's instruction blocks and "
                      "owned recovery integrations back out if the binary "
@@ -1240,6 +1261,7 @@ def _setup_consent_screen(*, no_semantic: bool) -> str:
 def _setup_hook_consent_screen() -> str:
     """Disclose each detected compaction integration as a separate choice."""
     import hookinstall
+    import teach
 
     lines = ["post-compact recovery integrations "
              "(separate consent choice; undone by `agrep remove`):"]
@@ -1264,10 +1286,10 @@ def _setup_hook_consent_screen() -> str:
                      "OMP also extends its native compaction prompt; both "
                      "queue hidden recovery context only after compaction or "
                      "a compacted resume")
-    where = ("launchd com.agrep.sentinel"
+    where = (f"launchd {teach._launchd_label()}"
              if sys.platform == "darwin" else
-             "the agrep-sentinel scheduled task" if os.name == "nt" else
-             "the agrep-sentinel systemd user units")
+             f"the {teach._sentinel_task_name()} scheduled task" if os.name == "nt" else
+             f"the {teach._sentinel_task_name()} systemd user units")
     lines.append(f"  cleanup snapshot in {where}")
     lines.append("    does: removes only these exact agrep-owned files if "
                  "the package disappears; any edited copy survives")
@@ -1319,8 +1341,9 @@ def _setup_headless_brief(cli: str, *, no_semantic: bool) -> str:
         f"  1. run `{cli} setup --yes{flag}` now: it writes exactly the "
         "blocks disclosed above,",
         f"     all owned by agrep and fully undone by `{cli} remove`. "
-        "without them, no agent",
-        "     on this box ever discovers this searchable history.",
+        "the search itself works",
+        "     without them; the blocks are how agents learn agrep exists "
+        "and when to reach for it.",
         "  2. tell your human what was installed (or ask first when they "
         "are reachable);",
         "     opt-outs: --no-teach (instructions), --no-hook (integrations).",
@@ -1468,8 +1491,9 @@ def cmd_setup(a) -> int:
             # "re-run setup" is only advice when there is something to enroll -
             # on an agentless box that advice can never converge
             import teach
-            tail = ((" (agents not enrolled - they cannot use agrep until "
-                     f"`{cli} setup` writes their instructions)")
+            tail = ((" (agents not enrolled - search works now, but they are "
+                     f"not told agrep exists until `{cli} setup` writes their "
+                     "instructions)")
                     if teach.detected_agents() else
                     " (no agents detected on this box - `agrep setup` enrolls "
                     "them once one is installed)")
@@ -1718,8 +1742,7 @@ def _main() -> int:
                                   "cross-agent chat history",
         allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=_CORE_EVIDENCE_PATH + "\n\n"
-               "find text         search (the default: agrep \"<pattern>\"), "
+        epilog="find text         search (the default: agrep \"<pattern>\"), "
                "recall, pack\n"
                "resume work       postcompact, around, resume, chats\n"
                "maintain          status, doctor, audit, setup, index, reindex, set, "
@@ -1730,7 +1753,7 @@ def _main() -> int:
                "  agrep recall \"index lock\"    hits + the conversation around each\n"
                "  agrep postcompact           recent root context after compaction\n"
                "  agrep around @11111111:144   replay the moment itself\n"
-               "  agrep chats webapp           find a chat by name, not content\n"
+               "  agrep chats webapp           find a chat by project, opener, or content\n"
                "  agrep search index           search a word that is also a command\n"
                "\na bare first argument that isn't a command searches; "
                "`agrep <command> --help`\nshows each command's own examples")
@@ -1903,11 +1926,12 @@ def _main() -> int:
 
 
 def _crash_line(exc: BaseException) -> str:
-    """The reader gets the consequence and a command; the class name and the
-    internal message are debugging detail, so they wait behind AGREP_DEBUG."""
+    """Retain the actual cause when no specific remedy applies."""
     line = surface.crash_advice_line(exc, common.cli_name())
     if common.DEBUG:
-        line += f" [{type(exc).__name__}: {common.terminal_safe(exc)}]"
+        detail = f"{type(exc).__name__}: {common.terminal_safe(exc)}"
+        if detail not in line:
+            line += f" [{detail}]"
     return line
 
 

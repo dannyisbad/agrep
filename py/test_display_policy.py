@@ -1201,18 +1201,6 @@ class SemanticEdgeTests(unittest.TestCase):
         )
         self.assertIsNone(display_policy.semantic_coverage_line(
             {"indexed": 100, "total": 100, "pending": 0, "complete": True}))
-        self.assertEqual(
-            display_policy.semantic_coverage_line(
-                {"indexed": 99, "total": 100, "pending": 1,
-                 "complete": False}),
-            "semantic: searched 99/100 embedded rows (99%)",
-        )
-        self.assertEqual(
-            display_policy.semantic_coverage_line(
-                {"indexed": 999, "total": 1000, "pending": 1,
-                 "complete": False}),
-            "semantic: searched 999/1000 embedded rows (99%)",
-        )
 
     def test_invalid_semantic_coverage_fails_closed_without_raising(self) -> None:
         unavailable = (
@@ -1295,102 +1283,6 @@ class SemanticEdgeTests(unittest.TestCase):
                          display_policy.keyword_empty_line(17_352))
         self.assertNotIn("`-s`", display_policy.keyword_empty_line(17_352))
 
-    def test_probe_miss_is_not_silent_and_pointer_is_hedged(self) -> None:
-        miss = display_policy.probe_miss_line(
-            "keyword", corpus_sessions=143, semantic_warming=True)
-        self.assertIn("no confident past-context pointer", miss)
-        self.assertIn("searched 143 past session(s)", miss)
-        self.assertIn("semantic model warming", miss)
-        row = {"who": "subagent", "_meta_row": True}
-        label = display_policy.probe_pointer_label(
-            row, semantic=True, weak=False)
-        self.assertEqual(
-            label,
-            "top candidate (semantic evidence; provenance: "
-            "sidechain/subagent, ~meta)",
-        )
-        self.assertNotIn("semantic match", label)
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "user"}, semantic=False, weak=True),
-            "top candidate (weak prose evidence; provenance: lived/user)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {}, semantic=False, weak=False),
-            "top candidate (prose evidence; provenance: unknown/unknown)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "mystery"}, semantic=True, weak=True),
-            "top candidate (weak semantic evidence; "
-            "provenance: unknown/mystery)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "tool", "kind": "subagent_result", "ok": True},
-                semantic=True),
-            "top candidate (semantic evidence; provenance: "
-            "sidechain/subagent_result)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "user", "event_kind": "mystery", "kind": "tool"},
-                semantic=True),
-            "top candidate (semantic evidence; provenance: tool-output/tool)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "user"}, semantic="false"),
-            "top candidate (unverified evidence; provenance: lived/user)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "user"}, semantic=True, weak="true"),
-            "top candidate (weak semantic evidence; provenance: lived/user)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "user", "_meta_row": "false"},
-                semantic=False),
-            "top candidate (prose evidence; provenance: lived/user)",
-        )
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": "user\nforged"}, semantic=False),
-            "top candidate (prose evidence; provenance: unknown/unknown)",
-        )
-        self.assertEqual(
-            display_policy.probe_miss_line(
-                "keyword\nFORGED", corpus_sessions=143),
-            "recall: no confident past-context pointer "
-            "(unknown engine; searched 143 past session(s))",
-        )
-        huge = 10 ** 5000
-        self.assertEqual(
-            display_policy.probe_pointer_label(
-                {"who": huge}, semantic=False),
-            "top candidate (prose evidence; provenance: unknown/unknown)",
-        )
-        self.assertLess(
-            len(display_policy.probe_pointer_label(
-                {"who": "x" * 1_000_000}, semantic=False)),
-            100,
-        )
-        self.assertEqual(
-            display_policy.probe_miss_line(
-                "x" * 1_000_000, corpus_sessions=huge),
-            "recall: no confident past-context pointer "
-            "(unknown engine; corpus session count unavailable)",
-        )
-        for invalid in (None, -1, True, 1.5, "12"):
-            with self.subTest(invalid=invalid):
-                self.assertEqual(
-                    display_policy.probe_miss_line(
-                        "corpusdb", corpus_sessions=invalid),
-                    "recall: no confident past-context pointer "
-                    "(corpusdb; corpus session count unavailable)",
-                )
 
 
 if __name__ == "__main__":

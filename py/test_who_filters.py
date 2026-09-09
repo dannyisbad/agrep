@@ -292,5 +292,86 @@ class CliWhoArguments(unittest.TestCase):
                          surface.SpeakerFilter(("user", "agent"), ()))
 
 
+class NoSideSurface(unittest.TestCase):
+    """--no-side hides side SESSIONS; --no-who subagent only drops the rows
+    that speaker said, so a side chat's agent reply still surfaces under it."""
+
+    SIDE = {
+        "agent-a0000000000000001": {"agent": "claude", "project": "/w",
+                                    "parent": "root-1", "first_text": "spawned"},
+        "root-1": {"agent": "claude", "project": "/w", "parent": "",
+                   "first_text": "main chat"},
+    }
+
+    def _captured(self, argv, entry=search.main):
+        captured = {}
+
+        def fake_run_query(q, **kwargs):
+            captured.update(kwargs)
+            return {"hits": [], "total": 0, "chats": 0, "tool_hits": 0,
+                    "engine": "corpusdb", "mode": "keyword",
+                    "totals_exact": True}
+
+        import explore
+        with mock.patch.object(search.indexd_runtime, "ensure_index",
+                               return_value=True), \
+                mock.patch.object(search.indexd_runtime,
+                                  "agent_freshness_notice", return_value=""), \
+                mock.patch.object(search.common, "in_agent_context",
+                                  return_value=False), \
+                mock.patch.object(search.common, "ingest_bin",
+                                  return_value=Path("/nonexistent/agrep-rs")), \
+                mock.patch.object(explore, "_session_index",
+                                  return_value=self.SIDE), \
+                mock.patch.object(search, "run_query",
+                                  side_effect=fake_run_query), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            entry(argv)
+        return captured
+
+    def test_no_side_passes_the_hidden_session_set_not_a_speaker(self) -> None:
+        for argv in (["needle", "--no-side", "--lexical", "--classic"],
+                     ["needle", "--no-side", "-l", "--no-auto"]):
+            with self.subTest(argv=argv):
+                captured = self._captured(argv)
+                self.assertEqual(captured["_exclude_sessions"],
+                                 ("agent-a0000000000000001",))
+                self.assertIsNone(captured["who"])
+
+    def test_session_view_rank_only_under_score_sort(self) -> None:
+        # -l --sort time keeps recency order and the newest matching turn
+        for argv, expected in ((["needle", "-l", "--no-auto"], True),
+                               (["needle", "-l", "--sort", "time", "--no-auto"], False),
+                               (["needle", "--lexical", "--classic"], False)):
+            with self.subTest(argv=argv):
+                self.assertIs(self._captured(argv)["session_view_rank"], expected)
+
+    def test_no_who_subagent_stays_a_row_filter(self) -> None:
+        captured = self._captured(
+            ["needle", "--no-who", "subagent", "--lexical", "--classic"])
+        self.assertNotIn("_exclude_sessions", captured)
+        self.assertFalse(captured["who"].admits("subagent"))
+        self.assertTrue(captured["who"].admits("agent"))
+
+    def test_recall_shares_the_hidden_set(self) -> None:
+        captured = self._captured(
+            ["needle", "--no-side", "--lexical", "--json", "--no-auto"],
+            entry=recall.main)
+        self.assertEqual(captured["_exclude_sessions"],
+                         ("agent-a0000000000000001",))
+
+    def test_no_side_rides_the_larger_page_command(self) -> None:
+        import argparse
+        args = argparse.Namespace(
+            regex=False, word=False, lexical=True, agent=None, project=None,
+            exclude_project=None, model=None, who=None, no_who=None, chat=None,
+            since=None, until=None, model_soft=False, no_meta=False,
+            sort="score", include_self=False, force_no_self=False,
+            all_side_chats=False, no_side=True, strict_semantic=False,
+            no_auto=False, color="auto")
+        self.assertIn("--no-side", search._search_argv_base(args, semantic=False))
+
+
 if __name__ == "__main__":
     unittest.main()

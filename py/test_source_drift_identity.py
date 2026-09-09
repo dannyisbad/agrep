@@ -176,9 +176,8 @@ class YoungDriftWithoutAnOwner(unittest.TestCase):
             story = indexd_runtime.freshness_story()
             disclosure = indexd_runtime.machine_freshness(checked=True)
         self.assertEqual(story.state, "current")
-        self.assertTrue(story.absorbed_drift)
         self.assertEqual(
-            surface.grep_absence_exit(exact=True, freshness=story), 2)
+            surface.grep_absence_exit(exact=True, freshness=story), 1)
         self.assertEqual(disclosure["state"], "index-behind")
         self.assertTrue(disclosure["may_be_stale"])
         self.assertEqual(disclosure["cause"], "store-drift")

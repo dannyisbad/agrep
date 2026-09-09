@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import re
 import shlex
@@ -124,9 +125,9 @@ RESERVED_COMMAND_WORDS = _RESERVED_SEARCH_WORDS
 _SEARCH_FLAG_OPTIONS = frozenset({
     "-E", "-c", "-i", "-l", "-s", "-w", "--all-side-chats",
     "--classic", "--count", "--count-by-tier", "--coverage", "--flat",
-    "--ignore-case", "--json", "--lexical", "--model-soft", "--no-auto",
-    "--no-meta", "--no-self", "--self", "--semantic", "--soft",
-    "--strict-semantic",
+    "--here", "--ignore-case", "--json", "--lexical", "--model-soft",
+    "--no-auto", "--no-meta", "--no-self", "--no-side", "--self",
+    "--semantic", "--soft", "--strict-semantic",
 })
 _SEARCH_VALUE_OPTIONS = frozenset({
     "-n", "--agent", "--before", "--chat", "--color", "--exclude-project",
@@ -139,7 +140,9 @@ _SEARCH_VALUE_CHOICES = {
 }
 _WINDOWS_SHELL_AMBIGUOUS = re.compile(
     r"[&|<>^%!`$;'\"(){}\[\]@,#\r\n]")
-_WINDOWS_HANDLE_ARG = re.compile(r"@[A-Za-z0-9._~:-]+\Z")
+# a handle carries no shell metacharacter on either family (`~` after a digit
+# never tilde-expands), and quoting it breaks the paste into `agrep around`
+_HANDLE_ARG = re.compile(r"@[A-Za-z0-9._~:-]+\Z")
 
 
 def render_cli_argv(
@@ -153,14 +156,16 @@ def render_cli_argv(
     if windows:
         if any(
                 _WINDOWS_SHELL_AMBIGUOUS.search(value)
-                and _WINDOWS_HANDLE_ARG.fullmatch(value) is None
+                and _HANDLE_ARG.fullmatch(value) is None
                 for value in values):
             return None
         return " ".join(
             f'"{value}"' if value.startswith("@")
             else subprocess.list2cmdline([value])
             for value in values)
-    return shlex.join(values)
+    return " ".join(
+        value if _HANDLE_ARG.fullmatch(value) else shlex.quote(value)
+        for value in values)
 
 
 def _search_shaped_argv(argv: Sequence[str]) -> bool:
@@ -445,7 +450,49 @@ def _speaker_vocabulary() -> str:
 
 
 _WHEN_DOMAIN = "7d / 24h / 2w / 30m, or 2026-06-01"
-_PROJECT_DOMAIN = "a substring of a chat's stored project label"
+_PROJECT_DOMAIN = ("a chat's stored project label or its last path segment, "
+                   "exact; * and ? make it a glob")
+PROJECT_HELP = ("only chats whose project label, or its last path segment, "
+                "is exactly this (case-insensitive; * or ? make it a glob, "
+                "e.g. 'webapp*')")
+EXCLUDE_PROJECT_HELP = "hide chats whose project label matches this (same rule)"
+HERE_HELP = "--project <this folder's name> (the basename of the current directory)"
+
+
+def project_leaf(label: object) -> str:
+    """Last path segment of a stored project label, for display and matching."""
+    text = str(label or "").rstrip("/\\")
+    cut = text.rfind("/")
+    back = text.rfind("\\")
+    return text[(cut if cut > back else back) + 1:]
+
+
+def project_label_matches(label: object, value: object) -> bool:
+    """--project/--exclude-project predicate, one for SQL, scans and listings."""
+    needle = str(value or "").lower()
+    if not needle:
+        return True
+    text = str(label or "").lower()
+    leaf = project_leaf(text)
+    if "*" in needle or "?" in needle:
+        return fnmatch.fnmatchcase(text, needle) or fnmatch.fnmatchcase(leaf, needle)
+    return needle == text or needle == leaf
+
+
+def here_project(cwd: str | None = None) -> str:
+    """The --project value --here stands for: the working directory's basename."""
+    return project_leaf(os.getcwd() if cwd is None else cwd)
+
+
+def here_project_error(value: str) -> str | None:
+    """--here at a filesystem root has no folder name to filter by."""
+    if value:
+        return None
+    return ("--here needs a named working directory; this one has no "
+            "basename to match a project label against")
+
+
+
 FILTER_SPECS = (
     FilterSpec("--agent", "agent", _agent_vocabulary, "match every agent"),
     FilterSpec("--project", "project", _PROJECT_DOMAIN, "match every project"),
@@ -544,7 +591,7 @@ class DimensionSpec(NamedTuple):
 
 COVERAGE_DIMENSIONS = (
     DimensionSpec("--agent", "agent", "agents", "substring"),
-    DimensionSpec("--project", "project", "projects", "substring"),
+    DimensionSpec("--project", "project", "projects", "project"),
     DimensionSpec("--model", "model", "models", "exact"),
     DimensionSpec("--who", "who", "speakers", "exact"),
 )
@@ -558,6 +605,9 @@ def dimension_selects_nothing(spec: DimensionSpec, value: str,
                               soft: bool = False) -> bool:
     """Would the engine's own predicate admit any indexed value? --soft turns
     --model's equality into the substring test the search actually runs."""
+    if spec.match == "project":
+        return not any(project_label_matches(known_value, value)
+                       for known_value in known)
     needle = value.casefold()
     substring = spec.match == "substring" or soft
     return not any(needle in known_value.casefold() if substring
@@ -1240,9 +1290,6 @@ def indexing_advice_line(failure: object | None, cli: str) -> str:
     return f"{cost}: `{cli} {advice.command}`" if advice.command else cost
 
 
-# An unhandled exception is still a user-facing surface. The class name and
-# the internal message are the tool's own vocabulary; what the reader loses
-# and what they type is not. Ordered - the first matching rule wins.
 _CRASH_ADVICE = (
     ("PermissionError", (), StatusAdvice(
         "agrep cannot read or write its data directory", "doctor")),
@@ -1262,18 +1309,15 @@ _CRASH_ADVICE = (
         "a file agrep expected is gone", "doctor")),
 )
 
-_CRASH_ADVICE_ANY = StatusAdvice("agrep hit an unexpected error", "doctor")
-
-
 def crash_advice_line(exc: BaseException, cli: str) -> str:
-    """One sentence for an unhandled exception: what broke, and what to type."""
+    """Show a known remedy without discarding an unclassified failure's cause."""
     message = str(exc)
     if "`" in message:
         # a message that already carries the command was authored for the
         # reader (law 5's shape); translating it would destroy the remedy
         return f"agrep failed: {message}"
     name = type(exc).__name__
-    text = str(exc).lower()
+    text = message.lower()
     for want_name, markers, advice in _CRASH_ADVICE:
         if want_name and want_name not in name:
             continue
@@ -1281,7 +1325,8 @@ def crash_advice_line(exc: BaseException, cli: str) -> str:
             continue
         break
     else:
-        advice = _CRASH_ADVICE_ANY
+        detail = terminal_safe(message)
+        return f"agrep failed: {name}: {detail}" if detail else f"agrep failed: {name}"
     return (f"agrep failed: {advice.cost}: `{cli} {advice.command}`"
             if advice.command else f"agrep failed: {advice.cost}")
 
@@ -1333,7 +1378,7 @@ REMEDIES = MappingProxyType({
         owner="a full ingest can be expensive and rewrites derived stores"),
     "replace-installed-tool": Remedy(
         "consent",
-        "run `{command}`; agrep cannot replace the installed tool without your consent",
+        "update with `{command}`",
         owner="local tool installation changes a user-owned executable"),
     "setup-enroll": Remedy(
         "consent", "`{command}` teaches your agents to search this history",
@@ -1351,7 +1396,9 @@ REMEDIES = MappingProxyType({
         "human-prereq", "`{command}` fetches or compiles the ingest binary",
         owner="a build or network fetch can require user-controlled resources"),
     "setup-resync": Remedy(
-        "consent", "run `{command}` to re-sync agent instructions",
+        "consent",
+        "run `{command}` to re-sync agent instructions: it upgrades older "
+        "blocks and keeps a same-version edit",
         owner="rewrites user agent files"),
     "setup-reconcile": Remedy(
         "consent", "run `{command}` to reconcile it safely",
@@ -1430,10 +1477,6 @@ class FreshnessStory(NamedTuple):
     # behind only: drift younger than the debounce horizon that nothing will
     # absorb - served last-good, worth a line, but not an aged "behind"
     young: bool = False
-    # current only: drift was observed but a background owner is expected to
-    # absorb it - display stays silent (law 3), yet a zero must not read this
-    # state as proof of currency (the observation survives the silence)
-    absorbed_drift: bool = False
 
 
 NO_AUTO_HELP = (
@@ -1442,20 +1485,14 @@ NO_AUTO_HELP = (
 
 
 def grep_absence_exit(*, exact: bool, freshness: FreshnessStory) -> int:
-    """Exit 1 is "proven none"; 2 is "unverified". The rendered freshness
-    story decides which: a hedge on the page denies the proof, silence
-    licenses it. The exit code is a display surface for machines and obeys
-    law 3 like every other one - a zero the reader is told nothing about must
-    not carry a different verdict for a script.
-
-    The proof requires POSITIVE facts, matching miss_verdict: a current
-    index, no absorbed drift, and no visible hedge. Absorbed drift and a
-    young converging behind are silent by design ("system working") but they
-    are still in-flight - miss_verdict renders "index catching up; retry
-    shortly" for them, so the zero is not proven and must not exit 1."""
+    """Exit 1 means no match in a usable indexed snapshot; 2 means unverified."""
     if not exact:
         return 2
-    if freshness.state != "current" or freshness.absorbed_drift:
+    if freshness.state != "current" and not (
+            freshness.converging and (
+                (freshness.state == "behind" and freshness.young)
+                or (freshness.state == "unverified"
+                    and freshness.code == "search-index-stale"))):
         return 2
     return 1 if not freshness_story_line(freshness) else 2
 
@@ -1695,11 +1732,13 @@ def completeness_disclosure(
         more_command_kind: str | None = None,
         more_argv: Sequence[str] | None = None,
         full_argv: Sequence[str] | None = None,
-        action_unavailable_reason: str | None = None) -> dict:
+        action_unavailable_reason: str | None = None,
+        tool_rows: int | None = None) -> dict:
     """What a machine surface's numbers mean: rows printed, rows matched,
     whether that total is exact, and - when the page was cut - a bounded
     larger-page invocation or why no exhaustive form exists. A caller
-    must never infer a cap from the row count it happened to receive."""
+    must never infer a cap from the row count it happened to receive.
+    ``tool_rows`` counts matching ROWS in tool output whatever the unit."""
     shown = max(0, int(shown))
     total = max(0, int(total))
     cut = bool(truncated or total > shown or not totals_exact)
@@ -1710,6 +1749,8 @@ def completeness_disclosure(
         "unit": unit,
         "truncated": cut,
     }
+    if tool_rows is not None:
+        out["tool_rows"] = max(0, int(tool_rows))
     if cut and more_command:
         out["more_command"] = more_command
     if cut and more_argv:
@@ -1753,13 +1794,19 @@ def uncounted_total_line(shown: int, *, exhaustible: bool = True) -> str:
             f"(the search lane stopped early{lever})")
 
 
-def completeness_line(disclosure: Mapping, *, tool_hits: int = 0) -> str:
+def completeness_line(disclosure: Mapping) -> str:
     """The prose of the same disclosure, for surfaces whose stdout is rows.
     One artifact behind both so a porcelain line can never disagree with the
     JSON field beside it."""
     total = int(disclosure["total"])
     exact = disclosure["total_basis"] == "exact"
-    tool = f" ({tool_hits} of them in tool output)" if tool_hits else ""
+    unit = str(disclosure["unit"])
+    tool_rows = int(disclosure.get("tool_rows") or 0)
+    # "of them" is a subset claim: only true when the unit is rows
+    tool = ("" if not tool_rows
+            else f" ({tool_rows} of them in tool output)" if "row" in unit
+            else f" ({count_noun(tool_rows, 'matching row')} "
+                 f"{'is' if tool_rows == 1 else 'are'} tool output)")
     more = disclosure.get("more_command")
     reason = disclosure.get("no_exhaustive_form")
     # F3: a "+" total is a floor from a lane that stopped early; name the
@@ -1769,7 +1816,7 @@ def completeness_line(disclosure: Mapping, *, tool_hits: int = 0) -> str:
     tail = (f" · larger page: {more}" if more
             else f" · {reason}" if reason else "")
     return (f"showing {disclosure['shown']} of {total}{'' if exact else '+'} "
-            f"{disclosure['unit']}{'' if total == 1 else 's'}"
+            f"{unit}{'' if total == 1 else 's'}"
             f"{tool}{basis}{tail}")
 
 
@@ -1792,12 +1839,30 @@ def self_exclusion_disclosure(
         "excluded_hits": None,
         "excluded_hits_known": False,
     }
+    source = str(getattr(family, "source", "") or "")
+    if source:
+        out["identity"] = source
     if excluded_hits is not None:
         out["excluded_hits"] = max(0, int(excluded_hits))
         out["excluded_hits_known"] = True
     if boundary is not None:
         out["from_turn"] = int(boundary)
     return out
+
+
+def caller_unknown_notice(reason: str) -> str:
+    """One line for an agent shell whose calling session could not be named."""
+    if reason == "identity-conflict":
+        return ("caller session identities conflict: self-exclusion is off "
+                "and this chat's own rows may appear")
+    if reason == "caller-unresolved":
+        return ("agent shell, caller unknown: this chat's own rows may appear "
+                "(pi/omp: `agrep setup` installs the extension that names it)")
+    return ""
+
+
+FAMILY_INDEX_BEHIND_LINE = (
+    "family index behind: side-chat marks and short handles may lag")
 
 
 def stale_handle_recovery(cli: str) -> str:
@@ -1852,13 +1917,13 @@ RENDER_LINE_MAX_CHARS = 140   # a longer line is explaining, not stating (law 7)
 
 
 def self_exclusion_notice(*, resolved: bool, dropped: int = 0,
-                          windowed: bool = False) -> str:
+                          windowed: bool = False, noun: str = "hit") -> str:
     """One counted line for a policy proven to have hidden matching rows."""
     if dropped <= 0:
         return ""
     scope = ("the current window" if windowed
              else "this session family" if resolved else "this session")
-    return f"excluded {count_noun(dropped, 'hit')} from {scope}"
+    return f"excluded {count_noun(dropped, noun)} from {scope}"
 
 
 def handle_content_moved(turn: int, found: int) -> str:
@@ -1963,6 +2028,7 @@ class SemanticDeferral(NamedTuple):
     surface_reason: str
 
 
+# bench/semantic_calibration.py: floor clears unrelated rows; strong clears one shared noun.
 DEFAULT_SEMANTIC_SCORE_BANDS = SemanticScoreBands(
     floor=0.82,
     strong=0.84,
@@ -2055,6 +2121,8 @@ SEMANTIC_LANE_CAUSES = (
     ("AGREP_NO_SEM_WORKER",
      "AGREP_NO_SEM_WORKER disables automatic meaning; unset it to enable the lane"),
     ("agrep removal", "agrep removal blocks semantic serving"),
+    ("not a validated current generation",
+     "meaning index generation is not validated; retry with `agrep -s`"),
     ("model-not-cached",
      "semantic model not cached; `-s` or `agrep setup` fetches it once"),
     ("missing-embeddings", "meaning index is still building"),
@@ -2069,16 +2137,40 @@ def semantic_lane_cause(reason: str) -> str | None:
     return None
 
 
-def semantic_keyword_only_notice(
-        status: Mapping | None = None, *, brief: bool = False) -> str:
-    """Automatic-lane fallback with one factual explanation - transient or not.
+def _bounded_lane_reason(reason: str) -> str:
+    rendered = terminal_safe(reason)
+    budget = RENDER_LINE_MAX_CHARS - len(SEMANTIC_LANE_POLICY.keyword_only) - 3
+    if len(rendered) <= budget:
+        return rendered
+    half = (budget - 3) // 2
+    head = rendered[:half]
+    if not rendered[half].isspace() and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    tail_start = len(rendered) - half
+    tail = rendered[tail_start:]
+    if not rendered[tail_start - 1].isspace() and " " in tail:
+        tail = tail.split(" ", 1)[1]
+    return f"{head.rstrip()} … {tail.lstrip()}"
 
-    Dropping non-transient reasons was the bug: on a box whose model was
-    never fetched the lane reported `refresh model-not-cached` and the
-    reader got a bare hedge with no cause and no lever, forever.
-    ``brief`` renders the bare story for a cause the reader was already told
-    this window (common.semantic_notice_brief owns that decision): the lane
-    state is disclosed on every render, the lecture only once per outage."""
+
+def semantic_keyword_only_notice(
+        status: Mapping | None = None, *, brief: bool = False,
+        coverage: Mapping | None = None,
+        accelerator: Mapping | None = None) -> str:
+    """Automatic-lane fallback with one factual explanation, never the bare hedge.
+
+    ``brief`` renders the bare line for a cause the reader was already told this
+    window (indexd_runtime.semantic_notice_brief owns that decision)."""
+    if semantic_lane_answered(status):
+        if coverage is None:
+            coverage = (status or {}).get("coverage")
+        gap = semantic_coverage_notice(
+            coverage, accelerator, suppress_trivial=True)
+        if gap:
+            return "meaning coverage is partial" if brief else gap
+        if not semantic_coverage_usable(coverage, accelerator):
+            return _MISS_COVERAGE_UNKNOWN_LEVER
+        return "no confident meaning match"
     if brief:
         return SEMANTIC_LANE_POLICY.keyword_only
     line = SEMANTIC_LANE_POLICY.keyword_only
@@ -2087,8 +2179,10 @@ def semantic_keyword_only_notice(
         return f"{line} ({SEMANTIC_INDEX_UPDATE_REASON})"
     if semantic_status_retryable(status):
         return f"{line} ({SEMANTIC_WORKER_TRANSIENT_REASON})"
-    cause = semantic_lane_cause(reason)
-    return f"{line} ({cause})" if cause else line
+    if not reason:
+        return f"{line} ({SEMANTIC_LANE_POLICY.down_detail})"
+    cause = semantic_lane_cause(reason) or _bounded_lane_reason(reason)
+    return f"{line} ({cause})"
 
 
 def semantic_unavailable_notice(status: Mapping | None,
@@ -2135,9 +2229,7 @@ def semantic_integrity_notice(
     # Rows the derived mirror has not ingested yet prove nothing about the
     # embedded text, so they are stated as the coverage gap they are.
     if int(integrity.get("mismatched", dropped) or 0) <= 0:
-        if suppress_trivial and dropped <= SEMANTIC_TRIVIAL_GAP_ROWS:
-            # a live box's mirror trails its newest turns by a beat; page
-            # surfaces stay quiet over that churn (miss proofs never do)
+        if suppress_trivial and dropped <= SEMANTIC_TRIVIAL_MIRROR_LAG_ROWS:
             return None
         return (f"semantic integrity: {dropped} {row} held back - the search "
                 "index has not mirrored them yet; it catches up in the background")
@@ -2163,11 +2255,24 @@ def semantic_lane_change_notice(change: Mapping | None) -> str | None:
             "re-embedding history in the background")
 
 
-# A live box never closes the newest rows (the caller regenerates them);
-# below both bounds the gap is churn, not convergence - the notice stays
-# silent, while miss proofs always state their scope.
-SEMANTIC_TRIVIAL_GAP_ROWS = 64
+SEMANTIC_TRIVIAL_MIRROR_LAG_ROWS = 64
 SEMANTIC_TRIVIAL_GAP_RATIO = 0.99
+
+
+def semantic_coverage_usable(
+        coverage: Mapping | None, accelerator: Mapping | None = None) -> bool:
+    """Whether known coverage is complete or within the live-update tail."""
+    def usable(part: Mapping | None) -> bool:
+        if not isinstance(part, Mapping):
+            return False
+        if part.get("complete") is True:
+            return True
+        have, want = part.get("indexed"), part.get("total")
+        return (type(have) is int and type(want) is int and want > 0
+                and 0 <= have <= want
+                and have >= want * SEMANTIC_TRIVIAL_GAP_RATIO)
+
+    return usable(coverage) and (accelerator is None or usable(accelerator))
 
 
 def semantic_coverage_notice(
@@ -2183,20 +2288,9 @@ def semantic_coverage_notice(
         return None
     indexed = coverage.get("indexed", "?")
     total = coverage.get("total", "?")
+    if suppress_trivial and semantic_coverage_usable(coverage, accelerator):
+        return None
 
-    def trivial(have: object, want: object) -> bool:
-        return (isinstance(have, int) and isinstance(want, int) and want > 0
-                and want - have <= SEMANTIC_TRIVIAL_GAP_ROWS
-                and have >= want * SEMANTIC_TRIVIAL_GAP_RATIO)
-
-    if suppress_trivial:
-        # a live box never closes its newest rows in ANY lane; the notice
-        # returns the moment a real gap opens in one of them
-        base_trivial = not base_partial or trivial(indexed, total)
-        accelerator_trivial = not accelerator_partial or trivial(
-            accelerator.get("indexed"), accelerator.get("total"))
-        if base_trivial and accelerator_trivial:
-            return None
     searched = accelerator.get("indexed") if accelerator else None
     if searched is not None and searched != indexed:
         return (
@@ -2214,14 +2308,9 @@ def semantic_coverage_notice(
         "indexed; history is converging in the background")
 
 
-# The zero-trust contract: a miss either proves its scope - both lanes over a
-# current index - or names the ONE lever that would make it provable. One
-# verdict artifact behind search's zero and recall's probe miss (law 5).
-MISS_CONFIDENT_TAIL = "keyword + meaning, index current"
+MISS_CONFIDENT_TAIL = "keyword + meaning, indexed snapshot"
 _MISS_COVERAGE_UNKNOWN_LEVER = (
     "embedding coverage unavailable; searched scope is not verified")
-# Drift a background owner is absorbing licenses display silence, never the
-# words "index current": the zero hedges with the shared warming story.
 _MISS_INDEX_CONVERGING_TAIL = f"keyword + meaning; index {SEMANTIC_LANE_POLICY.warming}"
 _MISS_SCOPE_UNKNOWN_TAIL = (
     "keyword + meaning; corpus scope unavailable - absence unproven")
@@ -2240,26 +2329,25 @@ class MissVerdict(NamedTuple):
 def miss_verdict(story: FreshnessStory, *, meaning_served: bool,
                  meaning_coverage: Mapping | None = None,
                  meaning_accelerator: Mapping | None = None,
+                 meaning_integrity: Mapping | None = None,
                  sessions: int | None = None) -> MissVerdict:
-    """Confident states what the zero proved; hedged names its one lever.
-    A freshness hedge outranks the lane. Confidence needs positive facts -
-    a current index with no drift observed, proven meaning coverage, and a
-    resolvable corpus scope - never the mere absence of a hedge string."""
+    """Classify a miss against its indexed snapshot, retaining actionable gaps."""
     freshness_hedge = freshness_story_line(story)
     if freshness_hedge:
         return MissVerdict(False, freshness_hedge, owns_freshness=True)
-    if story.state != "current" or story.absorbed_drift:
-        # law 3 licenses silence beside served rows, not "index current" on
-        # a zero: drift in flight (behind/unverified, or absorbed) hedges
+    if grep_absence_exit(exact=True, freshness=story) != 1:
         return MissVerdict(
             False, _MISS_INDEX_CONVERGING_TAIL, owns_freshness=True)
+    integrity_gap = semantic_integrity_notice(meaning_integrity, suppress_trivial=True)
+    if integrity_gap is not None:
+        return MissVerdict(False, integrity_gap)
     if not meaning_served:
         return MissVerdict(False, SEMANTIC_LANE_POLICY.keyword_only)
-    gap = semantic_coverage_notice(meaning_coverage, meaning_accelerator)
+    gap = semantic_coverage_notice(
+        meaning_coverage, meaning_accelerator, suppress_trivial=True)
     if gap is not None:
         return MissVerdict(False, gap)
-    if not (meaning_coverage and meaning_coverage.get("complete") is True):
-        # a lane that cannot state its coverage cannot prove absence
+    if not semantic_coverage_usable(meaning_coverage, meaning_accelerator):
         return MissVerdict(False, _MISS_COVERAGE_UNKNOWN_LEVER)
     if sessions is None:
         # a scope nobody can count is a scope nobody may claim to have proven
