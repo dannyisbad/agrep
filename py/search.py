@@ -883,6 +883,7 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     terms = semantic_query_terms(q)
     unanchored, texts = False, {}
     term_weights = None
+    row_term_anchors = []
     if policy["results"]:
         anchor = {"anchored": None, "probed": 0}
         db = None
@@ -893,8 +894,17 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
             try:
                 anchor = semantic_corpus_anchor(q, filters, db=db)
                 texts = _semantic_row_texts(db, policy["results"])
+                row_term_anchors = [
+                    semantic_term_anchor(
+                        terms, texts.get((str(row.get("session") or ""),
+                                          row["turn"], str(row.get("who") or "")))
+                        or row.get("text") or row.get("summary") or "")
+                    for row in policy["results"]
+                ]
                 if (anchor.get("anchored") is True
-                        and 1 < len(terms) <= _SEMANTIC_ANCHOR_PROBE_MAX):
+                        and 1 < len(terms) <= _SEMANTIC_ANCHOR_PROBE_MAX
+                        and any(0 < matched < total
+                                for matched, total in row_term_anchors)):
                     frequencies = corpusdb.term_session_df(db, terms)
                     if (len(frequencies) == len(terms)
                             and all(value > 0 for value in frequencies.values())):
@@ -914,7 +924,7 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
         policy["semantic_status"]["corpus_anchor"] = anchor
         unanchored = anchor.get("anchored") is False
     hits = []
-    for o in policy["results"]:
+    for row_index, o in enumerate(policy["results"]):
         turn = o["turn"]
         snip = o.get("text") or o.get("title") or (o.get("summary") or "")[:140]
         semantic_source = o.get("semantic_source", level)
@@ -934,10 +944,13 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                      "semantic_source": semantic_source,
                      "semantic_partial": partial,
                      "_sem_unanchored": unanchored,
-                     "_sem_terms": semantic_term_anchor(
-                         terms, texts.get((str(session), turn, str(who)))
-                         or o.get("text") or o.get("summary") or "",
-                         weights=term_weights),
+                     "_sem_terms": (
+                         row_term_anchors[row_index]
+                         if term_weights is None and row_term_anchors else
+                         semantic_term_anchor(
+                             terms, texts.get((str(session), turn, str(who)))
+                             or o.get("text") or o.get("summary") or "",
+                             weights=term_weights)),
                      "semantic_coverage": coverage,
                      "semantic_accelerator_coverage": accelerator_coverage})
     policy_truncated = bool(policy["semantic_status"].get("truncated"))
