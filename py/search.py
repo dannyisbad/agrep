@@ -1406,7 +1406,7 @@ def _native_boundary_items(hits: list[dict], context):
             continue
         for match in finditer(snippet):
             span = match.span
-            spans = [list(span(index)) for index in span_indexes]
+            spans = tuple(span(index) for index in span_indexes)
             yield ({"text": snippet, "spans": spans, "validate_spans": False},
                    (hit, match.end() - match.start()))
 
@@ -1551,11 +1551,17 @@ def _native_boundary_scores(hits: list[dict], context, *, worker=None,
     started = time.perf_counter()
     try:
         while chunk:
-            items = [item for item, _owner in chunk]
-            owners = [owner for _item, owner in chunk]
-            needs_spans = any(
-                hit.get("matched") == "all-terms"
-                for hit, _match_length in owners)
+            items = []
+            owners = {}
+            for item, owner in chunk:
+                key = item["text"], item.get("spans")
+                group = owners.get(key)
+                if group is None:
+                    items.append(item)
+                    owners[key] = [owner]
+                else:
+                    group.append(owner)
+            needs_spans = any(spans is None for _text, spans in owners)
             request = {
                 "protocol": _NATIVE_BOUNDARY_PROTOCOL,
                 "query": query,
@@ -1580,8 +1586,8 @@ def _native_boundary_scores(hits: list[dict], context, *, worker=None,
                      if response.get("protocol") == _NATIVE_BOUNDARY_PROTOCOL else None)
             if not isinstance(batch, list) or len(batch) != len(request["items"]):
                 raise ValueError("invalid boundary-rank response")
-            for owner, result in zip(owners, batch):
-                hit, match_length = owner
+            for group, result in zip(owners.values(), batch):
+                hit = group[0][0]
                 if not isinstance(result, dict) or "error" in result:
                     raise ValueError("boundary-rank item error")
                 factor = float(result.get("factor"))
@@ -1595,11 +1601,12 @@ def _native_boundary_scores(hits: list[dict], context, *, worker=None,
                     if (not isinstance(spans, list) or not isinstance(qualities, list)
                             or len(spans) != len(qualities)):
                         raise ValueError("boundary-rank spans missing")
-                key = factor, -match_length
-                current = best.get(id(hit))
-                if current is None or key > current[:2]:
-                    best[id(hit)] = (
-                        factor, -match_length, match_class, spans, qualities, hit)
+                for hit, match_length in group:
+                    key = factor, -match_length
+                    current = best.get(id(hit))
+                    if current is None or key > current[:2]:
+                        best[id(hit)] = (
+                            factor, -match_length, match_class, spans, qualities, hit)
             total_items += len(chunk)
             del request, items, owners, batch, response, payload
             chunk.clear()
@@ -2701,6 +2708,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
     phrase_best: list[dict] = []
     term_best: list[dict] = []
     phrase_worst = term_worst = None
+    frontier = None
     pending: list[tuple[dict, bool]] = []
     boundary_state = [None, None, None]
     observed_total = observed_tools = examined = scored = 0
@@ -2724,7 +2732,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         return max((_rank_key(row) for row in bucket), default=None)
 
     def score_pending() -> None:
-        nonlocal phrase_worst, term_worst, scored
+        nonlocal phrase_worst, term_worst, frontier, scored
         if not pending:
             return
         rows = [hit for hit, _is_phrase in pending]
@@ -2738,6 +2746,8 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
             else:
                 term_worst = retain(term_best, hit, term_worst)
         scored += len(pending)
+        frontier = (term_frontier(max(0, limit - len(phrase_best)))
+                    if phrase_complete else phrase_worst)
         pending.clear()
 
     def queue_for_boundary(hit: dict, is_phrase: bool) -> None:
@@ -2777,7 +2787,6 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
                 common.dbg(
                     f"bounded rows: dense phrase lane complete with "
                     f"{phrase_count} match(es)")
-        term_target = max(0, limit - len(phrase_best))
         candidates = corpusdb.score_ceiling_candidates(
             db, anchors, flt, now_ms=now_ms, who_weights=_WHO_W,
             source_scales=_SOURCE_SCALE,
@@ -2786,11 +2795,8 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         for ceiling, row in candidates:
             max_rounded = math.ceil((ceiling + 1e-12) * 10_000) / 10_000
             upper = max_rounded
-            frontier = term_frontier(term_target) if phrase_complete else phrase_worst
             if pending and frontier is not None and upper < -frontier[1]:
                 score_pending()
-                frontier = (term_frontier(term_target)
-                            if phrase_complete else phrase_worst)
             if phrase_complete and frontier is not None and upper < -frontier[1]:
                 stopped_early = True
                 break
@@ -2802,11 +2808,15 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
             examined += 1
             text = row[corpusdb._TEXT]
             lowered = text.lower()
-            spans = [
-                common.insensitive_span(text, token, lowered, variants=variants)
-                for token, variants in term_specs
-            ]
-            if any(span is None for span in spans):
+            spans = []
+            complete = True
+            for token, variants in term_specs:
+                span = common.insensitive_span(text, token, lowered, variants=variants)
+                if span is None:
+                    complete = False
+                    break
+                spans.append(span)
+            if not complete:
                 continue
 
             if phrase_absent:
@@ -2830,7 +2840,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
                 if phrase_worst is None or upper >= -phrase_worst[1]:
                     queue_for_boundary(corpusdb._hit(row, start, end), True)
             elif fallback_possible and (term_worst is None or upper >= -term_worst[1]):
-                hit = corpusdb._spans_hit(row, [span for span in spans if span is not None])
+                hit = corpusdb._spans_hit(row, spans)
                 hit["matched"] = "all-terms"
                 queue_for_boundary(hit, False)
             if len(pending) >= seed_size:
@@ -3232,6 +3242,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
     phrase_best: dict[str, tuple[tuple, dict]] = {}
     term_best: dict[str, tuple[tuple, dict]] = {}
     view_best: dict[str, tuple[tuple, dict]] = {}
+    frontier = None
     phrase_sessions: set[str] = set()
     term_sessions: set[str] = set()
     phrase_count = term_count = phrase_tool_count = term_tool_count = 0
@@ -3262,6 +3273,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
             bucket[family] = (rank_key, hit)
 
     def score_pending() -> None:
+        nonlocal frontier
         if not pending:
             return
         rows = [hit for hit, _family, _is_phrase in pending]
@@ -3273,6 +3285,10 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                        boundary=scorer), 4)
             add_best(view_best if session_view_rank else (
                 phrase_best if is_phrase else term_best), family, hit)
+        frontier = (
+            bucket_frontier(view_best, limit) if session_view_rank
+            else term_frontier(max(0, limit - len(phrase_best))) if phrase_complete
+            else bucket_frontier(phrase_best, limit))
         pending.clear()
 
     def bucket_frontier(bucket: dict, target: int):
@@ -3401,10 +3417,8 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
             family = carried_root if family_diverse else session
             upper = max_rounded
             if session_view_rank:
-                frontier = bucket_frontier(view_best, limit)
                 if pending and frontier is not None and upper < -frontier[0]:
                     score_pending()
-                    frontier = bucket_frontier(view_best, limit)
                 if frontier is not None and upper < -frontier[0]:
                     stopped_early = True
                     break
@@ -3412,13 +3426,8 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 if phrase_complete and term_target == 0 and term_lane_confirmed:
                     stopped_early = True
                     break
-                frontier = (term_frontier(term_target)
-                            if phrase_complete else bucket_frontier(phrase_best, limit))
                 if pending and frontier is not None and upper < -frontier[1]:
                     score_pending()
-                    frontier = (
-                        term_frontier(term_target)
-                        if phrase_complete else bucket_frontier(phrase_best, limit))
                 if phrase_complete and frontier is not None:
                     if upper < -frontier[1]:
                         stopped_early = True
@@ -3430,11 +3439,15 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
 
             text = row[corpusdb._TEXT]
             low = text.lower()
-            term_spans = [
-                common.insensitive_span(text, token, low, variants=variants)
-                for token, variants in term_specs
-            ]
-            if any(span is None for span in term_spans):
+            term_spans = []
+            complete = True
+            for token, variants in term_specs:
+                span = common.insensitive_span(text, token, low, variants=variants)
+                if span is None:
+                    complete = False
+                    break
+                term_spans.append(span)
+            if not complete:
                 continue
             term_lane_confirmed = True
 
@@ -3465,8 +3478,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
             # displace its session head in score-folded views.
             if fallback_possible:
                 if not (session_view_rank and phrase_match):
-                    hit = corpusdb._spans_hit(
-                        row, [span for span in term_spans if span is not None])
+                    hit = corpusdb._spans_hit(row, term_spans)
                     hit["matched"] = "all-terms"
                     pending.append((hit, family, False))
                 term_count += 1

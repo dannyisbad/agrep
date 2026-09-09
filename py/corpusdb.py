@@ -4420,13 +4420,15 @@ def score_ceiling_candidates(
             heapq.heappush(heap, (-value, serial, tuple(row), cursor))
             serial += 1
         while heap:
-            neg_value, _serial, row, cursor = heapq.heappop(heap)
+            neg_value, _serial, row, cursor = heap[0]
             yield -neg_value, row
             successor = cursor.fetchone()
             if successor is not None:
                 value = ceiling(successor)
-                heapq.heappush(heap, (-value, serial, tuple(successor), cursor))
+                heapq.heapreplace(heap, (-value, serial, tuple(successor), cursor))
                 serial += 1
+            else:
+                heapq.heappop(heap)
     finally:
         for cursor in cursors:
             cursor.close()

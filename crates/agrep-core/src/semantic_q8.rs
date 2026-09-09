@@ -217,7 +217,7 @@ impl Q8Matrix {
 
     pub fn scores(&self, query: &[f32]) -> Result<Vec<f32>, Q8Error> {
         let (quantized, query_inv_norm) = self.quantized_query(query)?;
-        let dot_product = selected_dot();
+        let dot_product = selected_dot(&quantized);
         let payload = &self.image.as_slice()[HEADER_LEN..];
         let mut scores = Vec::with_capacity(self.rows);
         for row in payload.chunks_exact(self.stride) {
@@ -254,7 +254,7 @@ impl Q8Matrix {
         }
         validate_eligibility(eligibility, self.rows)?;
         let (quantized, query_inv_norm) = self.quantized_query(query)?;
-        let dot_product = selected_dot();
+        let dot_product = selected_dot(&quantized);
         let payload = &self.image.as_slice()[HEADER_LEN..];
         let mut heap = BinaryHeap::with_capacity(k.min(self.rows));
         for (ordinal, row) in payload.chunks_exact(self.stride).enumerate() {
@@ -342,7 +342,7 @@ impl Q8Matrix {
         }
         offsets[groups.group_count] = slots;
         let (quantized, query_inv_norm) = self.quantized_query(query)?;
-        let dot_product = selected_dot();
+        let dot_product = selected_dot(&quantized);
         let payload = &self.image.as_slice()[HEADER_LEN..];
         let mut best_scores = vec![f32::NEG_INFINITY; slots as usize];
         let mut best_ordinals = vec![u64::MAX; slots as usize];
@@ -360,29 +360,14 @@ impl Q8Matrix {
             let score = (dot_product(vector, &quantized) as f32) * row_inv_norm * query_inv_norm;
             let start = offsets[group as usize] as usize;
             let stop = offsets[group as usize + 1] as usize;
-            let candidate = Candidate {
-                score,
-                ordinal: ordinal as u64,
-            };
-            let mut insert = stop;
-            for position in start..stop {
-                let current = Candidate {
-                    score: best_scores[position],
-                    ordinal: best_ordinals[position],
-                };
-                if candidate > current {
-                    insert = position;
-                    break;
-                }
-            }
-            if insert < stop {
-                for position in (insert + 1..stop).rev() {
-                    best_scores[position] = best_scores[position - 1];
-                    best_ordinals[position] = best_ordinals[position - 1];
-                }
-                best_scores[insert] = score;
-                best_ordinals[insert] = ordinal as u64;
-            }
+            insert_group_head(
+                &mut best_scores[start..stop],
+                &mut best_ordinals[start..stop],
+                Candidate {
+                    score,
+                    ordinal: ordinal as u64,
+                },
+            );
         }
         let mut heap = BinaryHeap::with_capacity(k.min(groups.group_count));
         for group in 0..groups.group_count {
@@ -404,10 +389,8 @@ impl Q8Matrix {
                 heap.push(Reverse(candidate));
             }
         }
-        let mut selected: Vec<_> = heap.into_iter().map(|entry| entry.0).collect();
-        selected.sort_unstable_by(|left, right| right.cmp(left));
-        let mut output = Vec::with_capacity(selected.len() * heads);
-        for candidate in selected {
+        let mut output = Vec::with_capacity(heap.len() * heads);
+        for Reverse(candidate) in heap {
             let start = offsets[candidate.group as usize] as usize;
             let stop = offsets[candidate.group as usize + 1] as usize;
             for position in start..stop {
@@ -645,7 +628,7 @@ impl SegmentSet {
 
     pub fn scores(&self, query: &[f32]) -> Result<Vec<f32>, Q8Error> {
         let (quantized, query_inv_norm) = self.quantized_query(query)?;
-        let dot_product = selected_dot();
+        let dot_product = selected_dot(&quantized);
         let mut scores = vec![f32::MIN; self.row_high_water];
         for segment in &self.segments {
             let payload = &segment.matrix.image.as_slice()[HEADER_LEN..];
@@ -690,7 +673,7 @@ impl SegmentSet {
         }
         validate_eligibility(eligibility, self.row_high_water)?;
         let (quantized, query_inv_norm) = self.quantized_query(query)?;
-        let dot_product = selected_dot();
+        let dot_product = selected_dot(&quantized);
         let mut heap = BinaryHeap::with_capacity(k.min(self.live_rows));
         for segment in &self.segments {
             let payload = &segment.matrix.image.as_slice()[HEADER_LEN..];
@@ -764,7 +747,7 @@ impl SegmentSet {
         }
         offsets[self.group_count] = slots;
         let (quantized, query_inv_norm) = self.quantized_query(query)?;
-        let dot_product = selected_dot();
+        let dot_product = selected_dot(&quantized);
         let mut best_scores = vec![f32::NEG_INFINITY; slots];
         let mut best_ordinals = vec![u64::MAX; slots];
         for segment in &self.segments {
@@ -785,11 +768,11 @@ impl SegmentSet {
                     query_inv_norm,
                     dot_product,
                 );
+                let start = offsets[group as usize];
+                let stop = offsets[group as usize + 1];
                 insert_group_head(
-                    &offsets,
-                    &mut best_scores,
-                    &mut best_ordinals,
-                    group as usize,
+                    &mut best_scores[start..stop],
+                    &mut best_ordinals[start..stop],
                     Candidate {
                         score,
                         ordinal: row_ref,
@@ -888,17 +871,16 @@ fn retain_candidate(heap: &mut BinaryHeap<Reverse<Candidate>>, candidate: Candid
     }
 }
 
-fn insert_group_head(
-    offsets: &[usize],
-    best_scores: &mut [f32],
-    best_ordinals: &mut [u64],
-    group: usize,
-    candidate: Candidate,
-) {
-    let start = offsets[group];
-    let stop = offsets[group + 1];
-    let mut insert = stop;
-    for position in start..stop {
+#[inline]
+fn insert_group_head(best_scores: &mut [f32], best_ordinals: &mut [u64], candidate: Candidate) {
+    let Some((&score, &ordinal)) = best_scores.last().zip(best_ordinals.last()) else {
+        return;
+    };
+    if candidate <= (Candidate { score, ordinal }) {
+        return;
+    }
+    let mut insert = best_scores.len() - 1;
+    for position in 0..insert {
         let current = Candidate {
             score: best_scores[position],
             ordinal: best_ordinals[position],
@@ -908,14 +890,12 @@ fn insert_group_head(
             break;
         }
     }
-    if insert < stop {
-        for position in (insert + 1..stop).rev() {
-            best_scores[position] = best_scores[position - 1];
-            best_ordinals[position] = best_ordinals[position - 1];
-        }
-        best_scores[insert] = candidate.score;
-        best_ordinals[insert] = candidate.ordinal;
+    for position in (insert + 1..best_scores.len()).rev() {
+        best_scores[position] = best_scores[position - 1];
+        best_ordinals[position] = best_ordinals[position - 1];
     }
+    best_scores[insert] = candidate.score;
+    best_ordinals[insert] = candidate.ordinal;
 }
 
 fn select_group_candidates(
@@ -946,10 +926,8 @@ fn select_group_candidates(
             heap.push(Reverse(candidate));
         }
     }
-    let mut selected: Vec<_> = heap.into_iter().map(|entry| entry.0).collect();
-    selected.sort_unstable_by(|left, right| right.cmp(left));
-    let mut output = Vec::with_capacity(selected.len() * heads);
-    for candidate in selected {
+    let mut output = Vec::with_capacity(heap.len() * heads);
+    for Reverse(candidate) in heap {
         let start = offsets[candidate.group as usize];
         let stop = offsets[candidate.group as usize + 1];
         for position in start..stop {
@@ -1577,15 +1555,19 @@ pub fn dot_scalar(left: &[i8], right: &[i8]) -> i32 {
 
 pub fn dot(left: &[i8], right: &[i8]) -> i32 {
     debug_assert_eq!(left.len(), right.len());
-    selected_dot()(left, right)
+    selected_dot(right)(left, right)
 }
 
 type DotProduct = fn(&[i8], &[i8]) -> i32;
 
-fn selected_dot() -> DotProduct {
+fn selected_dot(_right: &[i8]) -> DotProduct {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
-        return dot_avx2_safe;
+        return if _right.contains(&i8::MIN) {
+            dot_avx2_safe
+        } else {
+            dot_avx2_q8_safe
+        };
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
@@ -1597,6 +1579,11 @@ fn selected_dot() -> DotProduct {
 #[cfg(target_arch = "x86_64")]
 fn dot_avx2_safe(left: &[i8], right: &[i8]) -> i32 {
     unsafe { dot_avx2(left, right) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dot_avx2_q8_safe(left: &[i8], right: &[i8]) -> i32 {
+    unsafe { dot_avx2_q8(left, right) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1621,6 +1608,46 @@ unsafe fn dot_avx2(left: &[i8], right: &[i8]) -> i32 {
         sum = _mm256_add_epi32(sum, _mm256_madd_epi16(a_high, b_high));
         offset += 32;
     }
+    let high = _mm256_extracti128_si256(sum, 1);
+    let low = _mm256_castsi256_si128(sum);
+    let mut total = _mm_add_epi32(low, high);
+    total = _mm_hadd_epi32(total, total);
+    total = _mm_hadd_epi32(total, total);
+    _mm_cvtsi128_si32(total) + dot_scalar(&left[offset..], &right[offset..])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2_q8(left: &[i8], right: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let ones = _mm256_set1_epi16(1);
+    let mut sum0 = _mm256_setzero_si256();
+    let mut sum1 = _mm256_setzero_si256();
+    let mut sum2 = _mm256_setzero_si256();
+    let mut sum3 = _mm256_setzero_si256();
+    let mut offset = 0usize;
+    while offset + 128 <= left.len() {
+        for (lane, sum) in [
+            (0usize, &mut sum0),
+            (32, &mut sum1),
+            (64, &mut sum2),
+            (96, &mut sum3),
+        ] {
+            let a = _mm256_loadu_si256(left.as_ptr().add(offset + lane).cast());
+            let b = _mm256_loadu_si256(right.as_ptr().add(offset + lane).cast());
+            let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(a), _mm256_sign_epi8(b, a));
+            *sum = _mm256_add_epi32(*sum, _mm256_madd_epi16(pairs, ones));
+        }
+        offset += 128;
+    }
+    while offset + 32 <= left.len() {
+        let a = _mm256_loadu_si256(left.as_ptr().add(offset).cast());
+        let b = _mm256_loadu_si256(right.as_ptr().add(offset).cast());
+        let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(a), _mm256_sign_epi8(b, a));
+        sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(pairs, ones));
+        offset += 32;
+    }
+    let sum = _mm256_add_epi32(_mm256_add_epi32(sum0, sum1), _mm256_add_epi32(sum2, sum3));
     let high = _mm256_extracti128_si256(sum, 1);
     let low = _mm256_castsi256_si128(sum);
     let mut total = _mm_add_epi32(low, high);
@@ -2174,10 +2201,23 @@ mod tests {
         let mut state = 0x1234_5678u32;
         for _ in 0..1027 {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            left.push(((state >> 24) as i8).clamp(-127, 127));
+            left.push((state >> 24) as i8);
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             right.push(((state >> 24) as i8).clamp(-127, 127));
         }
         assert_eq!(dot(&left, &right), dot_scalar(&left, &right));
+    }
+
+    #[test]
+    fn simd_preserves_signed_min_and_pair_sum_boundaries() {
+        for len in [31, 32, 127, 128, 129, 384, 16_384] {
+            let left = vec![i8::MIN; len];
+            let mut right = vec![127; len];
+            assert_eq!(dot(&left, &right), -16_256 * len as i32);
+            right.fill(-127);
+            assert_eq!(dot(&left, &right), 16_256 * len as i32);
+            right.fill(i8::MIN);
+            assert_eq!(dot(&left, &right), 16_384 * len as i32);
+        }
     }
 }
