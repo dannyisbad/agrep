@@ -2,6 +2,13 @@
 
 ## 0.3.2 — 2026-09-09
 
+- Regex searches can exceed three seconds while progressing. `AGREP_REGEX_TIMEOUT_S`
+  bounds each regex operation instead of the complete query; pathological matches
+  still terminate in an isolated worker. Mandatory literals jointly narrow indexed scans.
+- Large-corpus keyword ranking reuses unchanged top-k frontiers and identical
+  native boundary evaluations. Grouped semantic scans skip losing group heads
+  and use an exact AVX2 q8 fast path with a signed-minimum fallback.
+
 - Caller identity reaches tool shells. Under oh-my-pi, `agrep search`/`recall`
   run from tool shells never knew which session was calling: omp's tool shells
   inherit a one-time environment snapshot, so the extension's
