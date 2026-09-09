@@ -27,6 +27,7 @@ LAYERS = {
     "ownerfile": 0,
     "proc": 0,
     "mlx_modernbert": 0,
+    "regex_guard": 0,
     "surface_policy": 0,
     "winjob": 0,
     "hookless.__init__": 0,

@@ -1870,13 +1870,8 @@ def stale_handle_recovery(cli: str) -> str:
 
 
 def regex_timeout_line(timeout: float) -> str:
-    """A refusal that hands back every lever, because the caller has none.
-
-    The scan is linear in matched rows, so narrowing is the real fix and the
-    raised budget is the escape hatch; a refusal naming neither leaves an
-    agent with a dead end it cannot reason its way out of."""
-    return (f"regex exceeded the {timeout:g}s safety limit - narrow the scan "
-            f"(--agent/--project/--since/--chat), or raise the budget with "
+    return (f"a regex operation exceeded the {timeout:g}s safety limit - "
+            f"simplify the pattern, or raise the per-operation limit with "
             f"AGREP_REGEX_TIMEOUT_S")
 
 

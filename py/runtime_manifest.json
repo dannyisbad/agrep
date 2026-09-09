@@ -222,6 +222,10 @@
    "member": "agrep/py/recall.py"
   },
   {
+   "source": "py/regex_guard.py",
+   "member": "agrep/py/regex_guard.py"
+  },
+  {
    "source": "py/removal_fence.py",
    "member": "agrep/py/removal_fence.py"
   },

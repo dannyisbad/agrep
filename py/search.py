@@ -35,6 +35,7 @@ import compact
 import console
 import display_policy
 import indexd_runtime
+import regex_guard
 import session_context
 import surface_policy as surface
 
@@ -92,7 +93,7 @@ def _hl_regex(q: str, regex: bool) -> re.Pattern | None:
     user's pattern verbatim. Must stay in lockstep with the [\\W_]* join used to match."""
     try:
         if regex:
-            return re.compile(q, re.I)
+            return regex_guard.compile(q, re.I)
         toks = [re.escape(t) for t in re.split(r"[\s\-_]+", q.strip()) if t]
         return re.compile(r"[\W_]*".join(toks), re.I) if toks else None
     except re.error:
@@ -141,16 +142,17 @@ def _regex_scan(pattern: str, k: int, flt: dict | None = None) -> dict:
     """Regex search over the same corpus keyword_search uses (-E mode). Same hit shape."""
     import explore
     try:
-        rx = re.compile(pattern, re.I)
+        rx = regex_guard.compile(pattern, re.I)
     except re.error as e:
         common.log(f"bad regex: {e}")
         raise SystemExit(2)
     hits = []
+    search = rx.search
     for e in explore._iter_kw_corpus(flt):
         # original text only, like corpusdb.regex: matching the pre-lowered
         # copy first made (?-i:...) constructs hit text the pattern rejects,
         # so the two engines disagreed depending on index state
-        m = rx.search(e["text"])
+        m = search(e["text"])
         if m:
             hits.append(explore.scan_hit(e, m.start(), m.end()))
     hits.sort(key=lambda h: (h["session"], h["turn"], 0 if h["who"] != "agent" else 1))
@@ -3600,16 +3602,24 @@ def _regex_timeout_s() -> float:
     return min(30.0, max(0.05, value))
 
 
-def _arm_regex_worker_deadline(timeout: float) -> None:
+def _arm_regex_worker_lifetime() -> None:
     if common.WIN:
         return
+    import multiprocessing
     import signal
 
-    signal.signal(signal.SIGALRM, signal.SIG_DFL)
-    signal.setitimer(signal.ITIMER_REAL, timeout + 0.5)
+    parent_pid = multiprocessing.parent_process().pid
+
+    def check_parent(_signum, _frame):
+        if os.getppid() != parent_pid:
+            os._exit(0)
+
+    signal.signal(signal.SIGALRM, check_parent)
+    check_parent(None, None)
+    signal.setitimer(signal.ITIMER_REAL, 0.25, 0.25)
 
 
-def _disarm_regex_worker_deadline() -> None:
+def _disarm_regex_worker_lifetime() -> None:
     if common.WIN:
         return
     import signal
@@ -3617,12 +3627,13 @@ def _disarm_regex_worker_deadline() -> None:
     signal.setitimer(signal.ITIMER_REAL, 0.0)
 
 
-def _regex_worker_main(send, spec: QuerySpec, timeout: float) -> None:
-    _arm_regex_worker_deadline(timeout)
+def _regex_worker_main(send, spec: QuerySpec, timeout: float, deadline) -> None:
+    _arm_regex_worker_lifetime()
+    regex_guard.install(deadline, timeout)
     try:
         try:
             result = _finalize_query(spec, _keyword_candidates(spec))
-            pattern = re.compile(spec.q, re.I)
+            pattern = regex_guard.compile(spec.q, re.I)
             for hit in result.get("hits", ()):
                 snippet = hit.get("snippet") or ""
                 hit["_regex_color_snippet"] = _hl(snippet, pattern, True)
@@ -3631,6 +3642,8 @@ def _regex_worker_main(send, spec: QuerySpec, timeout: float) -> None:
                     hit["_regex_compact_snippet"] = _snip_at(
                         snippet, match.start(), match.end(), 32)
             payload = ("ok", result)
+        except regex_guard.MatchTimeoutError:
+            payload = ("regex-timeout", surface.regex_timeout_line(timeout))
         except re.error as exc:
             payload = ("regex-error", str(exc))
         except QueryDatabaseBusyError as exc:
@@ -3640,13 +3653,14 @@ def _regex_worker_main(send, spec: QuerySpec, timeout: float) -> None:
         except Exception as exc:  # noqa: BLE001 -- the parent owns the process boundary
             payload = ("worker-error", f"{type(exc).__name__}: {exc}")
     finally:
-        _disarm_regex_worker_deadline()
+        regex_guard.uninstall()
     try:
         send.send(payload)
     except (BrokenPipeError, EOFError, OSError):
         pass
     finally:
         send.close()
+        _disarm_regex_worker_lifetime()
 
 
 def _stop_guarded_worker(process) -> None:
@@ -3671,14 +3685,19 @@ def _guarded_regex_query(spec: QuerySpec) -> dict:
     context = multiprocessing.get_context(method)
     receive, send = context.Pipe(duplex=False)
     timeout = _regex_timeout_s()
+    # Supported 64-bit targets publish this aligned deadline as one native word.
+    deadline = context.RawValue("d", 0.0)
     process = context.Process(
-        target=_regex_worker_main, args=(send, spec, timeout),
+        target=_regex_worker_main, args=(send, spec, timeout, deadline),
         name="agrep-regex", daemon=True)
     process.start()
     send.close()
     try:
-        if not receive.poll(timeout):
-            raise RegexTimeoutError(surface.regex_timeout_line(timeout))
+        while not receive.poll(min(timeout, 0.05)):
+            expires = deadline.value
+            if (expires and time.monotonic() >= expires
+                    and deadline.value == expires):
+                raise RegexTimeoutError(surface.regex_timeout_line(timeout))
         try:
             kind, payload = receive.recv()
         except EOFError as exc:
@@ -3689,6 +3708,8 @@ def _guarded_regex_query(spec: QuerySpec) -> dict:
         _stop_guarded_worker(process)
     if kind == "ok":
         return payload
+    if kind == "regex-timeout":
+        raise RegexTimeoutError(payload)
     if kind == "regex-error":
         raise re.error(payload)
     if kind == "query-database-busy":
