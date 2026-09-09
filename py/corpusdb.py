@@ -44,6 +44,7 @@ import compact
 import fileops
 import index_lock
 import indexd_runtime
+import regex_guard
 import surface_policy as surface
 
 DB_PATH = common.DATA_DIR / "corpus.db"
@@ -4831,12 +4832,9 @@ def word(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None, *,
     return _pack(hits, k, position_order)
 
 
-def _required_literal(pattern: str) -> str | None:
-    """Longest ASCII literal every match must contain, or None. Only top-level
-    LITERAL runs count: alternations, classes, groups, and repeats break the run,
-    so `TODO|FIXME` correctly yields None (no single literal is required) while
-    `memory leak.*free` yields "memory leak". Sound = may return None when a
-    literal exists, never returns one a match could lack."""
+def _required_literals(pattern: str) -> list[str]:
+    """ASCII literal runs every match must contain. Groups, alternations and
+    repeats break a run; only mandatory top-level literals narrow candidates."""
     try:
         import re._parser as sre  # 3.11+
     except ImportError:  # 3.10
@@ -4844,8 +4842,9 @@ def _required_literal(pattern: str) -> str | None:
     try:
         seq = sre.parse(pattern)
     except Exception:  # noqa: BLE001 -- bad pattern; let re.compile report it
-        return None
-    best, run = "", ""
+        return []
+    literals: list[str] = []
+    run = ""
     for op, arg in seq:
         name = str(op)
         if name == "LITERAL" and isinstance(arg, int) and 0x20 <= arg < 0x7F:
@@ -4853,9 +4852,12 @@ def _required_literal(pattern: str) -> str | None:
         elif name == "AT":  # zero-width anchor (\b, ^, $): transparent
             continue
         else:
-            best, run = max(best, run, key=len), ""
-    best = max(best, run, key=len)
-    return best if len(best) >= 3 else None
+            if len(run) >= 3:
+                literals.append(run)
+            run = ""
+    if len(run) >= 3:
+        literals.append(run)
+    return literals
 
 
 def regex(db: sqlite3.Connection, pattern: str, k: int, flt: dict | None = None, *,
@@ -4863,20 +4865,21 @@ def regex(db: sqlite3.Connection, pattern: str, k: int, flt: dict | None = None,
     """Regex can't use the index directly, but when the pattern demands a literal
     (most real ones do) the trigram FTS narrows candidates first; otherwise stream
     the table, which still skips the JSONL parse paid by the fallback."""
-    _register_functions(db)
-    rx = re.compile(pattern, re.I)
+    rx = regex_guard.compile(pattern, re.I)
+    search = rx.search
     hits = []
-    lit = _required_literal(pattern)
-    if lit:
-        cur = _candidates(db, [lit.lower()], flt)
+    literals = _required_literals(pattern)
+    if literals:
+        cur = _candidates(db, [literal.lower() for literal in literals], flt)
     else:
+        _register_functions(db)
         fw, fp = _filter_sql(flt)
         cur = db.execute(
             "SELECT session, agent, project, concept, model, model_source, "
             "turn, ts, who, text, content_digest FROM msgs"
             + (" WHERE " + " AND ".join(fw) if fw else ""), fp)
     for row in cur:
-        m = rx.search(row[_TEXT])
+        m = search(row[_TEXT])
         if m:
             hits.append(_hit(row, m.start(), m.end()))
     return _pack(hits, k, position_order)
