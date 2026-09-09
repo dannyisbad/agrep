@@ -34,6 +34,7 @@ import sqlite3
 import statistics
 import subprocess
 import sys
+import atexit
 import tempfile
 import threading
 import time
@@ -65,10 +66,17 @@ _PRIVATE_DISCOVERY_ENV_KEYS = (
     "USERPROFILE", "HOME", "APPDATA", "CLINE_DIR", "XDG_CONFIG_HOME")
 
 
+_EMPTY_CALLER_DIR = tempfile.TemporaryDirectory(prefix="agrep-perf-caller-")
+atexit.register(_EMPTY_CALLER_DIR.cleanup)
+
+
 def _private_environment() -> dict[str, str]:
     env = dict(os.environ)
     for name in (*_PRIVATE_DISCOVERY_ENV_KEYS, *AGENT_CONTEXT_ENV_KEYS):
         env.pop(name, None)
+    # an agent process above the bench publishes its caller record, which
+    # would put every child on the agent-context (non-streaming) path
+    env["AGREP_CALLER_PUBLICATION_DIR"] = _EMPTY_CALLER_DIR.name
     return env
 
 # local budgets in ms; CI multiplies by AGREP_PERF_SLACK. wall budgets include
@@ -534,7 +542,12 @@ _INGEST_PHASE = re.compile(
     r"(?:^|\s)phases:\s*(?P<body>source-check \d+ms(?:\s*·\s*[^\r\n]+)?)$",
     re.MULTILINE,
 )
-_INGEST_PHASE_VALUE = re.compile(r"(?P<name>[a-z0-9+_-]+) (?P<ms>\d+)ms")
+_INGEST_PHASE_VALUE = re.compile(
+    r"(?P<name>[a-z0-9+_-]+) (?P<ms>\d+(?:\.\d+)?)ms")
+_INGEST_WRITERS = re.compile(
+    r"^\* \[agrep ingest\] (?P<body>messages [^\r\n]+)\r?$",
+    re.MULTILINE,
+)
 _STREAM_TAIL_PHASE = re.compile(
     r"first-run tail: fts-delegate\+hooks (?P<ms>[\d.]+)ms")
 
@@ -548,9 +561,15 @@ def _ingest_sample_diagnostic(
         match.group("name"): float(match.group("ms"))
         for match in _INGEST_PHASE_VALUE.finditer(phases_match.group("body"))
     } if phases_match else {})
+    writers_match = _INGEST_WRITERS.search(combined)
+    writers = ({
+        match.group("name"): float(match.group("ms"))
+        for match in _INGEST_PHASE_VALUE.finditer(writers_match.group("body"))
+    } if writers_match else {})
     return {
         "wall_ms": round(wall_ms, 3),
         "phases_ms": phases,
+        "writers_ms": writers,
     }
 
 
@@ -572,6 +591,14 @@ def _ingest_proof_line(
             if isinstance(value, (int, float)))
         if rendered:
             parts.append(f"phases[{rendered}]")
+    writers = sample.get("writers_ms", {})
+    if isinstance(writers, dict):
+        rendered = ",".join(
+            f"{name}={float(value):.1f}"
+            for name, value in writers.items()
+            if isinstance(value, (int, float)))
+        if rendered:
+            parts.append(f"writers[{rendered}]")
     if isinstance(artifacts, dict):
         rendered = ",".join(
             f"{name}={int(artifacts[name])}"
@@ -675,6 +702,7 @@ def _private_ingest_metrics(
             # priority discovery roots so a typo can never fall through to a real store.
             env["AGREP_HOME"] = str(home)
             env["AGREP_DATA_DIR"] = str(data)
+            env["AGREP_DEBUG"] = "1"
             # Empty adapters retain default discovery and proof overhead.
             cmd = [str(binp), "index"]
 
@@ -1406,7 +1434,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"samples={','.join(f'{value:.1f}' for value in walls)}"
             )
             phase_values: dict[str, list[float]] = {}
-            for sample in changed_samples:
+            for index, sample in enumerate(changed_samples, 1):
+                proof = _ingest_proof_line(f"  delta[{index}]", sample)
+                if proof is not None:
+                    print(proof)
                 phases = sample.get("phases_ms", {}) if isinstance(sample, dict) else {}
                 if not isinstance(phases, dict):
                     continue

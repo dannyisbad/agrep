@@ -182,6 +182,19 @@ class CommandRenderingTests(unittest.TestCase):
             shlex.split(rendered or ""),
             ["agrep", "search", "board", "two words", "it's"])
 
+    def test_posix_rendering_leaves_handles_bare(self) -> None:
+        # a tool-output handle's `~event:span` tail is shell-safe (no tilde
+        # expansion mid-word), so it prints as it pastes; `it~s` is not a handle
+        tool_handle = "@01a046db:10.2685~a8f797767b0f558d5d5c67e6:214-222"
+        rendered = surface.render_cli_argv(
+            ["agrep", "around", tool_handle, "it~s"], windows=False)
+        self.assertEqual(rendered, f"agrep around {tool_handle} 'it~s'")
+        self.assertEqual(shlex.split(rendered),
+                         ["agrep", "around", tool_handle, "it~s"])
+        self.assertEqual(
+            surface.render_cli_argv(["agrep", "around", tool_handle], windows=True),
+            f'agrep around "{tool_handle}"')
+
 
 if __name__ == "__main__":
     unittest.main()

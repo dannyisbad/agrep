@@ -55,7 +55,7 @@ _DEEPER_VALUE_OPTIONS = (
 _DEEPER_MODE_FLAGS = {"-s", "--hybrid", "-E", "-w", "--lexical"}
 _DEEPER_BOOL_FLAGS = {
     "--soft", "--self", "--no-self", "--no-meta", "--all-side-chats",
-    "--strict-semantic", "--no-auto", "--classic",
+    "--no-side", "--strict-semantic", "--no-auto", "--classic",
 }
 
 

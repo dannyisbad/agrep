@@ -64,6 +64,13 @@ class SearchBoundedRowsTests(unittest.TestCase):
         add("tie-z-terms", 7, "equal has tied evidence before rank", ts=NOW_MS)
         add("tie-a-terms", 7, "equal has tied evidence before rank", ts=NOW_MS)
 
+        add("view-tool", 0, "folded view", who="tool")
+        add("view-user", 0, "folded has focused human evidence before view", who="user")
+        add("plural-target", 0, "don before this call", who="user")
+        add("fragment-adjacent", 0, "calls dont", who="user")
+        add("aligned-later", 0,
+            "dude dont we already have a don of cases then calls", who="user")
+
         add("filter-user", 1, "filtered target user evidence", who="user",
             agent="codex", project="/repo/red", model="gpt-5.4")
         add("filter-tool", 2, "filtered target tool evidence", who="tool",
@@ -149,14 +156,17 @@ class SearchBoundedRowsTests(unittest.TestCase):
                          self._shape(exhaustive[:limit]))
         return exhaustive, bounded
 
-    def _run_sessions(self, query: str, limit: int, flt: dict | None = None):
+    def _run_sessions(self, query: str, limit: int, flt: dict | None = None,
+                      *, session_view_rank: bool = False):
         filters = {} if flt is None else flt
         with self._fixed_ranking():
             exhaustive, boundary = self._exhaustive(query, filters)
             bounded = search._bounded_keyword_sessions(
-                self.db, query, limit, filters, False, boundary=boundary)
+                self.db, query, limit, filters, False, boundary=boundary,
+                session_view_rank=session_view_rank)
         self.assertIsNotNone(bounded, f"bounded session lane unavailable for {query!r}")
-        expected = search._session_heads(exhaustive, limit)
+        expected = search._session_heads(
+            exhaustive, limit, session_view_rank=session_view_rank)
         self.assertEqual(self._shape(bounded["hits"]), self._shape(expected))
         return exhaustive, bounded
 
@@ -319,6 +329,29 @@ class SearchBoundedRowsTests(unittest.TestCase):
         ])
         self.assertEqual([hit.get("matched") for hit in bounded["hits"]],
                          [None, None, "all-terms", "all-terms"])
+
+    def test_session_views_fold_lane_confidence_into_score(self):
+        exhaustive, bounded = self._run_sessions(
+            "folded view", 2, session_view_rank=True)
+        self.assertEqual(
+            [hit["session"] for hit in search._session_heads(exhaustive, 2)],
+            ["view-tool", "view-user"])
+        self.assertEqual(
+            [hit["session"] for hit in bounded["hits"]],
+            ["view-user", "view-tool"])
+
+    def test_plural_folding_and_aligned_spans_match_bounded_order(self):
+        _exhaustive, bounded = self._run("don calls", 3)
+        self.assertEqual(
+            [hit["session"] for hit in bounded["hits"]],
+            ["plural-target", "aligned-later", "fragment-adjacent"])
+        aligned = next(
+            hit for hit in bounded["hits"] if hit["session"] == "aligned-later")
+        self.assertIn("a don of cases", aligned["snippet"])
+        fragment = next(
+            hit for hit in bounded["hits"]
+            if hit["session"] == "fragment-adjacent")
+        self.assertEqual(fragment["_evidence"], 0.395285)
 
     def test_filters_match_exhaustive_order_and_payload(self):
         filters = (

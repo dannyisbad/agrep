@@ -101,6 +101,7 @@ class _AsciiText:
 @dataclass(frozen=True, slots=True)
 class BoundaryTerm:
     folded: str
+    variants: tuple[str, ...]
     ambiguity: float
 
 
@@ -124,7 +125,9 @@ class PreparedQuery:
         *,
         validate_spans: bool = True,
     ) -> BoundaryScore:
-        if text.isascii() and all(term.folded.isascii() for term in self.terms):
+        if text.isascii() and all(
+                variant.isascii()
+                for term in self.terms for variant in term.variants):
             prepared: _AsciiText | PreparedText = _AsciiText(text, text.lower())
         else:
             prepared = prepare_text(text)
@@ -135,8 +138,12 @@ class PreparedQuery:
         matched = True
         for index, term in enumerate(self.terms):
             if spans is None:
-                candidates = prepared.find_spans(term.folded)
-                span = max(candidates, key=prepared.quality) if candidates else None
+                candidates = (
+                    span
+                    for variant in term.variants
+                    for span in prepared.find_spans(variant)
+                )
+                span = max(candidates, key=prepared.quality, default=None)
             else:
                 span = spans[index]
             if span is None:
@@ -147,7 +154,8 @@ class PreparedQuery:
                 if start < 0 or end < start or end > len(text):
                     raise ValueError("boundary span outside text")
                 if (spans is not None and validate_spans
-                        and term.folded not in prepared.folded_slice(span)):
+                        and not any(variant in prepared.folded_slice(span)
+                                    for variant in term.variants)):
                     raise ValueError("span does not identify its query token")
                 quality = prepared.quality(span)
             selected.append(span)
@@ -162,6 +170,46 @@ def query_tokens(query: str) -> tuple[str, ...]:
 def normalize_token(token: str) -> str:
     return "".join(unicodedata.normalize("NFKC", cluster.text).casefold()
                    for cluster in _clusters(token))
+
+
+def term_variants(token: str) -> tuple[str, ...]:
+    """Return deterministic singular/plural spellings for one normalized term."""
+    folded = normalize_token(token)
+    if not folded or not folded.isascii() or not folded.isalpha():
+        return (folded,) if folded else ()
+    variants = [folded]
+    if len(folded) >= 5 and folded.endswith("ies"):
+        variants.append(folded[:-3] + "y")
+    elif (len(folded) >= 5 and folded.endswith("es")
+          and (folded[:-2].endswith(("x", "z", "ch", "sh", "ss"))
+               or (len(folded) >= 7
+                   and folded[:-2].endswith(("us", "is"))))):
+        variants.append(folded[:-2])
+    elif (len(folded) >= 5 and folded.endswith("s")
+          and not folded.endswith(("ss", "us", "is"))):
+        variants.append(folded[:-1])
+    elif (len(folded) >= 4 and folded.endswith("y")
+          and folded[-2] not in "aeiou"):
+        variants.append(folded[:-1] + "ies")
+    elif len(folded) >= 4 and not folded.endswith(("s", "x", "z", "ch", "sh")):
+        variants.append(folded + "s")
+    elif (len(folded) >= 4
+          and folded.endswith(("x", "z", "ch", "sh", "ss", "us"))):
+        variants.append(folded + "es")
+    return tuple(dict.fromkeys(
+        variant for variant in variants if variant == folded or len(variant) >= 3))
+
+
+def term_anchor(token: str) -> str:
+    """Return a substring shared by every folded variant for candidate lookup."""
+    variants = term_variants(token)
+    if not variants:
+        return ""
+    prefix = variants[0]
+    for variant in variants[1:]:
+        while prefix and not variant.startswith(prefix):
+            prefix = prefix[:-1]
+    return prefix if len(prefix) >= 3 else variants[0]
 
 
 def cold_prior(token: str) -> float:
@@ -201,7 +249,7 @@ def prepare_query(query: str, stats: Stats = None) -> PreparedQuery:
         prior = cold_prior(original)
         if folded not in resolved:
             resolved[folded] = _ambiguity(folded, prior, stats)
-        terms.append(BoundaryTerm(folded, resolved[folded]))
+        terms.append(BoundaryTerm(folded, term_variants(original), resolved[folded]))
     return PreparedQuery(tuple(terms))
 
 

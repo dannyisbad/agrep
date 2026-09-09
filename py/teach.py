@@ -29,6 +29,7 @@ harder than prose. Every write is gated on the agent's own home dir existing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -70,17 +71,17 @@ def _readonly_error() -> PermissionError:
         "AGREP_DATA_READONLY protects this data directory")
 
 
-# Bump NUDGE_V on ANY block-text change (selftest hash-enforces). Write-fight
-# tiebreaker: a process only rewrites blocks older than its own, so a stale daemon
-# can't byte-flip newer text every reconcile tick and shred agents' prompt cache.
-NUDGE_V = 37
+# Bump NUDGE_V on ANY block-text change (selftest hash-enforces) and move the
+# outgoing body digests into _PRIOR_BLOCK_DIGESTS. Write-fight tiebreaker: a
+# process only rewrites blocks older than its own, so a stale daemon cannot flip them.
+NUDGE_V = 38
 MARK_PREFIX = "<!-- agrep:recall"
 MARK_BEGIN = f"{MARK_PREFIX} v{NUDGE_V} -->"
 MARK_END = "<!-- /agrep:recall -->"
 
-# Block text lives in nudge_default.md / nudge_codex.md so the owner iterates
-# on prose without touching code; codex has its own file, everything else
-# shares the default. Bump NUDGE_V on ANY change to either (hash-enforced).
+# Block text lives in nudge_default.md / nudge_codex.md so prose iterates without
+# code changes; codex has its own file, everything else shares the default. Both
+# are second person with no template slots; any change to either bumps NUDGE_V.
 _PROMPTS_DIR = Path(__file__).resolve().parent
 
 
@@ -90,6 +91,35 @@ def _nudge_source(name: str) -> str:
 
 NUDGE = _nudge_source("nudge_default.md")
 NUDGE_CODEX = _nudge_source("nudge_codex.md")
+
+# Body digests of every block agrep has shipped, keyed by version; a body that
+# hashes to none of them was edited. v37 rendered a name slot per registry label.
+_PRIOR_BLOCK_DIGESTS: dict[int, frozenset[str]] = {
+    37: frozenset({
+        "572c7559e835e114d4e630baf858747e34782871f424b6453011b2a748feb203",
+        "96784b1826a37525bc86fa6ade0406437384d94abae209cf55923e2fbc1961b9",
+        "cb410994197f9bc27cf1414b72f509eaf09fb1a5a25f4144229b9f01a06b0472",
+        "6c9d81854e227edd6b01a3ee4e99d2c80c6b3ab2c26f170da5a1966bb7ee9935",
+        "ec3ed3ba468cbd7709e0f175bca1d70c1497f6717d7354f0ee4cc0f0604fbff2",
+        "0b005b665fc2f475fe611e3018ebf0aa0b623dfa2597f5674ad15a0d85547acb",
+        "7f77c150be8451c53e51d887d09274c6c3433077e2a8620511bd5c7e37a9da96",
+        "3627c3cb05ab0fa696878a92aa69058614df0642f376106ac1675223591b4054",
+        "df8cbec382cdfea1971863c9a763e166d6386d6d9520fafebc4ceb013c5cf889",
+        "5bf8461dd62569bd941fa7b4d398838921be1afcc12ebcd3d370cc077503be2a",
+        "3275c12482f7539db2d07583b0e7f6da726305f9684f0989fc7f2498dada8d65",
+        "c4ac492598f1c73c1457a17fdaf12762e0c86466016004c426ce2fd6c994b2af",
+        "ffb4965c148e232f424abcd0f07c7e164157b4695fe548d7f9a34638dd04e7ce",
+        "33fae6184a8cbf531a68b0e2de3c464c8f7f83c9a6f88e27fc6e30d9c5496bce",
+        "282ae6ccad5c8f0d53bc154eb55a5c1fd964bbb715ae7a4f871da20168340713",
+        "bfa88e1af40a7bbcd879daa393057fed403cfcc5dee1ee2ed6703ed9608a9acd",
+        "44f0128c0715479164133985b91b74561d9c85c2fafd8436a570977e5da743c4",
+        "60987f3b402464d5bc7320010fbd45de1e55ef11d5b80196ee1afd96dcf4cd68",
+        "ab23bf6cab082bb9eaaf8d732bf6ea038aca90fde2ac4b1788751cb3c4315b3b",
+    }),
+}
+_CURRENT_BLOCK_DIGESTS = frozenset(
+    hashlib.sha256(text.encode("utf-8")).hexdigest()
+    for text in (NUDGE, NUDGE_CODEX))
 
 
 def manifest_targets(
@@ -342,7 +372,7 @@ def reconcile_health() -> dict:
             allowed_kinds=frozenset({
                 "malformed-markers", "unowned-skill", "invalid-utf8",
                 "target-unreadable", "health-unavailable", "drifted",
-                "concurrent-edit", "removal-pending",
+                "edited", "concurrent-edit", "removal-pending",
             }))
         preserved = _valid_reconcile_rows(
             value.get("preserved_newer"), max_rows=target_count,
@@ -439,31 +469,6 @@ def _has_skill_frontmatter(raw: bytes, eol: bytes) -> bool:
     return raw.startswith(opening) and eol + b"---" + eol in raw[len(opening):]
 
 
-# the template conjugates third-person ("{name} wakes"), so values must be
-# proper nouns; lowercase brands keep their casing. codex routes to its own
-# template and is absent on purpose.
-_AGENT_NAMES = {
-    "claude": "Claude",
-    "opencode": "opencode",
-    "gemini/antigravity": "Gemini",
-    "qwen": "Qwen",
-    "crush": "Crush",
-    "kimi": "Kimi",
-    "windsurf": "Windsurf",
-    "cline": "Cline",
-    "roo": "Roo",
-    "goose": "goose",
-    "amp": "Amp",
-    "copilot": "Copilot",
-    "droid": "Droid",
-    "grok": "Grok",
-    "continue": "Continue",
-    "cursor": "Cursor",
-    # lowercase per the owner; both roots register this one label
-    "pi": "pi",
-}
-
-
 def _label_for(path: Path | None) -> str | None:
     """The registry label that owns ``path``, from the live target tables.
 
@@ -486,14 +491,6 @@ def _label_for(path: Path | None) -> str | None:
     return None
 
 
-def _person(path: Path | None) -> str:
-    """The third-person subject for the NUDGE template. Model post-training
-    corpora speak about the assistant by name ("Claude should..."), so each
-    block addresses its agent the way its training data does; an unknown
-    target reads as "the agent", which conjugates at every slot."""
-    return _AGENT_NAMES.get(_label_for(path), "the agent")
-
-
 _TAG_BLOCK_RE = re.compile(r"^<([a-zA-Z][\w-]*)>\s*$[\s\S]*?^</\1>\s*$", re.M)
 
 
@@ -509,16 +506,39 @@ def _codex_target(path: Path | None) -> bool:
     return _label_for(path) == "codex"
 
 
+_BLOCK_WRAP = ("<agrep-recall>\n", "\n</agrep-recall>")
+
+
 def _block(path: Path | None = None, host: str = "") -> str:
-    # NUDGE_CODEX is used raw: it carries no subject slots, and codex's
-    # dialect is second person throughout.
-    body = (NUDGE_CODEX if _codex_target(path)
-            else NUDGE.format(name=_person(path)))
+    body = NUDGE_CODEX if _codex_target(path) else NUDGE
     if _tag_styled(host):
         # <agrep-recall>, not <instructions>: the host likely owns an
         # <instructions> block already, and a duplicate sibling tag collides
-        body = f"<agrep-recall>\n{body}\n</agrep-recall>"
+        body = f"{_BLOCK_WRAP[0]}{body}{_BLOCK_WRAP[1]}"
     return f"{MARK_BEGIN}\n{body}\n{MARK_END}\n"
+
+
+def _span_body(raw: bytes, span: _BlockSpan) -> str:
+    """The prose between a span's marker lines, EOL- and wrapper-normalized."""
+    lines = raw[span.start:span.end].decode("utf-8").replace(
+        "\r\n", "\n").split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    body = "\n".join(lines[1:-1])
+    opening, closing = _BLOCK_WRAP
+    if body.startswith(opening) and body.endswith(closing):
+        body = body[len(opening):-len(closing)]
+    return body
+
+
+def _body_provenance(raw: bytes, span: _BlockSpan) -> str | None:
+    """"shipped" or "edited" against that version's digests; None if unrecorded."""
+    shipped = (_CURRENT_BLOCK_DIGESTS if span.version == NUDGE_V
+               else _PRIOR_BLOCK_DIGESTS.get(span.version))
+    if shipped is None:
+        return None
+    digest = hashlib.sha256(_span_body(raw, span).encode("utf-8")).hexdigest()
+    return "shipped" if digest in shipped else "edited"
 
 
 def _atomic_write_bytes(
@@ -675,14 +695,35 @@ def _write_skill(
     return "added"
 
 
-def _legacy_block_version(path: Path) -> int | None:
+def _installed_block(path: Path) -> tuple[int | None, bool | None]:
+    """(version, edited) of the block setup acts on: the newest version at or
+    below this build's, and whether its body was edited (None: unrecorded)."""
     try:
-        versions = [span.version for span in _block_spans(path.read_bytes())]
+        raw = path.read_bytes()
+        raw.decode("utf-8")
+        spans = _block_spans(raw)
     except (OSError, UnicodeError, ValueError):
-        return None
-    if not versions or any(version >= NUDGE_V for version in versions):
-        return None
-    return max(versions)
+        return None, None
+    if not spans or any(span.version > NUDGE_V for span in spans):
+        return None, None
+    version = max(span.version for span in spans)
+    verdicts = {_body_provenance(raw, span)
+                for span in spans if span.version == version}
+    if "edited" in verdicts:
+        return version, True
+    return version, (False if verdicts == {"shipped"} else None)
+
+
+def _transition(
+        verb: str, noun: str, version: int | None, edited: bool | None,
+) -> str:
+    if verb == "updated" and version is not None and version < NUDGE_V:
+        if edited:
+            return f"replacing an edited v{version} {noun} with v{NUDGE_V}"
+        return f"updated {noun} v{version} -> v{NUDGE_V}"
+    if verb == "kept" and version == NUDGE_V and edited:
+        return f"kept edited v{NUDGE_V} {noun}"
+    return f"{verb} {noun}"
 
 
 def _remove_block(path: Path) -> bool:
@@ -874,10 +915,28 @@ def _reenroll_target(target: Path, is_skill: bool) -> None:
     _save_state(targets, skills, removing)
 
 
-# Uninstall sentinel: taught blocks must vanish seconds after agrep is deleted,
+# Uninstall sentinel: taught blocks must vanish within minutes of agrep being deleted,
 # not scheduler-hours - per-platform watch catalog on _sentinel_install's docstring.
 
-TASK_NAME = "agrep-sentinel"
+def _sentinel_scope() -> str:
+    path = os.path.normcase(str(common.DATA_DIR.resolve()))
+    return hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
+
+
+def _sentinel_task_name() -> str:
+    return f"agrep-sentinel-{_sentinel_scope()}"
+
+
+def _launchd_label() -> str:
+    return f"com.agrep.sentinel-{_sentinel_scope()}"
+
+
+_LEGACY_TASK_NAME = "agrep-sentinel"
+_LEGACY_LAUNCHD_LABEL = "com.agrep.sentinel"
+_LAUNCHD_ABSENT = ("could not find service", "could not find domain",
+                   "not found", "no such process")
+
+
 _LINUX_UNARMED_MARKER = "sentinel-linux-unarmed"
 
 # Windows resident children need CREATE_NO_WINDOW or each subprocess flashes a console.
@@ -892,9 +951,15 @@ from pathlib import Path
 DIR = Path(__file__).resolve().parent
 CFG = DIR / "sentinel.json"
 
+try:
+    cfg = json.loads(CFG.read_text(encoding="utf-8"))
+    TASK = cfg["task_name"]
+except (OSError, ValueError, KeyError):
+    sys.exit(0)
+
 k32 = ctypes.windll.kernel32
-# singleton: a second copy (logon task + install-time spawn) exits immediately
-k32.CreateMutexW(None, False, "Local\\agrep-sentinel")
+# singleton per data root: a second copy (logon task + install-time spawn) exits immediately
+k32.CreateMutexW(None, False, "Local\\" + TASK)
 if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
     sys.exit(0)
 
@@ -1025,10 +1090,6 @@ def strip(cfg):
 
 
 def main():
-    try:
-        cfg = json.loads(CFG.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
     cli = Path(cfg["cli"])
     handles = [h for h in (_watch(cli.parent), _watch(DIR)) if h]
     n = len(handles)
@@ -1043,10 +1104,14 @@ def main():
         if not CFG.exists():
             return  # agrep remove: deliberate, everything else already handled
         if not cli.exists():
-            time.sleep(20)  # a git checkout / restore can blip the file
-            if not CFG.exists():
-                return
-            if not cli.exists():
+            # a reinstall that rebuilds from source keeps the file gone for minutes
+            for _ in range(15):
+                time.sleep(20)
+                if not CFG.exists():
+                    return
+                if cli.exists():
+                    break
+            else:
                 strip(cfg)
                 return
         for h in handles:
@@ -1057,7 +1122,6 @@ main()
 '''.lstrip()
 
 
-LAUNCHD_LABEL = "com.agrep.sentinel"
 
 # mac/linux twins share this body; values are templated at install time (sh can't
 # parse JSON) and only the scheduler-teardown tail differs. Two-miss contract.
@@ -1114,8 +1178,13 @@ rename($tmp, $path) or do { unlink $tmp; exit 2 };
 _SENTINEL_SH = r"""#!/bin/sh
 DIR=@@DIR@@
 if [ -e @@CLI@@ ]; then exit 0; fi
-sleep 20  # a git checkout / restore can blip the file
-if [ -e @@CLI@@ ]; then exit 0; fi
+# a reinstall that rebuilds from source keeps the file gone for minutes
+n=0
+while [ "$n" -lt 15 ]; do
+    sleep 20
+    if [ -e @@CLI@@ ]; then exit 0; fi
+    n=$((n + 1))
+done
 
 # still gone: agrep was uninstalled - clean everything it taught.
 for t in @@TARGETS@@; do
@@ -1242,7 +1311,7 @@ def _sh_squote(s: str) -> str:
 
 
 def _plist_path() -> Path:
-    return HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    return HOME / "Library" / "LaunchAgents" / f"{_launchd_label()}.plist"
 
 
 def _systemd_unit_dir() -> Path:
@@ -1467,7 +1536,7 @@ def sentinel_status(*, timeout_s: float | None = None) -> dict:
                    for name in ("sentinel.json", "sentinel_watch.py")):
             return missing("Windows sentinel artifacts are missing")
         return run_status(
-            ["schtasks", "/Query", "/TN", TASK_NAME],
+            ["schtasks", "/Query", "/TN", _sentinel_task_name()],
             "Windows uninstall sentinel")
     if sys.platform == "darwin":
         if (not _plist_path().is_file()
@@ -1475,14 +1544,14 @@ def sentinel_status(*, timeout_s: float | None = None) -> dict:
                 or not (common.DATA_DIR / "sentinel_strip.pl").is_file()):
             return missing("macOS sentinel artifacts are missing")
         return run_status(
-            ["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+            ["launchctl", "print", f"gui/{os.getuid()}/{_launchd_label()}"],
             "macOS uninstall sentinel")
     if sys.platform.startswith("linux"):
         if not all((common.DATA_DIR / name).is_file()
                    for name in ("sentinel.sh", "sentinel_strip.pl")):
             return missing("Linux sentinel artifacts are missing")
 
-        units = (f"{TASK_NAME}.path", f"{TASK_NAME}.timer")
+        units = (f"{_sentinel_task_name()}.path", f"{_sentinel_task_name()}.timer")
         for unit in units:
             for action in ("is-enabled", "is-active"):
                 left = remaining()
@@ -1536,8 +1605,66 @@ def _pythonw() -> str:
     return str(w if w.exists() else exe)
 
 
+def _console_text(raw: bytes) -> str:
+    """schtasks writes pipes in the console code page, whatever its XML declares."""
+    return raw.decode("oem" if os.name == "nt" else "utf-8", "replace")
+
+
+def _windows_task_runs_watcher(task_xml: str, watcher: Path) -> bool | None:
+    """Whether an exported task's Exec action names `watcher`; None when unparsable."""
+    import xml.etree.ElementTree as ET
+    try:
+        actions = ET.fromstring(task_xml).findall(".//{*}Exec")
+    except ET.ParseError:
+        return None
+    expected = {os.path.normcase(str(watcher)),
+                os.path.normcase(str(watcher.resolve()))}
+    for action in actions:
+        command = " ".join(action.findtext(f"{{*}}{tag}") or ""
+                           for tag in ("Command", "Arguments"))
+        for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', command):
+            token = quoted or bare
+            spellings = {os.path.normcase(token)}
+            try:
+                spellings.add(os.path.normcase(str(Path(token).resolve())))
+            except (OSError, ValueError):
+                pass
+            if spellings & expected:
+                return True
+    return False
+
+
+def _retire_legacy_windows_sentinel() -> bool:
+    """Retire the unscoped `agrep-sentinel` logon task only when its action proves
+    it runs this root's watcher; an unqueryable task counts as absent because
+    schtasks exits 1 for a missing task and an unreadable one alike."""
+    watcher = common.DATA_DIR / "sentinel_watch.py"
+    try:
+        query = subprocess.run(
+            ["schtasks", "/Query", "/TN", _LEGACY_TASK_NAME, "/XML", "ONE"],
+            capture_output=True, **_NO_WINDOW)
+        if query.returncode != 0:
+            return True
+        owned = _windows_task_runs_watcher(_console_text(query.stdout), watcher)
+        if owned is None:
+            return False
+        if not owned:
+            return True
+        removed = subprocess.run(
+            ["schtasks", "/Delete", "/TN", _LEGACY_TASK_NAME, "/F"],
+            capture_output=True, **_NO_WINDOW)
+        verified = subprocess.run(
+            ["schtasks", "/Query", "/TN", _LEGACY_TASK_NAME],
+            capture_output=True, **_NO_WINDOW)
+    except OSError:
+        return False
+    return removed.returncode == 0 and verified.returncode != 0
+
+
 def _sentinel_install_win(targets: list[Path]) -> bool:
     if _data_dir_readonly():
+        return False
+    if not _retire_legacy_windows_sentinel():
         return False
     d = common.DATA_DIR
     d.mkdir(parents=True, exist_ok=True)
@@ -1555,7 +1682,7 @@ def _sentinel_install_win(targets: list[Path]) -> bool:
                    if pi_extensions else "")
     _atomic_write_text(d / "sentinel.json", json.dumps({
         "cli": str(REPO / "cli.py"),
-        "task_name": TASK_NAME,
+        "task_name": _sentinel_task_name(),
         "mark_prefix": MARK_PREFIX,
         "mark_end": MARK_END,
         "targets": [str(t) for t in targets],
@@ -1573,7 +1700,7 @@ def _sentinel_install_win(targets: list[Path]) -> bool:
         return "'" + value.replace("'", "''") + "'"
 
     register = (
-        "Register-ScheduledTask -Force -TaskName " + _ps_quote(TASK_NAME)
+        "Register-ScheduledTask -Force -TaskName " + _ps_quote(_sentinel_task_name())
         + " -Action (New-ScheduledTaskAction -Execute "
         + _ps_quote(_pythonw())
         + " -Argument " + _ps_quote(f'"{watcher}"')
@@ -1587,7 +1714,7 @@ def _sentinel_install_win(targets: list[Path]) -> bool:
     if r.returncode != 0:
         # logon task revives the waiter after reboots; the spawn below covers right now
         r = subprocess.run(
-            ["schtasks", "/Create", "/F", "/TN", TASK_NAME, "/SC", "ONLOGON",
+            ["schtasks", "/Create", "/F", "/TN", _sentinel_task_name(), "/SC", "ONLOGON",
              "/TR", f'"{_pythonw()}" "{watcher}"'],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             **_NO_WINDOW)
@@ -1603,12 +1730,94 @@ def _sentinel_install_win(targets: list[Path]) -> bool:
     return r.returncode == 0 and launched and sentinel_armed()
 
 
+def _names_sentinel_script(candidates: list[str]) -> bool:
+    """Whether any candidate path is this data root's sentinel.sh."""
+    script = common.DATA_DIR / "sentinel.sh"
+    resolved = script.resolve()
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.is_absolute():
+            continue
+        if path == script:
+            return True
+        try:
+            if path.resolve() == resolved:
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+def _launchd_absent(result: subprocess.CompletedProcess) -> bool:
+    output = (result.stderr + result.stdout).lower()
+    return result.returncode != 0 and any(
+        marker in output for marker in _LAUNCHD_ABSENT)
+
+
+def _launchd_program(report: str) -> list[str] | None:
+    """ProgramArguments of a loaded job, from its `launchctl print` report."""
+    block = re.search(r"^\s*arguments = \{\n(.*?)^\s*\}", report, re.M | re.S)
+    if block:
+        return [line.strip() for line in block.group(1).splitlines()
+                if line.strip()]
+    program = re.search(r"^\s*program = (.+)$", report, re.M)
+    return [program.group(1).strip()] if program else None
+
+
+def _plist_names_sentinel_script(plist: Path) -> bool:
+    import plistlib
+    from xml.parsers.expat import ExpatError
+    try:
+        with plist.open("rb") as stream:
+            arguments = plistlib.load(stream).get("ProgramArguments")
+    except (OSError, ValueError, ExpatError, AttributeError):
+        return False
+    return isinstance(arguments, list) and _names_sentinel_script(
+        [argument for argument in arguments if isinstance(argument, str)])
+
+
+def _retire_legacy_mac_sentinel() -> bool:
+    """Retire the unscoped com.agrep.sentinel job only when launchd's own report
+    names this root's script; a plist in this HOME proves nothing about the
+    per-uid job, which another data root may own."""
+    target = f"gui/{os.getuid()}/{_LEGACY_LAUNCHD_LABEL}"
+    plists = [HOME / "Library" / "LaunchAgents" / f"{_LEGACY_LAUNCHD_LABEL}.plist"]
+    report = _launchctl("print", target)
+    if report.returncode == 0:
+        program = _launchd_program(report.stdout)
+        if program is None:
+            return False
+        if _names_sentinel_script(program):
+            loaded_from = re.search(r"^\s*path = (/.+)$", report.stdout, re.M)
+            if loaded_from:
+                plists.append(Path(loaded_from.group(1).strip()))
+            _launchctl("bootout", target)
+            if not _launchd_absent(_launchctl("print", target)):
+                return False
+    elif not _launchd_absent(report):
+        return False
+    try:
+        for plist in plists:
+            if plist.is_file() and _plist_names_sentinel_script(plist):
+                plist.unlink()
+    except OSError:
+        return False
+    return True
+
+
 def _sentinel_install_mac(targets: list[Path]) -> bool:
     if _data_dir_readonly():
         return False
+    if not _retire_legacy_mac_sentinel():
+        return False
     plist = _plist_path()
     subs = _sh_subs(targets) | {
-        "@@LABEL@@": LAUNCHD_LABEL,
+        "@@LABEL@@": _launchd_label(),
         "@@PLIST@@": _sh_squote(plist),
     }
     script = _write_sentinel_sh(_SENTINEL_TAIL_MAC, subs)
@@ -1616,21 +1825,17 @@ def _sentinel_install_mac(targets: list[Path]) -> bool:
     from xml.sax.saxutils import escape
     watch = "".join(f"<string>{escape(str(p))}</string>"
                     for p in _sentinel_watch_paths())
-    body = _LAUNCHD_PLIST.format(label=escape(LAUNCHD_LABEL),
+    body = _LAUNCHD_PLIST.format(label=escape(_launchd_label()),
                                  script=escape(str(script)), watch=watch)
     _atomic_write_text(plist, body)
     # bootstrap works from contexts load -w does not (daemon-spawned shells);
     # bootout only after the new body is on disk, so a failed load never
     # leaves less armed than before this ran
     domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
-                   capture_output=True, text=True, encoding="utf-8", errors="replace")
-    r = subprocess.run(["launchctl", "bootstrap", domain, str(plist)],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _launchctl("bootout", f"{domain}/{_launchd_label()}")
+    r = _launchctl("bootstrap", domain, str(plist))
     if r.returncode != 0:
-        r = subprocess.run(["launchctl", "load", "-w", str(plist)],
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+        r = _launchctl("load", "-w", str(plist))
     return r.returncode == 0 and sentinel_armed()
 
 
@@ -1651,8 +1856,103 @@ def _user_manager_unavailable() -> bool:
     return (observed.get("stdout") or "").strip().lower() in ("", "offline")
 
 
+_SYSTEMD_RETIRED = {
+    "is-enabled": {"disabled", "static", "indirect", "masked", "not-found"},
+    "is-active": {"inactive", "failed", "unknown"},
+}
+
+
+def _systemd_disable(*units: str) -> bool:
+    """disable --now, then prove each unit is neither enabled nor active."""
+    disabled: dict = {}
+    _systemctl_user("disable", "--now", *units, observation=disabled)
+    retired = disabled.get("state") == "complete"
+    for unit in units:
+        for action, states in _SYSTEMD_RETIRED.items():
+            observed: dict = {}
+            rc = _systemctl_user(action, unit, observation=observed)
+            retired = retired and (
+                rc != 0 and observed.get("state") == "complete"
+                and observed.get("stdout") in states)
+    return retired
+
+
+def _command_paths(command: str) -> list[str]:
+    """Program and script of `/bin/sh "<script>"` or systemd's space-joined argv."""
+    program, _, argument = command.strip().partition(" ")
+    return [program, argument.strip().strip('"')]
+
+
+def _unit_names_sentinel_script(service: Path) -> bool:
+    try:
+        text = service.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "ExecStart" \
+                and _names_sentinel_script(_command_paths(value)):
+            return True
+    return False
+
+
+def _retire_legacy_linux_sentinel() -> bool:
+    """Retire the unscoped agrep-sentinel units only when the user manager's
+    loaded ExecStart names this root's script; unit files in this HOME are
+    removed only when they name it too."""
+    unit_dir = _systemd_unit_dir()
+    service = unit_dir / f"{_LEGACY_TASK_NAME}.service"
+    timer = unit_dir / f"{_LEGACY_TASK_NAME}.timer"
+    path_unit = unit_dir / f"{_LEGACY_TASK_NAME}.path"
+    observed: dict = {}
+    _systemctl_user("show", service.name, "--property=LoadState,ExecStart",
+                    observation=observed)
+    if observed.get("state") == "budget-exceeded":
+        return False
+    load_state = None
+    commands: list[str] = []
+    for line in (observed.get("stdout") or "").splitlines():
+        key, _, value = line.partition("=")
+        if key == "LoadState":
+            load_state = value
+        elif key == "ExecStart":
+            commands.append(value)
+    if load_state is None:
+        if observed.get("state") == "complete" and not _user_manager_unavailable():
+            return False
+    elif load_state == "loaded":
+        argv = [re.search(r"argv\[\]=(.*?) ; ", command) for command in commands]
+        if not argv or None in argv:
+            return False
+        if any(_names_sentinel_script(_command_paths(found.group(1)))
+               for found in argv):
+            if not _systemd_disable(timer.name, path_unit.name):
+                return False
+    if not (service.is_file() and _unit_names_sentinel_script(service)):
+        return True
+    try:
+        for link, unit in (
+                (unit_dir / "paths.target.wants" / path_unit.name, path_unit),
+                (unit_dir / "timers.target.wants" / timer.name, timer)):
+            if link.is_symlink() and \
+                    link.resolve(strict=False) == unit.resolve(strict=False):
+                link.unlink()
+                try:
+                    link.parent.rmdir()
+                except OSError:
+                    pass
+        for unit in (service, timer, path_unit):
+            unit.unlink(missing_ok=True)
+    except OSError:
+        return False
+    _systemctl_user("daemon-reload")
+    return True
+
+
 def _sentinel_install_linux(targets: list[Path]) -> bool:
     if _data_dir_readonly():
+        return False
+    if not _retire_legacy_linux_sentinel():
         return False
     marker = common.DATA_DIR / _LINUX_UNARMED_MARKER
     try:
@@ -1660,9 +1960,9 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
     except OSError:
         return False
     unit_dir = _systemd_unit_dir()
-    service = unit_dir / f"{TASK_NAME}.service"
-    timer = unit_dir / f"{TASK_NAME}.timer"
-    path_unit = unit_dir / f"{TASK_NAME}.path"
+    service = unit_dir / f"{_sentinel_task_name()}.service"
+    timer = unit_dir / f"{_sentinel_task_name()}.timer"
+    path_unit = unit_dir / f"{_sentinel_task_name()}.path"
     links = (
         (unit_dir / "paths.target.wants" / path_unit.name, path_unit),
         (unit_dir / "timers.target.wants" / timer.name, timer),
@@ -1672,7 +1972,7 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
         for path in (service, timer, path_unit, *(link for link, _ in links))
     )
     subs = _sh_subs(targets) | {
-        "@@UNIT@@": TASK_NAME,
+        "@@UNIT@@": _sentinel_task_name(),
         "@@UNITS@@": " ".join(_sh_squote(u) for u in (service, timer, path_unit)),
     }
     script = _write_sentinel_sh(_SENTINEL_TAIL_LINUX, subs)
@@ -1731,43 +2031,37 @@ def _sentinel_remove() -> bool:
     try:
         if sys.platform == "win32":
             removed = subprocess.run(
-                ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+                ["schtasks", "/Delete", "/TN", _sentinel_task_name(), "/F"],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", **_NO_WINDOW)
             verified = subprocess.run(
-                ["schtasks", "/Query", "/TN", TASK_NAME],
+                ["schtasks", "/Query", "/TN", _sentinel_task_name()],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", **_NO_WINDOW)
             absent = verified.returncode != 0 and (
                 removed.returncode == 0 or any(
                     marker in (verified.stderr + verified.stdout).lower()
                     for marker in ("cannot find", "not found", "does not exist")))
+            absent = absent and _retire_legacy_windows_sentinel()
         elif sys.platform == "darwin":
             plist = _plist_path()
-            domain = f"gui/{os.getuid()}"
-            bootout = subprocess.run(
-                ["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace")
-            unloaded = subprocess.run(
-                ["launchctl", "unload", str(plist)], capture_output=True,
-                text=True, encoding="utf-8", errors="replace")
-            verified = subprocess.run(
-                ["launchctl", "print", f"{domain}/{LAUNCHD_LABEL}"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace")
-            missing = (verified.stderr + verified.stdout).lower()
+            target = f"gui/{os.getuid()}/{_launchd_label()}"
+            bootout = _launchctl("bootout", target)
+            unloaded = _launchctl("unload", str(plist))
+            verified = _launchctl("print", target)
             absent = verified.returncode != 0 and (
                 bootout.returncode == 0 or unloaded.returncode == 0
-                or any(marker in missing for marker in (
-                    "could not find service", "not found", "no such process")))
+                or _launchd_absent(verified))
+            absent = absent and _retire_legacy_mac_sentinel()
         elif sys.platform.startswith("linux"):
             unit_dir = _systemd_unit_dir()
             units = tuple(
-                unit_dir / f"{TASK_NAME}{suffix}"
+                unit_dir / f"{_sentinel_task_name()}{suffix}"
                 for suffix in (".service", ".timer", ".path")
             )
             links = (
-                unit_dir / "paths.target.wants" / f"{TASK_NAME}.path",
-                unit_dir / "timers.target.wants" / f"{TASK_NAME}.timer",
+                unit_dir / "paths.target.wants" / f"{_sentinel_task_name()}.path",
+                unit_dir / "timers.target.wants" / f"{_sentinel_task_name()}.timer",
             )
             marker = common.DATA_DIR / _LINUX_UNARMED_MARKER
             try:
@@ -1784,23 +2078,10 @@ def _sentinel_remove() -> bool:
             if proven_unarmed:
                 absent = True
             else:
-                disabled: dict = {}
-                _systemctl_user(
-                    "disable", "--now", f"{TASK_NAME}.timer", f"{TASK_NAME}.path",
-                    observation=disabled)
-                absent = disabled.get("state") == "complete"
-                expected = {
-                    "is-enabled": {
-                        "disabled", "static", "indirect", "masked", "not-found"},
-                    "is-active": {"inactive", "failed", "unknown"},
-                }
-                for unit in (f"{TASK_NAME}.timer", f"{TASK_NAME}.path"):
-                    for action, states in expected.items():
-                        observed: dict = {}
-                        rc = _systemctl_user(action, unit, observation=observed)
-                        absent = absent and (
-                            rc != 0 and observed.get("state") == "complete"
-                            and observed.get("stdout") in states)
+                absent = _systemd_disable(
+                    f"{_sentinel_task_name()}.timer",
+                    f"{_sentinel_task_name()}.path")
+            absent = absent and _retire_legacy_linux_sentinel()
         else:
             absent = True
     except OSError:
@@ -1812,7 +2093,7 @@ def _sentinel_remove() -> bool:
             _plist_path().unlink(missing_ok=True)
         elif sys.platform.startswith("linux"):
             for suffix in (".service", ".timer", ".path"):
-                (_systemd_unit_dir() / f"{TASK_NAME}{suffix}").unlink(missing_ok=True)
+                (_systemd_unit_dir() / f"{_sentinel_task_name()}{suffix}").unlink(missing_ok=True)
             _systemctl_user("daemon-reload")
         for n in ("sentinel.ps1", "sentinel.sh", "sentinel.json", "sentinel.miss",
                   "sentinel_watch.py", "sentinel_skill_front",
@@ -1921,6 +2202,13 @@ def reconcile() -> list[str]:
             if current_count == 1 and not has_legacy and (
                     not is_skill
                     or _has_skill_frontmatter(cur, _preferred_eol(cur))):
+                current = next(
+                    span for span in spans if span.version == NUDGE_V)
+                if _body_provenance(cur, current) == "edited":
+                    refusals.append(_reconcile_issue(
+                        p, "edited",
+                        f"agrep block v{NUDGE_V} was edited after install; "
+                        "kept as is until a newer agrep setup replaces it"))
                 continue
             if exists:
                 kind = "unowned-skill" if is_skill and not spans else "drifted"
@@ -2095,7 +2383,7 @@ def _install() -> int:
     for agent, proof, target in MD_TARGETS:
         if not proof.is_dir():
             continue
-        legacy = _legacy_block_version(target)
+        version, edited = _installed_block(target)
         try:
             verb = _write_block(target)
         except (OSError, ValueError) as exc:
@@ -2105,15 +2393,13 @@ def _install() -> int:
         if verb == "skipped":
             failed = True
             continue
-        transition = (
-            f" v{legacy} -> v{NUDGE_V}"
-            if verb == "updated" and legacy is not None else "")
-        print(f"  {agent}: {verb} block{transition} in {target}")
+        print(f"  {agent}: {_transition(verb, 'block', version, edited)} "
+              f"in {target}")
         written.append(target)
     for agent, proof, target in SKILL_TARGETS:
         if not proof.is_dir():
             continue
-        legacy = _legacy_block_version(target)
+        version, edited = _installed_block(target)
         try:
             verb = _write_skill(target)
         except (OSError, ValueError) as exc:
@@ -2124,10 +2410,8 @@ def _install() -> int:
             print(f"  {agent}: refused to overwrite existing unowned skill {target}")
             failed = True
             continue
-        transition = (
-            f" v{legacy} -> v{NUDGE_V}"
-            if verb == "updated" and legacy is not None else "")
-        print(f"  {agent}: {verb} skill{transition} in {target}")
+        print(f"  {agent}: {_transition(verb, 'skill', version, edited)} "
+              f"in {target}")
         written.append(target)
         skills.append(target)
     enrolled = {str(target) for target in written}

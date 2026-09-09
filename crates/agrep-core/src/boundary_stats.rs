@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::cache::write_bytes_atomic;
+use crate::cache::{write_bytes_atomic, SessionAlias};
 use crate::model::Message;
 
 pub const FILE_NAME: &str = "boundary_stats.json";
@@ -508,17 +508,28 @@ fn root_for(
     root
 }
 
-fn layout(
-    msgs: &[Message],
+fn layout<'m>(
+    msgs: &'m [Message],
+    aliases: &[SessionAlias],
 ) -> (
     HashMap<SessionKey, SessionKey>,
-    HashMap<SessionKey, Vec<&Message>>,
+    HashMap<SessionKey, Vec<&'m Message>>,
 ) {
+    let canonical: HashMap<SessionKey, SessionKey> = aliases
+        .iter()
+        .map(|claim| {
+            (
+                (claim.agent.to_string(), claim.alias.clone()),
+                (claim.agent.to_string(), claim.session.to_string()),
+            )
+        })
+        .collect();
     let mut parents = HashMap::new();
     for message in msgs.iter().filter(|message| !message.parent.is_empty()) {
+        let parent = (message.agent.to_string(), message.parent.to_string());
         parents.insert(
             (message.agent.to_string(), message.session.to_string()),
-            (message.agent.to_string(), message.parent.to_string()),
+            canonical.get(&parent).cloned().unwrap_or(parent),
         );
     }
     let mut memo = HashMap::new();
@@ -711,8 +722,8 @@ fn quality_ceiling(token: &str, counts: &Counts) -> u32 {
     2
 }
 
-fn rebuild_cache(msgs: &[Message], generation: &str) -> BoundaryCache {
-    let (sessions, families) = layout(msgs);
+fn rebuild_cache(msgs: &[Message], aliases: &[SessionAlias], generation: &str) -> BoundaryCache {
+    let (sessions, families) = layout(msgs, aliases);
     let collected: Vec<_> = families
         .into_par_iter()
         .map(|(family, messages)| (family, family_tokens(&messages)))
@@ -759,29 +770,28 @@ fn stats_from_cache(cache: &BoundaryCache) -> BoundaryStats {
 
 #[cfg(test)]
 fn build(msgs: &[Message], generation: &str) -> BoundaryStats {
-    stats_from_cache(&rebuild_cache(msgs, generation))
+    stats_from_cache(&rebuild_cache(msgs, &[], generation))
 }
 
 pub fn write(
     msgs: &[Message],
+    aliases: &[SessionAlias],
     path: &Path,
     cache_path: &Path,
     generation: &str,
     prior_generation: Option<&str>,
     touched: &HashSet<String>,
-    force: bool,
 ) -> anyhow::Result<usize> {
     let cached = std::fs::read(cache_path)
         .ok()
         .and_then(|bytes| bincode::deserialize::<BoundaryCache>(&bytes).ok())
         .filter(|cache| {
-            !force
-                && cache.schema == CACHE_SCHEMA
+            cache.schema == CACHE_SCHEMA
                 && cache.build_id == BUILD_ID
                 && prior_generation.is_some_and(|prior| cache.generation == prior)
         });
     let mut cache = if let Some(mut cache) = cached {
-        let (sessions, families) = layout(msgs);
+        let (sessions, families) = layout(msgs, aliases);
         let mut affected = HashSet::new();
         for (session, old_family) in &cache.sessions {
             if sessions.get(session) != Some(old_family) || touched.contains(&session.1) {
@@ -797,7 +807,7 @@ pub fn write(
             }
         }
         if affected.is_empty() && cache.generation != generation {
-            rebuild_cache(msgs, generation)
+            rebuild_cache(msgs, aliases, generation)
         } else {
             let replacements: Vec<_> = affected
                 .par_iter()
@@ -831,7 +841,7 @@ pub fn write(
             cache
         }
     } else {
-        rebuild_cache(msgs, generation)
+        rebuild_cache(msgs, aliases, generation)
     };
     cache.generation = generation.to_string();
     compact_dead_tokens(&mut cache);
@@ -851,7 +861,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use super::{build, collect_text, counts_live, layout, write, BoundaryCache};
+    use super::{build, collect_text, counts_live, layout, write, BoundaryCache, SessionAlias};
     use crate::model::Message;
 
     fn message(session: &str, parent: &str, text: &str) -> Message {
@@ -944,7 +954,7 @@ mod tests {
             message("cycle-a", "cycle-b", "cycle"),
             message("cycle-b", "cycle-a", "cycle"),
         ];
-        let (sessions, families) = layout(&rows);
+        let (sessions, families) = layout(&rows, &[]);
         assert_eq!(families.len(), 3);
         assert_eq!(
             sessions[&("codex".to_string(), "root-a".to_string())].1,
@@ -966,6 +976,33 @@ mod tests {
             sessions[&("codex".to_string(), "cycle-b".to_string())].1,
             "cycle-a"
         );
+    }
+
+    #[test]
+    fn a_resolved_alias_folds_the_filename_parent_into_the_header_family() {
+        let rows = vec![
+            message("header-id", "", "alpha"),
+            message("child", "file-id", "alpha"),
+            message("grandchild", "child", "alpha"),
+        ];
+        let (split, _) = layout(&rows, &[]);
+        assert_eq!(
+            split[&("codex".to_string(), "child".to_string())].1,
+            "file-id"
+        );
+        let claim = SessionAlias {
+            agent: "codex",
+            alias: "file-id".into(),
+            session: "header-id".into(),
+        };
+        let (sessions, families) = layout(&rows, std::slice::from_ref(&claim));
+        assert_eq!(families.len(), 1);
+        for session in ["header-id", "child", "grandchild"] {
+            assert_eq!(
+                sessions[&("codex".to_string(), session.to_string())].1,
+                "header-id"
+            );
+        }
     }
 
     #[test]
@@ -1064,7 +1101,7 @@ mod tests {
             message("child", "root", "akd"),
             message("other", "", "zzakdzz xidq"),
         ];
-        write(&first, &path, &cache, "3:one", None, &HashSet::new(), false).unwrap();
+        write(&first, &[], &path, &cache, "3:one", None, &HashSet::new()).unwrap();
         let initial: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(initial["tokens"]["id"], serde_json::json!([2, 1, 2]));
@@ -1076,12 +1113,12 @@ mod tests {
         ];
         write(
             &second,
+            &[],
             &path,
             &cache,
             "3:two",
             Some("3:one"),
             &HashSet::from(["child".to_string()]),
-            false,
         )
         .unwrap();
         let body: serde_json::Value =
@@ -1112,12 +1149,12 @@ mod tests {
             .collect();
         write(
             &first,
+            &[],
             &path,
             &cache_path,
             "3:churn-one",
             None,
             &HashSet::new(),
-            false,
         )
         .unwrap();
         let before: BoundaryCache =
@@ -1127,12 +1164,12 @@ mod tests {
         let second = vec![message("session-0", "", &base36_token(0))];
         write(
             &second,
+            &[],
             &path,
             &cache_path,
             "3:churn-two",
             Some("3:churn-one"),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         let after: BoundaryCache =
@@ -1160,12 +1197,12 @@ mod tests {
         }
         write(
             &[],
+            &[],
             &path,
             &cache_path,
             "3:churn-three",
             Some("3:churn-two"),
             &HashSet::from(["session-0".to_string()]),
-            false,
         )
         .unwrap();
         let empty: serde_json::Value =

@@ -544,6 +544,36 @@ class SegmentQueryTests(unittest.TestCase):
                         surface.SEMANTIC_INDEX_UPDATE_REASON):
                     refs.resolve([2])
 
+    def test_committed_snapshot_queries_while_family_publication_moves(
+            self) -> None:
+        with _temporary_root() as root:
+            source, meta, _, corpus, _ = self._fixture(root)
+            race = common.TranscriptPublicationRace(
+                "session-family publication precedes its ingest signature")
+            publication = common.FamilyPublication(
+                signature="committed",
+                signature_sha256=source["ingest_signature"],
+                stamp="stable", moving=True)
+            with mock.patch.object(
+                    common, "transcript_generation", side_effect=race), \
+                    mock.patch.object(
+                        common, "read_family_publication",
+                        return_value=publication):
+                _, matrix, refs, coverage = segment_query.open_current(
+                    meta, need_matrix=True)
+                refs.corpus_connect = lambda: sqlite3.connect(corpus)
+                scores = matrix @ np.asarray([1.0, 0.0], dtype=np.float32)
+                resolved = refs.resolve([2])
+        self.assertEqual(
+            {key: coverage[key] for key in ("indexed", "total", "pending")},
+            {"indexed": 2, "total": 2, "pending": 0},
+        )
+        np.testing.assert_allclose(scores[2:], [0.8, 0.6])
+        self.assertEqual(
+            (resolved[0]["session"], resolved[0]["text"]),
+            ("s-a", "current alpha"),
+        )
+
     def test_matrix_refs_filters_and_text_proof(self) -> None:
         with _temporary_root() as root:
             source, meta, _, corpus, _ = self._fixture(root)
@@ -561,7 +591,7 @@ class SegmentQueryTests(unittest.TestCase):
                 self.assertEqual(refs.family_id_for_session("s-c"), 2)
                 self.assertIsNone(refs.family_id_for_session("missing"))
                 np.testing.assert_array_equal(refs.eligible({
-                    "agent": "COD", "project": "ALP", "chat": "S-",
+                    "agent": "COD", "project": "ALP*", "chat": "S-",
                     "who": "user", "model": "GPT-5", "since_ms": 250,
                     "until_ms": 350,
                 }), [2])

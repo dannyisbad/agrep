@@ -180,6 +180,7 @@ _DOWNLOAD_CLAIM_BYTES = 4096
 _DOWNLOAD_CREATE_GRACE_S = 2.0
 _DOWNLOAD_POLL_S = 0.05
 _DOWNLOAD_RETRY_S = 0.02
+_DOWNLOAD_WAIT_DISCLOSE_S = 2.0
 _DOWNLOAD_FS_RETRY_DELAYS = (0.0, 0.01, 0.05)
 
 
@@ -322,6 +323,14 @@ def _download_claim_state(observed: ownerfile.Snapshot) -> tuple[bool, float]:
         return 0.0 <= age < _DOWNLOAD_CREATE_GRACE_S, age
 
 
+def _download_claim_holder(observed: ownerfile.Snapshot) -> str:
+    try:
+        pid = int(json.loads(observed.raw.decode("utf-8")).get("pid") or 0)
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        pid = 0
+    return f"pid {pid}" if pid > 0 else "unknown pid"
+
+
 def _download_claim_leaf_problem(path: Path) -> OSError | None:
     try:
         info = path.lstat()
@@ -364,9 +373,11 @@ def _acquire_download_claim(root: Path) -> ownerfile.Handle | None:
                 verified[name] = current
         return True
 
-    deadline = time.monotonic() + MODEL_DOWNLOAD_WAIT_S
+    started = time.monotonic()
+    deadline = started + MODEL_DOWNLOAD_WAIT_S
     reclaimed_last = False
-    while time.monotonic() < deadline:
+    disclosed = False
+    while (now := time.monotonic()) < deadline:
         if model_complete():
             return None
         try:
@@ -398,6 +409,13 @@ def _acquire_download_claim(root: Path) -> ownerfile.Handle | None:
                         path, observed, tombstone=True):
                     reclaimed_last = True
                     continue
+            if not disclosed and now - started >= _DOWNLOAD_WAIT_DISCLOSE_S:
+                disclosed = True
+                common.log(
+                    "embedder: waiting for another agrep process "
+                    f"({_download_claim_holder(observed)}) to finish the model "
+                    f"download; giving up after {MODEL_DOWNLOAD_WAIT_S:g}s "
+                    "(Ctrl-C interrupts the wait)")
             time.sleep(_DOWNLOAD_POLL_S)
         except OSError as exc:
             raise EmbedderUnavailable(f"could not claim model download: {exc}") from exc

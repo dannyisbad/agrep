@@ -65,6 +65,13 @@ def _command(*argv: object) -> str:
         *argv, fallback="agrep recall <query-with-control-characters>")
 
 
+def _expand_command(target: str, turn: int) -> str:
+    """The one pointer a capped message carries, shared with `around`."""
+    return console.shell_command(
+        "agrep", "around", target, turn, "-C", 0, "--max-chars", 0,
+        fallback="agrep around <session> <turn> -C 0 --max-chars 0")
+
+
 def _utf8_size(value: str) -> int:
     return len(value.encode("utf-8", errors="replace"))
 
@@ -103,7 +110,7 @@ def _content_budget(budget: int) -> int:
 # _cap's tail marker; stripped before re-shrinking so a second cut never slices
 # through the agrep-around command the first one embedded.
 _CAP_MARKER_RE = re.compile(
-    r" \[\+[\d,]+ chars - agrep around .+ \d+ -C 0(?: --full)?\]\Z")
+    r" \[\+[\d,]+ chars - agrep around .+ \d+ -C 0(?: --max-chars 0| --full)?\]\Z")
 
 
 def _shrink_row(row: dict, session_index=None,
@@ -123,7 +130,7 @@ def _shrink_row(row: dict, session_index=None,
         row["omitted_chars"] = int(row.get("omitted_chars") or 0) + len(body) - keep
         return len(row["text"]) < len(old)
     target = compact.encode_session_target(sess, session_index=session_index)
-    expand = _command("agrep", "around", target, turn, "-C", 0)
+    expand = _expand_command(target, turn)
     if anchors and head is None:
         # law 6: a halving that would drop the row's own query match slides
         # the kept slice to the match instead of keeping the blind head
@@ -793,13 +800,17 @@ def _weak_line(head: str, text: str, anchors: list[re.Pattern],
 def _merge_key(hit: dict) -> tuple:
     """Merged page order: lived evidence before command-lineage echoes, then
     strength and lane. An all-meta set keeps the prior score order unchanged;
-    semantic rows sort by cosine rather than display-annotated score."""
+    semantic rows sort by cosine rather than display-annotated score, weak
+    meaning rows (sub-strong or missing the query's terms) after confident."""
     return (hit.get("_meta_row") is True,
             _weak_scatter(hit), hit.get("_recall_lane", 0),
             hit.get("matched") == "all-terms",
+            search._semantic_row_weak(hit),
             -(hit.get("sem_score") if hit.get("sem_score") is not None
               else hit.get("score", 0)),
             -(hit.get("ts") or 0), hit["session"], hit.get("turn") or 0)
+
+
 
 
 def _auto_semantic_query(query: str) -> bool:
@@ -922,23 +933,13 @@ def _probe_line(
         queries: list[str], hits: list[dict], engine: str,
         total_sessions: int | None = None, session_index=None,
 ) -> str | None:
-    """Build the one-line probe pointer, or None when evidence is too weak.
-
-    Confidence is judged per lane: when no hit carries a semantic score, only
-    the keyword lane served, and its own standard applies - a row holding every
-    query term is a confident pointer. Absent semantic scores must never demote
-    keyword evidence to a miss that plain search would answer first try.
-    Related-terms rows stay weak in every lane.
-
-    Every lane has a floor, because "this box has not hit that before" is a
-    useful answer and the best available row is not evidence that it is a
-    good one. The bag-of-words lane's floor is the lexical evidence its own
-    ranking measured: all-terms means every token was found as a SUBSTRING,
-    which unrelated prose satisfies routinely, and an unscored row cannot be
-    judged at all."""
-    keyword_only = all(h.get("sem_score") is None for h in hits)
+    """Build one probe pointer from independently supported retrieval evidence."""
+    keyword_only = all(
+        h.get("sem_score") is None for h in hits if not h.get("_probe_query_echo"))
 
     def confident(h: dict) -> bool:
+        if h.get("_probe_query_echo"):
+            return False
         if h.get("sem_score") is not None:
             return h["sem_score"] >= PROBE_MIN_SEM
         if h.get("matched") not in ("all-terms", "content-terms"):
@@ -970,8 +971,6 @@ def _probe_line(
                                    _ts_label(top.get("ts") or 0),
                                    "~self" if top.get("_self") else "") if x)
     meaning = top.get("sem_score") is not None
-    # F11: no internal store names, real plurals, and the evidence kind is
-    # said once - by the pointer label, not the lead too
     if total_sessions is None:
         lead = f"top results span {surface.count_noun(sessions, 'past session')}"
     elif not total_sessions and meaning:
@@ -986,8 +985,6 @@ def _probe_line(
     else:
         lead = (f"{surface.count_noun(total_sessions, 'past session')} "
                 f"{'matches' if total_sessions == 1 else 'match'}")
-    # the pointer is hedged evidence, never a conclusion; the label owns the
-    # hedge, the provenance clause, and the ~meta marker
     label = display_policy.probe_pointer_label(
         top, semantic=meaning,
         weak=bool(meaning and search._semantic_row_weak(top)))
@@ -995,12 +992,16 @@ def _probe_line(
     # multi-query probe suggests pack with each query as its own argument
     pull = (_command("agrep", "recall", queries[0]) if len(queries) == 1
             else _command("agrep", "pack", *queries))
-    return f"recall: {lead} - {label}: {where} - pull: {pull}"
+    qualifier = f" · {label}" if label else ""
+    return f"recall: {lead}{qualifier} · {where} · pull: {pull}"
 
 
 def _probe(queries: list[str], hits: list[dict], engine: str,
            total_sessions: int | None = None, budget: int = 0,
            session_index=None, *, meaning_down: bool = False,
+           meaning_status: dict | None = None,
+           meaning_coverage: dict | None = None,
+           meaning_accelerator: dict | None = None,
            tools_excluded: bool = False,
            coverage: dict | None = None,
            verdict: surface.MissVerdict | None = None,
@@ -1017,7 +1018,6 @@ def _probe(queries: list[str], hits: list[dict], engine: str,
         # says 0 and carries the same owned record the zero-hit path renders
         empty = (coverage or {}).get("empty_dimensions") or []
         line = display_policy.probe_miss_line(
-            engine,
             corpus_sessions=0 if empty
             else summary.get("sessions") if summary else None)
         for dimension in empty:
@@ -1029,8 +1029,10 @@ def _probe(queries: list[str], hits: list[dict], engine: str,
             if verdict.owns_freshness and said_once is not None:
                 said_once.add("freshness")
         elif meaning_down:
-            # the one owned lane-down story (F4), not a third phrasing
-            line = f"{line} - {surface.SEMANTIC_LANE_POLICY.keyword_only}"
+            notice = surface.semantic_keyword_only_notice(
+                meaning_status, brief=True, coverage=meaning_coverage,
+                accelerator=meaning_accelerator)
+            line = f"{line} - {notice}"
         _write_payload(
             _fit_probe_line(line, budget, tools_excluded), budget)
         return 1
@@ -1217,7 +1219,8 @@ def _handle_filter_override(args, session: str, window: dict,
     filters whose own predicates would have excluded the served session."""
     supplied = [flag for flag, value in (
         ("--chat", args.chat), ("--agent", args.agent),
-        ("--project", args.project), ("--model", args.model),
+        ("--project", args.project),
+        ("--exclude-project", args.exclude_project), ("--model", args.model),
         ("--who", args.who), ("--no-who", args.no_who),
         ("--since", args.since), ("--until", args.until))
         if value not in (None, "")]
@@ -1226,14 +1229,17 @@ def _handle_filter_override(args, session: str, window: dict,
     mismatched = []
     if args.chat and session != args.chat:
         mismatched.append("--chat")
-    # mirror the engine predicates (substring, casefolded); --model/--who row
-    # facts are not in the window, so those stay named-but-unverified
+    # mirror the engine predicates; --model/--who row facts are not in the
+    # window, so those stay named-but-unverified
     if args.agent and args.agent.casefold() not in str(
             window.get("agent") or "").casefold():
         mismatched.append("--agent")
-    if args.project and args.project.casefold() not in str(
-            window.get("project") or "").casefold():
+    if args.project and not surface.project_label_matches(
+            window.get("project"), args.project):
         mismatched.append("--project")
+    if args.exclude_project and surface.project_label_matches(
+            window.get("project"), args.exclude_project):
+        mismatched.append("--exclude-project")
     if ts is not None:
         if since_ms is not None and ts < since_ms:
             mismatched.append("--since")
@@ -1268,37 +1274,42 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=examples +
-               "\nprose recall combines keyword + meaning; -s forces meaning only.\n"
-               "exit: 0 found, 1 proven no confident result, "
-               "2 usage, unverified result, or a required lane unavailable.")
+               "\nCombines keyword and meaning search; -s uses meaning only.\n"
+               "exit: 0 found, 1 no confident match with complete search coverage, "
+               "2 invalid arguments or incomplete search.")
     ap.add_argument("query", nargs="+",
                     help="what to look for" if one else "queries, each searched separately")
     ap.add_argument("--hits", type=int, default=None, metavar="N",
-                    help="top chats in the shared pack, round-robin across queries "
-                         "(default: 3, growing with --budget; floored at one per query)")
+                    help="chats to show (default: 3, increasing with "
+                         "--budget; at least one per query)")
     ap.add_argument("--budget", type=int, default=None, metavar="BYTES",
-                    help="cap on rendered output bytes, including the final newline "
-                         "(default 200000; 0 = uncapped)")
+                    help="maximum output bytes (default 200000; 0 = uncapped)")
     ap.add_argument("-C", "--context", type=int, default=2, metavar="N",
                     help="turns before and after each hit (default 2)")
     ap.add_argument("-s", "--semantic", action="store_true",
                     help="force semantic-only search (recall normally uses keyword + meaning)")
     ap.add_argument("--lexical", action="store_true",
-                    help="keyword only: disable the default meaning lane")
+                    help="search keywords only")
     self_group = ap.add_mutually_exclusive_group()
     self_group.add_argument("--self", dest="include_self", action="store_true",
-                            help="include the calling agent's current-window echoes "
-                                 "(older/family hits are otherwise labeled ~self)")
+                            help="include the calling agent's live context window "
+                                 "(hidden, with older turns labeled ~self, only "
+                                 "when the calling session is identified)")
     self_group.add_argument("--no-self", dest="force_no_self",
                             action="store_true",
                             help="conservatively exclude the whole calling session "
                                  "family, even outside agent shells")
     ap.add_argument("--all-side-chats", action="store_true",
-                    help="allow sibling child chats from one root conversation to "
-                         "occupy separate ranked slots")
+                    help="ranking only: let sibling side chats from one root "
+                         "conversation occupy separate ranked slots")
+    ap.add_argument("--no-side", dest="no_side", action="store_true",
+                    help="hide side chats (spawned subagent sessions) entirely")
     ap.add_argument("--agent", help=f"only this agent ({', '.join(common.KNOWN_AGENTS)})")
-    ap.add_argument("--project", help="only chats whose project label contains this "
-                                      "(usually the workspace folder name)")
+    project_group = ap.add_mutually_exclusive_group()
+    project_group.add_argument("--project", help=surface.PROJECT_HELP)
+    project_group.add_argument("--here", action="store_true",
+                               help=surface.HERE_HELP)
+    ap.add_argument("--exclude-project", help=surface.EXCLUDE_PROJECT_HELP)
     ap.add_argument("--model", help="only turns from this exact model name")
     ap.add_argument("--soft", "--model-soft", dest="model_soft", action="store_true",
                     help="with --model, substring-match the model name (like *model*)")
@@ -1306,7 +1317,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     help="only these speakers, comma-separated "
                          "(same names as `agrep search`)")
     ap.add_argument("--no-who", dest="no_who", metavar="LIST",
-                    help="exclude these speakers (e.g. --no-who subagent)")
+                    help="exclude these speakers' rows (e.g. --no-who subagent "
+                         "drops subagent-spoken turns; --no-side hides side chats)")
     ap.add_argument("--no-meta", dest="no_meta", action="store_true",
                     help="drop structurally proven ~meta rows; retain one marked "
                          "row when it is the query's only evidence")
@@ -1319,10 +1331,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     ap.add_argument("--json", action="store_true",
                     help="one JSON object: {query, engine, hits: [{..., window: [...]}]}")
     ap.add_argument("--probe", action="store_true",
-                    help="confidence check only: one qualifying candidate "
-                         "pointer, compact scoped miss otherwise; scope notices "
-                         "remain on stderr "
-                         "(exit 0 hit / 1 proven miss / 2 unverified)")
+                    help="return one result pointer or a brief miss "
+                         "(exit 0 found / 1 no confident match / 2 incomplete)")
     ap.add_argument("--no-auto", action="store_true",
                     help=surface.NO_AUTO_HELP)
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
@@ -1336,6 +1346,11 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         ap.error(blank_filter)
     if args.agent:
         args.agent = common.normalize_agent_name(args.agent.lower())
+    if args.here:
+        args.project = surface.here_project()
+        here_error = surface.here_project_error(args.project)
+        if here_error:
+            ap.error(here_error)
     if args.hits is not None and args.hits < 1:
         ap.error("--hits must be at least 1")
     if args.budget is not None and args.budget < 0:
@@ -1673,7 +1688,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                           else max(0.0, float(auto_semantic_timeout_s)))
     fkw = dict(limit=query_target, session_limit=query_target,
                sort="score", agent=args.agent,
-               project=args.project, who=args.who_filter, model=args.model,
+               project=args.project, exclude_project=args.exclude_project,
+               who=args.who_filter, model=args.model,
                model_soft=args.model_soft, chat=args.chat,
                since_ms=since_ms, until_ms=until_ms,
                family_diverse=family_diverse,
@@ -1681,11 +1697,12 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                allow_fallback=not args.lexical,
                # probe prints an exact session count; normal recall skips corpus-wide totals
                exact_totals=args.probe)
+    if args.no_side:
+        fkw["_exclude_sessions"] = search.indexed_side_sessions()
     if self_policy is not None:
         # scope discloses once, at the end of the render, through the one
         # owned notice (F1/F4) - no second policy line up front
-        query_filters = self_policy.query_filters()
-        fkw.update(query_filters)
+        self_policy.apply_filters(fkw)
 
     active_semantic_pending = None
     tools_excluded = False
@@ -1709,6 +1726,16 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     and result is not None
                     and not result.get("fallback_recommended")):
                 self_count_specs.append((q, mode, dict(kwargs), None))
+            if args.probe and result is not None:
+                for hit in result["hits"]:
+                    hit["_recall_query"] = query_i
+                    if self_policy is not None:
+                        hit.pop("_self", None)
+                        if self_policy.labels(
+                                str(hit.get("session") or ""), hit.get("turn")):
+                            hit["_self"] = True
+                search._mark_history_meta(
+                    result["hits"], queries, probe_mode=mode)
             return result
         except search.SnapshotPublicationTimeout as exc:
             _finish_active_semantic()
@@ -1910,8 +1937,11 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 # Skipping the tool corpus takes STRONG fill: weak scatter that
                 # reaches `target` must not mask tool sessions holding the queried
                 # phrase verbatim - the gate is evidence strength, not row count.
-                if (len(res["hits"]) < target
-                        or all(_weak_scatter(h) for h in res["hits"])):
+                usable_prose = [
+                    hit for hit in res["hits"] if not hit.get("_probe_query_echo")
+                ]
+                if (len(usable_prose) < target
+                        or all(_weak_scatter(h) for h in usable_prose)):
                     tool_kw = {**fkw, "who": "tool"}
                     tool_res = _run_query(q, mode="keyword", **tool_kw)
                     if tool_res["hits"]:
@@ -1923,7 +1953,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     fell_back = fell_back or bool(tool_res.get("terms_fallback"))
                     fell_back = fell_back or bool(tool_res.get("content_fallback"))
             # Probe stays miss-triggered to preserve its cheap one-line contract.
-            strong = any(not _weak_scatter(h) for h in res["hits"])
+            strong = any(
+                not _weak_scatter(h) and not h.get("_probe_query_echo")
+                for h in res["hits"])
             nl_shaped = args.semantic or _auto_semantic_query(q)
             want_meaning = (nl_shaped and (args.probe or meaning_room)
                             and (not args.probe or not strong))
@@ -2065,13 +2097,35 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         self_excluded_count = self_dropped
 
     def _note_self_exclusion() -> None:
-        # JSON owns the structured count; prose emits one counted line.
-        if (self_policy is None or current_family is None
-                or args.json or not self_excluded_count):
+        # JSON owns the structured state; prose speaks once per render
+        search._note_family_index_behind()
+        if args.json:
+            return
+        if self_policy is None:
+            if (self_exclusion_requested and not args.force_no_self
+                    and "self" not in said_once):
+                said_once.add("self")
+                notice = surface.caller_unknown_notice(self_inactive_reason)
+                if notice:
+                    common.log(console.paint(
+                        "d", notice, common.color_enabled(sys.stderr, args.color)))
+            return
+        if current_family is None or not self_excluded_count:
             return
         common.log(surface.self_exclusion_notice(
             resolved=current_family.resolved, dropped=self_excluded_count,
             windowed=self_policy.windowed))
+
+    def _emit_coverage_retry(shown: list[dict]) -> None:
+        nonlocal self_excluded_count
+        if args.lexical or requested_mode != "keyword":
+            return
+        for q in search_queries:
+            scanned = search._emit_overspec_block(
+                q, fkw, shown, self_policy, brief=True, request=args)
+            # the block is a separately ranked lane: no exact cross-lane count
+            if scanned and self_policy is not None:
+                self_excluded_count = None
 
     def _trim_self_windows(pairs: list[tuple[dict, dict]]) -> list[tuple[dict, dict]]:
         if self_policy is None or not self_policy.windowed:
@@ -2110,8 +2164,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             out.append((hit, trimmed))
         return out
     lineage_windows = (
-        search._mark_history_meta(hits, queries)
-        if not args.json or args.no_meta else {})
+        search._mark_history_meta(
+            hits, queries, probe_mode=requested_mode if args.probe else None)
+        if (not args.probe or direct_hit is not None)
+        and (not args.json or args.no_meta) else {})
     hits.sort(key=_merge_key)
     meta_dropped = meta_retained = 0
     if args.no_meta and hits:
@@ -2120,19 +2176,17 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             common.log(surface.meta_filter_notice(
                 meta_dropped, meta_retained))
     if args.probe:
-        # one pointer out, but the judgment set holds each query's best
-        # candidate (per lane under hybrid): a weak query-0 row must not
-        # eclipse another query's exact-phrase hit into a false miss
+        probe_hits = [hit for hit in hits if not hit.get("_probe_query_echo")]
         judge_target = max(1, len(queries))
         if hybrid_used:
             selected = _select(
-                [hit for hit in hits if hit.get("lane") != "semantic"],
+                [hit for hit in probe_hits if hit.get("lane") != "semantic"],
                 judge_target, len(queries), family_diverse=family_diverse)
             selected = selected + _select(
-                [hit for hit in hits if hit.get("lane") == "semantic"],
+                [hit for hit in probe_hits if hit.get("lane") == "semantic"],
                 judge_target, len(queries), family_diverse=family_diverse)
         else:
-            selected = _select(hits, judge_target, len(queries),
+            selected = _select(probe_hits, judge_target, len(queries),
                                family_diverse=family_diverse)
     else:
         selected = _select(hits, target, len(queries),
@@ -2144,11 +2198,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     hybrid_visible = any(hit.get("lane") == "semantic" for hit in selected)
     if hybrid_visible:
         semantic_meta["hybrid"] = True
-        if not args.json and not args.probe:
-            common.log(
-                "semantic-only candidates added "
-                "(UNVERIFIED: cosine ranks similarity, not correctness; "
-                "topic overlap is a miss; --lexical disables)")
     elif (hybrid_used and requested_mode == "keyword"
           and weak_neighbors_command is None):
         # meaning rows lost the merge, but the lane DID search: keep the
@@ -2181,7 +2230,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         # story to the queries whose runs failed - one story, no contradiction.
         status = semantic_meta.get("semantic_status")
         lane_notice = surface.semantic_keyword_only_notice(
-            status, brief=indexd_runtime.semantic_notice_brief(
+            coverage=semantic_meta.get("semantic_coverage"),
+            accelerator=semantic_meta.get("semantic_accelerator_coverage"),
+            status=status, brief=indexd_runtime.semantic_notice_brief(
                 (status or {}).get("reason")))
         if hybrid_visible and meaning_down_queries:
             down = " · ".join(console.terminal_safe(q)[:60]
@@ -2196,18 +2247,27 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 and direct_hit is None and search_queries
                 and meaning_lanes_run == len(search_queries)
                 and not tools_excluded
-                and not any((args.chat, args.agent, args.project, args.model,
+                and not any((args.chat, args.agent, args.project,
+                             args.exclude_project, args.no_side, args.model,
                              args.since, args.until, args.who, args.no_who))):
             probe_verdict = surface.miss_verdict(
                 indexd_runtime.freshness_story(),
-                meaning_served=not meaning_lane_down,
+                meaning_served=(
+                    not meaning_lane_down
+                    or surface.semantic_lane_answered(
+                        semantic_meta.get("semantic_status"))),
                 meaning_coverage=semantic_meta.get("semantic_coverage"),
                 meaning_accelerator=semantic_meta.get(
                     "semantic_accelerator_coverage"),
+                meaning_integrity=semantic_meta.get("semantic_integrity"),
                 sessions=(common.index_summary() or {}).get("sessions"))
         _note_self_exclusion()
         rc = _probe(queries, selected, engine, exact_probe_sessions, budget,
                     meaning_down=meaning_lane_down,
+                    meaning_status=semantic_meta.get("semantic_status"),
+                    meaning_coverage=semantic_meta.get("semantic_coverage"),
+                    meaning_accelerator=semantic_meta.get(
+                        "semantic_accelerator_coverage"),
                     tools_excluded=tools_excluded,
                     coverage=(search.filter_coverage(args) if not selected
                               else surface.filter_coverage_disclosure(
@@ -2218,7 +2278,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         if rc == 0:
             return 0
         if (semantic_unavailable or meaning_lane_down
-                or search._semantic_result_incomplete(semantic_meta)):
+                or search._semantic_result_incomplete(
+                    semantic_meta, allow_live_tail=True)):
             return 2
         return surface.grep_absence_exit(
             exact=not tools_excluded,
@@ -2324,10 +2385,12 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                            f"{surface.count_noun(sessions, 'indexed session')}.")
                 for empty_dimension in coverage["empty_dimensions"]:
                     common.log(surface.empty_dimension_line(empty_dimension))
+                _emit_coverage_retry([])
                 _note_self_exclusion()
                 _note_freshness()
         if (semantic_unavailable or meaning_lane_down
-                or search._semantic_result_incomplete(semantic_meta)):
+                or search._semantic_result_incomplete(
+                    semantic_meta, allow_live_tail=True)):
             return 2
         exact = not selected and not tools_excluded
         return surface.grep_absence_exit(
@@ -2379,8 +2442,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 # the share, so widening can only ever truncate CONTEXT turns, never the hit
                 tcap = (0 if fits else
                         max(cap, min(2400, share)) if t["turn"] == w["center"] else cap)
-                expand = _command(
-                    "agrep", "around", target, t["turn"], "-C", 0)
+                expand = _expand_command(target, t["turn"])
                 for who, text in ((t["who"], t["text"]), ("agent", t["reply"])):
                     if not text:
                         continue
@@ -2443,7 +2505,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                              "sem_score": h.get("sem_score"),
                              "score_kind": h.get("score_kind"),
                              **({"lane": h["lane"]} if h.get("lane") else {}),
-                             "matched": h.get("matched", "phrase"), "window": rows})
+                             "matched": h.get("matched") or (
+                                 "semantic" if h.get("lane") == "semantic"
+                                 else "phrase"),
+                             "window": rows})
             required_tool_rows.append(required_tools)
         obj = {"query": queries[0] if one else queries, "engine": engine, "hits": out_hits}
         served = surface.around_service_disclosure(handle_notes)
@@ -2520,27 +2585,18 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         # that most needs to be verifiable
         result_handle = _window_result_handle(w, h, session_index)
         sem_score = h.get("sem_score")
-        score_label = (f"{h.get('score_kind') or 'cosine'} {float(sem_score):.4f}"
-                       if sem_score is not None
-                       else f"score {h.get('score', 0)}")
-        # "weak meaning match" is the taught vocabulary (the block tells agents
-        # to weigh a weak semantic match accordingly); it already carries the
-        # below-threshold verdict, so no separate threshold flag renders.
         meaning_label = ("weak meaning match" if sem_score is not None
                          and search._semantic_row_weak(h)
                          else "meaning match" if sem_score is not None else "")
-        threshold_label = ""
-        project_label = f"project={console.terminal_safe(search._proj(w['project']))}"
+        project_label = console.terminal_safe(search._proj(w["project"]))
         # @session:turn is the universal handle; colliding sessions need longer prefixes.
         rendered_handle = console.terminal_safe(result_handle)
         identity = (
-            rendered_handle, f"pull: agrep around {rendered_handle}",
+            rendered_handle,
             console.terminal_safe(w["agent"]), project_label,
             _ts_label(h.get("ts") or 0),
         )
-        head_fields = ((*identity, meaning_label, score_label, threshold_label,
-                        _provenance_marks(h)) if sem_score is not None else
-                       (*identity, score_label, _provenance_marks(h)))
+        head_fields = (*identity, meaning_label, _provenance_marks(h))
         head = " · ".join(x for x in head_fields if x)
         if collapse[i]:
             center = _center_text(w, h) or next(
@@ -2589,8 +2645,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         hidden_tools = 0
         for t in w["turns"]:
             tcap = center_cap if t["turn"] == w["center"] else cap
-            expand = _command(
-                "agrep", "around", target, t["turn"], "-C", 0)
+            expand = _expand_command(target, t["turn"])
             # every capped text row keeps its own match window, not just the
             # center turn - context rows exist because they bear on the query
             if t["text"]:
@@ -2655,6 +2710,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     common.lap("render")
     _write_payload(payload, budget)
 
+    _emit_coverage_retry(selected)
     _note_self_exclusion()
     _note_freshness()
     return 0

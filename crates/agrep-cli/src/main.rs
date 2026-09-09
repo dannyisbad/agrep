@@ -1207,13 +1207,8 @@ fn reclaim_cold_rollback_journal(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Successor takeover for the upgrade-day family: the derived stores name another build, but
-/// no live writer holds them (the caller verified the daemon fence, reclaimed any cold rollback
-/// journal, and holds both daemon-lock generations plus the index lock). Everything discarded here is a derivation of the
-/// build-neutral published transcripts; only a record that provably names another build
-/// authorizes a discard, and any uncertain probe aborts fail-closed. The run then proceeds
-/// through the ordinary adoption corner, which publishes this build's ownership on success.
-fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), String> {
+/// Requires verified daemon-generation fences and the index lock.
+fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<bool, String> {
     use agrep_core::ingest_cache::CacheOwnerProbe;
 
     let current = agrep_core::ingest_cache::current_cache_writer_build_id();
@@ -1244,11 +1239,21 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
         }
         Ok::<(), String>(())
     };
+    let mut cache_discarded = false;
     let cache_story = match cache_probe {
         CacheOwnerProbe::Missing => String::from("parse cache absent"),
-        CacheOwnerProbe::LegacyUnowned => String::from("legacy parse cache kept"),
         CacheOwnerProbe::Current { build_id } if build_id == current => {
             String::from("parse cache already current")
+        }
+        CacheOwnerProbe::LegacyUnowned => {
+            let adopted = agrep_core::ingest_cache::adopt_foreign_cache(&cache_path).map_err(
+                |error| {
+                    format!(
+                        "{reason}; takeover declined: legacy parse cache could not be migrated: {error}"
+                    )
+                },
+            )?;
+            format!("legacy parse cache verified and adopted ({adopted} sources)")
         }
         CacheOwnerProbe::Current { .. } | CacheOwnerProbe::Foreign { .. } => {
             match agrep_core::ingest_cache::adopt_foreign_cache(&cache_path) {
@@ -1260,6 +1265,7 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
                         remove_derived_artifact(path)
                             .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
                     }
+                    cache_discarded = true;
                     String::from("foreign parse cache discarded")
                 }
             }
@@ -1306,7 +1312,7 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
         publish_retained_corpus_owner(data, candidate)
             .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
     } else {
-        remove_derived_artifact(&data.join(DERIVED_OWNER_FILE))
+        write_derived_owner(data, current)
             .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
     }
     match derived_write_ownership(data) {
@@ -1316,7 +1322,7 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
                  {corpus_story}, published transcripts kept",
                 agrep_core::ingest::terminal_safe(reason)
             );
-            Ok(())
+            Ok(cache_discarded)
         }
         DerivedWriteOwnership::Foreign(detail)
         | DerivedWriteOwnership::Refused(detail)
@@ -2265,9 +2271,16 @@ fn publish_derived_owner(data: &Path) -> anyhow::Result<()> {
         }
         DerivedWriteOwnership::Adoption => {}
     }
+    write_derived_owner(
+        data,
+        agrep_core::ingest_cache::current_cache_writer_build_id(),
+    )
+}
+
+fn write_derived_owner(data: &Path, build_id: String) -> anyhow::Result<()> {
     let record = DerivedOwnerRecord {
         version: DERIVED_OWNER_VERSION,
-        build_id: agrep_core::ingest_cache::current_cache_writer_build_id(),
+        build_id,
         legacy_corpus_db: if data.join("corpus.db").exists() {
             Some(derived_file_proof(data, "corpus.db")?)
         } else {
@@ -3780,7 +3793,7 @@ fn temporal_backfill(rows: &[(u32, Arc<str>)], turn: u32) -> Option<Arc<str>> {
 /// (commutative) so a run-to-run reordering from the parallel ingest can never masquerade as a
 /// change. Computed straight off the in-memory messages, which is far cheaper than serializing
 /// them - and serializing IS the write cost we're trying to skip when nothing moved.
-fn content_sig(msgs: &[Message]) -> u64 {
+fn content_sig(msgs: &[Message], aliases: &[cache::SessionAlias]) -> u64 {
     fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
         for &b in bytes {
             h ^= b as u64;
@@ -3788,7 +3801,8 @@ fn content_sig(msgs: &[Message]) -> u64 {
         }
         h
     }
-    msgs.par_iter()
+    let messages = msgs
+        .par_iter()
         .map(|m| {
             let mut h: u64 = 0xcbf29ce484222325;
             h = fnv(h, m.agent.as_bytes());
@@ -3807,7 +3821,37 @@ fn content_sig(msgs: &[Message]) -> u64 {
             h = fnv(h, m.parent.as_bytes()); // sessions.jsonl linkage is derived content too
             h
         })
-        .reduce(|| 0u64, |a, b| a.wrapping_add(b))
+        .reduce(|| 0u64, |a, b| a.wrapping_add(b));
+    // an alias rewrites sessions.jsonl rows without touching any message
+    aliases.iter().fold(messages, |sum, claim| {
+        let mut h: u64 = 0xcbf29ce484222325;
+        h = fnv(h, b"alias\0");
+        h = fnv(h, claim.agent.as_bytes());
+        h = fnv(h, b"\0");
+        h = fnv(h, claim.alias.as_bytes());
+        h = fnv(h, b"\0");
+        h = fnv(h, claim.session.as_bytes());
+        sum.wrapping_add(h)
+    })
+}
+
+/// Filename ids the stores assert for indexed sessions, resolved once per generation so
+/// sessions.jsonl, its family proof, and the boundary layout agree on one family.
+fn session_aliases(parse_cache: &IngestCache, msgs: &[Message]) -> Vec<cache::SessionAlias> {
+    let claims = parse_cache
+        .session_sources()
+        .into_iter()
+        .filter_map(|(path, agent, session)| {
+            ingest::registry::session_alias(agent, &path, &session).map(|alias| {
+                cache::SessionAlias {
+                    agent,
+                    alias,
+                    session,
+                }
+            })
+        })
+        .collect();
+    cache::resolve_session_aliases(msgs, claims)
 }
 
 const SOURCE_SNAPSHOT_FILE: &str = ".source_snapshot.bin";
@@ -3826,7 +3870,7 @@ const SOURCE_ABSENCE_MAX_BYTES: u64 = 64 * 1024;
 const SOURCE_ABSENCE_HEADER: &str = "agrep-source-absence-v1\n";
 // Any ingest policy change that can alter derived rows must bump this version: a bump
 // voids the source-identical shortcut even when every source file is byte-identical.
-const HARNESS_POLICY_HEADER: &[u8] = b"agrep-harness-policy-v4\0";
+const HARNESS_POLICY_HEADER: &[u8] = b"agrep-harness-policy-v5\0";
 
 /// Load the corpus-local classification policy once per index pass. The exact bytes plus a
 /// format version are part of the all-hit permission slip, while parsing is done from that same
@@ -4233,6 +4277,8 @@ struct GenerationPublication<'a> {
     messages: &'a [Message],
     repaired_sessions: &'a HashSet<String>,
     preserve_signal_if_unchanged: bool,
+    /// Family proof bytes bound to `signature`; None keeps the published proof.
+    family_meta: Option<&'a [u8]>,
 }
 
 fn ensure_derived_write_ownership(data: &Path) -> anyhow::Result<()> {
@@ -4283,11 +4329,17 @@ fn publish_generation_markers(publication: GenerationPublication<'_>) -> anyhow:
         messages,
         repaired_sessions,
         preserve_signal_if_unchanged,
+        family_meta,
     } = publication;
     ensure_derived_write_ownership(data)?;
     let started = Instant::now();
     write_changed_sessions(data, complete, parse_cache, messages, repaired_sessions)?;
     let delta_done = started.elapsed();
+    // Readers accept the family proof only while it names the committed signature, so it
+    // lands here, inside the marker commit, and never beside the session rows it describes.
+    if let Some(bytes) = family_meta {
+        cache::write_bytes_atomic(&data.join(cache::SESSION_FAMILY_META_FILE), bytes)?;
+    }
     publish_derived_proof(data, signature)?;
     let proof_done = started.elapsed();
     let signal_written =
@@ -4634,6 +4686,7 @@ fn index_cmd_locked(
         }};
     }
     let data = data_dir()?;
+    let mut takeover_discarded_cache = false;
     let ownership_current = match derived_write_ownership(&data) {
         DerivedWriteOwnership::Current => {
             if adoption_claim.is_none() {
@@ -4673,10 +4726,13 @@ fn index_cmd_locked(
                 disclose_read_only_ownership(&format!("{reason}; {fence}"));
                 return Ok(());
             }
-            if let Err(refusal) = take_over_foreign_derived_stores(&data, &reason) {
-                disclose_read_only_ownership(&refusal);
-                return Ok(());
-            }
+            takeover_discarded_cache = match take_over_foreign_derived_stores(&data, &reason) {
+                Ok(discarded) => discarded,
+                Err(refusal) => {
+                    disclose_read_only_ownership(&refusal);
+                    return Ok(());
+                }
+            };
             false
         }
         DerivedWriteOwnership::PostAdoptionClobber(reason) => {
@@ -4840,12 +4896,12 @@ fn index_cmd_locked(
         || data.join("sessions.jsonl").exists();
     let repair_events = !full && !events_complete && prior_generation;
     let recover_corrupt_events = agent == "all" && (full || repair_events);
-    // Pending preflight (or a legacy generation with no snapshot) means no stable source
-    // generation was published; retry through the same guarded path. Unlike event repair this
-    // preserves cache hits - its only job is catching sources that moved during the prior pass.
+    // Guard source absence without forcing reparses of retained cache hits.
     let retry_sources = !full
         && !emit_rows
-        && (pending_source.is_some() || (prior_generation && published_source.is_none()));
+        && (takeover_discarded_cache
+            || pending_source.is_some()
+            || (prior_generation && published_source.is_none()));
     let source_before_view = source_before
         .as_deref()
         .and_then(ingest::registry::source_snapshot_view);
@@ -4927,10 +4983,13 @@ fn index_cmd_locked(
         }
         let (cache, refusal) = disclose_cache_refusal(IngestCache::repair(&cache_path));
         if let Some(refusal) = refusal {
-            // An undecodable base is discarded and reparsed; a missing/foreign one keeps the
-            // two-snapshot protocol. The pending marker rotated above when it could, and the
-            // next byte-identical preflight - complete or stably incomplete - completes it.
-            if !refusal.is_undecodable() && !source_identical && !repeated_stable_preflight {
+            let discarded_by_takeover = takeover_discarded_cache
+                && refusal == agrep_core::ingest_cache::CacheDecodeRefusal::MissingFile;
+            if !refusal.is_undecodable()
+                && !discarded_by_takeover
+                && !source_identical
+                && !repeated_stable_preflight
+            {
                 anyhow::bail!(
                     "ingest recovery needs a valid parse cache ({refusal}) or two stable source snapshots; retry{}",
                     if durable_blocked {
@@ -5039,6 +5098,7 @@ fn index_cmd_locked(
     // carries touched sessions' events, so the pulse rollup waits for the next complete run.
     let complete = full || repair_events || !pcache.warm;
     let (msgs, evts, repaired_sessions) = ingest_agent(agent, &mut pcache, &harness_prefixes)?;
+    let session_aliases = session_aliases(&pcache, &msgs);
     lap!("ingest+dedupe");
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
@@ -5139,7 +5199,7 @@ fn index_cmd_locked(
     // bincode cache rewrite behind the message hash instead of paying both serially.
     let (cache_stage, sig_line) = rayon::join(
         || pcache.stage_save(&cache_path),
-        || format!("{}:{}\n", msgs.len(), content_sig(&msgs)),
+        || format!("{}:{}\n", msgs.len(), content_sig(&msgs, &session_aliases)),
     );
     // The staged cache stays private until validation; event-proof revocation makes its later
     // commit crash-recoverable even though event payloads are not serialized in the cache.
@@ -5230,6 +5290,7 @@ fn index_cmd_locked(
             );
             cache::write_session_family_meta(
                 &msgs,
+                &session_aliases,
                 &data.join(cache::SESSION_FAMILY_META_FILE),
                 sig_line.trim(),
             )?;
@@ -5260,6 +5321,7 @@ fn index_cmd_locked(
             messages: &msgs,
             repaired_sessions: &repaired_sessions,
             preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
+            family_meta: None,
         })?;
         preserve_signal_age(
             &sig_path,
@@ -5289,7 +5351,6 @@ fn index_cmd_locked(
     let n = msgs.len();
     let rpath = data.join("replies.jsonl");
     let sessions_path = data.join("sessions.jsonl");
-    let family_meta_path = data.join(cache::SESSION_FAMILY_META_FILE);
 
     // Independent backstop, whatever the guards above concluded: this pass may not shrink the
     // row census of a scope it could not read. Scope-local on purpose - a deletion elsewhere
@@ -5331,12 +5392,16 @@ fn index_cmd_locked(
     // The final signature remains the cross-file permission slip.
     agrep_core::boundary_stats::write(
         &msgs,
+        &session_aliases,
         &boundary_path,
         &boundary_cache_path,
         sig_line.trim(),
-        previous_sig.as_deref().map(str::trim),
+        if full {
+            None
+        } else {
+            previous_sig.as_deref().map(str::trim)
+        },
         &pcache.touched,
-        full,
     )?;
     lap!("write-boundary-stats");
 
@@ -5345,8 +5410,8 @@ fn index_cmd_locked(
     let sessions_work = || {
         timed!(cache::write_session_index(
             &msgs,
+            &session_aliases,
             &sessions_path,
-            &family_meta_path,
             sig_line.trim(),
         ))
     };
@@ -5367,7 +5432,7 @@ fn index_cmd_locked(
     ) = message_outputs;
     messages_result?;
     replies_result?;
-    let n_sessions = sessions_result?;
+    let (n_sessions, family_meta) = sessions_result?;
     invalidate_turn_enrichment(&data)?;
     let (event_proof_result, events_elapsed) = events_work();
     let (event_result, proof_complete) = event_proof_result?;
@@ -5397,6 +5462,7 @@ fn index_cmd_locked(
         messages: &msgs,
         repaired_sessions: &repaired_sessions,
         preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
+        family_meta: Some(&family_meta),
     })?;
     preserve_signal_age(
         &sig_path,

@@ -249,6 +249,38 @@ def _prepare_ephemeral_coordination_dir() -> Path:
     return path
 
 
+_STALE_NAMESPACE_S = 3600.0
+
+
+def reap_stale_coordination_dirs(now: float | None = None) -> int:
+    """Remove sibling namespaces that hold no record and have not been touched
+    for an hour; every sandboxed data dir mints one and nothing else deletes it.
+    A non-empty or foreign-owned directory is never touched."""
+    live = _ephemeral_coordination_dir().name
+    prefix = f"agrep-semantic-v{_COORDINATION_NAMESPACE_VERSION}-"
+    uid_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+    uid = uid_fn() if uid_fn is not None else None
+    cutoff = (time.time() if now is None else now) - _STALE_NAMESPACE_S
+    removed = 0
+    try:
+        entries = list(os.scandir(_coordination_base_path()))
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(prefix) or entry.name == live:
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+            if (not stat.S_ISDIR(st.st_mode) or st.st_mtime > cutoff
+                    or (uid is not None and st.st_uid != uid)):
+                continue
+            os.rmdir(entry.path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def worker_lock_path() -> Path:
     return _ephemeral_coordination_path("worker.lock")
 
@@ -1063,6 +1095,9 @@ def stop_worker_and_wait(
             False, running=True, blocked=True,
             owner_state="start-claim")
     try:
+        if not _drain_launch_children(deadline):
+            return _stop_outcome(
+                False, running=True, blocked=True, owner_state="launch-child")
         return _stop_worker_under_start_claim(
             grace_s, fallback_s, deadline)
     finally:
@@ -1802,8 +1837,95 @@ def _release_start_claim(claim: ownerfile.Handle) -> None:
         return
     try:
         claim.release(tombstone=True, require_stable_mtime=True)
+        parsed = _parse_start_claim(claim.snapshot)
+        if parsed is not None:
+            _retire_launch_record(parsed.nonce)
     except OSError:
         pass
+
+
+def _launch_child_path(nonce: str) -> Path:
+    return common.DATA_DIR / f".semantic-worker.launch-{nonce}"
+
+
+def _read_launch_child(path: Path) -> tuple[ownerfile.Snapshot, dict] | None:
+    try:
+        observed = ownerfile.snapshot(path, max_bytes=_WORKER_OWNER_BYTES)
+        record = json.loads(observed.raw)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(record, dict)
+            or type(record.get("pid")) is not int or record["pid"] <= 0
+            or not isinstance(record.get("process_start"), str)
+            or _hex_token(record.get("nonce"), 32) is None
+            or path != _launch_child_path(record["nonce"])):
+        return None
+    return observed, record
+
+
+def _launch_child_has_owner(record: dict) -> bool:
+    owner = _inspect_worker_lock()
+    return bool(
+        owner.state is _WorkerOwnerState.EXACT and owner.record is not None
+        and owner.record.get("pid") == record["pid"]
+        and (record["process_start"] in _UNVERIFIABLE_STARTS
+             or owner.record.get("process_start") == record["process_start"]))
+
+
+def _retire_launch_record(nonce: str) -> None:
+    path = _launch_child_path(nonce)
+    entry = _read_launch_child(path)
+    if entry is None:
+        return
+    observed, record = entry
+    if (_process_owner(record["pid"], record["process_start"]) not in (
+            ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED)
+            and not _launch_child_has_owner(record)):
+        return
+    try:
+        ownerfile.remove_exact(path, observed, require_stable_mtime=True)
+    except OSError:
+        pass
+
+
+def _drain_launch_children(deadline: float) -> bool:
+    try:
+        paths = tuple(common.DATA_DIR.glob(".semantic-worker.launch-*"))
+    except OSError:
+        return False
+    for path in paths:
+        entry = _read_launch_child(path)
+        if entry is None:
+            try:
+                malformed = ownerfile.snapshot(path, max_bytes=_WORKER_OWNER_BYTES)
+                if _record_is_fresh(malformed.mtime):
+                    return False
+                if not ownerfile.remove_exact(
+                        path, malformed, require_stable_mtime=True):
+                    return False
+            except OSError:
+                return False
+            continue
+        observed, record = entry
+        while (record["process_start"] in _UNVERIFIABLE_STARTS
+               and common.pid_alive(record["pid"])
+               and not _launch_child_has_owner(record)):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+        if (not _launch_child_has_owner(record)
+                and common.pid_alive(record["pid"])):
+            if not common.terminate_exact_process_tree(
+                    record["pid"], record["process_start"],
+                    wait_s=max(0.0, deadline - time.monotonic())):
+                return False
+        try:
+            if not ownerfile.remove_exact(
+                    path, observed, require_stable_mtime=True):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _spawn_worker(claim: ownerfile.Handle) -> subprocess.Popen:
@@ -1830,9 +1952,42 @@ def _spawn_worker(claim: ownerfile.Handle) -> subprocess.Popen:
     else:
         kw["start_new_session"] = True
     try:
-        return subprocess.Popen(cmd, **kw)
+        process = subprocess.Popen(cmd, **kw)
+        try:
+            process_start = common.process_start_identity(process.pid) or ""
+            ownerfile.create_exclusive(
+                _launch_child_path(parsed.nonce),
+                json.dumps({
+                    "pid": process.pid, "process_start": process_start,
+                    "nonce": parsed.nonce,
+                }).encode(), mode=0o600)
+        except OSError:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            raise
+        return process
     finally:
         logf.close()
+
+
+# A launch still booting past its discovery budget keeps its claim until it
+# binds or dies; releasing early exits the worker as "no longer current".
+_OWN_LAUNCH: dict = {"process": None, "claim": None}
+
+
+def _settle_own_launch() -> bool:
+    """Release the retained claim once its worker died; return whether one is
+    still booting."""
+    process = _OWN_LAUNCH["process"]
+    if process is None:
+        return False
+    if process.poll() is None:
+        return True
+    claim = _OWN_LAUNCH["claim"]
+    _OWN_LAUNCH.update(process=None, claim=None)
+    _release_start_claim(claim)
+    return False
 
 
 def _wait_for_worker(
@@ -1846,6 +2001,8 @@ def _wait_for_worker(
             if process.poll() is not None:
                 return None
         else:
+            if _OWN_LAUNCH["process"] is not None and not _settle_own_launch():
+                return None
             inspected = _inspect_worker_lock()
             if inspected.state is _WorkerOwnerState.EXACT:
                 if (inspected.record is None
@@ -1906,6 +2063,7 @@ def _ensure_worker(start_timeout_s: float | None = None) -> dict | None:
             _WorkerOwnerState.MALFORMED_FRESH,
             _WorkerOwnerState.BLOCKED):
         return None
+    _settle_own_launch()
     claim = _acquire_start_claim()
     if claim is not None:
         try:
@@ -1925,9 +2083,14 @@ def _ensure_worker(start_timeout_s: float | None = None) -> dict | None:
                 process = _spawn_worker(claim)
             except OSError:
                 return None
-            return _wait_for_worker(wait_s, process=process)
+            hit = _wait_for_worker(wait_s, process=process)
+            if hit is None and process.returncode is None:
+                _OWN_LAUNCH.update(process=process, claim=claim)
+                claim = None
+            return hit
         finally:
-            _release_start_claim(claim)
+            if claim is not None:
+                _release_start_claim(claim)
     return _wait_for_worker(wait_s)
 
 
@@ -2233,9 +2396,9 @@ def _validate_request(obj: object) -> tuple[str, str, int, dict, bool]:
             if not isinstance(value, bool):
                 raise ValueError("invalid semantic filter")
         elif key in {"_exclude_who", "_include_who", "_exclude_sessions"}:
-            limit = 4 if key == "_exclude_sessions" else 16
             max_chars = 1024 if key == "_exclude_sessions" else 64
-            if (not isinstance(value, (list, tuple)) or len(value) > limit
+            if (not isinstance(value, (list, tuple))
+                    or (key != "_exclude_sessions" and len(value) > 16)
                     or any(not isinstance(item, str) or not item
                            or len(item) > max_chars for item in value)):
                 raise ValueError("invalid semantic filter")
@@ -2254,7 +2417,7 @@ def _validate_request(obj: object) -> tuple[str, str, int, dict, bool]:
         elif not isinstance(value, str) or len(value) > 4096:
             raise ValueError("invalid semantic filter")
         clean[key] = value
-    if len(json.dumps(clean, separators=(",", ":")).encode()) > MAX_BODY_BYTES // 2:
+    if len(json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()) > MAX_BODY_BYTES:
         raise ValueError("invalid semantic filter")
     return query.strip(), str(level), k, clean, timing
 
@@ -2421,6 +2584,16 @@ class SemanticWorkerServer:
         self.retire_deadline = 0.0
         self.stop = threading.Event()
         owner = self
+        if search_fn is None:
+            # Readiness means query-ready: a caller's short deadline must not
+            # pay the model load and then retire the worker for the timeout.
+            self._semantic_loaded = True
+            try:
+                import semantic
+                semantic.warm_query_model()
+            except Exception as exc:  # noqa: BLE001 -- requests disclose the exact reason
+                common.log(
+                    f"semantic worker model warm-up failed: {type(exc).__name__}")
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
@@ -2695,6 +2868,7 @@ def serve_main() -> int:
         return 0
     try:
         owner.verify(require_stable_mtime=True)
+        reap_stale_coordination_dirs()
         server = SemanticWorkerServer(lifetime=owner)
         server.serve()
     except ownerfile.OwnershipLost:

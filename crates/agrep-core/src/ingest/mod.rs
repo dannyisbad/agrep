@@ -1204,6 +1204,9 @@ mod tests {
         std::fs::write(&path, &seeded).unwrap();
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Each read follows at least one more landed append, so growth under the
+        // reader is guaranteed rather than left to thread scheduling.
+        let (appended, landed) = std::sync::mpsc::channel::<()>();
         let writer = {
             let (path, line, stop) = (path.clone(), line.clone(), stop.clone());
             std::thread::spawn(move || {
@@ -1214,6 +1217,9 @@ mod tests {
                     .unwrap();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     file.write_all(line.as_bytes()).unwrap();
+                    if appended.send(()).is_err() {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
             })
@@ -1222,6 +1228,9 @@ mod tests {
         let mut lengths = Vec::new();
         let mut sample = String::new();
         for _ in 0..20 {
+            landed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the appender must make progress");
             let text = read_lossy(&path).expect("a growing source stays readable");
             assert!(text.len() >= seeded.len());
             lengths.push(text.len());

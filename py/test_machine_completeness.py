@@ -113,7 +113,8 @@ class MachineCompleteness(unittest.TestCase):
             truncated=True,
             more_command="agrep --lexical --json -n 80 -- needle",
             more_command_kind="broader-rerun",
-            full_command="agrep --lexical --json -n 0 -- needle")
+            full_command="agrep --lexical --json -n 0 -- needle",
+            tool_rows=0)
         self.assertEqual(head["completeness"], expected)
         page_fields = {
             "completeness", "freshness", "filter_coverage",
@@ -148,7 +149,7 @@ class MachineCompleteness(unittest.TestCase):
             rows[0]["completeness"],
             surface.completeness_disclosure(
                 shown=0, total=0, unit="matching row",
-                totals_exact=True, truncated=False))
+                totals_exact=True, truncated=False, tool_rows=0))
 
     def test_json_total_reconciles_with_count(self):
         result = _result(40, 1765)
@@ -295,6 +296,27 @@ class MachineCompleteness(unittest.TestCase):
         self.assertIn(counts, stderr)
         self.assertIn("--json", named)
         self.assertIn("--flat -n 80", stderr)
+
+    def test_chat_unit_footer_counts_tool_rows_as_rows_not_chats(self):
+        # -l counts chats; 941 matching rows in tool output is a separate
+        # fact, never "941 of them" out of 290 chats; JSON carries the number
+        result = _result(8, 1200)
+        result["chats"] = 290
+        result["tool_hits"] = 941
+        _rc, stdout, _err = self._search(
+            ["needle", "-l", "--json", "--lexical", "-n", "8"], result)
+        block = self._rows(stdout)[0]["completeness"]
+        self.assertEqual((block["unit"], block["total"], block["tool_rows"]),
+                         ("chat", 290, 941))
+        _rc, _stdout, stderr = self._search(
+            ["needle", "-l", "--lexical", "--color", "never", "-n", "8"], result)
+        self.assertIn("showing 8 of 290 chats (941 matching rows are tool output)",
+                      stderr)
+        self.assertNotIn("of them", stderr)
+        rows_line = surface.completeness_line(surface.completeness_disclosure(
+            shown=5, total=1375, unit="matching row", totals_exact=True,
+            truncated=True, tool_rows=1118))
+        self.assertIn("(1118 of them in tool output)", rows_line)
 
     def test_floor_total_states_its_basis_on_both_surfaces(self):
         result = _result(40, 1765, totals_exact=False)
@@ -463,8 +485,9 @@ class LargerResultCommandTests(unittest.TestCase):
                     no_who=None, chat=None, since=None, until=None,
                     model_soft=False, no_meta=False, sort="score",
                     include_self=False, force_no_self=False,
-                    all_side_chats=False, strict_semantic=False, no_auto=False,
-                    color="auto", max=3, json=False, flat=False, chats=False)
+                    all_side_chats=False, no_side=False, strict_semantic=False,
+                    no_auto=False, color="auto", max=3, json=False, flat=False,
+                    chats=False)
         base.update(over)
         return argparse.Namespace(**base)
 

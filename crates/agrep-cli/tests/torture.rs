@@ -1290,6 +1290,7 @@ fn live_fenced_foreign_owner_returns_before_lock_sweep_or_publication() {
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "AGREP_RS_BIN",
+            "AGREP_PYTHON_RUNTIME_BUILD_ID",
         ] {
             command.env_remove(key);
         }
@@ -1456,6 +1457,7 @@ fn live_fenced_foreign_database_owner_fences_ownerless_missing_or_legacy_cache()
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "AGREP_RS_BIN",
+            "AGREP_PYTHON_RUNTIME_BUILD_ID",
         ] {
             command.env_remove(key);
         }
@@ -1521,6 +1523,7 @@ fn dead_foreign_owner_takeover_converges_in_one_invocation() {
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "AGREP_RS_BIN",
+            "AGREP_PYTHON_RUNTIME_BUILD_ID",
         ] {
             command.env_remove(key);
         }
@@ -1770,6 +1773,7 @@ fn live_daemon_descriptor_fences_first_adoption_unless_exactly_authorized() {
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "AGREP_RS_BIN",
+            "AGREP_PYTHON_RUNTIME_BUILD_ID",
         ] {
             command.env_remove(key);
         }

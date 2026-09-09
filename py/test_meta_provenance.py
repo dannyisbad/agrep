@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest import mock
 
 import common
+import compact
 import display_policy
 import explore
 import recall
@@ -121,7 +123,7 @@ class HistoryMetaMarking(unittest.TestCase):
             "session": HistoryMetaMarking.SESSION, "turn": turn,
             "ts": turn * 10, "who": who, "agent": "codex",
             "project": "/work/agrep", "snippet": "needle", "score": 1.0,
-            "matched": "phrase", "_recall_lane": 0,
+            "_recall_lane": 0,
             "_recall_query": query, **extra,
         }
 
@@ -169,7 +171,8 @@ class HistoryMetaMarking(unittest.TestCase):
         identity = common.tool_event_identity(
             self.SESSION, 5, 55, row["text"] if row else None)
         selected = self._hit(
-            "tool", 5, query=1, _event_identity=identity)
+            "tool", 5, query=1, _event_identity=identity,
+            content_digest=compact.content_digest(row["text"]))
         different = self._hit(
             "tool", 5, query=1, _event_identity="0" * 24)
         with mock.patch.object(
@@ -182,6 +185,9 @@ class HistoryMetaMarking(unittest.TestCase):
                 [selected, different], ["needle", "output-only evidence"])
         self.assertTrue(selected.get("_meta_row"))
         self.assertIsNone(different.get("_meta_row"))
+        self.assertIsNotNone(recall._probe_line(
+            ["output-only evidence"], [selected], "corpusdb",
+            session_index=(self.SESSION,)))
 
     def test_failed_history_read_marks_tool_but_not_later_answer(self) -> None:
         invocation = _event("agrep recall needle", turn=4, ts=44)
@@ -203,6 +209,114 @@ class HistoryMetaMarking(unittest.TestCase):
         self.assertTrue(display_policy.history_read_invocation(invocation))
         self.assertFalse(display_policy.history_read_invoked(
             invocation, "needle"))
+
+    def test_probe_cannot_bootstrap_confidence_from_self_command_input(self) -> None:
+        query = "xylophonically indigo quokka telemetry banana"
+        event = _event(
+            f'{{"code":"run([\\"recall\\",\\"{query}\\",\\"--probe\\"])',
+            turn=5, ts=55, output='{"command":["agrep","chats"],"exit":0}')
+        event.update(
+            name="eval", input_truncated=True, input_chars=1245,
+            output_truncated=True, output_chars=22048)
+        text, _bounds = common.tool_search_record(event)
+        hit = self._hit(
+            "tool", 5, _self=True, _event_identity=common.tool_event_identity(
+                self.SESSION, 5, 55, text),
+            content_digest=compact.content_digest(text))
+        at = text.index(query)
+        hit["_match_span"] = (at, at + len(query))
+        with mock.patch.object(
+                search, "_family_roots_for_hits",
+                return_value={self.SESSION: self.SESSION}), \
+                mock.patch.object(
+                    explore, "get_windows", side_effect=self._windows([event])):
+            search._mark_history_meta([hit], [query], probe_mode="keyword")
+        self.assertIsNone(recall._probe_line(
+            [query], [hit], "corpusdb", session_index=(self.SESSION,)))
+
+    def test_probe_cannot_treat_a_relay_delivery_receipt_as_query_evidence(self) -> None:
+        query = "unrecognized arguments"
+        event = _event(
+            json.dumps({"op": "send", "message": f'Investigate "{query}"'}),
+            turn=5, ts=55, output="Delivered to 1 peer(s)")
+        event["name"] = "hub"
+        text, _bounds = common.tool_search_record(event)
+        match = search._match_pat(query, "keyword").search(text)
+        hit = self._hit(
+            "tool", 5, _self=True, _match_span=match.span(),
+            _event_identity=common.tool_event_identity(
+                self.SESSION, 5, 55, text),
+            content_digest=compact.content_digest(text))
+        with mock.patch.object(
+                search, "_family_roots_for_hits",
+                return_value={self.SESSION: self.SESSION}), \
+                mock.patch.object(
+                    explore, "get_windows", side_effect=self._windows([event])):
+            search._mark_history_meta([hit], [query], probe_mode="keyword")
+        self.assertIsNone(recall._probe_line(
+            [query], [hit], "corpusdb", session_index=(self.SESSION,)))
+
+    def test_self_output_match_is_not_confused_with_same_turn_input_echo(self) -> None:
+        query = "unrecognized arguments"
+        echo = _event(f'agrep recall "{query}"', turn=5, ts=55)
+        output = _event(
+            f'agrep recall "{query}" --limit 8', turn=5, ts=55,
+            output="error: unrecognized arguments: --limit 8")
+        text, _bounds = common.tool_search_record(output)
+        tool = self._hit(
+            "tool", 5, _self=True, _event_identity=common.tool_event_identity(
+                self.SESSION, 5, 55, text),
+            content_digest=compact.content_digest(text))
+        at = text.index(query)
+        tool["_match_span"] = (at, at + len(query))
+        with mock.patch.object(
+                search, "_family_roots_for_hits",
+                return_value={self.SESSION: self.SESSION}), \
+                mock.patch.object(
+                    explore, "get_windows",
+                    side_effect=self._windows([echo, output])):
+            search._mark_history_meta([tool], [query], probe_mode="keyword")
+        self.assertIsNotNone(recall._probe_line(
+            [query], [tool], "corpusdb", session_index=(self.SESSION,)))
+
+    def test_probe_regex_input_match_uses_the_canonical_record(self) -> None:
+        query = r"^eval:.*azure[_ ]quokka"
+        event = _event('{"code":"probe azure_quokka"}', turn=5, ts=55,
+                       output="collector stopped")
+        event["name"] = "eval"
+        text, _bounds = common.tool_search_record(event)
+        match = search._match_pat(query, "regex").search(text)
+        hit = self._hit(
+            "tool", 5, _self=True, _match_span=match.span(),
+            _event_identity=common.tool_event_identity(
+                self.SESSION, 5, 55, text),
+            content_digest=compact.content_digest(text))
+        with mock.patch.object(
+                search, "_family_roots_for_hits",
+                return_value={self.SESSION: self.SESSION}), \
+                mock.patch.object(
+                    explore, "get_windows", side_effect=self._windows([event])):
+            search._mark_history_meta([hit], [query], probe_mode="regex")
+        self.assertIsNone(recall._probe_line(
+            [query], [hit], "corpusdb", session_index=(self.SESSION,)))
+
+    def test_probe_does_not_infer_input_echo_from_an_unbound_match(self) -> None:
+        query = "azure quokka"
+        event = _event(f'agrep recall "{query}"', turn=5, ts=55)
+        text, _bounds = common.tool_search_record(event)
+        hit = self._hit(
+            "tool", 5, _self=True,
+            _event_identity=common.tool_event_identity(
+                self.SESSION, 5, 55, text),
+            content_digest=compact.content_digest(text))
+        with mock.patch.object(
+                search, "_family_roots_for_hits",
+                return_value={self.SESSION: self.SESSION}), \
+                mock.patch.object(
+                    explore, "get_windows", side_effect=self._windows([event])):
+            search._mark_history_meta([hit], [query], probe_mode="keyword")
+        self.assertIsNotNone(recall._probe_line(
+            [query], [hit], "corpusdb", session_index=(self.SESSION,)))
 
     def test_filter_retains_one_best_row_only_for_meta_only_queries(self) -> None:
         first = self._hit("agent", 1, _meta_row=True)

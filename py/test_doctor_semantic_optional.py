@@ -734,11 +734,24 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
             "semantic model prefetch skipped for this setup run",
             output.getvalue())
 
-    def test_doctor_rejects_no_semantic_without_setup(self) -> None:
+    def test_doctor_rejects_no_semantic_without_setup_or_deep(self) -> None:
         error = io.StringIO()
         with contextlib.redirect_stderr(error):
             self.assertEqual(doctor.main(["--no-semantic"]), 2)
-        self.assertIn("has no effect without --setup", error.getvalue())
+        self.assertIn("has no effect without --setup or --deep", error.getvalue())
+        # --deep --no-semantic is the Metal-less caller's deep report: the
+        # semantic tier stays at routine depth instead of being refused.
+        output = io.StringIO()
+        with (mock.patch.object(doctor, "report", return_value={}) as run,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(doctor.main(["--deep", "--no-semantic"]), 0)
+        run.assert_called_once_with(
+            deep=True, fix_actions=False, semantic=False)
+        with (mock.patch.object(doctor, "_json_report", return_value={}) as run,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(
+                doctor.main(["--deep", "--no-semantic", "--json"]), 0)
+        run.assert_called_once_with(deep=True, semantic=False)
 
     def test_cli_setup_no_semantic_skips_both_semantic_starts(self) -> None:
         output = io.StringIO()

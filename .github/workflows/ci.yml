@@ -13,15 +13,23 @@ jobs:
   rust:
     name: cargo test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: install pinned Rust toolchain
         run: rustc --version
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        if: runner.os == 'Windows'
+        with: { python-version: "3.13" }
+      - name: portable Windows target
+        if: runner.os == 'Windows'
+        run: Remove-Item -LiteralPath .cargo/config.toml
       - name: cargo clippy
+        if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo test
         run: cargo test --workspace --locked --release
@@ -74,12 +82,18 @@ jobs:
         env: { AGREP_CI: "1" }
         shell: bash
         run: |
+          failures=()
           for test in py/test_*.py; do
             case "$test" in
               py/test_jsonl_native_full_exit_perf.py|py/test_perf_budgets.py) continue ;;
             esac
-            PYTHONPATH="$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/py" python "$test" -v
+            PYTHONPATH="$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/py" python "$test" -v \
+              || failures+=("$(basename "$test")")
           done
+          if [ "${#failures[@]}" -ne 0 ]; then
+            echo "focused test failures: ${failures[*]}" >&2
+            exit 1
+          fi
       - name: perf gate (isolated 14k ingest + proven 100k search, 3x slack)
         if: ${{ matrix.perf }}
         env:
@@ -89,6 +103,10 @@ jobs:
           # keeps this gate tighter than release's 1000ms, so a regression
           # cannot pass here and fail there.
           AGREP_PERF_INGEST_ONE_CHANGED_SLACK: "1.6"
+          # the write-boundary-stats lap is core-bound (6.4s on a 4-core hosted
+          # runner, 12.8s on today's 2-core ones), not disk: 6x covers 2 cores
+          AGREP_PERF_INGEST_COLD_SLACK: "6"
+          AGREP_PERF_STREAMED_COMPLETION_SLACK: "6"
         run: python bench/perf.py --check
       - name: idle CPU / RSS / handle gate (4,600-file store)
         if: ${{ matrix.perf }}
@@ -242,8 +260,6 @@ jobs:
           AGREP_PERF_STREAMED_FIRST_HIT_SLACK: "8"
           AGREP_PERF_STREAMED_COMPLETION_SLACK: "4"
         run: python bench/perf.py --check
-      - name: cargo test release
-        run: cargo test --release --workspace --locked
       - name: install supported semantic wheels
         run: >-
           python -m pip install --disable-pip-version-check --only-binary=:all:
@@ -310,7 +326,6 @@ jobs:
             "sticky working flag"
             "reply cap (64k)"
             "procscan agent processes"
-            "search engines kw/word/regex"
             "filter pushdown parity"
             "semantic embedding coherence tracks generations exactly"
             "stale lane starts one deduped background embed"

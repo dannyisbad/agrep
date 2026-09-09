@@ -32,8 +32,9 @@ GUIDANCE = (
     "the work needs something the summary refers to but does not state, "
     "run `agrep postcompact` to recover this same session's proven "
     "pre-boundary tail. Do not use `agrep recall` for this session's own "
-    "facts: it hides the current context window and ranks this session's "
-    "turns (marked ~self, `--self` overrides) against all history, while "
+    "facts: when it can identify the calling session it hides the current "
+    "context window and marks this session's older turns ~self (`--self` "
+    "overrides), and it always ranks them against all history, while "
     "postcompact is exact and needs no query. If postcompact cannot "
     "identify the calling session, use `agrep postcompact --session <id>`."
 )

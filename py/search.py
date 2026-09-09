@@ -35,6 +35,7 @@ import compact
 import console
 import display_policy
 import indexd_runtime
+import session_context
 import surface_policy as surface
 
 corpusdb = None
@@ -65,14 +66,7 @@ def _color_on(when: str) -> bool:
 
 def _proj(p: str) -> str:
     """Last path segment of a project dir, for compact display."""
-    p = (p or "").rstrip("/\\")
-    if not p:
-        return "-"
-    # rfind over both separators == re.split(r"[/\\]", p)[-1], without the
-    # regex machinery; this runs once per row on ranking and machine paths.
-    cut = p.rfind("/")
-    back = p.rfind("\\")
-    return p[(cut if cut > back else back) + 1:]
+    return surface.project_leaf(p) or "-"
 
 
 # One implementation: common owns the snippet renderers, the alias keeps call sites stable.
@@ -109,8 +103,11 @@ def _terms_hl_pat(q: str) -> re.Pattern | None:
     """Highlight for any-order fallback rows (~all): each content term marks
     itself - the in-order phrase pattern can never match a scattered row, and
     an unmarked row reads as "the match isn't shown"."""
-    terms = sorted({t.lower() for t in _content_terms(q) if len(t) >= 3},
-                   key=lambda term: (-len(term), term))
+    terms = sorted({
+        variant
+        for term in _content_terms(q) if len(term) >= 3
+        for variant in boundary_rank.term_variants(term)
+    }, key=lambda term: (-len(term), term))
     if not terms:
         return None
     return re.compile("|".join(re.escape(term) for term in terms), re.I)
@@ -348,7 +345,35 @@ def semantic_query_policy(query: str) -> dict:
 _SEMANTIC_ANCHOR_PROBE_MAX = 8
 
 
-def semantic_corpus_anchor(query: str, flt: dict | None = None) -> dict:
+def semantic_query_terms(query: str) -> list[str]:
+    """Content words a meaning row is expected to carry: lowercased, deduped,
+    at least three characters, never a stopword."""
+    words: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9]+", query or ""):
+        low = word.lower()
+        if len(low) >= 3 and low not in _STOP and low not in words:
+            words.append(low)
+    return words
+
+
+def semantic_term_anchor(
+        terms: list[str], text: str, *,
+        weights: dict[str, float] | None = None) -> tuple[float, float]:
+    """Matched term mass; use equal weights without corpus frequencies."""
+    low = (text or "").lower()
+    if weights is not None:
+        return sum(weights[term] for term in terms if term in low), 1.0
+    return sum(term in low for term in terms), len(terms)
+
+
+def _sem_term_weak(hit: dict) -> bool:
+    """A meaning row carrying less than half the query's term mass."""
+    terms = hit.get("_sem_terms")
+    return bool(terms) and terms[1] > 0 and terms[0] * 2 < terms[1]
+
+
+def semantic_corpus_anchor(query: str, flt: dict | None = None, *,
+                           db: sqlite3.Connection | None = None) -> dict:
     """Does any query word occur in the corpus the meaning lane just searched?
 
     Multi-word out-of-vocabulary mush ("zqxjklwvutplmb frobnicated quuxstring")
@@ -361,21 +386,18 @@ def semantic_corpus_anchor(query: str, flt: dict | None = None) -> dict:
     ``flt`` is the lane's own filter set, so the probe measures the same scope
     the neighbors came from: a caller's family is excluded from both, and the
     query's own echo in the transcript that typed it never anchors itself.
+    ``db`` is a caller-owned connection to reuse; without one the probe opens
+    and closes its own.
     """
-    words: list[str] = []
-    for word in re.findall(r"[A-Za-z0-9]+", query or ""):
-        low = word.lower()
-        if len(low) < 3 or low in _STOP or low in words:
-            continue
-        words.append(low)
-        if len(words) >= _SEMANTIC_ANCHOR_PROBE_MAX:
-            break
+    words = semantic_query_terms(query)[:_SEMANTIC_ANCHOR_PROBE_MAX]
     if not words:
         return {"anchored": None, "probed": 0}
-    _load_corpusdb()
-    db = corpusdb.connect(allow_stale=True)
-    if db is None:
-        return {"anchored": None, "probed": 0}
+    owned = db is None
+    if owned:
+        _load_corpusdb()
+        db = corpusdb.connect(allow_stale=True)
+        if db is None:
+            return {"anchored": None, "probed": 0}
     try:
         for probed, word in enumerate(words, 1):
             # cap 1 stops at the first confirmed row: an existence probe walks
@@ -390,16 +412,42 @@ def semantic_corpus_anchor(query: str, flt: dict | None = None) -> dict:
         # a filter set the keyword lane never validated: unknown, not weak
         return {"anchored": None, "probed": 0}
     finally:
-        try:
-            db.close()
-        except sqlite3.DatabaseError as exc:
-            corpusdb.record_query_database_error(exc, db)
+        if owned:
+            _close_corpus(db)
     return {"anchored": False, "probed": len(words)}
+
+
+def _close_corpus(db: sqlite3.Connection) -> None:
+    try:
+        db.close()
+    except sqlite3.DatabaseError as exc:
+        corpusdb.record_query_database_error(exc, db)
+
+
+def _semantic_row_texts(db: sqlite3.Connection,
+                        rows: list[dict]) -> dict[tuple[str, int, str], str]:
+    """Full indexed text per message row; the lane's snippet is only its head."""
+    wanted = {(str(row.get("session") or ""), int(row["turn"]),
+               str(row.get("who") or ""))
+              for row in rows if row.get("semantic_source", "message") == "message"}
+    texts: dict[tuple[str, int, str], str] = {}
+    try:
+        for session, turn, who in wanted:
+            by_who = {str(row["who"]): str(row["text"] or "")
+                      for row in corpusdb.session_rows(
+                          db, session, lo=turn, hi=turn, include_tools=True)}
+            text = by_who.get(who) or next(iter(by_who.values()), "")
+            if text:
+                texts[(session, turn, who)] = text
+    except sqlite3.DatabaseError as exc:
+        corpusdb.record_query_database_error(exc, db)
+    return texts
 
 
 def semantic_result_policy(query: str, rows: list[dict], *, requested: int,
                            explicit_who: object = None,
                            coverage: dict | None = None,
+                           accelerator_coverage: dict | None = None,
                            partial: bool = False,
                            score_kind: str = "cosine") -> dict:
     """Apply the one semantic relevance/noise contract to raw ranked rows.
@@ -442,9 +490,13 @@ def semantic_result_policy(query: str, rows: list[dict], *, requested: int,
         accepted.append(row)
 
     shown = accepted[:requested] if requested else accepted
-    complete_coverage = bool(coverage and coverage.get("complete") and not partial)
+    complete_coverage = bool(
+        coverage and coverage.get("complete") and not partial
+        and (accelerator_coverage is None
+             or accelerator_coverage.get("complete") is True))
     state = "ready" if shown else "no-confident-match"
-    fallback_recommended = not shown and not complete_coverage
+    fallback_recommended = not shown and not surface.semantic_coverage_usable(
+        coverage, accelerator_coverage)
     return {
         "results": shown,
         "semantic_status": {
@@ -484,6 +536,17 @@ def _semantic_runtime_unavailable(
     }
 
 
+def _semantic_lane_failure(state: dict, exc: BaseException) -> dict:
+    """The lane thread's own exception in the unavailable-result shape; the
+    typed prefix keeps it from ever reading as a known transient."""
+    kwargs = state.get("kwargs") or {}
+    message = terminal_safe(str(exc))[:surface.RENDER_LINE_MAX_CHARS].strip()
+    reason = type(exc).__name__ + (f": {message}" if message else "")
+    return _semantic_runtime_unavailable(
+        str(state.get("query") or ""), int(kwargs.get("limit") or 0),
+        kwargs.get("who"), reason)
+
+
 def _semantic_index_update_active() -> bool:
     try:
         import segment_query
@@ -504,11 +567,9 @@ def _semantic_bootstrap_disabled() -> bool:
 
 
 def _semantic_row_weak(hit: dict) -> bool:
-    """One weak verdict for a meaning row, shared by every label site: a
-    sub-strong score, or a page whose query anchored nowhere in the corpus -
-    those scores rank noise against noise, so none of them earns confidence."""
+    """Weak cosine, insufficient query-term evidence, or no corpus anchor."""
     score = hit.get("sem_score")
-    return bool(hit.get("_sem_unanchored")) or (
+    return bool(hit.get("_sem_unanchored")) or _sem_term_weak(hit) or (
         score is not None and float(score) < _RECALL_STRONG_SEM)
 
 
@@ -537,6 +598,16 @@ def _weak_semantic_neighbors_notice(query: str) -> str:
     return ("no semantic-only candidate cleared the auto-use threshold; "
             "inspect below-auto-threshold candidates: "
             f"{inspect}")
+
+
+def _semantic_empty_notice(result: dict) -> str:
+    coverage = result.get("semantic_coverage")
+    return (
+        surface.semantic_coverage_notice(
+            coverage, result.get("semantic_accelerator_coverage"),
+            suppress_trivial=True)
+        or display_policy.semantic_coverage_line(coverage)
+        or display_policy.semantic_empty_line(coverage))
 
 
 def _semantic_local(q: str, k: int, level: str = "hybrid", *,
@@ -617,7 +688,10 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
         bootstrap_disabled = (
             not cached and not embeddings_off and _semantic_bootstrap_disabled())
         if cached:
-            launch_detail = "starting the semantic worker ..."
+            refusal = semworker._worker_coordination_refusal_reason()
+            launch_detail = (
+                "starting the semantic worker ..." if refusal is None else
+                f"semantic worker launch refused: {refusal}")
         elif embeddings_off:
             launch_detail = (
                 "semantic model is not cached; "
@@ -696,10 +770,11 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
             or semworker._data_dir_readonly())
         if timeout_s is not None:
             available = remaining()
+            # Still the cheap first pass (publisher allowance included): a cold
+            # child cannot finish in it, so the typed miss opens recovery instead.
             if (available is None
-                    or available <= _AUTO_SEMANTIC_TIMEOUT_S + 0.10):
-                # Preserve the cheap hot path. This typed pre-acceptance miss
-                # opens the separately bounded recovery pass below.
+                    or available <= (_AUTO_SEMANTIC_TIMEOUT_S
+                                     + _QUERY_PUBLICATION_WAIT_S + 0.10)):
                 return _semantic_runtime_unavailable(
                     q, requested, who,
                     preflight_retry_reason or preflight_reason
@@ -709,7 +784,8 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
             try:
                 guarded = _guarded_semantic_local_fallback(
                     q, level=sem_level, k=fetch_k,
-                    filters=filters, timeout_s=available)
+                    filters=filters, timeout_s=available,
+                    reason=preflight_reason)
             except SemanticQueryTimeoutError:
                 return _semantic_runtime_unavailable(
                     q, requested, who,
@@ -788,7 +864,8 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     score_kind = data.get("score_kind") or "cosine"
     policy = semantic_result_policy(
         q, rows, requested=requested, explicit_who=who,
-        coverage=coverage, partial=partial, score_kind=score_kind)
+        coverage=coverage, accelerator_coverage=accelerator_coverage,
+        partial=partial, score_kind=score_kind)
     integrity = data.get("semantic_integrity")
     if data.get("semantic_unavailable") and isinstance(integrity, dict):
         policy["semantic_status"].update(
@@ -801,23 +878,53 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     if isinstance(filtered, dict):
         filtered["invalid"] = int(filtered.get("invalid") or 0) + invalid_turns
     # Only a lane that served rows gets probed: nothing else can mislabel.
-    anchor = (semantic_corpus_anchor(q, filters) if policy["results"] else None)
-    if anchor is not None:
+    terms = semantic_query_terms(q)
+    unanchored, texts = False, {}
+    term_weights = None
+    if policy["results"]:
+        anchor = {"anchored": None, "probed": 0}
+        db = None
+        if terms:
+            _load_corpusdb()
+            db = corpusdb.connect(allow_stale=True)
+        if db is not None:
+            try:
+                anchor = semantic_corpus_anchor(q, filters, db=db)
+                texts = _semantic_row_texts(db, policy["results"])
+                if (anchor.get("anchored") is True
+                        and 1 < len(terms) <= _SEMANTIC_ANCHOR_PROBE_MAX):
+                    frequencies = corpusdb.term_session_df(db, terms)
+                    if (len(frequencies) == len(terms)
+                            and all(value > 0 for value in frequencies.values())):
+                        import math
+                        total_weight = 0.0
+                        for term, frequency in frequencies.items():
+                            weight = math.log1p(1.0 / frequency)
+                            frequencies[term] = weight
+                            total_weight += weight
+                        for term in frequencies:
+                            frequencies[term] /= total_weight
+                        term_weights = frequencies
+            except sqlite3.DatabaseError as exc:
+                corpusdb.record_query_database_error(exc, db)
+            finally:
+                _close_corpus(db)
         policy["semantic_status"]["corpus_anchor"] = anchor
-    unanchored = bool(anchor and anchor.get("anchored") is False)
+        unanchored = anchor.get("anchored") is False
     hits = []
     for o in policy["results"]:
         turn = o["turn"]
         snip = o.get("text") or o.get("title") or (o.get("summary") or "")[:140]
         semantic_source = o.get("semantic_source", level)
-        hits.append({"session": o.get("session", ""), "agent": o.get("agent", ""),
+        session, who = o.get("session", ""), o.get("who", "")
+        hits.append({"session": session, "agent": o.get("agent", ""),
                      "project": o.get("project", "") or o.get("cwd_project", ""),
                      "concept": o.get("concept", ""),
                      "model": o.get("model", ""),
                      "model_source": o.get("model_source") or (
                          "summary" if semantic_source == "summary" and o.get("model")
                          else "unknown"),
-                     "turn": turn, "ts": o.get("ts", 0), "who": o.get("who", ""),
+                     "turn": turn, "ts": o.get("ts", 0), "who": who,
                      "sem_score": o.get("score"),
                      "score_kind": o.get("score_kind") or data.get("score_kind") or "cosine",
                      "content_digest": o.get("content_digest"),
@@ -825,6 +932,10 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                      "semantic_source": semantic_source,
                      "semantic_partial": partial,
                      "_sem_unanchored": unanchored,
+                     "_sem_terms": semantic_term_anchor(
+                         terms, texts.get((str(session), turn, str(who)))
+                         or o.get("text") or o.get("summary") or "",
+                         weights=term_weights),
                      "semantic_coverage": coverage,
                      "semantic_accelerator_coverage": accelerator_coverage})
     policy_truncated = bool(policy["semantic_status"].get("truncated"))
@@ -849,27 +960,41 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     return result
 
 
-def _semantic_result_incomplete(result: dict | None) -> bool:
-    """Whether semantic absence is bounded by incomplete evidence."""
+def _semantic_result_incomplete(
+        result: dict | None, *, allow_live_tail: bool = False) -> bool:
+    """Keep exact counts strict; ordinary misses may use a healthy live tail."""
     if not result:
         return False
     if result.get("self_exclusion_more_unknown"):
         return True
-    if result.get("partial"):
+    status = result.get("semantic_status")
+    usable = bool(
+        allow_live_tail
+        and (status is None or surface.semantic_lane_answered(status))
+        and surface.semantic_coverage_usable(
+            result.get("semantic_coverage"),
+            result.get("semantic_accelerator_coverage")))
+    if result.get("partial") and not usable:
         return True
     for field in ("semantic_coverage", "semantic_accelerator_coverage"):
         coverage = result.get(field)
-        if isinstance(coverage, dict) and coverage.get("complete") is False:
+        if (isinstance(coverage, dict) and coverage.get("complete") is False
+                and not usable):
             return True
-    status = result.get("semantic_status")
-    if isinstance(status, dict) and status.get("complete") is False:
-        return True
+    if isinstance(status, dict) and not usable:
+        complete = status.get("complete")
+        if complete is False or (
+                surface.semantic_lane_answered(status) and complete is not True):
+            return True
     integrity = result.get("semantic_integrity")
     if isinstance(integrity, dict):
         if integrity.get("state") == "generation-rejected":
             return True
         try:
-            if int(integrity.get("dropped") or 0) > 0:
+            dropped = int(integrity.get("dropped") or 0)
+            if dropped > 0 and not (
+                    usable and integrity.get("mismatched") == 0
+                    and dropped <= surface.SEMANTIC_TRIVIAL_MIRROR_LAG_ROWS):
                 return True
         except (TypeError, ValueError):
             return True
@@ -928,12 +1053,12 @@ def _resolve_chat(sess_q: str) -> str | None:
 
 def _excluding_project(hits: list[dict],
                        exclude_project: str | None) -> list[dict]:
-    """--exclude-project: --project's substring semantics, negated. Applied to
+    """--exclude-project: --project's label semantics, negated. Applied to
     full candidate sets before ranking/top-k, never as a page post-filter."""
     if not exclude_project:
         return hits
-    needle = exclude_project.lower()
-    return [h for h in hits if needle not in (h.get("project") or "").lower()]
+    return [h for h in hits
+            if not surface.project_label_matches(h.get("project"), exclude_project)]
 
 
 def _filtered(hits: list[dict], agent: str | None, project: str | None,
@@ -965,8 +1090,8 @@ def _filtered(hits: list[dict], agent: str | None, project: str | None,
         ag = agent.lower()
         out = [h for h in out if ag in (h.get("agent") or "").lower()]
     if project:
-        pr = project.lower()
-        out = [h for h in out if pr in (h.get("project") or "").lower()]
+        out = [h for h in out
+               if surface.project_label_matches(h.get("project"), project)]
     if chat:  # 8-char id prefix (what the UI shows) or a full session uuid
         c = chat.lower()
         out = [h for h in out if (h.get("session") or "").lower().startswith(c)]
@@ -1046,7 +1171,7 @@ def _history_event_identity(session: str, event: dict) -> str | None:
 
 
 def _mark_history_meta(
-        hits: list[dict], queries: list[str],
+        hits: list[dict], queries: list[str], *, probe_mode: str | None = None,
 ) -> dict[tuple[str, int], dict]:
     """Attach bounded command-lineage evidence and return reusable windows."""
     roots = _family_roots_for_hits(hits)
@@ -1061,6 +1186,29 @@ def _mark_history_meta(
                 hit.pop("_sidechain", None)
         if _meta_row(hit):
             hit["_meta_row"] = True
+    if probe_mode is not None:
+        for query_index, query in enumerate(queries):
+            if len([t for t in re.split(r"[\s\-_]+", query.strip()) if t]) < 2:
+                continue
+            prose = [
+                hit for hit in hits
+                if hit.get("_self") is True and hit.get("who") != "tool"
+                and hit.get("_direct_handle") is not True
+                and _meta_query_index(hit) == query_index
+            ]
+            quotations = []
+            for hit in prose:
+                if (probe_mode in ("keyword", "word")
+                        and hit.get("sem_score") is None
+                        and hit.get("matched") not in ("all-terms", "content-terms")
+                        and hit.get("_match_span") is not None):
+                    hit["_probe_query_echo"] = True
+                else:
+                    quotations.append(hit)
+            _mark_query_echoes(query, quotations)
+            for hit in quotations:
+                if hit.get("_query_echo"):
+                    hit["_probe_query_echo"] = True
     candidates = _history_meta_candidates(hits)
     requests = []
     request_keys = []
@@ -1096,11 +1244,22 @@ def _mark_history_meta(
             if type(identity) is not str:
                 continue
             for event in window.get("events") or []:
-                if (event.get("turn") == hit["turn"]
-                        and _history_event_identity(key[0], event) == identity
-                        and display_policy.history_read_invocation(event)):
+                if (event.get("turn") != hit["turn"]
+                        or _history_event_identity(key[0], event) != identity):
+                    continue
+                if display_policy.history_read_invocation(event):
                     hit["_meta_row"] = True
-                    break
+                if (probe_mode in ("keyword", "word", "regex")
+                        and hit.get("_self") is True
+                        and hit.get("_direct_handle") is not True
+                        and hit.get("matched") not in ("all-terms", "content-terms")
+                        and hit.get("sem_score") is None
+                        and display_policy.tool_input_echo(
+                            event, common.tool_search_record(event),
+                            _match_pat(query, probe_mode),
+                            hit.get("_match_span"))):
+                    hit["_probe_query_echo"] = True
+                break
             continue
         floor = int(hit["turn"]) - _HISTORY_META_LOOKBACK
         if any(
@@ -1392,11 +1551,14 @@ def _native_boundary_scores(hits: list[dict], context, *, worker=None,
         while chunk:
             items = [item for item, _owner in chunk]
             owners = [owner for _item, owner in chunk]
+            needs_spans = any(
+                hit.get("matched") == "all-terms"
+                for hit, _match_length in owners)
             request = {
                 "protocol": _NATIVE_BOUNDARY_PROTOCOL,
                 "query": query,
                 "stats": stats,
-                "compact": True,
+                "compact": not needs_spans,
                 "decut": True,
                 "items": items,
             }
@@ -1425,18 +1587,31 @@ def _native_boundary_scores(hits: list[dict], context, *, worker=None,
                 if (not math.isfinite(factor) or not 0.0 <= factor <= 1.0
                         or match_class not in ("aligned", "partial", "interior")):
                     raise ValueError("invalid boundary-rank score")
+                spans = result.get("spans")
+                qualities = result.get("qualities")
+                if hit.get("matched") == "all-terms":
+                    if (not isinstance(spans, list) or not isinstance(qualities, list)
+                            or len(spans) != len(qualities)):
+                        raise ValueError("boundary-rank spans missing")
                 key = factor, -match_length
                 current = best.get(id(hit))
                 if current is None or key > current[:2]:
-                    best[id(hit)] = (factor, -match_length, match_class, hit)
+                    best[id(hit)] = (
+                        factor, -match_length, match_class, spans, qualities, hit)
             total_items += len(chunk)
             del request, items, owners, batch, response, payload
             chunk.clear()
             chunk = list(itertools.islice(stream, chunk_size))
-        for factor, _length, match_class, hit in best.values():
+        for factor, _length, match_class, spans, qualities, hit in best.values():
             hit["_boundary_class"] = match_class
             hit["_boundary_score_factor"] = factor
             hit["_boundary_factor"] = round(factor, 6)
+            if hit.get("matched") == "all-terms":
+                shift = 1 if (hit.get("snippet") or "").startswith(_CUT) else 0
+                hit["_boundary_spans"] = tuple(
+                    None if span is None else (int(span[0]) - shift, int(span[1]) - shift)
+                    for span in spans)
+                hit["_boundary_qualities"] = tuple(float(value) for value in qualities)
         _NATIVE_BOUNDARY_AVAILABLE = True
         common.dbg(
             f"boundary: Rust scored {total_items} occurrence(s) in "
@@ -1492,65 +1667,50 @@ def _boundary_batch(rows: list[dict], context, state: list) -> bool:
     return False
 
 
-def _terms_proximity(snippet: str, terms: list[str], qlen: int) -> float:
-    """Match strength for scattered-terms rows. The stitched snippet projects the
-    engine's per-term spans, so grade their spread: clustered terms outrank a
-    row-wide scatter. Every cut marker stands in for >=80 clipped characters."""
+def _terms_proximity(
+        snippet: str, terms: list[str], qlen: int, *,
+        spans: tuple[tuple[int, int] | None, ...] | None = None,
+        qualities: tuple[float, ...] | None = None) -> float:
+    """Grade spread between the boundary evaluator's selected term occurrences."""
+    if spans is not None and qualities is not None and len(spans) == len(qualities):
+        selected = [(span, quality) for span, quality in zip(spans, qualities)
+                    if span is not None]
+        fraction = len(selected) / len(qualities) if qualities else 1.0
+        if len(selected) < 2:
+            return fraction
+        first = min(span[0] for span, _quality in selected)
+        last = max(span[1] for span, _quality in selected)
+        spread = last - first + 80 * snippet.count(_CUT, first, last)
+        quality_scale = min(max(0.0, 2.0 * quality - 1.0)
+                            for _span, quality in selected)
+        return fraction * (
+            0.5 + 0.5 * min(1.0, qlen / max(1, spread)) * quality_scale)
+
     found = 0
     first = last = 0
-    for t in terms:
-        span = common.insensitive_span(snippet, t)
+    for term in terms:
+        span = common.insensitive_span(
+            snippet, term, variants=boundary_rank.term_variants(term))
         if span is None:
             continue
-        p, end = span
+        start, end = span
         if not found:
-            first, last = p, end
+            first, last = start, end
         else:
-            first = min(first, p)
+            first = min(first, start)
             last = max(last, end)
         found += 1
-    frac = found / len(terms)
+    fraction = found / len(terms)
     if found < 2:
-        return frac
+        return fraction
     spread = last - first + 80 * snippet.count(_CUT, first, last)
-    return frac * (0.5 + 0.5 * min(1.0, qlen / spread))
+    return fraction * (0.5 + 0.5 * min(1.0, qlen / max(1, spread)))
 
 
 def _score(h: dict, pat: re.Pattern | None, qlen: int, now_ms: float,
            terms: list[str] | None = None, boundary=None,
-           rec_floor: float = 0.0) -> float:
+           rec_floor: float = 0.0, optimistic_boundary: bool = False) -> float:
     """Bounded tightness, recency, speaker, source, and boundary evidence."""
-    match = 1.0  # semantic: the vector engine already judged relevance
-    if pat is not None:
-        snippet = h.get("snippet") or ""
-        best = n = 0
-        if len(snippet) >= qlen:
-            for m in pat.finditer(snippet):
-                n += 1
-                # span arithmetic == len(m.group(0)) without materializing the
-                # matched substring; this loop runs once per hit at corpus scale
-                length = m.end() - m.start()
-                if not best or length < best:
-                    best = length
-        # tightness = minimal-possible-length / tightest actual match: compact exact = 1.0, gappy scores lower
-        tight = min(1.0, qlen / best) if (n and qlen and best) else (1.0 if n else 0.0)
-        match = tight * (1.0 - 0.5 ** n)
-        if terms and h.get("matched") in ("all-terms", "content-terms"):
-            # Fallback hits: the phrase pattern usually re-finds nothing; the signal is
-            # engine coverage (idf) or the projected spread of the engine's term spans.
-            # max() keeps in-snippet phrase re-finds at full strength.
-            if h.get("coverage") is not None:
-                match = max(match, h["coverage"])
-            else:
-                match = max(match, _terms_proximity(snippet, terms, qlen))
-    age_days = max(0.0, now_ms - (h.get("ts") or 0)) / 86_400_000
-    rec = 0.5 ** (age_days / _RECENCY_HALF_LIFE_DAYS)
-    speaker = h.get("who") or ""
-    if speaker == "user":
-        rec = max(rec, _USER_REC_FLOOR)  # human evidence never ages below generated rows
-    if rec_floor:
-        rec = max(rec, rec_floor)
-    who = _WHO_W.get(speaker, 0.5)
     boundary_factor = 1.0
     if "_boundary_score_factor" in h:
         boundary_factor = float(h["_boundary_score_factor"])
@@ -1562,12 +1722,48 @@ def _score(h: dict, pat: re.Pattern | None, qlen: int, now_ms: float,
             boundary_factor = quality.factor
             h["_boundary_class"] = quality.match_class
             h["_boundary_factor"] = round(quality.factor, 6)
+            if h.get("matched") == "all-terms":
+                shift = 1 if (h.get("snippet") or "").startswith(_CUT) else 0
+                h["_boundary_spans"] = tuple(
+                    None if span is None else (
+                        int(span[0]) - shift, int(span[1]) - shift)
+                    for span in quality.spans)
+                h["_boundary_qualities"] = quality.qualities
+
+    match = 1.0
+    if pat is not None:
+        snippet = h.get("snippet") or ""
+        best = n = 0
+        if len(snippet) >= qlen:
+            for found in pat.finditer(snippet):
+                n += 1
+                length = found.end() - found.start()
+                if not best or length < best:
+                    best = length
+        tight = min(1.0, qlen / best) if (n and qlen and best) else (1.0 if n else 0.0)
+        match = tight * (1.0 - 0.5 ** n)
+        if terms and h.get("matched") in ("all-terms", "content-terms"):
+            if h.get("coverage") is not None:
+                match = max(match, h["coverage"])
+            elif (optimistic_boundary and h.get("matched") == "all-terms"
+                  and boundary is None and "_boundary_spans" not in h):
+                match = 1.0
+            else:
+                match = max(match, _terms_proximity(
+                    snippet, terms, qlen,
+                    spans=h.get("_boundary_spans"),
+                    qualities=h.get("_boundary_qualities")))
+    age_days = max(0.0, now_ms - (h.get("ts") or 0)) / 86_400_000
+    rec = 0.5 ** (age_days / _RECENCY_HALF_LIFE_DAYS)
+    speaker = h.get("who") or ""
+    if speaker == "user":
+        rec = max(rec, _USER_REC_FLOOR)
+    if rec_floor:
+        rec = max(rec, rec_floor)
+    who = _WHO_W.get(speaker, 0.5)
     meta = _META_SCALE if _meta_row(h) else 1.0
     if meta != 1.0:
         h["_meta_row"] = True
-    # The lexical half of the score, kept separate from the recency/speaker
-    # weighting: only this half says anything about relevance, and a one-line
-    # pointer has to judge relevance without a page to hedge on.
     h["_evidence"] = round(match * boundary_factor, 6)
     return (match * rec * who * boundary_factor
             * _SOURCE_SCALE.get(speaker, 1.0) * meta)
@@ -1582,6 +1778,17 @@ def _rank_key(h: dict) -> tuple:
     return (_RANK_CLASS.get(h.get("matched") or "", 0), -h["score"],
             -(h.get("ts") or 0), h["session"], -1 if turn is None else turn,
             h.get("who") or "")
+
+_SESSION_LANE_WEIGHT = {"all-terms": 0.7, "content-terms": 0.5}
+
+
+def _session_view_key(h: dict) -> tuple:
+    """Fold lane confidence into score for session-head surfaces."""
+    turn = h.get("turn")
+    lane = h.get("matched") or ""
+    folded = h["score"] * _SESSION_LANE_WEIGHT.get(lane, 1.0)
+    return (-folded, _RANK_CLASS.get(lane, 0), -(h.get("ts") or 0),
+            h["session"], -1 if turn is None else turn, h.get("who") or "")
 
 
 def _rank(hits: list[dict], q: str, mode: str, sort: str, boundary=None,
@@ -1612,16 +1819,20 @@ def _rank(hits: list[dict], q: str, mode: str, sort: str, boundary=None,
         hit.pop("_boundary_class", None)
         hit.pop("_boundary_factor", None)
         hit.pop("_boundary_score_factor", None)
+        hit.pop("_boundary_spans", None)
+        hit.pop("_boundary_qualities", None)
         hit.pop("_evidence", None)
 
-    def score_rows(rows: list[dict], evidence, *, try_native: bool = True) -> bool:
+    def score_rows(rows: list[dict], evidence, *, try_native: bool = True,
+                   optimistic_boundary: bool = False) -> bool:
         native = bool(evidence is not None and try_native and try_native_boundary
                       and _native_boundary_scores(rows, evidence))
         scorer = None if native else evidence
         for hit in rows:
             hit["score"] = round(
                 _score(hit, pat, qlen, now_ms, terms=terms, boundary=scorer,
-                       rec_floor=rec_floor), 4)
+                       rec_floor=rec_floor,
+                       optimistic_boundary=optimistic_boundary), 4)
         return native
 
     if boundary is None:
@@ -1638,7 +1849,7 @@ def _rank(hits: list[dict], q: str, mode: str, sort: str, boundary=None,
             visible = hits[:top_k]
         score_rows(visible, boundary)
     else:
-        score_rows(hits, None)
+        score_rows(hits, None, optimistic_boundary=True)
         native = bool(try_native_boundary
                       and _native_boundary_scores(hits, boundary))
         if native:
@@ -1784,7 +1995,7 @@ def _family_roots_for_hits(hits: list[dict]) -> dict[str, str]:
         str(hit.get("session") or "") for hit in hits
         if hit.get("session") and str(hit.get("session")) not in roots
     }
-    indexed = common.indexed_family_roots(missing)
+    indexed = common.indexed_family_roots(missing, allow_behind=True)
     if indexed is not None:
         roots.update(indexed)
     for session in missing:
@@ -1806,27 +2017,26 @@ def _merge_auto_semantic_hits(keyword_hits: list[dict], semantic_hits: list[dict
         session = str(hit.get("session") or "")
         return roots.get(session, session)
 
-    lexical_families = {family(hit) for hit in lexical if hit.get("session")}
+    strong_lexical = [hit for hit in lexical if not _weak_lexical_hit(hit)]
+    # scatter cousins corroborate only when the lexical lane is all scatter
+    corroborating = {family(hit) for hit in (strong_lexical or lexical)
+                     if hit.get("session")}
     visible_families = {family(hit) for hit in lexical[:cap] if hit.get("session")}
     seen_turns = {(str(hit.get("session") or ""), hit.get("turn")): hit
                   for hit in lexical if hit.get("session") and hit.get("turn") is not None}
     seen_text = {key for hit in lexical if (key := _hybrid_text_key(hit))}
     meaning = []
-    raw_meaning = list(semantic_hits)[:_AUTO_SEMANTIC_ROWS]
+    raw_meaning = sorted(semantic_hits, key=_semantic_row_weak)[:_AUTO_SEMANTIC_ROWS]
     if lexical and not any(
             not _weak_lexical_hit(hit) for hit in lexical[:cap]):
         # Weak neighbors may supplement an exact anchor but never lead a page
-        # whose lexical lane is itself only scatter; strong semantic rows can
-        # still rescue it, and sub-strong rows stay reachable through `-s`.
-        raw_meaning = [
-            hit for hit in raw_meaning
-            if hit.get("sem_score") is not None
-            and float(hit["sem_score"]) >= _RECALL_STRONG_SEM
-        ]
+        # whose lexical lane is itself only scatter; confident semantic rows
+        # can still rescue it, and weak rows stay reachable through `-s`.
+        raw_meaning = [hit for hit in raw_meaning if not _semantic_row_weak(hit)]
         if not raw_meaning:
             return lexical[:cap]
     overlaps = [index for index, hit in enumerate(raw_meaning)
-                if hit.get("session") and family(hit) in lexical_families]
+                if hit.get("session") and family(hit) in corroborating]
     overlap_at = max(overlaps) if overlaps else None
     # A weak scattered cousin is corroboration, not coverage: only a strong
     # visible row of the same family may suppress the semantic lead.
@@ -1871,8 +2081,7 @@ def _merge_auto_semantic_hits(keyword_hits: list[dict], semantic_hits: list[dict
         remainder = [hit for hit in lexical
                      if not hit.get("session") or family(hit) not in used]
         return [*meaning, *remainder][:cap]
-    strong = [hit for hit in lexical if not _weak_lexical_hit(hit)]
-    if not strong:
+    if not strong_lexical:
         reserve = min(len(meaning), _AUTO_SEMANTIC_ROWS, cap)
         return [*meaning[:reserve], *lexical][:cap]
     lead = min(3, next(
@@ -1991,9 +2200,11 @@ def _finish_semantic_query_inner(pending) -> dict | None:
         # Retain typed failures returned by that deadline, but never delay lexical
         # output for a still-running optional meaning call.
         return None
-    if state.get("error") is not None:
+    error = state.get("error")
+    if error is not None:
         common.dbg(
-            f"automatic semantic lane failed: {type(state['error']).__name__}", "!")
+            f"automatic semantic lane failed: {type(error).__name__}", "!")
+        return _semantic_lane_failure(state, error)
     result = state.get("result")
     if not isinstance(result, dict):
         return None
@@ -2053,20 +2264,29 @@ def _want_terms_fallback(mode: str, q: str) -> bool:
     return len([t for t in re.split(r"[\s\-_]+", q.strip()) if t]) >= 2
 
 
-def _session_heads(hits: list[dict], limit: int) -> list[dict]:
-    """Best-ranked hit from each session, preserving the ranking already applied.
+def _keyword_term_specs(tokens: list[str]) -> list[tuple[str, tuple[str, ...]]]:
+    """Deduplicate query terms with their deterministic folded variants."""
+    out = []
+    seen = set()
+    for token in tokens:
+        variants = boundary_rank.term_variants(token)
+        if variants and variants not in seen:
+            seen.add(variants)
+            out.append((token, variants))
+    return out
 
-    `limit=0` means every distinct session, mirroring run_query's row-limit
-    convention. Keeping this at the query layer matters: callers asking for chats
-    must not guess how many turn rows they need to fetch before deduplicating.
-    """
+
+def _session_heads(hits: list[dict], limit: int,
+                   *, session_view_rank: bool = False) -> list[dict]:
+    """Keep each session's best row, optionally folding lane confidence into score."""
     counts: dict[str, int] = {}
     for h in hits:
         session = h.get("session")
         if session:
             counts[session] = counts.get(session, 0) + 1
+    ordered = sorted(hits, key=_session_view_key) if session_view_rank else hits
     out, seen = [], set()
-    for h in hits:
+    for h in ordered:
         session = h.get("session")
         if not session or session in seen:
             continue
@@ -2458,10 +2678,12 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         # python row-by-row merge over the whole table (an emoji query measured
         # 492k fetchones, ~5s). The SQL lane scans the same rows in C.
         return None
-    lows = list(dict.fromkeys(token.lower() for token in toks))
+    term_specs = _keyword_term_specs(toks)
+    lows = [token.lower() for token, _variants in term_specs]
+    anchors = [boundary_rank.term_anchor(token) for token, _variants in term_specs]
     gate = max(0, int(_BOUNDED_KEYWORD_MIN_CANDIDATES))
     try:
-        if corpusdb.candidate_count_capped(db, lows, flt, gate + 1) <= gate:
+        if corpusdb.candidate_count_capped(db, anchors, flt, gate + 1) <= gate:
             return None
     except sqlite3.OperationalError as exc:
         common.dbg(f"bounded row preflight unavailable ({exc}); using exhaustive ranking", "!")
@@ -2536,7 +2758,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         own_tx = not db.in_transaction
         if own_tx:
             db.execute("BEGIN")
-        dense = corpusdb.dense_candidate_lane(db, lows, flt)
+        dense = corpusdb.dense_candidate_lane(db, anchors, flt)
         if fallback_possible and dense:
             phrase_complete, thin_phrase = corpusdb.dense_phrase_preflight(
                 db, toks, flt, limit)
@@ -2555,7 +2777,7 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
                     f"{phrase_count} match(es)")
         term_target = max(0, limit - len(phrase_best))
         candidates = corpusdb.score_ceiling_candidates(
-            db, lows, flt, now_ms=now_ms, who_weights=_WHO_W,
+            db, anchors, flt, now_ms=now_ms, who_weights=_WHO_W,
             source_scales=_SOURCE_SCALE,
             recency_half_life_days=_RECENCY_HALF_LIFE_DAYS,
             user_recency_floor=_USER_REC_FLOOR, dense=dense)
@@ -2578,7 +2800,10 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
             examined += 1
             text = row[corpusdb._TEXT]
             lowered = text.lower()
-            spans = [common.insensitive_span(text, token, lowered) for token in lows]
+            spans = [
+                common.insensitive_span(text, token, lowered, variants=variants)
+                for token, variants in term_specs
+            ]
             if any(span is None for span in spans):
                 continue
 
@@ -2949,7 +3174,8 @@ def _bounded_short_keyword_sessions(
 def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                               allow_fallback: bool,
                               boundary=None,
-                              family_diverse: bool = False) -> dict | None:
+                              family_diverse: bool = False,
+                              session_view_rank: bool = False) -> dict | None:
     """Exact top session heads without exhaustive hit materialization.
 
     ``None`` delegates to the ordinary exhaustive path. The returned heads and their
@@ -2965,10 +3191,12 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
     toks = [t for t in re.split(r"[\s\-_]+", q.strip()) if t]
     if not toks or limit <= 0:
         return None
-    lows = list(dict.fromkeys(t.lower() for t in toks))
     caller = str(flt.get("exclude_session") or "")
     window_boundary = flt.get("exclude_session_from_turn")
     exclude_family = flt.get("exclude_family", True)
+    term_specs = _keyword_term_specs(toks)
+    lows = [token.lower() for token, _variants in term_specs]
+    anchors = [boundary_rank.term_anchor(token) for token, _variants in term_specs]
     caller_row = (
         db.execute(
             "SELECT root FROM session_family WHERE session=?", (caller,)
@@ -2983,7 +3211,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
     gate = max(0, int(_BOUNDED_KEYWORD_MIN_CANDIDATES))
     try:
         if corpusdb.candidate_count_capped(
-                db, lows, stream_flt, gate + 1) <= gate:
+                db, anchors, stream_flt, gate + 1) <= gate:
             return None
     except sqlite3.OperationalError as exc:
         common.dbg(f"bounded keyword preflight unavailable ({exc}); using exhaustive ranking", "!")
@@ -3001,6 +3229,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
 
     phrase_best: dict[str, tuple[tuple, dict]] = {}
     term_best: dict[str, tuple[tuple, dict]] = {}
+    view_best: dict[str, tuple[tuple, dict]] = {}
     phrase_sessions: set[str] = set()
     term_sessions: set[str] = set()
     phrase_count = term_count = phrase_tool_count = term_tool_count = 0
@@ -3016,7 +3245,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
     examined = 0
 
     def add_best(bucket: dict, family: str, hit: dict) -> None:
-        rank_key = _rank_key(hit)
+        rank_key = _session_view_key(hit) if session_view_rank else _rank_key(hit)
         current = bucket.get(family)
         if current is not None:
             if rank_key < current[0]:
@@ -3040,7 +3269,8 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
             hit["score"] = round(
                 _score(hit, score_pat, qlen, now_ms, terms=lows,
                        boundary=scorer), 4)
-            add_best(phrase_best if is_phrase else term_best, family, hit)
+            add_best(view_best if session_view_rank else (
+                phrase_best if is_phrase else term_best), family, hit)
         pending.clear()
 
     def bucket_frontier(bucket: dict, target: int):
@@ -3060,19 +3290,25 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
         terms_fallback = fallback_possible and phrase_count == 0
         terms_augmented = False
         if fallback_possible:
-            if not term_best:
+            if not term_best and not view_best:
                 content = _content_terms(q)
                 if allow_fallback and _nl_query(q, content):
                     return None
-            extras = [value for family, value in term_best.items()
-                      if family not in phrase_best]
-            terms_augmented = bool(phrase_best) and bool(extras)
-            values = [*phrase_best.values(), *extras]
+            if session_view_rank:
+                values = list(view_best.values())
+                terms_augmented = bool(phrase_count) and any(
+                    hit.get("matched") == "all-terms" for _key, hit in values)
+            else:
+                extras = [value for family, value in term_best.items()
+                          if family not in phrase_best]
+                terms_augmented = bool(phrase_best) and bool(extras)
+                values = [*phrase_best.values(), *extras]
             observed_total = term_count
             observed_chats = len(term_sessions)
             observed_tools = term_tool_count
         else:
-            values = list(phrase_best.values())
+            values = list(view_best.values() if session_view_rank
+                          else phrase_best.values())
             observed_total = phrase_count
             observed_chats = len(phrase_sessions)
             observed_tools = phrase_tool_count
@@ -3090,8 +3326,9 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                     "SELECT session, text FROM msgs" + where,
                     [*params, *selected_sessions]):
                 lowered = text.lower()
-                if all(common.insensitive_span(text, token, lowered) is not None
-                       for token in lows):
+                if all(common.insensitive_span(
+                        text, token, lowered, variants=variants) is not None
+                       for token, variants in term_specs):
                     selected_counts[session] += 1
         for hit in selected:
             hit["session_hits"] = selected_counts[hit["session"]]
@@ -3107,7 +3344,7 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
         own_tx = not db.in_transaction
         if own_tx:
             db.execute("BEGIN")
-        dense = corpusdb.dense_candidate_lane(db, lows, stream_flt)
+        dense = corpusdb.dense_candidate_lane(db, anchors, stream_flt)
         if fallback_possible and dense:
             phrase_complete, thin_phrase = corpusdb.dense_phrase_preflight(
                 db, toks, stream_flt, max(256, limit * 16))
@@ -3138,9 +3375,10 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 common.dbg(
                     f"bounded sessions: dense phrase lane complete with "
                     f"{phrase_count} match(es)")
-        term_target = max(0, limit - len(phrase_best))
+        term_target = (limit if session_view_rank
+                       else max(0, limit - len(phrase_best)))
         candidates = corpusdb.score_ceiling_candidates(
-            db, lows, stream_flt, now_ms=now_ms, who_weights=_WHO_W,
+            db, anchors, stream_flt, now_ms=now_ms, who_weights=_WHO_W,
             source_scales=_SOURCE_SCALE,
             recency_half_life_days=_RECENCY_HALF_LIFE_DAYS,
             user_recency_floor=_USER_REC_FLOOR, dense=dense,
@@ -3160,28 +3398,40 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 continue
             family = carried_root if family_diverse else session
             upper = max_rounded
-            if phrase_complete and term_target == 0 and term_lane_confirmed:
-                stopped_early = True
-                break
-            frontier = (term_frontier(term_target)
-                        if phrase_complete else bucket_frontier(phrase_best, limit))
-            if pending and frontier is not None and upper < -frontier[1]:
-                score_pending()
+            if session_view_rank:
+                frontier = bucket_frontier(view_best, limit)
+                if pending and frontier is not None and upper < -frontier[0]:
+                    score_pending()
+                    frontier = bucket_frontier(view_best, limit)
+                if frontier is not None and upper < -frontier[0]:
+                    stopped_early = True
+                    break
+            else:
+                if phrase_complete and term_target == 0 and term_lane_confirmed:
+                    stopped_early = True
+                    break
                 frontier = (term_frontier(term_target)
                             if phrase_complete else bucket_frontier(phrase_best, limit))
-            if phrase_complete and frontier is not None:
-                if upper < -frontier[1]:
-                    stopped_early = True
-                    break
-            elif phrase_count >= early_stop_at and frontier is not None:
-                if upper < -frontier[1]:
-                    stopped_early = True
-                    break
+                if pending and frontier is not None and upper < -frontier[1]:
+                    score_pending()
+                    frontier = (
+                        term_frontier(term_target)
+                        if phrase_complete else bucket_frontier(phrase_best, limit))
+                if phrase_complete and frontier is not None:
+                    if upper < -frontier[1]:
+                        stopped_early = True
+                        break
+                elif phrase_count >= early_stop_at and frontier is not None:
+                    if upper < -frontier[1]:
+                        stopped_early = True
+                        break
 
             text = row[corpusdb._TEXT]
             low = text.lower()
-            term_spans = [common.insensitive_span(text, token, low)
-                          for token in lows]
+            term_spans = [
+                common.insensitive_span(text, token, low, variants=variants)
+                for token, variants in term_specs
+            ]
             if any(span is None for span in term_spans):
                 continue
             term_lane_confirmed = True
@@ -3209,13 +3459,14 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 phrase_sessions.add(session)
                 phrase_tool_count += hit.get("who") == "tool"
 
-            # Terms lane stays live even amid phrase abundance (a phrase's own echoes
-            # would shadow scattered hits); merge drops phrase-hit sessions, early stop bounds cost.
+            # The same row remains a phrase row; only a different scattered row may
+            # displace its session head in score-folded views.
             if fallback_possible:
-                hit = corpusdb._spans_hit(
-                    row, [span for span in term_spans if span is not None])
-                hit["matched"] = "all-terms"
-                pending.append((hit, family, False))
+                if not (session_view_rank and phrase_match):
+                    hit = corpusdb._spans_hit(
+                        row, [span for span in term_spans if span is not None])
+                    hit["matched"] = "all-terms"
+                    pending.append((hit, family, False))
                 term_count += 1
                 term_sessions.add(session)
                 term_tool_count += hit.get("who") == "tool"
@@ -3268,6 +3519,7 @@ class QuerySpec:
     exact_totals: bool
     family_diverse: bool
     semantic_timeout_s: float | None
+    session_view_rank: bool = False
     excluded_sessions: tuple[str, ...] = ()
     allow_model_download: bool = False
     exclude_project: str | None = None
@@ -3451,6 +3703,9 @@ _SEMANTIC_FALLBACK_CHILD_ARG = "--semantic-local-fallback-child"
 _SEMANTIC_CHILD_INPUT_MAX = 8 * 1024
 _SEMANTIC_CHILD_OUTPUT_MAX = 8 * 1024 * 1024
 _SEMANTIC_TREE_OPEN_S = 1.0
+# -s carries no caller deadline; its guarded child still ends at this ceiling
+_SEMANTIC_CHILD_CEILING_S = 30.0
+_SEMANTIC_WAIT_DISCLOSE_S = 2.0
 
 
 def _stop_semantic_subprocess(
@@ -3546,15 +3801,38 @@ def _open_windows_semantic_tree(
         time.sleep(0.005)
 
 
+def _semantic_child_timeout(timeout_s: float | None) -> float:
+    if timeout_s is None:
+        return _SEMANTIC_CHILD_CEILING_S
+    raw_timeout = float(timeout_s)
+    if not math.isfinite(raw_timeout):
+        raise ValueError("semantic timeout must be finite")
+    return max(0.05, min(_SEMANTIC_CHILD_CEILING_S, raw_timeout))
+
+
+def _communicate_with_disclosure(
+        process: subprocess.Popen, request: bytes, work_deadline: float,
+        waiting_on: str | None) -> tuple[bytes, bytes]:
+    """communicate() that names its wait on stderr once it outlives the
+    disclosure delay; the second call carries no input by the subprocess
+    contract (retrying after a timeout loses nothing)."""
+    first = max(0.001, work_deadline - time.monotonic())
+    if waiting_on is None or first <= _SEMANTIC_WAIT_DISCLOSE_S:
+        return process.communicate(input=request, timeout=first)
+    try:
+        return process.communicate(
+            input=request, timeout=_SEMANTIC_WAIT_DISCLOSE_S)
+    except subprocess.TimeoutExpired:
+        pass
+    remaining = max(0.001, work_deadline - time.monotonic())
+    common.log(f"meaning search: {waiting_on}; giving up in {remaining:.0f}s")
+    return process.communicate(timeout=remaining)
+
+
 def _run_guarded_semantic_child(
         request_obj: dict, *, timeout_s: float | None,
-        child_arg: str) -> dict | None:
-    timeout = None
-    if timeout_s is not None:
-        raw_timeout = float(timeout_s)
-        if not math.isfinite(raw_timeout):
-            raise ValueError("semantic timeout must be finite")
-        timeout = max(0.05, min(30.0, raw_timeout))
+        child_arg: str, waiting_on: str | None = None) -> dict | None:
+    timeout = _semantic_child_timeout(timeout_s)
     request = json.dumps(
         request_obj, ensure_ascii=False,
         separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -3587,12 +3865,8 @@ def _run_guarded_semantic_child(
         _stop_semantic_subprocess(process, None, 0.5)
         raise SemanticQueryWorkerError(
             "semantic query worker identity could not be verified")
-    cleanup_reserve = (
-        None if timeout is None
-        else min(1.0, max(0.10, timeout * 0.25)))
-    work_deadline = (
-        None if timeout is None
-        else started + max(0.05, timeout - cleanup_reserve))
+    cleanup_reserve = min(1.0, max(0.10, timeout * 0.25))
+    work_deadline = started + max(0.05, timeout - cleanup_reserve)
     windows_tree = None
     try:
         if common.WIN:
@@ -3603,13 +3877,9 @@ def _run_guarded_semantic_child(
                 raise SemanticQueryWorkerError(
                     "semantic query worker lifetime boundary could not be verified")
         try:
-            stdout, stderr = process.communicate(
-                input=request,
-                timeout=(
-                    None if work_deadline is None
-                    else max(0.001, work_deadline - time.monotonic())))
+            stdout, stderr = _communicate_with_disclosure(
+                process, request, work_deadline, waiting_on)
         except subprocess.TimeoutExpired as exc:
-            assert timeout is not None
             remaining = max(0.0, started + timeout - time.monotonic())
             if not _stop_semantic_subprocess(
                     process, process_start, remaining,
@@ -3619,16 +3889,12 @@ def _run_guarded_semantic_child(
             raise SemanticQueryTimeoutError(
                 f"meaning search exceeded its {timeout:g}s limit") from exc
         except BaseException:
-            remaining = (
-                1.0 if timeout is None
-                else max(0.0, started + timeout - time.monotonic()))
+            remaining = max(0.0, started + timeout - time.monotonic())
             _stop_semantic_subprocess(
                 process, process_start, remaining,
                 windows_tree=windows_tree)
             raise
-        remaining = (
-            1.0 if timeout is None
-            else max(0.0, started + timeout - time.monotonic()))
+        remaining = max(0.0, started + timeout - time.monotonic())
         if not _stop_semantic_subprocess(
                 process, process_start, remaining,
                 windows_tree=windows_tree):
@@ -3684,23 +3950,26 @@ def _guarded_semantic_query(spec: QuerySpec) -> dict | None:
 
 def _guarded_semantic_local_fallback(
         query: str, *, level: str, k: int, filters: dict,
-        timeout_s: float | None) -> dict:
+        timeout_s: float | None, reason: str | None = None) -> dict:
     parent_start = common.process_start_identity(os.getpid())
     if not parent_start:
         raise SemanticQueryWorkerError(
             "semantic fallback parent identity could not be verified")
-    owner_wait_s = 30.0
-    if timeout_s is not None:
-        timeout = max(0.05, min(30.0, float(timeout_s)))
-        cleanup_reserve = min(1.0, max(0.10, timeout * 0.25))
-        owner_wait_s = max(
-            0.0, timeout - cleanup_reserve - 0.75)
+    timeout = _semantic_child_timeout(timeout_s)
+    cleanup_reserve = min(1.0, max(0.10, timeout * 0.25))
+    owner_wait_s = max(0.0, timeout - cleanup_reserve - 0.75)
+    waiting_on = (
+        "the resident semantic worker is unreachable"
+        + (f" ({reason})" if reason else "")
+        + "; a read-only local pass is waiting for the semantic model owner "
+        "lease held by another agrep process")
     result = _run_guarded_semantic_child(
         {"query": query, "level": level, "k": k, "filters": filters,
          "owner_wait_s": owner_wait_s, "parent_pid": os.getpid(),
          "parent_start": parent_start},
         timeout_s=timeout_s,
-        child_arg=_SEMANTIC_FALLBACK_CHILD_ARG)
+        child_arg=_SEMANTIC_FALLBACK_CHILD_ARG,
+        waiting_on=waiting_on)
     if not isinstance(result, dict):
         raise SemanticQueryWorkerError(
             "bounded local semantic fallback returned no result")
@@ -4067,10 +4336,6 @@ class NativeEventScanMoved(NativeEventScanError):
     pass
 
 
-class SnapshotPublicationActive(RuntimeError):
-    pass
-
-
 class SnapshotPublicationTimeout(RuntimeError):
     pass
 
@@ -4079,14 +4344,12 @@ class NativeEventFallback(RuntimeError):
     pass
 
 
-# Publications land in tens-to-hundreds of ms; queries over a readable
-# last-good snapshot never wait at all (they pin it), so this window only
-# covers the atomic-swap gap when no snapshot exists yet (first-ever build).
+# Only queries without a verified snapshot wait for publication.
 _QUERY_PUBLICATION_WAIT_S = 1.0
 _QUERY_PUBLICATION_WAIT_MIN_S = 0.02
 _QUERY_PUBLICATION_WAIT_MAX_S = 0.25
 _QUERY_PUBLICATION_TIMEOUT = (
-    "history is still publishing its first searchable snapshot after 1s - "
+    "no verified transcript snapshot became available within 1s - "
     "rerun the same agrep command")
 # ranked rows a --deeper replay resumes past: the frozen chain served them
 _DEEPER_SKIP_ROWS: int = 0
@@ -4208,10 +4471,11 @@ def _native_event_shape(spec: QuerySpec) -> bool:
         spec.mode == "keyword" and not spec.exhaustive
         and spec.sort == "score" and spec.session_limit is None
         and not spec.family_diverse and spec.exclude_project is None
+        and spec.project is None  # the native owner filter is substring-only
         and 0 < spec.limit <= 512 and 0 < len(tokens) <= 16
         and spec.q.isascii()
         and all(value is None or str(value).isascii()
-                for value in (spec.agent, spec.project, spec.chat))
+                for value in (spec.agent, spec.chat))
         and all(char.isalnum() or char.isspace() or char in "-_"
                 for char in spec.q)
         and (len(tokens) > 1 or len(tokens[0]) >= 3))
@@ -4423,10 +4687,6 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
             db = None
     search_index_building = bool(
         db is None and corpusdb.query_search_index_build_active())
-    if (db is None and not search_index_building
-            and corpusdb.query_publication_active()):
-        raise SnapshotPublicationActive(
-            "a verified publisher is updating the query generation")
     try:
         # Boundary evidence, candidates, and counts are one answer; close releases
         # the pinned generation after every SQL lane has finished reading it.
@@ -4590,7 +4850,8 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
                 if result.bounded_sessions is None:
                     result.bounded_sessions = _bounded_keyword_sessions(
                         db, spec.q, spec.session_limit, flt, spec.allow_fallback,
-                        boundary=boundary, family_diverse=spec.family_diverse)
+                        boundary=boundary, family_diverse=spec.family_diverse,
+                        session_view_rank=spec.session_view_rank)
             if (result.bounded_rows is None
                     and result.bounded_sessions is not None):
                 _count_early_stop(db, spec, flt, result.bounded_sessions)
@@ -4755,8 +5016,6 @@ def _keyword_candidates(spec: QuerySpec) -> LaneResult:
                     raise QueryDatabaseUnavailableError(
                         "search index is temporarily unavailable; retry") from exc
                 fallback_retried = True
-        except SnapshotPublicationActive as exc:
-            publication_error = exc
         except (DirectSnapshotQueryMoved, NativeEventScanMoved) as exc:
             publisher_active = corpusdb.query_publication_active()
             if not movement_retried:
@@ -4772,8 +5031,10 @@ def _keyword_candidates(spec: QuerySpec) -> LaneResult:
                 spec = replace(spec, pin_last_good=True)
                 continue
             publication_error = exc
-        except (DirectSnapshotQueryError, NativeEventScanError):
-            raise
+        except (DirectSnapshotQueryError, NativeEventScanError) as exc:
+            if not corpusdb.query_publication_active():
+                raise
+            publication_error = exc
         if publication_error is None:
             continue
         now = time.monotonic()
@@ -4828,7 +5089,8 @@ def _finalize_query(spec: QuerySpec, result: LaneResult) -> dict:
             head_limit = (
                 requested_heads if spec.mode == "semantic"
                 else 0 if spec.family_diverse else requested_heads)
-            selected = _session_heads(hits, head_limit)
+            selected = _session_heads(
+                hits, head_limit, session_view_rank=spec.session_view_rank)
             if spec.family_diverse and spec.mode != "semantic":
                 selected = _family_heads(selected, requested_heads)
         else:
@@ -4854,7 +5116,10 @@ def _finalize_query(spec: QuerySpec, result: LaneResult) -> dict:
         out.update(result.semantic_meta)
         status = result.semantic_meta.get("semantic_status") or {}
         out["totals_exact"] = (
-            bool(status.get("complete")) and not result.semantic_truncated)
+            surface.semantic_lane_answered(status)
+            and not _semantic_result_incomplete(
+                out, allow_live_tail=not spec.exact_totals)
+            and not result.semantic_truncated)
         if result.semantic_truncated:
             out["truncated"] = True
     if result.terms_fallback:
@@ -4891,7 +5156,8 @@ def run_query(q: str, *, mode: str = "keyword", limit: int = 40, sort: str = "sc
               semantic_timeout_s: float | None = None,
               semantic_process_guard: bool = False,
               allow_model_download: bool = False,
-              exclude_project: str | None = None) -> dict | None:
+              exclude_project: str | None = None,
+              session_view_rank: bool = False) -> dict | None:
     """The one query layer all callers share: dispatch to the right engine
     (corpusdb keyword/word/regex, JSONL scans when unavailable, the in-process
     semantic lane), filter, rank, cap. No printing; raises re.error on a bad regex.
@@ -4899,11 +5165,13 @@ def run_query(q: str, *, mode: str = "keyword", limit: int = 40, sort: str = "sc
     filtered set, or None when semantic can't answer (stale/refreshing embeddings -
     the caller serves keyword instead).
     `session_limit=N` switches only the returned hits to a session-level view: the
-    best globally-ranked hit from each of the top N chats. ``exact_totals=False`` is
-    an opt-in keyword/session optimization: heads stay exact while aggregate counts
-    become observed lower bounds and carry ``totals_exact=False``. Ordinary search
-    and probes retain exhaustive totals by default. Caller-family filters run before
-    top-k so self echoes cannot mask past hits."""
+    best hit from each of the top N chats. `session_view_rank=True` folds lane
+    confidence into score for that selection while row search remains lane-first.
+    ``exact_totals=False`` is an opt-in keyword/session optimization: heads stay
+    exact while aggregate counts become observed lower bounds and carry
+    ``totals_exact=False``. Ordinary search and probes retain exhaustive totals by
+    default. Caller-family filters run before top-k so self echoes cannot mask past
+    hits."""
     if session_limit is not None:
         session_limit = max(0, int(session_limit))
     if family_diverse is None:
@@ -4920,7 +5188,8 @@ def run_query(q: str, *, mode: str = "keyword", limit: int = 40, sort: str = "sc
         exact_totals=exact_totals, family_diverse=bool(family_diverse),
         semantic_timeout_s=semantic_timeout_s,
         allow_model_download=allow_model_download,
-        exclude_project=exclude_project)
+        exclude_project=exclude_project,
+        session_view_rank=bool(session_view_rank))
     if spec.mode == "regex":
         return _guarded_regex_query(spec)
     if spec.mode == "semantic" and semantic_process_guard:
@@ -4949,6 +5218,16 @@ def _is_side(hs, roots: dict[str, str] | None = None) -> bool:
     session = str(hs[0].get("session") or "")
     roots = roots if roots is not None else _family_roots_for_hits(hs)
     return bool(session and roots.get(session, session) != session)
+
+
+def indexed_side_sessions() -> tuple[str, ...]:
+    """Every indexed side chat (spawned subagent session), sorted: the set
+    `chats` hides by default and `--no-side` hides on search/recall."""
+    import explore
+    index = explore._session_index()
+    return tuple(sorted(
+        session for session, raw in index.items()
+        if explore._indexed_chat_is_side({**raw, "session": session})))
 
 
 # prose rows, not raw transcript turns: the corpus median is 1 and p99 is 40,
@@ -4998,10 +5277,13 @@ def _chat_head(hs0, n, color, side=False, session_index=None):
         else compact.encode_session_target(session, session_index=session_index))
     handle = terminal_safe(handle)
     cnt = f"{n} hit{'s' if n != 1 else ''}"
+    # the head row's age: under --sort time the chat's newest matching row
+    age = common.age_label(hs0.get("ts"))
+    tail = f"{handle} · {cnt}" + (f" · {age}" if age != "-" else "")
     if color:
-        s = f"{_C['hd']}{crumbs}{_C['r']}  {_C['d']}{handle} · {cnt}{_C['r']}"
+        s = f"{_C['hd']}{crumbs}{_C['r']}  {_C['d']}{tail}{_C['r']}"
     else:
-        s = f"{crumbs}  [{handle} · {cnt}]"
+        s = f"{crumbs}  [{tail}]"
     return s
 
 
@@ -5457,9 +5739,9 @@ def _search_argv_base(
         argv.append("--hybrid")
     elif semantic:
         argv.append("-s")
-    elif args.regex:
+    elif getattr(args, "regex", False):
         argv.append("-E")
-    elif args.word:
+    elif getattr(args, "word", False):
         argv.append("-w")
     elif args.lexical:
         argv.append("--lexical")
@@ -5479,15 +5761,18 @@ def _search_argv_base(
         argv.append("--soft")
     if args.no_meta:
         argv.append("--no-meta")
-    if args.sort != "score":
-        argv.append(f"--sort={args.sort}")
+    sort = getattr(args, "sort", "score")
+    if sort != "score":
+        argv.append(f"--sort={sort}")
     if args.include_self:
         argv.append("--self")
     elif args.force_no_self:
         argv.append("--no-self")
     if args.all_side_chats:
         argv.append("--all-side-chats")
-    if args.strict_semantic:
+    if args.no_side:
+        argv.append("--no-side")
+    if getattr(args, "strict_semantic", False):
         argv.append("--strict-semantic")
     if args.no_auto:
         argv.append("--no-auto")
@@ -5714,7 +5999,7 @@ def _self_exclusion_match_keys(
     """
     family = policy.family
     sessions = (
-        (family.session,) if policy.windowed
+        (family.session, *sorted(policy.window_members)) if policy.windowed
         else tuple(sorted(family.members or frozenset({family.session}))))
     requested_chat = str(query_kwargs.get("chat") or "").lower()
     if requested_chat:
@@ -5727,6 +6012,7 @@ def _self_exclusion_match_keys(
         key: value for key, value in query_kwargs.items()
         if key not in {
             "chat", "exclude_session", "exclude_session_from_turn",
+            "_exclude_sessions",
             "exhaustive", "exact_totals", "family_diverse", "limit",
             "session_limit", "sort",
         }
@@ -5793,9 +6079,8 @@ def _count_tiers(hits: list[dict]) -> dict[str, int]:
     return tiers
 
 
-# Over-specification auto-recovery: a wordy natural-language query whose page
-# holds no strong row beyond the caller's own echoes retries once with bm25
-# term coverage. Corpus document frequencies pick the informative terms.
+# Over-specification recovery: a multi-term page with no strong independent
+# row retries once with bm25 term coverage; corpus DF picks the terms.
 _OVERSPEC_MIN_TERMS = 5
 _OVERSPEC_BLOCK_ROWS = 5
 _OVERSPEC_FORCED_ROWS = 20
@@ -5843,10 +6128,11 @@ def _overspec_narration_df(q: str, db) -> bool:
     return any(f >= _OVERSPEC_DF_UBIQUITOUS for f in df.values())
 
 
-def _coverage_cmd(q: str) -> str:
-    """The copyable force command: law 2 - the auto-retry's route has a pin."""
+def _coverage_cmd(q: str, request: argparse.Namespace | None = None) -> str:
+    argv = (["agrep"] if request is None
+            else _search_argv_base(request, semantic=False))
     return console.shell_command(
-        "agrep", "--coverage", "--", q,
+        *argv, "--coverage", "--", q,
         fallback="agrep --coverage <query>")
 
 
@@ -5894,9 +6180,11 @@ def _overspec_retry_attempt(q: str, fkw: dict, hits: list[dict], self_policy, *,
             if not force:
                 if not _overspec_masked(q, hits, db):
                     eligible = False
-                # Corpus DF gets the final say when the cheap stop-word path
-                # cannot establish that a masked query contains narration.
-                elif (not _overspec_query(q)
+                # weak scatter is already partial evidence, so a second lane
+                # needs narration (stop words, else corpus DF) to shed; an
+                # empty or echo-only page has nothing else to offer
+                elif (any(_weak_lexical_hit(h) for h in hits)
+                      and not _overspec_query(q)
                       and not _overspec_narration_df(q, db)):
                     eligible = False
             if eligible:
@@ -5905,8 +6193,9 @@ def _overspec_retry_attempt(q: str, fkw: dict, hits: list[dict], self_policy, *,
                     "since_ms", "until_ms", "exclude_session",
                     "exclude_session_from_turn", "exclude_family",
                     "_exclude_sessions")}
-                candidates = corpusdb.coverage_rank(
-                    db, q, _OVERSPEC_SCAN_ROWS, flt)
+                candidates = _excluding_project(
+                    corpusdb.coverage_rank(db, q, _OVERSPEC_SCAN_ROWS, flt),
+                    fkw.get("exclude_project"))
         except sqlite3.DatabaseError as exc:
             database_error = exc
         finally:
@@ -5984,7 +6273,8 @@ def _overspec_retry_rows(q: str, fkw: dict, hits: list[dict], self_policy, *,
 
 
 def _overspec_disclosure(block: list[dict], q: str = "", *,
-                         force: bool = False) -> str:
+                         force: bool = False,
+                         request: argparse.Namespace | None = None) -> str:
     """Law-1 route line: name the reformulation the retry actually measured."""
     lead = block[0]
     matched = lead.get("_terms_matched") or []
@@ -6000,12 +6290,13 @@ def _overspec_disclosure(block: list[dict], q: str = "", *,
                   f"dropped: {terminal_safe(dropped)}")
     if force:
         return f"coverage lane (forced): {detail}"
-    deeper = f" · more: {_coverage_cmd(q)}" if q else ""
+    deeper = f" · more: {_coverage_cmd(q, request)}" if q else ""
     return f"~coverage {detail}{deeper}"
 
 
 def _emit_overspec_block(q: str, fkw: dict, hits: list[dict], self_policy, *,
-                         force: bool = False,
+                         force: bool = False, brief: bool = False,
+                         request: argparse.Namespace | None = None,
                          attempt: _CoverageRetry | None = None) -> bool:
     attempt = attempt or _overspec_retry_attempt(
         q, fkw, hits, self_policy, force=force)
@@ -6014,6 +6305,12 @@ def _emit_overspec_block(q: str, fkw: dict, hits: list[dict], self_policy, *,
         raise error
     block = attempt.block
     scanned = attempt.state == _COVERAGE_SCANNED
+    if brief and block:
+        selected = next((
+            hit for hit in block
+            if not (hit.get("_self") and hit.get("who") == "tool")
+        ), None)
+        block = [selected] if selected is not None else []
     if not block:
         if force:
             common.log("coverage lane: no candidate rows"
@@ -6028,40 +6325,59 @@ def _emit_overspec_block(q: str, fkw: dict, hits: list[dict], self_policy, *,
             common.log(
                 "coverage retry skipped: search index is unavailable; "
                 "original results unchanged")
-        elif scanned:
+        elif scanned and not brief:
             # law 1: "retried, empty" must not read like "never retried"
             common.log("only echo/weak rows - coverage retry found no new "
-                       f"sessions ({_coverage_cmd(q)} rescans without the "
+                       f"sessions ({_coverage_cmd(q, request)} rescans without the "
                        "page filter)")
         return scanned
     session_index = common.indexed_session_prefix_candidates(
         hit.get("session") for hit in block)
-    common.log(_overspec_disclosure(block, q, force=force))
+    common.log(_overspec_disclosure(block, q, force=force, request=request))
     for hit in block:
         common.log(_compact_line(hit, session_index))
     return scanned
 
 
-def _demote_query_echoes(q: str, hits: list[dict]) -> None:
-    """Display-lane demotion: a row that verbatim-quotes a wordy query restates
-    the question instead of answering it, so it may fill the page but never
-    lead it. Stable partition on row text (never the rendered snippet)."""
-    if len(hits) < 2 or not _overspec_query(q):
+def _mark_query_echoes(q: str, hits: list[dict]) -> None:
+    """Mark full-query quotations on the exact indexed result rows."""
+    if not hits:
+        return
+    echo_pat = _hl_regex(q, False)
+    if echo_pat is None:
         return
     _load_corpusdb()
-    db = corpusdb.connect(allow_stale=True)
+    try:
+        db = corpusdb.connect(allow_stale=True)
+    except sqlite3.DatabaseError as exc:
+        corpusdb.record_query_database_error(exc)
+        return
     if db is None:
         return
-    raw = [t for t in re.split(r"[\s\-_]+", q.strip()) if t]
-    echo_pat = re.compile(r"[\W_]*".join(re.escape(t) for t in raw), re.I)
     try:
         flags = []
         for hit in hits:
-            row = db.execute(
-                "SELECT text FROM msgs WHERE session = ? AND turn IS ? "
-                "AND who IS ? LIMIT 1",
-                (hit.get("session"), hit.get("turn"), hit.get("who"))).fetchone()
-            flags.append(row is not None and echo_pat.search(row[0]) is not None)
+            where = "session = ? AND turn IS ? AND who IS ?"
+            params = [hit.get("session"), hit.get("turn"), hit.get("who")]
+            if type(hit.get("ts")) is int:
+                where += " AND ts = ?"
+                params.append(hit["ts"])
+            echo = False
+            for ts, text, digest in db.execute(
+                    "SELECT ts, text, content_digest FROM msgs WHERE " + where,
+                    params):
+                expected_digest = hit.get("content_digest")
+                if (expected_digest is not None
+                        and expected_digest != (digest or compact.content_digest(text))):
+                    continue
+                identity = hit.get("_event_identity")
+                if (identity is not None
+                        and common.tool_event_identity(
+                            hit.get("session"), hit.get("turn"), ts, text) != identity):
+                    continue
+                echo = echo_pat.search(text) is not None
+                break
+            flags.append(echo)
     except sqlite3.DatabaseError as exc:
         corpusdb.record_query_database_error(exc, db)
         return
@@ -6073,6 +6389,14 @@ def _demote_query_echoes(q: str, hits: list[dict]) -> None:
     for hit, echo in zip(hits, flags):
         if echo:
             hit["_query_echo"] = True
+
+
+def _demote_query_echoes(q: str, hits: list[dict]) -> None:
+    """Keep verbatim query quotations behind other display-lane matches."""
+    if len(hits) < 2 or not _overspec_query(q):
+        return
+    _mark_query_echoes(q, hits)
+    flags = [bool(hit.get("_query_echo")) for hit in hits]
     if any(flags) and not all(flags):
         hits[:] = ([hit for hit, echo in zip(hits, flags) if not echo]
                    + [hit for hit, echo in zip(hits, flags) if echo])
@@ -6247,10 +6571,11 @@ def _stream_first_run(q: str, mode: str, args, color: bool,
             n_rows += 1
             if args.agent and args.agent.lower() not in r["agent"].lower():
                 continue
-            if args.project and args.project.lower() not in (r.get("project") or "").lower():
+            if args.project and not surface.project_label_matches(
+                    r.get("project"), args.project):
                 continue
-            if (args.exclude_project and args.exclude_project.lower()
-                    in (r.get("project") or "").lower()):
+            if args.exclude_project and surface.project_label_matches(
+                    r.get("project"), args.exclude_project):
                 continue
             if args.chat and not r["session"].lower().startswith(args.chat.lower()):
                 continue
@@ -6437,6 +6762,17 @@ def escalated_freshness_notice(notice: str | None = None) -> str:
     return notice
 
 
+_FAMILY_INDEX_BEHIND_ANNOUNCED = False
+
+
+def _note_family_index_behind() -> None:
+    """Once per process: session marks and handles came from a lagging index."""
+    global _FAMILY_INDEX_BEHIND_ANNOUNCED
+    if _FAMILY_INDEX_BEHIND_ANNOUNCED or not session_context.family_index_behind():
+        return
+    _FAMILY_INDEX_BEHIND_ANNOUNCED = True
+    common.log(surface.FAMILY_INDEX_BEHIND_LINE)
+
 
 def _indexed_message_total() -> int | None:
     """The corpus size the zero-hit line names.
@@ -6598,10 +6934,11 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                     help="one tab-separated row per hit (the piped default "
                          "outside agent shells)")
     ap.add_argument("--agent", help=f"only this agent ({', '.join(common.KNOWN_AGENTS)})")
-    ap.add_argument("--project", help="only chats whose project label contains this "
-                                      "(usually the workspace folder name)")
-    ap.add_argument("--exclude-project",
-                    help="hide chats whose project label contains this")
+    project_group = ap.add_mutually_exclusive_group()
+    project_group.add_argument("--project", help=surface.PROJECT_HELP)
+    project_group.add_argument("--here", action="store_true",
+                               help=surface.HERE_HELP)
+    ap.add_argument("--exclude-project", help=surface.EXCLUDE_PROJECT_HELP)
     ap.add_argument("--model", help="only turns from this exact model name")
     ap.add_argument("--soft", "--model-soft", dest="model_soft", action="store_true",
                     help="with --model, substring-match the model name (like *model*)")
@@ -6609,8 +6946,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                     help="only these speakers, comma-separated "
                          f"({', '.join(surface.SEARCH_SPEAKER_CHOICES)})")
     ap.add_argument("--no-who", dest="no_who", metavar="LIST",
-                    help="exclude these speakers (same names; e.g. "
-                         "--no-who subagent hides side-chat turns)")
+                    help="exclude these speakers' rows (same names; --no-who "
+                         "subagent drops subagent-spoken turns, not side chats)")
     ap.add_argument("--no-meta", dest="no_meta", action="store_true",
                     help="drop structurally proven ~meta rows; retain one marked "
                          "row when it is the query's only evidence")
@@ -6636,13 +6973,18 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                          f"{_OVERSPEC_FORCED_ROWS} rows)")
     self_group = ap.add_mutually_exclusive_group()
     self_group.add_argument("--self", dest="include_self", action="store_true",
-                            help="include the calling agent's current-window echoes")
+                            help="include the calling agent's live context window "
+                                 "(hidden, with older turns labeled ~self, only "
+                                 "when the calling session is identified)")
     self_group.add_argument("--no-self", dest="force_no_self", action="store_true",
                             help="exclude the calling session and its indexed family, "
                                  "even outside agent shells")
     ap.add_argument("--all-side-chats", action="store_true",
-                    help="with -s, show sibling child chats independently instead of "
-                         "one best hit per root conversation family")
+                    help="ranking only, with -s: let sibling side chats take "
+                         "separate slots instead of one best hit per root family")
+    ap.add_argument("--no-side", dest="no_side", action="store_true",
+                    help="hide side chats (spawned subagent sessions) entirely; "
+                         "-l then lists no [side chat] rows")
     ap.add_argument("--strict-semantic", action="store_true",
                     help="compatibility alias: --semantic already exits if meaning is unavailable")
     ap.add_argument("--json", action="store_true",
@@ -6658,6 +7000,11 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     blank_filter = surface.filter_value_error(args)
     if blank_filter:
         ap.error(blank_filter)
+    if args.here:
+        args.project = surface.here_project()
+        here_error = surface.here_project_error(args.project)
+        if here_error:
+            ap.error(here_error)
     if args.agent:
         args.agent = common.normalize_agent_name(args.agent.lower())
     try:
@@ -6686,8 +7033,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if more_given or deeper_given:
         incompatible = (args.pattern or args.max is not None or args.regex or args.word
                         or args.ignore_case or args.chats or args.flat or args.classic
-                        or args.agent or args.project or args.exclude_project
-                        or args.model or args.model_soft
+                        or args.agent or args.project or args.here
+                        or args.exclude_project
+                        or args.model or args.model_soft or args.no_side
                         or args.who or args.no_who or args.no_meta
                         or args.chat or args.since or args.until
                         or args.sort != "score" or args.semantic or args.all_side_chats
@@ -6992,7 +7340,10 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                exact_totals=bool(args.count or args.count_by_tier),
                # a keyword fallback keeps meaning search's family-level chat shape
                family_diverse=bool(args.semantic and not args.all_side_chats),
-               allow_model_download=bool(args.semantic))
+               allow_model_download=bool(args.semantic),
+               # session views (-l) order heads by folded score, not lane-first;
+               # --sort time keeps recency order and the newest matching turn
+               session_view_rank=bool(args.chats and args.sort == "score"))
 
     # Fresh install + plain grep: stream hits out of the ingest itself (--emit-rows) so
     # the first answer lands in seconds; unstreamable surfaces (see _stream_first_run) block-build.
@@ -7003,7 +7354,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             and not (args.json or args.count or args.count_by_tier
                      or args.semantic or args.chats)
             and not args.regex and args.sort == "score"
-            and not args.model and not args.chat):
+            and not args.model and not args.chat and not args.no_side):
         rc = _stream_first_run(q, mode, args, color, since_ms, until_ms)
         if rc is not None:
             if rc in (0, 1):
@@ -7032,6 +7383,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             _json_error("chat-unresolved", q)
             return 2
         args.chat = fkw["chat"] = resolved
+    if args.no_side:
+        # the same session set `chats` hides; needs the published session index
+        fkw["_exclude_sessions"] = indexed_side_sessions()
 
     self_dropped = 0
     self_excluded_count: int | None = None
@@ -7046,7 +7400,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         calling_session = current_family.session if current_family else "none"
         common.dbg(f"self-exclusion: calling_session={calling_session}")
         if self_policy is not None:
-            fkw.update(self_policy.query_filters())
+            self_policy.apply_filters(fkw)
         elif not args.json:
             identity = common.calling_identity()
             self_inactive_reason = (
@@ -7254,10 +7608,19 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             common.log(notice)
 
     def _note_self_exclusion() -> None:
-        # JSON carries the structured count in its envelope. Every prose/flat
-        # surface stays silent unless an exact proof found omitted matches.
-        if (self_policy is None or current_family is None
-                or args.json or not self_excluded_count):
+        # JSON carries this state in its envelope; prose speaks once per render
+        _note_family_index_behind()
+        if args.json:
+            return
+        if self_policy is None:
+            if (self_exclusion_requested and not args.force_no_self
+                    and "self" not in said_once):
+                said_once.add("self")
+                notice = surface.caller_unknown_notice(self_inactive_reason)
+                if notice:
+                    common.log(notice)
+            return
+        if current_family is None or not self_excluded_count:
             return
         common.log(surface.self_exclusion_notice(
             resolved=current_family.resolved, dropped=self_excluded_count,
@@ -7266,7 +7629,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     def _emit_main_overspec_block(*, force: bool = False) -> None:
         nonlocal self_excluded_count
         scanned = _emit_overspec_block(
-            q, fkw, hits, self_policy, force=force)
+            q, fkw, hits, self_policy, force=force, request=args)
         # Coverage is a bounded, separately ranked lane. It can prove which
         # rows it rendered, but not an exact cross-lane union before its cap.
         if scanned and self_policy is not None:
@@ -7315,6 +7678,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             return 2
     auto_semantic_failed = False
     auto_semantic_failure_status: dict | None = None
+    allow_live_tail = not (args.count or args.count_by_tier)
     semantic_empty_disclosed = False
     auto_semantic_zero: dict | None = None
     auto_semantic_weak: dict | None = None
@@ -7324,10 +7688,10 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         sem_res = _safe_finish_semantic_query(semantic_pending)
         semantic_lane_participated = bool(
             sem_res is not None
-            and not sem_res.get("fallback_recommended"))
+            and surface.semantic_lane_answered(sem_res.get("semantic_status")))
         if sem_res is not None:
             sem_res = _drop_meta(_drop_self(sem_res))
-        if semantic_lane_participated:
+        if sem_res is not None:
             secondary_semantic_result = sem_res
         auto_semantic_failed = (sem_res is None
                                 or bool(sem_res.get("fallback_recommended")))
@@ -7344,7 +7708,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 "totals_exact": (
                     bool(res.get("totals_exact", True))
                     and bool(sem_res.get("totals_exact", True))
-                    and bool((answered_status or {}).get("complete"))),
+                    and not _semantic_result_incomplete(
+                        sem_res, allow_live_tail=allow_live_tail)),
                 "semantic_status": answered_status,
                 "semantic_coverage": sem_res.get("semantic_coverage"),
                 "semantic_accelerator_coverage": sem_res.get(
@@ -7380,12 +7745,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         elif sem_res is not None and not sem_res.get("fallback_recommended"):
             if hits:
                 if not compact_output:
-                    coverage_line = display_policy.semantic_coverage_line(
-                        sem_res.get("semantic_coverage"))
-                    if coverage_line:
-                        common.log(coverage_line)
-                    common.log(display_policy.semantic_empty_line(
-                        sem_res.get("semantic_coverage")))
+                    common.log(_semantic_empty_notice(sem_res))
                     semantic_empty_disclosed = True
             else:
                 # a total miss: the unified zero verdict below owns disclosure
@@ -7403,7 +7763,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                             **{**fkw, "family_diverse": not args.all_side_chats})
         semantic_lane_participated = bool(
             sem_res is not None
-            and not sem_res.get("fallback_recommended"))
+            and surface.semantic_lane_answered(sem_res.get("semantic_status")))
         if sem_res is not None:
             sem_res = _drop_meta(_drop_self(sem_res))
         answered_status = (
@@ -7415,13 +7775,14 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 "totals_exact": (
                     bool(res.get("totals_exact", True))
                     and bool(sem_res.get("totals_exact", True))
-                    and bool((answered_status or {}).get("complete"))),
+                    and not _semantic_result_incomplete(
+                        sem_res, allow_live_tail=allow_live_tail)),
                 "semantic_status": answered_status,
                 "semantic_coverage": sem_res.get("semantic_coverage"),
                 "semantic_accelerator_coverage": sem_res.get(
                     "semantic_accelerator_coverage"),
             }
-        if semantic_lane_participated:
+        if sem_res is not None:
             secondary_semantic_result = sem_res
         if (sem_res is not None and not sem_res.get("fallback_recommended")
                 and sem_res.get("hits")):
@@ -7471,6 +7832,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if (not hits and not sem_used and mode == "keyword"
             and not args.count and not args.count_by_tier
             and not coverage["empty_dimensions"]
+            and res.get("totals_exact", True)
             and not res.get("index_missing")
             and not res.get("tools_excluded")
             and (self_policy is None or self_excluded_count == 0)
@@ -7483,11 +7845,14 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         if counts and counts.get("sessions") is not None:
             zero_verdict = surface.miss_verdict(
                 indexd_runtime.freshness_story(),
-                meaning_served=auto_semantic_zero is not None,
-                meaning_coverage=(auto_semantic_zero or {}).get(
+                meaning_served=(
+                    auto_semantic_zero is not None or surface.semantic_lane_answered(
+                        (secondary_semantic_result or {}).get("semantic_status"))),
+                meaning_coverage=(secondary_semantic_result or auto_semantic_zero or {}).get(
                     "semantic_coverage"),
-                meaning_accelerator=(auto_semantic_zero or {}).get(
+                meaning_accelerator=(secondary_semantic_result or auto_semantic_zero or {}).get(
                     "semantic_accelerator_coverage"),
+                meaning_integrity=(secondary_semantic_result or {}).get("semantic_integrity"),
                 sessions=int(counts["sessions"]))
             zero_line, zero_owns_freshness = surface.miss_zero_render(
                 int(counts["sessions"]), zero_verdict)
@@ -7496,6 +7861,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             and not res.get("tools_excluded")):
         common.log(surface.semantic_keyword_only_notice(
             auto_semantic_failure_status,
+            coverage=(secondary_semantic_result or {}).get("semantic_coverage"),
+            accelerator=(secondary_semantic_result or {}).get(
+                "semantic_accelerator_coverage"),
             brief=indexd_runtime.semantic_notice_brief(
                 (auto_semantic_failure_status or {}).get("reason"))))
     if (sem_used and not hits and not args.json and not args.count
@@ -7517,11 +7885,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if ((sem_used or semantic_lane_participated) and not porcelain_zero
             and not hits and not res.get("tools_excluded") and not args.json
             and not args.count and not args.count_by_tier):
-        zero_coverage = semantic_evidence.get("semantic_coverage")
-        coverage_line = display_policy.semantic_coverage_line(zero_coverage)
-        if coverage_line:
-            common.log(coverage_line)
-        common.log(display_policy.semantic_empty_line(zero_coverage))
+        common.log(_semantic_empty_notice(semantic_evidence))
         semantic_empty_disclosed = True
     if res.get("index_missing") and not args.json:
         # D2: the refused unindexed lane names its remedy instead of scanning
@@ -7533,11 +7897,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             said_once.add("freshness")
     elif (auto_semantic_zero is not None and not semantic_empty_disclosed
           and not res.get("tools_excluded")):
-        zero_coverage = auto_semantic_zero.get("semantic_coverage")
-        coverage_line = display_policy.semantic_coverage_line(zero_coverage)
-        if coverage_line:
-            common.log(coverage_line)
-        common.log(display_policy.semantic_empty_line(zero_coverage))
+        common.log(_semantic_empty_notice(auto_semantic_zero))
         semantic_empty_disclosed = True
     if (not hits and not sem_used and not porcelain_zero
             and not coverage["empty_dimensions"]
@@ -7563,10 +7923,11 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     shown = len(hits)
     hybrid_used = bool(res.get("hybrid_semantic"))
     semantic_incomplete = bool(
-        (sem_used or hybrid_used or semantic_lane_participated
-         or args.semantic or args.hybrid)
-        and (_semantic_result_incomplete(res)
-             or _semantic_result_incomplete(semantic_evidence)))
+        (sem_used or hybrid_used or semantic_lane_participated or args.semantic
+         or semantic_evidence.get("semantic_integrity"))
+        and (_semantic_result_incomplete(res, allow_live_tail=allow_live_tail)
+             or _semantic_result_incomplete(
+                 semantic_evidence, allow_live_tail=allow_live_tail)))
     result_totals_exact = bool(
         res.get("totals_exact", True)) and not semantic_incomplete
     # -l/-s page by chat: a hits-vs-rows compare would claim truncation on full pages
@@ -7604,7 +7965,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         full_argv=direct_full,
         action_unavailable_reason=action_unavailable,
         no_exhaustive_form=(None if exhaustible
-                            else surface.SEMANTIC_NO_EXHAUSTIVE_FORM))
+                            else surface.SEMANTIC_NO_EXHAUSTIVE_FORM),
+        tool_rows=int(res.get("tool_hits") or 0))
 
     # highlight pattern mirrors the search mode (none for semantic chat titles)
     pat = (None if mode == "regex" and not sem_used
@@ -7774,8 +8136,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 print(line)
             sys.stdout.flush()
             _compact_summary(page)
-            if args.coverage or (not sem_used and not res.get("hybrid_semantic")
-                                 and not args.lexical
+            if args.coverage or (not args.semantic and not args.lexical
                                  and mode == "keyword" and args.sort == "score"):
                 _emit_main_overspec_block(force=args.coverage)
             coverage = semantic_evidence.get("semantic_coverage")
@@ -7937,15 +8298,14 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                                 "conversations")
                     common.log(f"{_C['d']}{deeper}{_C['r']}"
                                if color else deeper)
-        if (not sem_used and not args.regex and not args.word
-                and not args.semantic and not args.lexical
+        if (not args.semantic and not args.regex and not args.word
+                and not args.lexical
                 and not args.flat and not args.chats and not args.coverage
                 and args.sort == "score"):
             _emit_main_overspec_block()
     elif more_exist and not args.json and not args.count and not args.count_by_tier:
         # piped consumers get no tty footer; disclose the cut without touching stdout
-        common.log(surface.completeness_line(
-            completeness, tool_hits=res.get("tool_hits") or 0))
+        common.log(surface.completeness_line(completeness))
     _note_self_exclusion()
     _note_freshness()
     if res.get("tools_excluded") and (args.count or args.count_by_tier):
@@ -7988,7 +8348,8 @@ def _chat_content_heads(
         query_filters: dict | None = None,
         hidden_sessions: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[dict[str, dict], bool]:
-    """Best matching turn per chat; bool says the candidate set is complete."""
+    """Best matching turn per chat; bool says the candidate set is complete.
+    ``query_filters`` carries run_query filters (project, since_ms, ...)."""
     candidate_limit = 0 if requested == 0 else max(20, requested * 2)
     filters = dict(query_filters or {})
     excluded = set(filters.pop("_exclude_sessions", ()))
@@ -8000,7 +8361,7 @@ def _chat_content_heads(
             query, mode="keyword", limit=candidate_limit, sort="score",
             agent=agent, exhaustive=False, session_limit=candidate_limit,
             allow_fallback=False, exact_totals=False, family_diverse=False,
-            **filters)
+            session_view_rank=True, **filters)
     except (DirectSnapshotQueryError, OSError, sqlite3.DatabaseError,
             RuntimeError, TypeError, ValueError):
         return {}, False
@@ -8078,22 +8439,44 @@ def chats_main(argv: list[str] | None = None) -> int:
                "  agrep chats                      newest indexed chats\n"
                "  agrep chats apartment            project / opening match\n"
                "  agrep chats drafting             topic match inside chats\n"
+               "  agrep chats drafting --here      only this folder's chats\n"
                "  agrep chats 0199fa               exact id prefixes include side chats\n"
                "  agrep chats webapp --agent codex --json\n"
-               "\nA leading @session opens its latest indexed turn with `agrep around` "
-               "and also works as a `--chat` selector; `agrep around @...` pins "
-               "an exact turn when available.\nexit: 0 found, 1 proven none, "
-               "2 no index or unverified result.")
+               "\nContent lookup: the words as an adjacent phrase first, then all "
+               "words anywhere in one turn; the best turn per chat is kept and "
+               "the top max(20, 2N) chats are ranked by that turn, the rest "
+               "newest first.\nA leading @session opens its latest indexed turn "
+               "with `agrep around` and also works as a `--chat` selector; "
+               "`agrep around @...` pins an exact turn when available.\n"
+               "exit: 0 found, 1 proven none, 2 no index or unverified result.")
     ap.add_argument("pattern", nargs="*",
-                    help="words matched against chat identity and indexed "
-                         "conversation content (all must hit)")
+                    help="words matched against chat identity (project, id, "
+                         "opening line) or indexed conversation content "
+                         "(all must hit in one place)")
     ap.add_argument("-n", "--max", type=int, default=20, metavar="N",
                     help="show at most N chats (default 20; 0 = all)")
     ap.add_argument("--agent", help=f"only this agent ({', '.join(common.KNOWN_AGENTS)})")
+    project_group = ap.add_mutually_exclusive_group()
+    project_group.add_argument("--project", help=surface.PROJECT_HELP)
+    project_group.add_argument("--here", action="store_true",
+                               help=surface.HERE_HELP)
+    ap.add_argument("--exclude-project", help=surface.EXCLUDE_PROJECT_HELP)
+    ap.add_argument("--since", metavar="WHEN",
+                    help="only chats active at/after WHEN (7d / 24h / 2w / 30m, "
+                         "or 2026-06-01); content hits must fall inside too")
+    ap.add_argument("--until", "--before", dest="until", metavar="WHEN",
+                    help="only chats started before WHEN (same formats as --since)")
     ap.add_argument("--side", action="store_true",
                     help="include side chats (spawned subagent sessions)")
+    self_group = ap.add_mutually_exclusive_group()
+    self_group.add_argument("--self", dest="include_self", action="store_true",
+                            help="include the calling agent's current-window echoes")
+    self_group.add_argument("--no-self", dest="force_no_self", action="store_true",
+                            help="exclude the calling session and its indexed family, "
+                                 "even outside agent shells")
     ap.add_argument("--json", action="store_true",
-                    help="one metadata object, then one JSON object per chat")
+                    help="one metadata object, then one JSON object per chat "
+                         "(content rows carry score, matched, who, match_ts)")
     ap.add_argument("--no-auto", action="store_true",
                     help=surface.NO_AUTO_HELP)
     ap.add_argument("--color", choices=("auto", "always", "never"),
@@ -8104,22 +8487,36 @@ def chats_main(argv: list[str] | None = None) -> int:
     blank_filter = surface.filter_value_error(args)
     if blank_filter:
         ap.error(blank_filter)
+    if args.here:
+        args.project = surface.here_project()
+        here_error = surface.here_project_error(args.project)
+        if here_error:
+            ap.error(here_error)
     if args.agent:
         args.agent = common.normalize_agent_name(args.agent.lower())
     if args.max < 0:
         ap.error("--max must be 0 or greater")
+    try:
+        since_ms = _parse_when(args.since) if args.since else None
+        until_ms = _parse_when(args.until) if args.until else None
+    except SystemExit:
+        return 2
+    inverted = surface.window_bounds_error(
+        args.since, since_ms, args.until, until_ms)
+    if inverted:
+        common.log(inverted)
+        return 2
 
     import explore
     machine_stdout = bool(args.json or not sys.stdout.isatty())
     if not indexd_runtime.ensure_index(
             auto=not args.no_auto, quiet=machine_stdout):
         return 2
+    common.lap("freshen")
     index = explore._session_index()
-    side_sessions = {
-        session for session, raw in index.items()
-        if explore._indexed_chat_is_side({**raw, "session": session})
-    }
+    side_sessions = frozenset(indexed_side_sessions())
     concepts = explore._session_concept()
+    common.lap("identity-index", f"{len(index)} sessions")
     tokens = [t.lower() for t in args.pattern]
     agent = (args.agent or "").lower()
     identity_token = (
@@ -8131,20 +8528,55 @@ def chats_main(argv: list[str] | None = None) -> int:
     }
     match_tokens = [identity_token] if direct_sessions else tokens
     content_lookup = bool(tokens and not direct_sessions)
+    # a bare listing is identity, not an echo: only --no-self narrows it
     self_policy = None
-    if content_lookup and common.in_agent_context():
-        self_policy = common.calling_self_exclusion()
+    if not args.include_self and (
+            args.force_no_self or (content_lookup and common.in_agent_context())):
+        self_policy = common.calling_self_exclusion(
+            conservative=args.force_no_self)
+        if self_policy is None and args.force_no_self and not args.json:
+            identity = common.calling_identity()
+            if not identity.session:
+                common.log("--no-self was not applied: "
+                           + common.self_exclusion_unavailable_notice(
+                               identity.reason))
+    scope_filters = {
+        key: value for key, value in (
+            ("project", args.project),
+            ("exclude_project", args.exclude_project),
+            ("since_ms", since_ms), ("until_ms", until_ms))
+        if value is not None}
     content_heads, content_exact = (
         _chat_content_heads(
             " ".join(args.pattern), agent=args.agent, requested=args.max,
-            query_filters=(self_policy.query_filters()
-                           if self_policy is not None else None),
+            query_filters={
+                **scope_filters,
+                **(self_policy.query_filters() if self_policy is not None else {})},
             hidden_sessions=frozenset() if args.side else side_sessions)
         if content_lookup else ({}, True)
     )
+    if content_lookup:
+        common.lap("content-query", f"{len(content_heads)} heads")
     content_rank = {
         session: rank for rank, session in enumerate(content_heads)
     }
+
+    def in_scope(row: dict) -> bool:
+        if agent and agent not in row["agent"].lower():
+            return False
+        if args.project and not surface.project_label_matches(
+                row["project"], args.project):
+            return False
+        if args.exclude_project and surface.project_label_matches(
+                row["project"], args.exclude_project):
+            return False
+        if since_ms is not None and (row["last_ts"] or 0) < since_ms:
+            return False
+        if until_ms is not None and (row["first_ts"] or 0) >= until_ms:
+            return False
+        return True
+
+    self_dropped = 0
     rows = []
     for session, raw in index.items():
         row = _chat_identity_row(
@@ -8152,25 +8584,31 @@ def chats_main(argv: list[str] | None = None) -> int:
             side=session in side_sessions)
         if row["side"] and not args.side and session not in direct_sessions:
             continue
-        if agent and agent not in row["agent"].lower():
+        if not in_scope(row):
             continue
         identity_match = (
             not match_tokens or _chat_identity_matches(row, match_tokens))
         content_hit = content_heads.get(session)
-        if (self_policy is not None and session not in direct_sessions
-                and content_hit is None
-                and self_policy.excludes(session, None)):
-            continue
         if match_tokens and not identity_match and content_hit is None:
             continue
+        if self_policy is not None and session not in direct_sessions:
+            # a content hit is judged by its turn; an identity row by whether
+            # the live window starts at the chat's first turn
+            live_turn = (content_hit.get("turn") if content_hit is not None
+                         else 0)
+            if self_policy.excludes(session, live_turn):
+                self_dropped += 1
+                continue
+            row["self"] = self_policy.family.contains(session)
         row["_content_hit"] = content_hit
         row["_content_rank"] = content_rank.get(session)
         rows.append(row)
     if content_lookup:
+        # equal content-rank bands and the identity tail both break on recency
         rows.sort(key=lambda row: (
             0 if row["_content_rank"] is not None else 1,
-            row["_content_rank"] if row["_content_rank"] is not None
-            else -(row["last_ts"] or 0)))
+            row["_content_rank"] if row["_content_rank"] is not None else 0,
+            -(row["last_ts"] or 0)))
     else:
         rows.sort(key=lambda row: -(row["last_ts"] or 0))
     matched = len(rows)
@@ -8193,6 +8631,11 @@ def chats_main(argv: list[str] | None = None) -> int:
             row["match_turn"] = int(content_hit.get("turn") or 0)
             row["match_text"] = common.one_line(
                 content_hit.get("snippet") or content_hit.get("text") or "")
+            # the ranking facts behind "best match first", as search --json spells them
+            for key in ("score", "matched", "who"):
+                if key in content_hit:
+                    row[key] = content_hit[key]
+            row["match_ts"] = content_hit.get("ts")
             try:
                 row["match_handle"] = compact.encode_bound_result_handle(
                     content_hit, session_index=session_index)
@@ -8206,7 +8649,14 @@ def chats_main(argv: list[str] | None = None) -> int:
         more_command = console.shell_command(
             "agrep", "chats",
             *(("--agent", args.agent) if args.agent else ()),
+            *(("--project", args.project) if args.project else ()),
+            *(("--exclude-project", args.exclude_project)
+              if args.exclude_project else ()),
+            *(("--since", args.since) if args.since else ()),
+            *(("--until", args.until) if args.until else ()),
             *(("--side",) if args.side else ()),
+            *(("--self",) if args.include_self else ()),
+            *(("--no-self",) if args.force_no_self else ()),
             *(("--json",) if args.json else ()),
             *(("--no-auto",) if args.no_auto else ()),
             "-n", str(next_max), *pattern_args,
@@ -8216,6 +8666,7 @@ def chats_main(argv: list[str] | None = None) -> int:
         totals_exact=matches_exact,
         truncated=truncated,
         more_command=more_command)
+    common.lap("render-prep")
     # a matched chat proves --agent is populated; only a zero needs the census
     coverage = (filter_coverage(args) if not rows
                 else surface.filter_coverage_disclosure([], checked=True))
@@ -8249,13 +8700,16 @@ def chats_main(argv: list[str] | None = None) -> int:
             handle = (row["session_handle"] or
                       f"session={terminal_safe(row['session'])}")
             side = " [side chat]" if row["side"] else ""
+            marks = f"{side}{' ~self' if row.get('self') else ''}"
             label = row["concept"] or _proj(row["project"])
+            matched_text = row.get("match_text")
+            # a content row's age is the matched turn's, not the chat's last turn
+            age_ts = row.get("match_ts") if matched_text is not None else row["last_ts"]
             head = " ".join(value for value in (
                 terminal_safe(handle), terminal_safe(row["agent"]),
                 terminal_safe(label),
-                common.age_label(row["last_ts"]),
+                common.age_label(age_ts),
                 f"{row['turns']}t") if value)
-            matched_text = row.get("match_text")
             preview = terminal_safe(
                 matched_text if matched_text is not None else row["first_text"])[:96]
             if matched_text is not None:
@@ -8265,10 +8719,10 @@ def chats_main(argv: list[str] | None = None) -> int:
                 "agrep", "around", open_handle, fallback="") if open_handle else "")
             exact = f" · {followup}" if followup else ""
             if color:
-                print(f"{_C['hd']}{head}{_C['r']}{side}  "
+                print(f"{_C['hd']}{head}{_C['r']}{marks}  "
                       f"{_C['d']}{preview}{exact}{_C['r']}")
             else:
-                print(f"{head}{side}  {preview}{exact}")
+                print(f"{head}{marks}  {preview}{exact}")
     what = "chat" if matched == 1 else "chats"
     if shown:
         sys.stdout.flush()
@@ -8281,12 +8735,17 @@ def chats_main(argv: list[str] | None = None) -> int:
         order = "best match first" if content_lookup else "newest first"
         common.log(f"showing {len(shown)} of {matched}{floor} matching {what}, "
                    f"{order}{scope}{cut}")
+        if self_policy is not None and self_dropped:
+            common.log(surface.self_exclusion_notice(
+                resolved=self_policy.family.resolved, dropped=self_dropped,
+                windowed=self_policy.windowed, noun="chat"))
         for empty_dimension in coverage["empty_dimensions"]:
             common.log(surface.empty_dimension_line(empty_dimension))
         notice = escalated_freshness_notice(
             surface.freshness_story_line(story))
         if notice:
             common.log(notice)
+        _note_family_index_behind()
     if shown:
         return 0
     return surface.grep_absence_exit(

@@ -27,33 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Event, Message};
 
-/// Bump when the cached struct layout OR the parse semantics change; old caches are then
-/// ignored (full reparse). 4->5: every adapter's timestamp parsing moved to
-/// ingest::parse_timestamp, so every store is re-read once through the consolidated path
-/// rather than served from an entry parsed by the old scattered sites. 5->6: intern_agent
-/// resolves against the registry (cursor/crush cached entries round-tripped as "unknown");
-/// the reparse re-materializes every session so the corpus delta carries the relabel. 6->7:
-/// Codex forked rollouts gain child-owned boundaries instead of collapsing into the parent.
-/// 7->8: entry shape settled as (mtime, size, msgs) - the one legacy wire generation with a
-/// migration path; v7 and earlier, plus abandoned v9/v10 caches, cold-reparse instead.
-/// 8->9: exact per-source event ownership and nanosecond stat keys; v8 is migrated through an
-/// explicit wire type and force-reparsed once before any exact incremental prune is allowed.
-/// 9->10: Codex guardian approval-review rollouts become counted internal sidechain skips.
-/// 10->11: Stat keys include filesystem change/replacement identity, detecting preserved-mtime
-/// edits on Unix and same-name replacements on Windows without reading every source file.
-/// 11->12: SQLite Stat keys include committed WAL metadata instead of blessing main-file hits.
-/// 12->13: reply source lengths disclose ingest-cap loss in detail and recall views.
-/// 13->14: Codex encrypted send_message payloads become non-searchable control events.
-/// 14->15: event ownership migrates to collision-safe hashed filenames after one forced reparse.
-/// 15->16: cache identities retain exact source/token keys; Windows stat keys use file USNs.
-/// 16->17: Windows source keys use stable file IDs and retain exact UTF-16 paths.
-/// 17->18: Claude compact-summary provenance replaces recap text-prefix inference.
-/// 18->19: token intake identities migrate from ambiguous separators to canonical JSON tuples.
-/// 19->20: event outputs retain original UTF-8 byte counts before preview truncation.
-/// 20->21: codex human turns require the rollout's own submission log, dropping the
-/// harness-composed role:user input (AGENTS.md, environment, catalogs) cached as lived.
-/// 21->22: nested oh-my-pi advisor and worker sessions link to their root chat.
-pub const CACHE_VERSION: u32 = 22;
+/// Increment when entry layout or parse semantics change.
+/// Supported prior generations retain last-good entries until their source reparse completes.
+pub const CACHE_VERSION: u32 = 24;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -356,21 +332,10 @@ pub fn current_cache_writer_build_id() -> String {
     WriterBuildId::current().as_str().to_owned()
 }
 
-/// Successor takeover: re-own a dead foreign writer's parse cache instead of
-/// discarding it. The base decodes through the full validation path (header,
-/// length, payload digest, storage version) and only committed journal frames
-/// replay, so the adopted entries are exactly what the dead writer last
-/// published; a fresh base then lands atomically under the current identity
-/// and the foreign journal is retired with it. Only a fully current
-/// generation adopts - an older generation reparses anyway, so the caller's
-/// discard loses nothing. Any refusal returns Err and the caller falls back
-/// to the discard path unchanged.
+/// Atomically re-own validated entries, preserving any required source reparse.
 pub fn adopt_foreign_cache(path: &Path) -> Result<usize, &'static str> {
-    let (entries, generation, _backing) = decode_cache_owned(path, WriterBuildId::current(), true)
+    let (entries, _generation, _backing) = decode_cache_owned(path, WriterBuildId::current(), true)
         .map_err(CacheDecodeRefusal::label)?;
-    if generation != CacheGeneration::Current {
-        return Err("cache generation predates this format; a reparse is due anyway");
-    }
     let adopted = entries.len();
     let cache = IngestCache::base(entries, CacheBacking::Rewrite);
     cache
@@ -2510,6 +2475,28 @@ impl IngestCache {
             .collect()
     }
 
+    /// `(source path, agent, session)` for every cached file with rows: the identities the
+    /// store's own filenames carry, resolved against the header ids at publication.
+    pub fn session_sources(&self) -> Vec<(PathBuf, &'static str, Arc<str>)> {
+        let mut out = Vec::new();
+        for (key, entry) in &self.entries {
+            let Some(path) = source_path_from_key(key) else {
+                continue;
+            };
+            let first = out.len();
+            for msg in &entry.msgs {
+                if out[first..]
+                    .iter()
+                    .any(|(_, _, session)| session == &msg.session)
+                {
+                    continue;
+                }
+                out.push((path.clone(), intern_agent(&msg.agent), msg.session.clone()));
+            }
+        }
+        out
+    }
+
     fn published_inventory_blind_to(&self, agent: &str, scope: &Path) -> bool {
         self.published_blind_scopes
             .iter()
@@ -4242,6 +4229,248 @@ mod tests {
     }
 
     #[test]
+    fn policy_empty_reparse_prunes_unchanged_source_material() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"unchanged input").unwrap();
+        let mut initial = IngestCache::cold();
+        collect_cached(&mut initial, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("excluded by current policy")],
+                vec![test_event("session", "old-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        initial.save(&cache_path).unwrap();
+
+        let (mut repair, refusal) = IngestCache::repair(&cache_path);
+        assert!(refusal.is_none());
+        repair.set_repair_expectations(
+            HashSet::from(["claude".to_string()]),
+            HashSet::from([source.clone()]),
+        );
+        let pass = collect_cached(&mut repair, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+        });
+        assert!(pass.messages.is_empty());
+        assert!(pass.events.is_empty());
+        assert!(repair.source_snapshot_safe());
+        assert_eq!(
+            repair.event_prune_files(&repair.live_event_files()),
+            HashSet::from([crate::cache::event_fname("claude", "session")])
+        );
+        repair.save(&cache_path).unwrap();
+        let mut reloaded = IngestCache::load(&cache_path);
+        let pass = collect_cached(
+            &mut reloaded,
+            &root,
+            std::slice::from_ref(&source),
+            |_| -> (Vec<Message>, Vec<Event>) { panic!("completed empty read was not cached") },
+        );
+        assert!(pass.messages.is_empty());
+        assert!(reloaded.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_empty_reparse_preserves_replaced_source_material() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        fs::write(&source, b"old").unwrap();
+        let original_mtime = fs::metadata(&source).unwrap().modified().unwrap();
+        let mut cache = IngestCache::cold();
+        collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("last good")],
+                vec![test_event("session", "last-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        let replacement = root.join("replacement.jsonl");
+        fs::write(&replacement, b"new").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+
+        let pass = collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "last good");
+        assert!(!cache.source_snapshot_safe());
+        assert!(cache
+            .event_prune_files(&cache.live_event_files())
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_empty_reparse_preserves_unattributed_legacy_events() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-legacy-events-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"unchanged input").unwrap();
+        let mut initial = IngestCache::cold();
+        collect_cached(&mut initial, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("legacy material")],
+                Vec::new(),
+                ReadOutcome::Complete,
+            )
+        });
+        initial
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .legacy_had_events = true;
+        initial.save(&cache_path).unwrap();
+        let (mut repair, _) = IngestCache::repair(&cache_path);
+        let pass = collect_cached(&mut repair, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "legacy material");
+        assert!(!repair.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_empty_sibling_does_not_block_complete_session_events() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-sibling-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let changed = root.join("changed.jsonl");
+        let sibling = root.join("sibling.jsonl");
+        fs::write(&changed, b"old").unwrap();
+        fs::write(&sibling, b"unchanged").unwrap();
+        let files = [changed.clone(), sibling.clone()];
+        let mut cache = IngestCache::cold();
+        collect_cached(&mut cache, &root, &files, |_| {
+            (
+                vec![test_message("old material")],
+                vec![test_event("session", "old-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        fs::write(&changed, b"changed and larger").unwrap();
+        let pass = collect_cached(&mut cache, &root, &files, |path| {
+            if path == sibling {
+                (Vec::new(), Vec::new(), ReadOutcome::Complete)
+            } else {
+                (
+                    vec![test_message("fresh")],
+                    vec![test_event("session", "fresh-call")],
+                    ReadOutcome::Complete,
+                )
+            }
+        });
+        assert_eq!(
+            pass.messages
+                .iter()
+                .map(|message| message.text.as_ref())
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
+        assert_eq!(
+            pass.events
+                .iter()
+                .map(|event| event.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fresh-call"]
+        );
+        assert!(cache.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_takeover_preserves_fallback_rows_and_required_reparse() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-adoption-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"unchanged input").unwrap();
+        let mut initial = IngestCache::cold();
+        collect_cached(&mut initial, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("last good")],
+                vec![test_event("session", "old-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        fs::write(
+            &cache_path,
+            bincode::serialize(&super::CacheFileRef {
+                version: CACHE_VERSION - 1,
+                entries: &initial.entries,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        super::adopt_foreign_cache(&cache_path).unwrap();
+
+        let mut guarded = IngestCache::load(&cache_path);
+        let pass = collect_cached(&mut guarded, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "last good");
+        assert!(!guarded.source_snapshot_safe());
+        let mut retry = IngestCache::load(&cache_path);
+        let pass = collect_cached(&mut retry, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("current policy")],
+                vec![test_event("session", "new-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "current policy");
+        assert_eq!(pass.events[0].call_id, "new-call");
+        assert!(retry.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cold_read_failure_keeps_readable_sibling_and_arms_retry() {
         let root = std::env::temp_dir().join(format!(
             "agrep-partial-cold-{}-{}",
@@ -5508,7 +5737,9 @@ mod tests {
             "kept"
         );
         assert_eq!(
-            reopened.entries[&source_key(&adopted)].msgs[0].text.as_ref(),
+            reopened.entries[&source_key(&adopted)].msgs[0]
+                .text
+                .as_ref(),
             "adopted"
         );
 
@@ -7709,10 +7940,15 @@ where
             }
         }
         if m.is_empty() && e.is_empty() {
-            let had_material = cache.entries.get(&key).is_some_and(|prev| {
-                !prev.msgs.is_empty() || !prev.event_keys.is_empty() || prev.legacy_had_events
+            let keep_prior = cache.entries.get(&key).is_some_and(|prev| {
+                prev.legacy_had_events
+                    || ((!prev.msgs.is_empty() || !prev.event_keys.is_empty())
+                        && (healthy != Some(ReadOutcome::Complete)
+                            || prev.mtime != mt
+                            || prev.size != sz
+                            || prev.identity.as_ref() != Some(&identity)))
             });
-            if had_material {
+            if keep_prior {
                 cache.mark_guarded_stale();
                 cache.record_source_read_issue(
                     agent,
@@ -7733,24 +7969,20 @@ where
                     continue;
                 }
             } else if cache.repair_mode
+                && healthy != Some(ReadOutcome::Complete)
                 && cache
                     .repair_expected_paths
                     .iter()
                     .any(|expected| source_path_eq(expected, &path))
             {
-                // A Complete read that truthfully yields nothing has no rows to
-                // lose and nothing to retry - guarding it wedges every repair pass
-                // forever. Only a non-Complete outcome is a silent read failure.
-                if !matches!(healthy, Some(ReadOutcome::Complete)) {
-                    cache.mark_guarded_stale();
-                    cache.output_incomplete = true;
-                    cache.record_source_read_issue(
-                        agent,
-                        &path,
-                        "source-read-failed",
-                        "source parser could not complete the read",
-                    );
-                }
+                cache.mark_guarded_stale();
+                cache.output_incomplete = true;
+                cache.record_source_read_issue(
+                    agent,
+                    &path,
+                    "source-read-failed",
+                    "source parser could not complete the read",
+                );
                 continue;
             }
         }
@@ -7810,10 +8042,12 @@ where
             }
         }
         if m.is_empty() && e.is_empty() {
-            let had_material = cache.entries.get(&key).is_some_and(|prev| {
-                !prev.msgs.is_empty() || !prev.event_keys.is_empty() || prev.legacy_had_events
+            let keep_prior = cache.entries.get(&key).is_some_and(|prev| {
+                prev.legacy_had_events
+                    || ((!prev.msgs.is_empty() || !prev.event_keys.is_empty())
+                        && healthy != Some(ReadOutcome::Complete))
             });
-            if had_material {
+            if keep_prior {
                 cache.mark_guarded_stale();
                 cache.record_source_read_issue(
                     agent,

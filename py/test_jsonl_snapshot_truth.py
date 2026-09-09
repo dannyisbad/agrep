@@ -250,16 +250,14 @@ class JsonlSnapshotTruthTests(unittest.TestCase):
 
             with mock.patch.object(
                     corpusdb, "query_publication_active",
-                    side_effect=[False, True, False]) as publishing, \
-                    mock.patch.object(search.time, "sleep") as sleep:
+                    return_value=True), \
+                    mock.patch.object(search.time, "sleep"):
                 rc, stdout, stderr = self._count(
                     root, loader=moving_loader)
             self._assert_valid_family_generation(root)
 
         self.assertEqual((rc, stdout, stderr), (0, "2\n", ""))
         self.assertEqual(reads, 2)
-        self.assertEqual(publishing.call_count, 3)
-        sleep.assert_not_called()
 
     def test_same_signature_body_rewrite_does_not_starve_a_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -388,7 +386,7 @@ class JsonlSnapshotTruthTests(unittest.TestCase):
         self.assertTrue(moved)
         self.assertEqual((rc, stdout, stderr), (0, "1\n", ""))
 
-    def test_live_owned_event_publication_finishes_before_the_scan(self) -> None:
+    def test_committed_event_snapshot_is_readable_before_writer_unlocks(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             _publish(
@@ -397,12 +395,13 @@ class JsonlSnapshotTruthTests(unittest.TestCase):
             marker = root / explore.EVENTS_DIR_NAME / common.EVENT_GENERATION_NAME
             lock_path = root / ".index.lock"
             ready = threading.Event()
+            read_finished = threading.Event()
 
             def publisher() -> None:
                 with common.IndexLock("event-publication", timeout=0.1):
                     marker.write_text("events-2", encoding="utf-8")
                     ready.set()
-                    time.sleep(0.05)
+                    read_finished.wait(2.0)
 
             with mock.patch.object(common, "INDEX_LOCK_PATH", lock_path), \
                     mock.patch.object(
@@ -411,15 +410,17 @@ class JsonlSnapshotTruthTests(unittest.TestCase):
                 thread.start()
                 self.assertTrue(ready.wait(1.0))
                 started = time.monotonic()
-                rc, stdout, stderr = self._count(
-                    root, tools=True,
-                    event_loader=lambda _keys, **_kwargs: iter(()))
-                elapsed = time.monotonic() - started
-                thread.join(1.0)
+                try:
+                    rc, stdout, stderr = self._count(
+                        root, tools=True,
+                        event_loader=lambda _keys, **_kwargs: iter(()))
+                    elapsed = time.monotonic() - started
+                finally:
+                    read_finished.set()
+                    thread.join(1.0)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual((rc, stdout, stderr), (0, "1\n", ""))
-        self.assertGreaterEqual(elapsed, 0.02)
         self.assertLess(elapsed, 1.0)
 
     def test_native_prose_lane_rejects_consumed_parser_damage(self) -> None:
@@ -475,6 +476,22 @@ class JsonlSnapshotTruthTests(unittest.TestCase):
         self.assertEqual(
             payload["error"]["code"], "direct-snapshot-unverified")
         self.assertEqual(stderr, "")
+
+    def test_active_writer_cannot_hide_cached_parse_damage(self) -> None:
+        for field in ("malformed_tail", "malformed_reply_tail"):
+            with self.subTest(source=field), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _publish(
+                    root, [_row(1, "needle from the valid row")], "generation-1",
+                    **{field: '{"session":"damaged","text":"needle"\n'})
+                with mock.patch.object(
+                        corpusdb, "query_publication_active", return_value=True):
+                    rc, stdout, _stderr = self._count(
+                        root, argv=["needle", "--json", "--lexical"])
+                payload = json.loads(stdout)
+                self.assertEqual(rc, 2)
+                self.assertEqual(payload["hits"], [])
+                self.assertEqual(payload["error"]["code"], "snapshot-publication-timeout")
 
     def test_unverified_zero_is_not_a_proven_grep_miss(self) -> None:
         result = {

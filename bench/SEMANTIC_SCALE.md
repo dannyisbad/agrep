@@ -111,3 +111,46 @@ The target 10M ceilings are 180 ms grouped scan, 220 ms scan plus f16 rerank,
 50 ms process-cold open, 45 s q8 build, 50 s top-up rebuild, 256 MiB private
 memory, 3.70 GiB q8, and 11.0 GiB for q8 + group map + f16. Candidate parity
 thresholds do not receive platform slack.
+
+## Score-band calibration
+
+`bench/semantic_calibration.py` embeds `bench/fixtures/semantic_calibration.json`
+with the pinned int8 model on the CPU lane and reports where the score bands
+sit. Every text embeds alone, the way a query does. The fixture holds 30
+one-sentence rows from unrelated domains (scored across all 435 pairs), 10
+same-topic pairs with no shared content noun, 10 pairs sharing exactly one
+content noun in the same sense, and 10 paraphrase pairs.
+
+```sh
+python bench/semantic_calibration.py
+```
+
+Measured 2026-09-01 (`granite-small-r2-q8`, `onnx-int8-cpu`):
+
+| level | n | min | mean | max |
+|---|---:|---:|---:|---:|
+| unrelated pairs | 435 | 0.620 | 0.711 | 0.792 |
+| same-topic pairs | 10 | 0.733 | 0.785 | 0.824 |
+| shared-noun pairs | 10 | 0.746 | 0.797 | 0.847 |
+| paraphrase pairs | 10 | 0.845 | 0.927 | 0.957 |
+
+The floor (0.82) sits 0.028 above the unrelated maximum and admits 1/10
+same-topic and 1/10 shared-noun pairs, so a row at the floor is topical, not
+necessarily on point. The previous strong band (0.84) admitted a shared-noun
+pair (`password` in two unrelated claims, 0.847) and sat below the level one
+salient noun buys on chat-length rows (0.85-0.87 on a private corpus, where
+`never promise a login` scored 0.86 against `hello? login isnt working`).
+The band stays at 0.84 for now: raising it to 0.87 would exclude every
+shared-noun and same-topic pair here and keep 9/10 paraphrases, but the
+private 20-task fixture named in `EMBED_SPEED.md` (the remaining
+semantic-quality gate) is not in this tree and was not rerun, and a global
+band move demotes every 0.84-0.87 hit corpus-wide. Per-row term anchoring
+(`search.semantic_term_anchor`) already labels the shared-noun rows weak
+without moving the band. Rerun the fixture before deciding.
+
+Batch-shape drift on the int8 lane: a row embedded alone and the same row
+embedded in a length-bucketed padded batch agree to 0.989 cosine at worst on
+this fixture, moving a query-row score by up to 0.021. The Metal lane showed
+none. A query always embeds alone (`Embedder.embed_query` runs a single-text
+batch), so the noise lives in the stored row vectors; treat a score within
+0.02 of a band as on the band.

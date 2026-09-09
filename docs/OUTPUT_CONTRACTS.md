@@ -24,19 +24,30 @@ command. Versioned machine-mode validation errors keep their structured shape.
 
 - **Never routed.** No lane substitution, semantic escalation, or interactive
   content-term recovery. A script gets the same shape every time.
-  Caller-window exclusion is renderer-independent: when a numeric recap
-  boundary proves the current window, that window is withheld from every
-  surface; without that proof, automatic exclusion withholds nothing.
+  Caller-window exclusion is renderer-independent: once the calling session
+  is identified and its family index resolves, the live window - every turn
+  from the newest indexed recap, or the whole session when it never
+  compacted - is withheld from every surface and older caller turns are
+  labeled `~self`; without an identity or a resolving family, automatic
+  exclusion withholds nothing.
 - **Never collapsed.** No inlined follow-ups; machine callers compose their
   own pipelines.
-- **A miss must be proven.** Exit 1 means an exact empty result over a source
-  generation verified current for that command. Stale, partial, or unchecked
-  absence exits 2; `--no-auto` deliberately makes an empty result unverified.
+- **A miss is relative to the indexed snapshot.** Exit 1 means no match in a
+  usable committed snapshot, not absence at the current millisecond. Healthy
+  live-update lag stays silent on hits and misses while each semantic lane covers
+  at least 99% of its source; the tolerated row count scales with the corpus. A verified read
+  also remains usable while the background indexer owns its refresh. Raw coverage
+  metadata remains unchanged. Material gaps, required-query failures, integrity
+  failures, and unchecked absence exit 2; `--no-auto` keeps empty results
+  unverified. Optional meaning-lane unavailability is disclosed without changing
+  the completed keyword search's exit status. Exact count and filter qualification
+  still require complete coverage; meaning results cannot make inexact keyword
+  totals exact.
 - **Every surface states its own completeness.** A machine surface that
   printed part of the answer says so in the payload: search `--json` begins
   with one `agrep-meta` run envelope carrying `completeness` (`shown`, `total`,
-  `total_basis` exact/floor, `unit`, `truncated`), and a cut page names
-  a bounded live rerun (`more_command`, explicitly `broader-rerun`), the
+  `total_basis` exact/floor, `unit`, `truncated`, `tool_rows`), and a cut page
+  names a bounded live rerun (`more_command`, explicitly `broader-rerun`), the
   uncapped invocation (`full_command`), or why none exists
   (`no_exhaustive_form`, the meaning lane). When the local shell cannot quote
   an argument safely, the corresponding `more_argv` / `full_argv` is a JSON
@@ -46,8 +57,10 @@ command. Versioned machine-mode validation errors keep their structured shape.
   continuations. `--flat`, `-c` and
   `--count-by-tier` render the same judgement to stderr, so stdout keeps
   grep parity. A row count is never the signal; inferring a cap from it is
-  how a parser reports 40 for 1,765. Emitter and checker share
-  `surface_policy.completeness_disclosure`; pinned in
+  how a parser reports 40 for 1,765. `tool_rows` counts matching ROWS that are
+  tool output whatever the unit: under `-l` (unit `chat`) the stderr line says
+  `N matching rows are tool output` beside the chat total, never `of them`.
+  Emitter and checker share `surface_policy.completeness_disclosure`; pinned in
   `test_machine_completeness.py`.
 - **Indexed JSON hits are directly inspectable.** Each search row carries a
   digest-bound `handle` accepted by `agrep around`; serialization never mints
@@ -59,8 +72,11 @@ command. Versioned machine-mode validation errors keep their structured shape.
   each hit. An empty page remains one `agrep-meta` record with `hits: []`.
 - **Chats JSON uses the same one-envelope page shape.** The leading
   `agrep-meta` record carries completeness, freshness, and filter state once;
-  chat records contain only chat identity and navigation fields. An empty page
-  remains one self-contained `agrep-meta` record with `hits: []`.
+  chat records contain chat identity and navigation fields, and a content
+  match additionally carries the ranking facts behind "best match first"
+  (`score`, `matched`, `who`, `match_ts`, `match_turn`, `match_handle`) as
+  search `--json` spells them. An empty page remains one self-contained
+  `agrep-meta` record with `hits: []`.
 - **Every surface states why it is empty.** A zero from a filter selecting a
   dimension the index holds no value for is not the same answer as a zero
   from a search that looked and found nothing, and the two must not render
@@ -80,7 +96,40 @@ command. Versioned machine-mode validation errors keep their structured shape.
   envelope; flat/count surfaces put the same one-line count on stderr without
   changing stdout. An unprovable count stays explicitly unknown and produces
   no prose notice. `--self` disables the automatic window and explicit
-  `--no-self` expands the scope to the caller's indexed family.
+  `--no-self` expands the scope to the caller's indexed family. The one
+  exception to silence is the failure itself: when an agent shell is
+  detected but the calling session cannot be named (`caller-unresolved`,
+  `identity-conflict`), search and recall prose surfaces print one stderr
+  line saying so (`surface_policy.caller_unknown_notice`); JSON keeps the
+  same reason in `self_exclusion.reason` and the `identity` source
+  (`claude`, `codex`, `pi`, `pi-process`, `corroborated`) when active.
+- **The family index degrades loudly, not silently.** `[side chat]` marks,
+  prefix-shortened handles, and the caller's family are read from the last
+  published family index even while a store drifts past its `family_stamp`;
+  that fallback prints one stderr line per invocation
+  (`surface_policy.FAMILY_INDEX_BEHIND_LINE`). Query-time family expansion stays
+  generation-bound. Compaction recovery from a behind-generation publication is
+  marked partial with an `index_freshness` disclosure.
+- **A writer does not invalidate a verified snapshot.** If SQLite is unavailable
+  during ownership adoption or indexing, the generation-bound JSONL reader may
+  serve a complete committed publication while the index lock is held. Missing,
+  moving, or damaged publications remain subject to the bounded publication retry
+  and fail closed when no verified result becomes available. Cached message and
+  reply parse damage applies on every attempt, not only the first cache read.
+  Event payloads and their database generation commit before the external event
+  marker. Readers compare the database generation with that marker and recheck
+  identities, so the database-commit/marker-publication gap cannot serve mixed events.
+- **Parser-policy exclusions can remove previously cached material.** A complete
+  empty reparse of the same source identity, mtime and size replaces its old rows
+  and exact event ownership without a source-health warning. A complete empty
+  reparse of an unchanged affected sibling follows the same rule. Changed or
+  unverified source identities, incomplete reads and unattributed legacy events
+  retain the last-good guard. Claude's empty-result fast path validates JSONL
+  before declaring the read complete; malformed input is a read failure, not a
+  policy exclusion.
+  Cache generation 23 recognizes Codex Desktop `item_completed` / `UserMessage`
+  submissions; generation 24 rechecks empty Claude sources under that read
+  contract. Supported prior generations retain fallback material during reparse.
 - **A window that selects no time is a usage error.** `--since`/`--until`
   name the half-open interval `[since, until)`; with the bounds the wrong way
   round it holds no instant, so every corpus answers zero. Both surfaces
@@ -110,10 +159,30 @@ command. Versioned machine-mode validation errors keep their structured shape.
   recovered tail can never read as an override of what the agent can already
   see. Scope is `root-only`: tool rows and delegated sessions are excluded and
   the output says so. Exit follows the proven-miss rule: 0 recovered, 1 proven
-  empty against a generation verified current, 2 unavailable or invalid, and
+  empty against a generation verified current, 2 partial, unavailable, or invalid, and
   `--no-auto` marks the packet partial and exits 2 rather than presenting an
   unchecked absence as empty. Pages are bounded at 8,000 bytes of text or
   16,000 of JSON across at most eight blocks.
+  Recovery never acquires the ingestion lock or runs a foreground full-store
+  ingest. A timestamped request first checks the verified committed generation:
+  its exact boundary can return recovered or empty with
+  `index_freshness: indexed-snapshot`, without claiming global source freshness.
+  A missing boundary or unproven generation queues a nonce-bound source/FTS refresh
+  with the existing background owner. Recovery checks for the requested boundary
+  during that refresh; an unrelated source failure cannot veto a verified packet.
+  Only requests captured before a source pass receive completion receipts; a live
+  daemon or suppressed warning is not proof. A source flush landing after that pass
+  triggers another request within the same deadline. Manual calls without a
+  timestamp select the newest indexed recap after their requested refresh.
+  The reader also checks the database's full materialized-source stamp: unchanged
+  family metadata alone cannot validate older recap rows. Bounded polling waits
+  for up to eight seconds, including when the daemon was already running.
+  A behind-generation fallback remains partial. An unavailable requested recap is
+  never replaced by another boundary.
+  For timestamped requests, an identity missing from the published snapshot
+  stays pending rather than proving that its source has no compaction.
+  Caller exit cancels its exact pending request and removes any completion receipt;
+  a canceled request cannot force a later ingest.
 - This layer is the embedding surface: a harness builds on it precisely
   because it never surprises, so its stability is maintained deliberately
   across releases.
@@ -163,9 +232,9 @@ The routing rules for this layer:
    actually starts and then fails or times out, keyword hits remain available
    beside the canonical `meaning unavailable; keyword-only` notice. A runtime
    that was never present and a completed meaning miss are not lane failures.
-   A meaning lane that ran against partial coverage can still serve hits. An
-   empty semantic result on partial coverage exits 2 instead of presenting a
-   proven zero.
+   A meaning lane that ran against partial coverage can still serve hits.
+   Ordinary misses tolerate the bounded live tail above; material backlog or
+   unknown coverage exits 2 rather than presenting an ordinary empty result.
    The deterministic layer is the availability floor that makes the
    interactive layer safe to depend on.
 6. **Compression has a floor: the judgment call.** A compact row exists so
@@ -235,6 +304,9 @@ Standing today, in full:
   hint all render from `surface_policy.SEMANTIC_LANE_POLICY`; recall `--json`
   carries a `semantic_status` that separates "searched, empty" from "never
   ran"; parity-pinned in `test_surface_policy.py`.
+  The notice is shared, not the exit requirement: a completed keyword search
+  retains its exit when optional meaning is unavailable; a recall/probe miss
+  still exits 2 when its requested meaning lane never ran.
 - Rule 6 (compression preserves the judgment call): blocks are evicted whole
   before any block degrades to stubs, with the eviction disclosed; compact
   completeness is fixture-locked to the documented exact/floor/unknown forms;

@@ -18,7 +18,6 @@ import io
 import json
 import subprocess
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -150,34 +149,6 @@ class RoutineAndDeepAgree(unittest.TestCase):
         built = cls._cli("index")
         if built.returncode != 0:
             raise AssertionError(f"fixture ingest failed: {built.stderr[-400:]}")
-        cls._settle_search_index()
-
-    @classmethod
-    def _settle_search_index(cls) -> None:
-        """Wait out the fixture's handed-off derived build before verdicts.
-
-        `index` returns once the corpus publishes; the FTS build may still be
-        landing (or, on slow Windows runners, its finished child's pid may be
-        reused by a foreign process the ownership check cannot verify). The
-        verdict tests are about tier AGREEMENT on settled bytes, so settle
-        first, and retake with the documented remedy - one more `index` run -
-        when the transient ownership story lingers."""
-        deadline = time.monotonic() + 90.0
-        retaken = False
-        while time.monotonic() < deadline:
-            machine = cls._cli("status", "--json")
-            state = ""
-            if machine.returncode == 0:
-                try:
-                    state = json.loads(machine.stdout)["search_index_state"]
-                except (ValueError, KeyError):
-                    state = ""
-            if state and state not in ("building", "owned-elsewhere"):
-                return
-            if state == "owned-elsewhere" and not retaken:
-                retaken = True
-                cls._cli("index")
-            time.sleep(2.0)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -189,10 +160,17 @@ class RoutineAndDeepAgree(unittest.TestCase):
             cls.home, cls.data, cls.protected, *args, timeout=timeout)
 
     def verdicts(self) -> tuple[str, str]:
-        """(what a machine is told by routine, what the deep tier concludes)."""
-        machine = self._cli("status", "--json")
-        self.assertEqual(machine.returncode, 0, machine.stderr[-400:])
-        routine = json.loads(machine.stdout)["search_index_state"]
+        """Return the first concluded routine verdict and the deep verdict."""
+        for _ in range(4):
+            machine = self._cli("status", "--json")
+            self.assertEqual(machine.returncode, 0, machine.stderr[-400:])
+            status = json.loads(machine.stdout)
+            routine = status["search_index_state"]
+            if routine != "status-deferred":
+                break
+        else:
+            self.fail(
+                f"routine tier reached no verdict: {status['diagnostics']}")
         probe = self._cli("doctor", "--json", "--deep")
         self.assertEqual(probe.returncode, 0, probe.stderr[-400:])
         return routine, json.loads(probe.stdout)["core"]["search_db"]["state"]

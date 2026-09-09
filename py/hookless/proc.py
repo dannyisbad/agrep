@@ -112,6 +112,96 @@ def process_start_identity(pid: int) -> str | None:
     return None
 
 
+def _windows_parent(pid: int) -> int | None:
+    import ctypes
+
+    class ProcessBasicInformation(ctypes.Structure):
+        _fields_ = (
+            ("reserved1", ctypes.c_void_p),
+            ("peb", ctypes.c_void_p),
+            ("reserved2", ctypes.c_void_p * 2),
+            ("unique_process_id", ctypes.c_void_p),
+            ("inherited_from_unique_process_id", ctypes.c_void_p),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        info = ProcessBasicInformation()
+        written = ctypes.c_ulong(0)
+        status = ntdll.NtQueryInformationProcess(
+            ctypes.c_void_p(handle), 0, ctypes.byref(info),
+            ctypes.sizeof(info), ctypes.byref(written))
+        if status != 0:
+            return None
+        return int(info.inherited_from_unique_process_id or 0) or None
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def parent_pid(pid: int) -> int | None:
+    """Return the kernel-reported parent of ``pid``, or None when unreadable."""
+    if pid <= 0 or pid > _MAX_PROCESS_ID:
+        return None
+    if sys.platform == "win32":
+        return _windows_parent(pid)
+    if sys.platform == "darwin":
+        try:
+            from hookless import procscan
+
+            ctypes, info_type, pidinfo = procscan._mac_birth_api()
+            info = info_type()
+            got = pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        except (AttributeError, OSError, OverflowError, ValueError):
+            return None
+        if got != ctypes.sizeof(info):
+            return None
+        return int(info.ppid) or None
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            return int(raw[raw.rfind(")") + 2:].split()[1]) or None
+        except (IndexError, OSError, ValueError):
+            return None
+    return None
+
+
+def process_start_time(pid: int) -> float | None:
+    """Return the kernel birth time of ``pid`` as epoch seconds, or None."""
+    if pid <= 0 or pid > _MAX_PROCESS_ID:
+        return None
+    if sys.platform == "win32":
+        identity = _windows_start(pid)
+        if not identity:
+            return None
+        # FILETIME: 100 ns ticks since 1601-01-01.
+        return int(identity[4:]) / 1e7 - 11644473600.0
+    if sys.platform == "darwin":
+        from hookless import procscan
+
+        return procscan._process_birth(pid)[1] or None
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            ticks = int(raw[raw.rfind(")") + 2:].split()[19])
+            boot = None
+            for line in Path("/proc/stat").read_text(encoding="ascii").splitlines():
+                if line.startswith("btime "):
+                    boot = int(line.split()[1])
+                    break
+            if boot is None:
+                return None
+            return boot + ticks / os.sysconf("SC_CLK_TCK")
+        except (IndexError, OSError, ValueError):
+            return None
+    return None
+
+
 def _process_group_active(process_group: int) -> bool | None:
     if sys.platform == "win32" or process_group <= 0:
         return False

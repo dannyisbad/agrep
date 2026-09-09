@@ -2,8 +2,10 @@
 
 Claude shapes the summary with PreCompact. Codex injects resumed context with
 SessionStart/compact. pi and OMP load the same lifecycle extension: OMP also
-adds native summarizer context, while both export their exact session ID and
-queue recovery guidance only at a compaction boundary or compacted resume.
+adds native summarizer context, while both export their exact session ID to
+the process environment, publish it per process for tool shells that inherit
+a stale environment snapshot, and queue recovery guidance only at a
+compaction boundary or compacted resume.
 
 Installed only by the hook choice in `agrep setup`; `--no-hook` skips it.
 Never auto-repaired, and never overwrites a user's own hook or extension.
@@ -46,6 +48,8 @@ PRIOR_PAYLOAD_HASHES = frozenset({
     "0557eb91adce33d36c08ca136e62a5a47e77e044b25b787f027d34b6e17347e1",
     # v7: before recovery explicitly checked the visible summary first
     "1d6c76882e0b8a8da3d19b724e88cfe47e946f56d5d8d17b50768bf2ae7251ed",
+    # v8: before the recall warning was conditioned on caller identification
+    "09c73004070ddabd3f2828c0f39b92a051e9e9ec5f04cb7f902865135f1708c6",
 })
 
 def _home() -> Path:
@@ -89,6 +93,11 @@ PRIOR_PI_EXTENSION_HASHES: frozenset[str] = frozenset({
     "34c99ac023bca77e457359c36bc57f698e364e49aece0100c3135a4fe22ea55b",
     # v2: before the check-first gate stopped sufficient-summary pulls
     "127c3cf0cc2afc4bd3d2aee86b589ec3a80810b896413e3b6e3f084869186e32",
+    # v3: env-only identity, before the per-process caller publication
+    "4b26c969f97e57607fc8d8d21666442ac162dcdcf3d083ae6a2a9c72050b656f",
+    # v4: publication written without checking the /tmp directory's owner
+    "7f9fd2e3910ffa76c9b928aa14a98651f3809fdb55a0ac37c71bfc2e9efde114",
+    "6cfdf55fd59ba3834f9557804b79da19930ea14e803b267a5cf04e2690033a94",
 })
 
 

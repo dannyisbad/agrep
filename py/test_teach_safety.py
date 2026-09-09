@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -70,6 +71,8 @@ class TeachSafetyTest(unittest.TestCase):
                 mock.patch.object(teach.common,
                                   "windows_background_child_flags",
                                   return_value=0), \
+                mock.patch.object(teach, "_retire_legacy_windows_sentinel",
+                                  return_value=True), \
                 mock.patch.object(teach, "sentinel_armed",
                                   return_value=True):
             self.assertTrue(teach._sentinel_install_win([]))
@@ -86,7 +89,7 @@ class TeachSafetyTest(unittest.TestCase):
         script = calls[0][4]
         self.assertIn("Register-ScheduledTask", script)
         self.assertIn("-AtLogOn", script)
-        self.assertIn(teach.TASK_NAME, script)
+        self.assertIn(teach._sentinel_task_name(), script)
         self.assertIn("sentinel_watch.py", script)
 
     def test_win_sentinel_falls_back_to_schtasks_on_register_failure(
@@ -95,7 +98,7 @@ class TeachSafetyTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0], "powershell")
         self.assertEqual(calls[1][:5], [
-            "schtasks", "/Create", "/F", "/TN", teach.TASK_NAME])
+            "schtasks", "/Create", "/F", "/TN", teach._sentinel_task_name()])
         self.assertIn("/SC", calls[1])
         self.assertIn("ONLOGON", calls[1])
 
@@ -435,6 +438,73 @@ class TeachSafetyTest(unittest.TestCase):
         self.assertIn(
             f"updated block v24 -> v{teach.NUDGE_V}", output.getvalue())
 
+    def test_explicit_setup_says_when_it_replaces_an_edited_legacy_block(
+            self) -> None:
+        # a v24 body on the recorded digests is shipped; off them it is an edit
+        proof = self.home / ".codex"
+        proof.mkdir()
+        target = proof / "AGENTS.md"
+        teach.MD_TARGETS = [("codex", proof, target)]
+        shipped = hashlib.sha256(b"old").hexdigest()
+        cases = (
+            ("old", f"updated block v24 -> v{teach.NUDGE_V}"),
+            ("old, reworded", f"replacing an edited v24 block with v{teach.NUDGE_V}"),
+        )
+        for body, line in cases:
+            with self.subTest(body=body):
+                target.write_bytes(
+                    f"{teach.MARK_PREFIX} v24 -->\n{body}\n{teach.MARK_END}\n"
+                    .encode("utf-8"))
+                output = io.StringIO()
+                with mock.patch.dict(
+                        teach._PRIOR_BLOCK_DIGESTS, {24: frozenset({shipped})}), \
+                        mock.patch.object(
+                            teach, "_sentinel_install", return_value=True), \
+                        mock.patch("sys.stdout", new=output):
+                    self.assertEqual(teach._install(), 0)
+                self.assertIn(f"  codex: {line} in {target}", output.getvalue())
+                self.assertNotIn(
+                    f"{teach.MARK_PREFIX} v24 -->".encode(), target.read_bytes())
+
+    def test_same_version_edit_is_kept_and_disclosed_as_edited(self) -> None:
+        proof = self.home / ".codex"
+        proof.mkdir()
+        target = proof / "AGENTS.md"
+        edited = (
+            f"HOST\r\n{teach.MARK_BEGIN}\r\nmy own wording\r\n"
+            f"{teach.MARK_END}\r\nTAIL\r\n"
+        ).encode("utf-8")
+        target.write_bytes(edited)
+        teach.MD_TARGETS = [("codex", proof, target)]
+        output = io.StringIO()
+        with mock.patch.object(
+                teach, "_sentinel_install", return_value=True), \
+                mock.patch("sys.stdout", new=output):
+            self.assertEqual(teach._install(), 0)
+        self.assertIn(
+            f"  codex: kept edited v{teach.NUDGE_V} block in {target}",
+            output.getvalue())
+        self.assertEqual(target.read_bytes(), edited)
+
+        self.assertEqual(teach.reconcile(), [])
+        self.assertEqual(target.read_bytes(), edited)
+        health = teach.current_reconcile_health()
+        self.assertEqual(health["state"], "refused")
+        self.assertEqual(
+            [(row["kind"], row["reason"]) for row in health["refusals"]],
+            [("edited",
+              f"agrep block v{teach.NUDGE_V} was edited after install; "
+              "kept as is until a newer agrep setup replaces it")])
+        self.assertEqual(teach.reconcile_health()["refusals"], health["refusals"])
+
+        # the shipped body in a tag-styled host is a wrapper, not an edit
+        host = b"<rules>\r\nA\r\n</rules>\r\n<style>\r\nB\r\n</style>\r\n"
+        target.write_bytes(host)
+        self.assertEqual(teach._write_block(target), "added")
+        self.assertIn(b"<agrep-recall>", target.read_bytes())
+        self.assertEqual(teach.reconcile(), [])
+        self.assertEqual(teach.current_reconcile_health()["state"], "clean")
+
     def test_reconcile_collapses_duplicate_current_blocks_byte_for_byte(
             self) -> None:
         first = (
@@ -706,6 +776,9 @@ class TeachSafetyTest(unittest.TestCase):
             mock.Mock(returncode=0, stdout="", stderr=""),
             mock.Mock(returncode=1, stdout="", stderr="not loaded"),
             mock.Mock(returncode=1, stdout="", stderr="not found"),
+            mock.Mock(returncode=113, stdout="", stderr=(
+                'Could not find service "com.agrep.sentinel" '
+                "in domain for user gui: 501")),
         ]
         with mock.patch.object(teach.sys, "platform", "darwin"), \
                 mock.patch.object(
@@ -746,11 +819,11 @@ class TeachSafetyTest(unittest.TestCase):
             marker = self.data / teach._LINUX_UNARMED_MARKER
             self.assertEqual(marker.read_bytes(), b"not-armed\n")
             for path in (
-                    unit_dir / f"{teach.TASK_NAME}.service",
-                    unit_dir / f"{teach.TASK_NAME}.timer",
-                    unit_dir / f"{teach.TASK_NAME}.path",
-                    unit_dir / "paths.target.wants" / f"{teach.TASK_NAME}.path",
-                    unit_dir / "timers.target.wants" / f"{teach.TASK_NAME}.timer",
+                    unit_dir / f"{teach._sentinel_task_name()}.service",
+                    unit_dir / f"{teach._sentinel_task_name()}.timer",
+                    unit_dir / f"{teach._sentinel_task_name()}.path",
+                    unit_dir / "paths.target.wants" / f"{teach._sentinel_task_name()}.path",
+                    unit_dir / "timers.target.wants" / f"{teach._sentinel_task_name()}.timer",
                     self.data / "sentinel.sh",
                     self.data / "sentinel_strip.pl"):
                 self.assertFalse(path.exists() or path.is_symlink(), path)
@@ -758,7 +831,8 @@ class TeachSafetyTest(unittest.TestCase):
             before_remove = len(calls)
             self.assertTrue(teach._sentinel_remove())
 
-        self.assertEqual(calls[before_remove:], [("daemon-reload",)])
+        self.assertFalse(
+            {call[0] for call in calls[before_remove:]} & {"enable", "disable"})
         self.assertFalse(marker.exists())
 
     def test_interrupted_remove_cannot_be_reinjected(self) -> None:
@@ -1187,6 +1261,7 @@ class TeachSafetyTest(unittest.TestCase):
         target = self.root / "rules & notes.md"
         with mock.patch.object(teach.subprocess, "run", return_value=mock.Mock(returncode=0)), \
                 mock.patch.object(teach.os, "getuid", return_value=501, create=True), \
+                mock.patch.object(teach, "_retire_legacy_mac_sentinel", return_value=True), \
                 mock.patch.object(teach, "sentinel_armed", return_value=True):
             self.assertTrue(teach._sentinel_install_mac([target]))
         ET.parse(teach._plist_path())
@@ -1251,7 +1326,7 @@ class TeachSafetyTest(unittest.TestCase):
         Path(namespace["__file__"]).write_text("watcher", encoding="utf-8")
         namespace["strip"]({
             "mark_prefix": teach.MARK_PREFIX, "mark_end": teach.MARK_END,
-            "targets": [str(link)], "skill_files": [], "task_name": teach.TASK_NAME,
+            "targets": [str(link)], "skill_files": [], "task_name": teach._sentinel_task_name(),
         })
         self.assertTrue(link.is_symlink())
         self.assertTrue(target.exists())
@@ -1278,7 +1353,7 @@ class TeachSafetyTest(unittest.TestCase):
         Path(namespace["__file__"]).write_text("watcher", encoding="utf-8")
         namespace["strip"]({
             "mark_prefix": teach.MARK_PREFIX, "mark_end": teach.MARK_END,
-            "targets": [str(target)], "skill_files": [], "task_name": teach.TASK_NAME,
+            "targets": [str(target)], "skill_files": [], "task_name": teach._sentinel_task_name(),
         })
         self.assertEqual(target.read_bytes(), original)
 

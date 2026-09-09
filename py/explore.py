@@ -10,6 +10,7 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from contextlib import contextmanager
+from itertools import chain
 import functools
 import json
 import os
@@ -18,6 +19,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import boundary_rank
 import common
 import compact
 import conceptpair
@@ -55,7 +57,7 @@ class DirectSnapshotMoved(DirectSnapshotError):
 def _record_direct_snapshot_damage(name: str, skipped: int) -> None:
     damage = getattr(_DIRECT_SNAPSHOT_LOCAL, "damage", None)
     if damage is not None and skipped:
-        damage[name] = damage.get(name, 0) + int(skipped)
+        damage[name] = max(damage.get(name, 0), int(skipped))
 
 
 def _freshen() -> None:
@@ -76,9 +78,8 @@ def _freshen() -> None:
     if gen == _GEN:
         return
     for fn in (_vibe_index, _summaries, _concept_pair, _concept_names, _session_concept,
-               _summary_by_session, _messages_by_session_read, _messages_by_session,
+               _summary_by_session, _messages_by_session_read,
                _primary_models, _emotions_by_id, _reply_records_by_id_read,
-               _reply_records_by_id, _replies_by_id,
                _session_index, _session_index_read):
         fn.cache_clear()
     with _SESSION_CONTEXT_LOCK:
@@ -317,7 +318,6 @@ def _messages_by_session_read() -> tuple[dict[str, list[dict]], int]:
     return out, skipped
 
 
-@functools.lru_cache(maxsize=1)
 def _messages_by_session() -> dict[str, list[dict]]:
     """session -> message rows, with damage retained by the underlying read."""
     rows, skipped = _messages_by_session_read()
@@ -544,17 +544,12 @@ def _reply_records_by_id_read() -> tuple[dict[str, dict], int]:
     return out, skipped
 
 
-@functools.lru_cache(maxsize=1)
 def _reply_records_by_id() -> dict[str, dict]:
     rows, skipped = _reply_records_by_id_read()
     _record_direct_snapshot_damage("replies.jsonl", skipped)
     return rows
 
 
-@functools.lru_cache(maxsize=1)
-def _replies_by_id() -> dict[str, str]:
-    """Message id -> agent reply text compatibility view."""
-    return {key: value["reply"] for key, value in _reply_records_by_id().items()}
 
 def _native_family_members(
         caller: str,
@@ -563,6 +558,8 @@ def _native_family_members(
     if indexed is not None:
         return indexed[1], indexed[2]
     census = common.read_session_family_census()
+    if census is not None:
+        caller = census.aliases.get(caller, caller)
     if census is None or caller not in census.sessions:
         return frozenset({caller}), frozenset()
     memo: dict[str, str] = {}
@@ -590,7 +587,7 @@ def _iter_kw_corpus(flt: dict | None = None):
     """
     flt = flt or {}
     agent = (flt.get("agent") or "").lower()
-    project = (flt.get("project") or "").lower()
+    project = flt.get("project") or ""
     chat = (flt.get("chat") or "").lower()
     who = flt.get("who")
     model = (flt.get("model") or "").lower()
@@ -650,7 +647,8 @@ def _iter_kw_corpus(flt: dict | None = None):
             return False
         if agent and agent not in (row_agent or "").lower():
             return False
-        if project and project not in (row_project or "").lower():
+        if project and not surface_policy.project_label_matches(
+                row_project, project):
             return False
         if model:
             actual = (row_model or "").lower()
@@ -867,7 +865,7 @@ def _native_event_owners(flt: dict) -> list[dict] | None:
     if flt.get("model"):
         return []
     agent = str(flt.get("agent") or "").lower()
-    project = str(flt.get("project") or "").lower()
+    project = str(flt.get("project") or "")
     chat = str(flt.get("chat") or "").lower()
     excluded_sessions = _native_excluded_sessions(flt)
     try:
@@ -888,7 +886,8 @@ def _native_event_owners(flt: dict) -> list[dict] | None:
             continue
         if agent and agent not in row_agent.lower():
             continue
-        if project and project not in row_project.lower():
+        if project and not surface_policy.project_label_matches(
+                row_project, project):
             continue
         owners.append({
             "agent": row_agent, "session": session, "project": row_project,
@@ -1284,9 +1283,12 @@ def native_event_scan_preflight(flt: dict) -> bool:
 def _native_owner_filter(flt: dict) -> dict | None:
     if not _native_event_lane_enabled(flt):
         return None
+    if flt.get("project"):
+        # the native owner filter is a substring test; --project is not
+        return None
     return {
         "agent_contains": str(flt.get("agent") or ""),
-        "project_contains": str(flt.get("project") or ""),
+        "project_contains": "",
         "chat_prefix": str(flt.get("chat") or ""),
         "excluded_sessions": sorted(_native_excluded_sessions(flt)),
     }
@@ -2034,21 +2036,16 @@ def keyword_search(q: str, k: int = 300, flt: dict | None = None, *,
     if not q:
         return {"hits": [], "total": 0, "chats": 0}
     toks = [t for t in re.split(r"[\s\-_]+", q) if t]
-    corpus = _iter_kw_corpus(_keyword_scan_filter(toks, flt))
+    scan_tokens = (
+        [boundary_rank.term_anchor(token) for token in toks]
+        if len(toks) >= 2 else toks)
+    corpus = _iter_kw_corpus(_keyword_scan_filter(scan_tokens, flt))
     hits = []
-    if len(toks) <= 1:  # single token -> plain substring (fastest)
-        ql = q.lower()
-        pat = re.compile(re.escape(q), re.I)
+    if len(toks) <= 1:  # single token -> substring, snippet on the best-aligned occurrence
         for row_key, e in enumerate(corpus):
-            i = e["low"].find(ql)
-            match = None if i >= 0 else pat.search(e["text"])
-            if i >= 0 or match is not None:
-                if match is not None:
-                    start, end = match.span()
-                else:
-                    start, end = common.original_span_for_lowered(
-                        e["text"], e["low"], i, i + len(ql))
-                hit = scan_hit(e, start, end)
+            span = common.insensitive_span(e["text"], q, e["low"])
+            if span is not None:
+                hit = scan_hit(e, *span)
                 if row_keys:
                     hit["_agrep_row_key"] = row_key
                 hits.append(hit)
@@ -2063,24 +2060,14 @@ def keyword_search(q: str, k: int = 300, flt: dict | None = None, *,
         # Compile the Python-re.I compatibility seam once per token; lower/find
         # handles ordinary text, while the regex covers exceptional Unicode.
         def term_spec(token: str):
-            lowered = token.lower()
-            needs_regex = (
-                not token.isascii() or "i" in lowered or "s" in lowered)
-            return (
-                lowered,
-                re.compile(re.escape(token), re.I) if needs_regex else None,
-            )
+            return token, boundary_rank.term_variants(token)
 
         term_specs = [term_spec(token) for token in toks]
 
         def term_span(e: dict, spec) -> tuple[int, int] | None:
-            lowered, fallback = spec
-            start = e["low"].find(lowered)
-            if start >= 0:
-                return common.original_span_for_lowered(
-                    e["text"], e["low"], start, start + len(lowered))
-            match = fallback.search(e["text"]) if fallback is not None else None
-            return match.span() if match is not None else None
+            token, variants = spec
+            return common.insensitive_span(
+                e["text"], token, e["low"], variants=variants)
 
         for row_key, e in enumerate(corpus):
             # Every phrase and every all-terms row contains token zero.  This
@@ -2149,7 +2136,13 @@ def resolve_session(q: str) -> list[str]:
     indexed = common.indexed_session_matches(q)
     if indexed is not None:
         return [session for session in indexed if session in servable]
-    return common.match_session_ids(servable, q)
+    census = common.read_session_family_census()
+    if census is None or not census.aliases:
+        return common.match_session_ids(servable, q)
+    matches = common.match_session_ids(chain(servable, census.aliases), q)
+    return list(dict.fromkeys(
+        canonical for session in matches
+        if (canonical := census.aliases.get(session, session)) in servable))
 
 
 def _session_context(db, generation: tuple[str, str], session: str) -> dict | None:
@@ -2205,7 +2198,7 @@ def _merge_transcript_rows(rows: list[dict]) -> list[dict]:
 
 def _legacy_window_source(session: str) -> tuple[dict | None, list[dict]]:
     """Compatibility path for Python/sqlite builds without trigram FTS5."""
-    rep = _replies_by_id()
+    rep = _reply_records_by_id()
     rows = []
     timeline = []
     for o in sorted(_messages_by_session().get(session, []),
@@ -2214,9 +2207,10 @@ def _legacy_window_source(session: str) -> tuple[dict | None, list[dict]]:
         who = o.get("who", "user")
         turn = int(o.get("turn", 0))
         ts = int(o.get("ts", 0) or 0)
+        reply = rep.get(o.get("id", ""))
         rows.append({"turn": turn, "ts": ts, "agent": o.get("agent", ""),
                      "project": o.get("project", ""), "who": who, "text": text,
-                     "reply": rep.get(o.get("id", ""), "")})
+                     "reply": reply["reply"] if reply is not None else ""})
         timeline.append({"turn": turn, "ts": ts})
     if not rows:
         return None, []

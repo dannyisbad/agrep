@@ -131,6 +131,11 @@ pub trait Adapter: Sync {
     fn store_content(&self, _path: &std::path::Path) -> bool {
         true
     }
+    /// The id the store's own filename gives `session`'s transcript at `path`, when it differs
+    /// from the header id the rows carry; publication resolves both to one family.
+    fn session_alias(&self, _path: &Path, _session: &str) -> Option<String> {
+        None
+    }
     /// Inputs whose unchanged state permits skipping this adapter altogether. Usually these
     /// are the same as the doctor/audit roots, but an adapter may add attribution metadata
     /// which affects emitted rows without itself being conversation content.
@@ -174,6 +179,14 @@ pub static ADAPTERS: &[&dyn Adapter] = &[
     &crate::ingest::cursor::Cursor,
     &crate::ingest::pi::Pi,
 ];
+
+/// [`Adapter::session_alias`] for the adapter that owns `agent`'s rows.
+pub fn session_alias(agent: &str, path: &Path, session: &str) -> Option<String> {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent)
+        .and_then(|adapter| adapter.session_alias(path, session))
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ChangeToken {

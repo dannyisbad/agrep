@@ -65,7 +65,7 @@ class DerivedArtifactRecoveryTests(unittest.TestCase):
                 json.dumps(row) + "\n", encoding="utf-8")
 
             explore._session_index.cache_clear()
-            explore._messages_by_session.cache_clear()
+            explore._messages_by_session_read.cache_clear()
             explore._GEN = None
             with (
                 mock.patch.object(common, "DATA_DIR", stale),

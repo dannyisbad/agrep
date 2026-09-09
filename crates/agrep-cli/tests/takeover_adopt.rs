@@ -1,11 +1,4 @@
-//! Deploy-day takeover adopts the dead owner's verified parse cache.
-//!
-//! The successor takeover used to discard the foreign cache wholesale, so
-//! every deploy paid a full reparse of every transcript. The cache format
-//! proves its own integrity (digested base, commit-framed journal), so the
-//! takeover now re-owns it: same entries, new identity, nothing reparsed.
-//! This pins the integration seam the ingest_cache unit tests cannot see -
-//! the disclosure line and the zero-reparse rebuild through the real binary.
+//! Successor takeover preserves verified stores and reconstructs incompatible caches safely.
 
 mod common;
 
@@ -38,6 +31,7 @@ fn run(home: &Path, data: &Path, build_id: &str, full: bool) -> std::process::Ou
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "AGREP_RS_BIN",
+        "AGREP_PYTHON_RUNTIME_BUILD_ID",
     ] {
         command.env_remove(key);
     }
@@ -330,6 +324,27 @@ fn fts_hits(path: &Path) -> i64 {
         .unwrap()
 }
 
+fn make_cache_incompatible(data: &Path) {
+    let path = data.join(".ingest_cache.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    let version = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    bytes[..4].copy_from_slice(&(version + 7).to_le_bytes());
+    fs::write(path, bytes).unwrap();
+}
+
+fn assert_owned_by(data: &Path, expected: &str) {
+    use agrep_core::ingest_cache::{probe_cache_owner, CacheOwnerProbe};
+
+    let owner: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join(".derived-owner.json")).unwrap()).unwrap();
+    assert_eq!(owner["build_id"], expected);
+    let observed = match probe_cache_owner(&data.join(".ingest_cache.bin")) {
+        CacheOwnerProbe::Current { build_id } | CacheOwnerProbe::Foreign { build_id } => build_id,
+        other => panic!("parse cache has no writing-build identity: {other:?}"),
+    };
+    assert_eq!(observed, expected);
+}
+
 fn forge_wal_owned_corpus(data: &Path, owner: &str) -> rusqlite::Connection {
     let seed = data.join("wal-seed.db");
     let connection = rusqlite::Connection::open(&seed).unwrap();
@@ -455,18 +470,193 @@ fn takeover_adopts_the_cache_and_reparses_nothing() {
     // Windows: an open connection blocks the child's replace-over (no
     // delete sharing); POSIX rename hid this. Close before the next run.
     drop(metadata);
+}
 
-    // a torn cache never adopts: corrupt it, flip identities again, and the
-    // takeover must fall back to the discard path and still converge
+#[test]
+fn takeover_reconstructs_incompatible_cache_on_first_changed_source_ingest() {
+    for repair_events in [false, true] {
+        let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+        let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+        let home = temp_dir("takeover-reconstruct-home");
+        copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+        let data = temp_dir("takeover-reconstruct-data");
+        let first = run(&home, &data, owner_a, true);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        forge_owned_corpus(&data, owner_a);
+        make_cache_incompatible(&data);
+        if repair_events {
+            fs::remove_file(data.join(".events_complete.claude.json")).unwrap();
+        }
+        let source = home.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl");
+        let changed = fs::read_to_string(&source)
+            .unwrap()
+            .replace(
+                "how do i fix the flaky timer test",
+                "successor first-ingest question",
+            )
+            .replace("Let me run the timer test.", "successor first-ingest reply");
+        fs::write(source, changed).unwrap();
+
+        let successor = run(&home, &data, owner_b, false);
+        assert!(
+            successor.status.success(),
+            "{}",
+            String::from_utf8_lossy(&successor.stderr)
+        );
+        let messages = fs::read_to_string(data.join("messages.jsonl")).unwrap();
+        assert!(messages.contains("successor first-ingest question"));
+        assert!(!messages.contains("how do i fix the flaky timer test"));
+        assert!(fs::read_to_string(data.join("replies.jsonl"))
+            .unwrap()
+            .contains("successor first-ingest reply"));
+        assert_owned_by(&data, owner_b);
+        assert_eq!(owner_at(&data.join("corpus.db")), owner_b);
+        assert!(agrep_core::cache::events_complete(&data.join("events"), &["claude"]).unwrap());
+        assert!(!data.join(".ingest_pending.bin").exists());
+    }
+}
+
+#[test]
+fn takeover_discard_does_not_authorize_source_loss() {
+    for repair_events in [false, true] {
+        for missing in [false, true] {
+            let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+            let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+            let home = temp_dir("takeover-source-loss-home");
+            copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+            let data = temp_dir("takeover-source-loss-data");
+            assert!(run(&home, &data, owner_a, true).status.success());
+            let published = ["messages.jsonl", "replies.jsonl", "sessions.jsonl"]
+                .map(|name| (name, fs::read(data.join(name)).unwrap()));
+            make_cache_incompatible(&data);
+            if repair_events {
+                fs::remove_file(data.join(".events_complete.claude.json")).unwrap();
+            }
+            if missing {
+                fs::remove_dir_all(home.join(".claude/projects")).unwrap();
+            } else {
+                fs::write(
+                    home.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl"),
+                    b"\xff\xfe",
+                )
+                .unwrap();
+            }
+
+            let successor = run(&home, &data, owner_b, false);
+            assert!(
+                !successor.status.success(),
+                "{}",
+                String::from_utf8_lossy(&successor.stderr)
+            );
+            for (name, bytes) in published {
+                assert_eq!(fs::read(data.join(name)).unwrap(), bytes, "{name}");
+            }
+            let owner: serde_json::Value =
+                serde_json::from_slice(&fs::read(data.join(".derived-owner.json")).unwrap())
+                    .unwrap();
+            assert_eq!(owner["build_id"], owner_b);
+            assert!(!data.join(".ingest_cache.bin").exists());
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn takeover_migrates_legacy_cache_without_losing_unreadable_source_material() {
+    let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+    let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+    let home = temp_dir("takeover-legacy-cache-home");
+    copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+    let data = temp_dir("takeover-legacy-cache-data");
+    assert!(run(&home, &data, owner_a, true).status.success());
+    forge_owned_corpus(&data, owner_a);
+    fs::remove_file(data.join(".derived-owner.json")).unwrap();
     let cache = data.join(".ingest_cache.bin");
-    let mut bytes = fs::read(&cache).unwrap();
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
-    fs::write(&cache, bytes).unwrap();
-    let third = run(&home, &data, owner_a, false);
-    let stderr = String::from_utf8_lossy(&third.stderr);
-    assert!(third.status.success(), "{stderr}");
-    assert!(stderr.contains("foreign parse cache discarded"), "{stderr}");
+    let wrapped = fs::read(&cache).unwrap();
+    assert_eq!(&wrapped[12..20], b"AGRPCB01");
+    assert_eq!(&wrapped[84..88], &0_u32.to_le_bytes());
+    let mut legacy = wrapped[100..].to_vec();
+    let version = u32::from_le_bytes(legacy[..4].try_into().unwrap());
+    legacy[..4].copy_from_slice(&(version - 1).to_le_bytes());
+    fs::write(&cache, legacy).unwrap();
+    assert_eq!(
+        agrep_core::ingest_cache::probe_cache_owner(&cache),
+        agrep_core::ingest_cache::CacheOwnerProbe::LegacyUnowned
+    );
+    let published =
+        ["messages.jsonl", "replies.jsonl"].map(|name| (name, fs::read(data.join(name)).unwrap()));
+    let source = home.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl");
+    let original = fs::read_to_string(&source).unwrap();
+    fs::write(&source, b"\xff\xfe").unwrap();
+
+    let successor = run(&home, &data, owner_b, false);
+    assert!(
+        !successor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&successor.stderr)
+    );
+    for (name, bytes) in published {
+        assert_eq!(fs::read(data.join(name)).unwrap(), bytes, "{name}");
+    }
+    assert_owned_by(&data, owner_b);
+    assert_eq!(owner_at(&data.join("corpus.db")), owner_b);
+
+    fs::write(
+        source,
+        original.replace(
+            "how do i fix the flaky timer test",
+            "legacy source restored",
+        ),
+    )
+    .unwrap();
+    let restored = run(&home, &data, owner_b, false);
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(fs::read_to_string(data.join("messages.jsonl"))
+        .unwrap()
+        .contains("legacy source restored"));
+    assert_owned_by(&data, owner_b);
+}
+
+#[test]
+fn undecodable_unowned_cache_keeps_stores_and_does_not_publish_an_anchor() {
+    let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+    let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+    let home = temp_dir("takeover-unowned-cache-home");
+    copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+    let data = temp_dir("takeover-unowned-cache-data");
+    assert!(run(&home, &data, owner_a, true).status.success());
+    forge_owned_corpus(&data, owner_a);
+    fs::remove_file(data.join(".derived-owner.json")).unwrap();
+    fs::write(data.join(".ingest_cache.bin"), b"unproven legacy cache").unwrap();
+    fs::write(data.join(".ingest_cache.bin.journal"), b"unproven journal").unwrap();
+    let preserved = [
+        ".ingest_cache.bin",
+        ".ingest_cache.bin.journal",
+        "corpus.db",
+        "messages.jsonl",
+        "replies.jsonl",
+    ]
+    .map(|name| (name, fs::read(data.join(name)).unwrap()));
+
+    let successor = run(&home, &data, owner_b, false);
+    assert!(
+        successor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&successor.stderr)
+    );
+    for (name, bytes) in preserved {
+        assert_eq!(fs::read(data.join(name)).unwrap(), bytes, "{name}");
+    }
+    assert!(!data.join(".derived-owner.json").exists());
+    assert_eq!(owner_at(&data.join("corpus.db")), owner_a);
 }
 
 #[test]

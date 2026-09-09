@@ -202,7 +202,9 @@ class PerfHarnessTests(unittest.TestCase):
             ["agrep-rs", "index"], 0,
             "  phases: source-check 12ms · load-cache 34ms · "
             "write-derived+source-validate 56ms\n",
-            "",
+            "* [agrep ingest] dispatch 3.1ms · guard 0.0ms\n"
+            "* [agrep ingest] messages 45.6ms · replies 32.1ms · "
+            "sessions 7.8ms · events 0.0ms · postflight 12.3ms\n",
         )
 
         sample = self.perf._ingest_sample_diagnostic(run, 123.4567)
@@ -212,6 +214,10 @@ class PerfHarnessTests(unittest.TestCase):
             "source-check": 12.0,
             "load-cache": 34.0,
             "write-derived+source-validate": 56.0,
+        })
+        self.assertEqual(sample["writers_ms"], {
+            "messages": 45.6, "replies": 32.1, "sessions": 7.8,
+            "events": 0.0, "postflight": 12.3,
         })
 
     def test_ingest_sample_diagnostic_ignores_other_phase_reports(self):

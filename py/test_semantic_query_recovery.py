@@ -97,38 +97,36 @@ class SemanticGenerationRecoveryTests(unittest.TestCase):
             result = semantic.wait_for_query_recovery(timeout_s=1.0)
         self.assertEqual(result["state"], "ready")
         self.assertFalse(result["waited"])
-        active.assert_called_once_with()
+        active.assert_not_called()
         embed.assert_not_called()
         sleep.assert_not_called()
 
-    def test_partial_searchable_generation_waits_for_active_publisher(
+    def test_partial_published_generation_is_ready_during_live_ingestion(
             self) -> None:
         partial = {
             "state": "partial", "coherent": False, "searchable": True,
             "coverage": {
-                "indexed": 1, "total": 2, "pending": 1,
+                "indexed": 56_256, "total": 56_312, "pending": 56,
                 "complete": False,
             },
         }
-        clock = [0.0]
-
-        def sleep(delay: float) -> None:
-            clock[0] += delay
-
         with mock.patch.object(
                 semantic, "embedding_coherence", return_value=partial), \
                 mock.patch.object(
                     semantic, "_query_corpus_update_active",
-                    return_value=True), \
+                    side_effect=AssertionError(
+                        "live ingestion must not gate an immutable snapshot")), \
                 mock.patch.object(
-                    semantic, "embed_running", return_value=False), \
+                    semantic, "embed_running",
+                    side_effect=AssertionError(
+                        "a queryable publication does not need the embedder")), \
                 mock.patch.object(
-                    semantic.time, "monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(semantic.time, "sleep", side_effect=sleep):
-            result = semantic.wait_for_query_recovery(timeout_s=0.05)
-        self.assertEqual(result["state"], "timeout")
-        self.assertTrue(result["waited"])
-        self.assertLessEqual(clock[0], 0.05)
+                    semantic.time, "sleep",
+                    side_effect=AssertionError(
+                        "a queryable publication must not enter recovery wait")):
+            result = semantic.wait_for_query_recovery(timeout_s=12.0)
+        self.assertEqual(result["state"], "ready")
+        self.assertFalse(result["waited"])
 
     def test_unexplained_stale_generation_does_not_sleep_or_fake_ready(
             self) -> None:
@@ -321,7 +319,7 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
                 self._completed_pending(first))
         self.assertEqual(result, _ready())
         query.assert_called_once()
-        active.assert_called_once_with()
+        active.assert_not_called()
         embed.assert_not_called()
 
     def test_convergence_and_retry_share_one_absolute_deadline(self) -> None:
@@ -570,6 +568,97 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertFalse(surface.semantic_status_retryable({
                     "state": "unavailable", "reason": reason}))
+
+
+class ForcedSemanticBoundTests(unittest.TestCase):
+    """`-s` carries no caller deadline, yet its guarded local pass must end
+    and must say what it waits on: in a sandbox that denies loopback, the
+    child waited up to 30s for the model-owner lease in total silence."""
+
+    def test_a_missing_deadline_is_the_child_ceiling_not_forever(self) -> None:
+        self.assertEqual(search._semantic_child_timeout(None),
+                         search._SEMANTIC_CHILD_CEILING_S)
+        self.assertEqual(search._semantic_child_timeout(120.0),
+                         search._SEMANTIC_CHILD_CEILING_S)
+        self.assertEqual(search._semantic_child_timeout(0.2), 0.2)
+        with self.assertRaises(ValueError):
+            search._semantic_child_timeout(float("inf"))
+
+    def test_forced_fallback_bounds_the_owner_wait_and_names_the_reason(
+            self) -> None:
+        with mock.patch.object(
+                search.common, "process_start_identity", return_value="birth"), \
+                mock.patch.object(
+                    search, "_run_guarded_semantic_child",
+                    return_value={"ok": True, "data": {}}) as child:
+            search._guarded_semantic_local_fallback(
+                "staged checklists", level="message-session", k=2,
+                filters={}, timeout_s=None,
+                reason="loopback denied")
+        request = child.call_args.args[0]
+        ceiling = search._SEMANTIC_CHILD_CEILING_S
+        self.assertEqual(request["owner_wait_s"], ceiling - 1.0 - 0.75)
+        self.assertIsNone(child.call_args.kwargs["timeout_s"])
+        waiting_on = child.call_args.kwargs["waiting_on"]
+        self.assertIn("resident semantic worker is unreachable "
+                      "(loopback denied)", waiting_on)
+        self.assertIn("model owner lease", waiting_on)
+
+    def test_a_long_child_wait_is_disclosed_once_then_bounded(self) -> None:
+        calls: list[dict] = []
+
+        class Process:
+            def communicate(self, input=None, timeout=None):
+                calls.append({"input": input, "timeout": timeout})
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired("child", timeout)
+                return b"{}", b""
+
+        clock = [100.0]
+        said: list[str] = []
+        with mock.patch.object(search.time, "monotonic",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(search.common, "log",
+                                  side_effect=said.append):
+            out = search._communicate_with_disclosure(
+                Process(), b"req", 100.0 + 29.0, "waiting on the lease")
+        self.assertEqual(out, (b"{}", b""))
+        self.assertEqual(calls[0]["input"], b"req")
+        self.assertEqual(calls[0]["timeout"], search._SEMANTIC_WAIT_DISCLOSE_S)
+        self.assertIsNone(calls[1]["input"])
+        self.assertAlmostEqual(calls[1]["timeout"], 29.0)
+        self.assertEqual(
+            said, ["meaning search: waiting on the lease; giving up in 29s"])
+
+        calls.clear()
+        said.clear()
+        with mock.patch.object(search.common, "log", side_effect=said.append), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            search._communicate_with_disclosure(
+                Process(), b"req", search.time.monotonic() + 1.0, None)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"], b"req")
+        self.assertEqual(said, [])
+
+    def test_a_forced_child_that_never_answers_times_out_at_the_ceiling(
+            self) -> None:
+        process = mock.Mock(pid=4242, returncode=None)
+        process.stdin = process.stdout = process.stderr = None
+        with mock.patch.object(search.subprocess, "Popen", return_value=process), \
+                mock.patch.object(
+                    search.common, "process_start_identity", return_value="birth"), \
+                mock.patch.object(search.common, "WIN", False), \
+                mock.patch.object(
+                    search, "_communicate_with_disclosure",
+                    side_effect=subprocess.TimeoutExpired("child", 29.0)), \
+                mock.patch.object(
+                    search, "_stop_semantic_subprocess", return_value=True):
+            with self.assertRaisesRegex(
+                    search.SemanticQueryTimeoutError,
+                    r"meaning search exceeded its 30s limit"):
+                search._run_guarded_semantic_child(
+                    {"q": "x", "limit": 1}, timeout_s=None,
+                    child_arg=search._SEMANTIC_CHILD_ARG)
 
 
 if __name__ == "__main__":

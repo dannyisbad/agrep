@@ -1,10 +1,10 @@
 """A8: the block agrep installs into agent configs never returns as lived recall.
 
-`agrep setup` writes NUDGE into every agent instruction file on the box. Codex
-hands that file back to the model inside a composed `role:user` turn, so the
-ingest lane sees agrep's own documentation in the exact position a typed
-sentence occupies. This suite indexes a sandbox HOME whose rollouts each carry
-an installed block and holds the corpus to the product's core guarantee: a row
+`agrep setup` writes the codex block into ~/.codex/AGENTS.md. Codex hands that
+file back to the model inside a composed `role:user` turn, so the ingest lane
+sees agrep's own documentation in the exact position a typed sentence
+occupies. This suite indexes a sandbox HOME whose rollouts each carry the
+installed block and holds the corpus to the product's core guarantee: a row
 is lived because of where it came from, never because of what it says.
 """
 
@@ -42,7 +42,7 @@ def _installed_block() -> str:
     return (
         "<recommended_plugins>\nplugins\n</recommended_plugins>\n"
         "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n"
-        + teach.NUDGE.strip()
+        + teach._block(Path("AGENTS.md")).strip()
         + "\n</INSTRUCTIONS>"
     )
 
@@ -118,18 +118,20 @@ class InstalledBlockIsNeverLivedTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_no_row_originates_in_the_installed_block(self) -> None:
-        marker = teach.NUDGE.strip().splitlines()[0]
+        marker = teach.NUDGE_CODEX.strip().splitlines()[0]
         carriers = [r for r in self.rows if marker in r.get("text", "")]
         self.assertEqual(carriers, [])
 
     def test_the_blocks_own_example_queries_find_nothing(self) -> None:
-        # Every literal command the block teaches, searched over a corpus
-        # holding BLOCKS copies of it.
-        for line in teach.NUDGE.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("$ agrep"):
-                continue
-            phrase = stripped[len("$ agrep"):].split("#")[0].strip()
+        # Every literal command the codex block teaches, searched over a
+        # corpus holding BLOCKS copies of it.
+        taught = [
+            line.strip()[len("$ agrep"):].split("#")[0].strip()
+            for line in teach.NUDGE_CODEX.splitlines()
+            if line.strip().startswith("$ agrep")
+        ]
+        self.assertGreaterEqual(len(taught), 3)
+        for phrase in taught:
             with self.subTest(taught=phrase):
                 hits = [r for r in self.rows if phrase in r.get("text", "")]
                 self.assertEqual(hits, [], f"{phrase} recalls the block itself")

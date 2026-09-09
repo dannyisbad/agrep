@@ -1642,10 +1642,11 @@ def _matches(row: dict, filters: dict | None) -> bool:
     if filters.get("agent") and filters["agent"].lower() not in (row.get("agent") or "").lower():
         return False
     project = row.get("project") or row.get("cwd_project") or ""
-    if filters.get("project") and filters["project"].lower() not in project.lower():
+    if filters.get("project") and not surface.project_label_matches(
+            project, filters["project"]):
         return False
     if (filters.get("exclude_project")
-            and filters["exclude_project"].lower() in project.lower()):
+            and surface.project_label_matches(project, filters["exclude_project"])):
         return False
     if filters.get("chat") and not (row.get("session") or "").lower().startswith(
             filters["chat"].lower()):

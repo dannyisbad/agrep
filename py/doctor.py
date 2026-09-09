@@ -8,6 +8,7 @@ or broken - why, and what fixes it. `agrep status` invokes this bounded report;
 examples:
   agrep doctor          bounded operational report
   agrep doctor --deep   full integrity, attribution, and archive proofs
+  agrep doctor --deep --no-semantic   the same, without loading the semantic runtime
   agrep doctor --fix    repair safe faults and prefetch available semantics
   agrep doctor --json   machine-readable bounded report
 
@@ -145,12 +146,15 @@ def _budget_detail(observation: dict) -> str:
     return f"{what} exceeded its diagnostic time budget"
 
 
-def _deep_notice(*, stream=None) -> None:
+def _deep_notice(*, stream=None, semantic: bool = True) -> None:
     target = sys.stdout if stream is None else stream
+    skipped = (
+        "" if semantic else
+        " The semantic runtime stays at its routine depth (--no-semantic).")
     print(
         "deep diagnostics: verifying SQLite integrity, full model "
         "attribution, and the archive manifest; this opt-in work may "
-        "take time (every probe keeps a safety timeout).",
+        f"take time (every probe keeps a safety timeout).{skipped}",
         file=target,
         flush=True,
     )
@@ -814,33 +818,46 @@ def _store_embedding_lane() -> str | None:
 _LANE_IDENTITY_SUFFIX = ":lane-"
 
 
-def _store_lane_notice() -> str | None:
-    """Which engine wrote this store's vectors, always said out loud.
+def _metal_capability() -> tuple[bool, str]:
+    try:
+        import mlx_embed
+        return mlx_embed.available()
+    except Exception as exc:  # noqa: BLE001 -- absence is the common, unremarkable case
+        return False, f"mlx is not importable here ({type(exc).__name__})"
 
-    Only a non-default lane used to speak, so a store stranded on the slow
-    engine read exactly like a healthy one. Both lanes get a row now; the
-    near-threshold caveat stays with metal, which alone earns it.
-    """
+
+def _store_lane_notice(smart: dict | None = None) -> tuple[str, str] | None:
+    """(severity, text): informational while the lane that built the store
+    opens here, WARN when it does not - that mismatch is what refuses queries."""
     identity = _store_embedding_identity()
     if not identity:
         return None
     _, _, lane = str(identity).partition(_LANE_IDENTITY_SUFFIX)
     if lane:
-        return (f"store built on the {lane} lane (experimental): near-threshold "
+        runtime_lane = (smart or {}).get("runtime_lane")
+        if runtime_lane:
+            opens = runtime_lane == lane
+            refusal = (str((smart or {}).get("runtime_lane_refusal") or "")
+                       or f"this machine opens {runtime_lane}")
+        else:
+            opens, refusal = _metal_capability()
+        if opens:
+            return OPT, (
+                f"store built on the {lane} lane (experimental): near-threshold "
                 "results may differ from the default cpu lane")
-    try:
-        import mlx_embed
-        installed = bool(mlx_embed.available()[0])
-    except Exception:  # noqa: BLE001 -- absence is the common, unremarkable case
-        installed = False
-    if installed:
+        return WARN, (
+            f"store built on the {lane} lane, which does not open here "
+            f"({refusal}); meaning queries are refused rather than answered "
+            f"from the cpu lane's vector space - run where {lane} opens, or "
+            "`agrep reindex --full` rebuilds onto the cpu lane")
+    if _metal_capability()[0]:
         # "installed", not "will open": the parity gate and a pinned ONNX
         # provider can still decline, and this tier does not pay a model load
         # to find out. `--deep` probes for real and names the refusal.
-        return ("store built on the cpu lane; this machine has the metal lane "
-                "installed (~10x faster to embed) - `agrep reindex --full` "
-                "rebuilds onto it, `agrep doctor --deep` confirms it opens")
-    return "store built on the cpu lane"
+        return OPT, (
+            "store uses CPU embeddings; Metal is installed. "
+            "`agrep doctor --deep` checks whether it opens")
+    return OPT, "store built on the cpu lane"
 
 
 def _runtime_lane_facts(*, deep: bool, model_cached: bool) -> dict:
@@ -1151,8 +1168,19 @@ def _source_issue_remedy(issue: dict) -> str:
 
 def _installed_build_detail(observation: dict) -> str:
     detail = str(observation.get("detail") or "provenance unavailable")
+    if observation.get("reason") == "no-local-source-provenance":
+        try:
+            dated = time.strftime(
+                "%Y-%m-%d", time.gmtime(INGEST_BIN.stat().st_mtime))
+        except OSError:
+            dated = None
+        binary = f"; native binary dated {dated}" if dated else ""
+        return (f"{detail} (a wheel install){binary} - "
+                "AGREP_SOURCE_DIR=<checkout> compares it against a checkout")
     if observation.get("state") != "lagging":
         return detail
+    if observation.get("installed_basis") == "distribution-content":
+        detail = "differs from the local checkout"
     remedy = surface.REMEDIES.get(str(observation.get("remedy") or ""))
     argv = observation.get("remedy_argv")
     if remedy is None or remedy.kind != "consent":
@@ -1167,6 +1195,20 @@ def _installed_build_detail(observation: dict) -> str:
     return (
         f"{detail} - "
         f"{surface.render_remedy(str(observation['remedy']), command=command)}")
+
+
+def _source_checkout_detail(observation: dict) -> str | None:
+    """The unreleased tail a checkout carries above its last release."""
+    unreleased = observation.get("unreleased")
+    if not isinstance(unreleased, dict) or not unreleased.get("count"):
+        return None
+    count = int(unreleased["count"])
+    since = (f" since {unreleased['since']}"
+             if unreleased.get("since") else "")
+    newest = (f'; newest: "{common.terminal_safe(unreleased["newest"])}"'
+              if unreleased.get("newest") else "")
+    return (f"{count} unreleased change{'s' if count != 1 else ''} in "
+            f"CHANGELOG.md{since}{newest} - no released build carries them")
 
 
 def _runtime_build_kind() -> str:
@@ -1757,6 +1799,11 @@ class _DerivedOwnerRefusal(OSError):
     """
 
 
+class _DerivedIdentityUnavailable(OSError):
+    """This build could not derive its own writer identity, so no ownership
+    verdict exists - not a fact about the database or about another owner."""
+
+
 def _post_adoption_clobber_remedy(path: Path) -> str:
     data = common.terminal_safe(path.parent)
     database = common.terminal_safe(path)
@@ -1789,6 +1836,8 @@ def _open_corpus_diagnostic_snapshot(
                 raise sqlite_failure
             if ownership.state == "post-adoption-clobber":
                 raise _PostAdoptionClobber(ownership.reason)
+            if ownership.state == "unavailable":
+                raise _DerivedIdentityUnavailable(ownership.reason)
             raise _DerivedOwnerRefusal(ownership.reason)
     if routine:
         return corpusdb._connect_read_snapshot(
@@ -1928,6 +1977,12 @@ def _corpus_db_readiness(
     except _DerivedOwnerRefusal as error:
         return finish({
             "state": "owned-elsewhere",
+            "detail": common.terminal_safe(error),
+        })
+    except _DerivedIdentityUnavailable as error:
+        return finish({
+            "state": "unavailable",
+            "code": "writer-identity-unavailable",
             "detail": common.terminal_safe(error),
         })
     except corpusdb.AliasCloneRefused:
@@ -2423,8 +2478,13 @@ def _machine_freshness_fields(
 def probe(
         *, deep: bool = False, progress=None,
         for_report: bool = False,
-        routine_deadline: float | None = None) -> dict:
-    """Structured report; routine probes share every expensive observation."""
+        routine_deadline: float | None = None,
+        semantic: bool = True) -> dict:
+    """Structured report; routine probes share every expensive observation.
+
+    ``semantic=False`` keeps the semantic tier at its routine (file-read)
+    depth even under ``deep``: no native wheel is loaded, no model opened.
+    """
     deadline = (
         None if deep else
         routine_deadline
@@ -2437,7 +2497,7 @@ def probe(
     if deep or _remaining_timeout(deadline, _DIAGNOSTIC_STORE_TIMEOUT_S) > 0.0:
         indexd_runtime.arm_store_census()
     embeddings_setting = settings.setting_observation("embeddings")
-    smart = _semantic_probe(deep=deep, fix=False)
+    smart = _semantic_probe(deep=deep and semantic, fix=False)
     orphans = _orphan_inventory(deep=deep, deadline=deadline)
     footprint = _data_footprint(
         deadline=None if deep else deadline)
@@ -2692,11 +2752,11 @@ def probe(
     return result
 
 
-def _json_report(*, deep: bool = False) -> dict:
+def _json_report(*, deep: bool = False, semantic: bool = True) -> dict:
     """probe() plus the tier roll-up and unlock commands, as one JSON-ready dict."""
     if deep:
-        _deep_notice(stream=sys.stderr)
-    p = probe(deep=deep)
+        _deep_notice(stream=sys.stderr, semantic=semantic)
+    p = probe(deep=deep, semantic=semantic)
     fixes: list[str] = []
     embeddings_observation = (
         p.get("settings", {}).get("embeddings")
@@ -2714,10 +2774,9 @@ def _json_report(*, deep: bool = False) -> dict:
             "refresh": "disabled",
             "install_hint": None,
         }
-    if not p["core"]["rust"]:
-        fixes.append("install Rust: https://rustup.rs")
-    if not p["core"]["binary"] and p["core"]["rust"]:
-        fixes.append(_command_remedy("index-binary", "index"))
+    if not p["core"]["binary"]:
+        fixes.append(_command_remedy("index-binary", "index")
+                     if p["core"]["rust"] else "install Rust: https://rustup.rs")
     if (not embeddings_off
             and p["semantic"].get("runtime_verified", True)
             and not p["semantic"].get(
@@ -2745,15 +2804,16 @@ def _json_report(*, deep: bool = False) -> dict:
     return p
 
 
-def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
+def report(*, deep: bool = False, fix_actions: bool = False,
+           semantic: bool = True) -> dict:
     import corpusdb  # the owner of the tables that say what repairs itself
     fixes: list[str] = []
     if deep:
-        _deep_notice()
+        _deep_notice(semantic=semantic)
     deadline = _routine_deadline(deep=deep)
     snapshot = probe(
         deep=deep, progress=_deep_progress if deep else None,
-        for_report=True, routine_deadline=deadline)
+        for_report=True, routine_deadline=deadline, semantic=semantic)
     render = snapshot["_render"]
 
     print("\ndata")
@@ -2868,6 +2928,9 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
                 db_detail = (
                     "held by another agrep installation - "
                     + _command_remedy("index-publish", "index"))
+    elif db_readiness.get("code") == "writer-identity-unavailable":
+        db_status = WARN
+        db_detail = f"not verified - {db_readiness['detail']}"
     else:
         db_status = WARN
         db_detail = f"unreadable - {db_readiness['detail']}"
@@ -3141,6 +3204,10 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
              WARN if installed_state == "lagging" else
              OK if installed_state == "current" else OPT,
              _installed_build_detail(installed_build))
+    elif installed_state == "not-installed":
+        unreleased = _source_checkout_detail(installed_build)
+        if unreleased:
+            _row("source checkout", OPT, unreleased)
 
     store_rows = snapshot["core"]["stores"]
     store_observation = snapshot["core"].get(
@@ -3171,8 +3238,7 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
     if enrollment.get("state") == "enrolled":
         n_targets = int(enrollment.get("targets") or 0)
         _row("instructions", OK,
-             f"installed in {n_targets} agent file{'s' if n_targets != 1 else ''} "
-             f"({_command_remedy('setup-resync', 'setup')})")
+             f"installed in {n_targets} agent file{'s' if n_targets != 1 else ''}")
         sentinel = snapshot.get("sentinel") or {
             "state": "unavailable", "armed": None,
             "detail": "uninstall-sentinel observation is unavailable",
@@ -3181,7 +3247,7 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
         if sentinel_state == "armed":
             _row(
                 "uninstall sentinel", OK,
-                "armed - strips agent instructions seconds after agrep is deleted")
+                "armed; removes agent instructions five minutes after uninstall")
         elif not _ran(sentinel):
             pass
         elif sentinel_state == "not-armed":
@@ -3209,8 +3275,7 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
         # agrep prior, so nothing ever uses this history until setup runs
         _row("instructions", WARN if summary else OPT,
              "not installed - "
-             + _command_remedy("setup-enroll", "setup")
-             + " (they will never find agrep on their own)")
+             + _command_remedy("setup-enroll", "setup"))
 
     _report_teach_reconcile(snapshot["teach_reconcile"])
 
@@ -3235,7 +3300,7 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
         snapshot, smart, embeddings_off=embeddings_off)
     # Every tier: a suffixed identity is a file read, not a runtime probe, and a
     # store nobody told you was approximate is the whole reason for the row.
-    store_lane = _store_lane_notice()
+    store_lane = _store_lane_notice(smart)
     routine_coverage = _routine_coverage_row(smart)
     if (inspected or visible_failed_job or routine_lane or store_lane
             or routine_coverage):
@@ -3245,7 +3310,7 @@ def report(*, deep: bool = False, fix_actions: bool = False) -> dict:
     if routine_coverage is not None:
         _row("meaning", routine_coverage[0], routine_coverage[1])
     if store_lane is not None:
-        _row("embedding lane", WARN, store_lane)
+        _row("embedding lane", store_lane[0], store_lane[1])
     if (embeddings_observation.get("state") != "verified"
             and (inspected or visible_failed_job)):
         _row(
@@ -3577,19 +3642,13 @@ def _metal_lane_note() -> None:
         return
     ok, reason = mlx_embed.available()
     if ok:
-        print("metal lane: on - new embedding stores use the GPU "
-              "(~10.9x the CPU lane on the benchmark host); "
-              "AGREP_MLX=off opts out.")
+        print("GPU embedding: Metal available (AGREP_MLX=off disables it).")
         return
     if "disabled" in reason:
-        print("metal lane: off (AGREP_MLX=off); unset it to re-enable "
-              "GPU embedding for new stores.")
+        print("GPU embedding: disabled by AGREP_MLX=off.")
         return
     hint = dist.semantic_install_hint(extra="metal")
-    print(f"available on this Mac: the Metal GPU lane, measured ~10.9x "
-          f"faster than the CPU lane on the repository's benchmark host - "
-          f"{hint}, then `agrep reindex --full` if you want "
-          f"existing history rebuilt on it.")
+    print(f"GPU embedding: Metal unavailable; {hint}.")
 
 
 def setup(
@@ -3600,7 +3659,12 @@ def setup(
     scripts and ignored.
     """
     before = _json_report()
-    print(f"tiers now: {', '.join(before['tiers']) or 'none'}")
+    tiers = ", ".join(before["tiers"]) or "none"
+    unknown = ", ".join(before.get("tiers_unknown") or ())
+    if unknown:
+        tiers += (f"; {unknown} not verified this run - "
+                  + _command_remedy("diagnostic-deep", "doctor", "--deep"))
+    print(f"tiers now: {tiers}")
     if prefetch_semantic:
         rc = fix()
     else:
@@ -3631,20 +3695,27 @@ def main(argv: list[str] | None = None) -> int:
     if conflict is not None:
         return surface.argument_error(
             "agrep doctor", conflict, argv=argv, search_word="doctor")
-    if "--no-semantic" in argv and "--setup" not in argv:
-        return surface.argument_error(
-            "agrep doctor", "--no-semantic has no effect without --setup",
-            argv=argv, search_word="doctor")
     deep = "--deep" in argv
+    no_semantic = "--no-semantic" in argv
+    if no_semantic and not (deep or "--setup" in argv):
+        return surface.argument_error(
+            "agrep doctor",
+            "--no-semantic has no effect without --setup or --deep",
+            argv=argv, search_word="doctor")
     if "--json" in argv:
-        print(json.dumps(_json_report(deep=deep), ensure_ascii=False))
+        print(json.dumps(
+            _json_report(deep=deep, semantic=not no_semantic),
+            ensure_ascii=False))
         return 0
     if "--setup" in argv:
-        return setup(prefetch_semantic="--no-semantic" not in argv)
+        return setup(prefetch_semantic=not no_semantic)
     if "--fix" in argv:
-        report(deep=deep, fix_actions=True)
+        report(deep=deep, fix_actions=True, semantic=not no_semantic)
+        if no_semantic:
+            print("semantic tier untouched (--no-semantic).")
+            return 0
         return fix()
-    report(deep=deep, fix_actions=False)
+    report(deep=deep, fix_actions=False, semantic=not no_semantic)
     return 0
 
 

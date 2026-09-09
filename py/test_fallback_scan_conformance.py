@@ -13,6 +13,7 @@ from _test_support import isolate_data_dir
 
 isolate_data_dir()
 
+import boundary_rank
 import console
 import common
 import events
@@ -92,12 +93,18 @@ class FallbackScanConformance(unittest.TestCase):
                     entry["payload_bounds"] = row["payload_bounds"]
                 tokens = [token for token in re.split(
                     r"[\s\-_]+", case["query"].strip()) if token]
-                if case["lane"] == "phrase":
+                if case["lane"] == "phrase" and len(tokens) == 1:
+                    span = common.insensitive_span(text, case["query"], entry["low"])
+                    self.assertIsNotNone(span)
+                    hit = explore.scan_hit(entry, *span)
+                elif case["lane"] == "phrase":
                     match = explore._kw_pattern(case["query"]).search(text)
                     self.assertIsNotNone(match)
                     hit = explore.scan_hit(entry, *match.span())
                 else:
-                    spans = [common.insensitive_span(text, token, entry["low"])
+                    spans = [common.insensitive_span(
+                        text, token, entry["low"],
+                        variants=boundary_rank.term_variants(token))
                              for token in tokens]
                     self.assertTrue(all(span is not None for span in spans))
                     hit = {

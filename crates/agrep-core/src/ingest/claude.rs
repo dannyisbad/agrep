@@ -152,8 +152,9 @@ fn collect_tool_paths(content: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// Reduce a directory to its project ROOT bucket: strip the home prefix and any
-/// container segments (`Users/<name>/Desktop/...`), keep the first real segment.
-/// `~/Desktop/myproj/src` -> Some("myproj"); a bare home dir -> None (no signal).
+/// container segments (`Users/<name>/Desktop/...`, `projects/`, `repos/`), keep the
+/// first real segment. `~/Desktop/projects/myproj/src` -> Some("myproj"); a bare home
+/// dir or bare container -> None (no signal).
 fn project_root(dir: &str) -> Option<String> {
     let d = dir.replace('\\', "/");
     let mut segs: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
@@ -179,14 +180,24 @@ fn project_root(dir: &str) -> Option<String> {
     // (a migrated corpus's cwds carry another box's user) - home_leaf() only knows
     // this one's, so any post-Users/home segment is skipped unconditionally.
     let mut after_user_container = false;
+    // macOS TMPDIR: /private/var/folders/<2 chars>/<random>/T/<name>
+    let mut after_folders = 0u8;
     segs.into_iter()
         .find(|s| {
             let sl = s.to_ascii_lowercase();
             if sl.ends_with(':') || std::mem::take(&mut after_user_container) || sl == user {
                 return false;
             }
+            if after_folders > 0 {
+                after_folders -= 1;
+                return false;
+            }
             if matches!(sl.as_str(), "users" | "home") {
                 after_user_container = true;
+                return false;
+            }
+            if sl == "folders" {
+                after_folders = 3;
                 return false;
             }
             !matches!(
@@ -197,11 +208,24 @@ fn project_root(dir: &str) -> Option<String> {
                     | "onedrive"
                     | "tmp"
                     | "temp"
+                    | "private"
+                    | "var"
                     | "appdata"
                     | "local"
                     | "locallow"
                     | "roaming"
                     | "src"
+                    | "projects"
+                    | "project"
+                    | "code"
+                    | "repos"
+                    | "repositories"
+                    | "git"
+                    | "github"
+                    | "work"
+                    | "dev"
+                    | "workspace"
+                    | "workspaces"
             )
         })
         .map(|s| s.to_string())
@@ -615,6 +639,16 @@ fn parse_file_with_tally(
     for m in &mut out {
         m.project = project.clone();
     }
+    let read_outcome = if out.is_empty()
+        && events.is_empty()
+        && data
+            .lines()
+            .any(|line| !line.trim().is_empty() && serde_json::from_str::<&RawValue>(line).is_err())
+    {
+        crate::ingest_cache::ReadOutcome::Invalid
+    } else {
+        crate::ingest_cache::ReadOutcome::Complete
+    };
     (
         out.into_iter()
             .map(|raw| {
@@ -628,7 +662,7 @@ fn parse_file_with_tally(
             })
             .collect(),
         events,
-        crate::ingest_cache::ReadOutcome::Complete,
+        read_outcome,
     )
 }
 
@@ -1086,6 +1120,66 @@ mod tests {
         assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
         assert_eq!(messages.len(), 4);
         assert!(messages.iter().all(|message| &*message.project == "alpha"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_root_skips_code_containers_but_keeps_real_segments() {
+        let root = |dir: &str| super::project_root(dir);
+        assert_eq!(
+            root("/Users/alice/Desktop/projects/shop").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(
+            root("/Users/alice/Desktop/projects/shop/src/lib").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(root("/home/alice/repos/api/tests").as_deref(), Some("api"));
+        assert_eq!(
+            root("C:\\Users\\alice\\code\\shop").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(root("/work/alpha").as_deref(), Some("alpha"));
+        assert_eq!(root("/Users/alice/Desktop/projects"), None);
+        assert_eq!(root("/Users/alice"), None);
+        assert_eq!(
+            root("/private/tmp/agrep-mirror").as_deref(),
+            Some("agrep-mirror")
+        );
+        assert_eq!(root("/private/tmp"), None);
+        assert_eq!(
+            root("/private/var/folders/zz/abc123/T/proj").as_deref(),
+            Some("proj")
+        );
+        assert_eq!(root("/private/var/folders/zz/abc123/T"), None);
+    }
+
+    #[test]
+    fn project_attribution_buckets_below_a_projects_container() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-claude-projects-container-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = root.join("projects").join("fallback-slug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"},\"cwd\":\"/Users/alice/Desktop/projects/shop\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"two\"},\"cwd\":\"/Users/alice/Desktop/projects/shop/docs\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"three\"},\"cwd\":\"/Users/alice/Desktop/projects\"}\n",
+            ),
+        )
+        .unwrap();
+        let (messages, _, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|message| &*message.project == "shop"));
         let _ = std::fs::remove_dir_all(root);
     }
 
