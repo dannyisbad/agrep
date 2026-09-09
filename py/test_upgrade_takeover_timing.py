@@ -875,19 +875,21 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
 
                 def recovered() -> bool:
                     latest, _elapsed = self._run_search(env, NEW_TEXT)
-                    return latest.returncode == 0 and any(
-                        NEW_TEXT in row.get("snippet", "") for row in self._json_rows(latest))
+                    if latest.returncode != 0 or not any(
+                            NEW_TEXT in row.get("snippet", "")
+                            for row in self._json_rows(latest)):
+                        return False
+                    status = subprocess.run(
+                        [sys.executable, os.fspath(CLI), "status", "--json"],
+                        cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(status.returncode, 0, status.stderr)
+                    packet = json.loads(status.stdout)
+                    return (packet["daemon"]["running"]
+                            and packet["search_index_ready"])
 
                 self._wait_for(
                     recovered, 20,
                     "successor daemon could not serve the rebuilt publication")
-                status = subprocess.run(
-                    [sys.executable, os.fspath(CLI), "status", "--json"],
-                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
-                self.assertEqual(status.returncode, 0, status.stderr)
-                packet = json.loads(status.stdout)
-                self.assertTrue(packet["daemon"]["running"], packet)
-                self.assertTrue(packet["search_index_ready"], packet)
             finally:
                 stopped = subprocess.run(
                     [sys.executable, os.fspath(CLI), "remove"],
