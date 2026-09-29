@@ -1,13 +1,6 @@
 # Changelog
 
-## 0.3.2 — 2026-09-09
-
-- Regex searches can exceed three seconds while progressing. `AGREP_REGEX_TIMEOUT_S`
-  bounds each regex operation instead of the complete query; pathological matches
-  still terminate in an isolated worker. Mandatory literals jointly narrow indexed scans.
-- Large-corpus keyword ranking reuses unchanged top-k frontiers and identical
-  native boundary evaluations. Grouped semantic scans skip losing group heads
-  and use an exact AVX2 q8 fast path with a signed-minimum fallback.
+## 0.3.2 — 2026-09-29
 
 ### Agent coverage
 
@@ -51,8 +44,8 @@
   gain `--exclude-project`.
 - `--here` on search, recall, pack and chats is `--project <basename of the
   current directory>`; mutually exclusive with `--project`, refused at a
-  filesystem root; continuation and larger-page commands re-spell it as the
-  resolved `--project=`.
+  filesystem root (including Windows drive and UNC roots); continuation and
+  larger-page commands re-spell it as the resolved `--project=`.
 - `--no-side` on search and recall hides side-chat sessions using the same
   hidden set `chats` builds, so `agrep <q> -l --no-side` lists no
   `[side chat]` rows. `chats --no-side` explicitly selects its default
@@ -87,8 +80,11 @@
   `--json` completeness carries the same number as `tool_rows`.
 - Multi-word keyword search folds minimal singular/plural spellings (`s`,
   `es`, `ies`) in the all-terms lane, so `don calls` finds a chat that said
-  `before this call`. The original spelling is always kept, short and
-  non-alphabetic tokens stay exact, and the adjacent-phrase lane never folds.
+  `before this call`, and `tries` also finds `try`. The original spelling
+  is always kept, single-word queries and the adjacent-phrase lane never
+  fold, short and non-alphabetic tokens stay exact, and a token whose
+  Unicode-normalized form differs (`Straße`, fullwidth or ligature
+  spellings) keeps matching its literal spelling.
 - All-terms scoring measures term proximity from the same best-aligned
   occurrence the boundary factor grades, scaled by that occurrence's edge
   quality. A word fragment next to another query term (`calls dont` for
@@ -98,28 +94,29 @@
   the JSONL scan and the Rust fallback scanner now pick the same occurrence.
   The Rust scanner and the Python scorer agree via the updated exact-score
   conformance fixture.
-- The term-coverage retry reaches the pages it exists for. Search offers it
-  on an empty or query-echo-only page without first proving the query holds
+- The term-coverage retry reaches the pages it exists for. Search offers it on
+  an empty or query-echo-only page without first proving the query holds
   filler words (it still needs a whitespace-shaped query of at least five
   distinct terms, and a page with weak lexical hits still needs narration
   evidence), and after an automatic meaning-only page. `recall` offers it on
-  an empty prose page unless `--lexical` is set, and after a pack holding
-  only meaning rows, weak scatter or echoes. Explicit semantic and lexical
-  modes never trigger it. Its candidates respect `--exclude-project`, which
-  they previously bypassed. Concise recall keeps the best recovered row with
-  its measured term coverage and a command for the full coverage page,
-  instead of replacing evidence it already retrieved with a request to
-  search again, and never spends that slot on the caller's own `~self` tool
-  rows. Generated `--coverage` commands keep the original scope and filters.
-  Recovered rows stay a separate stderr block, outside the pack, counts and
-  exit status.
+  an empty prose page unless `--lexical` is set, and after a pack holding only
+  meaning rows, weak scatter or echoes. Explicit semantic and lexical modes
+  never trigger it. Its candidates respect `--exclude-project` inside the
+  ranked scan itself, which they previously bypassed. Concise recall keeps the
+  best recovered row with its measured term coverage and a command for the
+  full coverage page, instead of replacing evidence it already retrieved with
+  a request to search again, and never spends that slot on the caller's own
+  `~self` tool rows. Generated `--coverage` commands keep the original scope
+  and filters. Recovered rows stay a separate stderr block, outside the pack,
+  counts and exit status.
 - `recall --probe` no longer takes the caller's own words as confident past
   context. A phrase found only in the caller's command input - including
   relay messages and search arguments in `~self` tool rows - or in caller
   prose quoting a multi-term query cannot supply the pointer, and such
   echoes no longer suppress the tool or meaning fallbacks. The check uses
   the exact tool event and the active keyword, word or regex matcher; a
-  match also present in retained tool output stays eligible. Ordinary
+  match also present in retained tool output stays eligible, and a
+  rejected echo gives way to the next eligible row of the same chat. Ordinary
   recall rows and explicit handle reads are unchanged.
 - Compact query-echo demotion checks the actual result row, including its
   timestamp, content digest and tool-event identity when available. It no
@@ -137,14 +134,15 @@
   (`agrep around @01a046db:10.2685~a8f7...:214-222`) instead of
   single-quoted; a `~` after a digit never tilde-expands. Matches the
   Windows renderer.
-- `agrep around` gains `--whole` (also `-C all`): the entire chat, root
-  prose, the usual per-message cap; `--whole --who user` is the compact
-  transcript. Every `[+N chars - ...]` cap marker in `around` and `recall`
-  points at the lever that lifts it,
-  `agrep around <session> <turn> -C 0 --max-chars 0`, instead of the
-  forensic `--full` stream; the tool-collapse pointer keeps `--full`. Under
-  `--who`, the scope line points at the same read without `--who` rather
-  than at `--full`.
+- `agrep around` gains `--whole` (also `-C all`): the entire chat, root prose,
+  the usual per-message cap; `--whole --who user` is the compact transcript.
+  Every `[+N chars - ...]` cap marker in `around` and `recall` points at the
+  lever that lifts it, `agrep around <session> <turn> -C 0 --max-chars 0`
+  (plus `--who <role>` for a recap, control, harness, synthetic or subagent
+  message), instead of the forensic `--full` stream, and a tight `--budget`
+  shrinks prose before it would ever cut that command; the tool-collapse
+  pointer keeps `--full`. Under `--who`, the scope line points at the same
+  read without `--who` rather than at `--full`.
 - Recall headers keep the result handle, agent, project, age and meaning or
   provenance marks without repeating numeric scores and an `around` command
   on every row. Probe pointers and misses are shorter, and `around` prints
@@ -180,10 +178,13 @@
   row (a compaction recap, a giant paste) used to embed as its first ~4KB
   — for pi/omp recaps that is a fixed harness preamble, making every
   mega-recap score like generic instructions against unrelated queries and
-  surface as a top hit. Rows beyond the window now embed as capped,
+  surface as a top hit. Rows beyond one window now embed as capped,
   overlapping `#cN` chunk vectors (head chunk keeps the unsuffixed id, the
-  `#r` reply convention extended); recap rows additionally skip the
-  structural resume-instruction preamble so their vectors carry content.
+  `#r` reply convention extended). Windows are sized by a UTF-8 byte bound
+  the byte-level tokenizer can never exceed, so dense code, JSON, CJK and
+  emoji text never fall between chunks. pi/omp recap rows additionally skip
+  the structural resume-instruction preamble so their vectors carry
+  content; Claude and Codex summaries embed unmodified.
   Query-side, chunk hits max-pool back to their logical row, which appears
   at most once in results. Historical long rows upgrade on
   `agrep reindex --full`.
@@ -267,11 +268,14 @@
   checks the full database source stamp. Once a completed refresh shows no
   boundary it refuses at once instead of retrying to the bound, and when
   the daemon's published coverage already vouches for the caller's
-  transcript at its current size and mtime the refusal needs no further
-  refresh cycle; every evidence shortfall still waits for fresh proof, so
-  absence stays verified absence. An unfinished refresh leaves an available
-  committed packet marked partial. The pending request and any completion
-  receipt are released on exit.
+  transcript at its current size and mtime the refusal returns without
+  waiting for the refresh; every evidence shortfall still waits for fresh
+  proof, so absence stays verified absence. An unfinished refresh leaves an
+  available committed packet marked partial, and a packet produced while a
+  source stays unreadable remains partial with the source-health notice.
+  The daemon acknowledges every clean refresh, reaps requests left by dead
+  or recycled clients, and the pending request and any completion receipt
+  are released on exit.
 - Pi/OMP recovery names the compaction that triggered it:
   `agrep postcompact --boundary-ms <timestamp>` selects that exact recap,
   never an older or later one, and can serve it straight from a verified
@@ -302,7 +306,9 @@
   symlinked or foreign-owned publication directories and tightens an owned
   one to 0700 before writing; the reader accepts only an owned 0700
   directory, so a directory pre-created by another user under `/tmp` never
-  receives session ids.
+  receives session ids. The parent-chain walk stops at a parent younger
+  than its child, so a recycled Windows pid never makes an ordinary
+  terminal adopt an unrelated agent session.
 - Never-compacted sessions get a live window. Automatic self-exclusion
   required an indexed compaction recap, so it did nothing for ~95% of
   sessions even with a known caller. A resolved caller with no recap row is
@@ -416,7 +422,9 @@
   reconstructed in the same ingest instead of needing another invocation.
   Missing or unreadable sources still cannot replace the published
   generation, and an undecodable unowned cache is kept with takeover
-  refused.
+  refused. Upgrading from 0.3.0 or 0.3.1 adopts their parse cache with its
+  last-good rows and republishes their session-family metadata in the
+  current format on the first ingest, even when no message changed.
 - Indexing can restore a missing durable owner when both the owner anchor
   and the parse cache are gone but `corpus.db` still names the current
   writer; that state used to block the very ingest needed to repair it.
