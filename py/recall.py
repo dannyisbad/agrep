@@ -1755,21 +1755,33 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             if args.probe and result is not None:
                 _mark_probe_hits(result["hits"], mode)
                 if mode == "keyword" and kwargs.get("session_limit") is not None:
+                    taken = {str(row.get("session") or "") for row in result["hits"]}
+                    span_family = bool(kwargs.get("family_diverse"))
                     for index, hit in enumerate(result["hits"]):
                         if not hit.get("_probe_query_echo"):
                             continue
-                        # A rejected head cannot stand in for the session's lower rows.
-                        session = hit["session"]
+                        # A rejected head cannot stand in for lower rows of its chat, or of
+                        # sibling chats its family collapse already dropped.
+                        session = str(hit.get("session") or "")
+                        scope = {} if span_family else {"chat": session}
                         alternate = search.run_query(q, mode=mode, **{
-                            **kwargs, "chat": session, "limit": 0,
-                            "session_limit": None, "family_diverse": False,
-                            "exhaustive": True})
+                            **kwargs, **scope, "limit": 0, "session_limit": None,
+                            "family_diverse": False, "exhaustive": True})
                         rows = (alternate or {}).get("hits", [])
                         _mark_probe_hits(rows, mode)
-                        result["hits"][index] = next(
+                        roots = (search._family_roots_for_hits([hit, *rows])
+                                 if span_family else {})
+                        family = roots.get(session, session)
+                        replacement = next(
                             (row for row in rows
-                             if row.get("session") == session
-                             and not row.get("_probe_query_echo")), hit)
+                             if not row.get("_probe_query_echo")
+                             and roots.get(str(row.get("session") or ""),
+                                           str(row.get("session") or "")) == family
+                             and (str(row.get("session") or "") == session
+                                  or str(row.get("session") or "") not in taken)),
+                            hit)
+                        result["hits"][index] = replacement
+                        taken.add(str(replacement.get("session") or ""))
             return result
         except search.SnapshotPublicationTimeout as exc:
             _finish_active_semantic()
