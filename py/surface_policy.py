@@ -12,6 +12,7 @@ import sys
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
+from pathlib import PurePath
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -456,7 +457,8 @@ PROJECT_HELP = ("only chats whose project label, or its last path segment, "
                 "is exactly this (case-insensitive; * or ? make it a glob, "
                 "e.g. 'webapp*')")
 EXCLUDE_PROJECT_HELP = "hide chats whose project label matches this (same rule)"
-HERE_HELP = "--project <this folder's name> (the basename of the current directory)"
+HERE_HELP = ("--project <this folder's name> (the current directory's basename; "
+             "filesystem roots are refused)")
 
 
 def project_leaf(label: object) -> str:
@@ -479,9 +481,10 @@ def project_label_matches(label: object, value: object) -> bool:
     return needle == text or needle == leaf
 
 
-def here_project(cwd: str | None = None) -> str:
-    """The --project value --here stands for: the working directory's basename."""
-    return project_leaf(os.getcwd() if cwd is None else cwd)
+def here_project(cwd: str | PurePath | None = None) -> str:
+    """The working directory's basename; filesystem anchors have no project."""
+    path = os.getcwd() if cwd is None else cwd
+    return (path if isinstance(path, PurePath) else PurePath(path)).name
 
 
 def here_project_error(value: str) -> str | None:

@@ -504,6 +504,37 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertNotIn("chars - agrep around", whole)
         self.assertIn(long_reply.strip(), whole)
 
+    def test_capped_nondefault_speaker_command_recovers_the_message(self) -> None:
+        text = "HEAD " + "word " * 3_000 + "TAIL"
+        for who in ("recap", "control", "harness", "synthetic", "subagent"):
+            for json_output in (False, True):
+                with self.subTest(who=who, json=json_output):
+                    def window(session: str, center: int, radius: int) -> dict:
+                        result = _window(session, center, radius)
+                        result["turns"] = [{
+                            "turn": center, "ts": 0, "who": who,
+                            "text": text, "reply": "",
+                        }]
+                        return result
+
+                    with mock.patch.object(explore, "get_window", window):
+                        rc, capped, err = self._run([
+                            TWINS[0], "5", "-C", "0", "--who", who,
+                            "--color", "never", *(["--json"] if json_output else [])])
+                        self.assertEqual(rc, 0, err)
+                        if json_output:
+                            capped = next(
+                                row["text"] for row in map(json.loads, capped.splitlines())
+                                if row.get("kind") == "msg")
+                        command = capped.rsplit("chars - ", 1)[1].split("]", 1)[0]
+                        rc, expanded, err = self._run(
+                            [*shlex.split(command)[2:], "--json"])
+                    self.assertEqual(rc, 0, err)
+                    rows = [row for row in map(json.loads, expanded.splitlines())
+                            if row.get("kind") == "msg"]
+                    self.assertEqual(
+                        [(row["who"], row["text"]) for row in rows], [(who, text)])
+
     def test_who_filter_treats_events_as_tool_rows(self) -> None:
         def one_tool_turn(session: str, center: int, radius: int) -> dict:
             window = _window(session, center, radius)

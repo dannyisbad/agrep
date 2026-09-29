@@ -174,6 +174,84 @@ def _run_recall(argv, run_query=None, agent_context=False, windows=None,
     return rc, stdout.getvalue(), stderr.getvalue()
 
 
+class RecallCapSpeakerTests(unittest.TestCase):
+    def _assert_cap_commands(self, who, json_output, budget):
+        text = "needle " + "source " * 3_000 + "SOURCE_TAIL"
+        reply = "needle " + "answer " * 3_000 + "ANSWER_TAIL"
+        hit = {
+            **_hits()[0], "who": who,
+            "content_digest": compact.content_digest(text),
+        }
+        window = {
+            "session": STRONG, "center": 3, "first_turn": 3,
+            "last_turn": 3, "agent": "codex", "project": "agrep",
+            "events": [], "turns": [{
+                "turn": 3, "ts": 1, "who": who,
+                "text": text, "reply": reply,
+            }],
+        }
+        rc, capped, err = _run_recall(
+            ["needle", "--lexical", "--hits", "1", "--budget", str(budget),
+             "--color", "never", *(["--json"] if json_output else [])],
+            run_query=lambda *_a, **_k: _result([dict(hit)]),
+            windows=lambda requests: [window for _ in requests])
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(capped.encode("utf-8")), budget)
+        if json_output:
+            rows = json.loads(capped)["hits"][0]["window"]
+            messages = [(row["who"], row["text"]) for row in rows
+                        if row["kind"] == "msg"]
+            for row in rows:
+                if row["kind"] != "msg":
+                    continue
+                retained = row["text"].split(" [+")[0]
+                source = reply if row["who"] == "agent" else text
+                self.assertEqual(
+                    len(retained) + row["omitted_chars"], len(source))
+        else:
+            messages = re.findall(r"^ +3 (\w+): (.+)$", capped, re.M)
+        self.assertEqual({role for role, _ in messages}, {who, "agent"})
+        for role, message in messages:
+            command = re.search(
+                r"\[(?:\+[\d,]+ chars - |snippet - open: )(agrep around [^\]]+)\]",
+                message)
+            self.assertIsNotNone(command, message)
+            out = io.StringIO()
+            with mock.patch.object(
+                    around.indexd_runtime, "ensure_index", return_value=True), \
+                    mock.patch.object(
+                        around.explore, "resolve_session", return_value=[STRONG]), \
+                    mock.patch.object(
+                        around.explore, "_session_index", return_value={STRONG: {}}), \
+                    mock.patch.object(
+                        around.explore, "get_window", return_value=window), \
+                    mock.patch.object(
+                        around.session_context, "indexed_family_roots",
+                        return_value={STRONG: STRONG}), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = around.main(
+                    [*shlex.split(command[1])[2:], "--json", "--no-auto"])
+            self.assertEqual(rc, 0, out.getvalue())
+            recovered = {
+                row["who"]: row["text"]
+                for row in map(json.loads, out.getvalue().splitlines())
+                if row.get("kind") == "msg"
+            }
+            self.assertEqual(
+                recovered.get(role), reply if role == "agent" else text)
+
+    def test_cap_commands_recover_nondefault_speakers_and_agent_replies(self):
+        for who in ("recap", "control", "harness", "synthetic", "subagent"):
+            for json_output in (False, True):
+                with self.subTest(who=who, json=json_output):
+                    self._assert_cap_commands(
+                        who, json_output, 4096 if json_output else 7000)
+
+    def test_budget_shrinking_retains_runnable_cap_commands(self):
+        self._assert_cap_commands("user", False, 4096)
+
+
 class RecallMissRetriesCoverage(unittest.TestCase):
     """A multi-term page with no strong independent row - empty, or filled
     only by meaning rows or weak scatter - hands the shown page to the

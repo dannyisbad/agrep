@@ -11,10 +11,13 @@ mid-session actually has - it runs the search, pulls the conversation around eac
 top hit (explore.get_window), and caps the whole thing at --budget bytes so the
 caller gets context, not a transcript. pack is the same over several queries at
 once: hits deduped by (session, turn), one shared budget. Renderer-cap markers
-carry the exact `agrep around` command; ingest-cap loss is labeled separately.
+keep runnable, speaker-scoped `agrep around` commands through budget shrinking;
+ingest-cap loss is labeled separately.
 The budget follows relevance, not content size: weak evidence (bag-of-words
 scatter, sub-strong meaning) past the top hit renders as one summary line with
 its handle, and the strongest surviving block draws the largest share.
+Probes reject caller-input echoes before choosing a session's evidence pointer,
+reselecting a lower-ranked row when its retained output independently matches.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ import search
 import surface_policy as surface
 from around import (
     _cap,
+    _expand_command,
     _reply_loss_marker,
     _resolve_handle_claims,
     _selected_tool_match,
@@ -63,13 +67,6 @@ _C = surface.PALETTE
 def _command(*argv: object) -> str:
     return console.shell_command(
         *argv, fallback="agrep recall <query-with-control-characters>")
-
-
-def _expand_command(target: str, turn: int) -> str:
-    """The one pointer a capped message carries, shared with `around`."""
-    return console.shell_command(
-        "agrep", "around", target, turn, "-C", 0, "--max-chars", 0,
-        fallback="agrep around <session> <turn> -C 0 --max-chars 0")
 
 
 def _utf8_size(value: str) -> int:
@@ -110,7 +107,8 @@ def _content_budget(budget: int) -> int:
 # _cap's tail marker; stripped before re-shrinking so a second cut never slices
 # through the agrep-around command the first one embedded.
 _CAP_MARKER_RE = re.compile(
-    r" \[\+[\d,]+ chars - agrep around .+ \d+ -C 0(?: --max-chars 0| --full)?\]\Z")
+    r" \[\+[\d,]+ chars - agrep around .+ \d+ -C 0"
+    r"(?: --max-chars 0| --full)?(?: --who \w+)?\]\Z")
 
 
 def _shrink_row(row: dict, session_index=None,
@@ -130,7 +128,7 @@ def _shrink_row(row: dict, session_index=None,
         row["omitted_chars"] = int(row.get("omitted_chars") or 0) + len(body) - keep
         return len(row["text"]) < len(old)
     target = compact.encode_session_target(sess, session_index=session_index)
-    expand = _expand_command(target, turn)
+    expand = _expand_command(target, turn, row.get("who", "user"))
     if anchors and head is None:
         # law 6: a halving that would drop the row's own query match slides
         # the kept slice to the match instead of keeping the blind head
@@ -301,7 +299,7 @@ def _fit_json_payload(
 # tool calls, over-budget hit tails. The final cap must never slice one open.
 _TRUNC_MARKER_RE = re.compile(
     r"\[(?:\+[\d,]+ (?:chars|tool calls|hit\(s\) over budget) - [^\]]*"
-    r"|[\d,]+ chars)\]")
+    r"|[\d,]+ chars|snippet - open: [^\]]*)\]")
 
 # the over-budget trailer recall builds; parsed back when it must be degraded
 _TRAILER_RE = re.compile(r"\[\+(\d+) hit\(s\) over budget - (.*)\]\Z", re.S)
@@ -1103,9 +1101,27 @@ def _window_expand_command(window: dict, target: str) -> str:
 def _cap_line_bytes(line: str, budget: int) -> str:
     if _utf8_size(line) <= budget:
         return line
-    if budget <= _utf8_size("…"):
-        return _utf8_prefix(line, budget)
-    return _utf8_prefix(line, budget - _utf8_size("…")).rstrip() + "…"
+    markers = list(_TRUNC_MARKER_RE.finditer(line))
+    recovery = next(
+        (marker for marker in reversed(markers)
+         if "agrep around " in marker[0]), None)
+    suffix = ""
+    if recovery is not None:
+        suffix = " " + line[recovery.start():]
+        line = line[:recovery.start()].rstrip()
+        budget -= _utf8_size(suffix)
+    # Recovery pointers are indivisible. The page fitter can evict a whole
+    # marker when even the row's prose cannot yield enough room for it.
+    if budget <= 0:
+        return suffix.lstrip()
+    ellipsis = "…" if budget > _utf8_size("…") else ""
+    cut = len(_utf8_prefix(line, budget - _utf8_size(ellipsis)))
+    for marker in markers:
+        if marker.start() < cut < marker.end():
+            cut = marker.start()
+            break
+    prefix = line[:cut].rstrip()
+    return prefix + ellipsis + suffix if prefix else suffix.lstrip()
 
 
 def _cap_required_lines(head: str, records: list[dict], indexes: list[int],
@@ -1716,6 +1732,16 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
 
     self_count_specs: list[tuple[str, str, dict, float | None]] = []
 
+    def _mark_probe_hits(rows: list[dict], mode: str) -> None:
+        for hit in rows:
+            hit["_recall_query"] = query_i
+            if self_policy is not None:
+                hit.pop("_self", None)
+                if self_policy.labels(
+                        str(hit.get("session") or ""), hit.get("turn")):
+                    hit["_self"] = True
+        search._mark_history_meta(rows, queries, probe_mode=mode)
+
     def _run_query(q: str, *, mode: str, **kwargs):
         nonlocal tools_excluded
         try:
@@ -1727,15 +1753,23 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     and not result.get("fallback_recommended")):
                 self_count_specs.append((q, mode, dict(kwargs), None))
             if args.probe and result is not None:
-                for hit in result["hits"]:
-                    hit["_recall_query"] = query_i
-                    if self_policy is not None:
-                        hit.pop("_self", None)
-                        if self_policy.labels(
-                                str(hit.get("session") or ""), hit.get("turn")):
-                            hit["_self"] = True
-                search._mark_history_meta(
-                    result["hits"], queries, probe_mode=mode)
+                _mark_probe_hits(result["hits"], mode)
+                if mode == "keyword" and kwargs.get("session_limit") is not None:
+                    for index, hit in enumerate(result["hits"]):
+                        if not hit.get("_probe_query_echo"):
+                            continue
+                        # A rejected head cannot stand in for the session's lower rows.
+                        session = hit["session"]
+                        alternate = search.run_query(q, mode=mode, **{
+                            **kwargs, "chat": session, "limit": 0,
+                            "session_limit": None, "family_diverse": False,
+                            "exhaustive": True})
+                        rows = (alternate or {}).get("hits", [])
+                        _mark_probe_hits(rows, mode)
+                        result["hits"][index] = next(
+                            (row for row in rows
+                             if row.get("session") == session
+                             and not row.get("_probe_query_echo")), hit)
             return result
         except search.SnapshotPublicationTimeout as exc:
             _finish_active_semantic()
@@ -2442,10 +2476,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 # the share, so widening can only ever truncate CONTEXT turns, never the hit
                 tcap = (0 if fits else
                         max(cap, min(2400, share)) if t["turn"] == w["center"] else cap)
-                expand = _expand_command(target, t["turn"])
                 for who, text in ((t["who"], t["text"]), ("agent", t["reply"])):
                     if not text:
                         continue
+                    expand = _expand_command(target, t["turn"], who)
                     capped, omitted = (
                         _anchored_cap(text, tcap, expand, anchors)
                         if anchors and t["turn"] == w["center"]
@@ -2645,10 +2679,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         hidden_tools = 0
         for t in w["turns"]:
             tcap = center_cap if t["turn"] == w["center"] else cap
-            expand = _expand_command(target, t["turn"])
             # every capped text row keeps its own match window, not just the
             # center turn - context rows exist because they bear on the query
             if t["text"]:
+                expand = _expand_command(target, t["turn"], t["who"])
                 body, _ = (_anchored_cap(" ".join(t["text"].split()), tcap,
                                          expand, anchors) if anchors
                            else _cap(" ".join(t["text"].split()), tcap, expand))
@@ -2678,6 +2712,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 })
                 order += 1
             if t["reply"]:
+                expand = _expand_command(target, t["turn"], "agent")
                 body, _ = (_anchored_cap(" ".join(t["reply"].split()), tcap,
                                          expand, anchors) if anchors
                            else _cap(" ".join(t["reply"].split()), tcap, expand))

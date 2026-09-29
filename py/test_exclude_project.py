@@ -8,7 +8,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest import mock
 
 from _test_support import isolate_data_dir
@@ -258,6 +258,34 @@ class ExcludeProjectTests(unittest.TestCase):
         self.assertTrue(calls)
         self.assertEqual(calls[0]["exclude_project"], "noisy-bench")
         self.assertEqual(calls[0]["project"], "shop")
+
+    def test_here_refuses_roots_in_each_path_flavor(self) -> None:
+        for cwd in (PurePosixPath("/"), PurePosixPath("//"),
+                    PureWindowsPath("C:/"), PureWindowsPath("//server/share/"),
+                    PureWindowsPath("//?/C:/")):
+            with self.subTest(cwd=cwd):
+                project = search.surface.here_project(cwd)
+                self.assertEqual(project, "")
+                self.assertIsNotNone(search.surface.here_project_error(project))
+
+        for cwd in (PurePosixPath("/work/shop/"),
+                    PureWindowsPath("C:/work/shop/"),
+                    PureWindowsPath("//server/share/shop/")):
+            with self.subTest(cwd=cwd):
+                project = search.surface.here_project(cwd)
+                self.assertEqual(project, "shop")
+                self.assertIsNone(search.surface.here_project_error(project))
+
+    def test_here_root_refusal_precedes_query_work(self) -> None:
+        for entrypoint in (search.main, recall.main, search.chats_main):
+            with self.subTest(entrypoint=entrypoint.__name__), \
+                    mock.patch.object(search.surface.os, "getcwd", return_value="/"), \
+                    mock.patch.object(search, "run_query") as query, \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as stopped:
+                entrypoint(["needle", "--here"])
+            self.assertEqual(stopped.exception.code, 2)
+            query.assert_not_called()
 
     def test_here_and_project_are_mutually_exclusive(self) -> None:
         for entrypoint in (search.main, recall.main, search.chats_main):

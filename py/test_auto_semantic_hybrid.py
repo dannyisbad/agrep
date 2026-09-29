@@ -3076,6 +3076,80 @@ class RecallHybridTests(unittest.TestCase):
         self.assertIn("@past:3", stdout.getvalue())
         self.assertNotIn("@root:3", stdout.getvalue())
 
+    def test_probe_reselects_eligible_tool_evidence_within_the_same_session(self) -> None:
+        query = "azure quokka telemetry"
+        family = recall.common.CallingFamily(
+            "root", "root", frozenset({"root"}), resolved=True, recap_turn=9)
+        for evidence_turn, expected_exit in ((4, 0), (3, 0), (9, 1)):
+            with self.subTest(evidence_turn=evidence_turn):
+                echo = _hit("root", 3, query)
+                lived = _hit("root", evidence_turn, query)
+                lived["ts"] += 1
+                events = [
+                    {"turn": echo["turn"], "ts": echo["ts"],
+                     "kind": "tool", "name": "eval",
+                     "input": f'run(["recall", "{query}", "--probe"])',
+                     "output": "", "ok": True},
+                    {"turn": lived["turn"], "ts": lived["ts"],
+                     "kind": "tool", "name": "bash",
+                     "input": "cat diagnosis.txt",
+                     "output": f"{query}: restart the collector", "ok": True},
+                ]
+                for hit, event in zip((echo, lived), events):
+                    text, _bounds = recall.common.tool_search_record(event)
+                    hit.update(
+                        who="tool", content_digest=compact.content_digest(text),
+                        _event_identity=recall.common.tool_event_identity(
+                            hit["session"], hit["turn"], hit["ts"], text),
+                        _match_span=search._match_pat(
+                            query, "keyword").search(text).span())
+                echo["score"] = lived["score"] + 1
+
+                def candidates(spec):
+                    rows = search._filtered(
+                        [dict(echo), dict(lived)], spec.agent, spec.project,
+                        spec.who, spec.model, spec.model_soft, chat=spec.chat,
+                        include_tools=spec.include_tools,
+                        exclude_session=spec.exclude_session,
+                        exclude_session_from_turn=spec.exclude_session_from_turn,
+                        exclude_sessions=spec.excluded_sessions)
+                    return search.LaneResult(rows, "fixture", pre_ranked=True)
+
+                def windows(requests):
+                    result = self._window(requests)
+                    for window in result:
+                        window["events"] = list(events)
+                    return result
+
+                stdout = io.StringIO()
+                with mock.patch.object(
+                        recall.indexd_runtime, "ensure_index", return_value=True), \
+                        mock.patch.object(
+                            recall.common, "in_agent_context", return_value=True), \
+                        mock.patch.object(
+                            session_context, "calling_family", return_value=family), \
+                        mock.patch.object(
+                            search, "_family_roots_for_hits",
+                            return_value={"root": "root"}), \
+                        mock.patch.object(
+                            search, "_self_exclusion_match_keys", return_value=set()), \
+                        mock.patch.object(
+                            search, "_keyword_candidates", side_effect=candidates), \
+                        mock.patch.object(
+                            explore, "_session_index", return_value={"root": {}}), \
+                        mock.patch.object(
+                            explore, "get_windows", side_effect=windows), \
+                        contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = recall.main(
+                        [query, "--probe", "--lexical", "--who", "tool"])
+                self.assertEqual(rc, expected_exit, stdout.getvalue())
+                if expected_exit == 0:
+                    pointer = compact.encode_result_handle(lived, session_index=("root",))
+                    self.assertIn(pointer, stdout.getvalue())
+                else:
+                    self.assertNotIn("@root:", stdout.getvalue())
+
     def test_probe_relay_quotes_cannot_supply_the_only_confident_pointer(self) -> None:
         nonce = "azure quokka telemetry"
         control = "unrecognized arguments"

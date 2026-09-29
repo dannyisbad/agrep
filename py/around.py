@@ -16,7 +16,8 @@ clamped turn, and defaults to -C 0; the positional session+turn form keeps the
 event noise, while a tool handle retains only its exact cited event. Positional
 and bare-session exploration also defaults to root/main prose; ``--who tool`` or
 ``--tool-output N`` explicitly opts into tools. ``--full`` restores the
-same-window forensic stream. Source truncation is labeled.
+same-window forensic stream. Message-cap commands retain nondefault speakers
+with ``--who`` and lift only the text cap. Source truncation is labeled.
 """
 
 from __future__ import annotations
@@ -71,12 +72,13 @@ def _color_on(when: str) -> bool:
     return common.color_enabled(sys.stdout, when)
 
 
-def _expand_command(target: str, turn: int) -> str:
-    """The command that prints one capped message whole: the cap lever, not
-    the forensic stream."""
+def _expand_command(target: str, turn: int, who: str = "user") -> str:
+    """Lift one message's cap without hiding its speaker or opening the forensic stream."""
+    speaker = ("--who", who) if who not in ("user", "agent") else ()
     return console.shell_command(
-        "agrep", "around", target, turn, "-C", 0, "--max-chars", 0,
-        fallback="agrep around <session> <turn> -C 0 --max-chars 0")
+        "agrep", "around", target, turn, "-C", 0, "--max-chars", 0, *speaker,
+        fallback="agrep around <session> <turn> -C 0 --max-chars 0"
+                 + (" --who <speaker>" if speaker else ""))
 
 
 def _forensic_command(target: str, turn: int, context: int) -> str:
@@ -1092,7 +1094,7 @@ def _main(argv: list[str] | None = None) -> int:
             for who, text in ((t["who"], t["text"]), ("agent", t["reply"])):
                 if not prose_selected(t, who, text):
                     continue
-                expand = _expand_command(target, t["turn"])
+                expand = _expand_command(target, t["turn"], who)
                 capped, omitted = cap_prose(t, who, text, expand)
                 row = {"kind": "msg", "session": w["session"],
                        "project": w["project"], "turn": t["turn"],
@@ -1170,8 +1172,8 @@ def _main(argv: list[str] | None = None) -> int:
         else:
             _stdout_print(
                 f"── turn {t['turn']} " + "─" * 40 + f" {_ts_label(t['ts'])}")
-        expand = _expand_command(target, t["turn"])
         if prose_selected(t, t["who"], t["text"]):
+            expand = _expand_command(target, t["turn"], t["who"])
             tag = common.terminal_safe(t["who"])
             source = " ".join(t["text"].split()) if cap else t["text"]
             body, _ = cap_prose(t, t["who"], source, expand)
@@ -1187,6 +1189,7 @@ def _main(argv: list[str] | None = None) -> int:
                                 selected_match_span=handle_match_span):
             _stdout_print(line)
         if prose_selected(t, "agent", t["reply"]):
+            expand = _expand_command(target, t["turn"], "agent")
             body, _ = cap_prose(t, "agent", t["reply"], expand)
             body = common.terminal_safe(body, multiline=True)
             body += _reply_loss_marker(t)
