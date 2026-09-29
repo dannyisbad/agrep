@@ -473,6 +473,99 @@ fn takeover_adopts_the_cache_and_reparses_nothing() {
 }
 
 #[test]
+fn ingest_upgrades_v2_family_meta_without_rewriting_unchanged_rows() {
+    for successor in ["bbbbbbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaaaaaa"] {
+        let owner = "aaaaaaaaaaaaaaaaaaaa";
+        let home = temp_dir("family-meta-upgrade-home");
+        copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+        let data = temp_dir("family-meta-upgrade-data");
+        let first = run(&home, &data, owner, true);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let family_path = data.join(agrep_core::cache::SESSION_FAMILY_META_FILE);
+        let current_meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&family_path).unwrap()).unwrap();
+        let mut legacy_meta = current_meta.clone();
+        legacy_meta["version"] = 2.into();
+        // v2 hashes the fixture's (session, parent) pairs, without the v3 alias field.
+        legacy_meta["digest"] = "3f95994e0b231fcc6cd7fb058aa0cc1ad4505a043acfbb49".into();
+        fs::write(&family_path, serde_json::to_vec(&legacy_meta).unwrap()).unwrap();
+
+        let proof_path = data.join(".derived_generation.json");
+        let mut proof: serde_json::Value =
+            serde_json::from_slice(&fs::read(&proof_path).unwrap()).unwrap();
+        let snapshot = agrep_core::ingest::registry::regular_file_edge_snapshot(&family_path, 512)
+            .unwrap()
+            .unwrap();
+        let edge_hash = snapshot
+            .len
+            .to_le_bytes()
+            .iter()
+            .chain(&snapshot.head)
+            .chain(&snapshot.tail)
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        let family_proof = proof["files"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|file| file["name"] == agrep_core::cache::SESSION_FAMILY_META_FILE)
+            .unwrap();
+        *family_proof = serde_json::json!({
+            "name": agrep_core::cache::SESSION_FAMILY_META_FILE,
+            "len": snapshot.len,
+            "modified_ns": snapshot.modified.duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos() as u64,
+            "change_token": snapshot.change_token,
+            "edge_hash": edge_hash,
+        });
+        fs::write(&proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
+        let signature = fs::read(data.join(".ingest.sig")).unwrap();
+        let preserved = [
+            "messages.jsonl",
+            "replies.jsonl",
+            "sessions.jsonl",
+            agrep_core::boundary_stats::FILE_NAME,
+            agrep_core::boundary_stats::CACHE_FILE_NAME,
+        ]
+        .map(|name| {
+            (
+                name,
+                agrep_core::ingest::registry::regular_file_edge_snapshot(&data.join(name), 512)
+                    .unwrap()
+                    .unwrap(),
+            )
+        });
+
+        let upgraded = run(&home, &data, successor, false);
+        assert!(
+            upgraded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&upgraded.stderr)
+        );
+        let upgraded_meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&family_path).unwrap()).unwrap();
+        assert_eq!(upgraded_meta["version"], 3, "{successor}");
+        assert_eq!(upgraded_meta, current_meta, "{successor}");
+        assert_eq!(fs::read(data.join(".ingest.sig")).unwrap(), signature);
+        for (name, before) in preserved {
+            let after =
+                agrep_core::ingest::registry::regular_file_edge_snapshot(&data.join(name), 512)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(after, before, "{name}: {successor}");
+        }
+        assert_owned_by(&data, successor);
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(data).unwrap();
+    }
+}
+
+#[test]
 fn takeover_reconstructs_incompatible_cache_on_first_changed_source_ingest() {
     for repair_events in [false, true] {
         let owner_a = "aaaaaaaaaaaaaaaaaaaa";
@@ -580,8 +673,7 @@ fn takeover_migrates_legacy_cache_without_losing_unreadable_source_material() {
     assert_eq!(&wrapped[12..20], b"AGRPCB01");
     assert_eq!(&wrapped[84..88], &0_u32.to_le_bytes());
     let mut legacy = wrapped[100..].to_vec();
-    let version = u32::from_le_bytes(legacy[..4].try_into().unwrap());
-    legacy[..4].copy_from_slice(&(version - 1).to_le_bytes());
+    legacy[..4].copy_from_slice(&22_u32.to_le_bytes());
     fs::write(&cache, legacy).unwrap();
     assert_eq!(
         agrep_core::ingest_cache::probe_cache_owner(&cache),

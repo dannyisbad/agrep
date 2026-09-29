@@ -12,8 +12,8 @@
 //! where a repeated tuple is byte-identical - so the result is order-independent and the cache
 //! is transparent. Claude and Codex are one-file-per-session; for any session that does
 //! span files, its unchanged sibling files are re-parsed too so its event file stays complete.
-//! A schema bump (`CACHE_VERSION`), a missing/corrupt cache, or `--full` fall back to a clean
-//! full parse.
+//! Supported schema bumps retain last-good rows during reparse. Missing, corrupt, or
+//! unsupported caches and `--full` fall back to a clean full parse.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -783,6 +783,11 @@ impl std::fmt::Display for CacheDecodeRefusal {
     }
 }
 
+/// These generations share the current entry layout but require current parser semantics.
+fn reparse_compatible_cache_version(version: u32) -> bool {
+    matches!(version, 18..=19 | 21..=23)
+}
+
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
 fn decode_cache_payload(
     bytes: &[u8],
@@ -809,14 +814,7 @@ fn decode_cache_payload(
             };
             return Ok((cache.entries, generation, true));
         }
-        if cache.version.checked_add(1) == Some(CACHE_VERSION) {
-            let mut entries = cache.entries;
-            for entry in entries.values_mut() {
-                entry.legacy_needs_reparse = true;
-            }
-            return Ok((entries, CacheGeneration::LegacyReparse, true));
-        }
-        if matches!(cache.version, 18..=19) {
+        if reparse_compatible_cache_version(cache.version) {
             let mut entries = cache.entries;
             for entry in entries.values_mut() {
                 entry.legacy_needs_reparse = true;
@@ -1015,10 +1013,7 @@ fn base_writer_build_id(bytes: &[u8]) -> Result<Option<WriterBuildId>, CacheDeco
 fn parse_base_header(bytes: &[u8]) -> Result<BaseHeader, CacheDecodeRefusal> {
     let semantic_version = read_u32(bytes, 0).ok_or(CacheDecodeRefusal::BaseHeader)?;
     let writer_build_id = base_writer_build_id(bytes)?;
-    if semantic_version != CACHE_VERSION
-        && semantic_version.checked_add(1) != Some(CACHE_VERSION)
-        && !matches!(semantic_version, 18..=19)
-    {
+    if semantic_version != CACHE_VERSION && !reparse_compatible_cache_version(semantic_version) {
         return Err(CacheDecodeRefusal::StorageVersion);
     }
     let storage_version = read_u32(bytes, 20).ok_or(CacheDecodeRefusal::BaseHeader)?;
@@ -1766,6 +1761,13 @@ fn decode_cache_owned(
         return Ok((entries, generation, CacheBacking::Rewrite));
     }
     let cursor = replay_journal(&cache_journal_path(path), instance, &mut entries);
+    if read_u32(payload.as_ref(), 0).is_some_and(reparse_compatible_cache_version) {
+        for key in &cursor.upserts {
+            if let Some(entry) = entries.get_mut(key) {
+                entry.legacy_needs_reparse = true;
+            }
+        }
+    }
     let backing = if generation == CacheGeneration::Current {
         CacheBacking::Delta {
             instance,
@@ -6829,6 +6831,82 @@ mod tests {
         assert_eq!(pass.parsed, 0);
         assert_eq!(pass.messages.len(), 1);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn takeover_adopts_released_cache_versions_with_last_good_rows() {
+        for (version, journaled) in [(22_u32, false), (22, true), (21, false)] {
+            let dir = std::env::temp_dir().join(format!(
+                "agrep-adopt-v{version}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("session.jsonl");
+            fs::write(&source, b"last-good transcript").unwrap();
+            let cache_path = dir.join(".ingest_cache.bin");
+            let mut cache = IngestCache::cold();
+            collect_cached(&mut cache, &dir, std::slice::from_ref(&source), |_| {
+                (vec![test_message("released last-good row")], Vec::<Event>::new())
+            });
+            let payload = bincode::serialize(&super::CacheFileRef {
+                version,
+                entries: &cache.entries,
+            })
+            .unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            bytes.extend_from_slice(super::CACHE_BASE_MAGIC);
+            bytes.extend_from_slice(&super::CACHE_BASE_STORAGE_VERSION.to_le_bytes());
+            bytes.extend_from_slice(b"ffffffffffffffffffff");
+            bytes.extend_from_slice(&[7_u8; 16]);
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&super::cache_digest(&payload));
+            bytes.extend_from_slice(&super::CACHE_CODEC_NONE.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            fs::write(&cache_path, bytes).unwrap();
+            let expected = if journaled {
+                let mut entry = cache.entries[&source_key(&source)].clone();
+                entry.msgs[0].text = "released journal row".into();
+                let delta = super::JournalDelta {
+                    upserts: vec![(source_key(&source), entry)],
+                    deletes: Vec::new(),
+                };
+                let mut journal = super::encode_journal_header([7_u8; 16]);
+                journal.extend_from_slice(&super::encode_journal_frame(0, 1, &delta).unwrap());
+                fs::write(super::cache_journal_path(&cache_path), journal).unwrap();
+                "released journal row"
+            } else {
+                "released last-good row"
+            };
+            assert!(matches!(
+                super::probe_cache_owner(&cache_path),
+                super::CacheOwnerProbe::Foreign { .. }
+            ));
+
+            assert_eq!(super::adopt_foreign_cache(&cache_path), Ok(1), "v{version}");
+            assert!(matches!(
+                super::probe_cache_owner(&cache_path),
+                super::CacheOwnerProbe::Current { .. }
+            ));
+            let mut reloaded = IngestCache::load(&cache_path);
+            assert!(reloaded.force_reparse, "v{version}");
+            assert!(reloaded.entries[&source_key(&source)].legacy_needs_reparse);
+            let pass = collect_cached(&mut reloaded, &dir, &[source], |_| {
+                (Vec::new(), Vec::new(), ReadOutcome::Skipped)
+            });
+            assert_eq!(pass.parsed, 1);
+            assert_eq!(pass.messages.len(), 1);
+            assert_eq!(pass.messages[0].text.as_ref(), expected);
+            assert!(!reloaded.source_snapshot_safe());
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]

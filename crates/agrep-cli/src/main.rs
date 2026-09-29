@@ -4194,6 +4194,23 @@ fn derived_generation_valid(data: &Path, signature: &str) -> bool {
     derived_generation_valid_with(data, signature, || derived_proof(data, signature))
 }
 
+// Family schemas can evolve without changing message signatures or the outer derived proof.
+fn session_family_meta_current(data: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    struct MetaVersion {
+        version: u32,
+    }
+
+    read_optional_bytes(
+        &data.join(cache::SESSION_FAMILY_META_FILE),
+        DERIVED_PROOF_MAX_BYTES,
+    )
+    .ok()
+    .flatten()
+    .and_then(|bytes| serde_json::from_slice::<MetaVersion>(&bytes).ok())
+    .is_some_and(|meta| meta.version == cache::SESSION_FAMILY_META_VERSION)
+}
+
 fn legacy_derived_generation_valid(data: &Path, signature: &str) -> bool {
     // A current publication with a damaged proof is not an upgrade candidate.
     // The narrow window is the exact v4 six-file publication with no family
@@ -4523,7 +4540,7 @@ fn unlocked_warm_skip(data: &Path, agent: &str) -> Option<(usize, u128)> {
     )
     .ok()??;
     let signature = String::from_utf8(sig_snapshot.bytes).ok()?;
-    if !derived_generation_valid(data, &signature) {
+    if !derived_generation_valid(data, &signature) || !session_family_meta_current(data) {
         return None;
     }
     let count = signature.trim().split_once(':')?.0.parse::<usize>().ok()?;
@@ -4826,6 +4843,7 @@ fn index_cmd_locked(
     let derived_valid = previous_sig
         .as_deref()
         .is_some_and(|signature| derived_generation_valid(&data, signature));
+    let family_meta_current = derived_valid && session_family_meta_current(&data);
     let legacy_derived_valid = !derived_valid
         && previous_sig
             .as_deref()
@@ -4859,6 +4877,7 @@ fn index_cmd_locked(
         && !emit_rows
         && ownership_current
         && derived_valid
+        && family_meta_current
         && previous_count.is_some()
         && source_identical
         && events_complete
@@ -5288,13 +5307,16 @@ fn index_cmd_locked(
                     ),
                 "legacy publication changed during its generation-bound upgrade"
             );
-            cache::write_session_family_meta(
+        }
+        let family_meta = if legacy_derived_valid || !family_meta_current {
+            Some(cache::session_family_meta_bytes(
                 &msgs,
                 &session_aliases,
-                &data.join(cache::SESSION_FAMILY_META_FILE),
                 sig_line.trim(),
-            )?;
-        }
+            )?)
+        } else {
+            None
+        };
         // The staged cache commits even when publication is withheld: pending retention
         // forces the retry, and a live-writer pass whose next read fails must serve THIS
         // pass's rows. The clock advances only on a safe or publishing pass.
@@ -5321,7 +5343,7 @@ fn index_cmd_locked(
             messages: &msgs,
             repaired_sessions: &repaired_sessions,
             preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
-            family_meta: None,
+            family_meta: family_meta.as_deref(),
         })?;
         preserve_signal_age(
             &sig_path,

@@ -288,7 +288,7 @@ pub struct SessionAlias {
 pub const SESSION_FAMILY_META_FILE: &str = "session_family.meta.json";
 // v3 adds each session's alias to the digested row. It detects torn local publications; the
 // ingest signature remains the generation commit marker.
-const SESSION_FAMILY_META_VERSION: u32 = 3;
+pub const SESSION_FAMILY_META_VERSION: u32 = 3;
 const SESSION_FAMILY_DIGEST_ALGORITHM: &str = "md5-fnv64-v1";
 
 #[derive(Serialize)]
@@ -483,23 +483,14 @@ fn session_family_aggregate_bytes(
     Ok(serde_json::to_vec(&meta)?)
 }
 
-/// Publish only the parent-census proof for an already edge-proven session index.
-///
-/// The legacy upgrade uses this narrow path so it can generation-bind an
-/// unchanged v4 publication without replacing any of that publication's six
-/// proved artifacts.
-pub fn write_session_family_meta(
+/// Build a current family proof for an unchanged, edge-proven session index.
+/// Publish these bytes with the generation markers, without rewriting session rows.
+pub fn session_family_meta_bytes(
     msgs: &[Message],
     aliases: &[SessionAlias],
-    family_meta_path: &Path,
     ingest_signature: &str,
-) -> anyhow::Result<usize> {
-    let by = aggregate_sessions(msgs, aliases);
-    write_bytes_atomic(
-        family_meta_path,
-        &session_family_aggregate_bytes(&by, ingest_signature)?,
-    )?;
-    Ok(by.len())
+) -> anyhow::Result<Vec<u8>> {
+    session_family_aggregate_bytes(&aggregate_sessions(msgs, aliases), ingest_signature)
 }
 
 /// Write the per-session aggregate index; returns the session count and the family proof
