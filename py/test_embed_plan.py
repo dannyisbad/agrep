@@ -100,6 +100,21 @@ class PendingEmbeddingPlanTests(unittest.TestCase):
             self.assertIsNone(embed._load_pending_plan(
                 source, "output-c", "model-a", manifest_rows=1, max_new=1))
 
+    def test_character_estimate_plan_is_invalidated_before_reuse(self) -> None:
+        source = {"ingest_signature": "generation-a"}
+        messages = [_message(1), _message(2)]
+        with mock.patch.object(embed, "_PENDING_PLAN_SCHEMA", "2"):
+            builder = embed._PendingPlanBuilder(source, "output-a", "model-a")
+            for seq, message in enumerate(messages):
+                builder.add(message, embed._text_hash(message.text), seq)
+            builder.publish(total=2)
+            self.assertTrue(embed._advance_pending_plan(
+                source, "output-a", "output-b", [messages[1].id]))
+        with mock.patch.object(
+                embed, "_resolve_pending_messages", side_effect=_resolve):
+            self.assertIsNone(embed._load_pending_plan(
+                source, "output-b", "model-a", manifest_rows=1, max_new=1))
+
     def test_failed_advance_cannot_make_unpublished_rows_reusable(self) -> None:
         source = {"ingest_signature": "generation-a"}
         builder = embed._PendingPlanBuilder(source, "output-a", "model-a")
@@ -201,7 +216,7 @@ class PendingEmbeddingPlanTests(unittest.TestCase):
 
         long_text = "\n".join(
             f"line {index} " + "x" * 60
-            for index in range(3 * embed._CHUNK_CHARS // 60))
+            for index in range(3 * embed._CHUNK_BYTES // 60))
         db = sqlite3.connect(":memory:")
         db.execute("CREATE TABLE msgs(session,turn,ts,agent,project,model,"
                    "model_source,who,text)")

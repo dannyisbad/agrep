@@ -28,6 +28,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from collections import ChainMap, OrderedDict
 from collections.abc import Iterator, Mapping
@@ -59,7 +60,7 @@ _Q8_REQUIRED_ROWS = 100_000
 GOVERNOR_BATTERY_FLOOR_PCT = surface.SEMANTIC_GOVERNOR.battery_floor_pct
 GOVERNOR_MEMORY_FLOOR = surface.SEMANTIC_GOVERNOR.memory_floor
 GOVERNOR_LOAD_LIMIT = surface.SEMANTIC_GOVERNOR.load_limit_per_core
-_PENDING_PLAN_SCHEMA = "2"
+_PENDING_PLAN_SCHEMA = "3"
 _PENDING_PLAN_BUFFER = 4096
 
 
@@ -1063,11 +1064,10 @@ def _retained_embedding_rows(old_mat, keep: list[int] | None, *, has_pending: bo
 # rows beyond one window embed as several store rows - unsuffixed head chunk
 # plus '#cN' siblings ('#r' extended); every id hashes the FULL source text.
 
-# Conservative prose estimate for the embedder's tokenizer; sizes derive from
-# the model window so a lane with a different window rechunks consistently.
-_CHUNK_CHARS_PER_TOKEN = 4
-_CHUNK_CHARS = int(embedder.PROFILE["max_seq"]) * _CHUNK_CHARS_PER_TOKEN
-_CHUNK_OVERLAP_CHARS = _CHUNK_CHARS // 10
+# Pinned NFC byte-level BPE emits <=1 token/UTF-8 byte plus CLS/SEP; common CJK uses 3 bytes/char, emoji 4.
+# Measuring normalized bytes also bounds NFC expansion and needs no tokenizer cache during planning.
+_CHUNK_BYTES = int(embedder.PROFILE["max_seq"]) - 2
+_CHUNK_OVERLAP_CHARS = _CHUNK_BYTES // 10
 # Bounded vector-store cost: one pathological multi-megabyte row must not
 # dominate the matrix with thousands of rows. The head chunks stay contiguous
 # (openings carry the request); the remainder is sampled evenly.
@@ -1079,39 +1079,41 @@ _HEAD_ROW_CHUNKS = 8
 # instructions are exactly the un-sectioned prose before the first heading.
 _RECAP_SECTION_HEADING = re.compile(
     r"^[^\S\n]*\S[^\n]{0,80}\n={3,}[^\S\n]*$", re.MULTILINE)
+_RECAP_PREAMBLE_SCAN_CHARS = 4096
 
 
 def _strip_recap_preamble(text: str) -> str:
-    """Drop the harness resume-instruction preamble from a recap row.
-
-    Structural anchor only: content starts at the first underlined section
-    heading found within one model window of the head. No heading means no
-    recognized preamble and the text embeds unmodified - under-stripping is
-    the designed failure mode, never over-stripping content."""
-    match = _RECAP_SECTION_HEADING.search(text, 0, _CHUNK_CHARS)
+    """Strip a pi harness preamble only when a setext heading appears in the first 4096 characters."""
+    match = _RECAP_SECTION_HEADING.search(text, 0, _RECAP_PREAMBLE_SCAN_CHARS)
     return text[match.start():] if match else text
 
 
-def _embeddable_row_text(who: str, text: str) -> str:
-    return _strip_recap_preamble(text) if who == "recap" else text
+def _embeddable_row_text(agent: str, who: str, text: str) -> str:
+    return _strip_recap_preamble(text) if agent == "pi" and who == "recap" else text
 
 
 def _row_chunk_spans(content: str) -> list[tuple[int, int]]:
-    """Overlapping chunk windows, split at line boundaries where possible."""
+    """Byte-budgeted overlapping windows, split at line boundaries where possible."""
     spans: list[tuple[int, int]] = []
-    step = _CHUNK_CHARS - _CHUNK_OVERLAP_CHARS
     total = len(content)
     start = 0
     while True:
-        end = min(start + _CHUNK_CHARS, total)
-        if end < total:
-            newline = content.rfind("\n", start + step, end)
-            if newline >= 0:
-                end = newline + 1
+        end = min(start + _CHUNK_BYTES, total)
+        while True:
+            if end < total:
+                newline = content.rfind("\n", start + (end - start) // 2, end)
+                if newline >= 0:
+                    end = newline + 1
+            chunk = content[start:end]
+            size = (len(chunk) if chunk.isascii()
+                    else len(unicodedata.normalize("NFC", chunk).encode("utf-8")))
+            if size <= _CHUNK_BYTES:
+                break
+            end = start + (end - start) * _CHUNK_BYTES // size
         spans.append((start, end))
         if end >= total:
             return spans
-        start = end - _CHUNK_OVERLAP_CHARS
+        start = end - min(_CHUNK_OVERLAP_CHARS, (end - start) // 2)
 
 
 def _capped_chunk_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -1127,22 +1129,15 @@ def _capped_chunk_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     ]
 
 
-def _row_chunks(who: str, text: str) -> list[str]:
+def _row_chunks(agent: str, who: str, text: str) -> list[str]:
     """The texts one logical row embeds, index-aligned with its store ids."""
-    content = _embeddable_row_text(who, text)
-    if len(content) <= _CHUNK_CHARS:
-        return [content]
+    content = _embeddable_row_text(agent, who, text)
     return [content[start:end]
             for start, end in _capped_chunk_spans(_row_chunk_spans(content))]
 
 
-def _row_chunk_count(who: str, text: str) -> int:
-    if len(text) <= _CHUNK_CHARS:
-        # the recap strip only shortens, so short rows stay single-vector
-        return 1
-    content = _embeddable_row_text(who, text)
-    if len(content) <= _CHUNK_CHARS:
-        return 1
+def _row_chunk_count(agent: str, who: str, text: str) -> int:
+    content = _embeddable_row_text(agent, who, text)
     return min(len(_row_chunk_spans(content)), _MAX_ROW_CHUNKS)
 
 
@@ -1153,7 +1148,8 @@ def _expand_source_message(message: common.Message) -> Iterator[common.Message]:
     logical row's text hash and metadata fingerprint; only the embedded
     input (``_embed_input``) differs per chunk."""
     yield message
-    for ordinal in range(1, _row_chunk_count(message.who, message.text)):
+    for ordinal in range(
+            1, _row_chunk_count(message.agent, message.who, message.text)):
         yield message._replace(id=f"{message.id}#c{ordinal}")
 
 
@@ -1161,11 +1157,13 @@ def _embed_input(message: common.Message,
                  _memo: list = [None, None]) -> str:  # noqa: B006 - deliberate slot
     """The text this store row actually embeds: its chunk of the logical row."""
     base, ordinal = common.semantic_chunk_split(message.id)
-    if ordinal == 0 and message.who != "recap" and len(message.text) <= _CHUNK_CHARS:
+    if (ordinal == 0 and message.who != "recap"
+            and len(message.text) <= _CHUNK_BYTES and message.text.isascii()):
         return message.text
-    if _memo[0] != (base, message.text):
-        _memo[0] = (base, message.text)
-        _memo[1] = _row_chunks(message.who, message.text)
+    key = (base, message.agent, message.who, message.text)
+    if _memo[0] != key:
+        _memo[0] = key
+        _memo[1] = _row_chunks(message.agent, message.who, message.text)
     chunks = _memo[1]
     if ordinal >= len(chunks):
         raise RuntimeError(
@@ -2662,7 +2660,7 @@ def _run_smoke(args) -> int:
         download=not bool(getattr(args, "no_model_download", False)),
         lane=_active_lane())
     vectors = np.asarray(
-        model.embed_texts([message.text for message in selected]),
+        model.embed_texts([_embed_input(message) for message in selected]),
         dtype=np.float32)
     expected = (len(selected), int(embedder.PROFILE["dim"]))
     if vectors.shape != expected or not np.all(np.isfinite(vectors)):

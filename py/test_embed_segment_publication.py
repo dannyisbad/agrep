@@ -42,7 +42,7 @@ class _Embedder:
 
 def _row(mid: str, text: str, *, session: str, turn: int) -> dict:
     return {
-        "id": mid, "agent": "codex", "project": "p", "session": session,
+        "id": mid, "agent": mid.split(":", 1)[0], "project": "p", "session": session,
         "ts": turn * 1000, "turn": turn, "text": text, "who": "user",
         "model": "gpt", "model_source": "explicit",
     }
@@ -664,9 +664,10 @@ class ChunkedRowPublicationTests(unittest.TestCase):
             encoding="utf-8")
         self.source = {"ingest_signature": "chunked-one"}
         filler = "\n".join(
-            f"filler line {index} " + "pad " * 12 for index in range(400))
+            f"filler line {index} " + "pad " * 12
+            for index in range(4 * embed._CHUNK_BYTES // 60))
         self.long_text = filler + "\n" + _PHRASE + "\n" + filler
-        self.chunk_count = len(embed._row_chunks("user", self.long_text))
+        self.chunk_count = len(embed._row_chunks("codex", "user", self.long_text))
         self.rows = [
             _row("codex:a:1", "alpha short row", session="a", turn=1),
             _row("codex:b:2", self.long_text, session="b", turn=2),

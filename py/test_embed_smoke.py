@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -44,7 +45,7 @@ class _BoundedMessages:
 
 def _chunk_message(mid: str, text: str, who: str = "user") -> common.Message:
     return common.Message(
-        id=mid, agent="codex", project="p", session="s", ts=1, turn=1,
+        id=mid, agent=mid.split(":", 1)[0], project="p", session="s", ts=1, turn=1,
         text=text, who=who, model="", model_source="unknown")
 
 
@@ -77,6 +78,17 @@ _RECAP_CONTENT = (
 )
 
 
+_DENSE_ROWS = {
+    "ascii": "x!?" * 2000,
+    "cjk": "中文内容检索" * 500,
+    "dense-json": json.dumps(
+        [{"id": i, "ok": True, "n": [1, 2, 3]} for i in range(150)],
+        separators=(",", ":")),
+    "emoji": "🫠🎉🧬🚀" * 500,
+    "normalization-expansion": "\U0001d160" * 700,
+}
+
+
 class LongRowChunkingTests(unittest.TestCase):
     def test_short_row_embeds_exactly_one_unsuffixed_vector(self) -> None:
         message = _chunk_message("codex:s:1", "a short prompt")
@@ -85,10 +97,10 @@ class LongRowChunkingTests(unittest.TestCase):
         self.assertEqual(embed._embed_input(message), "a short prompt")
 
     def test_long_row_expands_to_chunk_ids_carrying_the_full_text(self) -> None:
-        text = _long_text(4 * embed._CHUNK_CHARS)
+        text = _long_text(4 * embed._CHUNK_BYTES)
         message = _chunk_message("codex:s:2", text)
         rows = list(embed._expand_source_message(message))
-        chunks = embed._row_chunks("user", text)
+        chunks = embed._row_chunks("codex", "user", text)
         self.assertGreater(len(chunks), 1)
         self.assertEqual(
             [row.id for row in rows],
@@ -97,20 +109,62 @@ class LongRowChunkingTests(unittest.TestCase):
         self.assertTrue(all(row.text == text for row in rows))
         self.assertEqual([embed._embed_input(row) for row in rows], chunks)
         # deterministic: same text always yields the same expansion
-        self.assertEqual(chunks, embed._row_chunks("user", text))
+        self.assertEqual(chunks, embed._row_chunks("codex", "user", text))
 
     def test_long_reply_chunks_extend_the_reply_suffix(self) -> None:
         message = _chunk_message(
-            "codex:s:3#r", _long_text(2 * embed._CHUNK_CHARS), who="agent")
+            "codex:s:3#r", _long_text(2 * embed._CHUNK_BYTES), who="agent")
         rows = list(embed._expand_source_message(message))
         self.assertGreater(len(rows), 1)
         self.assertEqual(rows[1].id, "codex:s:3#r#c1")
         self.assertEqual(
             common.semantic_chunk_split("codex:s:3#r#c1"), ("codex:s:3#r", 1))
 
+    def test_dense_rows_cover_every_character_within_token_budget(self) -> None:
+        for name, text in _DENSE_ROWS.items():
+            with self.subTest(script=name):
+                message = _chunk_message(f"codex:{name}:1", text)
+                spans = embed._row_chunk_spans(text)
+                rows = list(embed._expand_source_message(message))
+                chunks = [embed._embed_input(row) for row in rows]
+                self.assertEqual(
+                    len(rows), embed._row_chunk_count("codex", "user", text))
+                self.assertEqual(len(chunks), len(spans))
+                covered = 0
+                for (start, end), chunk in zip(spans, chunks):
+                    self.assertLessEqual(start, covered)
+                    self.assertEqual(chunk, text[start:end])
+                    self.assertLessEqual(
+                        len(unicodedata.normalize("NFC", chunk).encode("utf-8")) + 2,
+                        embed.embedder.PROFILE["max_seq"])
+                    covered = end
+                self.assertEqual(covered, len(text))
+
+    def test_dense_chunks_fit_the_available_pinned_tokenizer(self) -> None:
+        try:
+            from tokenizers import Tokenizer
+        except ImportError:
+            self.skipTest("optional tokenizer runtime is unavailable")
+        path = embed.embedder.model_dir() / "tokenizer.json"
+        spec = embed.embedder.PROFILE["files"]["tokenizer.json"]
+        if not embed.embedder._file_ok(path, *spec):
+            self.skipTest("pinned tokenizer is not cached")
+        tokenizer = Tokenizer.from_file(str(path))
+        tokenizer.no_truncation()
+        tokenizer.no_padding()
+        for name, text in _DENSE_ROWS.items():
+            with self.subTest(script=name):
+                self.assertGreater(
+                    len(tokenizer.encode(text).ids), embed.embedder.PROFILE["max_seq"])
+                message = _chunk_message(f"codex:{name}:2", text)
+                for row in embed._expand_source_message(message):
+                    encoded = tokenizer.encode(embed._embed_input(row))
+                    self.assertLessEqual(
+                        len(encoded.ids), embed.embedder.PROFILE["max_seq"])
+
     def test_chunks_split_at_line_boundaries_and_reconstruct_exactly(self) -> None:
-        text = _long_text(6 * embed._CHUNK_CHARS)
-        chunks = embed._row_chunks("user", text)
+        text = _long_text(6 * embed._CHUNK_BYTES)
+        chunks = embed._row_chunks("codex", "user", text)
         for chunk in chunks[:-1]:
             self.assertTrue(chunk.endswith("\n"))
         rebuilt = chunks[0] + "".join(
@@ -119,8 +173,8 @@ class LongRowChunkingTests(unittest.TestCase):
 
     def test_multibyte_text_never_splits_inside_a_codepoint(self) -> None:
         text = ("多言語のテキスト mixed with emoji 🎉 and ascii\n"
-                * (3 * embed._CHUNK_CHARS // 40))
-        chunks = embed._row_chunks("user", text)
+                * (3 * embed._CHUNK_BYTES // 40))
+        chunks = embed._row_chunks("codex", "user", text)
         self.assertGreater(len(chunks), 1)
         for chunk in chunks:
             # a mid-codepoint split cannot round-trip through utf-8
@@ -160,11 +214,35 @@ class LongRowChunkingTests(unittest.TestCase):
         sectioned = _chunk_message("pi:s:8", _RECAP_CONTENT, who="recap")
         self.assertEqual(embed._embed_input(sectioned), _RECAP_CONTENT)
 
+    def test_provider_recap_with_setext_heading_keeps_its_summary(self) -> None:
+        text = "The deployment investigation found a stale cache.\n\nResults\n=======\nfixed\n"
+        for agent in ("claude", "codex"):
+            with self.subTest(agent=agent):
+                message = _chunk_message(f"{agent}:s:8", text, who="recap")
+                self.assertEqual(embed._embed_input(message), text)
+
+    def test_recap_agent_controls_chunk_count_after_a_long_preamble(self) -> None:
+        text = "Resume archive instructions.\n" * 100 + "\n" + _RECAP_CONTENT
+        for agent, expected in (("pi", _RECAP_CONTENT), ("claude", text)):
+            with self.subTest(agent=agent):
+                message = _chunk_message(f"{agent}:long-recap:1", text, who="recap")
+                rows = list(embed._expand_source_message(message))
+                chunks = embed._row_chunks(agent, "recap", text)
+                self.assertEqual(len(rows), embed._row_chunk_count(agent, "recap", text))
+                self.assertEqual([embed._embed_input(row) for row in rows], chunks)
+                reconstructed = chunks[0] + "".join(
+                    chunk[embed._CHUNK_OVERLAP_CHARS:] for chunk in chunks[1:])
+                self.assertEqual(reconstructed, expected)
+                if agent == "pi":
+                    self.assertEqual(len(rows), 1)
+                else:
+                    self.assertGreater(len(rows), 1)
+
     def test_non_recap_giant_row_chunks_without_any_stripping(self) -> None:
         text = _RECAP_PREAMBLE + _RECAP_CONTENT + _long_text(
-            3 * embed._CHUNK_CHARS)
+            3 * embed._CHUNK_BYTES)
         message = _chunk_message("codex:s:9", text, who="user")
-        chunks = embed._row_chunks("user", text)
+        chunks = embed._row_chunks("codex", "user", text)
         self.assertGreater(len(chunks), 1)
         self.assertEqual(embed._embed_input(message), chunks[0])
         self.assertTrue(chunks[0].startswith(_RECAP_PREAMBLE[:64]))
