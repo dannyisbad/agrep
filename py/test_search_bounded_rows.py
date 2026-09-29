@@ -71,6 +71,15 @@ class SearchBoundedRowsTests(unittest.TestCase):
         add("aligned-later", 0,
             "dude dont we already have a don of cases then calls", who="user")
 
+
+        for index, token in enumerate(("Straße", "ＡＢＣ", "ﬁle")):
+            add(f"unicode-{index}-phrase", 0, f"{token} repair", who="user")
+            add(f"unicode-{index}-terms", 0, f"repair before {token}", who="user")
+        add("short-anchor-phrase", 0, "tries repair", who="user")
+        add("short-anchor-terms", 0, "repair before try", who="user")
+        add("short-anchor-noise", 0, "repair trail", who="user")
+        for token in ("calls", "call", "callback", "recall", "policy", "policies"):
+            add(f"single-{token}", 0, token, who="user")
         add("filter-user", 1, "filtered target user evidence", who="user",
             agent="codex", project="/repo/red", model="gpt-5.4")
         add("filter-tool", 2, "filtered target tool evidence", who="tool",
@@ -178,6 +187,35 @@ class SearchBoundedRowsTests(unittest.TestCase):
         }
         for field, count in exact.items():
             self.assertLessEqual(bounded[field], count, field)
+
+    def test_normalized_tokens_keep_literal_candidates_in_bounded_lanes(self):
+        for index, token in enumerate(("Straße", "ＡＢＣ", "ﬁle")):
+            query = f"{token} repair"
+            expected = {f"unicode-{index}-phrase", f"unicode-{index}-terms"}
+            for lane in (self._run, self._run_sessions):
+                with self.subTest(query=query, lane=lane.__name__):
+                    _exhaustive, bounded = lane(query, 10)
+                    self.assertEqual(
+                        {hit["session"] for hit in bounded["hits"]}, expected)
+
+    def test_short_plural_anchor_admits_every_variant_in_bounded_lanes(self):
+        for lane in (self._run, self._run_sessions):
+            with self.subTest(lane=lane.__name__):
+                _exhaustive, bounded = lane(
+                    "tries repair", 10, {"chat": "short-anchor-"})
+                self.assertEqual(
+                    {hit["session"] for hit in bounded["hits"]},
+                    {"short-anchor-phrase", "short-anchor-terms"})
+
+    def test_single_token_bounded_rows_do_not_fold_plurals(self):
+        for token in ("calls", "policy"):
+            with self.subTest(query=token):
+                _exhaustive, bounded = self._run(
+                    token, 10, {"chat": "single-"})
+                self.assertEqual(
+                    [hit["session"] for hit in bounded["hits"]],
+                    [f"single-{token}"])
+                self.assertEqual(bounded["total"], 1)
 
 
     def test_repeated_terms_do_not_repeat_candidate_span_work(self):

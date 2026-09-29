@@ -872,6 +872,67 @@ class SearchCorrectnessTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_literal_and_short_variant_anchors_agree_across_sql_and_jsonl(self):
+        texts = {
+            "sharp-s": "Straße repair",
+            "fullwidth": "ＡＢＣ repair",
+            "ligature": "ﬁle repair",
+            "tries": "tries repair",
+            "try": "repair before try",
+            "noise": "repair trail",
+        }
+        events = {
+            session: {"kind": "tool", "name": "Read", "output": text, "ts": 1}
+            for session, text in texts.items()
+        }
+        messages = {
+            session: [{"session": session, "agent": "codex", "project": "p",
+                       "turn": 0, "ts": 1, "text": ""}]
+            for session in texts
+        }
+        payloads = {
+            session: (json.dumps(event, ensure_ascii=False) + "\n").encode()
+            for session, event in events.items()
+        }
+        db = sqlite3.connect(":memory:")
+        db.executescript(corpusdb._SCHEMA_SQL)
+        self.addCleanup(db.close)
+        db.executemany(corpusdb._INS, [
+            (session, 0, 1, "codex", "p", "", "", "", "tool",
+             common.tool_row_from_event(event, 1, 0)["text"])
+            for session, event in events.items()
+        ])
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        with mock.patch.object(explore, "_freshen"), \
+                mock.patch.object(explore, "_messages_by_session", return_value=messages), \
+                mock.patch.object(explore, "_session_concept", return_value={}), \
+                mock.patch.object(
+                    common, "event_blobs_bulk",
+                    side_effect=lambda keys, **_kw: (
+                        (agent, session, payloads[session]) for agent, session in keys)):
+            for query, expected in (
+                    ("Straße repair", {"sharp-s"}),
+                    ("ＡＢＣ repair", {"fullwidth"}),
+                    ("ﬁle repair", {"ligature"}),
+                    ("tries repair", {"tries", "try"})):
+                with self.subTest(query=query, lane="sql"):
+                    indexed = corpusdb.keyword_terms(db, query, 10)
+                    self.assertEqual(
+                        {hit["session"] for hit in indexed["terms"]["hits"]},
+                        expected)
+                with self.subTest(query=query, lane="count"):
+                    counted = corpusdb.keyword_count(db, query)
+                    self.assertEqual(
+                        (counted["total"], counted["chats"], counted["tool_hits"]),
+                        (len(expected), len(expected), len(expected)))
+                with self.subTest(query=query, lane="jsonl"):
+                    scanned = explore.keyword_search(
+                        query, 10, {"who": "tool", "_tool_lane_enabled": True},
+                        terms=True)
+                    self.assertEqual(
+                        {hit["session"] for hit in scanned["term_hits"]},
+                        expected)
+
     def test_re_i_widening_uses_the_sparse_partial_index(self):
         db = sqlite3.connect(":memory:")
         db.executescript(corpusdb._SCHEMA_SQL)
@@ -1333,6 +1394,44 @@ class OverspecRecoveryTests(unittest.TestCase):
             db.close()
         self.assertTrue(scanned)
         self.assertEqual([hit["session"] for hit in block], ["elsewhere"])
+
+    def test_coverage_excludes_project_before_scan_limit(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(corpusdb._SCHEMA_SQL)
+        rows = [
+            (f"noise-{index}", 0, index, "codex", "/w/NOISY-BENCH",
+             "", "", "", "user", self.TARGET_TEXT)
+            for index in range(search._OVERSPEC_SCAN_ROWS + 1)
+        ]
+        rows.append((
+            "elsewhere", 0, 1, "codex", "/w/quiet", "", "", "", "user",
+            self.TARGET_TEXT + " background" * 80))
+        db.executemany(corpusdb._INS, rows)
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        try:
+            unfiltered = corpusdb.coverage_rank(
+                db, self.QUERY, search._OVERSPEC_SCAN_ROWS)
+            self.assertEqual(len(unfiltered), search._OVERSPEC_SCAN_ROWS)
+            self.assertEqual(
+                {hit["project"] for hit in unfiltered}, {"/w/NOISY-BENCH"})
+            with self.subTest(lane="sql"):
+                filtered = corpusdb.coverage_rank(
+                    db, self.QUERY, search._OVERSPEC_SCAN_ROWS,
+                    {"exclude_project": "noisy-*"})
+                self.assertEqual(
+                    [hit["session"] for hit in filtered], ["elsewhere"])
+            with self.subTest(lane="retry"), \
+                    mock.patch.object(search, "corpusdb") as fake:
+                fake.connect.return_value = db
+                fake.coverage_rank = corpusdb.coverage_rank
+                fake.term_session_df = corpusdb.term_session_df
+                block, scanned = search._overspec_retry_rows(
+                    self.QUERY, {"exclude_project": "noisy-*"}, [], None)
+                self.assertTrue(scanned)
+                self.assertEqual(
+                    [hit["session"] for hit in block or []], ["elsewhere"])
+        finally:
+            db.close()
 
     def test_compact_hybrid_page_still_runs_the_coverage_retry(self):
         # meaning rows filled the page while the lexical lane found nothing:

@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -191,16 +192,26 @@ class ChatsListTests(unittest.TestCase):
         larger = err.split("larger page: ", 1)[1]
         self.assertIn("--no-auto", larger)
 
-    def test_larger_page_carries_every_scope_flag(self) -> None:
-        with mock.patch.object(search, "_parse_when",
-                               side_effect=lambda w: {"a": 0, "b": 10**13}[w]):
-            _rc, _out, err = _run([
-                "-n", "1", "--exclude-project", "bench", "--since", "a",
-                "--until", "b", "--no-self"])
-        larger = err.split("larger page: ", 1)[1].split("\n", 1)[0]
-        for flag in ("--exclude-project bench", "--since a", "--until b",
-                     "--no-self", "-n 80"):
-            self.assertIn(flag, larger)
+    def test_larger_page_replays_dash_prefixed_project_filters(self) -> None:
+        indexed = {}
+        for index, project in enumerate(("-shop", "-shop", "-bench", "other")):
+            session = f"0199{index:04x}-1111-7000-8000-000000000001"
+            indexed[session] = {
+                **SESSIONS[0], "session": session, "project": f"/home/u/{project}",
+                "last_ts": 9000 - index,
+            }
+        with mock.patch.object(explore, "_session_index", return_value=indexed), \
+                mock.patch.object(search, "_parse_when",
+                                  side_effect=lambda w: {"a": 0, "b": 10**13}[w]):
+            rc, first, err = _run([
+                "-n", "1", "--project=-*", "--exclude-project=-bench",
+                "--since", "a", "--until", "b", "--no-self"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(_heads(first), ["@01990000"])
+            larger = err.split("larger page: ", 1)[1].split("\n", 1)[0]
+            replay_rc, replay, replay_err = _run(shlex.split(larger)[2:])
+        self.assertEqual(replay_rc, 0, replay_err)
+        self.assertEqual(_heads(replay), ["@01990000", "@01990001"])
 
     def test_project_filter_is_exact_on_the_label_or_its_leaf(self) -> None:
         rc, out, _err = _run(["--project", "webapp"])

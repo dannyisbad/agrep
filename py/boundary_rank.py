@@ -201,15 +201,19 @@ def term_variants(token: str) -> tuple[str, ...]:
 
 
 def term_anchor(token: str) -> str:
-    """Return a substring shared by every folded variant for candidate lookup."""
+    """Return a literal-safe candidate substring; short prefixes use SQL LIKE."""
     variants = term_variants(token)
     if not variants:
         return ""
+    literal = token.lower()
+    if variants[0] != literal:
+        # Candidate stores do not apply the span matcher's NFKC/casefold normalization.
+        return literal
     prefix = variants[0]
     for variant in variants[1:]:
         while prefix and not variant.startswith(prefix):
             prefix = prefix[:-1]
-    return prefix if len(prefix) >= 3 else variants[0]
+    return prefix
 
 
 def cold_prior(token: str) -> float:

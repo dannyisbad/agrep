@@ -422,7 +422,6 @@ class BoundaryRankTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertEqual(boundary_rank.term_variants(token), variants)
         self.assertEqual(boundary_rank.term_anchor("policies"), "polic")
-        self.assertEqual(boundary_rank.term_anchor("tries"), "tries")
 
     def test_normalized_offsets_cover_original_graphemes(self):
         sharp_s = boundary_rank.prepare_query("STRASSE").evaluate("Straße")

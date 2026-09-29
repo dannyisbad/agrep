@@ -2700,9 +2700,11 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         # python row-by-row merge over the whole table (an emoji query measured
         # 492k fetchones, ~5s). The SQL lane scans the same rows in C.
         return None
-    term_specs = _keyword_term_specs(toks)
+    term_specs = ([(toks[0], (toks[0].lower(),))] if len(toks) == 1 else
+                  _keyword_term_specs(toks))
     lows = [token.lower() for token, _variants in term_specs]
-    anchors = [boundary_rank.term_anchor(token) for token, _variants in term_specs]
+    anchors = (lows if len(toks) == 1 else
+               [boundary_rank.term_anchor(token) for token, _variants in term_specs])
     gate = max(0, int(_BOUNDED_KEYWORD_MIN_CANDIDATES))
     try:
         if corpusdb.candidate_count_capped(db, anchors, flt, gate + 1) <= gate:
@@ -6235,13 +6237,11 @@ def _overspec_retry_attempt(q: str, fkw: dict, hits: list[dict], self_policy, *,
                     eligible = False
             if eligible:
                 flt = {key: fkw.get(key) for key in (
-                    "agent", "project", "who", "model", "model_soft", "chat",
+                    "agent", "project", "exclude_project", "who", "model", "model_soft", "chat",
                     "since_ms", "until_ms", "exclude_session",
                     "exclude_session_from_turn", "exclude_family",
                     "_exclude_sessions")}
-                candidates = _excluding_project(
-                    corpusdb.coverage_rank(db, q, _OVERSPEC_SCAN_ROWS, flt),
-                    fkw.get("exclude_project"))
+                candidates = corpusdb.coverage_rank(db, q, _OVERSPEC_SCAN_ROWS, flt)
         except sqlite3.DatabaseError as exc:
             database_error = exc
         finally:
@@ -8699,8 +8699,8 @@ def chats_main(argv: list[str] | None = None) -> int:
         more_command = console.shell_command(
             "agrep", "chats",
             *(("--agent", args.agent) if args.agent else ()),
-            *(("--project", args.project) if args.project else ()),
-            *(("--exclude-project", args.exclude_project)
+            *((f"--project={args.project}",) if args.project else ()),
+            *((f"--exclude-project={args.exclude_project}",)
               if args.exclude_project else ()),
             *(("--since", args.since) if args.since else ()),
             *(("--until", args.until) if args.until else ()),

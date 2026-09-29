@@ -3453,6 +3453,9 @@ def _filter_sql(flt: dict | None) -> tuple[list[str], list]:
     if flt.get("project"):
         where.append("agrep_project_match(project, ?)")
         params.append(flt["project"])
+    if flt.get("exclude_project"):
+        where.append("NOT agrep_project_match(project, ?)")
+        params.append(flt["exclude_project"])
     if flt.get("chat"):  # 8-char id prefix or full session uuid
         where.append("agrep_starts_ci(session, ?)")
         params.append(flt["chat"])
