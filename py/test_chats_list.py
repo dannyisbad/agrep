@@ -143,6 +143,15 @@ class ChatsListTests(unittest.TestCase):
         self.assertIn("side task", out)
         self.assertIn("[side chat]", out)
 
+    def test_no_side_is_the_explicit_default_and_conflicts_with_side(self) -> None:
+        rc, out, err = _run(["--no-side"])
+        self.assertEqual((rc, out, err), _run([]))
+        self.assertNotIn("side task", out)
+        with self.assertRaises(SystemExit) as raised, \
+                contextlib.redirect_stderr(io.StringIO()):
+            _run(["--side", "--no-side"])
+        self.assertEqual(raised.exception.code, 2)
+
     def test_cli_uses_the_shared_legacy_side_classifier(self) -> None:
         legacy = {
             "session": "legacy-child", "agent": "claude",

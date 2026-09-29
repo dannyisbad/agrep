@@ -8512,8 +8512,12 @@ def chats_main(argv: list[str] | None = None) -> int:
                          "or 2026-06-01); content hits must fall inside too")
     ap.add_argument("--until", "--before", dest="until", metavar="WHEN",
                     help="only chats started before WHEN (same formats as --since)")
-    ap.add_argument("--side", action="store_true",
-                    help="include side chats (spawned subagent sessions)")
+    side_group = ap.add_mutually_exclusive_group()
+    side_group.add_argument("--side", action="store_true",
+                            help="include side chats (spawned subagent sessions)")
+    side_group.add_argument("--no-side", dest="side", action="store_false",
+                            help="hide side chats (the default; accepted for "
+                                 "symmetry with search and recall)")
     self_group = ap.add_mutually_exclusive_group()
     self_group.add_argument("--self", dest="include_self", action="store_true",
                             help="include the calling agent's current-window echoes")
