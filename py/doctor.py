@@ -1180,7 +1180,8 @@ def _installed_build_detail(observation: dict) -> str:
     if observation.get("state") != "lagging":
         return detail
     if observation.get("installed_basis") == "distribution-content":
-        detail = "differs from the local checkout"
+        summary = install_lag.format_unreleased_summary(observation.get("unreleased"))
+        detail = "differs from the local checkout" + common.terminal_safe(summary)
     remedy = surface.REMEDIES.get(str(observation.get("remedy") or ""))
     argv = observation.get("remedy_argv")
     if remedy is None or remedy.kind != "consent":

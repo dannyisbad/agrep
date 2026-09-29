@@ -515,17 +515,21 @@ def _local_distribution_ids(
     return installed, source_id, problem
 
 
-def _unreleased_summary(source: Path) -> tuple[str, dict]:
-    unreleased = changelog_unreleased(source)
+def format_unreleased_summary(unreleased: dict | None) -> str:
     if not unreleased or not unreleased["count"]:
-        return "", {}
+        return ""
     count = unreleased["count"]
     since = f" since {unreleased['since']}" if unreleased["since"] else ""
     newest = (f'; newest: "{unreleased["newest"]}"'
               if unreleased["newest"] else "")
     return (f"; the checkout lists {count} unreleased "
-            f"change{'s' if count != 1 else ''}{since}{newest}",
-            {"unreleased": unreleased})
+            f"change{'s' if count != 1 else ''}{since}{newest}")
+
+
+def _unreleased_summary(source: Path) -> tuple[str, dict]:
+    unreleased = changelog_unreleased(source)
+    summary = format_unreleased_summary(unreleased)
+    return summary, {"unreleased": unreleased} if summary else {}
 
 
 def _content_comparison(

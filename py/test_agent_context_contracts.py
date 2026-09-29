@@ -213,6 +213,45 @@ class AgentContextContracts(unittest.TestCase):
             self.assertTrue(common.in_agent_context())
             self.assertEqual(common.calling_session(), "s")
 
+    def test_publication_requires_chronological_caller_ancestry(self) -> None:
+        chain = {4000: 3000, 3000: 2000, 2000: 1}
+        cases = (
+            ("older", 2000,
+             {5000: 400.0, 4000: 300.0, 3000: 200.0, 2000: 100.0}, True),
+            ("same-tick", 2000,
+             {5000: 100.0, 4000: 100.0, 3000: 100.0, 2000: 100.0}, True),
+            ("recycled-parent", 4000,
+             {5000: 300.0, 4000: 400.0, 3000: 200.0, 2000: 100.0}, False),
+            ("recycled-ancestor", 2000,
+             {5000: 400.0, 4000: 300.0, 3000: 100.0, 2000: 200.0}, False),
+            ("recycled-link-before-publisher", 2000,
+             {5000: 400.0, 4000: 200.0, 3000: 300.0, 2000: 100.0}, False),
+        )
+        for label, publisher, births, related in cases:
+            with self.subTest(label=label), contextlib.ExitStack() as stack:
+                self._publication_dir(stack, {
+                    publisher: {"pid": publisher, "sessions": ["published"],
+                                "updated": 500_000},
+                })
+                stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+                stack.enter_context(mock.patch.object(
+                    os, "getpid", return_value=5000))
+                stack.enter_context(mock.patch.object(
+                    os, "getppid", return_value=4000))
+                stack.enter_context(mock.patch.object(
+                    session_context.hookless_proc, "parent_pid",
+                    side_effect=chain.get))
+                stack.enter_context(mock.patch.object(
+                    session_context.hookless_proc, "process_start_time",
+                    side_effect=births.get))
+                publication = session_context.read_caller_publication(publisher)
+                self.assertEqual(publication.sessions, ("published",))
+                self.assertEqual(common.in_agent_context(), related)
+                identity = common.calling_identity()
+                self.assertEqual(identity.session, "published" if related else None)
+                self.assertEqual(
+                    identity.reason, "pi-process" if related else "caller-unresolved")
+
     def test_publication_is_refused_for_a_recycled_or_foreign_pid(self) -> None:
         now_ms = int(time.time() * 1000)
         cases = {

@@ -1712,14 +1712,21 @@ def published_caller() -> CallerPublication | None:
     found = None
     if _private_directory(CALLER_PUBLICATION_DIR):
         pid = key[1]
+        child_start = hookless_proc.process_start_time(os.getpid())
         seen: set[int] = set()
         for _ in range(CALLER_ANCESTRY_MAX_DEPTH):
             if not pid or pid <= 1 or pid in seen:
                 break
             seen.add(pid)
+            parent_start = hookless_proc.process_start_time(pid)
+            # Windows retains an exited parent's pid, even if another process reuses it.
+            if (child_start is not None and parent_start is not None
+                    and parent_start > child_start):
+                break
             found = read_caller_publication(pid)
             if found is not None:
                 break
+            child_start = parent_start
             pid = hookless_proc.parent_pid(pid)
     _PUBLISHED_CALLER_CACHE = (key, found)
     return found

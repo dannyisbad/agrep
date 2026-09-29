@@ -389,6 +389,33 @@ class DoctorRowLanguageTests(unittest.TestCase):
         self.assertIn("(a wheel install); native binary dated 2025-08-26", row)
         self.assertIn("AGREP_SOURCE_DIR=<checkout>", row)
 
+    def test_lagging_install_lists_checkout_changes_beside_the_remedy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "checkout"
+            source.mkdir()
+            (source / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## Unreleased\n\n"
+                "- Semantic search chunks long rows.\n"
+                "- Advisor sidecars index their own voice.\n\n"
+                "## 0.3.1 — 2026-08-26\n\n- Released change.\n",
+                encoding="utf-8")
+            with mock.patch.object(
+                    doctor.install_lag, "_local_distribution_ids",
+                    return_value=("installed", "checkout", None)):
+                observation = doctor.install_lag._content_comparison(
+                    Path(td) / "installed" / "py" / "install_lag.py", source,
+                    deadline=None, source_label="the AGREP_SOURCE_DIR checkout")
+            rendered = _render_report(_report_snapshot(install_lag=observation))
+        row = next(line for line in rendered.splitlines()
+                   if "] installed build" in line)
+        self.assertIn("differs from the local checkout", row)
+        self.assertIn("2 unreleased changes since 0.3.1 — 2026-08-26", row)
+        self.assertIn('newest: "Semantic search chunks long rows."', row)
+        command = console.shell_command(
+            "uv", "tool", "install", "--force", "--from", str(source), "agrep")
+        self.assertIn(
+            surface.render_remedy("replace-installed-tool", command=command), row)
+
     def test_a_checkout_renders_its_unreleased_tail_as_one_row(self) -> None:
         snapshot = _report_snapshot(install_lag={
             "state": "not-installed",
