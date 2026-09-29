@@ -1334,7 +1334,10 @@ def request_recovery_refresh() -> ownerfile.Handle | None:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         return ownerfile.create_exclusive(
             directory / f"{token}.json",
-            json.dumps({"version": 1, "token": token, "pid": os.getpid()}).encode())
+            json.dumps({
+                "version": 1, "token": token, "pid": os.getpid(),
+                "process_start": common.process_start_identity(os.getpid()),
+            }).encode())
     except OSError:
         return None
 
@@ -1387,9 +1390,14 @@ def serve_recovery_requests(ingest: Callable[[], bool]) -> bool:
                 observed, record = request
                 if path.stem != record["token"]:
                     continue
+                owner = ownerfile.classify_process(
+                    record["pid"], record.get("process_start"),
+                    pid_alive=common.pid_alive,
+                    process_start=common.process_start_identity)
+                if owner in {ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED}:
+                    expired.append((path, observed))
+                    continue
                 if path.suffix == ".done":
-                    if not common.pid_alive(record["pid"]):
-                        expired.append((path, observed))
                     continue
                 pending.append((path, observed, record))
                 if len(pending) == 64:

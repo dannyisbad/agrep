@@ -1078,6 +1078,106 @@ class ADelegatedBuildIsAQueuedWorkItem(unittest.TestCase):
             self.assertFalse(indexd_runtime.recovery_refresh_complete(request))
 
 
+class RecoveryRefreshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="agrep-recovery-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for patch in (
+                mock.patch.object(common, "DATA_DIR", self.root),
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}),
+                mock.patch.object(
+                    indexd_runtime, "derived_writes_permitted", return_value=True)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _request(self):
+        request = indexd_runtime.request_recovery_refresh()
+        self.assertIsNotNone(request)
+        self.addCleanup(indexd_runtime.release_recovery_request, request)
+        return request
+
+    def test_clean_ingest_acknowledges_recovery_despite_source_health(self) -> None:
+        import corpusdb
+        import embed
+        import indexer
+        import ownerfile
+        import semantic
+
+        health = self.root / ".source-health.json"
+        health.write_text(json.dumps({
+            "code": "source-unreadable",
+            "issues": [{"path": "/unreadable/history", "reason": "permission denied"}],
+        }), encoding="utf-8")
+        process = mock.Mock(pid=4242, returncode=0)
+        process.communicate.return_value = ("", "")
+        with mock.patch.object(
+                indexd_runtime, "indexd_failure_state", return_value=(0, "", 0.0)), \
+                mock.patch.object(
+                    indexd_runtime, "auto_index_escalated", return_value=False):
+            owner = indexer.AutoIndexer(
+                mock.Mock(), owns_lifetime=lambda: True,
+                owner_snapshot=ownerfile.Snapshot((1, 2, 0, 0), 0.0, b""))
+        with (
+                mock.patch.object(semantic, "source_generation", return_value=None),
+                mock.patch.object(corpusdb, "_read_changed", return_value=None),
+                mock.patch.object(embed, "rebase_generation_marker"),
+                mock.patch.object(
+                    owner, "_launch_index_process",
+                    return_value=(process, None)) as launch,
+                mock.patch.object(owner, "_refresh_search_index", return_value=True),
+                mock.patch.object(owner, "_run_post_index_hooks"),
+                mock.patch.object(common, "process_start_identity", return_value="birth"),
+                mock.patch.object(common, "_close_event_reader"),
+                mock.patch.object(indexd_runtime, "rust_writer_env", return_value={}),
+                mock.patch.object(indexd_runtime, "record_auto_index_health"),
+        ):
+            request = self._request()
+            self.assertTrue(owner._serve_recovery_requests())
+            self.assertTrue(indexd_runtime.recovery_refresh_complete(request))
+            self.assertFalse(owner._serve_recovery_requests())
+        launch.assert_called_once()
+        self.assertFalse(request.path.exists())
+        self.assertEqual(
+            indexd_runtime._source_health_failure().code, "source-unreadable")
+
+    def test_dead_request_is_reaped_without_running_ingest(self) -> None:
+        request = self._request()
+        ingest = mock.Mock(return_value=False)
+        with mock.patch.object(common, "pid_alive", return_value=False):
+            self.assertFalse(indexd_runtime.serve_recovery_requests(ingest))
+        ingest.assert_not_called()
+        self.assertFalse(request.path.exists())
+        self.assertFalse(indexd_runtime.recovery_refresh_complete(request))
+
+    def test_recycled_request_owner_cannot_keep_pending_work_or_receipt(self) -> None:
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                with mock.patch.object(
+                        common, "process_start_identity", return_value="request-birth"):
+                    request = self._request()
+                    if completed:
+                        self.assertTrue(
+                            indexd_runtime.serve_recovery_requests(lambda: True))
+                ingest = mock.Mock(return_value=False)
+                with mock.patch.object(common, "pid_alive", return_value=True), \
+                        mock.patch.object(
+                            common, "process_start_identity", return_value="other-birth"):
+                    self.assertFalse(indexd_runtime.serve_recovery_requests(ingest))
+                ingest.assert_not_called()
+                self.assertFalse(request.path.exists())
+                self.assertFalse(indexd_runtime.recovery_refresh_complete(request))
+
+    def test_unverifiable_live_request_is_not_reaped(self) -> None:
+        request = self._request()
+        with mock.patch.object(common, "pid_alive", return_value=True), \
+                mock.patch.object(
+                    common, "process_start_identity", return_value=None):
+            self.assertTrue(indexd_runtime.serve_recovery_requests(lambda: False))
+        self.assertTrue(request.path.exists())
+        self.assertFalse(indexd_runtime.recovery_refresh_complete(request))
+
+
 class ColdBuildBulkLoad(unittest.TestCase):
     """The cold build's temp file is unlinked on every exit, so it trades the
     rollback journal for the page cache FTS5's merge actually needs."""

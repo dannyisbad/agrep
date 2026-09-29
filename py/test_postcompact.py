@@ -616,6 +616,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(packet["selection"]["boundary_turn"], 8)
         self.assertEqual(stderr, "")
 
+    def test_completed_refresh_does_not_hide_unreadable_sources(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-source-health-") as raw:
+            root = Path(raw)
+            (root / ".source-health.json").write_text(json.dumps({
+                "code": "source-unreadable",
+                "issues": [{"path": "/unreadable/history", "reason": "permission denied"}],
+            }), encoding="utf-8")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(postcompact.common, "DATA_DIR", root), \
+                    mock.patch.object(
+                        postcompact.indexd_runtime, "ensure_index", return_value=True), \
+                    mock.patch.object(
+                        postcompact.session_context, "calling_family_snapshot",
+                        side_effect=self._snapshot), \
+                    contextlib.redirect_stdout(stdout), \
+                    contextlib.redirect_stderr(stderr):
+                rc = postcompact.main(["--json"])
+        packet = json.loads(stdout.getvalue())
+        self.assertEqual((rc, stderr.getvalue()), (2, ""))
+        self.assertEqual(packet["status"], "partial")
+        self.assertIn("/unreadable/history", packet["coverage"]["index_freshness"])
+        self.assertEqual(packet["selection"]["boundary_turn"], 8)
+
     def test_timestamped_recovery_needs_a_published_snapshot_not_global_freshness(
             self) -> None:
         for current, expected_exit in ((True, 0), (False, 2)):
@@ -935,6 +958,70 @@ class AbsenceEvidenceTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             rc = postcompact.main(argv)
         return rc, stdout.getvalue(), stderr.getvalue()
+
+    def _run_pending_boundary(self, *, live_digest):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        waited = []
+
+        def wait_for_refresh(delay):
+            waited.append(delay)
+
+        with (
+                mock.patch.object(postcompact, "_REFRESH_WAIT_S", 8.0),
+                mock.patch.object(postcompact.time, "monotonic", return_value=0.0),
+                mock.patch.object(
+                    postcompact.time, "sleep", side_effect=wait_for_refresh),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "request_recovery_refresh",
+                    return_value="pending"),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "recovery_refresh_complete",
+                    side_effect=lambda _request: bool(waited)),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "release_recovery_request"),
+                mock.patch.object(postcompact.indexd_runtime, "kick_background_repair"),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "ensure_index", return_value=True),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "agent_freshness_notice",
+                    return_value=None),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_read_verified_record",
+                    return_value=self._record()),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_store_paths_census",
+                    return_value={"codex": ["/stores/codex/root.jsonl"]}),
+                mock.patch.object(
+                    postcompact.indexd_runtime, "_store_change_digest",
+                    return_value=live_digest),
+                mock.patch.object(postcompact, "_snapshot_current", return_value=True),
+                mock.patch.object(
+                    postcompact.session_context, "_open_session_family_index",
+                    return_value=None),
+                mock.patch.object(
+                    postcompact.session_context, "calling_family_snapshot",
+                    side_effect=lambda: CliTests._snapshot(8 if waited else None)),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+        ):
+            rc = postcompact.main(["--json"])
+        return rc, json.loads(stdout.getvalue()), stderr.getvalue(), waited
+
+    def test_pending_refresh_does_not_delay_verified_boundary_absence(self) -> None:
+        rc, refusal, stderr, waited = self._run_pending_boundary(
+            live_digest=self._DIGEST)
+        self.assertEqual((rc, stderr, waited), (2, "", []))
+        self.assertEqual(refusal["status"], "boundary_unavailable")
+        self.assertEqual(refusal["absence_proof"], "publication-covered")
+        self.assertNotIn("rows", refusal)
+
+    def test_pending_refresh_still_waits_when_absence_is_unvouched(self) -> None:
+        rc, packet, stderr, waited = self._run_pending_boundary(
+            live_digest="cd" * 32)
+        self.assertEqual((rc, stderr, waited), (0, "", [0.1]))
+        self.assertEqual(packet["status"], "recovered")
+        self.assertEqual(packet["selection"]["boundary_turn"], 8)
+        self.assertNotIn("absence_proof", packet)
 
     def test_covered_transcript_proves_boundary_absence(self) -> None:
         rc, stdout, stderr = \

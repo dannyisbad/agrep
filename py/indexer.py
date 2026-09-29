@@ -1106,7 +1106,8 @@ class AutoIndexer(threading.Thread):
                 f"{streak_before} -> {streak}"
                 + ("" if not err
                    else "; the next escalation requires a success first"))
-        return not err and not pending and indexd_runtime._source_health_failure() is None
+        # A receipt proves this pass completed, not that every source was readable.
+        return not err and not pending
 
     def _run_post_index_hooks(self) -> None:
         with self._lock:

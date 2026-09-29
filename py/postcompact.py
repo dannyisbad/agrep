@@ -455,32 +455,30 @@ def main(argv: list[str] | None = None) -> int:
             refreshed = (None if request is None
                          else indexd_runtime.recovery_refresh_complete(request))
             retry = request is not None and time.monotonic() < deadline
-            if (args.boundary_ms is not None or request is None
-                    or refreshed or not retry):
-                miss: dict[str, str] = {}
-                outcome = _serve(
-                    args, retry_pending=retry or (request is None and not args.no_auto),
-                    miss=miss,
-                    refresh_complete=refreshed)
-                if outcome is not None:
-                    return outcome
-                if miss.get("status") == "boundary_unavailable":
-                    proof = _published_absence_proof(miss.get("session", ""))
-                    if proof is not None:
-                        outcome = _serve(
-                            args, retry_pending=False, absence_proof=proof,
-                            refresh_complete=refreshed)
-                        assert outcome is not None
-                        return outcome
-                if request is None:
-                    outcome = _serve(args, retry_pending=False)
+            miss: dict[str, str] = {}
+            outcome = _serve(
+                args, retry_pending=retry or (request is None and not args.no_auto),
+                miss=miss,
+                refresh_complete=refreshed)
+            if outcome is not None:
+                return outcome
+            if miss.get("status") == "boundary_unavailable":
+                proof = _published_absence_proof(miss.get("session", ""))
+                if proof is not None:
+                    outcome = _serve(
+                        args, retry_pending=False, absence_proof=proof,
+                        refresh_complete=refreshed)
                     assert outcome is not None
                     return outcome
-                if refreshed:
-                    indexd_runtime.release_recovery_request(request)
-                    request = indexd_runtime.request_recovery_refresh()
-                    if request is not None:
-                        indexd_runtime.kick_background_repair()
+            if request is None:
+                outcome = _serve(args, retry_pending=False)
+                assert outcome is not None
+                return outcome
+            if refreshed:
+                indexd_runtime.release_recovery_request(request)
+                request = indexd_runtime.request_recovery_refresh()
+                if request is not None:
+                    indexd_runtime.kick_background_repair()
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
     finally:
         if request is not None:
@@ -729,7 +727,12 @@ def _finish(args, packet: dict, *, retry_pending: bool,
             current = drift.state == "current" and not drift.absorbed
         if not current and not requested_snapshot and retry_pending:
             return None
-        if current:
+        source_failure = indexd_runtime._source_health_failure()
+        if source_failure is not None:
+            packet["status"] = "partial"
+            packet["coverage"]["index_freshness"] = (
+                indexd_runtime.agent_freshness_notice() or source_failure.reason)
+        elif current:
             packet["coverage"]["index_freshness"] = "fresh"
         elif requested_snapshot:
             packet["coverage"]["index_freshness"] = "indexed-snapshot"
