@@ -9,33 +9,37 @@
   native boundary evaluations. Grouped semantic scans skip losing group heads
   and use an exact AVX2 q8 fast path with a signed-minimum fallback.
 
-- Caller identity reaches tool shells. Under oh-my-pi, `agrep search`/`recall`
-  run from tool shells never knew which session was calling: omp's tool shells
-  inherit a one-time environment snapshot, so the extension's
-  `AGREP_PI_SESSION_ID` export never reached them, and every search returned
-  the current conversation's own rows ranked first, silently. The pi/omp
-  extension now also publishes `{pid, sessions[]}` for its process to
-  `/tmp/agrep-caller-v1-<uid>/<pid>.json` (0600, atomic, deleted when the
-  last session leaves) and agrep resolves the caller by walking its own parent
-  chain; a record with a recycled pid is refused. Several sessions in one
-  process (root, advisor, subagents) share one record instead of overwriting
-  one env var.
-- Never-compacted sessions get a live window. Automatic self-exclusion
-  required an indexed compaction recap, so it did nothing for ~95% of sessions
-  even with a known caller. A resolved caller with no recap row is windowed
-  from turn 0; a malformed recap row still fails open. `--self` help and the
-  codex/Claude compaction payloads state that labeling depends on identifying
-  the caller.
-- An agent shell with an unknown caller is disclosed: search and recall prose
-  surfaces print one stderr line (`agent shell, caller unknown: ...`, or the
-  identity-conflict variant) instead of failing open silently. `--no-self`,
-  `--json` and `--self` renders are unchanged.
-- The family index no longer degrades silently. While a store drifted past the
-  published `family_stamp`, `-l`/search/chats rows lost `[side chat]` marks and
-  printed full 36-char ids. Display readers now serve the last published family
-  index and print one line (`family index behind: side-chat marks and short
-  handles may lag`); generation-bound readers (`postcompact`, query-time family
-  expansion) stay strict.
+### Agent coverage
+
+- The omp/pi advisor sidecar's own voice is indexed. Advisor streams hold
+  synthetic transcript mirrors (skipped as sidechain duplicates) plus the
+  advisor's assistant records; because assistant text previously attached
+  only as a reply to the preceding user row, and every user row in an
+  advisor stream is a skipped mirror, the advisor's entire analysis was
+  unsearchable. Text-bearing advisor messages are now their own side-stream
+  rows under the watched session's family; pure-thinking records and the
+  mirrors still index nothing. On one real 71k-line sidecar: 2,542 advisory
+  rows surface, 8,172 mirrors stay skipped.
+- pi/omp sessions whose header id changed keep their filename id as an
+  alias. Both ids resolve to the same chat for caller self-exclusion,
+  `postcompact` and session-handle lookup, and side chats rejoin that family
+  instead of staying attached to an orphaned filename id. Ambiguous aliases
+  are ignored with a warning; result handles still verify their turn,
+  content digest and tool event before serving anything.
+- Codex Desktop's human submissions are searchable. The adapter recognizes
+  `item_completed` events carrying `UserMessage` items as well as the CLI's
+  older submission log, so Desktop turns no longer disappear for lack of a
+  legacy `user_message` event. Desktop evidence must match the response's
+  thread, turn and text; routed copies and injected input still do not
+  count as human prose. Existing parse caches are reparsed.
+- Claude sessions under a repository container such as
+  `~/Desktop/projects/<repo>` or a macOS temp root (`/private/tmp/<repo>`,
+  `$TMPDIR/<repo>`) are labelled by the repository (`shop`), not the
+  container (`projects`, `private`), matching the other adapters. Takes
+  effect after `agrep reindex --full`.
+
+### Search
+
 - `--project` and `--exclude-project` (search, recall, pack, chats) match a
   chat's stored project label exactly, or its last path segment,
   case-insensitively, instead of as a substring: `--project shop` reaches a
@@ -50,128 +54,127 @@
   filesystem root; continuation and larger-page commands re-spell it as the
   resolved `--project=`.
 - `--no-side` on search and recall hides side-chat sessions using the same
-  hidden set `chats` builds, so `agrep <q> -l --no-side` lists no `[side chat]`
-  rows. `--no-who subagent` remains a speaker-row filter and its help no longer
-  claims to hide side chats; `--all-side-chats` is documented as the semantic
-  ranking-slot switch.
+  hidden set `chats` builds, so `agrep <q> -l --no-side` lists no
+  `[side chat]` rows. `chats --no-side` explicitly selects its default
+  visibility instead of failing with `unrecognized arguments`, and is
+  mutually exclusive with `--side`. `--no-who subagent` remains a
+  speaker-row filter and its help no longer claims to hide side chats;
+  `--all-side-chats` is documented as the semantic ranking-slot switch.
 - `agrep chats` gains `--project`, `--exclude-project`, `--here`, `--since`,
   `--until`, `--self` and `--no-self`; the scope applies to the identity
   listing and the content lane, and the larger-page command carries every
-  flag. In an agent shell the calling chat's live-window rows are dropped (the
-  previous branch never fired), counted, and disclosed on stderr; kept rows
-  from the caller's family carry `~self`. `chats --json` content rows carry
-  `score`, `matched`, `who` and `match_ts`, so "best match first" is
-  explainable from the output. The human age column shows the matched turn's
-  age when a pattern was given; equal bands tie-break newest first. `chats
-  --help` and the top-level help describe the lookup (adjacent phrase first,
-  then all words anywhere, best turn per chat, top max(20, 2N) chats
-  content-ranked). `AGREP_TIMING=1 agrep chats ...` attributes identity-index
-  build, content query and render as separate laps.
-- `-l` rows end with the head row's age, so `--sort time` is readable from the
-  terminal. The piped `-l` footer no longer splices a row count into the chat
-  sentence: it reads `showing 8 of 290 chats (941 matching rows are tool
-  output)`; row-unit footers keep `(N of them in tool output)`; `--json`
-  completeness carries the same number as `tool_rows`.
-- Copyable commands on POSIX shells print result handles bare
-  (`agrep around @01a046db:10.2685~a8f7...:214-222`) instead of single-quoted;
-  a `~` after a digit never tilde-expands. Matches the Windows renderer.
+  flag. In an agent shell the calling chat's live-window rows are dropped
+  (the previous branch never fired), counted, and disclosed on stderr; kept
+  rows from the caller's family carry `~self`. `chats --json` content rows
+  carry `score`, `matched`, `who` and `match_ts`, so "best match first" is
+  explainable from the output. The human age column shows the matched
+  turn's age when a pattern was given; equal bands tie-break newest first.
+  `chats --help` and the top-level help describe the lookup (adjacent phrase
+  first, then all words anywhere, best turn per chat, top max(20, 2N) chats
+  content-ranked). `AGREP_TIMING=1 agrep chats ...` attributes
+  identity-index build, content query and render as separate laps.
+- Session views (`-l --sort score` and content-ranked `chats`) pick and
+  order chat heads by a lane-folded score (phrase x1.0, all-terms x0.7,
+  content fallback x0.5) instead of lane-first, so a strong human prose hit
+  represents a chat ahead of a weak phrase echo inside tool output.
+  `-l --sort time` keeps recency order and represents each chat by its
+  newest matching turn. Row search keeps its structural phrase-first order.
+  Exposed as `run_query(session_view_rank=True)`.
+- `-l` rows end with the head row's age, so `--sort time` is readable from
+  the terminal. The piped `-l` footer no longer splices a row count into the
+  chat sentence: it reads `showing 8 of 290 chats (941 matching rows are
+  tool output)`; row-unit footers keep `(N of them in tool output)`;
+  `--json` completeness carries the same number as `tool_rows`.
 - Multi-word keyword search folds minimal singular/plural spellings (`s`,
   `es`, `ies`) in the all-terms lane, so `don calls` finds a chat that said
   `before this call`. The original spelling is always kept, short and
   non-alphabetic tokens stay exact, and the adjacent-phrase lane never folds.
 - All-terms scoring measures term proximity from the same best-aligned
   occurrence the boundary factor grades, scaled by that occurrence's edge
-  quality. A word fragment next to another query term (`calls dont` for `don
-  calls`) no longer earns a near-phrase bonus; the row keeps the 0.5 proximity
-  floor. Snippets anchor on the aligned occurrence rather than the first
-  substring, in every engine: single-token snippets from the SQL lane, the
-  JSONL scan and the Rust fallback scanner now pick the same occurrence. The
-  Rust scanner and the Python scorer agree via the updated exact-score
+  quality. A word fragment next to another query term (`calls dont` for
+  `don calls`) no longer earns a near-phrase bonus; the row keeps the 0.5
+  proximity floor. Snippets anchor on the aligned occurrence rather than the
+  first substring, in every engine: single-token snippets from the SQL lane,
+  the JSONL scan and the Rust fallback scanner now pick the same occurrence.
+  The Rust scanner and the Python scorer agree via the updated exact-score
   conformance fixture.
-- Session views (`-l` and content-ranked `chats`) pick and order chat heads by
-  a lane-folded score (phrase x1.0, all-terms x0.7, content fallback x0.5)
-  instead of lane-first, so a strong human prose hit represents a chat ahead
-  of a weak phrase echo inside tool output. Row search keeps its structural
-  phrase-first order. Exposed as `run_query(session_view_rank=True)`.
-- Claude sessions under a repository container such as `~/Desktop/projects/<repo>`
-  or a macOS temp root (`/private/tmp/<repo>`, `$TMPDIR/<repo>`) are labelled by
-  the repository (`shop`), not the container (`projects`, `private`), matching
-  the other adapters. Takes effect after `agrep reindex --full`.
-- Meaning rows no longer displace exact-phrase hits on a weak cousin's say-so.
-  In the automatic hybrid merge a semantic row counted as corroborated when
-  any lexical row shared its conversation family, including scatter scoring
-  0.26, and every meaning row up to that one was emitted first; under
-  `--project` that pushed both exact-phrase hits off a three-row page.
-  Corroboration now requires a strong lexical row in the family whenever the
-  lexical lane has one. The recall preamble says where the rows landed (`N
-  semantic rows placed after exact matches` / `... lead: no exact match`).
-- Semantic rows are anchored on the query's content words. A row whose full
-  indexed text carries fewer than half of the query's content terms is labeled
-  a weak meaning match at any cosine and sorts after confident meaning rows,
-  because one shared noun buys a strong-band score on its own (`never promise
-  a login` scored 0.86 against `hello? login isnt working`).
-- Semantic score bands have a committed calibration baseline.
-  `bench/semantic_calibration.py` with `bench/fixtures/semantic_calibration.json`
-  measures unrelated, same-topic, shared-noun and paraphrase cosine levels on
-  the pinned model and reports where the floor (0.82) and strong (0.84) bands
-  sit against them; the numbers are recorded in `bench/SEMANTIC_SCALE.md`. The
-  bands themselves are unchanged pending a rerun of the private 20-task
-  fixture. Measured int8 batch-padding drift (up to 0.021 on a row's score) is
-  documented beside the bands.
-- Recall `--json` reports `matched: "semantic"` on semantic-only hits instead
-  of the `"phrase"` default; `sem_score` remains the cosine and `score` the
-  display prior.
-- `agrep doctor --deep` no longer aborts (SIGABRT) on a Mac without a Metal
-  device: `mlx_embed.available()` imports `mlx.core` once per process and
-  remembers the answer, so doctor's second capability check never re-runs the
-  extension init that nanobind refuses. `--no-semantic` is accepted with
-  `--deep` and keeps the semantic tier at routine depth.
-- The `embedding lane` row on `agrep status`/`doctor` is informational
-  (`[-- ]`) while the lane that built the store opens on this machine; it warns
-  only when a metal store cannot open here. Every healthy box used to carry a
-  permanent `[!! ]` for a lane fact.
-- `agrep status` explains a stale wheel install: a package with no PEP 610
-  local-source provenance is compared against the checkout named by
-  `AGREP_SOURCE_DIR`; a lagging result lists the checkout's unreleased
-  CHANGELOG entries beside the replace remedy. Running from a checkout renders
-  its own `source checkout` row.
-- Forced meaning search (`-s`) can no longer wait forever in silence: when the
-  resident semantic worker is unreachable the read-only local pass is bounded
-  at 30 s, and after 2 s stderr names what it is waiting on. Waiting on another
-  process's model download discloses the holder pid and the bound after 2 s.
-- `agrep around` gains `--whole` (also `-C all`): the entire chat, root prose,
-  the usual per-message cap; `--whole --who user` is the compact transcript.
-  Every `[+N chars - ...]` cap marker in `around` and `recall` points at the
-  lever that lifts it, `agrep around <session> <turn> -C 0 --max-chars 0`,
-  instead of the forensic `--full` stream; the tool-collapse pointer keeps
-  `--full`. Under `--who`, the scope line points at the same read without
-  `--who` rather than at `--full`.
-- The uninstall sentinel waits five minutes, not twenty seconds, before it
-  treats a missing `cli.py` as an uninstall. A reinstall that rebuilds from
-  source (`uv tool install --reinstall --from .`, an upgrade without a
-  matching wheel) keeps the file gone for a minute or more, and the sentinel
-  stripped every agent's taught block in that window; `agrep setup` then
-  re-added them as new blocks, so an edited block's disclosure was lost.
-- Empty semantic coordination namespaces under `/tmp` are reaped. Every
-  sandboxed data dir mints `agrep-semantic-v1-<uid>-<digest>/` and nothing
-  deleted it (286 on one development box); a starting worker now removes
-  sibling namespaces that hold no record and were last touched over an hour
-  ago, never a non-empty or foreign-owned one.
-- Instruction block v38 speaks to every agent in the second person (the
-  per-agent name slots are gone, so each non-codex target receives identical
-  bytes) and teaches the cross-project index: read the project and age on
-  every `chats` and `-l` row, scope with `--project`/`--here`/`--since`, hide
-  side chats with `--no-side`, treat meaning-match rows as leads and use
-  `--lexical` for exact phrases, open whole chats with `around --whole`, and
-  rely on the fixed self-echo behavior. Examples are generic. The codex block
-  carries the same facts.
-- `agrep setup` and the background reconcile tell an edited instruction block
-  from a shipped one by hashing its body against the digests agrep has shipped
-  (v37 onward). A same-version block whose text was edited is reported as
-  `edited` in `teach-reconcile.json` and `agrep status` (kept as is, never
-  rewritten in the background) instead of being classified clean; an explicit
-  `agrep setup` that ships a newer version prints `replacing an edited v37
-  block with v38 in <path>`. The status remedy says what a re-sync does.
+- The term-coverage retry reaches the pages it exists for. Search offers it
+  on an empty or query-echo-only page without first proving the query holds
+  filler words (it still needs a whitespace-shaped query of at least five
+  distinct terms, and a page with weak lexical hits still needs narration
+  evidence), and after an automatic meaning-only page. `recall` offers it on
+  an empty prose page unless `--lexical` is set, and after a pack holding
+  only meaning rows, weak scatter or echoes. Explicit semantic and lexical
+  modes never trigger it. Its candidates respect `--exclude-project`, which
+  they previously bypassed. Concise recall keeps the best recovered row with
+  its measured term coverage and a command for the full coverage page,
+  instead of replacing evidence it already retrieved with a request to
+  search again, and never spends that slot on the caller's own `~self` tool
+  rows. Generated `--coverage` commands keep the original scope and filters.
+  Recovered rows stay a separate stderr block, outside the pack, counts and
+  exit status.
+- `recall --probe` no longer takes the caller's own words as confident past
+  context. A phrase found only in the caller's command input - including
+  relay messages and search arguments in `~self` tool rows - or in caller
+  prose quoting a multi-term query cannot supply the pointer, and such
+  echoes no longer suppress the tool or meaning fallbacks. The check uses
+  the exact tool event and the active keyword, word or regex matcher; a
+  match also present in retained tool output stays eligible. Ordinary
+  recall rows and explicit handle reads are unchanged.
+- Compact query-echo demotion checks the actual result row, including its
+  timestamp, content digest and tool-event identity when available. It no
+  longer borrows the first row sharing a session, turn and speaker, which
+  could mistake genuine output for a neighbouring query echo or let an echo
+  lead the page.
+- Regex search (`-E`) applies `AGREP_REGEX_TIMEOUT_S` to each regex
+  operation, not the whole search: a large scan of cheap matches finishes,
+  while a pathological match or highlight is still stopped in the isolated
+  worker. The refusal says `a regex operation exceeded` the limit and
+  suggests simplifying the pattern or raising the per-operation limit.
+  Indexed scans narrow candidates with every required literal run instead
+  of only the longest one.
+- Copyable commands on POSIX shells print result handles bare
+  (`agrep around @01a046db:10.2685~a8f7...:214-222`) instead of
+  single-quoted; a `~` after a digit never tilde-expands. Matches the
+  Windows renderer.
+- `agrep around` gains `--whole` (also `-C all`): the entire chat, root
+  prose, the usual per-message cap; `--whole --who user` is the compact
+  transcript. Every `[+N chars - ...]` cap marker in `around` and `recall`
+  points at the lever that lifts it,
+  `agrep around <session> <turn> -C 0 --max-chars 0`, instead of the
+  forensic `--full` stream; the tool-collapse pointer keeps `--full`. Under
+  `--who`, the scope line points at the same read without `--who` rather
+  than at `--full`.
+- Recall headers keep the result handle, agent, project, age and meaning or
+  provenance marks without repeating numeric scores and an `around` command
+  on every row. Probe pointers and misses are shorter, and `around` prints
+  omission counts and a widening command only when something is hidden or
+  the conversation role needs disclosure, rather than adding a scope
+  preamble to an ordinary whole-chat or latest-tail read.
+- Search and recall misses describe the indexed snapshot, not an index
+  current to the millisecond. A verified snapshot stays usable during a
+  healthy background refresh, and ordinary semantic misses tolerate
+  live-update lag while both embedding and accelerator coverage reach 99%;
+  the allowance scales with the corpus rather than stopping at 64 rows.
+  Such misses exit 1 without a catching-up warning. Larger or unknown gaps,
+  failed integrity checks and `--no-auto` misses still exit 2, and exact
+  counts still require complete coverage.
+- Keyword search can serve a verified committed JSONL snapshot while an
+  ownership adoption or indexing pass holds the writer lock and SQLite is
+  unavailable; the lock alone no longer forces a publication wait. Missing,
+  moving or damaged snapshots still get a bounded retry, and after one
+  second the error says `no verified transcript snapshot became available
+  within 1s`.
+- The family index no longer degrades silently. While a store drifted past
+  the published `family_stamp`, `-l`/search/chats rows lost `[side chat]`
+  marks and printed full 36-char ids. Display readers now serve the last
+  published family index and print one line (`family index behind:
+  side-chat marks and short handles may lag`). Query-time family expansion
+  stays generation-bound; compaction recovery may serve a coherent prior
+  publication as a partial packet with an `index_freshness` disclosure.
+
+### Semantic search
+
 - Semantic search chunks long rows instead of embedding only their opening
   bytes. The embedder truncates at its model window, so a multi-megabyte
   row (a compaction recap, a giant paste) used to embed as its first ~4KB
@@ -182,22 +185,270 @@
   `#r` reply convention extended); recap rows additionally skip the
   structural resume-instruction preamble so their vectors carry content.
   Query-side, chunk hits max-pool back to their logical row, which appears
-  at most once in results.
-- The omp/pi advisor sidecar's own voice is indexed. Advisor streams hold
-  synthetic transcript mirrors (skipped as sidechain duplicates) plus the
-  advisor's assistant records; because assistant text previously attached
-  only as a reply to the preceding user row, and every user row in an
-  advisor stream is a skipped mirror, the advisor's entire analysis was
-  unsearchable. Text-bearing advisor messages are now their own side-stream
-  rows under the watched session's family; pure-thinking records and the
-  mirrors still index nothing. On one real 71k-line sidecar: 2,542 advisory
-  rows surface, 8,172 mirrors stay skipped.
-- `agrep postcompact` proves a no-boundary refusal from the freshness
-  daemon's published coverage evidence instead of re-running up to three
-  full ingests with bounded sleeps: verified absence now answers in ~0.4s
-  instead of ~8s. Every evidence shortfall - a grown transcript, a missing
-  or future-dated record, an oversized store - still pays the full pass;
-  absence stays verified absence.
+  at most once in results. Historical long rows upgrade on
+  `agrep reindex --full`.
+- Meaning rows no longer displace exact-phrase hits on a weak cousin's
+  say-so. In the automatic hybrid merge a semantic row counted as
+  corroborated when any lexical row shared its conversation family,
+  including scatter scoring 0.26, and every meaning row up to that one was
+  emitted first; under `--project` that pushed both exact-phrase hits off a
+  three-row page. Corroboration now requires a strong lexical row in the
+  family whenever the lexical lane has one.
+- Semantic rows are anchored on the query's content words. A row carrying
+  less than half of the query's content-term weight is labeled a weak
+  meaning match at any cosine and sorts after confident meaning rows,
+  because one shared noun buys a strong-band score on its own (`never
+  promise a login` scored 0.86 against `hello? login isnt working`). When
+  complete corpus frequencies are available for a bounded multi-term query,
+  rarer terms weigh more; otherwise terms count equally.
+- Semantic score bands have a committed calibration baseline.
+  `bench/semantic_calibration.py` with
+  `bench/fixtures/semantic_calibration.json` measures unrelated, same-topic,
+  shared-noun and paraphrase cosine levels on the pinned model and reports
+  where the floor (0.82) and strong (0.84) bands sit against them; the
+  numbers are recorded in `bench/SEMANTIC_SCALE.md`. The bands themselves
+  are unchanged pending a rerun of the private 20-task fixture. Measured
+  int8 batch-padding drift (up to 0.021 on a row's score) is documented
+  beside the bands.
+- Meaning search can use its last verified segmented index while the next
+  ingest publishes, instead of treating the marker handoff as an
+  unavailable lane. The saved index must match the committed ingest
+  signature; missing proofs and mismatched signatures still refuse the
+  read. These answers are marked as published coverage, and recovery no
+  longer waits for an active writer when that snapshot is already
+  queryable.
+- An unavailable optional meaning lane no longer turns a completed keyword
+  search into an error exit: search discloses `meaning unavailable;
+  keyword-only` and keeps the keyword result's exit status. A recall/probe
+  miss whose requested meaning lane never ran still exits 2.
+- The keyword-only fallback says why. An automatic meaning-lane exception is
+  reported instead of dropped, with a bounded, terminal-safe message for
+  unknown causes; permission failures no longer blame a sandbox or
+  prescribe an unsandboxed shell. A lane that answered with partial
+  coverage reads `meaning coverage is partial`, not keyword-only, and probe
+  miss classification no longer calls an incomplete answer an unavailable
+  lane.
+- Semantic and hybrid result totals use the same completeness checks as
+  their absence verdicts: an answered lane with unknown completeness, a
+  rejected generation or untrusted rows can no longer claim exact totals
+  because another status field says complete, and hybrid results keep an
+  inexact keyword total inexact.
+- Bounded meaning-lane notices keep the beginning and end of a long
+  diagnostic, cutting at word boundaries so a trailing recovery command
+  survives. An unvalidated meaning index says `meaning index generation is
+  not validated; retry with agrep -s` instead of leaving the refusal
+  without a next step.
+- Recall `--json` reports `matched: "semantic"` on semantic-only hits
+  instead of the `"phrase"` default; `sem_score` remains the cosine and
+  `score` the display prior.
+- Forced meaning search (`-s`) can no longer wait forever in silence: when
+  the resident semantic worker is unreachable the read-only local pass is
+  bounded at 30 s, and after 2 s stderr names what it is waiting on.
+  Waiting on another process's model download discloses the holder pid and
+  the bound after 2 s.
+- The semantic worker warms the store's embedding model before accepting
+  requests, instead of spending the first query's short deadline loading it
+  and being retired for the timeout. A launch that outlasts discovery keeps
+  its startup claim while the child is still booting.
+- Empty semantic coordination namespaces under `/tmp` are reaped. Every
+  sandboxed data dir mints `agrep-semantic-v1-<uid>-<digest>/` and nothing
+  deleted it (286 on one development box); a starting worker now removes
+  sibling namespaces that hold no record and were last touched over an hour
+  ago, never a non-empty or foreign-owned one.
+
+### Post-compact recovery
+
+- `agrep postcompact` leaves indexing to the freshness daemon. It requests
+  a background source and search-database refresh - also when the daemon
+  is already running - and waits up to eight seconds for that request's
+  completion receipt, never running a foreground ingest that competes with
+  the daemon for the ingest lock. A live daemon or unchanged family
+  metadata no longer makes an older recap snapshot look fresh: recovery
+  checks the full database source stamp. Once a completed refresh shows no
+  boundary it refuses at once instead of retrying to the bound, and when
+  the daemon's published coverage already vouches for the caller's
+  transcript at its current size and mtime the refusal needs no further
+  refresh cycle; every evidence shortfall still waits for fresh proof, so
+  absence stays verified absence. An unfinished refresh leaves an available
+  committed packet marked partial. The pending request and any completion
+  receipt are released on exit.
+- Pi/OMP recovery names the compaction that triggered it:
+  `agrep postcompact --boundary-ms <timestamp>` selects that exact recap,
+  never an older or later one, and can serve it straight from a verified
+  committed generation without waiting for a refresh (coverage reports
+  `index_freshness: indexed-snapshot`). An unrelated source failure no
+  longer blocks an already verified packet, and a partial fallback never
+  substitutes a different recap. If the transcript flush misses the first
+  refresh, another is requested within the same deadline; a missing target
+  stays `boundary_pending`, and a missing session is reported as absent
+  from the published snapshot, not as proof its source never compacted.
+  Manual calls without a timestamp still select the newest recap. `agrep
+  setup` recognizes the previously shipped recovery extension and upgrades
+  it to the timestamp-scoped commands; edited extensions stay untouched.
+
+### Caller identity and self-exclusion
+
+- Caller identity reaches tool shells. Under oh-my-pi, `agrep
+  search`/`recall` run from tool shells never knew which session was
+  calling: omp's tool shells inherit a one-time environment snapshot, so the
+  extension's `AGREP_PI_SESSION_ID` export never reached them, and every
+  search returned the current conversation's own rows ranked first,
+  silently. The pi/omp extension now also publishes `{pid, sessions[]}` for
+  its process to `/tmp/agrep-caller-v1-<uid>/<pid>.json` (0600, atomic,
+  deleted when the last session leaves) and agrep resolves the caller by
+  walking its own parent chain; a record with a recycled pid is refused.
+  Several sessions in one process (root, advisor, subagents) share one
+  record instead of overwriting one env var. The publisher refuses
+  symlinked or foreign-owned publication directories and tightens an owned
+  one to 0700 before writing; the reader accepts only an owned 0700
+  directory, so a directory pre-created by another user under `/tmp` never
+  receives session ids.
+- Never-compacted sessions get a live window. Automatic self-exclusion
+  required an indexed compaction recap, so it did nothing for ~95% of
+  sessions even with a known caller. A resolved caller with no recap row is
+  windowed from turn 0; a malformed recap row still fails open. `--self`
+  help and the codex/Claude compaction payloads state that labeling depends
+  on identifying the caller.
+- Automatic self-exclusion covers the caller's descendants: chats spawned
+  at or after the caller's latest recap are hidden (all of them for a
+  never-compacted caller), older descendants stay searchable as `~self`, and
+  a child caller never hides its parents or siblings. Previously only the
+  caller's own turns were windowed, so freshly spawned subagents echoed the
+  same live context. Exclusions already supplied by `--no-side` are kept,
+  and meaning search accepts more than four excluded sessions instead of
+  rejecting the query as `invalid semantic filter`.
+- An agent shell with an unknown caller is disclosed: search and recall
+  prose surfaces print one stderr line (`agent shell, caller unknown: ...`,
+  or the identity-conflict variant) instead of failing open silently.
+  `--no-self`, `--json` and `--self` renders are unchanged.
+
+### Status, doctor and setup
+
+- `agrep status` explains a stale wheel install: a package with no PEP 610
+  local-source provenance is compared against the checkout named by
+  `AGREP_SOURCE_DIR`; a lagging result lists the checkout's unreleased
+  CHANGELOG entries beside the replace remedy, and a content-only
+  comparison says the install `differs from the local checkout` rather than
+  asserting it is older. Running from a checkout renders its own
+  `source checkout` row.
+- The `embedding lane` row on `agrep status`/`doctor` is informational
+  (`[-- ]`) while the lane that built the store opens on this machine; it
+  warns only when a metal store cannot open here. Every healthy box used to
+  carry a permanent `[!! ]` for a lane fact. A CPU-built store on a Mac with
+  Metal installed points to `agrep doctor --deep` to confirm the GPU lane
+  opens instead of recommending a full rebuild on installation evidence
+  alone, and setup and status stop presenting one benchmark host's GPU
+  speedup as a property of this machine.
+- `agrep doctor --deep` no longer aborts (SIGABRT) on a Mac without a Metal
+  device: `mlx_embed.available()` imports `mlx.core` once per process and
+  remembers the answer, so doctor's second capability check never re-runs
+  the extension init that nanobind refuses. `--no-semantic` is accepted
+  with `--deep` and keeps the semantic tier at routine depth, and
+  `agrep doctor --deep --fix --no-semantic` now also skips the semantic
+  model prefetch (`semantic tier untouched (--no-semantic).`) instead of
+  downloading the model after the report.
+- `agrep status` reuses the ingest binary identity recorded by the last
+  writable indexing pass while the resolved binary's file identity still
+  matches, instead of probing the binary again; writers still verify the
+  bytes themselves. When the identity cannot be verified, status defers its
+  daemon-compatibility and database-readiness verdicts and `doctor` reports
+  the database `not verified` (`writer-identity-unavailable`) instead of
+  treating a missing local identity as proof that another installation owns
+  the database or that it is unreadable.
+- `agrep doctor` no longer recommends installing Rust when an ingest binary
+  is already available; that advice is reserved for a missing binary on a
+  machine without the toolchain.
+- `agrep setup` names the tiers its routine probe did not verify and points
+  to `agrep doctor --deep`; its `tiers now` line previously listed only
+  proven tiers, leaving unrun checks indistinguishable from unavailable
+  capabilities.
+- Unexpected CLI failures keep their exception class and message without
+  `AGREP_DEBUG`. Every unclassified failure used to become `agrep hit an
+  unexpected error` with a generic `doctor` command, hiding the cause;
+  known failures keep their specific remedies.
+- `agrep remove` waits for semantic workers that are still starting before
+  reporting a successful teardown. A spawned child could outlive its launch
+  claim without registering an owner, leaving a process and an open log
+  handle behind; startup handoffs now stay tracked until ownership or exit,
+  and an unsettled child blocks removal instead of being overlooked.
+
+### Teaching your agents
+
+- Instruction block v38 speaks to every agent in the second person (the
+  per-agent name slots are gone, so each non-codex target receives
+  identical bytes) and teaches the cross-project index: read the project and
+  age on every `chats` and `-l` row, scope with `--project`/`--here`/
+  `--since`, hide side chats with `--no-side`, treat meaning-match rows as
+  leads and use `--lexical` for exact phrases, open whole chats with
+  `around --whole`, and rely on the fixed self-echo behavior. Examples are
+  generic. The codex block carries the same facts.
+- `agrep setup` and the background reconcile tell an edited instruction
+  block from a shipped one by hashing its body against the digests agrep
+  has shipped (v37 onward). A same-version block whose text was edited is
+  reported as `edited` in `teach-reconcile.json` and `agrep status` (kept
+  as is, never rewritten in the background) instead of being classified
+  clean; an explicit `agrep setup` that ships a newer version prints
+  `replacing an edited v37 block with v38 in <path>`. The status remedy says
+  what a re-sync does.
+- Setup guidance states that search works without agent instruction blocks.
+  Headless setup and the enrollment reminder claimed agents could not use
+  agrep until setup wrote their instructions; the blocks teach the tool's
+  existence and use, they do not enable search.
+- The uninstall sentinel waits five minutes, not twenty seconds, before it
+  treats a missing `cli.py` as an uninstall. A reinstall that rebuilds from
+  source (`uv tool install --reinstall --from .`, an upgrade without a
+  matching wheel) keeps the file gone for a minute or more, and the
+  sentinel stripped every agent's taught block in that window; `agrep
+  setup` then re-added them as new blocks, so an edited block's disclosure
+  was lost.
+- Cleanup sentinels are scoped to the resolved data directory on macOS,
+  Linux and Windows, including the Windows watcher mutex, so setting up or
+  removing a second data root no longer overwrites or removes the first
+  root's scheduler job. An old unscoped job is retired only when its
+  registered command names this root's sentinel.
+
+### Index integrity and ownership
+
+- Native upgrades keep durable ownership while rebuilding an incompatible
+  parse cache, so the successor daemon does not lose its ownership fence
+  mid-reparse. Supported older caches are adopted with their last-good rows
+  intact until source reads succeed, and an incompatible foreign cache is
+  reconstructed in the same ingest instead of needing another invocation.
+  Missing or unreadable sources still cannot replace the published
+  generation, and an undecodable unowned cache is kept with takeover
+  refused.
+- Indexing can restore a missing durable owner when both the owner anchor
+  and the parse cache are gone but `corpus.db` still names the current
+  writer; that state used to block the very ingest needed to repair it.
+  Only the canonical Rust ingest may restore ownership, daemon and semantic
+  writers stay fenced until it succeeds, and a foreign or unverifiable
+  database owner does not qualify.
+- Parser exclusions can remove previously cached rows and tool events: a
+  complete empty reparse of an unchanged, verified source now replaces its
+  old material instead of keeping excluded content searchable and warning
+  about source health indefinitely. Changed or unverified sources and
+  incomplete reads keep the last-good guard, and an empty Claude parse with
+  malformed JSONL counts as a read failure, not a policy exclusion.
+- Malformed cached message or reply rows keep invalidating fallback search
+  results on every read. The first read recorded the damage, but a cached
+  retry could forget it and claim an exact answer from the surviving rows.
+- Family lookups and `postcompact` pin a read-only SQLite transaction while
+  reading the published corpus, so an in-place writer cannot change pages
+  beneath a recovery read. Family proof metadata lands with the ingest
+  commit markers instead of ahead of the event and cache writes, and
+  readers tell that handoff apart from missing family data.
+
+### Performance
+
+- Large-corpus searches do less repeated work without changing results:
+  identical text and match spans share one native boundary-score
+  calculation, ranking cutoffs are recomputed only when scored candidates
+  change, and a failed query term stops checking the rest - including for
+  `-l` and content-ranked `chats`. Meaning searches skip the corpus-wide
+  term-frequency pass when every returned row contains all or none of the
+  query's content terms, grouped native scans skip candidates that cannot
+  enter a family's retained hits, and compatible query vectors use an AVX2
+  dot-product path.
 
 ## 0.3.1 — 2026-08-26
 
