@@ -395,23 +395,17 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(len(err.splitlines()), 1)
         self.assertIn("automatic freshness checks are disabled", err)
 
-    def test_bare_printed_session_opens_its_latest_indexed_turn(self) -> None:
-        rc, out, err = self._run([f"@{TWINS[0]}", "-C", "0", "--json"])
-        self.assertEqual((rc, err), (0, ""))
-        rows = [json.loads(line) for line in out.splitlines()]
-        self.assertEqual(rows[0]["scope"]["selection_order"], "newest_tail")
-        self.assertEqual(rows[0]["scope"]["render_order"], "chronological")
-        self.assertEqual({row["turn"] for row in rows if row["kind"] == "msg"},
-                         {LAST})
-        self.assertFalse(any("served" in row for row in rows))
-
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
-                self.assertRaises(SystemExit) as raised:
-            around.main([TWINS[0]])
-        self.assertEqual(raised.exception.code, 2)
-        self.assertEqual(out.getvalue(), "")
-        self.assertIn("need a turn", err.getvalue())
+    def test_bare_session_opens_its_latest_indexed_turn_with_or_without_at(self) -> None:
+        for target in (f"@{TWINS[0]}", TWINS[0]):
+            with self.subTest(target=target):
+                rc, out, err = self._run([target, "-C", "0", "--json"])
+                self.assertEqual((rc, err), (0, ""))
+                rows = [json.loads(line) for line in out.splitlines()]
+                self.assertEqual(rows[0]["scope"]["selection_order"], "newest_tail")
+                self.assertEqual(rows[0]["scope"]["render_order"], "chronological")
+                self.assertEqual(
+                    {row["turn"] for row in rows if row["kind"] == "msg"}, {LAST})
+                self.assertFalse(any("served" in row for row in rows))
 
     def test_whole_reads_every_turn_and_needs_no_turn(self) -> None:
         rc, out, err = self._run([TWINS[0], "--whole", "--json"])

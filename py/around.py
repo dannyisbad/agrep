@@ -278,8 +278,8 @@ def _context_arg(value: str) -> int | str:
 
 
 def _parse_target(args_session: str, args_turn: str | None,
-                  json_output: bool, *, whole: bool = False) -> tuple[str, int]:
-    """Accept `around <session> <turn>` and `around <session>:<turn>` (the colon form
+                  json_output: bool) -> tuple[str, int]:
+    """Accept `around <session> [turn]` and `around <session>:<turn>` (the colon form
     pastes straight from a --json hit's fields). Exit 2 on an unparseable turn."""
     s = args_session
     if ((s.strip().startswith("@") and ":" in s)
@@ -294,9 +294,8 @@ def _parse_target(args_session: str, args_turn: str | None,
                 json_output, "bad-target",
                 "a result handle already includes its turn"))
         return parsed
-    # A printed bare @prefix addresses that chat's latest indexed turn. An
-    # unprefixed session remains positional and therefore still needs a turn.
-    bare_session_handle = s.strip().startswith("@") and args_turn is None
+    # A session with no turn, @-prefixed or not, addresses that chat's latest
+    # indexed turn; a colon form still names its turn explicitly.
     try:
         s = compact.normalize_session_arg(s)
     except compact.CompactError as exc:
@@ -306,13 +305,7 @@ def _parse_target(args_session: str, args_turn: str | None,
         s, _, t = s.rpartition(":")
         args_turn = t
     if args_turn is None:
-        if bare_session_handle or whole:
-            return s, _LATEST_TURN
-        raise SystemExit(_fail(
-            json_output, "bad-target",
-            "need a turn: `agrep around <session> <turn>` "
-            "(turns come from `agrep <pattern> --json`; `--whole` reads "
-            "the entire chat)."))
+        return s, _LATEST_TURN
     try:
         return s, int(args_turn)
     except ValueError:
@@ -718,16 +711,16 @@ def _main(argv: list[str] | None = None) -> int:
                "  agrep around 11111111 144 -C 0 --max-chars 0  one turn, its text uncapped\n"
                "  agrep around 11111111 144 -C 0 --full  include tool events and full text\n"
                "  agrep around 11111111 144 --tool-output 800  include tool results\n"
-               "  agrep around @11111111              latest indexed turn in that chat\n"
+               "  agrep around 11111111              latest indexed turn (same as @11111111)\n"
                "  agrep around @11111111:144          compact result handle: that turn only\n"
                "  agrep around 11111111 144 --json     one object per message/event\n"
                "\nsession ids and turns come from `agrep <pattern> --json`.\n"
                "exit: 0 shown, 1 no selected messages/events, "
                "2 bad target / no index.")
-    ap.add_argument("session", help="session id, bare @session for its latest turn, "
+    ap.add_argument("session", help="session id or @session (alone: its latest turn), "
                                     "session:turn, or a compact @session:turn handle")
     ap.add_argument("turn", nargs="?", help="turn number to center on "
-                                            "(optional with --whole)")
+                                            "(default: the latest indexed turn)")
     ap.add_argument("-C", "--context", "--radius",
                     dest="context", type=_context_arg, default=None, metavar="N",
                     help="turns before and after the center turn (default 4; "
@@ -769,9 +762,9 @@ def _main(argv: list[str] | None = None) -> int:
     if whole:
         args.whole = True
         args.context = None
-    latest_session = (str(args.session).strip().startswith("@")
-                      and not is_handle and args.turn is None
-                      and ":" not in str(args.session))
+    latest_session = (not is_handle and args.turn is None
+                      and ":" not in str(args.session)
+                      and (str(args.session).strip().startswith("@") or not whole))
     if args.context is not None and args.context < 0:
         ap.error("--context must be 0 or greater")
     if args.context is None and not whole:
@@ -782,8 +775,7 @@ def _main(argv: list[str] | None = None) -> int:
     if args.tool_output < 0:
         ap.error("--tool-output must be 0 (preview only) or greater")
 
-    sess_q, center = _parse_target(
-        args.session, args.turn, args.json, whole=whole)
+    sess_q, center = _parse_target(args.session, args.turn, args.json)
     requested_center = center
     if is_handle:
         (_prefix, _turn, handle_digest, handle_event_identity,
