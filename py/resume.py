@@ -1,10 +1,11 @@
-"""`agrep resume [id]` - jump back into a past session in its own agent, cd'd to where
-it ran. The id is whatever you see in `agrep` output: the short 8-char prefix, a full
-uuid, or an opencode `ses_…`. With no id, pick from your most recent sessions.
+"""`agrep resume [reference]` - reopen a session in its own agent, cd'd to where it ran.
+Paste a session id or result handle, name a project, or quote part of the chat's first
+line. With no reference, pick from the most recent sessions; ambiguous human references
+restrict that picker to matching chats.
 
 The agent takes over the current terminal (no new window); when it exits you're back at
-your shell. Session-id resolution is shared through common.py; per-agent resume commands
-live in native.py.
+your shell. Session-id matching is shared through common.py and handle parsing through
+compact.py; per-agent resume commands live in native.py.
 """
 
 from __future__ import annotations
@@ -30,24 +31,58 @@ def _sessions() -> list[dict]:
     return rows
 
 
+def _session_identity(value: str) -> str:
+    text = compact.normalize_session_arg(value)
+    if compact.is_result_handle(text):
+        return compact.parse_result_handle(text)[0]
+    session, colon, turns = text.rpartition(":")
+    if colon:
+        start, dash, end = turns.partition("-")
+        try:
+            identity, first = compact.parse_result_handle(f"{session}:{start}")
+            if dash:
+                _, last = compact.parse_result_handle(f"{session}:{end}")
+                if last < first:
+                    return text
+            return identity
+        except compact.CompactError:
+            pass
+    return text
+
+
+def _resolve_reference(rows: list[dict], q: str) -> tuple[list[dict], bool]:
+    """Return matching sessions and whether a human reference permits a picker."""
+    raw = compact.normalize_session_arg(q)
+    if not raw:
+        return [], False
+    exact = [r for r in rows if r.get("session") == raw]
+    if exact:
+        return exact, False
+    identity = _session_identity(q)
+    ids = set(common.match_session_ids((r.get("session") for r in rows), identity))
+    if ids:
+        return [r for r in rows if r.get("session") in ids], False
+    needle = identity.lower()
+    if len(needle) >= 6 and all(c in "0123456789abcdef" for c in needle):
+        matches = [r for r in rows if needle in str(r.get("session") or "").lower()]
+        if matches:
+            return matches, False
+    query = q.strip()
+    matches = [r for r in rows if surface.project_label_matches(r.get("project"), query)]
+    if not matches:
+        needle = query.casefold()
+        matches = [r for r in rows if needle in (r.get("first_text") or "").casefold()]
+    return sorted(matches, key=lambda r: r.get("last_ts", 0), reverse=True), True
+
+
 def _match(rows: list[dict], q: str) -> list[dict]:
-    """Resolve an id query: exact wins; else prefix on the full id or the short 8-char.
-    The `@` agrep prints in front of an id is part of the identity it prints,
-    so it pastes back here rather than reading as an unknown session."""
-    q = compact.normalize_session_arg(q)
-    matches = set(common.match_session_ids((r.get("session") for r in rows), q))
-    return [r for r in rows if r.get("session") in matches]
-
-
-def _live_identity(value: str) -> str:
-    if compact.is_result_handle(value):
-        return compact.parse_result_handle(value)[0]
-    return compact.normalize_session_arg(value)
+    """Resolve session references, then project labels, then first-line substrings."""
+    return _resolve_reference(rows, q)[0]
 
 
 def _live_match(value: str) -> tuple[list[dict], bool]:
     import livetui
-    return livetui.resolve_exact_live_session(_live_identity(value))
+    return livetui.resolve_exact_live_session(_session_identity(value))
 
 
 def _label(r: dict, color: bool, session_index=None) -> str:
@@ -87,7 +122,7 @@ def _pick(rows: list[dict], n: int, color: bool, session_index=None) -> dict | N
         return None
     if len(m) == 1:
         return m[0]
-    common.log(f"'{common.terminal_safe(raw)}' isn't a listed number or a unique id.")
+    common.log(f"'{common.terminal_safe(raw)}' isn't a listed number or a unique reference.")
     return None
 
 
@@ -98,17 +133,26 @@ def main(argv: list[str] | None = None) -> int:
         prog="agrep resume", description="resume a past session in its own agent, cd'd "
                                          "to where it ran",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="examples:\n"
-               "  agrep resume @11111111       resume the session from a search hit\n"
-               "  agrep resume --list          list recent resumable sessions\n"
-               "\nexit: 0 selected/listed or the resumed agent exited 0; "
+        epilog="IDs and handles take priority. A hex fragment of at least 6 characters\n"
+               "also matches inside an id when no prefix matches. Project labels use\n"
+               "the same exact-label-or-leaf rule as --project (including * and ? globs);\n"
+               "otherwise, match a first-line substring, ignoring case.\n"
+               "Multiple project/first-line matches open a restricted picker on a\n"
+               "terminal; without one, candidates are listed and nothing is launched.\n"
+               "\nexamples:\n"
+               "  agrep resume @01a06003:4.82c5   reopen the session from a search hit\n"
+               "  agrep resume solo-finder        match a project; pick if several\n"
+               "  agrep resume                    pick from recent sessions\n"
+               "  agrep resume --list             list recent resumable sessions\n"
+               "\nexit: 0 listed, picker closed, or the resumed agent exited 0; "
                "1 no unique match or launch failed; 2 unavailable data or invalid "
                "arguments. Other resumed-agent exit codes are passed through.",
         allow_abbrev=False)
-    ap.add_argument("id", nargs="?", help="session id or prefix (the 8-char from `agrep` "
-                                          "output, a uuid, or ses_…); omit to pick")
+    ap.add_argument("id", nargs="?", metavar="REFERENCE",
+                    help="session id/prefix (with optional @, uuid or ses_…), search-hit "
+                         "handle, project label, or first-line substring; omit to pick")
     ap.add_argument("-n", "--max", type=int, default=15, metavar="N",
-                    help="how many recent sessions to list when picking (default 15)")
+                    help="how many recent/matching sessions to show in the picker or list (default 15)")
     ap.add_argument("-l", "--list", action="store_true",
                     help="just list recent sessions; don't resume")
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
@@ -143,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.id:
-        m = _match(rows, args.id)
+        m, human_reference = _resolve_reference(rows, args.id)
         if not m:
             live, complete = _live_match(args.id)
             if len(live) == 1 and complete:
@@ -167,9 +211,14 @@ def main(argv: list[str] | None = None) -> int:
         elif len(m) > 1:
             common.log(f"'{common.terminal_safe(args.id)}' is ambiguous - "
                        f"{len(m)} sessions match:")
-            for r in m[:12]:
-                print(f"  {_label(r, color, session_index)}", file=sys.stderr)
-            return 1
+            if human_reference and sys.stdin.isatty():
+                chosen = _pick(m, args.max, color, session_index)
+                if not chosen:
+                    return 0
+            else:
+                for r in m:
+                    print(f"  {_label(r, color, session_index)}", file=sys.stderr)
+                return 1
         else:
             chosen = m[0]
     else:
