@@ -185,15 +185,20 @@ fn project_root(dir: &str) -> Option<String> {
     segs.into_iter()
         .find(|s| {
             let sl = s.to_ascii_lowercase();
-            if sl.ends_with(':') || std::mem::take(&mut after_user_container) || sl == user {
+            if sl.ends_with(':') || std::mem::take(&mut after_user_container) {
                 return false;
             }
             if after_folders > 0 {
                 after_folders -= 1;
                 return false;
             }
+            // Containers win over the home-leaf skip: a HOME ending in `home` or `users`
+            // must not hide the container and promote the username to the project.
             if matches!(sl.as_str(), "users" | "home") {
                 after_user_container = true;
+                return false;
+            }
+            if sl == user {
                 return false;
             }
             if sl == "folders" {
