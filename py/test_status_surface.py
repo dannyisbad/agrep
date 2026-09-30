@@ -30,13 +30,14 @@ from _test_support import isolate_data_dir
 isolate_data_dir()
 import cli  # noqa: E402
 import dist  # noqa: E402
+import indexd_runtime  # noqa: E402
 import surface_policy as surface  # noqa: E402
 
 
 
 class IdentityRecordTests(unittest.TestCase):
     def test_reader_preserves_files_and_replaced_binary_invalidates_record(self) -> None:
-        runtime = cli.indexd_runtime
+        runtime = indexd_runtime
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             binary = root / "agrep-rs"
@@ -67,13 +68,13 @@ class BuildIdentityTests(unittest.TestCase):
     def setUp(self) -> None:
         # the fallback tests below model a box with no identity record
         no_record = mock.patch.object(
-            cli.indexd_runtime, "recorded_binary_identity", return_value=None)
+            indexd_runtime, "recorded_binary_identity", return_value=None)
         no_record.start()
         self.addCleanup(no_record.stop)
 
     def test_recorded_identity_answers_without_a_hashing_child(self) -> None:
         with (mock.patch.object(
-                  cli.indexd_runtime, "recorded_binary_identity",
+                  indexd_runtime, "recorded_binary_identity",
                   return_value=("a" * 20, "b" * 20)),
               mock.patch.object(
                   cli, "_bounded_binary_identity",
@@ -107,15 +108,15 @@ class BuildIdentityTests(unittest.TestCase):
                     return_value={"state": "verified", "value": "auto",
                                   "source": "default"}),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     side_effect=AssertionError("judged daemon compatibility")),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
-                    return_value=([], cli.indexd_runtime.DriftReport("current"))),
+                    indexd_runtime, "observe_store_drift",
+                    return_value=([], indexd_runtime.DriftReport("current"))),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure", return_value=None),
+                    indexd_runtime, "indexing_failure", return_value=None),
                 mock.patch.object(
-                    cli.indexd_runtime, "machine_freshness",
+                    indexd_runtime, "machine_freshness",
                     return_value={"state": "no-known-failure"}),
                 mock.patch.object(
                     cli.common, "index_summary",
@@ -151,7 +152,7 @@ class BuildIdentityTests(unittest.TestCase):
                 dist.native_binary_build_id(first),
                 dist.native_binary_build_id(second))
             with mock.patch.object(
-                    cli.indexd_runtime, "INDEXD_BUILD_ID", "f" * 20):
+                    indexd_runtime, "INDEXD_BUILD_ID", "f" * 20):
                 self.assertEqual(dist.native_binary_build_id(first), expected)
             second.write_bytes(b"different native bytes")
             self.assertNotEqual(
@@ -334,7 +335,7 @@ class BuildIdentityTests(unittest.TestCase):
         with (mock.patch.object(
                   cli.common, "distribution_build_id", return_value="d" * 20),
               mock.patch.object(
-                  cli.indexd_runtime, "INDEXD_BUILD_ID", "a" * 20),
+                  indexd_runtime, "INDEXD_BUILD_ID", "a" * 20),
               mock.patch.object(
                   cli, "_bounded_binary_identity", return_value={
                       "native_binary_build_id": "c" * 20,
@@ -380,7 +381,7 @@ class BuildIdentityTests(unittest.TestCase):
 
         started = time.monotonic()
         with mock.patch.object(
-                cli.indexd_runtime, "derived_writer_build_id",
+                indexd_runtime, "derived_writer_build_id",
                 side_effect=slow_writer), self.assertRaises(TimeoutError):
             cli._bounded_binary_identity(
                 cli.common.ingest_bin(), timeout_s=0.01)
@@ -394,7 +395,7 @@ class BuildIdentityTests(unittest.TestCase):
 
         started = time.monotonic()
         with mock.patch.object(
-                cli.indexd_runtime, "derived_writer_build_id",
+                indexd_runtime, "derived_writer_build_id",
                 return_value="a" * 20), mock.patch.object(
                     cli.dist, "native_binary_build_id",
                     side_effect=slow_native):
@@ -410,7 +411,7 @@ class BuildIdentityTests(unittest.TestCase):
     @unittest.skipIf(cli.WIN, "fork-only worker patch fixture")
     def test_malformed_native_identity_does_not_erase_writer_identity(self) -> None:
         with mock.patch.object(
-                cli.indexd_runtime, "derived_writer_build_id",
+                indexd_runtime, "derived_writer_build_id",
                 return_value="a" * 20), mock.patch.object(
                     cli.dist, "native_binary_build_id", return_value="bad"):
             identity = cli._bounded_binary_identity(
@@ -435,7 +436,7 @@ class BuildIdentityTests(unittest.TestCase):
         with (mock.patch.object(
                   cli.common, "distribution_build_id", return_value="e" * 20),
               mock.patch.object(
-                  cli.indexd_runtime, "INDEXD_BUILD_ID", "c" * 20),
+                  indexd_runtime, "INDEXD_BUILD_ID", "c" * 20),
               mock.patch.object(
                   cli, "_bounded_binary_identity", return_value={
                       "native_binary_build_id": "b" * 20,
@@ -483,7 +484,7 @@ class BuildIdentityTests(unittest.TestCase):
 
         def core(**_kwargs):
             with self.assertRaises(OSError):
-                cli.indexd_runtime.derived_writer_build_id(
+                indexd_runtime.derived_writer_build_id(
                     cli.common.ingest_bin(), require_binary=True)
             return {"diagnostics": {
                 "tier": "routine", "state": "complete",
@@ -494,7 +495,7 @@ class BuildIdentityTests(unittest.TestCase):
         with (mock.patch.object(cli, "_status_core", side_effect=core),
               mock.patch.object(cli, "_status_semantic", return_value=semantic),
               mock.patch.object(cli, "_build_identity", return_value=identity),
-              mock.patch.object(cli.indexd_runtime, "_ingest_binary_digest",
+              mock.patch.object(indexd_runtime, "_ingest_binary_digest",
                                 side_effect=AssertionError("writer rehashed")),
               mock.patch.object(cli, "_kick_repair_if_damaged")):
             payload = cli._status_data()
@@ -608,7 +609,7 @@ class StatusDegradedStateTests(unittest.TestCase):
             index_built=False, index_state="never-built",
             search_index_ready=False, search_index_state="missing",
             search_index_defect=None,
-            _repair=cli.indexd_runtime.RepairKick(False, "no-binary"))
+            _repair=indexd_runtime.RepairKick(False, "no-binary"))
         self.assertOneCommandLine(rendered, "agrep setup")
 
     def test_specific_search_damage_owns_the_one_remedy_line(self) -> None:
@@ -637,7 +638,7 @@ class StatusDegradedStateTests(unittest.TestCase):
     def test_active_repair_keeps_search_index_damage_quiet(self) -> None:
         rendered = render(
             search_index_ready=False, search_index_state="stale",
-            _repair=cli.indexd_runtime.RepairKick(True, ""))
+            _repair=indexd_runtime.RepairKick(True, ""))
         self.assertEqual(self.problem_lines(rendered), [])
 
     def test_another_running_version_is_not_silently_rendered_as_healthy(self) -> None:
@@ -653,7 +654,7 @@ class StatusDegradedStateTests(unittest.TestCase):
             index_state="owned-elsewhere", search_index_ready=False,
             search_index_state="owned-elsewhere",
             daemon={"running": False, "blocked": True, "state": "incompatible"},
-            _repair=cli.indexd_runtime.RepairKick(True, ""))
+            _repair=indexd_runtime.RepairKick(True, ""))
         self.assertEqual(self.problem_lines(rendered), [])
 
     def test_summary_movement_does_not_hide_concluded_search_damage(self) -> None:
@@ -669,7 +670,7 @@ class StatusDegradedStateTests(unittest.TestCase):
                     search_index_ready=None, search_index_state="unavailable",
                     search_index_defect=defect,
                     daemon={"running": True},
-                    _repair=cli.indexd_runtime.RepairKick(False, "spawn-failed"))
+                    _repair=indexd_runtime.RepairKick(False, "spawn-failed"))
                 self.assertOneCommandLine(rendered, command)
 
     def test_concluded_search_index_damage_is_actionable(self) -> None:

@@ -34,6 +34,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import indexd_runtime
 
 ROOT = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
@@ -66,7 +70,6 @@ def _import_safe_text(value: str) -> str:
 try:
     import common  # noqa: E402  -- single source for binary / data / platform paths
     import dist  # noqa: E402
-    import indexd_runtime  # noqa: E402
     import legacy_cleanup  # noqa: E402
     import ownerfile  # noqa: E402
     import settings  # noqa: E402
@@ -86,9 +89,6 @@ except OSError as exc:
     )
     raise SystemExit(2) from None
 
-INGEST_BIN = common.ingest_bin()
-SEMANTIC_INSTALL_COMMAND = dist.semantic_install_command()
-SEMANTIC_INSTALL_HINT = dist.semantic_install_hint()
 _BINARY_IDENTITY_TIMEOUT_S = 0.25
 _BINARY_IDENTITY_STOP_S = 0.05
 
@@ -99,6 +99,8 @@ def _version() -> str:
 
 
 def _binary_identity_child(binary: str, sender) -> None:
+    import indexd_runtime
+
     def send(kind: str, state: str, value: str, detail: str) -> bool:
         try:
             sender.send((
@@ -132,6 +134,7 @@ def _bounded_binary_identity(binary: Path, *, timeout_s: float) -> dict:
     if timeout_s <= 0.0:
         raise TimeoutError("binary identity deadline expired before hashing")
     import multiprocessing
+    import indexd_runtime
     method = "spawn" if WIN else "fork"
     context = multiprocessing.get_context(method)
     receiver, sender = context.Pipe(duplex=False)
@@ -208,6 +211,8 @@ def _bounded_binary_identity(binary: Path, *, timeout_s: float) -> dict:
 
 
 def _build_identity(*, timeout_s: float = _BINARY_IDENTITY_TIMEOUT_S) -> dict:
+    import indexd_runtime
+
     identity = {
         "distribution_build_id": None,
         "distribution_build_state": "unavailable",
@@ -287,6 +292,8 @@ def _ensure_binary() -> bool:
 
 
 def _index() -> bool:
+    import indexd_runtime
+
     # The ingest invocation and derived-db refresh are shared with first-search indexing.
     print("=== indexing transcripts ===", flush=True)
     ok = indexd_runtime.build_index(require_search_index=True)
@@ -400,6 +407,8 @@ def _status_core(*, deadline: float | None = None,
     potentially scaling read shares one routine deadline. ``identity`` is this
     run's _build_identity(); without a verified writer id, daemon
     compatibility and database ownership have no verdict and are deferred."""
+    import indexd_runtime
+
     writer_build_id: str | None = None
     identity_gap: str | None = None
     if identity is not None:
@@ -741,6 +750,8 @@ def _status_data() -> dict:
     """The full machine-readable summary (`agrep status --json`), one shot.
     Bare status deliberately does not import the native ONNX runtime; `doctor`
     performs that stronger availability check."""
+    import indexd_runtime
+
     deadline = _status_deadline()
     binary = common.ingest_bin()
     identity = _build_identity(
@@ -767,6 +778,8 @@ def _status_data() -> dict:
 
 def _status_lines(cli: str, color: bool = False):
     """Human render for bare `agrep`; all observations share one deadline."""
+    import indexd_runtime
+
     deadline = _status_deadline()
     binary = common.ingest_bin()
     identity = _build_identity(
@@ -897,7 +910,7 @@ def _status_lines(cli: str, color: bool = False):
     sem = ""
     if d.get("semantic_deps") is False:
         sem = ("meaning search is off - optional dependencies are not "
-               f"installed. enable: {SEMANTIC_INSTALL_HINT}")
+               f"installed. enable: {dist.semantic_install_hint()}")
     elif (d.get("semantic_status") == "status-deferred"
             or d.get("semantic_deps") is None or setting is None
             or setting == "off" or not d.get("semantic_verified")):
@@ -1027,6 +1040,7 @@ def cmd_index(a) -> int:
         return 1
     if not _ensure_binary():
         return 1
+    import indexd_runtime
     if getattr(a, "full", False):
         print("=== indexing transcripts ===", flush=True)
         # cold-cache reparse of every store file (also reseeds the intake book)
@@ -1147,6 +1161,7 @@ def _setup_index_state() -> tuple[dict | None, bool]:
     if not _plain_regular_leaf(common.MESSAGES_PATH):
         return None, False
     import corpusdb
+    import indexd_runtime
     health = corpusdb.search_generation_health()
     state = str(health.get("state") or "")
     if state == "ready":
@@ -1704,6 +1719,11 @@ def _main() -> int:
     if raw and raw[0] not in {
             "status", "doctor", "audit", "tail", "board", "live"}:
         legacy_cleanup.retire_removed_explorer()
+    if not raw:
+        return cmd_status(argparse.Namespace())
+    if raw in (["-V"], ["--version"]):
+        print(_version_text())
+        raise SystemExit(0)
     if raw and raw[0] in {"ui", "up", "serve"}:
         return cmd_explorer(
             argparse.Namespace(rest=raw[1:]),

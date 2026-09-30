@@ -1040,15 +1040,15 @@ class DoctorObservationSharingTests(unittest.TestCase):
         drift = indexd_runtime.DriftReport("current")
         with (
             mock.patch.object(
-                cli.indexd_runtime, "indexd_resource_status",
+                indexd_runtime, "indexd_resource_status",
                 return_value=daemon,
             ) as daemon_probe,
             mock.patch.object(
-                cli.indexd_runtime, "observe_store_drift",
+                indexd_runtime, "observe_store_drift",
                 return_value=([], drift),
             ) as drift_probe,
             mock.patch.object(
-                cli.indexd_runtime, "indexing_failure",
+                indexd_runtime, "indexing_failure",
                 return_value=None,
             ) as failure_probe,
             mock.patch.object(cli.common, "index_summary", return_value=None),
@@ -1085,13 +1085,13 @@ class DoctorObservationSharingTests(unittest.TestCase):
                 mock.patch.object(cli.common, "MESSAGES_PATH",
                                   root / "messages.jsonl"),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     return_value={"running": False}),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
+                    indexd_runtime, "observe_store_drift",
                     side_effect=stores),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure",
+                    indexd_runtime, "indexing_failure",
                     return_value=None),
                 mock.patch.object(
                     cli.common, "index_summary", side_effect=summary),
@@ -1175,15 +1175,15 @@ class DoctorObservationSharingTests(unittest.TestCase):
                         "state": "verified", "value": "auto",
                         "source": "default"}),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     return_value={"running": True}),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
+                    indexd_runtime, "observe_store_drift",
                     return_value=([], drift)),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure", return_value=None),
+                    indexd_runtime, "indexing_failure", return_value=None),
                 mock.patch.object(
-                    cli.indexd_runtime, "machine_freshness",
+                    indexd_runtime, "machine_freshness",
                     return_value={"state": "no-known-failure"}),
                 mock.patch.object(cli.common, "index_summary", return_value=None),
                 mock.patch.object(
@@ -1273,16 +1273,16 @@ class DoctorObservationSharingTests(unittest.TestCase):
                             "state": "verified", "value": "auto",
                             "source": "default"}),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexd_resource_status",
+                        indexd_runtime, "indexd_resource_status",
                         return_value={"running": True}),
                     mock.patch.object(
-                        cli.indexd_runtime, "observe_store_drift",
+                        indexd_runtime, "observe_store_drift",
                         return_value=([], {"state": "complete"})),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexing_failure",
+                        indexd_runtime, "indexing_failure",
                         return_value=None),
                     mock.patch.object(
-                        cli.indexd_runtime, "machine_freshness",
+                        indexd_runtime, "machine_freshness",
                         return_value={"state": "no-known-failure"}),
                     mock.patch.object(
                         cli.common, "index_summary", return_value=None),
@@ -1377,15 +1377,15 @@ class DoctorObservationSharingTests(unittest.TestCase):
                         "state": "verified", "value": "auto",
                         "source": "default"}),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     return_value={"running": False}),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
+                    indexd_runtime, "observe_store_drift",
                     return_value=([], indexd_runtime.DriftReport("current"))),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure", return_value=None),
+                    indexd_runtime, "indexing_failure", return_value=None),
                 mock.patch.object(
-                    cli.indexd_runtime, "machine_freshness",
+                    indexd_runtime, "machine_freshness",
                     return_value={"state": "no-known-failure"}),
                 mock.patch.object(cli.common, "index_summary", return_value=None),
                 mock.patch.object(
@@ -1430,17 +1430,17 @@ class DoctorObservationSharingTests(unittest.TestCase):
                             "state": "verified", "value": "auto",
                             "source": "default"}),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexd_resource_status",
+                        indexd_runtime, "indexd_resource_status",
                         return_value={"running": False}),
                     mock.patch.object(
-                        cli.indexd_runtime, "observe_store_drift",
+                        indexd_runtime, "observe_store_drift",
                         return_value=(
                             [], indexd_runtime.DriftReport("current"))),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexing_failure",
+                        indexd_runtime, "indexing_failure",
                         return_value=None),
                     mock.patch.object(
-                        cli.indexd_runtime, "machine_freshness",
+                        indexd_runtime, "machine_freshness",
                         return_value={"state": "no-known-failure"}),
                     mock.patch.object(
                         cli.common, "index_summary", return_value=None),

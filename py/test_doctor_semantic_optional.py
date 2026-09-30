@@ -664,11 +664,6 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertFalse(observed["runtime_verified"])
         self.assertIsNone(observed["install_hint"])
 
-    def test_doctor_and_status_share_the_generated_install_command(self) -> None:
-        self.assertIsNotNone(doctor.SEMANTIC_INSTALL_COMMAND)
-        self.assertEqual(
-            doctor.SEMANTIC_INSTALL_COMMAND, cli.SEMANTIC_INSTALL_COMMAND)
-
     def test_scheduler_never_spawns_optional_worker_without_runtime(self) -> None:
         with (mock.patch.object(semantic, "runtime_dependencies_available",
                                return_value=False),
@@ -1536,7 +1531,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with (mock.patch.object(cli.common, "DATA_DIR", Path(td)),
                   mock.patch.object(
-                      cli.indexd_runtime, "kick_background_repair"),
+                      indexd_runtime, "kick_background_repair"),
                   mock.patch("importlib.util.find_spec", return_value=None)):
                 machine = cli._status_data()
         self.assertTrue(machine["semantic_optional"])
@@ -1548,7 +1543,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with (mock.patch.object(cli.common, "DATA_DIR", Path(td)),
                   mock.patch.object(
-                      cli.indexd_runtime, "kick_background_repair"),
+                      indexd_runtime, "kick_background_repair"),
                   mock.patch(
                       "importlib.util.find_spec",
                       side_effect=AssertionError(
@@ -1751,7 +1746,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                       cli.common, "index_summary",
                       return_value={"messages": 14, "sessions": 3}),
                   mock.patch.object(
-                      cli.indexd_runtime, "indexd_resource_status",
+                      indexd_runtime, "indexd_resource_status",
                       return_value={"running": True}) as daemon,
                   mock.patch.object(teach, "detected_agents", return_value=[]),
                   mock.patch.object(cli, "_setup_archive"),
@@ -1791,7 +1786,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                       cli.common, "index_summary",
                       return_value={"messages": 14, "sessions": 3}),
                   mock.patch.object(
-                      cli.indexd_runtime, "indexd_resource_status",
+                      indexd_runtime, "indexd_resource_status",
                       return_value={"running": False}),
                   mock.patch.object(teach, "detected_agents", return_value=[]),
                   mock.patch.object(cli, "_setup_archive"),
