@@ -3265,7 +3265,7 @@ class LifecycleTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with mock.patch.object(
-                module.indexd_runtime, "build_index", return_value=False) as build, \
+                indexd_runtime, "build_index", return_value=False) as build, \
                 mock.patch("builtins.print"):
             self.assertFalse(module._index())
         build.assert_called_once_with(require_search_index=True)
