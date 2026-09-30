@@ -33,6 +33,23 @@
 
 ### Search
 
+- `agrep resume` accepts every reference agrep prints: result handles
+  (`@01a06003:4.82c5`, with or without a `~event:lo-hi` suffix), turn ranges,
+  bare or `@`-prefixed ids, full uuids and `ses_` ids - plus a project name or
+  a fragment of a chat's first line; a hex fragment missing its leading
+  characters still resolves when it is unique. Several matches open a picker
+  on a terminal and are listed otherwise, and an ambiguous reference never
+  launches an agent. Only an id prefix resolved before, although
+  `resume --help` promised search-hit handles.
+- `agrep around <session>` without a turn opens that chat's latest indexed
+  turn, exactly like `agrep around @<session>`, instead of refusing with
+  `need a turn`.
+- A refused flag combination prints the command to run instead:
+  `agrep around: --max-chars cannot be combined with --full, which uncaps
+  indexed message text; run: agrep around @x:174 -C 0 --full`, across
+  around, search, recall, pack, tail and doctor. Search corrections always
+  spell `agrep search`, so a query word that names a command cannot change
+  what runs.
 - `--project` and `--exclude-project` (search, recall, pack, chats) match a
   chat's stored project label exactly, or its last path segment,
   case-insensitively, instead of as a substring: `--project shop` reaches a
@@ -116,7 +133,8 @@
   echoes no longer suppress the tool or meaning fallbacks. The check uses
   the exact tool event and the active keyword, word or regex matcher; a
   match also present in retained tool output stays eligible, and a
-  rejected echo gives way to the next eligible row of the same chat. Ordinary
+  rejected echo gives way to the next eligible row of the same chat or, when
+  results keep one chat per family, of a sibling chat in that family. Ordinary
   recall rows and explicit handle reads are unchanged.
 - Compact query-echo demotion checks the actual result row, including its
   timestamp, content digest and tool-event identity when available. It no
@@ -330,6 +348,11 @@
 
 ### Status, doctor and setup
 
+- Every invocation starts faster: the CLI imports the index runtime and
+  installer metadata only for commands that need them (import chain 37%
+  faster; `--version` 13% and `search` 12% faster end to end on the
+  reference Mac). `agrep --help` no longer exits 1 when the runtime manifest
+  is unreadable.
 - `agrep status` explains a stale wheel install: a package with no PEP 610
   local-source provenance is compared against the checkout named by
   `AGREP_SOURCE_DIR`; a lagging result lists the checkout's unreleased
