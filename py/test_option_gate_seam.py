@@ -19,10 +19,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import shlex
 import sys
 import unittest
 from pathlib import Path
 from typing import NamedTuple
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "py"))
@@ -392,6 +394,134 @@ class OptionGateTests(unittest.TestCase):
                 for ref in (gate.option, *gate.blocked_by, *gate.needs)})
             with self.subTest(flag=gate.option.flag):
                 self.assertIsNone(surface.option_gate_error(args, [gate]))
+
+
+class GateRemedyTests(unittest.TestCase):
+    HANDLE = "@11111111:174.82c5~a8f797767b0f558d5d5c67e6:214-222"
+
+    def assertRemedy(self, entry, argv, expected, gates, command):
+        rc, error = _exit_code(entry, argv)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("; run: ", error)
+        rendered = error.split("; run: ", 1)[1].rstrip("\n")
+        self.assertEqual(shlex.split(rendered), [*command, *expected])
+        if self.HANDLE in expected and sys.platform != "win32":
+            self.assertIn(f" {self.HANDLE} ", f" {rendered} ")
+        parser = _parser(entry, expected)
+        parsed = surface.parse_args_with_presence(parser, shlex.split(rendered)[len(command):])
+        self.assertIsNone(surface.option_gate_error(parsed, gates))
+        return rendered
+
+    def test_around_removes_only_the_refused_value_option(self) -> None:
+        import around
+        for refused, blocker in (
+                (["--max-chars", "4000", "--max-chars=60"], "--full"),
+                (["--tool-output=0"], "--no-tools")):
+            expected = [self.HANDLE, "-C", "0", blocker, "--no-auto", "--color", "never"]
+            with self.subTest(refused=refused):
+                self.assertRemedy(
+                    around.main, [*expected, *refused], expected,
+                    surface.AROUND_OPTION_GATES, ["agrep", "around"])
+
+    def test_search_removes_aliases_attached_values_and_short_clusters(self) -> None:
+        base = ["two words", "--project", "project with spaces", "--chat", self.HANDLE]
+        for supplied, kept in (
+                (["--count", "--json"], ["--count"]),
+                (["-ilc"], ["-ic"]),
+                (["--chats", "--count"], ["--count"]),
+                (["--flat", "--json"], ["--json"]),
+                (["--classic", "--flat"], ["--flat"]),
+                (["--count", "--sort=score"], ["--count"]),
+                (["-cin3", "--max=5", "-n", "8"], ["-ci"]),
+                (["--model-soft", "--soft"], [])):
+            with self.subTest(supplied=supplied):
+                self.assertRemedy(
+                    search.main, [*base, *supplied], [*base, *kept],
+                    surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+
+    def test_search_preserves_option_looking_values_and_the_terminator(self) -> None:
+        expected = ["-c", "--project=--json", "--", "--json", "two words", self.HANDLE]
+        self.assertRemedy(
+            search.main, ["--json", *expected], expected,
+            surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+
+    def test_recall_and_pack_keep_queries_filters_and_the_surface_name(self) -> None:
+        recall_args = [self.HANDLE, "--project", "project with spaces", "--probe", "-C", "0"]
+        self.assertRemedy(
+            recall.main, [*recall_args, "--hits=2"], recall_args,
+            surface.RECALL_OPTION_GATES, ["agrep", "recall"])
+        pack_args = ["two words", self.HANDLE, "--project", "project with spaces", "-C", "0"]
+        self.assertRemedy(
+            lambda argv: recall.main(argv, prog="pack"),
+            [*pack_args, "--model-soft"], pack_args,
+            surface.RECALL_OPTION_GATES, ["agrep", "pack"])
+
+    def test_missing_model_remedy_stays_on_the_requested_surface(self) -> None:
+        expected = ["two words", self.HANDLE, "--no-auto", "--lexical"]
+        for prog in ("recall", "pack"):
+            with self.subTest(prog=prog):
+                self.assertRemedy(
+                    lambda argv: recall.main(argv, prog=prog),
+                    [*expected, "--model-soft"], expected,
+                    surface.RECALL_OPTION_GATES, ["agrep", prog])
+
+    def test_tail_keeps_the_substring_and_repeated_agent_filters(self) -> None:
+        import tail
+        expected = ["--chat", f"chat with spaces {self.HANDLE}", "--agent", "claude",
+                    "--snapshot", "--agent", "codex"]
+        self.assertRemedy(
+            tail.main, [*expected, "--events=done"], expected,
+            surface.TAIL_OPTION_GATES, ["agrep", "tail"])
+
+    def test_doctor_repaired_commands_pass_its_action_parser(self) -> None:
+        import doctor
+        for argv, expected in (
+                (["--deep", "--fix", "--json", "--no-semantic", "--fix"],
+                 ["--deep", "--json", "--no-semantic"]),
+                (["--setup", "--fix", "--no-semantic"], ["--setup", "--no-semantic"]),
+                (["--json", "--setup"], ["--json"]),
+                (["--deep", "--setup", "--no-semantic"], ["--setup", "--no-semantic"])):
+            with self.subTest(argv=argv):
+                rc, error = _exit_code(doctor.main, argv)
+                self.assertEqual(rc, 2, error)
+                self.assertIn("; run: ", error)
+                repaired = shlex.split(error.split("; run: ", 1)[1])
+                self.assertEqual(repaired, ["agrep", "doctor", *expected])
+                self.assertIsNone(surface.doctor_action_conflict(repaired[2:]))
+                with mock.patch.object(doctor, "_json_report", return_value={}), \
+                        mock.patch.object(doctor, "setup", return_value=0):
+                    self.assertEqual(_exit_code(doctor.main, repaired[2:]), (0, ""))
+
+    def test_default_argv_is_retained_for_direct_module_entry(self) -> None:
+        import around
+        expected = [self.HANDLE, "-C", "0", "--full"]
+        with mock.patch.object(sys, "argv", ["around.py", *expected, "--max-chars", "60"]):
+            rc, error = _exit_code(lambda _argv: around.main(), [])
+        self.assertEqual(rc, 2, error)
+        self.assertIn("; run: ", error)
+        self.assertEqual(
+            shlex.split(error.split("; run: ", 1)[1]), ["agrep", "around", *expected])
+
+    def test_searching_a_command_word_stays_on_the_search_surface(self) -> None:
+        import cli
+        expected = ["doctor", "--count", "--no-auto"]
+        rendered = self.assertRemedy(
+            search.main, [*expected, "--json"], expected,
+            surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+        with mock.patch.object(sys, "argv", shlex.split(rendered)):
+            parser = _parser(lambda _argv: cli.main(), [])
+        parsed = surface.parse_args_with_presence(parser, expected)
+        self.assertEqual(parsed.pattern, ["doctor"])
+        self.assertTrue(parsed.count)
+        self.assertIsNone(surface.option_gate_error(parsed, surface.SEARCH_OPTION_GATES))
+
+    def test_resume_keeps_the_two_argument_gate_contract(self) -> None:
+        self.assertIsNotNone(_run(resume.main, ["-l", "zzzznope"]))
+        args = argparse.Namespace(list=True, id="zzzznope")
+        message = surface.option_gate_error(args, surface.RESUME_OPTION_GATES)
+        self.assertIn("-l", message)
+        self.assertIn("an id", message)
+        self.assertNotIn("; run: ", message)
 
 
 class ReportedCaseTests(unittest.TestCase):

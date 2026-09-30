@@ -754,9 +754,11 @@ def _main(argv: list[str] | None = None) -> int:
                     help=surface.NO_AUTO_HELP)
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     args = surface.parse_args_with_presence(ap, argv)
-    # an option a surface renders inert is refused, never dropped: --full
-    # swallowed an explicit --max-chars and --no-tools an explicit --tool-output
-    gated = surface.option_gate_error(args, surface.AROUND_OPTION_GATES)
+    # Explicit caps and tool output must not disappear behind display modes.
+    gated = surface.option_gate_error(
+        args, surface.AROUND_OPTION_GATES,
+        argv=argv if argv is not None else sys.argv[1:],
+        prog=("agrep", "around"), parser=ap)
     if gated:
         ap.error(gated)
 

@@ -273,10 +273,11 @@ class ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         message = _stable_argparse_error(message)
         line = f"{terminal_safe(self.prog)}: {terminal_safe(message)}"
-        hint = reserved_search_hint(
-            self._agrep_search_word, self._agrep_argv)
-        if hint:
-            line += f"; {hint}"
+        if "; run: " not in message:
+            hint = reserved_search_hint(
+                self._agrep_search_word, self._agrep_argv)
+            if hint:
+                line += f"; {hint}"
         self.exit(2, line + "\n")
 
 
@@ -843,19 +844,90 @@ AROUND_OPTION_GATES = (
 )
 
 
-def option_gate_error(args: object,
-                      gates: Sequence[OptionGate]) -> str | None:
-    """The one refusal a supplied-but-inert option gets, naming both flags."""
+def _without_gate_option(
+        argv: Sequence[str], option: OptionRef,
+        parser: argparse.ArgumentParser | None,
+) -> list[str]:
+    """Remove a flag/value option, including its aliases and short clusters."""
+    specs = ({flag: (action.dest, action.nargs != 0)
+              for flag, action in parser._option_string_actions.items()}
+             if parser is not None else
+             {option.flag: (option.dest, not isinstance(option.absent, bool))})
+    kept: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if token == "--":
+            kept.extend(argv[index - 1:])
+            break
+        flag, equals, _value = token.partition("=")
+        spec = specs.get(flag)
+        if spec is not None:
+            dest, takes_value = spec
+            end = index + int(takes_value and not equals)
+            if dest != option.dest:
+                kept.append(token)
+                kept.extend(argv[index:end])
+            index = end
+            continue
+        if not token.startswith("-") or token.startswith("--") or token == "-":
+            kept.append(token)
+            continue
+        cluster = "-"
+        values: Sequence[str] = ()
+        for offset, letter in enumerate(token[1:], 1):
+            spec = specs.get("-" + letter)
+            if spec is None:
+                cluster += token[offset:]
+                break
+            dest, takes_value = spec
+            if dest != option.dest:
+                cluster += letter
+            if takes_value:
+                attached = token[offset + 1:]
+                if attached:
+                    if dest != option.dest:
+                        cluster += attached
+                else:
+                    if dest != option.dest:
+                        values = argv[index:index + 1]
+                    index += 1
+                break
+        if cluster != "-":
+            kept.append(cluster)
+            kept.extend(values)
+    return kept
+
+
+def option_gate_error(
+        args: object, gates: Sequence[OptionGate], *,
+        argv: Sequence[str] | None = None,
+        prog: Sequence[str] = ("agrep",),
+        parser: argparse.ArgumentParser | None = None,
+) -> str | None:
+    """Name the inert option; supplied argv also earns a copyable correction."""
     for gate in gates:
         if not gate.option.supplied(args):
             continue
+        message = None
         for blocker in gate.blocked_by:
             if blocker.supplied(args):
-                return (f"{gate.option.flag} cannot be combined with "
-                        f"{blocker.flag}, which {blocker.renders}")
-        for needed in gate.needs:
-            if not needed.supplied(args):
-                return f"{gate.option.flag} has no effect without {needed.flag}"
+                message = (f"{gate.option.flag} cannot be combined with "
+                           f"{blocker.flag}, which {blocker.renders}")
+                break
+        if message is None:
+            for needed in gate.needs:
+                if not needed.supplied(args):
+                    message = f"{gate.option.flag} has no effect without {needed.flag}"
+                    break
+        if message is not None:
+            if argv is not None:
+                corrected = _without_gate_option(argv, gate.option, parser)
+                command = render_cli_argv([*prog, *corrected])
+                if command is not None:
+                    message += f"; run: {command}"
+            return message
     return None
 
 
@@ -865,7 +937,8 @@ def doctor_action_conflict(argv: Sequence[str]) -> str | None:
     supplied = argparse.Namespace(
         json="--json" in argv, fix="--fix" in argv,
         setup="--setup" in argv, deep="--deep" in argv)
-    return option_gate_error(supplied, DOCTOR_OPTION_GATES)
+    return option_gate_error(
+        supplied, DOCTOR_OPTION_GATES, argv=argv, prog=("agrep", "doctor"))
 
 
 def meta_exclusion_notice(dropped: int) -> str:

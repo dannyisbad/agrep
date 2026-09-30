@@ -1383,7 +1383,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     if args.probe and args.json:
         ap.error("--probe emits a pointer line and cannot be combined with --json")
     # an option a surface renders inert is refused, never dropped
-    gated = surface.option_gate_error(args, surface.RECALL_OPTION_GATES)
+    gated = surface.option_gate_error(
+        args, surface.RECALL_OPTION_GATES,
+        argv=argv if argv is not None else sys.argv[1:],
+        prog=("agrep", prog), parser=ap)
     if gated:
         ap.error(gated)
     try:

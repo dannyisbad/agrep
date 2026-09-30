@@ -7073,7 +7073,10 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     if args.count and args.count_by_tier:
         ap.error("-c and --count-by-tier are mutually exclusive")
     # an option a surface renders inert is refused, never dropped
-    gated = surface.option_gate_error(args, surface.SEARCH_OPTION_GATES)
+    gated = surface.option_gate_error(
+        args, surface.SEARCH_OPTION_GATES,
+        argv=argv if argv is not None else sys.argv[1:],
+        prog=("agrep", "search"), parser=ap)
     if gated:
         ap.error(gated)
     if more_given or deeper_given:

@@ -80,7 +80,10 @@ def main(argv: list[str] | None = None) -> int:
     a = surface.parse_args_with_presence(p, argv)
     # snapshot state has no done/queued rows to filter: a supplied --events
     # would render inert there, so the pair is refused, never dropped
-    gated = surface.option_gate_error(a, surface.TAIL_OPTION_GATES)
+    gated = surface.option_gate_error(
+        a, surface.TAIL_OPTION_GATES,
+        argv=argv if argv is not None else sys.argv[1:],
+        prog=("agrep", "tail"), parser=p)
     if gated:
         p.error(gated)
 
