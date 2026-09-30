@@ -900,6 +900,34 @@ def _without_gate_option(
     return kept
 
 
+def _gate_refusal(
+        args: object, gates: Sequence[OptionGate],
+) -> tuple[str, OptionRef] | None:
+    """The first refusal an args state earns, with the option it refuses."""
+    for gate in gates:
+        if not gate.option.supplied(args):
+            continue
+        for blocker in gate.blocked_by:
+            if blocker.supplied(args):
+                return (f"{gate.option.flag} cannot be combined with "
+                        f"{blocker.flag}, which {blocker.renders}", gate.option)
+        for needed in gate.needs:
+            if not needed.supplied(args):
+                return (f"{gate.option.flag} has no effect without {needed.flag}",
+                        gate.option)
+    return None
+
+
+def _without_supplied(args: object, option: OptionRef) -> argparse.Namespace:
+    """A copy of an args state in which `option` was never supplied."""
+    state = argparse.Namespace(**vars(args))
+    setattr(state, option.dest, option.absent)
+    supplied = getattr(state, "_agrep_supplied_options", None)
+    if supplied is not None:
+        state._agrep_supplied_options = set(supplied) - {option.dest}
+    return state
+
+
 def option_gate_error(
         args: object, gates: Sequence[OptionGate], *,
         argv: Sequence[str] | None = None,
@@ -907,28 +935,21 @@ def option_gate_error(
         parser: argparse.ArgumentParser | None = None,
 ) -> str | None:
     """Name the inert option; supplied argv also earns a copyable correction."""
-    for gate in gates:
-        if not gate.option.supplied(args):
-            continue
-        message = None
-        for blocker in gate.blocked_by:
-            if blocker.supplied(args):
-                message = (f"{gate.option.flag} cannot be combined with "
-                           f"{blocker.flag}, which {blocker.renders}")
-                break
-        if message is None:
-            for needed in gate.needs:
-                if not needed.supplied(args):
-                    message = f"{gate.option.flag} has no effect without {needed.flag}"
-                    break
-        if message is not None:
-            if argv is not None:
-                corrected = _without_gate_option(argv, gate.option, parser)
-                command = render_cli_argv([*prog, *corrected])
-                if command is not None:
-                    message += f"; run: {command}"
-            return message
-    return None
+    refusal = _gate_refusal(args, gates)
+    if refusal is None:
+        return None
+    message = refusal[0]
+    if argv is None:
+        return message
+    # The correction must clear every gate, not only the first: each pass drops
+    # one supplied option, so the loop ends once the reduced state is accepted.
+    corrected, state = list(argv), args
+    while refusal is not None:
+        corrected = _without_gate_option(corrected, refusal[1], parser)
+        state = _without_supplied(state, refusal[1])
+        refusal = _gate_refusal(state, gates)
+    command = render_cli_argv([*prog, *corrected])
+    return message if command is None else f"{message}; run: {command}"
 
 
 def doctor_action_conflict(argv: Sequence[str]) -> str | None:

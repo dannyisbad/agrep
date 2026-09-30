@@ -423,6 +423,22 @@ class GateRemedyTests(unittest.TestCase):
                     around.main, [*expected, *refused], expected,
                     surface.AROUND_OPTION_GATES, ["agrep", "around"])
 
+    def test_around_correction_clears_every_simultaneous_conflict(self) -> None:
+        import around
+        expected = [self.HANDLE, "-C", "0", "--full", "--no-tools", "--no-auto",
+                    "--color", "never"]
+        self.assertRemedy(
+            around.main,
+            [*expected, "--max-chars", "10", "--tool-output", "5"], expected,
+            surface.AROUND_OPTION_GATES, ["agrep", "around"])
+
+    def test_doctor_correction_clears_chained_action_conflicts(self) -> None:
+        message = surface.doctor_action_conflict(["--json", "--fix", "--setup"])
+        rendered = message.split("; run: ", 1)[1]
+        corrected = shlex.split(rendered)[2:]
+        self.assertEqual(corrected, ["--json"])
+        self.assertIsNone(surface.doctor_action_conflict(corrected))
+
     def test_search_removes_aliases_attached_values_and_short_clusters(self) -> None:
         base = ["two words", "--project", "project with spaces", "--chat", self.HANDLE]
         for supplied, kept in (
