@@ -1,0 +1,7 @@
+{"timestamp":"2026-08-01T10:03:00.000Z","type":"session_meta","payload":{"id":"55555555-5555-4555-8555-555555555555","cwd":"/work/upgrade-fixture"}}
+{"timestamp":"2026-08-01T10:03:01.000Z","type":"turn_context","payload":{"model":"gpt-5","turn_id":"codex-fixture-turn"}}
+{"timestamp":"2026-08-01T10:03:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Preserve the synthetic codex deployment manifest during the upgrade."}]}}
+{"timestamp":"2026-08-01T10:03:02.100Z","type":"event_msg","payload":{"type":"user_message","message":"Preserve the synthetic codex deployment manifest during the upgrade."}}
+{"timestamp":"2026-08-01T10:03:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The synthetic codex deployment manifest remains intact."}]}}
+{"timestamp":"2026-08-01T10:03:04.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Confirm the synthetic codex release marker is still searchable."}]}}
+{"timestamp":"2026-08-01T10:03:04.100Z","type":"event_msg","payload":{"type":"user_message","message":"Confirm the synthetic codex release marker is still searchable."}}

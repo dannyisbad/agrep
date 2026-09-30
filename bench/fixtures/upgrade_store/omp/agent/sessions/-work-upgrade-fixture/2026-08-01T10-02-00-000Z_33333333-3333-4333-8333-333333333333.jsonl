@@ -1,0 +1,5 @@
+{"type":"session","id":"33333333-3333-4333-8333-333333333333","version":3,"cwd":"/work/upgrade-fixture","timestamp":"2026-08-01T10:02:00.000Z"}
+{"type":"message","id":"omp-user","parentId":null,"timestamp":"2026-08-01T10:02:01.000Z","message":{"role":"user","content":[{"type":"text","text":"Review the synthetic release inventory with the advisor."}]}}
+{"type":"message","id":"omp-answer","parentId":"omp-user","timestamp":"2026-08-01T10:02:02.000Z","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"The advisor will inspect the synthetic release inventory."}]}}
+{"type":"compaction","id":"omp-compact","parentId":"omp-answer","timestamp":"2026-08-01T10:02:03.000Z","summary":"The synthetic release inventory review is complete; preserve the rollback checklist.","tokensBefore":42000,"firstKeptEntryId":"omp-user"}
+{"type":"message","id":"omp-after","parentId":"omp-compact","timestamp":"2026-08-01T10:02:04.000Z","message":{"role":"user","content":[{"type":"text","text":"Verify the synthetic rollback checklist after compaction."}]}}
