@@ -1,14 +1,23 @@
 # agrep
 
-**agrep - agentic grep.** Memory for your AI coding agents. Eleven supported
-agent tools keep their session records on disk - Claude Code, Codex,
+**agrep - agentic grep.** Search everything you and your AI agents have done.
+Eleven agent tools keep their session records on disk - Claude Code, Codex,
 opencode, Antigravity, Kimi CLI, Cline, Gemini CLI, crush, Cursor, pi, and
 oh-my-pi (a pi fork sharing its format) - and none of them can search the
-others. agrep reads them all into one local, ranked index, so you (and your
-agents) can ask "have I hit this before?" and get the actual session back:
-search it, read the conversation around a hit, or resume it in its own
-agent. What each tool retains is up to that tool; agrep indexes what is on
-disk when it reads.
+others. agrep reads them all into one local, ranked index of every
+conversation, tool call and result, so you can:
+
+- **find** where something happened - a decision, an error, a command's
+  output, a file an agent wrote: `agrep "rate limit"`, `agrep chats "retry backoff"`
+- **open** a hit at its source, with the conversation around it:
+  `agrep around @3f2a91c4:88.d1e0`
+- **resume** that chat in its own agent, from any handle, id or project name
+  agrep printed: `agrep resume @3f2a91c4:88.d1e0`, `agrep resume payments`
+- **watch** what every agent is doing right now, across tools: `agrep board`
+
+Your agents search the same index: a short instruction block tells them agrep
+exists, so they look things up instead of re-deriving them. What each tool
+retains is up to that tool; agrep indexes what is on disk when it reads.
 
 Indexing and search are local and read-only over agent stores. Transcript content
 is never uploaded.
@@ -21,10 +30,12 @@ $ agrep recall "why the retry backoff was capped at 30s"
        what tripped the account-level throttle in us-east-1 ...
 $ agrep around @3f2a91c4:88.d1e0
     ... that turn at its source, with a surrounding window on request ...
+$ agrep resume @3f2a91c4:88.d1e0
+    ... reopens that chat in claude, in the directory it ran in ...
 ```
 
-An answer that was about to be re-derived from scratch by the agent that
-solved it twelve days ago.
+The decision, its evidence, and the chat to jump back into - twelve days
+later, in three commands.
 
 ## Quickstart
 

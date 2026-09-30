@@ -241,7 +241,7 @@ class TerminalSafetyTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("usage: agrep board", proc.stdout)
-        self.assertNotIn("grep your cross-agent chat history", proc.stdout)
+        self.assertNotIn("search everything your AI agents have done", proc.stdout)
 
     def test_audit_and_archive_quote_store_paths_and_errors(self):
         danger = "bad\x1b]52;c;payload\x07\r\u202eforge"

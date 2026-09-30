@@ -1,9 +1,9 @@
 # agrep
 
-grep your AI coding agents' chat history - Claude Code, Codex, opencode,
-Antigravity, Kimi CLI, Cline, Gemini CLI, crush, Cursor, pi, and oh-my-pi -
-straight from the shell. One searchable cross-agent history, budgeted context
-recall, live session board, and native resume.
+Find, open, resume and watch your AI agents' work - Claude Code, Codex,
+opencode, Antigravity, Kimi CLI, Cline, Gemini CLI, crush, Cursor, pi, and
+oh-my-pi - straight from the shell. One local index of every conversation,
+tool call and result, with native resume and a live board across tools.
 
 This npm package is a thin shim: agrep is a python package with a bundled rust binary,
 and the shim runs it through [uv](https://docs.astral.sh/uv/) (or pipx). uv manages

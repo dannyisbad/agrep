@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""agrep (agentic grep) - search and explore your cross-agent chat history.
+"""agrep (agentic grep) - find, open, resume and watch your AI agents' work.
 
   agrep "race condition"    grep your whole agent history; print matches  (the namesake)
   agrep recall "<query>"    top hits + the chat around each, one byte budget (for agents)
@@ -999,8 +999,8 @@ def cmd_status(a) -> int:
         return doctor.main(a.rest)
     cli = common.cli_name()  # `python cli.py` in a dev checkout, `agrep` once installed
     color = common.color_enabled(sys.stdout)
-    print(_paint("hd", "agrep (agentic grep) - search and explore your "
-                       "cross-agent chat history", color) + "\n", flush=True)
+    print(_paint("hd", "agrep (agentic grep) - find, open, resume and watch your AI agents' work",
+                 color) + "\n", flush=True)
     for line in _status_lines(cli, color):
         print(line)
     if common.MESSAGES_PATH.is_file():
@@ -1758,8 +1758,7 @@ def _main() -> int:
         return cmd_search(argparse.Namespace(rest=raw))
 
     p = surface.ArgumentParser(
-        prog="agrep", description="agentic grep: search and explore your "
-                                  "cross-agent chat history",
+        prog="agrep", description="agentic grep: find, open, resume and watch your AI agents' work",
         allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="find text         search (the default: agrep \"<pattern>\"), "

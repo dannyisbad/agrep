@@ -6930,7 +6930,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
     common.utf8_stdio()
 
     ap = surface.ArgumentParser(
-        prog="agrep", description="agentic grep: grep your cross-agent chat history",
+        prog="agrep", description="agentic grep: search everything your AI agents have done",
         allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
