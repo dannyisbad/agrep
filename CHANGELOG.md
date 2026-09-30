@@ -28,8 +28,9 @@
 - Claude sessions under a repository container such as
   `~/Desktop/projects/<repo>` or a macOS temp root (`/private/tmp/<repo>`,
   `$TMPDIR/<repo>`) are labelled by the repository (`shop`), not the
-  container (`projects`, `private`), matching the other adapters. Takes
-  effect after `agrep reindex --full`.
+  container (`projects`, `private`), matching the other adapters, also on a
+  machine whose own home directory is named `home` or `users`. Takes effect
+  after `agrep reindex --full`.
 
 ### Search
 
