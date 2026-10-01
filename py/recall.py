@@ -758,6 +758,12 @@ def _weak_scatter(hit: dict) -> bool:
     return hit.get("matched") in ("all-terms", "content-terms")
 
 
+def _matched_label(hit: dict) -> str:
+    """The lane a recall hit reports: search's own label, else meaning or phrase."""
+    return hit.get("matched") or (
+        "semantic" if hit.get("lane") == "semantic" else "phrase")
+
+
 _WEAK_SNIPPET = 160    # snippet cap inside a collapsed weak line
 _WEAK_LINE_COST = 240  # budget reserved per collapsed line (head + snippet)
 
@@ -1825,6 +1831,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     requested_mode = "semantic" if args.semantic else "keyword"
     engine = "handle" if direct_hit is not None else ""
     fell_back = False
+    phrase_found = False
     hybrid_used = False
     # Weak-neighbor escalation arrived as unfinished snapshot work: its render
     # sites landed without the code that ever sets this. None keeps every one
@@ -2001,6 +2008,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     used_tool_fallback = bool(tool_res["hits"])
                     fell_back = fell_back or bool(tool_res.get("terms_fallback"))
                     fell_back = fell_back or bool(tool_res.get("content_fallback"))
+                    phrase_found = phrase_found or any(
+                        _matched_label(hit) == "phrase" for hit in tool_res["hits"])
             # Probe stays miss-triggered to preserve its cheap one-line contract.
             strong = any(
                 not _weak_scatter(h) and not h.get("_probe_query_echo")
@@ -2055,6 +2064,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         engine = engine or res["engine"]
         fell_back = fell_back or bool(res.get("terms_fallback"))
         fell_back = fell_back or bool(res.get("content_fallback"))
+        phrase_found = phrase_found or any(
+            _matched_label(hit) == "phrase" for hit in res["hits"])
         for hit in res["hits"]:
             if "_recall_lane" not in hit:
                 hit["_recall_lane"] = 2 if hit.get("who") == "tool" else 0
@@ -2554,9 +2565,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                              "sem_score": h.get("sem_score"),
                              "score_kind": h.get("score_kind"),
                              **({"lane": h["lane"]} if h.get("lane") else {}),
-                             "matched": h.get("matched") or (
-                                 "semantic" if h.get("lane") == "semantic"
-                                 else "phrase"),
+                             "matched": _matched_label(h),
                              "window": rows})
             required_tool_rows.append(required_tools)
         obj = {"query": queries[0] if one else queries, "engine": engine, "hits": out_hits}
@@ -2579,7 +2588,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         if tools_excluded:
             obj["tools_excluded"] = {
                 "reason": surface.TOOLS_PENDING_ERROR_CODE}
-        if fell_back:
+        if fell_back and not phrase_found:
             obj["note"] = "no exact phrase match; showing hits containing all terms"
         _write_payload(
             _fit_json_payload(obj, _content_budget(budget), session_index,

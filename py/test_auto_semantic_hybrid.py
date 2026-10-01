@@ -3800,6 +3800,36 @@ class RecallHybridTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         return payload["semantic_status"], stderr.getvalue()
 
+    def test_recall_json_fallback_note_never_contradicts_a_phrase_hit(self) -> None:
+        phrase = self._keyword("prose")
+        scatter = self._keyword("scatter", fallback=True)
+        for prose_hits, prose_extra, noted in (
+                ([phrase], {"phrase_chats": 1}, False),
+                ([scatter], {"phrase_chats": 0, "terms_fallback": True}, True)):
+            with self.subTest(noted=noted):
+                def run_query(_query, *, mode="keyword", who=None, **_kwargs):
+                    if who == "tool":
+                        return _result([], phrase_chats=0, terms_fallback=True)
+                    return _result([dict(hit) for hit in prose_hits], **prose_extra)
+
+                stdout = io.StringIO()
+                with mock.patch.object(recall.indexd_runtime, "ensure_index",
+                                       return_value=True), \
+                        mock.patch.object(recall.common, "in_agent_context",
+                                          return_value=False), \
+                        mock.patch.object(search, "run_query", side_effect=run_query), \
+                        mock.patch.object(explore, "get_windows",
+                                          side_effect=self._window), \
+                        contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = recall.main(["violet checkpoint", "--lexical", "--json",
+                                      "--hits", "2", "--budget", "4000"])
+                self.assertEqual(rc, 0)
+                payload = json.loads(stdout.getvalue())
+                labels = [hit["matched"] for hit in payload["hits"]]
+                self.assertEqual("note" in payload, noted)
+                self.assertEqual("phrase" in labels, not noted)
+
     def test_recall_json_separates_searched_empty_from_never_ran(self) -> None:
         status, stderr = self._json_status(
             ["deployment retry loop", "--lexical"])
