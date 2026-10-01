@@ -43,6 +43,10 @@ command. Versioned machine-mode validation errors keep their structured shape.
   the completed keyword search's exit status. Exact count and filter qualification
   still require complete coverage; meaning results cannot make inexact keyword
   totals exact.
+  A store census observed within the last 5 seconds (possibly by the daemon)
+  may be reused when the publication, ingest binary, discovery environment
+  and working directory for relative roots are unchanged and the wall and
+  monotonic clocks agree on its age.
 - **Every surface states its own completeness.** A machine surface that
   printed part of the answer says so in the payload: search `--json` begins
   with one `agrep-meta` run envelope carrying `completeness` (`shown`, `total`,

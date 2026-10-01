@@ -407,6 +407,7 @@ class AutoIndexer(threading.Thread):
         self._repair_streak = 0
         self._last_repair_run = 0.0
         self._last_verify_stamp = time.monotonic()
+        self._last_census_check = 0.0
         self._fail_streak, last_error, last_attempt = (
             indexd_runtime.indexd_failure_state())
         self._pending_streak = 0
@@ -608,6 +609,7 @@ class AutoIndexer(threading.Thread):
                 return
             self._serve_recovery_requests()
             now = time.monotonic()
+            self._maybe_warm_store_census(now)
             if now < next_check:
                 continue
             next_check = now + CHECK_S
@@ -620,6 +622,12 @@ class AutoIndexer(threading.Thread):
             else:
                 self._maybe_verify_current(time.monotonic())
             self._serve_index_request()
+
+    def _maybe_warm_store_census(self, now: float) -> None:
+        if now - self._last_census_check < 1.0:
+            return
+        self._last_census_check = now
+        indexd_runtime.warm_store_census()
 
     def _serve_recovery_requests(self, *, startup: bool = False) -> bool:
         if (self._retry_needed

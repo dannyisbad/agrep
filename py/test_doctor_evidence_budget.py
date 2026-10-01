@@ -2046,7 +2046,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
                 indexd_runtime.observe_store_drift(timeout_s=0.125),
                 (None, report),
             )
-        census.assert_called_once_with(timeout_s=0.125)
+        census.assert_called_once_with(timeout_s=0.125, persist=False)
         derive.assert_called_once_with(store_rows=None)
 
     def test_store_detection_forwards_the_diagnostic_deadline(self) -> None:
