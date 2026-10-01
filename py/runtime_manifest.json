@@ -230,6 +230,10 @@
    "member": "agrep/py/removal_fence.py"
   },
   {
+   "source": "py/resident.py",
+   "member": "agrep/py/resident.py"
+  },
+  {
    "source": "py/resources.py",
    "member": "agrep/py/resources.py"
   },

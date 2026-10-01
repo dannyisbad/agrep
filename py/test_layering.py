@@ -72,6 +72,7 @@ LAYERS = {
     "explore": 4,
     "indexd_runtime": 4,
     "indexer": 4,
+    "resident": 4,
     "segment_query": 4,
     "semantic": 4,
     "semworker": 4,

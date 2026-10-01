@@ -2474,6 +2474,16 @@ def _stop_daemons() -> bool:
         return False
     stopped = []
     clean = True
+    try:
+        import resident
+        outcome = resident.stop_servers()
+        stopped.extend(outcome.get("stopped") or ())
+        if not outcome.get("ok"):
+            print("  ! resident CLI could not be stopped")
+            clean = False
+    except Exception:
+        print("  ! resident CLI teardown failed")
+        clean = False
     indexers = indexd_runtime.stop_indexers_for_removal()
     stopped.extend(indexers.get("stopped") or ())
     if not indexers.get("ok"):

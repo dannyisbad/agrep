@@ -25,6 +25,15 @@ run as `python cli.py <cmd>`. Run `agrep <command> --help` for a command's own o
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "py"))
+    import resident
+    _resident_result = resident.try_run()
+    if _resident_result is not None:
+        raise SystemExit(_resident_result)
+
 import argparse
 import errno
 import json
