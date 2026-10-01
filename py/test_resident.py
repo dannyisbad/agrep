@@ -40,7 +40,7 @@ IMPORT_EXPORTS = (
 class ResidentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base = Path(tempfile.mkdtemp(prefix="resident-", dir=os.environ["TMPDIR"]))
+        cls.base = Path(tempfile.mkdtemp(prefix="resident-"))
         # sun_path is 104 bytes on macOS; a TMPDIR-rooted runtime dir would not fit.
         cls.runtime = Path(tempfile.mkdtemp(prefix="agr-", dir="/tmp"))
         cls.home = cls.base / "home"
@@ -203,7 +203,7 @@ resident.serve(path, lock)
 
     @staticmethod
     def _ps_rows():
-        listing = subprocess.run(["ps", "-axo", "pid=,ppid=,stat="], capture_output=True, text=True)
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,stat="], capture_output=True, text=True)
         rows = {}
         for line in listing.stdout.splitlines():
             parts = line.split()
@@ -212,7 +212,7 @@ resident.serve(path, lock)
         return rows
 
     def _server_pid(self, path):
-        listing = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
+        listing = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,command="], capture_output=True, text=True)
         pids = [int(line.split(None, 1)[0]) for line in listing.stdout.splitlines()
                 if f"resident.serve({path!r},3)" in line]
         self.assertEqual(len(pids), 1, pids)
@@ -626,7 +626,7 @@ else:
         # Default stop actions are discarded in an orphaned group: keep the client in this session.
         client = subprocess.Popen(self._command(["search", "copper", "-n", "1"], served=True), cwd=ROOT,
                                   env=env, stdin=subprocess.DEVNULL, stdout=write_end, stderr=err_write,
-                                  process_group=0)
+                                  preexec_fn=os.setpgrp)
         os.close(write_end)
         os.close(err_write)
         try:
