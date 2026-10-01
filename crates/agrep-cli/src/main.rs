@@ -2489,6 +2489,9 @@ enum Cmd {
         /// and content predicates.
         #[arg(long)]
         paths: bool,
+        /// Emit {"version":1,"stores":[...],"paths":[...]} from one census.
+        #[arg(long, conflicts_with_all = ["paths", "tokens", "audit", "agent"])]
+        census: bool,
         /// Emit exact live token-store fingerprints keyed like intake tallies.
         #[arg(long, hide = true)]
         tokens: bool,
@@ -2577,10 +2580,11 @@ fn run() -> anyhow::Result<()> {
         Cmd::Detect => detect_cmd(),
         Cmd::Stores {
             paths,
+            census,
             tokens,
             audit,
             agent,
-        } => stores_cmd(paths, tokens, audit, agent.as_deref().unwrap_or("all")),
+        } => stores_cmd(paths, census, tokens, audit, agent.as_deref().unwrap_or("all")),
         Cmd::BoundaryRank { serve } => boundary_rank_cmd(serve),
         Cmd::FallbackEventScan => fallback_event_scan_cmd(),
         Cmd::SemanticQ8Build {
@@ -3285,9 +3289,8 @@ fn serialize_store_audit_payload(
     Ok(encoded)
 }
 
-/// Store presence + newest mtime per registered adapter (registry::stores), or - with
-/// --paths - every content file each adapter would discover (the audit census input).
-fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Result<()> {
+/// Store summaries and content paths share one registry walk and one durable-health read.
+fn stores_cmd(paths: bool, census: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Result<()> {
     if audit {
         let payload = collect_store_audit_payload(agent)?;
         let encoded = serialize_store_audit_payload(&payload, STORE_AUDIT_OUTPUT_MAX_BYTES)?;
@@ -3343,15 +3346,16 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
             "reason": error.to_string(),
         })],
     };
-    if paths {
-        let mut items = Vec::new();
-        for diagnostic in ingest::registry::store_diagnostics() {
-            items.extend(diagnostic.paths().map(|path| {
+    let diagnostics = ingest::registry::store_diagnostics();
+    let mut path_items = Vec::new();
+    if paths || census {
+        for diagnostic in &diagnostics {
+            path_items.extend(diagnostic.paths().map(|path| {
                 serde_json::json!({
                     "name": diagnostic.name(), "path": path, "state": "available"
                 })
             }));
-            items.extend(diagnostic.issues().iter().map(|issue| {
+            path_items.extend(diagnostic.issues().iter().map(|issue| {
                 serde_json::json!({
                     "name": diagnostic.name(),
                     "path": issue.path(),
@@ -3361,7 +3365,7 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
                 })
             }));
         }
-        items.extend(durable_issues.iter().map(|issue| {
+        path_items.extend(durable_issues.iter().map(|issue| {
             serde_json::json!({
                 "name": issue.get("agent").and_then(|value| value.as_str()).unwrap_or("all"),
                 "path": issue.get("path").and_then(|value| value.as_str()).unwrap_or(""),
@@ -3370,11 +3374,13 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
                 "reason": issue.get("reason").and_then(|value| value.as_str()).unwrap_or("read failed"),
             })
         }));
-        println!("{}", serde_json::to_string(&items)?);
+    }
+    if paths {
+        println!("{}", serde_json::to_string(&path_items)?);
         return Ok(());
     }
-    let mut items: Vec<serde_json::Value> = ingest::registry::store_diagnostics()
-        .into_iter()
+    let mut items: Vec<serde_json::Value> = diagnostics
+        .iter()
         .map(|diagnostic| {
             let issues: Vec<_> = diagnostic
                 .issues()
@@ -3399,7 +3405,22 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
         })
         .collect();
     apply_durable_store_issues(&mut items, durable_issues);
-    println!("{}", serde_json::to_string(&items)?);
+    if census {
+        #[derive(serde::Serialize)]
+        struct CensusOutput {
+            version: u32,
+            stores: Vec<serde_json::Value>,
+            paths: Vec<serde_json::Value>,
+        }
+        let payload = CensusOutput {
+            version: 1,
+            stores: items,
+            paths: path_items,
+        };
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        println!("{}", serde_json::to_string(&items)?);
+    }
     Ok(())
 }
 
@@ -7328,6 +7349,21 @@ mod tests {
         assert!(Cli::try_parse_from(["agrep-rs", "stores", "--audit", "--tokens"]).is_err());
         assert!(Cli::try_parse_from(["agrep-rs", "stores", "--agent", "codex"]).is_err());
         assert!(agrep_core::ingest::registry::source_audit_snapshot("unknown-adapter").is_err());
+    }
+
+    #[test]
+    fn store_census_rejects_conflicting_modes() {
+        assert!(Cli::try_parse_from(["agrep-rs", "stores", "--census"]).is_ok());
+        for flag in ["--paths", "--tokens", "--audit"] {
+            let error = Cli::try_parse_from(["agrep-rs", "stores", "--census", flag])
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        let error = Cli::try_parse_from(["agrep-rs", "stores", "--census", "--agent", "codex"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[cfg(unix)]

@@ -1991,7 +1991,7 @@ fn sqlite_snapshot_directory(_path: &Path) -> bool {
     false
 }
 
-fn walk_regular_sources(
+fn walk_regular_sources<const CENSUS: bool>(
     adapter: &dyn Adapter,
     path: &Path,
     accepts: impl Fn(&Path) -> bool,
@@ -2064,7 +2064,19 @@ fn walk_regular_sources(
             match entry {
                 Ok(entry) => {
                     let path = entry.path();
+                    // File types come from directory entries on Unix. Census-only filtering
+                    // avoids statting auxiliary files without skipping links or special files.
+                    let accepted =
+                        CENSUS && cfg!(unix) && entry.file_type().is_ok_and(|kind| kind.is_file());
+                    if accepted && !accepts(&path) {
+                        continue;
+                    }
                     match entry.metadata() {
+                        Ok(metadata)
+                            if accepted && metadata.is_file() && !metadata_is_link(&metadata) =>
+                        {
+                            candidates.push(SourceCandidate { path, metadata });
+                        }
                         Ok(metadata) => pending.push((path, Some(metadata))),
                         Err(error) => {
                             crate::ingest::warn_source_skip(adapter.name(), &path, &error);
@@ -2081,7 +2093,9 @@ fn walk_regular_sources(
             }
         }
     }
-    candidates.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    if !CENSUS {
+        candidates.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    }
     SourceWalk {
         candidates,
         issues,
@@ -2098,7 +2112,7 @@ fn walk_sources(
 ) -> (bool, Vec<SourceIssue>, SourceSnapshotTiming) {
     // Discovery (notably Codex's YYYY/MM/DD tree) has no depth ceiling. Store roots
     // never follow symlinks, so transcript-shaped files outside them stay out of scope.
-    let walked = walk_regular_sources(adapter, path, |path| adapter.freshness_content(path));
+    let walked = walk_regular_sources::<false>(adapter, path, |path| adapter.freshness_content(path));
     let candidate_count = walked.candidates.len();
     let mut complete = walked.complete;
     let mut issues = walked.issues;
@@ -2402,7 +2416,7 @@ impl StoreDiagnostic {
 
 pub fn store_diagnostics() -> Vec<StoreDiagnostic> {
     ADAPTERS
-        .iter()
+        .par_iter()
         .filter_map(|adapter| store_diagnostic(*adapter))
         .collect()
 }
@@ -2461,11 +2475,12 @@ struct StoreCensus {
 }
 
 fn store_census(adapter: &dyn Adapter) -> StoreCensus {
-    let mut files = HashMap::new();
+    let mut files = Vec::new();
     let mut issues = Vec::new();
     for root in adapter.store_roots() {
-        let walked = walk_regular_sources(adapter, &root, |path| adapter.store_content(path));
+        let walked = walk_regular_sources::<true>(adapter, &root, |path| adapter.store_content(path));
         issues.extend(walked.issues);
+        files.reserve(walked.candidates.len());
         for candidate in walked.candidates {
             let modified = candidate
                 .metadata
@@ -2474,14 +2489,18 @@ fn store_census(adapter: &dyn Adapter) -> StoreCensus {
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
-            files
-                .entry(candidate.path)
-                .and_modify(|current: &mut u64| *current = (*current).max(modified))
-                .or_insert(modified);
+            files.push((candidate.path, modified));
         }
     }
-    let mut files: Vec<_> = files.into_iter().collect();
     files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    files.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            earlier.1 = earlier.1.max(later.1);
+            true
+        } else {
+            false
+        }
+    });
     issues.sort();
     issues.dedup();
     StoreCensus { files, issues }
@@ -3997,6 +4016,81 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_census_deduplicates_roots_without_losing_special_file_issues() {
+        use std::os::unix::fs::symlink;
+
+        struct CensusAdapter(Vec<PathBuf>);
+        impl Adapter for CensusAdapter {
+            fn name(&self) -> &'static str {
+                "census-test"
+            }
+            fn fingerprint(&self) -> Fingerprint {
+                Fingerprint::Stat
+            }
+            fn collect(&self, _cache: &mut IngestCache) -> (Vec<Message>, Vec<Event>) {
+                panic!("a store census must not parse transcripts")
+            }
+            fn store_roots(&self) -> Vec<PathBuf> {
+                self.0.clone()
+            }
+            fn store_content(&self, path: &Path) -> bool {
+                path.extension().is_some_and(|extension| extension == "jsonl")
+            }
+        }
+
+        let root = snapshot_root("census-overlapping-roots");
+        let nested = root.join("nested");
+        let hidden = root.join(".agrep-sqlite-123-abcd-0");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&hidden).unwrap();
+        let first = root.join("a.jsonl");
+        let second = nested.join("b.jsonl");
+        fs::write(&first, b"not parsed").unwrap();
+        fs::write(&second, b"not parsed").unwrap();
+        fs::write(hidden.join("private.jsonl"), b"private snapshot").unwrap();
+        fs::write(nested.join("auxiliary.json"), b"not content").unwrap();
+        let link = root.join("link.txt");
+        symlink(&second, &link).unwrap();
+        let special = root.join("special.jsonl");
+        fifo(&special);
+        fifo(&root.join("auxiliary.pipe"));
+        let adapter = CensusAdapter(vec![
+            nested,
+            root.clone(),
+            second.clone(),
+            root.join("absent"),
+        ]);
+        let diagnostic = store_diagnostic(&adapter).unwrap();
+        assert_eq!(
+            diagnostic.paths().collect::<Vec<_>>(),
+            [first.to_str().unwrap(), second.to_str().unwrap()]
+        );
+        assert_eq!(diagnostic.state(), "source-unreadable");
+        assert_eq!(
+            diagnostic
+                .issues()
+                .iter()
+                .map(|issue| (issue.path(), issue.kind()))
+                .collect::<Vec<_>>(),
+            [
+                (link.to_str().unwrap(), "unsupported-link"),
+                (special.to_str().unwrap(), "unsupported-file-type"),
+            ]
+        );
+        let expected_mtime = fs::metadata(&first)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .max(fs::metadata(&second).unwrap().modified().unwrap())
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(diagnostic.newest_mtime_ms(), expected_mtime);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
