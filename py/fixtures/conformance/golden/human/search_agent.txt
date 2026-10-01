@@ -1,0 +1,8 @@
+exit: 0
+--- stdout ---
+55555555-5555-4555-8555-555555555555	codex	cedar	3	user	Summarize the codex lantern decision for the release lead.
+55555555-5555-4555-8555-555555555555	codex	cedar	0	user	Audit the copper lantern deployment manifest for cedar.
+55555555-5555-4555-8555-555555555555	codex	cedar	3	agent	The codex lantern decision keeps the west dock closed until sunrise.
+55555555-5555-4555-8555-555555555555	codex	cedar	0	agent	The copper lantern manifest names the amber gate and west dock.
+55555555-5555-4555-8555-555555555555	codex	cedar	2	tool	exec_command: cat manifest.txt toolproof-codex: copper lantern manifest verified
+--- stderr ---

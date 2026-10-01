@@ -1,0 +1,12 @@
+exit: 0
+--- stdout ---
+22222222-2222-4222-8222-222222222222	pi	maple	2	user	Keep the maple lantern review separate from cedar.
+22222222-2222-4222-8222-222222222222	pi	maple	0	user	Check the maple lantern against the glacier inventory.
+66666666-6666-4666-8666-666666666666	claude	birch	2	user	End the birch lantern review with a clean handoff.
+66666666-6666-4666-8666-666666666666	claude	birch	0	user	The birch lantern uses a silver compass instead of a copper switch.
+22222222-2222-4222-8222-222222222222	pi	maple	2	agent	The maple lantern review remains independent.
+22222222-2222-4222-8222-222222222222	pi	maple	0	agent	The maple lantern inventory has a turquoise latch.
+66666666-6666-4666-8666-666666666666	claude	birch	2	agent	The birch lantern handoff has no outstanding repairs.
+66666666-6666-4666-8666-666666666666	claude	birch	0	agent	A silver compass is reserved for the birch lantern.
+22222222-2222-4222-8222-222222222222	pi	maple	1	tool	bash: cat inventory.txt toolproof-maple: turquoise latch present lantern count: 2
+--- stderr ---

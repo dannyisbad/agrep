@@ -1,0 +1,3 @@
+{"type":"session","id":"44444444-4444-4444-8444-444444444444","version":3,"cwd":"{{home}}/projects/cedar","timestamp":"{{t-1d+6h+10m}}"}
+{"type":"message","id":"side-0","parentId":null,"timestamp":"{{t-1d+6h+11m}}","message":{"role":"user","content":[{"type":"text","text":"Check the sidecar lantern rollback plan for the cedar lead."}]}}
+{"type":"message","id":"side-1","parentId":"side-0","timestamp":"{{t-1d+6h+12m}}","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"Sidecar lantern verdict: the rollback plan preserves the amber gate."}]}}

@@ -1,0 +1,6 @@
+exit: 0
+--- stdout ---
+@11111111:1.5a26 claude/user cedar 2d Keep the key distinct from keychain and monk…
+@55555555:1.934e codex/agent cedar 1d …e; keychain is not a whole-word key.
+--- stderr ---
+3 matches · more: agrep --more m.<TOKEN>

@@ -1,0 +1,29 @@
+exit: 0
+--- stdout ---
+11111111 · claude · cedar  turns 0-7 of 0-7
+1 tool events omitted · agrep around 11111111 7 --whole --full
+── turn 0 ──────────────────────────────────────── 2000-01-17 14:00
+user: Please map the copper lantern launch checklist for cedar.
+agent: The cedar copper lantern checklist begins with the amber gate.
+── turn 1 ──────────────────────────────────────── 2000-01-17 14:03
+user: Keep the key distinct from keychain and monkey in the matcher.
+agent: The whole word key belongs beside beacon-red in the notes.
+── turn 2 ──────────────────────────────────────── 2000-01-17 14:06
+user: Read the inventory before changing the launch sequence.
+agent: I will read the inventory and check toolproof-cedar.
+── turn 3 ──────────────────────────────────────── 2000-01-17 14:09
+user: Check violet checkpoint before the copper lantern release.
+agent: Violet checkpoint is clear; the copper lantern release can proceed.
+── turn 4 ──────────────────────────────────────── 2000-01-17 14:12
+user: Record beacon-blue after the queue is drained.
+agent: The drained queue leaves beacon-blue ready for review.
+── turn 5 ──────────────────────────────────────── 2000-01-17 14:15
+user: Describe the rollback window without opening a network connection.
+agent: The rollback window lasts until the amber gate closes.
+── turn 6 ──────────────────────────────────────── 2000-01-17 14:18
+user: Is the lantern inventory complete for the night shift?
+agent: The lantern inventory contains three sealed crates.
+── turn 7 ──────────────────────────────────────── 2000-01-17 14:21
+user: Write the final cedar handoff in plain language.
+agent: The final cedar handoff keeps the copper lantern by the east door.
+--- stderr ---

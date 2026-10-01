@@ -1,0 +1,8 @@
+exit: 0
+--- stdout ---
+@55555555:1.056b codex/user cedar 1d Use beacon-blue to identify the isolated worker…
+@11111111:4.6b32 claude/user cedar 2d Record beacon-blue after the queue is drained.
+@11111111:1.24df claude/agent cedar 2d …e whole word key belongs beside beacon-red in the notes.
+--- stderr ---
+5 matches · more: agrep --more m.<TOKEN>
+excluded 1 hit from the current window

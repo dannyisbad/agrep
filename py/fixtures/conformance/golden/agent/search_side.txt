@@ -1,0 +1,6 @@
+exit: 0
+--- stdout ---
+@44444444:0.9bdf pi/agent cedar 17h Sidecar lantern verdict: the rollback plan pres…
+@33333333:0.1afe pi/user cedar 17h ~all Review the cedar lantern plan with a sidecar advisor.
+--- stderr ---
+4 matches · more: agrep --more m.<TOKEN>

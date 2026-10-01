@@ -1,0 +1,6 @@
+exit: 0
+--- stdout ---
+55555555-5555-4555-8555-555555555555	codex	cedar	2	tool	exec_command: cat manifest.txt toolproof-codex: copper lantern manifest verified
+11111111-1111-4111-8111-111111111111	claude	cedar	2	tool	Read: inventory.txt toolproof-cedar: three copper lantern crates status: sealed
+22222222-2222-4222-8222-222222222222	pi	maple	1	tool	bash: cat inventory.txt toolproof-maple: turquoise latch present lantern count: 2
+--- stderr ---

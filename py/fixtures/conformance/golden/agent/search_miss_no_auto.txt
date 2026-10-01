@@ -1,0 +1,5 @@
+exit: 2
+--- stdout ---
+--- stderr ---
+keyword: 0 matching rows across 23 indexed messages
+history may be stale: automatic freshness checks are disabled by --no-auto

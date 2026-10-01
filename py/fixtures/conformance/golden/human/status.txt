@@ -1,0 +1,30 @@
+exit: 0
+--- stdout ---
+agrep (agentic grep) - find, open, resume and watch your AI agents' work
+
+  data dir: <SANDBOX>/data (env)
+  23 messages · 6 sessions · last indexed <AGE> ago
+    claude  11 messages · 2 sessions
+    pi      8 messages · 3 sessions
+    codex   4 messages · 1 sessions
+  your agents do not know about agrep yet: `python cli.py setup`
+
+recent chats (`python cli.py chats` for more):
+@33333333 pi cedar 17h 4t  Review the cedar lantern plan with a sidecar advisor. · agrep around @33333333:3.7b29
+@55555555 codex cedar 1d 4t  Audit the copper lantern deployment manifest for cedar. · agrep around @55555555:3.95fb
+@11111111 claude cedar 2d 8t  Please map the copper lantern launch checklist for cedar. · agrep around @11111111:7.4ef4
+@22222222 pi maple 4d 3t  Check the maple lantern against the glacier inventory. · agrep around @22222222:2.23c2
+@66666666 claude birch 6d 3t  The birch lantern uses a silver compass instead of a copper switch. · agrep around @66666666:2.4b25
+
+try:
+  python cli.py "race condition"        grep every agent for a phrase
+  python cli.py deadlock --agent codex  filter to one agent
+  python cli.py search index            search a word that is also a command
+  python cli.py -E "TODO|FIXME"         regex search
+  python cli.py -l auth                 which chats mention it
+  python cli.py recall "topic" --probe   one-line pointer to past sessions (cheap)
+  python cli.py recall "topic"          the conversations themselves, budget-capped
+  python cli.py around <id> <turn>      the conversation around a hit
+  python cli.py resume <id>             reopen a past session in its agent
+--- stderr ---
+showing 5 of 5 matching chats, newest first (side chats hidden; --side shows them)

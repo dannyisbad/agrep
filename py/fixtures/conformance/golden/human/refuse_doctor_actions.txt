@@ -1,0 +1,4 @@
+exit: 2
+--- stdout ---
+--- stderr ---
+agrep doctor: --fix cannot be combined with --json, which prints one machine report; run: agrep doctor --json

@@ -1,0 +1,8 @@
+exit: 0
+--- stdout ---
+@33333333 pi cedar 17h 4t  match: Confirm the copper lantern handoff after the recap. · agrep around @33333333:3.3bfd
+@55555555 codex cedar 1d 4t  match: Audit the copper lantern deployment manifest for cedar. · agrep around @55555555:0.b9d2
+@11111111 claude cedar 2d 8t  match: Check violet checkpoint before the copper lantern release. · agrep around @11111111:3.0c42
+@66666666 claude birch 6d 3t  match: The birch lantern uses a silver compass instead of a copper switch. · agrep around @66666666:0.a0d9
+--- stderr ---
+showing 4 of 4 matching chats, best match first (side chats hidden; --side shows them)

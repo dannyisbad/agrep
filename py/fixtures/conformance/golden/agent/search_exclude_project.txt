@@ -1,0 +1,8 @@
+exit: 0
+--- stdout ---
+@22222222:2.adc8 pi/user maple 4d Keep the maple lantern review separate from cedar.
+@22222222:0.b42e pi/user maple 4d Check the maple lantern against the glacier inventory.
+@22222222:1.242a~<EVENT>:65-72 pi/tool maple 4d …-maple: turquoise latch present lantern count: 2
+--- stderr ---
+5 matches · more: agrep --more m.<TOKEN>
+excluded 4 hits from the current window

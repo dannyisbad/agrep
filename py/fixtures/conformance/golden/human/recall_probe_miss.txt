@@ -1,0 +1,4 @@
+exit: 1
+--- stdout ---
+recall: no confident match in 6 past conversations
+--- stderr ---

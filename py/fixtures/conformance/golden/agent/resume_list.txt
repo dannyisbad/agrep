@@ -1,0 +1,9 @@
+exit: 0
+--- stdout ---
+pi · <HOME>/projects/cedar  44444444  Check the sidecar lantern rollback plan for the cedar lead.
+pi · <HOME>/projects/cedar  33333333  Review the cedar lantern plan with a sidecar advisor.
+codex · cedar  55555555  Audit the copper lantern deployment manifest for cedar.
+claude · cedar  11111111  Please map the copper lantern launch checklist for cedar.
+pi · <HOME>/projects/maple  22222222  Check the maple lantern against the glacier inventory.
+claude · birch  66666666  The birch lantern uses a silver compass instead of a copper switch.
+--- stderr ---

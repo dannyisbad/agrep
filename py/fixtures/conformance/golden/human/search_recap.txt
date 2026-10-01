@@ -1,0 +1,5 @@
+exit: 0
+--- stdout ---
+33333333-3333-4333-8333-333333333333	pi	cedar	1	user	Preserve the saffron recap after compaction.
+33333333-3333-4333-8333-333333333333	pi	cedar	2	recap	Saffron recap: the copper lantern review is complete; preserve the rollback plan and turquois…
+--- stderr ---
