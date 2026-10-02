@@ -1,0 +1,2 @@
+{"sessionId":"d7d7d7d7-0007-4000-8000-000000000007","cwd":"{{home}}/projects/atlas","type":"user","userType":"external","timestamp":"{{t-2h}}","message":{"role":"user","content":"Tidy the atlas README."}}
+{"sessionId":"d7d7d7d7-0007-4000-8000-000000000007","cwd":"{{home}}/projects/atlas","type":"assistant","timestamp":"{{t-2h+1m}}","message":{"role":"assistant","model":"claude-sonnet-4","content":[{"type":"text","text":"Which section of the atlas README should I trim first?"}]}}
