@@ -522,14 +522,14 @@
   On one real home it took 73 ms, against 238 ms for the separate `stores`
   and `stores --paths` walks it replaces.
 - On macOS and Linux, read commands (`search`, `chats`, `around`, `recall`,
-  bare `agrep`, `--version`, `--help`) run in a forked child of a warm
-  resident process instead of starting Python and importing agrep each time:
-  on a 5,000-chat store a warm search went from 102 to 47 ms and `--version`
-  from 69 to 35 ms. The resident checks the caller's process id with the
-  kernel before serving, so self-exclusion matches a direct run, and any
-  failure before a command starts runs it directly. `AGREP_NO_RESIDENT=1`
-  turns it off, `AGREP_RESIDENT_IDLE_S` (default 600) sets how long it idles,
-  and `agrep remove` stops it.
+  `summary`, `why`, bare `agrep`, `--version`, `--help`) run in a forked
+  child of a warm resident process instead of starting Python and importing
+  agrep each time: on a 5,000-chat store a warm search went from 102 to 47 ms
+  and `--version` from 69 to 35 ms. The resident checks the caller's process
+  id with the kernel before serving, so self-exclusion matches a direct run,
+  and any failure before a command starts runs it directly.
+  `AGREP_NO_RESIDENT=1` turns it off, `AGREP_RESIDENT_IDLE_S` (default 600)
+  sets how long it idles, and `agrep remove` stops it.
 
 ## 0.3.1 — 2026-08-26
 
