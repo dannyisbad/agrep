@@ -1966,6 +1966,13 @@ def _corpus_db_readiness(
                 "state": "stale",
                 "detail": "database publication changed during the integrity scan",
             }, integrity)
+        # SQLite before 3.44 has no xIntegrity: quick_check cannot see lost
+        # FTS5 shadow tables, but constructing the virtual table does.
+        try:
+            for table in ("msgs_fts", "msgs_prose_fts"):
+                db.execute(f"SELECT rowid FROM {table} LIMIT 1").fetchall()
+        except sqlite3.Error as error:
+            return finish(dict(_sqlite_failure(error)), integrity)
         return finish(ready, integrity)
     except _PostAdoptionClobber as error:
         reason = common.terminal_safe(error)
