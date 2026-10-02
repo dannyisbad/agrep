@@ -268,6 +268,12 @@ resident.serve(path, lock)
                         time.sleep((1 - fraction) % 1 + 0.02)
                     normal = self._call(args, normal=True, pty=pty)
                     served = self._call(args, served=True, pty=pty)
+                    if not args:
+                        # A loaded box can push the pair across the next whole-second wrap.
+                        normal, served = (
+                            (code, re.sub(rb"last indexed \d+[smhd] ago",
+                                          b"last indexed <AGE> ago", out), err)
+                            for code, out, err in (normal, served))
                     self.assertNotEqual(served[0], 97)
                     self.assertEqual(served, normal)
                     if "resident-unfindable-token" in args:
