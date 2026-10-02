@@ -50,28 +50,44 @@ A single hit deletes the output and exits 1. Review the samples by hand before c
 the manifest lists uncovered shapes so a reviewer can decide whether to raise
 `--max-files`.
 
-## Lane B: full-history run over the real stores (local, on demand)
+## Lane B: full-history run over a frozen copy of the real stores (local, on demand)
 
 ```
-python bench/real_history/run.py                 # ~minutes; report is aggregates only
-python bench/real_history/run.py --keep --report /tmp/real-history.json
+python bench/real_history/run.py --freeze                 # snapshot, index, check, delete
+python bench/real_history/run.py --freeze --keep --report /tmp/real-history.json
+python bench/real_history/snapshot.py ~/.agrep-real-history/frozen  # or freeze once ...
+python bench/real_history/run.py --home ~/.agrep-real-history/frozen # ... and rerun against it
+python bench/real_history/snapshot.py ~/.agrep-real-history/frozen --delete
 ```
+
+Agents append to the live stores while a run takes minutes, which breaks every invariant that
+compares two readings of a file (`warm_reindex_identity`, `source_bounds`, `audit --full`).
+`snapshot.py` freezes the stores first: every store root `agrep-rs stores --paths` reports is
+cloned copy-on-write (`cp -c` / clonefile on APFS, `cp --reflink=always` on btrfs/xfs; the tool
+refuses other filesystems and other volumes), SQLite stores are copied through the backup API
+from a read-only connection (never a raw copy of a live db plus WAL), and the manifest
+`.agrep-snapshot.json` records what the clone really allocated, measured as the free-space delta;
+a clone that silently fell back to copying bytes is deleted and refused. The live stores are
+only read. Running `--home ~` directly still works but its findings carry the live caveat.
 
 This is the one sanctioned exception to the sandbox-HOME rule. Safeguards:
 
-- `env -i` style sealed environment; `HOME`/`AGREP_HOME` point at the real home only so
-  store discovery works; `AGREP_DATA_DIR` is a fresh dir under `~/.agrep-p4/RealHistory`
-  and the run refuses to start if it resolves into the production data dir;
-- `AGREP_DATA_READONLY` names the production dir as a second fence;
+- `env -i` style sealed environment; `HOME`/`AGREP_HOME` point at the frozen (or real) home only
+  so store discovery works; `AGREP_DATA_DIR` is a fresh dir under `~/.agrep-real-history`
+  and the run refuses to start if it resolves into any production data dir: the indexed home's,
+  the snapshot source's, or the operator's own;
+- `AGREP_DATA_READONLY` names the source home's production dir as a second fence;
 - `AGREP_NO_DAEMON`, `AGREP_NO_RESIDENT`, `AGREP_NO_SEM_WORKER`, `AGREP_NO_FETCH` set,
   embeddings off in the scratch `settings.json`, `TMPDIR`/`XDG_RUNTIME_DIR` in scratch;
 - never `setup`, `teach`, `remove` or `doctor --fix`; the only commands are `index`,
   `search --json`, `chats --json`, `around --json`, `audit --full --json`,
   `agrep-rs stores --paths`;
-- `du -sk` over the store roots first; refuses unless free disk is at least
-  `--min-free-ratio` (2.0) times the store size;
-- the scratch dir is deleted at the end unless `--keep`; background children bound to the
-  scratch data dir are reaped.
+- free-space guard over the content bytes the index will read (the files `stores --paths`
+  lists), not `du` of the roots: clones share their blocks with the live store, so `du` would
+  count the snapshot twice, while the run only allocates derived data (measured 0.26 x content).
+  Refuses unless free disk is at least `--min-free-ratio` (1.0) times the content;
+- the scratch dir and a `--freeze` snapshot are deleted at the end unless `--keep`; background
+  children bound to the scratch data dir are reaped.
 
 ## Invariants (shared by both lanes, `invariants.py`)
 
@@ -86,7 +102,7 @@ This is the one sanctioned exception to the sandbox-HOME rule. Safeguards:
 | `project_labels` | name-form labels are never a generic container (`projects`, `private`, `tmp`, `Users`, `home`, ...); pi publishes the raw cwd by contract and is exempt |
 | `warm_reindex_identity` | an unchanged rerun leaves messages/sessions/replies/intake/boundary/event artifacts byte-identical |
 | `handle_round_trip` | sampled `chats`/`search` handles reopen via `around --json` at the same session, turn and content digest; sampled aliases open their canonical session |
-| `search_first_lines` | a sample of session first lines is found by `search --json` |
+| `search_first_lines` | a sample of published first lines is searchable: the rarest words of the line (document frequency over all first lines), scoped to the session with `--chat`, return the row that carries the line. Corpus-wide rank is not asserted: thousands of sessions share boilerplate openers, so top-k is a ranking property, not a missing-row signal |
 
 A failing invariant on real data is reported as a finding with the check name, the
 aggregate counts and the adapters involved; it is a potential real bug and must not be

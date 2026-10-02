@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT / "bench" / "real_history"))
 import invariants  # noqa: E402
 import sandbox  # noqa: E402
 import shapes  # noqa: E402
+import snapshot  # noqa: E402
 
 FIXTURES = ROOT / "bench" / "fixtures" / "real_shapes"
 EXPECTED_ADAPTERS = ("claude", "codex", "pi", "opencode")
@@ -148,7 +150,7 @@ class RealShapeIngestTests(unittest.TestCase):
         self.assertCheck(invariants.check_warm_identity(self.before, self.after))
 
     def test_search_finds_indexed_first_lines(self) -> None:
-        check = invariants.check_search_first_lines(self.sandbox.runner, self.sessions)
+        check = invariants.check_search_first_lines(self.sandbox.runner, self.sessions, self.messages)
         self.assertCheck(check)
         self.assertGreater(check.counts["queried"], 0)
 
@@ -240,6 +242,125 @@ class InvariantDetectionTests(unittest.TestCase):
             self.assertFalse(invariants.check_family_closure(messages, sessions, corpus).ok)
             sessions[1].pop("alias")
             self.assertTrue(invariants.check_family_closure(messages, sessions, corpus).ok)
+
+    def test_search_first_lines_reject_a_row_missing_from_search(self) -> None:
+        # The publication layer still lists the first line while the search database has lost
+        # its row: the check must report that session, not just a lower rank.
+        if not FIXTURES.is_dir() or not (FIXTURES / "manifest.json").is_file():
+            raise unittest.SkipTest("bench/fixtures/real_shapes has not been generated")
+        box = RealShapeSandbox()
+        try:
+            runner = box.runner
+            self.assertEqual(runner.cli(["index"]).returncode, 0)
+            sessions = invariants.read_jsonl(box.data / "sessions.jsonl")
+            messages = invariants.read_jsonl(box.data / "messages.jsonl")
+            victim = next(row for row in sessions
+                          if row["agent"] == "claude" and len(row.get("first_text", "")) >= 12)
+            turn = invariants._first_line_turn(
+                victim["first_text"], [row for row in messages if row["session"] == victim["session"]])
+            self.assertIsNotNone(turn)
+            check = invariants.check_search_first_lines(runner, [victim], messages, sample=1)
+            self.assertTrue(check.ok, check.counts)
+            with sqlite3.connect(box.data / "corpus.db") as corpus:
+                deleted = corpus.execute("DELETE FROM msgs WHERE session = ? AND turn = ?",
+                                         (victim["session"], turn)).rowcount
+            self.assertGreater(deleted, 0)
+            check = invariants.check_search_first_lines(runner, [victim], messages, sample=1)
+            self.assertFalse(check.ok, check.counts)
+            self.assertEqual(check.counts["outcomes"], {"no_hit_in_session": 1})
+        finally:
+            box.close()
+
+    def test_handle_round_trip_expects_the_kind_a_handle_cites(self) -> None:
+        # A tool hit at a recap turn reopens as its tool row alone; losing that row must still fail.
+        session = "0123abcd-0000-4000-8000-000000000000"
+        handle, turn = "@0123abcd:4.ab12", 4
+
+        class Canned:
+            json_rows = sandbox.CliRunner.json_rows
+
+            def __init__(self, shown: list[dict]) -> None:
+                self.shown = shown
+
+            def cli(self, argv, **_options):
+                rows = []
+                if argv[0] == "search":
+                    rows = [{"handle": handle, "session": session, "who": "tool"}]
+                elif argv[0] == "around":
+                    rows = [{"kind": "agrep-meta", "scope": {
+                        "session": session, "selected_record_role": "tool"}}, *self.shown]
+                stdout = "".join(json.dumps(row) + "\n" for row in rows)
+                return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+        messages = [{"session": session, "turn": turn}]
+        sessions = [{"session": session, "first_text": "lantern compass ledger"}]
+        tool_row = {"kind": "tool", "session": session, "turn": turn}
+        check = invariants.check_handle_round_trip(Canned([tool_row]), messages, sessions)
+        self.assertTrue(check.ok, check.counts)
+        check = invariants.check_handle_round_trip(Canned([]), messages, sessions)
+        self.assertEqual(check.counts["failures"], {"tool:around_turn_missing": 1})
+
+
+class SnapshotTests(unittest.TestCase):
+    """Freezing a home clones file stores byte for byte and backs databases up consistently."""
+
+    def setUp(self) -> None:
+        self.temp = Path(tempfile.mkdtemp(prefix="agrep-frozen-", dir=tempfile.gettempdir()))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.home = self.temp / "home"
+        store = self.home / ".claude" / "projects" / "-home-u-projects-x"
+        store.mkdir(parents=True)
+        self.transcript = store / "s1.jsonl"
+        self.transcript.write_text('{"type":"user","cwd":"/home/u/projects/x"}\n', encoding="utf-8")
+        os.utime(self.transcript, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+        self.database = self.home / sandbox.OPENCODE_DB
+        self.database.parent.mkdir(parents=True)
+        with sqlite3.connect(self.database) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE session_v2(id TEXT PRIMARY KEY)")
+            db.execute("INSERT INTO session_v2 VALUES('a'), ('b')")
+        self.discovered = [("claude", self.transcript), ("opencode", self.database)]
+        self.dest = self.temp / "frozen"
+
+    def freeze(self) -> dict:
+        try:
+            return snapshot.freeze(self.home, self.dest, self.discovered)
+        except snapshot.SnapshotError as error:
+            if "copy-on-write clones need" in str(error):
+                raise unittest.SkipTest(str(error))
+            raise
+
+    def test_clone_is_byte_identical_and_the_database_is_backed_up(self) -> None:
+        manifest = self.freeze()
+        frozen = self.dest / self.transcript.relative_to(self.home)
+        self.assertEqual(frozen.read_bytes(), self.transcript.read_bytes())
+        self.assertEqual(frozen.stat().st_mtime_ns, self.transcript.stat().st_mtime_ns)
+        with sqlite3.connect(f"file:{self.dest / sandbox.OPENCODE_DB}?mode=ro", uri=True) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM session_v2").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        self.assertFalse((self.dest / sandbox.OPENCODE_DB).with_name("opencode.db-wal").exists())
+        self.assertEqual({root["relative"]: root["kind"] for root in manifest["roots"]},
+                         {".claude/projects": "clone", ".local/share/opencode": "sqlite-backup"})
+        self.assertEqual(snapshot.read_manifest(self.dest)["source_home"], str(self.home.resolve()))
+        # the source stays untouched: same bytes, same stat key, WAL sidecars left alone
+        self.assertEqual(self.transcript.stat().st_mtime_ns, 1_600_000_000_000_000_000)
+        self.assertTrue(snapshot.delete(self.dest))
+        self.assertFalse(self.dest.exists())
+
+    def test_content_outside_known_roots_is_refused_not_dropped(self) -> None:
+        stray = self.home / ".unknown" / "chat.jsonl"
+        stray.parent.mkdir()
+        stray.write_text("{}\n", encoding="utf-8")
+        self.discovered.append(("mystery", stray))
+        with self.assertRaises(snapshot.SnapshotError):
+            self.freeze()
+        self.assertFalse(self.dest.exists())
+
+    def test_delete_refuses_a_directory_without_a_manifest(self) -> None:
+        self.dest.mkdir()
+        with self.assertRaises(snapshot.SnapshotError):
+            snapshot.delete(self.dest)
+        self.assertTrue(self.dest.exists())
 
 
 if __name__ == "__main__":

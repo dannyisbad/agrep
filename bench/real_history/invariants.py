@@ -386,7 +386,6 @@ def check_handle_round_trip(runner, messages: list[dict], sessions: list[dict], 
         opened = runner.cli(["around", handle, "--json"])
         rows = runner.json_rows(opened) if opened.returncode == 0 else []
         meta = next((row for row in rows if row.get("kind") == "agrep-meta"), None)
-        shown = [row for row in rows if row.get("kind") == "msg" and row.get("turn") == turn]
         if opened.returncode != 0 or meta is None:
             failures[f"{who}:around_failed"] += 1
             payload = opened.stdout.strip().splitlines()[0][:200] if opened.stdout.strip() else ""
@@ -395,7 +394,11 @@ def check_handle_round_trip(runner, messages: list[dict], sessions: list[dict], 
             continue
         if meta.get("scope", {}).get("session") != session:
             failures[f"{who}:around_session_mismatch"] += 1
-        if not shown:
+        # A tool hit reopens as its event row (tool, subagent_start, ...) and the turn's prose
+        # may be a role-hidden recap. Chat handles carry no role, so around's record role decides.
+        role = who if who != "chat" else meta.get("scope", {}).get("selected_record_role")
+        at_turn = [row for row in rows if row.get("turn") == turn and row.get("kind") != "agrep-meta"]
+        if not any((row.get("kind") != "msg") == (role == "tool") for row in at_turn):
             failures[f"{who}:around_turn_missing"] += 1
     for alias, session in aliases:
         opened = runner.cli(["around", "@" + alias, "--json"])
@@ -408,21 +411,59 @@ def check_handle_round_trip(runner, messages: list[dict], sessions: list[dict], 
                   "failures": dict(failures)})
 
 
-def check_search_first_lines(runner, sessions: list[dict], *, sample: int = 12,
-                             seed: int = 5) -> Check:
+def _query_words(text: str) -> list[str]:
+    """Alphanumeric words of four or more characters, casefolded, first occurrence order."""
+    seen: dict[str, None] = {}
+    for word in text.split():
+        if word.isalnum() and len(word) >= 4:
+            seen.setdefault(word.casefold())
+    return list(seen)
+
+
+def _first_line_turn(first_text: str, rows: list[dict]) -> int | None:
+    """Turn of the published row that carries the session's first line (whitespace-normalised)."""
+    head = re.sub(r"\s+", " ", first_text).strip()[:60]
+    for row in sorted(rows, key=lambda row: row["turn"]):
+        if re.sub(r"\s+", " ", row.get("text") or "").strip().startswith(head):
+            return row["turn"]
+    return None
+
+
+def check_search_first_lines(runner, sessions: list[dict], messages: list[dict], *,
+                             sample: int = 12, seed: int = 5, words_per_query: int = 3) -> Check:
+    """Every published first line is searchable: its rarest words, scoped to the session with
+    --chat, return the row carrying that line. Rank across the corpus is deliberately not
+    asserted; thousands of sessions share boilerplate openers, so top-k is a ranking property."""
     rng = random.Random(seed)
-    candidates = [row for row in sessions if len(row.get("first_text", "")) >= 12]
+    frequency: Counter = Counter()
+    for row in sessions:
+        frequency.update(set(_query_words(row.get("first_text", ""))))
+    candidates = [row for row in sessions
+                  if len(row.get("first_text", "")) >= 12 and _query_words(row["first_text"])]
     if len(candidates) > sample:
         candidates = rng.sample(candidates, sample)
-    misses = 0
+    by_session: dict[str, list[dict]] = defaultdict(list)
+    for row in messages:
+        by_session[row["session"]].append(row)
+    outcomes: Counter = Counter()
     for row in candidates:
-        words = [word for word in row["first_text"].split() if word.isalnum() and len(word) >= 3]
-        if not words:
+        words = _query_words(row["first_text"])
+        rarest = sorted(words, key=lambda word: (frequency[word], words.index(word)))[:words_per_query]
+        turn = _first_line_turn(row["first_text"], by_session.get(row["session"], []))
+        if turn is None:
+            outcomes["first_line_row_not_published"] += 1
             continue
-        query = " ".join(words[:3])
-        found = runner.cli(["search", "--json", "-n", "50", query])
-        hits = {hit.get("session") for hit in runner.json_rows(found) if hit.get("session")}
-        if row["session"] not in hits:
-            misses += 1
+        found = runner.cli(["search", "--json", "--chat", row["session"], "-n", "50", " ".join(rarest)])
+        if found.returncode not in (0, 1):
+            outcomes[f"search_rc{found.returncode}"] += 1
+            continue
+        hits = [hit for hit in runner.json_rows(found) if hit.get("session") == row["session"]]
+        if any(hit.get("turn") == turn for hit in hits):
+            outcomes["found"] += 1
+        elif hits:
+            outcomes["other_turns_only"] += 1
+        else:
+            outcomes["no_hit_in_session"] += 1
+    misses = sum(count for key, count in outcomes.items() if key != "found")
     return Check("search_first_lines", misses == 0,
-                 {"queried": len(candidates), "misses": misses})
+                 {"queried": len(candidates), "misses": misses, "outcomes": dict(outcomes)})
