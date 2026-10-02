@@ -185,6 +185,29 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual([chat["session"] for chat in projects[0]["worked_on"]], [S8, S3])
         self.assertEqual(projects[0]["worked_on"][1]["side_chats"], 1)
 
+    def test_side_chat_activity_keeps_its_family_in_a_narrow_window(self) -> None:
+        # the root ended 09:10:30; only its side chat (09:02-09:12) was active in this window
+        window = ("--since", "2026-03-13 09:11", "--until", "2026-03-13 09:13")
+        meta, rows = _rows(self._ok("time", "--project", "beacon", *window, "--json"))
+        self.assertEqual((meta["chats"], meta["side_chats"]), (1, 1))
+        self.assertEqual([(r["period"], r["project"], r["estimated_active_ms"], r["chats"])
+                          for r in rows], [("2026-03-13", "beacon", MINUTE, 1)])
+        self.assertEqual(meta["total_estimated_active_ms"], MINUTE)
+        _meta, items = _rows(self._ok("pending", "--project", "beacon", *window, "--json"))
+        self.assertEqual([(i["session"], i["status"], i["source"]) for i in items],
+                         [(S3, "todo_open", "root")])
+        _meta, projects = _rows(self._ok("--project", "beacon", *window, "--json"))
+        self.assertEqual([(c["session"], c["side_chats"], c["estimated_active_ms"])
+                          for c in projects[0]["worked_on"]], [(S3, 1, MINUTE)])
+
+    def test_family_entirely_outside_the_window_is_excluded(self) -> None:
+        # root and side chat both end by 09:12:30; a window starting after that admits neither
+        result = self.sandbox.summary("time", "--project", "beacon", "--since", "2026-03-13 09:13",
+                                      "--until", "2026-03-13 10:00", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        meta, rows = _rows(result)
+        self.assertEqual((rows, meta["hits"], meta["chats"], meta["side_chats"]), ([], [], 0, 0))
+
     def test_unknown_timestamps_are_excluded_and_counted(self) -> None:
         result = self._ok("time", *MARCH, "--json")
         meta, _rows_ = _rows(result)

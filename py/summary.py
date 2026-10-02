@@ -657,43 +657,52 @@ def main(argv: list[str] | None = None) -> int:
                 common.log("--no-self was not applied: "
                            + common.self_exclusion_unavailable_notice(identity.reason))
 
-    def in_scope(row: dict) -> bool:
+    def passes_filters(row: dict) -> bool:
         if agent and agent not in str(row.get("agent") or "").lower():
             return False
         if args.project and not surface.project_label_matches(row.get("project"), args.project):
             return False
-        if (row.get("last_ts") or 0) < since_ms:
-            return False
-        if until_ms is not None and (row.get("first_ts") or 0) >= until_ms:
-            return False
         return True
 
-    chats: dict[str, _Chat] = {}
-    roots: dict[str, _Chat] = {}
-    for session, raw in index.items():
-        root, side = family.get(session, (session, session in side_sessions))
+    def overlaps_window(row: dict) -> bool:
+        if (row.get("last_ts") or 0) < since_ms:
+            return False
+        return until_ms is None or (row.get("first_ts") or 0) < until_ms
+
+    def chat_row(session: str, raw: dict, *, root: str, side: bool,
+                 agent_fallback: str = "") -> _Chat:
+        return _Chat(session=session, agent=str(raw.get("agent") or agent_fallback),
+                     project=str(raw.get("project") or ""), root=root, side=side,
+                     first_ts=int(raw.get("first_ts") or 0), last_ts=int(raw.get("last_ts") or 0),
+                     first_text=common.one_line(raw.get("first_text") or ""))
+
+    candidates: list[tuple[str, bool]] = []
+    side_members: dict[str, list[str]] = {}
+    for session in index:
+        root, side = family.get(session, (session, False))
         side = side or session in side_sessions
         if side and root != session:
-            continue
-        if not in_scope(raw):
-            continue
-        chat = _Chat(session=session, agent=str(raw.get("agent") or ""),
-                     project=str(raw.get("project") or ""), root=session, side=side,
-                     first_ts=int(raw.get("first_ts") or 0), last_ts=int(raw.get("last_ts") or 0),
-                     first_text=common.one_line(raw.get("first_text") or ""))
-        roots[session] = chat
-        chats[session] = chat
+            side_members.setdefault(root, []).append(session)
+        else:
+            candidates.append((session, side))
+    # filters judge the family's root; the window admits a family on any member's activity
+    chats: dict[str, _Chat] = {}
+    roots: dict[str, _Chat] = {}
     sides: dict[str, list[_Chat]] = {}
-    for session, (root, side) in family.items():
-        if session in roots or root not in roots or not (side or session in side_sessions):
+    for session, side in candidates:
+        raw = index[session]
+        if not passes_filters(raw):
             continue
-        raw = index.get(session) or {}
-        chat = _Chat(session=session, agent=str(raw.get("agent") or roots[root].agent),
-                     project=str(raw.get("project") or ""), root=root, side=True,
-                     first_ts=int(raw.get("first_ts") or 0), last_ts=int(raw.get("last_ts") or 0),
-                     first_text=common.one_line(raw.get("first_text") or ""))
-        chats[session] = chat
-        sides.setdefault(root, []).append(chat)
+        kin = side_members.get(session, ())
+        if not (overlaps_window(raw) or any(overlaps_window(index[member]) for member in kin)):
+            continue
+        chat = chat_row(session, raw, root=session, side=side)
+        roots[session] = chats[session] = chat
+        for member in kin:
+            side_chat = chat_row(member, index[member], root=session, side=True,
+                                 agent_fallback=chat.agent)
+            chats[member] = side_chat
+            sides.setdefault(session, []).append(side_chat)
     common.lap("identity-index", f"{len(roots)} root chats")
 
     _load_transcripts(chats)
