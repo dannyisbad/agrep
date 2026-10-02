@@ -556,6 +556,12 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
         if state.get("gate") is not None:
             os.close(state.pop("gate"))
 
+    def lose_client(state):
+        """A stopped child takes SIGTERM only once continued; SIGKILL follows if it outlives the deadline."""
+        _kill_group(state["pid"], signal.SIGTERM)
+        _kill_group(state["pid"], signal.SIGCONT)
+        state["kill_at"] = time.monotonic() + 1
+
     try:
         while True:
             try:
@@ -610,7 +616,7 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                             os.write(gate, b"G")
                             os.close(gate)
                         elif not data:
-                            os.killpg(state["pid"], signal.SIGTERM)
+                            lose_client(state)
                             selector.unregister(connection)
                         continue
                     data, ancillary, flags, _ = connection.recvmsg(65536, socket.CMSG_SPACE(3 * 4))
@@ -663,18 +669,19 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                     connection.sendall(b"P" + pid.to_bytes(4, "big"))
                 except (OSError, ValueError, EOFError, TypeError):
                     if state["pid"] is not None:
-                        try:
-                            os.killpg(state["pid"], signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
+                        lose_client(state)
                     else:
                         close_client(state)
+            now = time.monotonic()
             for state in list(clients.values()):
-                if time.monotonic() > state["deadline"]:
+                if now > state["deadline"]:
                     if state["pid"] is None:
                         close_client(state)
                     elif "gate" in state:
                         os.close(state.pop("gate"))
+                if now > state.get("kill_at", now):
+                    del state["kill_at"]
+                    _kill_group(state["pid"], signal.SIGKILL)
     finally:
         for pid in children:
             try:

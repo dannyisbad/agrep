@@ -647,6 +647,51 @@ else:
         self.assertEqual(client.returncode, 0)
         self.assertIn(b"copper", stdout[filler:])
 
+    def test_killed_stopped_client_ends_served_child(self):
+        env = self._private_runtime(AGREP_RESIDENT_IDLE_S="16")
+        ready = self.base / "stop-kill.ready"
+        handled = self.base / "stop-kill.handled"
+        # macOS kills a stopped SIG_DFL process outright; only a handled SIGTERM waits for SIGCONT there.
+        server = self._hand_server(env, f'''
+import signal
+def terminated(*_):
+    open({str(handled)!r}, "w").close()
+    sys.exit(143)
+def command():
+    if sys.argv[1:] != ["--version"]:
+        return 0
+    signal.signal(signal.SIGTERM, terminated)
+    open({str(ready)!r}, "w").close()
+    time.sleep(30)
+    return 0
+resident._preload = lambda: command
+''')
+        # Default stop actions are discarded in an orphaned group: keep the client in this session.
+        client = subprocess.Popen(self._command(["--version"], served=True), env=env, cwd=ROOT,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp)
+        child = None
+        try:
+            self._poll(ready.exists)
+            child = self._served_child(server.pid)
+            client.send_signal(signal.SIGTSTP)
+            self._poll(lambda: all(self._ps_rows().get(pid, (0, ""))[1].startswith("T")
+                                   for pid in (client.pid, child)))
+            client.kill()
+            client.wait(timeout=10)
+            self._poll(lambda: child not in self._ps_rows(), timeout=5)
+        finally:
+            if client.poll() is None:
+                client.send_signal(signal.SIGCONT)
+                client.kill()
+                client.wait()
+            if child is not None:
+                resident._kill_group(child, signal.SIGKILL)
+        self.assertEqual(client.returncode, -signal.SIGKILL)
+        self.assertTrue(handled.exists())
+        self.assertEqual(self._call(["--help"], served=True, env=env)[0], 0)
+        self.assertIsNone(server.poll())
+
     def test_orphaned_stop_never_strands_served_child(self):
         extra = {"AGREP_RESIDENT_IDLE_S": "15", "AGREP_DEBUG": "1"}
         env = {**self.env, **extra}
