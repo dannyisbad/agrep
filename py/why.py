@@ -94,7 +94,8 @@ def _ingest_sig() -> dict:
 
 
 def _corpus_facts(session: str) -> dict:
-    """What the search database holds for one session, read in mode=ro."""
+    """What the search database holds for one session, read in mode=ro, and whether that
+    copy is what messages.jsonl now publishes."""
     path = common.DATA_DIR / "corpus.db"
     if not path.exists():
         return {"state": "missing"}
@@ -105,16 +106,38 @@ def _corpus_facts(session: str) -> dict:
         return {"state": "unreadable", "reason": str(exc)}
     try:
         rows = db.execute("SELECT count(*) FROM msgs WHERE session=?", (session,)).fetchone()[0]
-        sig = db.execute("SELECT 1 FROM session_sig WHERE session=?", (session,)).fetchone()
+        sig = db.execute("SELECT sig FROM session_sig WHERE session=?", (session,)).fetchone()
         family = db.execute("SELECT root, side FROM session_family WHERE session=?",
                             (session,)).fetchone()
+        stamp = db.execute("SELECT value FROM meta WHERE key='stamp'").fetchone()
     except sqlite3.Error as exc:
         return {"state": "unreadable", "reason": str(exc)}
     finally:
         db.close()
-    return {"state": "ok", "rows": int(rows), "session_sig": sig is not None,
-            "root": family[0] if family else None,
-            "side": bool(family[1]) if family else None}
+    facts = {"state": "ok", "rows": int(rows), "session_sig": sig is not None,
+             "root": family[0] if family else None,
+             "side": bool(family[1]) if family else None}
+    facts.update(_corpus_currency(session, sig[0] if sig else None, stamp[0] if stamp else ""))
+    return facts
+
+
+def _corpus_currency(session: str, stored_sig: str | None, stamp: str) -> dict:
+    """Is the stored copy of `session` current? A source stamp equal to the one the database
+    recorded proves every session current without a scan; otherwise this session's published
+    rows are fingerprinted with corpusdb's own signature and compared to the stored one."""
+    import corpusdb
+    import events
+    # The scan validates event payloads; damage found there must not schedule indexd from `why`.
+    events.set_event_repair_callback(lambda: False)
+    try:
+        if corpusdb._stamps_equal(stamp, corpusdb._stamp()):
+            return {"stamp_current": True, "proof": "stamp", "current": True}
+        rows = corpusdb._scan(only={session}).get(session, [])
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"stamp_current": False, "proof": None, "current": None, "reason": str(exc)}
+    published = corpusdb._session_sig(rows) if rows else None
+    return {"stamp_current": False, "proof": "session_sig",
+            "current": bool(rows) and published == stored_sig, "published_rows": len(rows)}
 
 
 # --------------------------------------------------------------------------- formatting
@@ -292,15 +315,7 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     issue = next((i for i in (_issue_covering(ctx, p) for p in paths) if i), None)
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
              "sources": paths, "intake": entries, "issue": issue}
-    lines = [_index_line(row)]
-    if corpus.get("state") == "ok":
-        family = (f", family root {corpus['root']}" + (" (side chat)" if corpus["side"] else "")
-                  if corpus.get("root") else "")
-        lines.append(f"corpus.db: {_plural(corpus['rows'], 'row')}, session_sig "
-                     f"{'present' if corpus['session_sig'] else 'absent'}{family}")
-    else:
-        lines.append(f"corpus.db: {corpus.get('state')}"
-                     + (f" ({corpus['reason']})" if corpus.get("reason") else ""))
+    lines = [_index_line(row), _corpus_line(corpus)]
     if ctx.payload is None:
         lines.append(f"store census: unavailable ({ctx.census_error}); freshness unverified")
     elif paths:
@@ -338,12 +353,17 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"not fully indexed: the transcript of {agent} chat {_short(session)} "
             "was written after the last index",
             lines, facts=facts, next_action="agrep index")
-    if corpus.get("state") != "ok" or not corpus.get("rows"):
+    if corpus.get("state") != "ok" or not corpus.get("rows") or corpus.get("current") is False:
         lines.append(ctx.sig_line())
         return _report(
-            ctx, "corpus-behind-transcripts",
-            f"not searchable yet: transcripts list {agent} chat {_short(session)} "
-            "but the search database does not hold it",
+            ctx, "corpus-behind-transcripts", _corpus_behind_summary(corpus, agent, session),
+            lines, facts=facts, next_action="agrep index")
+    if corpus.get("current") is None:
+        lines.append(ctx.sig_line())
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: the search database is behind the published sources and {agent} "
+            f"chat {_short(session)} could not be compared",
             lines, facts=facts, next_action="agrep index")
     if via == "alias" or (via == "path" and row.get("alias")):
         verdict, summary = "indexed-under-alias", (
@@ -356,6 +376,37 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     else:
         verdict, summary = "indexed", f"indexed: {agent} chat {session} is searchable ({count})"
     return _report(ctx, verdict, summary, lines, facts=facts)
+
+
+def _corpus_line(corpus: dict) -> str:
+    """The corpus.db evidence line, naming which proof of currency was used."""
+    if corpus.get("state") != "ok":
+        return (f"corpus.db: {corpus.get('state')}"
+                + (f" ({corpus['reason']})" if corpus.get("reason") else ""))
+    sig = "present" if corpus["session_sig"] else "absent"
+    if corpus["proof"] == "session_sig":
+        published = _plural(corpus["published_rows"], "row")
+        if corpus["current"]:
+            sig = f"matches the {published} messages.jsonl publishes"
+        elif corpus["session_sig"]:
+            sig = f"differs from the {published} messages.jsonl publishes"
+        else:
+            sig = f"absent, messages.jsonl publishes {published}"
+        sig += ", stamp behind the published sources"
+    elif corpus["proof"] is None:
+        sig += (", stamp behind the published sources, messages.jsonl unverifiable "
+                f"({corpus['reason']})")
+    family = (f", family root {corpus['root']}" + (" (side chat)" if corpus["side"] else "")
+              if corpus.get("root") else "")
+    return f"corpus.db: {_plural(corpus['rows'], 'row')}, session_sig {sig}{family}"
+
+
+def _corpus_behind_summary(corpus: dict, agent: str, session: str) -> str:
+    if corpus.get("state") != "ok" or not corpus.get("rows"):
+        return (f"not searchable yet: transcripts list {agent} chat {_short(session)} "
+                "but the search database does not hold it")
+    return (f"not fully searchable: the search database holds an older copy of {agent} chat "
+            f"{_short(session)} than messages.jsonl publishes (session_sig differs)")
 
 
 _READABLE_ACTION = "make the file readable, then agrep index"

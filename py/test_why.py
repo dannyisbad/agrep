@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
+import shutil
 import signal
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import time
@@ -32,10 +33,55 @@ OMP_SIDE = "44444444-4444-4444-8444-444444444444"
 OMP_CONTAINER = f"-work-beta/2000-02-03T04-05-06-000Z_{OMP_ROOT}"
 VERDICT_EXIT = {"indexed": 0, "indexed-under-alias": 0, "indexed-as-side-chat": 0,
                 "ambiguous": 2, "not-provable": 2}
+NOT_SERVED = 97
+RESIDENT_CLIENT = (
+    f"import sys;sys.path[:]={[str(ROOT / 'py'), str(ROOT), *sys.path[1:]]!r};"
+    f"import resident;sys.argv[0]={str(ROOT / 'cli.py')!r};"
+    f"code=resident.try_run();sys.exit({NOT_SERVED} if code is None else code)"
+)
 
 
 def _rust_bin() -> Path:
     return Path(os.environ.get("AGREP_RS_BIN") or dist.ingest_bin())
+
+
+def _dead_explorer_descriptor() -> str:
+    """A `.server` record in the shape legacy_cleanup retires: its owner pid has exited."""
+    child = subprocess.Popen(["/bin/sh", "-c", ":"], env={"PATH": "/usr/bin:/bin"})
+    child.wait(timeout=10)
+    return json.dumps({"pid": child.pid, "port": 1, "mode": "explorer",
+                       "process_start": "unknown"}) + "\n"
+
+
+def _append_claude_turn(path: Path, home: Path, text: str, stamp: str, *,
+                        session: str = CLAUDE, project: str = "cedar") -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "sessionId": session, "cwd": str(home / "projects" / project), "type": "user",
+            "userType": "external", "timestamp": stamp,
+            "message": {"role": "user", "content": text}}) + "\n")
+
+
+def _processes_mentioning(marker: str) -> set[int]:
+    listing = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "command="],
+                             env={"PATH": "/usr/bin:/bin"}, capture_output=True,
+                             text=True, encoding="utf-8", errors="replace",
+                             timeout=5, check=False)
+    return {int(line.split(None, 1)[0]) for line in listing.stdout.splitlines()
+            if marker in line and int(line.split(None, 1)[0]) != os.getpid()}
+
+
+def _kill_processes_mentioning(marker: str) -> None:
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        pids = _processes_mentioning(marker)
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.2)
 
 
 class Sandbox:
@@ -66,10 +112,19 @@ class Sandbox:
             "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "py"))),
         }
 
-    def spawn(self, command: list[str], *, timeout: float = 60) -> subprocess.CompletedProcess:
-        return subprocess.run(command, cwd=self.home, env=self.env, input="",
-                              capture_output=True, text=True, encoding="utf-8",
+    def spawn(self, command: list[str], *, timeout: float = 60,
+              env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(command, cwd=self.home, env=self.env if env is None else env,
+                              input="", capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=timeout, check=False)
+
+    def cli(self, *argv: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        """The real entry point, the way `agrep ...` reaches `why`."""
+        return self.spawn([sys.executable, str(ROOT / "cli.py"), *argv], env=env)
+
+    def data_snapshot(self) -> dict:
+        return {str(p.relative_to(self.data)): (p.stat().st_mtime_ns, p.stat().st_size)
+                for p in self.data.rglob("*")}
 
     def index(self) -> None:
         result = self.spawn([sys.executable, str(ROOT / "cli.py"), "index"])
@@ -97,27 +152,9 @@ class Sandbox:
         agent, rest = relative.split("/", 1)
         return self.home / ("." + agent) / rest
 
-    def _stray_processes(self) -> set[int]:
-        listing = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "command="],
-                                 env={"PATH": "/usr/bin:/bin"}, capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 timeout=5, check=False)
-        marker = re.escape(str(self.data))
-        return {int(line.split(None, 1)[0]) for line in listing.stdout.splitlines()
-                if re.search(marker, line) and int(line.split(None, 1)[0]) != os.getpid()}
-
     def close(self) -> None:
         if os.name != "nt":
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                pids = self._stray_processes()
-                if not pids:
-                    break
-                for pid in pids:
-                    try:
-                        os.kill(pid, sig)
-                    except ProcessLookupError:
-                        pass
-                time.sleep(0.2)
+            _kill_processes_mentioning(str(self.data))
         for path in self.home.rglob("*"):
             try:
                 path.chmod(0o700 if path.is_dir() else 0o600)
@@ -139,6 +176,7 @@ class _VerdictAssertions(unittest.TestCase):
         self.assertEqual(payload.get("next_action"), next_action, payload)
         human = self.sandbox.why(*argv)
         self.assertEqual(human.returncode, code, human.stdout + human.stderr)
+        self.assertTrue(human.stdout, f"human form printed nothing\n{human.stderr}")
         first, *rest = human.stdout.splitlines()
         self.assertEqual(first, payload["summary"])
         shown = [line for line in rest if line.startswith("  ")]
@@ -256,6 +294,82 @@ class WhyReadOnlyVerdictTests(_VerdictAssertions):
         self.assertEqual(self.sandbox.why("   ").returncode, 2)
 
 
+class WhyCliReadOnlyTests(unittest.TestCase):
+    """Through cli.py: `why` skips the legacy-explorer retirement other commands run."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sandbox = Sandbox()
+        cls.sandbox.index()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.sandbox.close()
+
+    def setUp(self) -> None:
+        self.descriptor = self.sandbox.data / ".server"
+        self.plant()
+
+    def tearDown(self) -> None:
+        if self.descriptor.exists():
+            self.descriptor.unlink()
+
+    def plant(self) -> None:
+        self.record = _dead_explorer_descriptor()
+        self.descriptor.write_text(self.record, encoding="utf-8")
+        self.snapshot = self.sandbox.data_snapshot()
+
+    def assert_untouched(self, result: subprocess.CompletedProcess) -> None:
+        detail = result.stdout + result.stderr
+        self.assertTrue(self.descriptor.exists(), f"why retired the descriptor\n{detail}")
+        self.assertEqual(self.descriptor.read_text(encoding="utf-8"), self.record, detail)
+        self.assertEqual(self.sandbox.data_snapshot(), self.snapshot, f"why wrote the data dir\n{detail}")
+
+    def test_why_leaves_a_dead_explorer_descriptor_alone(self) -> None:
+        for argv in ((CLAUDE,), (CLAUDE, "--json"), ("--help",)):
+            with self.subTest(argv=argv):
+                result = self.sandbox.cli("why", *argv)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_untouched(result)
+
+    def test_other_commands_still_retire_the_descriptor(self) -> None:
+        result = self.sandbox.cli("--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.descriptor.exists(), "the control command left the descriptor")
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "fork"),
+                         "the resident server needs POSIX fork and SCM_RIGHTS")
+    def test_served_why_leaves_the_descriptor_alone(self) -> None:
+        # Socket paths stop at 104 bytes, which a deep TMPDIR (macOS /var/folders) exceeds.
+        runtime = Path(tempfile.mkdtemp(prefix="agw-", dir="/tmp"))
+        env = {key: value for key, value in self.sandbox.env.items() if key != "AGREP_NO_RESIDENT"}
+        env["XDG_RUNTIME_DIR"] = str(runtime)
+        client = [sys.executable, "-c", RESIDENT_CLIENT]
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                warm = self.sandbox.spawn([*client, "--version"], env=env)
+                if warm.returncode != NOT_SERVED:
+                    break
+                self.assertLess(time.monotonic(), deadline, "the resident never became ready")
+                time.sleep(0.05)
+            self.assertEqual(warm.returncode, 0, warm.stderr)
+            # The warm-up command retires descriptors itself, so plant after it.
+            self.plant()
+            served = self.sandbox.spawn([*client, "why", CLAUDE], env=env)
+            self.assertNotEqual(served.returncode, NOT_SERVED, f"not served\n{served.stderr}")
+            self.assertEqual(served.returncode, 0, served.stdout + served.stderr)
+            self.assertTrue(served.stdout.startswith("indexed: claude chat"), served.stdout)
+            self.assert_untouched(served)
+        finally:
+            stop = self.sandbox.spawn(
+                [sys.executable, "-c", "import json,resident;print(json.dumps(resident.stop_servers()))"],
+                env=env)
+            _kill_processes_mentioning(str(runtime))
+            shutil.rmtree(runtime, ignore_errors=True)
+        self.assertEqual(json.loads(stop.stdout).get("ok"), True, stop.stdout + stop.stderr)
+
+
 class WhyMutationVerdictTests(_VerdictAssertions):
     def setUp(self) -> None:
         self.sandbox = Sandbox()
@@ -267,17 +381,17 @@ class WhyMutationVerdictTests(_VerdictAssertions):
     def test_source_appended_after_indexing(self) -> None:
         path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
         self.assert_verdict("indexed", "11111111-1111")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
-                "sessionId": CLAUDE, "cwd": str(self.sandbox.home / "projects/cedar"),
-                "type": "user", "userType": "external", "timestamp": "2000-01-20T12:04:00.000Z",
-                "message": {"role": "user", "content": "Add a brand new question."}}) + "\n")
+        _append_claude_turn(path, self.sandbox.home, "Add a brand new question.",
+                            "2000-01-20T12:04:00.000Z")
         payload = self.assert_verdict("written-after-last-index", "11111111-1111",
                                       next_action="agrep index")
         lines = payload["evidence"]["lines"]
         self.assertRegex(lines[1], r"^intake_stats\.json: ~/.claude/projects/.* parsed at .* \(s:\d+:\d+\), now .* \(s:\d+:\d+\)$")
         self.assertTrue(lines[2].startswith(".ingest.sig: last index published"), lines)
         self.assertEqual(payload["evidence"]["intake"][0]["fresh"], False)
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["proof"], corpus["stamp_current"], corpus["current"]),
+                         ("stamp", True, True), corpus)
         self.sandbox.index()
         self.assertEqual(self.assert_verdict("indexed", "11111111-1111")["evidence"]["index_row"]["session"], CLAUDE)
         self.assertEqual(self.sandbox.why_json("11111111-1111")[0]["evidence"]["intake"][0]["rows"], 3)
@@ -303,11 +417,88 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         self.sandbox.rust_index()
         payload = self.assert_verdict("corpus-behind-transcripts", "77777777",
                                       next_action="agrep index")
-        self.assertEqual(payload["evidence"]["corpus"], {"state": "ok", "rows": 0, "session_sig": False,
-                                                         "root": None, "side": None})
-        self.assertIn("corpus.db: 0 rows, session_sig absent", payload["evidence"]["lines"])
+        self.assertEqual(payload["evidence"]["corpus"], {
+            "state": "ok", "rows": 0, "session_sig": False, "root": None, "side": None,
+            "stamp_current": False, "proof": "session_sig", "current": False, "published_rows": 1})
+        self.assertIn("corpus.db: 0 rows, session_sig absent, messages.jsonl publishes 1 row, "
+                      "stamp behind the published sources", payload["evidence"]["lines"])
         self.sandbox.index()
         self.assert_verdict("indexed", "77777777")
+
+    def test_native_only_ingest_leaves_corpus_behind(self) -> None:
+        path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
+        before = self.assert_verdict("indexed", "11111111-1111")["evidence"]["corpus"]
+        self.assertEqual((before["proof"], before["stamp_current"], before["current"]),
+                         ("stamp", True, True), before)
+        rows = before["rows"]
+        _append_claude_turn(path, self.sandbox.home, "A turn the search database never saw.",
+                            "2000-01-20T12:04:00.000Z")
+        self.sandbox.rust_index()
+        payload = self.assert_verdict("corpus-behind-transcripts", "11111111-1111",
+                                      next_action="agrep index")
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual(corpus["rows"], rows)
+        self.assertEqual(corpus["session_sig"], True)
+        self.assertEqual((corpus["proof"], corpus["stamp_current"], corpus["current"]),
+                         ("session_sig", False, False), corpus)
+        self.assertEqual(corpus["published_rows"], rows + 1)
+        self.assertIn("session_sig differs", payload["summary"])
+        self.assertEqual(payload["evidence"]["lines"][1],
+                         f"corpus.db: {rows} rows, session_sig differs from the {rows + 1} rows "
+                         "messages.jsonl publishes, stamp behind the published sources, "
+                         f"family root {CLAUDE}")
+        self.assertEqual(payload["evidence"]["intake"][0]["fresh"], True)
+        # A transcript written after that native publication is the upstream verdict again.
+        _append_claude_turn(path, self.sandbox.home, "And one the ingest never saw.",
+                            "2000-01-20T12:05:00.000Z")
+        payload = self.assert_verdict("written-after-last-index", "11111111-1111",
+                                      next_action="agrep index")
+        self.assertEqual(payload["evidence"]["corpus"]["current"], False)
+        self.sandbox.index()
+        after = self.assert_verdict("indexed", "11111111-1111")["evidence"]["corpus"]
+        self.assertEqual((after["proof"], after["current"], after["rows"]),
+                         ("stamp", True, rows + 2), after)
+
+    def test_unchanged_chats_stay_indexed_while_another_lags(self) -> None:
+        """With the stamp behind, an untouched chat is proven current by its own session_sig."""
+        path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
+        _append_claude_turn(path, self.sandbox.home, "A turn the search database never saw.",
+                            "2000-01-20T12:04:00.000Z")
+        self.sandbox.rust_index()
+        for verdict, reference in (("indexed", CLAUDE_TWIN), ("indexed-as-side-chat", "44444444"),
+                                   ("indexed", OMP_ROOT)):
+            with self.subTest(reference=reference):
+                corpus = self.assert_verdict(verdict, reference)["evidence"]["corpus"]
+                self.assertEqual((corpus["proof"], corpus["stamp_current"], corpus["current"]),
+                                 ("session_sig", False, True), corpus)
+
+    def test_damaged_event_store_never_wakes_the_daemon(self) -> None:
+        """A lagging corpus makes `why` fingerprint event payloads; a bad digest kicks no repair."""
+        twin = self.sandbox.store(f"claude/projects/-projects-birch/{CLAUDE_TWIN}.jsonl")
+        _append_claude_turn(twin, self.sandbox.home, "A turn the search database never saw.",
+                            "2000-01-21T12:02:00.000Z", session=CLAUDE_TWIN, project="birch")
+        self.sandbox.rust_index()
+        db = sqlite3.connect(self.sandbox.data / "events" / ".store.sqlite3")
+        try:
+            with db:
+                damaged = db.execute("UPDATE event_sessions SET digest=X'00' WHERE name LIKE ?",
+                                     (f"%{CLAUDE_TWIN}%",)).rowcount
+        finally:
+            db.close()
+        self.assertEqual(damaged, 1)
+        env = {key: value for key, value in self.sandbox.env.items() if key != "AGREP_NO_DAEMON"}
+        env["AGREP_INDEXD_IDLE_S"] = "2"
+        snapshot = self.sandbox.data_snapshot()
+        result = self.sandbox.cli("why", CLAUDE_TWIN, "--json", env=env)
+        payload = json.loads(result.stdout)
+        self.assertEqual((payload["verdict"], result.returncode), ("not-provable", 2), payload)
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["proof"], corpus["current"], corpus["stamp_current"]),
+                         (None, None, False), corpus)
+        self.assertIn("could not be compared", payload["summary"])
+        self.assertIn("messages.jsonl unverifiable (", payload["evidence"]["lines"][1])
+        self.assertEqual(self.sandbox.data_snapshot(), snapshot,
+                         "why scheduled a repair or wrote the data dir")
 
     @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
     def test_unreadable_file_is_reported_from_durable_health(self) -> None:

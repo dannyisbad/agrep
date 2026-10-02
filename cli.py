@@ -1782,7 +1782,7 @@ def _main() -> int:
     # for every unrelated command before building its real parser in the target module.
     raw = sys.argv[1:]
     if raw and raw[0] not in {
-            "status", "doctor", "audit", "tail", "board", "live"}:
+            "status", "doctor", "audit", "tail", "board", "live", "why"}:
         legacy_cleanup.retire_removed_explorer()
     if not raw:
         return cmd_status(argparse.Namespace())
