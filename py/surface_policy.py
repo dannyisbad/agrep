@@ -276,11 +276,11 @@ def _owned_by(command: str, why: str, *, takes_value: bool = False) -> FlagRewri
     return FlagRewrite(takes_value, why, command=command)
 
 
-_SIDE_SHOWN = "side chats already show; --no-side hides them"
-_RECALL_OWNED = "a recall option"
-_SEARCH_OWNED = "a search option"
+_SIDE_SHOWN = "is already on (--no-side hides side chats)"
+_RECALL_OWNED = "is a recall option"
+_SEARCH_OWNED = "is a search option"
 _SEARCH_REWRITES = {
-    "--limit": _renamed("-n", "-n N caps hits here"),
+    "--limit": _renamed("-n", "is -n N here"),
     "--hits": _owned_by("recall", _RECALL_OWNED, takes_value=True),
     "--budget": _owned_by("recall", _RECALL_OWNED, takes_value=True),
     "--probe": _owned_by("recall", _RECALL_OWNED),
@@ -291,9 +291,9 @@ _SEARCH_REWRITES = {
 # every search option recall and pack lack, so a switched command never
 # carries one along; the count flag is renamed rather than switched
 _RECALL_REWRITES = {
-    "--limit": _renamed("--hits", "--hits N caps chats here"),
-    "-n": _renamed("--hits", "--hits N caps chats here"),
-    "--max": _renamed("--hits", "--hits N caps chats here"),
+    "--limit": _renamed("--hits", "is --hits N here"),
+    "-n": _renamed("--hits", "is --hits N here"),
+    "--max": _renamed("--hits", "is --hits N here"),
     "--side": _dropped(_SIDE_SHOWN),
     **{flag: _owned_by("search", _SEARCH_OWNED, takes_value=True)
        for flag in ("--more", "--deeper", "--sort")},
@@ -303,36 +303,37 @@ _RECALL_REWRITES = {
                     "--classic", "--flat", "--hybrid", "--coverage",
                     "--strict-semantic")},
 }
-_AROUND_ONE_CHAT = "around reads one chat as indexed"
-_POSTCOMPACT_BOUNDED = "postcompact output is already bounded"
-_POSTCOMPACT_OWN_TAIL = "postcompact replays this session's own tail"
+_AROUND_CONTEXT = "is -C N (turns of context) here"
+_AROUND_ONE_CHAT = "does not apply: around reads one chat as indexed"
+_POSTCOMPACT_BOUNDED = "does not apply: postcompact output is already bounded"
+_POSTCOMPACT_OWN_TAIL = "does not apply: postcompact replays this session's own tail"
 FLAG_REWRITES: Mapping[str, Mapping[str, FlagRewrite]] = MappingProxyType({
     "search": MappingProxyType(_SEARCH_REWRITES),
     "recall": MappingProxyType(_RECALL_REWRITES),
     "pack": MappingProxyType(_RECALL_REWRITES),
     "around": MappingProxyType({
-        "--limit": _renamed("-C", "-C N sets the window in turns here"),
-        "-n": _renamed("-C", "-C N sets the window in turns here"),
-        "--max": _renamed("-C", "-C N sets the window in turns here"),
+        "--limit": _renamed("-C", _AROUND_CONTEXT),
+        "-n": _renamed("-C", _AROUND_CONTEXT),
+        "--max": _renamed("-C", _AROUND_CONTEXT),
         "--lexical": _dropped(_AROUND_ONE_CHAT),
         "--side": _dropped(_AROUND_ONE_CHAT),
     }),
     "chats": MappingProxyType({
-        "--limit": _renamed("-n", "-n N caps rows here"),
-        "--hits": _renamed("-n", "-n N caps rows here"),
-        "--lexical": _dropped("chats matches keywords only"),
+        "--limit": _renamed("-n", "is -n N here"),
+        "--hits": _renamed("-n", "is -n N here"),
+        "--lexical": _dropped("is implied: chats matches keywords only"),
     }),
     "postcompact": MappingProxyType({
-        "--chat": _renamed("--session", "--session ID names the chat here"),
+        "--chat": _renamed("--session", "is --session ID here"),
         **{flag: _dropped(_POSTCOMPACT_BOUNDED, takes_value=True)
            for flag in ("--limit", "-n", "--max", "--hits", "--budget")},
         "--lexical": _dropped(_POSTCOMPACT_OWN_TAIL),
         "--side": _dropped(_POSTCOMPACT_OWN_TAIL),
     }),
     "board": MappingProxyType({
-        "--limit": _renamed("-n", "-n N caps sessions here"),
-        "--hits": _renamed("-n", "-n N caps sessions here"),
-        "--lexical": _dropped("board shows live state, not search hits"),
+        "--limit": _renamed("-n", "is -n N here"),
+        "--hits": _renamed("-n", "is -n N here"),
+        "--lexical": _dropped("does not apply: board shows live state, not search hits"),
     }),
 })
 
@@ -355,8 +356,11 @@ def _split_argv(
         token = argv[index]
         index += 1
         if token == "--":
-            entries.extend(_ArgvOption(None, None, True, (rest,))
-                           for rest in argv[index - 1:])
+            # an earlier positional already consumed the target's nargs
+            # positional, so argparse would refuse everything after `--`
+            if any(entry.flag is None for entry in entries):
+                return None
+            entries.append(_ArgvOption(None, None, True, tuple(argv[index - 1:])))
             break
         if not token.startswith("-") or token == "-":
             entries.append(_ArgvOption(None, None, True, (token,)))
@@ -387,6 +391,11 @@ def _split_argv(
     return entries
 
 
+def _positional_count(entries: Sequence[_ArgvOption]) -> int:
+    return sum(len(entry.raw) - (entry.raw[0] == "--")
+               for entry in entries if entry.flag is None)
+
+
 class FlagCorrection(NamedTuple):
     reasons: tuple[str, ...]
     argv: tuple[str, ...]       # the corrected argv, without the command name
@@ -394,14 +403,17 @@ class FlagCorrection(NamedTuple):
 
 
 def flag_correction(
-        command: str, argv: Sequence[str], known: Mapping[str, bool],
+        command: str, argv: Sequence[str], parser: argparse.ArgumentParser,
 ) -> FlagCorrection | None:
     """Rewrite argv around the unrecognized options another spelling or
-    command owns; None when one has no mapping, a value is missing, or the
-    mapped options belong to different commands."""
+    command owns; None when one has no mapping, a value is missing, the
+    mapped options belong to different commands, or the rewrite would change
+    what the caller asked for."""
     table = FLAG_REWRITES.get(command)
     if table is None:
         return None
+    actions = parser._option_string_actions
+    known = {flag: action.nargs != 0 for flag, action in actions.items()}
     entries = _split_argv(argv, known, table)
     if entries is None:
         return None
@@ -413,7 +425,21 @@ def flag_correction(
     if len(targets) > 1:
         return None
     target = targets.pop() if targets else command
+    # pack searches each query separately; search joins them into one pattern
+    if command == "pack" and target != command and _positional_count(entries) > 1:
+        return None
     target_table = FLAG_REWRITES[target]
+    # every spelling the caller supplied for the target as typed, so a renamed
+    # flag never overrides an explicit value whichever order they came in
+    explicit: set[str] = set()
+    for entry in entries:
+        if entry.flag is None:
+            continue
+        if entry.known:
+            if target == command or entry.flag not in target_table:
+                explicit.update(actions[entry.flag].option_strings)
+        elif table[entry.flag].command == target:
+            explicit.add(entry.flag)
     reasons: list[str] = []
     corrected: list[str] = []
     for entry in entries:
@@ -421,7 +447,7 @@ def flag_correction(
             corrected.extend(entry.raw)
             continue
         if not entry.known and table[entry.flag].command == target:
-            reasons.append(table[entry.flag].why)
+            reasons.append(f"{entry.flag} {table[entry.flag].why}")
             corrected.extend(entry.raw)
             continue
         rewrite = target_table.get(entry.flag)
@@ -432,8 +458,8 @@ def flag_correction(
             continue
         if rewrite.command is not None:
             return None
-        reasons.append(rewrite.why)
-        if rewrite.spelling is not None:
+        reasons.append(f"{entry.flag} {rewrite.why}")
+        if rewrite.spelling is not None and rewrite.spelling not in explicit:
             corrected.append(rewrite.spelling)
             if rewrite.takes_value:
                 corrected.append(entry.value)
@@ -445,18 +471,18 @@ _UNRECOGNIZED_PREFIX = "unrecognized arguments: "
 
 def flag_correction_suffix(
         command: str | None, argv: Sequence[str] | None,
-        known: Mapping[str, bool], message: str,
+        parser: argparse.ArgumentParser, message: str,
 ) -> str | None:
-    """The `(why); run: agrep ...` tail for an unrecognized-arguments refusal."""
+    """The `; <flag> <why>; run: agrep ...` tail of an unrecognized-arguments refusal."""
     if command is None or argv is None or not message.startswith(_UNRECOGNIZED_PREFIX):
         return None
-    correction = flag_correction(command, argv, known)
+    correction = flag_correction(command, argv, parser)
     if correction is None:
         return None
     rendered = render_cli_argv(["agrep", correction.command, *correction.argv])
     if rendered is None:
         return None
-    return f" ({'; '.join(correction.reasons)}); run: {rendered}"
+    return f"; {'; '.join(correction.reasons)}; run: {rendered}"
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -484,10 +510,8 @@ class ArgumentParser(argparse.ArgumentParser):
         message = _stable_argparse_error(message)
         line = f"{terminal_safe(self.prog)}: {terminal_safe(message)}"
         if "; run: " not in message:
-            known = {flag: action.nargs != 0
-                     for flag, action in self._option_string_actions.items()}
             correction = flag_correction_suffix(
-                self._agrep_command, self._agrep_argv, known, message)
+                self._agrep_command, self._agrep_argv, self, message)
             if correction:
                 line += correction
             else:

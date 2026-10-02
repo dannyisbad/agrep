@@ -883,8 +883,7 @@ class UnknownFlagCorrectionTests(unittest.TestCase):
          ["deadlock", "--sort", "time", "-n", "4"]),
         ("pack", ["unicode", "cp1252", "--limit", "2"], "pack",
          ["unicode", "cp1252", "--hits", "2"]),
-        ("pack", ["unicode", "cp1252", "-E"], "search",
-         ["unicode", "cp1252", "-E"]),
+        ("pack", ["index lock", "-E"], "search", ["index lock", "-E"]),
         ("around", [HANDLE, "--limit", "3"], "around", [HANDLE, "-C", "3"]),
         ("around", [HANDLE, "-n", "3", "--lexical", "--full"], "around",
          [HANDLE, "-C", "3", "--full"]),
@@ -899,6 +898,24 @@ class UnknownFlagCorrectionTests(unittest.TestCase):
         ("board", ["--once", "--limit", "3"], "board", ["--once", "-n", "3"]),
         ("board", ["--once", "--json", "--hits", "3", "--lexical"], "board",
          ["--once", "--json", "-n", "3"]),
+        # `--` ahead of the query keeps its place; the target's positional is
+        # still free to take what follows it
+        ("search", ["--limit", "3", "--", "-bar"], "search",
+         ["-n", "3", "--", "-bar"]),
+        # an explicit value for the target's own spelling wins over a renamed
+        # count, whichever order they were typed in
+        ("search", ["deadlock", "--hits", "3", "-n", "4"], "recall",
+         ["deadlock", "--hits", "3"]),
+        ("search", ["deadlock", "-n", "4", "--hits", "3"], "recall",
+         ["deadlock", "--hits", "3"]),
+        ("recall", ["deadlock", "--limit", "3", "--hits", "4"], "recall",
+         ["deadlock", "--hits", "4"]),
+        ("around", [HANDLE, "--limit", "3", "--radius", "5"], "around",
+         [HANDLE, "--radius", "5"]),
+        ("chats", ["webapp", "-n", "5", "--limit", "3"], "chats",
+         ["webapp", "-n", "5"]),
+        ("postcompact", ["--chat", "aaaa1111", "--session", "bbbb2222"],
+         "postcompact", ["--session", "bbbb2222"]),
     )
 
     def _parser_accepts(self, command: str, argv: list[str]) -> str | None:
@@ -941,7 +958,15 @@ class UnknownFlagCorrectionTests(unittest.TestCase):
                 ("search", ["deadlock", "--hits", "2", "-l"]),
                 ("recall", ["deadlock", "-l", "--budget", "100"]),
                 ("around", [self.HANDLE, "--limit", "3", "--bogus"]),
-                ("board", ["--once", "--since", "7d"])):
+                ("board", ["--once", "--since", "7d"]),
+                # `--` after the query: the target's positional is already
+                # consumed, so the tokens behind it would be refused
+                ("search", ["deadlock", "--limit", "3", "--", "-bar"]),
+                ("search", ["deadlock", "--hits", "3", "--", "-bar"]),
+                ("recall", ["deadlock", "--limit", "3", "--", "-bar"]),
+                # pack searches each query separately; search would join them
+                ("pack", ["retry backoff", "index lock", "-l"]),
+                ("pack", ["unicode", "cp1252", "-E"])):
             with self.subTest(command=command, argv=argv):
                 rc, error = _exit_code(entries[command], argv)
                 self.assertEqual(rc, 2, error)
