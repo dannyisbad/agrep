@@ -13,7 +13,8 @@ the local story of a hit (error, attempts, fix) for a few KB instead of a whole
 transcript. A pasted @session:turn handle names one exact turn, never a nearby
 clamped turn, and defaults to -C 0; the positional session+turn form keeps the
 ±4 radius. Digest-bound handles are role-aware: a prose handle omits generic
-event noise, while a tool handle retains only its exact cited event. Positional
+event noise but always shows the row it cites (a recap or control row too),
+while a tool handle retains only its exact cited event. Positional
 and bare-session exploration also defaults to root/main prose; ``--who tool`` or
 ``--tool-output N`` explicitly opts into tools. ``--full`` restores the
 same-window forensic stream. Message-cap commands retain nondefault speakers
@@ -984,6 +985,13 @@ def _main(argv: list[str] | None = None) -> int:
                 and handle_event_identity is None and not role_proven):
             # The digest verifies content, not root/child authority. Without
             # a generation-bound family role, keep the exact turn inclusive.
+            return True
+        if (is_handle and handle_digest is not None
+                and handle_event_identity is None
+                and int(turn.get("turn", -1)) == int(w["center"])
+                and compact.content_digest(text) == handle_digest):
+            # The handle cites this exact row (recap, control, ...); its speaker
+            # never hides what the citation verified.
             return True
         if session_role == "delegated":
             return who in ("user", "agent", "subagent")

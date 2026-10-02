@@ -2492,13 +2492,13 @@ def get_events(agent: str, session: str, start_ts: int | None = None,
     first_line = 0
     ordered = True
     checkpoint_generation: tuple[int, int, int, int, int] | None = None
-    if start_ts is not None:
+    if start_ts is not None or end_ts is not None:
         try:
             checkpoint_generation = common._event_file_stamp(p)
             checkpoints, ordered = _event_checkpoints(str(p), checkpoint_generation)
         except OSError:
             return []
-        if ordered and checkpoints:
+        if start_ts is not None and ordered and checkpoints:
             # Step one checkpoint back from the first >= start. Besides providing
             # scan overlap, this preserves all events when several share start_ts.
             pos = bisect_left([row[0] for row in checkpoints], start_ts) - 1
@@ -2542,15 +2542,21 @@ def get_events(agent: str, session: str, start_ts: int | None = None,
     return out
 
 
-def _event_intervals(timeline: list[dict], selected: set[int]) -> list[tuple[int, int | None]]:
+def _event_intervals(timeline: list[dict],
+                     selected: set[int]) -> list[tuple[int | None, int | None]]:
     """Chronological event ranges owned by selected turns, merged when adjacent."""
     chronological = sorted((int(row.get("ts", 0) or 0), int(row["turn"]))
                            for row in timeline if row.get("ts"))
-    ranges = []
+    ranges: list[tuple[int | None, int | None]] = []
     for i, (start, turn) in enumerate(chronological):
         if turn not in selected:
             continue
         end = chronological[i + 1][0] if i + 1 < len(chronological) else None
+        if i == 0:
+            # The earliest prompt owns every event recorded before it: the corpus
+            # indexes those tool rows under that turn (events._event_ts_turn).
+            ranges.append((None, end))
+            continue
         # Equal prompt timestamps are indistinguishable. The latest turn at that
         # timestamp owns subsequent events; the earlier interval is correctly empty.
         if end is not None and end <= start:
@@ -2566,7 +2572,7 @@ def _event_intervals(timeline: list[dict], selected: set[int]) -> list[tuple[int
         previous_end = merged[-1][1]
         merged[-1][1] = (None if previous_end is None or end is None
                          else max(previous_end, end))
-    return [(int(start), int(end) if end is not None else None) for start, end in merged]
+    return [(start, end) for start, end in merged]
 
 
 def _events_for_turns(agent: str, session: str, turns: list[dict],
@@ -2582,9 +2588,7 @@ def _events_for_turns(agent: str, session: str, turns: list[dict],
         for event in get_events(agent, session, start, end):
             ts = int(event.get("ts", 0) or 0)
             pos = bisect_right(chronological, (ts, float("inf"))) - 1
-            if pos < 0:
-                continue
-            owner = chronological[pos][1]
+            owner = chronological[max(pos, 0)][1]
             if owner not in selected:
                 continue
             raw_input = event.get("input", "")

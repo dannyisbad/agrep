@@ -611,6 +611,142 @@ class HandleWidthUnderFamilyIndexLag(unittest.TestCase):
         self.assertEqual(err.getvalue().count(surface.FAMILY_INDEX_BEHIND_LINE), 1)
 
 
+class PrintedHandleReopens(unittest.TestCase):
+    """A handle search prints names a row the index holds; around must show
+    that row. The event window has to attribute events the way the corpus
+    indexed them, and a cited row is shown whatever its speaker."""
+
+    SESSION = "abcdef012345"
+    TIMELINE = [{"turn": 0, "ts": 1_000}, {"turn": 1, "ts": 2_000}]
+    TURNS = [
+        {"turn": 0, "ts": 1_000, "who": "user", "text": "first prompt", "reply": ""},
+        {"turn": 1, "ts": 2_000, "who": "user", "text": "second prompt", "reply": ""},
+    ]
+    NEEDLE = "DEEP_NEEDLE"
+    # the match sits well past the first few hundred chars of the event
+    EARLY_EVENT = {"ts": 500, "kind": "tool", "name": "exec_command",
+                   "input": "cargo test", "ok": True,
+                   "output": "routine line\n" * 40 + NEEDLE + " decisive evidence"}
+    LATER_EVENTS = [
+        {"ts": 1_500, "kind": "tool", "name": "exec_command", "input": "ls", "output": "a"},
+        {"ts": 2_500, "kind": "tool", "name": "exec_command", "input": "pwd", "output": "b"},
+    ]
+
+    def _event_store(self, stack: contextlib.ExitStack) -> bytes:
+        import tempfile
+        import events
+        import explore
+
+        td = stack.enter_context(tempfile.TemporaryDirectory())
+        stack.enter_context(mock.patch.object(explore.common, "DATA_DIR", Path(td)))
+        stack.enter_context(mock.patch.object(events, "EVENTS_DIR", Path(td) / "events"))
+        (Path(td) / "events").mkdir()
+        explore._event_checkpoints.cache_clear()
+        stack.callback(explore._event_checkpoints.cache_clear)
+        payload = "".join(json.dumps(row) + "\n" for row in
+                          (self.EARLY_EVENT, *self.LATER_EVENTS)).encode()
+        explore.common.event_path_candidates("codex", self.SESSION)[0].write_bytes(payload)
+        return payload
+
+    def _around(self, handle: str, window, family_roots) -> tuple[int, list[dict], str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(around.common, "MESSAGES_PATH", Path(__file__)), \
+                mock.patch.object(around.explore, "resolve_session",
+                                  return_value=[self.SESSION]), \
+                mock.patch.object(around.explore, "get_window", side_effect=window), \
+                mock.patch.object(around.explore, "_session_index",
+                                  return_value={self.SESSION: {}}), \
+                mock.patch.object(around.session_context, "indexed_family_roots",
+                                  return_value=family_roots), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = around.main([handle, "--json", "--no-auto"])
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        return rc, rows, stderr.getvalue()
+
+    def test_window_attributes_pre_prompt_events_like_the_index(self) -> None:
+        import events
+        import explore
+
+        with contextlib.ExitStack() as stack:
+            payload = self._event_store(stack)
+            marks = [(row["ts"], row["turn"]) for row in self.TIMELINE]
+            indexed = [(row["ts"], row["turn"])
+                       for row in events.tool_rows_from_payload(payload, marks)]
+            first = explore._events_for_turns(
+                "codex", self.SESSION, self.TURNS[:1], self.TIMELINE)
+            second = explore._events_for_turns(
+                "codex", self.SESSION, self.TURNS[1:], self.TIMELINE)
+        self.assertEqual(indexed, [(500, 0), (1_500, 0), (2_500, 1)])
+        self.assertEqual([(row["ts"], row["turn"]) for row in first],
+                         [(500, 0), (1_500, 0)])
+        self.assertEqual([(row["ts"], row["turn"]) for row in second], [(2_500, 1)])
+
+    def test_tool_handle_for_an_event_before_its_prompt_reopens(self) -> None:
+        import common
+        import events
+        import explore
+
+        with contextlib.ExitStack() as stack:
+            payload = self._event_store(stack)
+            marks = [(row["ts"], row["turn"]) for row in self.TIMELINE]
+            row = events.tool_rows_from_payload(payload, marks)[0]
+            start = row["text"].index(self.NEEDLE)
+            hit = {"session": self.SESSION, "turn": row["turn"], "ts": row["ts"],
+                   "agent": "codex", "project": "agrep", "who": "tool",
+                   "snippet": self.NEEDLE,
+                   "content_digest": compact.content_digest(row["text"]),
+                   "_match_span": (start, start + len(self.NEEDLE)),
+                   "_event_identity": common.tool_event_identity(
+                       self.SESSION, row["turn"], row["ts"], row["text"])}
+            with mock.patch.object(
+                    search.common, "indexed_session_prefix_candidates",
+                    return_value=compact.session_prefix_index((self.SESSION,))):
+                handle = search.public_rows([hit], result_handles=True)[0]["handle"]
+
+            def window(session: str, center: int, radius: int) -> dict:
+                turns = [turn for turn in self.TURNS
+                         if abs(turn["turn"] - center) <= radius]
+                return {"session": self.SESSION, "center": center,
+                        "first_turn": 0, "last_turn": 1, "agent": "codex",
+                        "project": "agrep", "concept": "", "title": "",
+                        "turns": turns,
+                        "events": explore._events_for_turns(
+                            "codex", self.SESSION, turns, self.TIMELINE)}
+
+            rc, rows, stderr = self._around(
+                handle, window, {self.SESSION: self.SESSION})
+        self.assertEqual((rc, stderr), (0, ""), rows[:1])
+        shown = [row for row in rows if row.get("kind") == "tool"]
+        self.assertEqual([(row["turn"], row["ts"]) for row in shown], [(0, 500)])
+        self.assertIn(self.NEEDLE, shown[0].get("match_preview", ""))
+
+    def test_cited_recap_row_is_shown_and_positional_default_still_hides_it(
+            self) -> None:
+        recap = "summary of the earlier conversation"
+        turns = [{"turn": 2, "ts": 3_000, "who": "recap", "text": recap, "reply": ""}]
+        hit = {"session": self.SESSION, "turn": 2, "ts": 3_000, "agent": "pi",
+               "project": "agrep", "who": "recap", "snippet": recap,
+               "content_digest": compact.content_digest(recap)}
+        with mock.patch.object(
+                search.common, "indexed_session_prefix_candidates",
+                return_value=compact.session_prefix_index((self.SESSION,))):
+            handle = search.public_rows([hit], result_handles=True)[0]["handle"]
+
+        def window(session: str, center: int, radius: int) -> dict:
+            return {"session": self.SESSION, "center": 2, "first_turn": 2,
+                    "last_turn": 2, "agent": "pi", "project": "agrep",
+                    "concept": "", "title": "", "turns": turns, "events": []}
+
+        roots = {self.SESSION: self.SESSION}
+        rc, rows, stderr = self._around(handle, window, roots)
+        self.assertEqual((rc, stderr), (0, ""), rows[:1])
+        self.assertEqual([(row["who"], row["text"]) for row in rows
+                          if row.get("kind") == "msg"], [("recap", recap)])
+        rc, rows, _stderr = self._around(f"{self.SESSION}:2", window, roots)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(rows[0].get("miss", {}).get("code"), "no-speaker-match")
+
 
 if __name__ == "__main__":
     unittest.main()
