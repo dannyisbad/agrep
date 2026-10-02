@@ -35,7 +35,19 @@ S7 = "d7d7d7d7-0007-4000-8000-000000000007"  # atlas, recent: the calling agent'
 S8 = "b8b8b8b8-0008-4000-8000-000000000008"  # beacon: done list + sign-off, nothing pending
 S9 = "e9e9e9e9-0009-4000-8000-000000000009"  # cedar/claude: project label is the basename
 S10 = "f0f0f0f0-0010-4000-8000-000000000010"  # cedar/pi: project label is the full cwd path
+S11 = "d1d1d1d1-0011-4000-8000-000000000011"  # delta: subagent handed back, then a clean reply
+S11_SIDE = "agent-d1side0001"
+S12 = "e2e2e2e2-0012-4000-8000-000000000012"  # echo: background subagent outlives the reply
+S12_SIDE = "agent-e2side0001"
+S13 = "f3f3f3f3-0013-4000-8000-000000000013"  # foxtrot: capped todo list, all done, clean reply
+S14 = "f4f4f4f4-0014-4000-8000-000000000014"  # foxtrot: capped todo list with open items
+S15 = "g5g5g5g5-0015-4000-8000-000000000015"  # golf: next-steps plan mid-turn, then completion
+S16 = "g6g6g6g6-0016-4000-8000-000000000016"  # golf: next-steps section ends the reply
+S17 = "h7h7h7h7-0017-4000-8000-000000000017"  # hotel: parent transcript never indexed
+S17_SIDE = "agent-h7side0001"
 MARCH = ("--since", "2026-03-01", "--until", "2026-03-20")
+APRIL = ("--since", "2026-04-01", "--until", "2026-04-30")
+DAY_MS = 86_400_000
 
 
 class SummarySandbox:
@@ -88,7 +100,7 @@ class SummarySandbox:
                 raise AssertionError(f"unexpanded fixture template: {source}")
             destination.write_text(content, encoding="utf-8")
 
-    def spawn(self, command, *, env_overrides=None):
+    def spawn(self, command, *, env_overrides=None, executable=None):
         env = dict(self.env)
         for key, value in (env_overrides or {}).items():
             if value is None:
@@ -96,7 +108,7 @@ class SummarySandbox:
             else:
                 env[key] = str(value)
         return subprocess.run(
-            [sys.executable, *command], cwd=self.home, env=env, input="",
+            [executable or sys.executable, *command], cwd=self.home, env=env, input="",
             capture_output=True, text=True, encoding="utf-8", errors="strict",
             timeout=120, check=False)
 
@@ -109,6 +121,13 @@ class SummarySandbox:
             raise AssertionError(f"fixture indexing failed:\n{indexed.stdout}{indexed.stderr}")
         if not (self.data / "corpus.db").is_file():
             raise AssertionError("index did not synchronously publish the search database")
+
+    def rust_index(self) -> None:
+        """The Rust ingest alone: the publication moves on while the search database lags."""
+        binary = self.env.get("AGREP_RS_BIN") or str(ROOT / "target" / "release" / "agrep-rs")
+        result = self.spawn(["index", "--agent", "all"], executable=binary)
+        if result.returncode:
+            raise AssertionError(f"rust ingest failed:\n{result.stdout}{result.stderr}")
 
     def close(self) -> None:
         self._temp.cleanup()
@@ -276,6 +295,80 @@ class SummaryTests(unittest.TestCase):
             "“Should I apply it to the production schema now, or keep it staged?”", lines[1])
         self.assertIn("4 open items across 9 chats", result.stderr)
 
+    def test_side_chat_handed_back_before_the_root_replied_is_not_pending(self) -> None:
+        # delta: the subagent's final reply came back as the root's Task result and the root then
+        # replied cleanly, so the subagent's unclosed todo list is not the family's latest activity
+        finished = self.sandbox.summary("pending", *APRIL, "--project", "delta", "--json")
+        self.assertNotEqual(finished.returncode, 0)
+        meta, items = _rows(finished)
+        self.assertEqual((items, meta["chats"], meta["side_chats"]), ([], 1, 1))
+        # echo: a background subagent still working after the root replied does roll up
+        _meta, items = _rows(self._ok("pending", *APRIL, "--project", "echo", "--json"))
+        self.assertEqual([(i["session"], i["status"], i["source"], i["evidence_session"])
+                          for i in items], [(S12, "todo_open", "side-chat", S12_SIDE)])
+        self.assertEqual(items[0]["items"], ["rebuild the echo index", "report the echo rebuild"])
+
+    def test_capped_todo_list_recovers_complete_items_or_is_no_evidence(self) -> None:
+        # both lists exceed the 800-char event cap; S13's kept items are all done, so its clean
+        # final reply decides; S14's kept items include open ones, the ones past the cap unseen
+        _meta, items = _rows(self._ok("pending", *APRIL, "--project", "foxtrot", "--json"))
+        self.assertEqual([(i["session"], i["status"]) for i in items], [(S14, "todo_open")])
+        self.assertEqual(items[0]["items"], [f"migrate the foxtrot {name} service"
+                                             for name in ("beta", "gamma", "delta", "epsilon", "zeta")])
+        self.assertEqual(items[0]["caveats"],
+                         ["todo list capped at index time; items past the cap were not seen"])
+
+    def test_next_steps_section_counts_only_when_it_ends_the_reply(self) -> None:
+        # S15 planned "Next steps" before its tool call and finished with "All done."; S16's
+        # section ends the reply with only a sign-off after it, its first bullet two sentences long
+        _meta, items = _rows(self._ok("pending", *APRIL, "--project", "golf", "--json"))
+        self.assertEqual([(i["session"], i["status"]) for i in items], [(S16, "open_next_steps")])
+        self.assertEqual(items[0]["items"], ["publish the golf release notes. They are drafted in docs.",
+                                             "tag the golf release"])
+
+    def test_orphan_side_chat_heads_its_own_family_and_says_so(self) -> None:
+        meta, projects = _rows(self._ok(*APRIL, "--project", "hotel", "--json"))
+        self.assertEqual((meta["chats"], meta["side_chats"]), (1, 0))
+        chat = projects[0]["worked_on"][0]
+        self.assertEqual((chat["session"], chat["parent"], chat["parent_indexed"], chat["turns"]),
+                         (S17_SIDE, S17, False, 2))
+        self.assertEqual(projects[0]["estimated_active_ms"], 5 * MINUTE)
+        self.assertEqual([(o["session"], o["status"], o["parent"], o["parent_indexed"])
+                          for o in projects[0]["open"]], [(S17_SIDE, "todo_open", S17, False)])
+        human = self._ok(*APRIL, "--project", "hotel")
+        self.assertIn("@agent-h7 claude ", human.stdout)
+        self.assertEqual(human.stdout.count("[side chat; parent not indexed]"), 2, human.stdout)
+        table = _time_table(self._ok("time", *APRIL, "--project", "hotel", "--json"))
+        self.assertEqual(table[("2026-04-06", "hotel")], {
+            "kind": "time", "period": "2026-04-06", "group": "day", "project": "hotel",
+            "estimated_active_ms": 5 * MINUTE, "estimated_active": "5m", "chats": 1})
+
+    def test_turns_come_from_the_publication_when_the_search_db_lags(self) -> None:
+        """The Rust ingest republishes sessions.jsonl and messages.jsonl; the search database
+        keeps its older copy until a Python refresh, and one chat must not mix the two."""
+        sandbox = SummarySandbox()
+        self.addCleanup(sandbox.close)
+        sandbox.index()
+        path = sandbox.home / ".claude" / "projects" / "-projects-atlas" / f"{S1}.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            for stamp, role, text in (("2026-03-10T12:10:00.000Z", "user", "Keep it staged."),
+                                      ("2026-03-10T12:10:30.000Z", "assistant",
+                                       "Kept the atlas migration staged.")):
+                row = {"sessionId": S1, "cwd": str(sandbox.home / "projects" / "atlas"),
+                       "type": role, "timestamp": stamp,
+                       "message": {"role": role, "content": text}}
+                if role == "user":
+                    row["userType"] = "external"
+                handle.write(json.dumps(row) + "\n")
+        sandbox.rust_index()
+        _meta, items = _rows(sandbox.summary("pending", *MARCH, "--project", "atlas", "--json"))
+        self.assertEqual([(i["session"], i["status"]) for i in items], [(S2, "open_next_steps")])
+        _meta, projects = _rows(sandbox.summary(*MARCH, "--project", "atlas", "--json"))
+        self.assertEqual(projects[0]["turns"], 6)
+        chats = {chat["session"]: chat for chat in projects[0]["worked_on"]}
+        self.assertEqual(chats[S1]["turns"], 4)
+        self.assertRegex(chats[S1]["latest_handle"], r"^@a1a1a1a1:3\.[0-9a-f]{4}$")
+
     # --- briefing ---
 
     def test_briefing_orders_projects_by_estimated_time(self) -> None:
@@ -295,7 +388,7 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("  worked on:\n    @a2a2a2a2 claude ", human.stdout)
         self.assertIn("  open:\n    HIGH   open_next_steps", human.stdout)
         self.assertNotIn("billable", human.stdout + human.stderr)
-        self.assertIn("4 projects, 9 chats in the last 2026-03-01..2026-03-20", human.stderr)
+        self.assertIn("4 projects, 9 chats from 2026-03-01 to 2026-03-20", human.stderr)
 
     def test_max_bounds_chats_listed_per_project(self) -> None:
         _meta, projects = _rows(self._ok(*MARCH, "--project", "cairn", "-n", "1", "--json"))
@@ -322,7 +415,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(len(headings), 1, human.stdout)
         self.assertIn("@e9e9e9e9 claude", human.stdout)
         self.assertIn("@f0f0f0f0 pi", human.stdout)
-        self.assertIn("1 project, 2 chats in the last", human.stderr)
+        self.assertIn("1 project, 2 chats from 2026-03-01 to 2026-03-20", human.stderr)
         table = _time_table(self._ok("time", *MARCH, "--project", "cedar", "--json"))
         self.assertEqual(list(table), [("2026-03-16", "cedar")])
         self.assertEqual(table[("2026-03-16", "cedar")]["chats"], 2)
@@ -337,6 +430,14 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(meta["window"]["since"], "7d")
         self.assertEqual([(p["project"], p["chats"]) for p in projects], [("atlas", 1)])
         self.assertEqual([c["session"] for c in projects[0]["worked_on"]], [S7])
+
+    def test_until_alone_is_the_seven_days_before_it(self) -> None:
+        meta, projects = _rows(self._ok("--until", "2026-03-20", "--json"))
+        self.assertEqual(meta["window"]["since"], "7d")
+        self.assertEqual(meta["window"]["since_ts"], meta["window"]["until_ts"] - 7 * DAY_MS)
+        self.assertEqual(sorted(p["project"] for p in projects), ["beacon", "cairn", "cedar"])
+        human = self._ok("pending", "--until", "2026-03-20")
+        self.assertIn("in the 7d before 2026-03-20", human.stderr)
 
     def test_project_filter_matches_label_or_leaf(self) -> None:
         _meta, projects = _rows(self._ok(*MARCH, "--project", "Atlas", "--json"))

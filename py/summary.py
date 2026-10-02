@@ -34,6 +34,9 @@ import search
 import surface_policy as surface
 
 DEFAULT_SINCE = "7d"
+# the span DEFAULT_SINCE names; --until alone anchors it at the window end instead of now
+_DEFAULT_SPAN_MS = 7 * 86_400_000
+_RELATIVE_WHEN_RE = re.compile(r"\d+\s*[a-z]+", re.IGNORECASE)
 DEFAULT_IDLE_CAP = "20m"
 MODES = ("pending", "time")
 GROUPS = ("day", "week", "month")
@@ -73,6 +76,12 @@ _UNCHECKED_RE = re.compile(r"^\[\s\]")
 _ITEM_DONE_RE = re.compile(
     r"(?:^~~.*~~$)|(?:\((?:done|completed|cancelled|canceled|skipped)\)\s*$)|"
     r"(?:[-:—]\s*(?:done|completed|cancelled|canceled|skipped)\.?\s*$)", re.IGNORECASE)
+# a closing courtesy after a list offers more help; any other prose after the list supersedes it
+_SIGN_OFF_RE = re.compile(
+    r"\b(let me know|tell me|say the word|happy to|glad to|feel free|if you(?:'d| would)? "
+    r"(?:like|want|prefer|need)|want me to|i can (?:also|then|take)|just (?:say|ask)|shout|"
+    r"ping me)\b", re.IGNORECASE)
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=\S)")
 _TODO_TOOL_RE = re.compile(r"todo", re.IGNORECASE)
 _TODO_OPEN_STATUSES = frozenset({
     "pending", "in_progress", "in-progress", "not_started", "not-started", "open",
@@ -106,6 +115,8 @@ class _Chat:
     events: list[dict] = field(default_factory=list)
     # turns the caller's live window withholds; the chat's state after them is not history
     withheld: bool = False
+    # the unindexed parent of a side chat promoted to a family root of its own
+    parent: str = ""
 
     def last_turn(self) -> _Turn | None:
         return max(self.turns, key=lambda row: (row.turn, row.ts)) if self.turns else None
@@ -153,9 +164,11 @@ def _parser() -> surface.ArgumentParser:
                     help="pending: open items only; time: estimated active time table; "
                          "omitted: full briefing")
     ap.add_argument("--since", metavar="WHEN", default=None,
-                    help=f"window start (7d / 24h / 2w / 30m, or 2026-06-01); default {DEFAULT_SINCE}")
+                    help=f"window start (7d / 24h / 2w / 30m, or 2026-06-01); default "
+                         f"{DEFAULT_SINCE} before now, or before --until when only --until is given")
     ap.add_argument("--until", "--before", dest="until", metavar="WHEN",
-                    help="window end (same formats as --since)")
+                    help=f"window end (same formats as --since); alone, the window is the "
+                         f"{DEFAULT_SINCE} before it")
     ap.add_argument("--project", help=surface.PROJECT_HELP)
     ap.add_argument("--agent", help=f"only this agent ({', '.join(common.KNOWN_AGENTS)})")
     ap.add_argument("--group", choices=GROUPS, default=None,
@@ -196,11 +209,16 @@ def _family_metadata(sessions: list[str], index: dict[str, dict]) -> dict[str, t
 
 
 def _load_transcripts(chats: dict[str, _Chat]) -> bool:
-    """Fill turns and replies from the search db, else from the materialized JSONL."""
+    """Fill turns and replies from the search db, else from the materialized JSONL.
+    Scope and last_ts come from sessions.jsonl, so a db behind that publication is skipped
+    whole: one chat never mixes a fresh session row with older turns."""
     sessions = list(chats)
     try:
         db = search._load_corpusdb().connect(allow_stale=True)
     except (OSError, sqlite3.DatabaseError, RuntimeError, TypeError, ValueError):
+        db = None
+    if db is not None and getattr(db, "_source_stamp_current", None) is False:
+        db.close()
         db = None
     if db is not None:
         seen: dict[str, set[int]] = {session: set() for session in sessions}
@@ -376,43 +394,85 @@ def _direct_request(reply: str) -> str | None:
 
 
 def _open_section_items(reply: str) -> tuple[str, list[str], int] | None:
-    """(heading, open items, closed count) for the last next-steps style section."""
+    """(heading, open items, closed count) for a next-steps style section that ends the reply.
+    A turn's reply joins every assistant text block, so prose after the bullets is a later
+    block that supersedes the list; only a short sign-off may follow it."""
     lines = _prose(reply).splitlines()
-    found = None
-    for index, line in enumerate(lines):
-        heading = _SECTION_RE.match(line)
-        if heading is None:
+    heading_at = next((i for i in range(len(lines) - 1, -1, -1) if _SECTION_RE.match(lines[i])),
+                      None)
+    if heading_at is None:
+        return None
+    heading = _SECTION_RE.match(lines[heading_at]).group(1).lower()
+    bullets: list[str] = []
+    trailing: list[str] = []
+    for candidate in lines[heading_at + 1:]:
+        if not candidate.strip():
             continue
-        open_items: list[str] = []
-        closed = 0
-        for candidate in lines[index + 1:]:
-            if not candidate.strip():
-                if open_items or closed:
-                    break
-                continue
-            bullet = _BULLET_RE.match(candidate)
-            if bullet is None:
-                if _SECTION_RE.match(candidate) or open_items or closed:
-                    break
-                continue
-            item = bullet.group(1).strip()
-            if _CHECKED_RE.match(item) or _ITEM_DONE_RE.search(item):
-                closed += 1
-                continue
-            item = _UNCHECKED_RE.sub("", item).strip()
-            open_items.append(common.one_line(_MARKUP_RE.sub(" ", item)))
-        if open_items or closed:
-            found = (heading.group(1).lower(), open_items, closed)
-    return found
+        bullet = _BULLET_RE.match(candidate)
+        if bullet is not None and not trailing:
+            bullets.append(bullet.group(1).strip())
+        elif bullets:
+            trailing.append(candidate.strip())
+    if not bullets:
+        return None
+    # the index keeps no block boundary: the last bullet ends at its first sentence boundary and
+    # whatever follows it on the line is the next block's prose
+    head, *rest = _SENTENCE_END_RE.split(bullets[-1], maxsplit=1)
+    bullets[-1] = head
+    tail = " ".join(rest + trailing)
+    if tail and not (len(tail) <= 200 and _SIGN_OFF_RE.search(tail)):
+        return None
+    open_items: list[str] = []
+    closed = 0
+    for item in bullets:
+        if _CHECKED_RE.match(item) or _ITEM_DONE_RE.search(item):
+            closed += 1
+            continue
+        item = _UNCHECKED_RE.sub("", item).strip()
+        open_items.append(common.one_line(_MARKUP_RE.sub(" ", item)))
+    return heading, open_items, closed
+
+
+def _input_capped(event: dict) -> bool:
+    """Did the ingest cap cut this event's input? The row keeps the source length to say so."""
+    raw = str(event.get("input") or "")
+    try:
+        chars = int(event.get("input_chars") or 0)
+    except (TypeError, ValueError):
+        return False
+    return raw.endswith("…") and chars >= len(raw)
+
+
+def _capped_list_items(raw: str) -> list:
+    """Every list element still complete in a JSON input the ingest cap cut short."""
+    decoder = json.JSONDecoder()
+    pos = raw.find("[")
+    if pos < 0:
+        return []
+    out: list = []
+    pos += 1
+    while True:
+        while pos < len(raw) and raw[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(raw) or raw[pos] not in "{\"":
+            return out
+        try:
+            item, pos = decoder.raw_decode(raw, pos)
+        except ValueError:
+            return out
+        out.append(item)
 
 
 def _todo_items(event: dict) -> list[tuple[str, str]] | None:
-    """(item, status) pairs from a todo tool's captured input; None when unparseable."""
+    """(item, status) pairs from a todo tool's captured input; None when its shape is unknown.
+    A capped input yields the items that are still complete, possibly none."""
     raw = str(event.get("input") or "")
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
-        return None
+        if not _input_capped(event):
+            return None
+        payload = _capped_list_items(raw)
     items = payload.get("todos") if isinstance(payload, dict) else payload
     if not isinstance(items, list):
         return None
@@ -431,24 +491,27 @@ def _todo_items(event: dict) -> list[tuple[str, str]] | None:
     return out
 
 
-def _latest_todo(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool]:
-    """Items of the last todo event and whether a todo event existed at all."""
+def _latest_todo(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool]:
+    """(items of the last todo event, whether one existed, whether its input was capped)."""
     for event in reversed(chat.events):
         if event.get("kind") == "tool" and _TODO_TOOL_RE.search(str(event.get("name") or "")):
-            return _todo_items(event), True
-    return None, False
+            return _todo_items(event), True, _input_capped(event)
+    return None, False, False
 
 
 def _open_todos(chat: _Chat) -> tuple[list[str], list[str]]:
-    """(open todo items, caveats)."""
-    items, present = _latest_todo(chat)
+    """(open todo items, caveats). A capped list whose kept items are all closed is no evidence:
+    the final reply decides."""
+    items, present, capped = _latest_todo(chat)
     if not present:
         return [], []
     if items is None:
-        return [], ["todo list captured in an unparseable form (truncated or unknown shape)"]
+        return [], ["todo list captured in an unknown shape"]
     open_items = [name for name, status in items
                   if status in _TODO_OPEN_STATUSES or
                   (status not in _TODO_CLOSED_STATUSES and status == "")]
+    if open_items and capped:
+        return open_items, ["todo list capped at index time; items past the cap were not seen"]
     return open_items, []
 
 
@@ -515,10 +578,41 @@ def _classify_root(chat: _Chat) -> dict | None:
     return None
 
 
-def _classify_side(chat: _Chat, root_last_ts: int) -> dict | None:
-    """Side-chat evidence only rolls up when the side chat was the family's latest activity."""
+def _latest_ts(chat: _Chat) -> int:
+    """The latest moment the index places in a chat: its last prompt or its latest tool call.
+    Replies carry no timestamp of their own."""
     last = chat.last_turn()
-    if last is None or last.ts <= 0 or last.ts < root_last_ts:
+    return max(last.ts if last is not None else 0,
+               *(int(event.get("ts") or 0) for event in chat.events), 0)
+
+
+def _result_received(root: _Chat, side: _Chat) -> bool | None:
+    """Did the root get the side chat's final reply back as a subagent result? That receipt is
+    the only indexed proof the root went on after the side chat ended. None when the side reply
+    is capped and the comparison cannot be made."""
+    last = side.last_turn()
+    reply = side.replies.get(last.turn, "") if last is not None else ""
+    if not reply:
+        return False
+    if len(reply) >= _REPLY_CAP_CHARS:
+        return None
+    final = " ".join(reply.split())
+    for event in root.events:
+        if event.get("kind") != "subagent_start":
+            continue
+        head = " ".join(str(event.get("output") or "").rstrip("…").split())[:160]
+        if head and head in final:
+            return True
+    return False
+
+
+def _classify_side(chat: _Chat, root: _Chat) -> dict | None:
+    """Side-chat evidence rolls up only when the side chat is provably the family's latest
+    activity: after every timestamp the index holds for the root, with no result handed back."""
+    last = chat.last_turn()
+    if last is None or last.ts <= 0 or _latest_ts(chat) <= _latest_ts(root):
+        return None
+    if _result_received(root, chat) is not False:
         return None
     record = {"turn": last.turn, "turn_ts": last.ts, "signals": [], "evidence": "",
               "items": [], "caveats": []}
@@ -546,8 +640,8 @@ def _pending_item(root: _Chat, sides: list[_Chat], handles) -> dict | None:
     source_chat = root
     source = "root"
     if record is None:
-        for side in sorted(sides, key=lambda chat: -chat.last_ts):
-            record = _classify_side(side, root.last_ts)
+        for side in sorted(sides, key=lambda chat: -_latest_ts(chat)):
+            record = _classify_side(side, root)
             if record is not None:
                 source_chat, source = side, "side-chat"
                 break
@@ -574,6 +668,8 @@ def _pending_item(root: _Chat, sides: list[_Chat], handles) -> dict | None:
     }
     if source == "side-chat":
         item["evidence_session"] = source_chat.session
+    if root.parent:
+        item.update(parent=root.parent, parent_indexed=False)
     if record["caveats"]:
         item["caveats"] = record["caveats"]
     return item
@@ -629,8 +725,11 @@ def main(argv: list[str] | None = None) -> int:
         args.agent = common.normalize_agent_name(args.agent.lower())
     since_text = args.since or DEFAULT_SINCE
     try:
-        since_ms = search._parse_when(since_text)
         until_ms = search._parse_when(args.until) if args.until else None
+        if args.since is None and until_ms is not None:
+            since_ms = until_ms - _DEFAULT_SPAN_MS
+        else:
+            since_ms = search._parse_when(since_text)
     except SystemExit:
         return 2
     inverted = surface.window_bounds_error(since_text, since_ms, args.until, until_ms)
@@ -678,13 +777,17 @@ def main(argv: list[str] | None = None) -> int:
 
     candidates: list[tuple[str, bool]] = []
     side_members: dict[str, list[str]] = {}
+    # a side chat whose family root is not indexed heads a family of its own, parent disclosed
+    orphan_parent: dict[str, str] = {}
     for session in index:
         root, side = family.get(session, (session, False))
         side = side or session in side_sessions
-        if side and root != session:
+        if side and root != session and root in index:
             side_members.setdefault(root, []).append(session)
         else:
             candidates.append((session, side))
+            if side and root != session:
+                orphan_parent[session] = str(index[session].get("parent") or root)
     # filters judge the family's root; the window admits a family on any member's activity
     chats: dict[str, _Chat] = {}
     roots: dict[str, _Chat] = {}
@@ -697,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
         if not (overlaps_window(raw) or any(overlaps_window(index[member]) for member in kin)):
             continue
         chat = chat_row(session, raw, root=session, side=side)
+        chat.parent = orphan_parent.get(session, "")
         roots[session] = chats[session] = chat
         for member in kin:
             side_chat = chat_row(member, index[member], root=session, side=True,
@@ -778,7 +882,14 @@ def main(argv: list[str] | None = None) -> int:
                        "excluded from time and turn counts")
     if not totals_exact:
         caveats.append("the session index skipped corrupt rows; counts are a floor")
-    window_text = f"{since_text}" + (f"..{args.until}" if args.until else "")
+    if args.until and args.since is None:
+        window_text = f"in the {DEFAULT_SINCE} before {args.until}"
+    elif args.until:
+        window_text = f"from {since_text} to {args.until}"
+    elif _RELATIVE_WHEN_RE.fullmatch(since_text.strip()):
+        window_text = f"in the last {since_text}"
+    else:
+        window_text = f"since {since_text}"
 
     rows: list[dict] = []
     if args.mode == "time":
@@ -819,7 +930,8 @@ def main(argv: list[str] | None = None) -> int:
                 "estimated_active_ms": family_ms[root],
                 "latest_handle": handles.turn(chat, last.turn) if last else None,
                 "side_chats": len(sides.get(root, ())),
-                **({"self": True} if chat.withheld else {})})
+                **({"self": True} if chat.withheld else {}),
+                **({"parent": chat.parent, "parent_indexed": False} if chat.parent else {})})
         for item in pending_items:
             projects[item["project"]]["open"].append(item)
         for entry in projects.values():
@@ -872,16 +984,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
     if not args.json:
         if args.mode == "time":
-            common.log(f"{METRIC} for {surface.count_noun(len(roots), 'chat')} in the last "
-                       f"{window_text}, idle cap {args.idle_cap}, local time {_timezone_label()}"
+            common.log(f"{METRIC} for {surface.count_noun(len(roots), 'chat')} {window_text}, "
+                       f"idle cap {args.idle_cap}, local time {_timezone_label()}"
                        f" · not elapsed span, not billable")
         elif args.mode == "pending":
             common.log(f"{surface.count_noun(len(rows), 'open item')} across "
-                       f"{surface.count_noun(len(roots), 'chat')} in the last {window_text}, "
+                       f"{surface.count_noun(len(roots), 'chat')} {window_text}, "
                        "most confident first")
         else:
             common.log(f"{surface.count_noun(len(rows), 'project')}, "
-                       f"{surface.count_noun(len(roots), 'chat')} in the last {window_text}, "
+                       f"{surface.count_noun(len(roots), 'chat')} {window_text}, "
                        f"most active first · {METRIC} with a {args.idle_cap} idle cap, "
                        "side chats folded into their family")
         if unknown_rows:
@@ -924,7 +1036,9 @@ def _render(args, rows: list[dict], *, group: str, window_text: str, total_ms: i
             detail = f"\u201c{item['evidence'][:120]}\u201d"
         else:
             detail = "; ".join(item["signals"])
-        source = "  [side chat]" if item["source"] == "side-chat" else ""
+        source = ("  [side chat]" if item["source"] == "side-chat" else
+                  "  [side chat; parent not indexed]" if item.get("parent_indexed") is False
+                  else "")
         return (f"{indent}{item['confidence'].upper():<6} {item['status']:<21} "
                 f"{safe(handle)}{source}  {safe(detail)}")
 
@@ -951,7 +1065,8 @@ def _render(args, rows: list[dict], *, group: str, window_text: str, total_ms: i
         for chat in entry["worked_on"]:
             handle = chat["session_handle"] or f"session={chat['session']}"
             marks = (" ~self" if chat.get("self") else "") + (
-                f" (+{chat['side_chats']} side)" if chat["side_chats"] else "")
+                f" (+{chat['side_chats']} side)" if chat["side_chats"] else "") + (
+                " [side chat; parent not indexed]" if chat.get("parent_indexed") is False else "")
             followup = (console.shell_command("agrep", "around", chat["latest_handle"], fallback="")
                         if chat["latest_handle"] else "")
             tail = f" · {followup}" if followup else ""
