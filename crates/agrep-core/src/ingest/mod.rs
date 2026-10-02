@@ -1370,6 +1370,7 @@ mod tests {
         let before_metadata = std::fs::symlink_metadata(&path).unwrap();
         let generic_before =
             crate::ingest::registry::metadata_change_token(&path, &before_metadata).unwrap();
+        crate::ingest::registry::wait_for_next_ctime_tick(&path);
         let generation = sqlite_generation_token(&path).unwrap();
         let snapshot = SqliteSnapshot::create_with(&path, |_, _| Ok(false)).unwrap();
         assert_eq!(

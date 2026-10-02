@@ -17,7 +17,7 @@ isolate_data_dir()
 
 
 # Daemon semantics run real here, daemon processes never do (shared seam).
-from _test_support import lift_daemon_semantics
+from _test_support import lift_daemon_semantics, wait_for_next_ctime_tick
 import indexd_runtime  # noqa: E402
 
 setUpModule, tearDownModule = lift_daemon_semantics(indexd_runtime)
@@ -275,6 +275,7 @@ class SemanticWorkerStartClaimTests(unittest.TestCase):
 
         claim = self._acquire()
         copied = claim.snapshot.raw
+        wait_for_next_ctime_tick(self.path)
         self.path.unlink()
         self.path.write_bytes(copied)
         semworker._release_start_claim(claim)

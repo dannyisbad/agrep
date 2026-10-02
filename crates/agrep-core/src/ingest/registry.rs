@@ -335,6 +335,28 @@ pub fn metadata_change_token(
     ))
 }
 
+/// Linux stamps ctime from the coarse tick clock, so a change in the same tick as the
+/// last one keeps its token. Tests that need a visible change wait for the next tick.
+#[cfg(all(test, unix))]
+pub(crate) fn wait_for_next_ctime_tick(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).unwrap();
+    let before = (metadata.ctime(), metadata.ctime_nsec());
+    let probe = path.with_extension("ctime-probe");
+    loop {
+        fs::write(&probe, b"tick").unwrap();
+        let probed = fs::metadata(&probe).unwrap();
+        if (probed.ctime(), probed.ctime_nsec()) > before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = fs::remove_file(&probe);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn wait_for_next_ctime_tick(_path: &Path) {}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WindowsFileIdentity {
@@ -4419,6 +4441,7 @@ mod tests {
             tokens: TokenAvailability::Empty,
         };
         let before = adapter_source(&adapter).unwrap();
+        wait_for_next_ctime_tick(&source);
 
         fs::write(&source, b"after!").unwrap();
         let file = fs::OpenOptions::new().write(true).open(&source).unwrap();

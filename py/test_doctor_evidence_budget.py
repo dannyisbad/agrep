@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import isolate_data_dir, wait_for_next_ctime_tick
 
 
 isolate_data_dir()
@@ -416,6 +416,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
                 first = doctor._run_quick_check(db, database, progress.append)
                 second = doctor._run_quick_check(db, database, progress.append)
                 before = wal.stat()
+                wait_for_next_ctime_tick(wal)
                 wal.write_bytes(b"wal2")
                 os.utime(wal, ns=(before.st_atime_ns, before.st_mtime_ns))
                 third = doctor._run_quick_check(db, database, progress.append)
@@ -434,6 +435,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
             path.write_bytes(b"before")
             before_stat = path.stat()
             before = doctor._regular_file_identity(path)
+            wait_for_next_ctime_tick(path)
             path.write_bytes(b"after!")
             os.utime(path, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
             after = doctor._regular_file_identity(path)
@@ -530,6 +532,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
                 first, first_integrity = doctor._model_cache_probe(fake, deep=True)
                 second, second_integrity = doctor._model_cache_probe(fake, deep=True)
                 before = model.stat()
+                wait_for_next_ctime_tick(model)
                 model.write_bytes(b"model2")
                 os.utime(model, ns=(before.st_atime_ns, before.st_mtime_ns))
                 third, third_integrity = doctor._model_cache_probe(fake, deep=True)

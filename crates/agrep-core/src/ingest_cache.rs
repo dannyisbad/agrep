@@ -4039,6 +4039,7 @@ mod tests {
             calls.fetch_add(1, Ordering::Relaxed);
             (vec![test_message("before")], Vec::new())
         });
+        crate::ingest::registry::wait_for_next_ctime_tick(&source);
 
         fs::write(&source, b"after!").unwrap();
         fs::OpenOptions::new()
@@ -4322,6 +4323,7 @@ mod tests {
                 ReadOutcome::Complete,
             )
         });
+        crate::ingest::registry::wait_for_next_ctime_tick(&source);
         let replacement = root.join("replacement.jsonl");
         fs::write(&replacement, b"new").unwrap();
         fs::File::options()

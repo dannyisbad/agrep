@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from _test_support import wait_for_next_ctime_tick
+
 import numpy as np
 
 import ask
@@ -113,6 +115,7 @@ def _mutate_same_size(path: Path, before: bytes, after: bytes) -> None:
         raise AssertionError(f"mutation target is absent from {path}")
     prior = path.stat()
     prior_identity = embedding_segments._file_identity(path)
+    wait_for_next_ctime_tick(path)
     with path.open("r+b") as stream:
         stream.seek(offset)
         stream.write(after)

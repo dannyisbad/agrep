@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 
 _TEST_ROOT_ENV = "AGREP_TEST_DATA_ROOT"
@@ -74,6 +75,21 @@ def isolate_data_dir() -> Path:
     if loaded is not None and Path(loaded.DATA_DIR) != root:
         raise RuntimeError("test isolation was requested after common initialized real paths")
     return root
+
+
+def wait_for_next_ctime_tick(path: Path) -> None:
+    """Linux stamps ctime from the coarse tick clock; a rewrite in the same tick
+    as ``path``'s last change keeps its identity."""
+    before = os.stat(path).st_ctime_ns
+    probe = Path(f"{path}.ctime-probe")
+    try:
+        while True:
+            probe.write_bytes(b"tick")
+            if probe.stat().st_ctime_ns > before:
+                return
+            time.sleep(0.001)
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 def publish_derived_generation(
