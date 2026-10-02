@@ -33,8 +33,9 @@ _COMMANDS = frozenset((
     "status", "doctor", "audit", "tail", "board", "live", "setup", "remove", "index",
     "reindex", "resume", "run", "search", "chats", "around", "postcompact", "recall",
     "pack", "archive", "restore", "set", "inject", "ui", "up", "serve", "explorer",
+    "summary", "why",
 ))
-_READ_COMMANDS = frozenset(("search", "chats", "around", "recall"))
+_READ_COMMANDS = frozenset(("search", "chats", "around", "recall", "summary", "why"))
 _MAX_REQUEST = 4 * 1024 * 1024
 _SUN_PATH_MAX = 104 if sys.platform == "darwin" else 108
 # Result kinds: the command returned a code, the child exited without one, or a signal ended it.

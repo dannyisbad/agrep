@@ -91,7 +91,9 @@ LAYERS = {
     "resume": 6,
     "search": 6,
     "server": 6,
+    "summary": 6,
     "tail": 6,
+    "why": 6,
     # 7 — harness: selftest exercises every layer, the sweep loads every module
     "global_state_sweep": 7,
     "selftest": 7,

@@ -24,25 +24,30 @@ context instead of re-deriving them.
 
 ## Commands
 
-Run `agrep --help` once before first use; `agrep <command> --help` documents
-each command's flags and caveats.
-
 - `agrep chats <topic or quote>` - find a prior conversation by identity or
   indexed contents, then run its printed `agrep around` follow-up. Bare
   `agrep chats` lists the newest sessions first: use it for "recent/last/
-  latest sessions", not board.
+  latest sessions", not board. `-n N` caps rows.
+- `agrep <words> --here --since 14d -l --sort time` - which chats mention it,
+  newest first (`agrep search ...` when the first word is a command name).
 - `agrep recall "<distinctive phrase>"` - prior solutions from OTHER
-  sessions, bounded context.
+  sessions, bounded context; `--hits N` chats, `--budget BYTES` output,
+  `-C N` turns around each hit.
 - `agrep around <handle>` - open a hit at its source before citing it;
-  `--whole` (or `-C all`) prints the entire chat.
+  `-C N` turns of context, `--tool-output N` chars of each tool result,
+  `--max-chars N` per message (`--full` uncaps), `--no-tools`; `--whole`
+  (or `-C all`) prints the entire chat.
 - `agrep postcompact` - THIS session's turns from before a compaction
   boundary: verbatim excerpts of the newest ones, omissions marked, no query
-  needed. Do not use recall for this session's own facts: recall hides the
-  current context window, demotes this session's older turns to ~self
-  (`--self` overrides), and ranks your tail against lookalikes from all
-  history.
+  needed (`--session ID` when the caller is unresolved). Do not use recall
+  for this session's own facts: recall hides the current context window,
+  demotes this session's older turns to ~self (`--self` overrides), and
+  ranks your tail against lookalikes from all history.
 - `agrep board --once` - live agent activity right now (running/active
   questions only; recent-history questions are `chats`).
+
+No command takes `--limit`. The rest (tail, resume, archive, audit, semantic
+controls) is in `agrep <command> --help`.
 
 The index spans every project on this box; nothing scopes results to the
 current directory unless you ask. Every `chats` and `-l` row prints its

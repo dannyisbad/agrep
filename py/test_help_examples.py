@@ -44,10 +44,12 @@ def _cli_help(argv):
     stdout = io.StringIO()
     with mock.patch.object(sys, "argv", ["agrep", *argv]), \
             contextlib.redirect_stdout(stdout), \
-            contextlib.redirect_stderr(io.StringIO()), \
-            unittest.TestCase().assertRaises(SystemExit) as raised:
-        cli._main()
-    assert raised.exception.code == 0, raised.exception.code
+            contextlib.redirect_stderr(io.StringIO()):
+        try:
+            code = cli._main()
+        except SystemExit as stopped:
+            code = stopped.code
+    assert code in (0, None), code
     return stdout.getvalue()
 
 
@@ -110,7 +112,7 @@ class VerbHelpExamples(unittest.TestCase):
             self.assertIn(detail, flat)
         top = _cli_help(["--help"])
         self.assertNotIn("by name, not content", top)
-        self.assertIn("agrep chats webapp", top)
+        self.assertIn('agrep chats "retry backoff"', top)
 
     def test_search_examples_are_windows_safe_and_dependency_free(self) -> None:
         rendered = _help_of(search.main, ["--help"])
@@ -193,17 +195,13 @@ class VerbHelpExamples(unittest.TestCase):
 
 class TopLevelHelpGrouping(unittest.TestCase):
 
-    def test_verbs_are_grouped_by_task(self) -> None:
+    def test_top_level_help_carries_examples_and_the_escape_hatch(self) -> None:
         rendered = _cli_help(["--help"])
-        for group in ("find text", "resume work", "maintain", "live"):
-            self.assertIn(group, rendered)
-        _assert_examples(self, rendered, "top-level")
+        examples = [line for line in rendered.splitlines()
+                    if line.strip().startswith("agrep ")]
+        self.assertGreaterEqual(len(examples), 2)
         # the collision escape hatch is documented where eyes land first
         self.assertIn("agrep search index", rendered)
-        self.assertIn("chats", rendered)
-        self.assertIn("search history; compact prose may add meaning", rendered)
-        maintain = rendered.split("maintain", 1)[1].split("live", 1)[0]
-        self.assertIn("audit", maintain)
 
     def test_status_and_doctor_explain_bounded_vs_deep(self) -> None:
         status_help = _cli_help(["status", "--help"])

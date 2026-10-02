@@ -5456,7 +5456,7 @@ def t_block_version():
     import tempfile
     from pathlib import Path as P
     import teach
-    pinned = (38, "f520cdfb6033")  # (NUDGE_V, sha256(NUDGE)[:12]) - update BOTH together
+    pinned = (39, "0e89be07f6ac")  # (NUDGE_V, sha256(NUDGE)[:12]) - update BOTH together
     h = hashlib.sha256(teach.NUDGE.encode()).hexdigest()[:12]
     if (teach.NUDGE_V, h) != pinned:
         return ("FAIL", f"NUDGE changed (v{teach.NUDGE_V}, {h}) vs pinned {pinned} - "
@@ -5481,14 +5481,20 @@ def t_block_version():
     # The lean blocks carry no illustrative probe output; the anti-drift
     # check only binds when a demo line exists to drift.
     probe_current = (probe or "") == demo if demo else probe is not None
+    # Every command a block routes to, plus the inline flag essentials and the
+    # per-command help escape hatch: a first reach must need no help lookup.
     routes_current = all(
         route in text
         for text in (teach.NUDGE, teach.NUDGE_CODEX)
         for route in (
             'agrep chats <topic or quote>',
             'agrep recall "<distinctive phrase>"', "agrep around <handle>",
-            "agrep postcompact", "agrep board --once", "agrep --help",
-        ))
+            "agrep postcompact", "agrep board --once",
+            "agrep <command> --help", "`--hits N`", "`-C N`", "`-n N`",
+            "`--tool-output N`", "command takes `--limit`",
+        )) and not any(
+            "Run `agrep --help`" in text or "one help call" in text
+            for text in (teach.NUDGE, teach.NUDGE_CODEX))
     with tempfile.TemporaryDirectory() as td:
         older = P(td) / "older.md"
         newer = P(td) / "newer.md"

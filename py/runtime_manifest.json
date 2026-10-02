@@ -286,6 +286,10 @@
    "member": "agrep/py/settings.py"
   },
   {
+   "source": "py/summary.py",
+   "member": "agrep/py/summary.py"
+  },
+  {
    "source": "py/surface_policy.py",
    "member": "agrep/py/surface_policy.py"
   },
@@ -296,6 +300,10 @@
   {
    "source": "py/teach.py",
    "member": "agrep/py/teach.py"
+  },
+  {
+   "source": "py/why.py",
+   "member": "agrep/py/why.py"
   },
   {
    "source": "py/winjob.py",

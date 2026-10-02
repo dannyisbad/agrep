@@ -100,6 +100,32 @@ class InProcessDispatchTests(unittest.TestCase):
         for option in ("--agent", "--json", "--strict", "--full"):
             self.assertIn(option, rendered)
 
+    def test_top_level_help_leads_with_agent_commands_and_lists_every_name(self) -> None:
+        import re
+        import surface_policy as surface
+        rendered = {}
+        for flag in ("--help", "-h"):
+            output, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "argv", ["agrep", flag]), \
+                    redirect_stdout(output), redirect_stderr(err):
+                self.assertEqual(cli._main(), 0)
+            self.assertEqual(err.getvalue(), "")
+            rendered[flag] = output.getvalue()
+        self.assertEqual(rendered["-h"], rendered["--help"])
+        page = rendered["--help"]
+        head, separator, tail = page.partition("other commands:")
+        self.assertTrue(separator, page)
+        lead = re.findall(r"^  ([a-z]+) ", head, flags=re.M)
+        self.assertEqual(lead, ["search", "around", "recall", "chats", "postcompact",
+                                "board", "resume", "status", "why", "summary"])
+        for name in lead:
+            example = r'^ {17}agrep "' if name == "search" else rf"^ {{17}}agrep {name}\b"
+            self.assertRegex(head, re.compile(example, re.M))
+        other = set(re.findall(r"[a-z]+", tail.split("\n\n", 1)[0]))
+        hidden = {"live", "inject", "up"}
+        self.assertEqual(set(lead) | other, surface.RESERVED_COMMAND_WORDS - hidden)
+        self.assertFalse(set(lead) & other)
+
 
 class OneShotLiveSurfaceTests(unittest.TestCase):
     class Watcher:

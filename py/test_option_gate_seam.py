@@ -833,5 +833,152 @@ class NonsenseValueTests(unittest.TestCase):
                 self.assertIsNone(_run(resume.main, ["-l", "-n", value]))
 
 
+class UnknownFlagCorrectionTests(unittest.TestCase):
+    """An option this command spells differently, or another command owns, is
+    refused with the same runnable correction the gates print; every printed
+    correction parses on the command it names. Agents pasted recall's --budget
+    into search and grep's --limit into every command, then guessed again."""
+
+    HANDLE = "@11111111:174.82c5~a8f797767b0f558d5d5c67e6:214-222"
+
+    @staticmethod
+    def _entries() -> dict:
+        import around
+        import livetui
+        import postcompact
+        return {
+            "search": search.main,
+            "recall": recall.main,
+            "pack": lambda argv: recall.main(argv, prog="pack"),
+            "chats": search.chats_main,
+            "around": around.main,
+            "postcompact": postcompact.main,
+            "board": livetui.main,
+        }
+
+    # past the parser these run against the empty sandbox and stop there;
+    # board and postcompact would start live machinery, so only their parsers run
+    RUNNABLE = frozenset({"search", "recall", "pack", "chats", "around"})
+
+    CASES = (
+        ("search", ["deadlock", "--limit", "5"], "search",
+         ["deadlock", "-n", "5"]),
+        ("search", ["deadlock", "--limit=5", "--side", "--here"], "search",
+         ["deadlock", "-n", "5", "--here"]),
+        ("search", ["two words", "--budget", "4000", "-n", "3"], "recall",
+         ["two words", "--budget", "4000", "--hits", "3"]),
+        ("search", ["deadlock", "--hits", "2", "--since", "7d"], "recall",
+         ["deadlock", "--hits", "2", "--since", "7d"]),
+        ("search", ["deadlock", "--probe", "--no-auto"], "recall",
+         ["deadlock", "--probe", "--no-auto"]),
+        ("search", ["deadlock", "-C", "3", "--limit", "2"], "recall",
+         ["deadlock", "-C", "3", "--hits", "2"]),
+        ("recall", ["deadlock", "--limit", "5"], "recall",
+         ["deadlock", "--hits", "5"]),
+        ("recall", ["deadlock", "-n5", "--side"], "recall",
+         ["deadlock", "--hits", "5"]),
+        ("recall", ["deadlock", "-l", "--since", "7d"], "search",
+         ["deadlock", "-l", "--since", "7d"]),
+        ("recall", ["deadlock", "--sort", "time", "--limit", "4"], "search",
+         ["deadlock", "--sort", "time", "-n", "4"]),
+        ("pack", ["unicode", "cp1252", "--limit", "2"], "pack",
+         ["unicode", "cp1252", "--hits", "2"]),
+        ("pack", ["unicode", "cp1252", "-E"], "search",
+         ["unicode", "cp1252", "-E"]),
+        ("around", [HANDLE, "--limit", "3"], "around", [HANDLE, "-C", "3"]),
+        ("around", [HANDLE, "-n", "3", "--lexical", "--full"], "around",
+         [HANDLE, "-C", "3", "--full"]),
+        ("chats", ["webapp", "--limit", "4", "--lexical"], "chats",
+         ["webapp", "-n", "4"]),
+        ("chats", ["webapp", "--hits", "4", "--here"], "chats",
+         ["webapp", "-n", "4", "--here"]),
+        ("postcompact", ["--chat", "abcd1234", "--limit", "5"], "postcompact",
+         ["--session", "abcd1234"]),
+        ("postcompact", ["--json", "--budget", "4000", "--lexical"], "postcompact",
+         ["--json"]),
+        ("board", ["--once", "--limit", "3"], "board", ["--once", "-n", "3"]),
+        ("board", ["--once", "--json", "--hits", "3", "--lexical"], "board",
+         ["--once", "--json", "-n", "3"]),
+    )
+
+    def _parser_accepts(self, command: str, argv: list[str]) -> str | None:
+        parser = _parser(self._entries()[command], argv)
+
+        def refuse(_self, message):
+            raise _Refused(message)
+
+        original = surface.ArgumentParser.error
+        surface.ArgumentParser.error = refuse
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                surface.parse_args_with_presence(parser, argv)
+        except _Refused as exc:
+            return str(exc)
+        finally:
+            surface.ArgumentParser.error = original
+        return None
+
+    def test_each_mapping_prints_a_correction_its_target_accepts(self) -> None:
+        entries = self._entries()
+        for command, argv, target, expected in self.CASES:
+            with self.subTest(command=command, argv=argv):
+                rc, error = _exit_code(entries[command], argv)
+                self.assertEqual(rc, 2, error)
+                self.assertIn("unrecognized arguments: ", error)
+                self.assertIn("; run: ", error)
+                rendered = error.split("; run: ", 1)[1].rstrip("\n")
+                self.assertEqual(shlex.split(rendered), ["agrep", target, *expected])
+                self.assertIsNone(self._parser_accepts(target, expected))
+                if target in self.RUNNABLE:
+                    self.assertIsNone(_run(entries[target], expected))
+
+    def test_unmapped_conflicting_or_valueless_options_keep_argparse_text(self) -> None:
+        entries = self._entries()
+        for command, argv in (
+                ("search", ["deadlock", "--bogus"]),
+                ("search", ["deadlock", "--limit"]),
+                ("search", ["deadlock", "--limit", "--side"]),
+                ("search", ["deadlock", "--hits", "2", "-l"]),
+                ("recall", ["deadlock", "-l", "--budget", "100"]),
+                ("around", [self.HANDLE, "--limit", "3", "--bogus"]),
+                ("board", ["--once", "--since", "7d"])):
+            with self.subTest(command=command, argv=argv):
+                rc, error = _exit_code(entries[command], argv)
+                self.assertEqual(rc, 2, error)
+                self.assertIn("unrecognized arguments: ", error)
+                self.assertNotIn("; run: ", error)
+
+    def test_a_flag_correction_outranks_the_command_word_search_hint(self) -> None:
+        rc, error = _exit_code(recall.main, ["deadlock", "-l"])
+        self.assertEqual(rc, 2, error)
+        self.assertNotIn('to search for the word "recall"', error)
+        self.assertEqual(
+            shlex.split(error.split("; run: ", 1)[1]),
+            ["agrep", "search", "deadlock", "-l"])
+
+    def test_switch_tables_cover_every_option_the_target_lacks(self) -> None:
+        # a switched command carries the source's other options along, so the
+        # target's table must answer each one the target parser does not know
+        entries = self._entries()
+        bases = {"search": ["deadlock"], "recall": ["deadlock"],
+                 "pack": ["deadlock"]}
+        spellings = {
+            name: {flag for action in _parser(entries[name], base)._actions
+                   for flag in action.option_strings}
+            for name, base in bases.items()}
+        for source, table in surface.FLAG_REWRITES.items():
+            for flag, rewrite in table.items():
+                if rewrite.command is None:
+                    continue
+                target_table = surface.FLAG_REWRITES[rewrite.command]
+                missing = {
+                    spelling for spelling in spellings[source]
+                    if spelling not in spellings[rewrite.command]
+                    and spelling not in target_table
+                    and spelling not in ("-h", "--help")}
+                with self.subTest(source=source, flag=flag):
+                    self.assertEqual(missing, set())
+
+
 if __name__ == "__main__":
     unittest.main()

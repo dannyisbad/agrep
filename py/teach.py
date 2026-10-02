@@ -74,7 +74,7 @@ def _readonly_error() -> PermissionError:
 # Bump NUDGE_V on ANY block-text change (selftest hash-enforces) and move the
 # outgoing body digests into _PRIOR_BLOCK_DIGESTS. Write-fight tiebreaker: a
 # process only rewrites blocks older than its own, so a stale daemon cannot flip them.
-NUDGE_V = 38
+NUDGE_V = 39
 MARK_PREFIX = "<!-- agrep:recall"
 MARK_BEGIN = f"{MARK_PREFIX} v{NUDGE_V} -->"
 MARK_END = "<!-- /agrep:recall -->"
@@ -115,6 +115,10 @@ _PRIOR_BLOCK_DIGESTS: dict[int, frozenset[str]] = {
         "44f0128c0715479164133985b91b74561d9c85c2fafd8436a570977e5da743c4",
         "60987f3b402464d5bc7320010fbd45de1e55ef11d5b80196ee1afd96dcf4cd68",
         "ab23bf6cab082bb9eaaf8d732bf6ea038aca90fde2ac4b1788751cb3c4315b3b",
+    }),
+    38: frozenset({
+        "f520cdfb60339a4401405443e003e231f571951d054e05671e4a240525730698",
+        "b4f159407917b844d33f793447c2d02898de67de8f8c82ba5e2b8b598541355c",
     }),
 }
 _CURRENT_BLOCK_DIGESTS = frozenset(

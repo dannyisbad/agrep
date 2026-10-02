@@ -119,8 +119,8 @@ def terminal_safe(value: object, *, multiline: bool = False) -> str:
 _RESERVED_SEARCH_WORDS = frozenset({
     "archive", "around", "audit", "board", "chats", "doctor", "index",
     "inject", "live", "pack", "postcompact", "recall", "reindex", "remove", "restore",
-    "resume", "run", "search", "serve", "set", "setup", "status", "tail",
-    "ui", "up",
+    "resume", "run", "search", "serve", "set", "setup", "status", "summary", "tail",
+    "ui", "up", "why",
 })
 RESERVED_COMMAND_WORDS = _RESERVED_SEARCH_WORDS
 _SEARCH_FLAG_OPTIONS = frozenset({
@@ -255,6 +255,210 @@ def _stable_argparse_error(message: str) -> str:
     return prefix + marker + ", ".join(choice[1:-1] for choice in choices) + ")"
 
 
+class FlagRewrite(NamedTuple):
+    """One option a command lacks: its spelling here, the command that owns
+    it as typed, or neither (dropped); `why` is printed beside the correction."""
+    takes_value: bool
+    why: str
+    spelling: str | None = None
+    command: str | None = None
+
+
+def _renamed(spelling: str, why: str) -> FlagRewrite:
+    return FlagRewrite(True, why, spelling=spelling)
+
+
+def _dropped(why: str, *, takes_value: bool = False) -> FlagRewrite:
+    return FlagRewrite(takes_value, why)
+
+
+def _owned_by(command: str, why: str, *, takes_value: bool = False) -> FlagRewrite:
+    return FlagRewrite(takes_value, why, command=command)
+
+
+_SIDE_SHOWN = "side chats already show; --no-side hides them"
+_RECALL_OWNED = "a recall option"
+_SEARCH_OWNED = "a search option"
+_SEARCH_REWRITES = {
+    "--limit": _renamed("-n", "-n N caps hits here"),
+    "--hits": _owned_by("recall", _RECALL_OWNED, takes_value=True),
+    "--budget": _owned_by("recall", _RECALL_OWNED, takes_value=True),
+    "--probe": _owned_by("recall", _RECALL_OWNED),
+    "-C": _owned_by("recall", _RECALL_OWNED, takes_value=True),
+    "--context": _owned_by("recall", _RECALL_OWNED, takes_value=True),
+    "--side": _dropped(_SIDE_SHOWN),
+}
+# every search option recall and pack lack, so a switched command never
+# carries one along; the count flag is renamed rather than switched
+_RECALL_REWRITES = {
+    "--limit": _renamed("--hits", "--hits N caps chats here"),
+    "-n": _renamed("--hits", "--hits N caps chats here"),
+    "--max": _renamed("--hits", "--hits N caps chats here"),
+    "--side": _dropped(_SIDE_SHOWN),
+    **{flag: _owned_by("search", _SEARCH_OWNED, takes_value=True)
+       for flag in ("--more", "--deeper", "--sort")},
+    **{flag: _owned_by("search", _SEARCH_OWNED)
+       for flag in ("-E", "--regex", "-w", "--word", "-i", "--ignore-case",
+                    "-l", "--chats", "-c", "--count", "--count-by-tier",
+                    "--classic", "--flat", "--hybrid", "--coverage",
+                    "--strict-semantic")},
+}
+_AROUND_ONE_CHAT = "around reads one chat as indexed"
+_POSTCOMPACT_BOUNDED = "postcompact output is already bounded"
+_POSTCOMPACT_OWN_TAIL = "postcompact replays this session's own tail"
+FLAG_REWRITES: Mapping[str, Mapping[str, FlagRewrite]] = MappingProxyType({
+    "search": MappingProxyType(_SEARCH_REWRITES),
+    "recall": MappingProxyType(_RECALL_REWRITES),
+    "pack": MappingProxyType(_RECALL_REWRITES),
+    "around": MappingProxyType({
+        "--limit": _renamed("-C", "-C N sets the window in turns here"),
+        "-n": _renamed("-C", "-C N sets the window in turns here"),
+        "--max": _renamed("-C", "-C N sets the window in turns here"),
+        "--lexical": _dropped(_AROUND_ONE_CHAT),
+        "--side": _dropped(_AROUND_ONE_CHAT),
+    }),
+    "chats": MappingProxyType({
+        "--limit": _renamed("-n", "-n N caps rows here"),
+        "--hits": _renamed("-n", "-n N caps rows here"),
+        "--lexical": _dropped("chats matches keywords only"),
+    }),
+    "postcompact": MappingProxyType({
+        "--chat": _renamed("--session", "--session ID names the chat here"),
+        **{flag: _dropped(_POSTCOMPACT_BOUNDED, takes_value=True)
+           for flag in ("--limit", "-n", "--max", "--hits", "--budget")},
+        "--lexical": _dropped(_POSTCOMPACT_OWN_TAIL),
+        "--side": _dropped(_POSTCOMPACT_OWN_TAIL),
+    }),
+    "board": MappingProxyType({
+        "--limit": _renamed("-n", "-n N caps sessions here"),
+        "--hits": _renamed("-n", "-n N caps sessions here"),
+        "--lexical": _dropped("board shows live state, not search hits"),
+    }),
+})
+
+
+class _ArgvOption(NamedTuple):
+    flag: str | None            # None for a positional token
+    value: str | None
+    known: bool
+    raw: tuple[str, ...]        # the tokens as typed, for verbatim carry-over
+
+
+def _split_argv(
+        argv: Sequence[str], known: Mapping[str, bool],
+        table: Mapping[str, FlagRewrite],
+) -> list[_ArgvOption] | None:
+    """argv as options and positionals; None when an option is unplaceable."""
+    entries: list[_ArgvOption] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if token == "--":
+            entries.extend(_ArgvOption(None, None, True, (rest,))
+                           for rest in argv[index - 1:])
+            break
+        if not token.startswith("-") or token == "-":
+            entries.append(_ArgvOption(None, None, True, (token,)))
+            continue
+        if token.startswith("--"):
+            flag, equals, attached = token.partition("=")
+            attached = attached if equals else None
+        else:
+            flag, attached = token[:2], token[2:] or None
+        if flag in known:
+            takes_value = known[flag]
+        elif flag in table:
+            takes_value = table[flag].takes_value
+        else:
+            return None
+        if not takes_value:
+            # a cluster of short switches stays one token; argparse accepted it
+            entries.append(_ArgvOption(flag, None, flag in known, (token,)))
+            continue
+        if attached is not None:
+            entries.append(_ArgvOption(flag, attached, flag in known, (token,)))
+            continue
+        if index >= len(argv) or (flag not in known and argv[index].startswith("-")):
+            return None
+        entries.append(_ArgvOption(flag, argv[index], flag in known,
+                                   (token, argv[index])))
+        index += 1
+    return entries
+
+
+class FlagCorrection(NamedTuple):
+    reasons: tuple[str, ...]
+    argv: tuple[str, ...]       # the corrected argv, without the command name
+    command: str
+
+
+def flag_correction(
+        command: str, argv: Sequence[str], known: Mapping[str, bool],
+) -> FlagCorrection | None:
+    """Rewrite argv around the unrecognized options another spelling or
+    command owns; None when one has no mapping, a value is missing, or the
+    mapped options belong to different commands."""
+    table = FLAG_REWRITES.get(command)
+    if table is None:
+        return None
+    entries = _split_argv(argv, known, table)
+    if entries is None:
+        return None
+    unknown = [entry for entry in entries if entry.flag and not entry.known]
+    if not unknown:
+        return None
+    targets = {table[entry.flag].command for entry in unknown
+               if table[entry.flag].command}
+    if len(targets) > 1:
+        return None
+    target = targets.pop() if targets else command
+    target_table = FLAG_REWRITES[target]
+    reasons: list[str] = []
+    corrected: list[str] = []
+    for entry in entries:
+        if entry.flag is None or (entry.known and target == command):
+            corrected.extend(entry.raw)
+            continue
+        if not entry.known and table[entry.flag].command == target:
+            reasons.append(table[entry.flag].why)
+            corrected.extend(entry.raw)
+            continue
+        rewrite = target_table.get(entry.flag)
+        if rewrite is None:
+            if not entry.known:
+                return None
+            corrected.extend(entry.raw)
+            continue
+        if rewrite.command is not None:
+            return None
+        reasons.append(rewrite.why)
+        if rewrite.spelling is not None:
+            corrected.append(rewrite.spelling)
+            if rewrite.takes_value:
+                corrected.append(entry.value)
+    return FlagCorrection(tuple(dict.fromkeys(reasons)), tuple(corrected), target)
+
+
+_UNRECOGNIZED_PREFIX = "unrecognized arguments: "
+
+
+def flag_correction_suffix(
+        command: str | None, argv: Sequence[str] | None,
+        known: Mapping[str, bool], message: str,
+) -> str | None:
+    """The `(why); run: agrep ...` tail for an unrecognized-arguments refusal."""
+    if command is None or argv is None or not message.startswith(_UNRECOGNIZED_PREFIX):
+        return None
+    correction = flag_correction(command, argv, known)
+    if correction is None:
+        return None
+    rendered = render_cli_argv(["agrep", correction.command, *correction.argv])
+    if rendered is None:
+        return None
+    return f" ({'; '.join(correction.reasons)}); run: {rendered}"
+
+
 class ArgumentParser(argparse.ArgumentParser):
     """argparse help with terse, one-line failures for the product CLI."""
 
@@ -263,6 +467,12 @@ class ArgumentParser(argparse.ArgumentParser):
         inferred = self.prog.rsplit(" ", 1)[-1]
         self._agrep_search_word = search_word or (
             inferred if inferred in _RESERVED_SEARCH_WORDS else None)
+        # the bare `agrep` prog is search's own parser (cli.py's dispatcher
+        # never refuses an option: unknowns pass through to the command)
+        self._agrep_command = (
+            "search" if self.prog == "agrep"
+            else self.prog[len("agrep "):] if self.prog.startswith("agrep ")
+            else None)
         self._agrep_argv: list[str] | None = None
 
     def parse_known_args(self, args=None, namespace=None):
@@ -274,10 +484,17 @@ class ArgumentParser(argparse.ArgumentParser):
         message = _stable_argparse_error(message)
         line = f"{terminal_safe(self.prog)}: {terminal_safe(message)}"
         if "; run: " not in message:
-            hint = reserved_search_hint(
-                self._agrep_search_word, self._agrep_argv)
-            if hint:
-                line += f"; {hint}"
+            known = {flag: action.nargs != 0
+                     for flag, action in self._option_string_actions.items()}
+            correction = flag_correction_suffix(
+                self._agrep_command, self._agrep_argv, known, message)
+            if correction:
+                line += correction
+            else:
+                hint = reserved_search_hint(
+                    self._agrep_search_word, self._agrep_argv)
+                if hint:
+                    line += f"; {hint}"
         self.exit(2, line + "\n")
 
 

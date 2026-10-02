@@ -1651,6 +1651,19 @@ def cmd_recall(a) -> int:
     return recall.main(a.rest, prog="recall")
 
 
+def cmd_summary(a) -> int:
+    rc = _reject_unknown_agent(a.rest)
+    if rc is not None:
+        return rc
+    import summary
+    return summary.main(a.rest)
+
+
+def cmd_why(a) -> int:
+    import why
+    return why.main(a.rest)
+
+
 def cmd_pack(a) -> int:
     rc = _reject_unknown_agent(a.rest)
     if rc is not None:
@@ -1713,6 +1726,49 @@ def cmd_explorer(a, *, open_browser: bool) -> int:
     return server.main(a.rest, open_browser=open_browser)
 
 
+# The commands agents reach for lead, one runnable example each; the names an
+# agent never typed share one line so the whole surface stays listed.
+_TOP_LEVEL_HELP = """\
+usage: agrep [-h] [-V] <command> [options]
+       agrep "<pattern>" [options]        bare text searches (same as agrep search)
+
+agentic grep: find, open, resume and watch your AI agents' work
+
+commands:
+  search       search every agent's history by keyword, plus meaning when confident
+                 agrep "race condition" --here --since 14d -l --sort time
+  around       open a hit at its source, with turns of context
+                 agrep around @11111111:144 -C 8 --tool-output 400
+  recall       top hits + the conversation around each, within one byte budget
+                 agrep recall "index lock" --here --since 30d --hits 5
+  chats        find a chat by project, opener, or content; bare lists newest first
+                 agrep chats "retry backoff" --project webapp
+  postcompact  this session's own turns from before a compaction, verbatim
+                 agrep postcompact
+  board        live agent activity on this box right now
+                 agrep board --once
+  resume       reopen a past session in its own agent, cd'd to where it ran
+                 agrep resume @11111111:144
+  status       bounded diagnostic; --json is the cheap machine summary
+                 agrep status --json
+  why          explain why a chat is or isn't indexed
+                 agrep why 11111111
+  summary      per-project briefing: work done, open items, estimated time
+                 agrep summary --since 30d
+
+other commands: pack, setup, index, reindex, doctor, audit, archive, restore,
+                set, remove, tail, ui, serve, run
+
+options:
+  -h, --help     show this help and exit
+  -V, --version  print the version and exit
+
+a bare first argument that isn't a command searches; `agrep search index`
+searches a word that is also a command. `agrep <command> --help` shows each
+command's flags and examples.
+"""
+
+
 def _main() -> int:
     """CLI entry point.
 
@@ -1733,6 +1789,9 @@ def _main() -> int:
     if raw in (["-V"], ["--version"]):
         print(_version_text())
         raise SystemExit(0)
+    if raw[0] in ("-h", "--help"):
+        print(_TOP_LEVEL_HELP, end="")
+        return 0
     if raw and raw[0] in {"ui", "up", "serve"}:
         return cmd_explorer(
             argparse.Namespace(rest=raw[1:]),
@@ -1750,6 +1809,8 @@ def _main() -> int:
         "around": cmd_around,
         "postcompact": cmd_postcompact,
         "recall": cmd_recall,
+        "summary": cmd_summary,
+        "why": cmd_why,
         "pack": cmd_pack,
         "archive": cmd_archive,
         "restore": cmd_restore,
@@ -1763,35 +1824,17 @@ def _main() -> int:
         "audit", "status", "setup", "remove", "index",
     }
     if (raw and raw[0] not in parser_commands
-            and raw[0] not in ("-h", "--help", "-V", "--version")):
+            and raw[0] not in ("-V", "--version")):
         return cmd_search(argparse.Namespace(rest=raw))
 
-    p = surface.ArgumentParser(
-        prog="agrep", description="agentic grep: find, open, resume and watch your AI agents' work",
-        allow_abbrev=False,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="find text         search (the default: agrep \"<pattern>\"), "
-               "recall, pack\n"
-               "resume work       postcompact, around, resume, chats\n"
-               "maintain          status, doctor, audit, setup, index, reindex, set, "
-               "archive, restore, remove\n"
-               "live              tail, board, ui, serve, run\n"
-               "\nexamples:\n"
-               "  agrep \"race condition\"       grep every agent's history\n"
-               "  agrep recall \"index lock\"    hits + the conversation around each\n"
-               "  agrep postcompact           recent root context after compaction\n"
-               "  agrep around @11111111:144   replay the moment itself\n"
-               "  agrep chats webapp           find a chat by project, opener, or content\n"
-               "  agrep search index           search a word that is also a command\n"
-               "\na bare first argument that isn't a command searches; "
-               "`agrep <command> --help`\nshows each command's own examples")
+    p = surface.ArgumentParser(prog="agrep", allow_abbrev=False, add_help=False)
     p.add_argument("-V", "--version", action=_VersionAction, nargs=0)
     # metavar: the public commands only - without it the usage {brace} would leak the
     # hidden compatibility subparsers (live, inject) have no help below.
     sub = p.add_subparsers(
         dest="cmd",
-        metavar="{search,chats,postcompact,around,recall,pack,resume,status,setup,index,doctor,"
-                "audit,reindex,archive,restore,set,remove,tail,board,ui,serve,run}")
+        metavar="{search,chats,summary,why,postcompact,around,recall,pack,resume,status,setup,"
+                "index,doctor,audit,reindex,archive,restore,set,remove,tail,board,ui,serve,run}")
 
     se = sub.add_parser(
         "search",

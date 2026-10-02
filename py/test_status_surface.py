@@ -220,9 +220,7 @@ class BuildIdentityTests(unittest.TestCase):
                 side_effect=AssertionError("help hashed native")) as native, \
                 mock.patch.object(sys, "argv", ["agrep", "--help"]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit) as stopped:
-                cli._main()
-        self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(cli._main(), 0)
         native.assert_not_called()
 
     def test_status_json_carries_portable_native_identity(self) -> None:
@@ -427,9 +425,7 @@ class BuildIdentityTests(unittest.TestCase):
                 side_effect=AssertionError("help hashed the binary")) as binary, \
                 mock.patch.object(sys, "argv", ["agrep", "--help"]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit) as stopped:
-                cli._main()
-        self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(cli._main(), 0)
         binary.assert_not_called()
 
         output = io.StringIO()

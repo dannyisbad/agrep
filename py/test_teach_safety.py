@@ -156,18 +156,28 @@ class TeachSafetyTest(unittest.TestCase):
         ):
             self._assert_phrase(phrase, block)
 
-    def test_missing_artifact_and_machine_output_routes_are_explicit(self) -> None:
-        # The artifact route stays inline (the moment of need is mid-task);
-        # flag-level machine-output detail is deliberately delegated to the
-        # always-current per-command help instead of the block.
-        block = teach._block(self.home / ".codex" / "AGENTS.md")
-        for phrase in (
+    def test_missing_artifact_route_and_flag_essentials_are_inline(self) -> None:
+        # a first reach must need no `agrep --help` call; per-command help stays the hatch
+        for host in (self.home / ".codex" / "AGENTS.md",
+                     self.home / ".claude" / "CLAUDE.md"):
+            block = teach._block(host)
+            with self.subTest(host=host.name):
+                for phrase in (
+                    "before concluding it is gone",
+                    "`-n N`",
+                    "`--hits N`",
+                    "`-C N`",
+                    "`--tool-output N`",
+                    "`--max-chars N`",
+                    "command takes `--limit`",
+                    "`agrep <command> --help`",
+                ):
+                    self._assert_phrase(phrase, block)
+                self.assertNotIn("Run `agrep --help`", block)
+                self.assertNotIn("one help call", block)
+        self._assert_phrase(
             "absent after one bounded filesystem lookup",
-            "before concluding it is gone",
-            "Run `agrep --help` once before first use",
-            "`agrep <command> --help`",
-        ):
-            self._assert_phrase(phrase, block)
+            teach._block(self.home / ".codex" / "AGENTS.md"))
 
     def test_frontier_routing_separates_indexed_history_from_live_state(self) -> None:
         # Indexed history vs live activity is a routing decision both blocks

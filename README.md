@@ -262,6 +262,40 @@ its older turns `~self`), lets their summarizer carry the same recovery
 schema, and injects hidden next-turn guidance only when it observes a real
 compaction boundary.
 
+## `summary`
+
+A per-project briefing from your history - what was worked on, what is still
+open, and roughly how long it took - for a status update or before a call:
+
+```
+agrep summary                           # last 7 days, most active project first
+agrep summary --project shop --since 30d
+agrep summary pending                   # open items across projects, most confident first
+agrep summary time --group week         # estimated active time per project
+```
+
+Open items come from each chat's last turn: the agent asked you something,
+left unchecked next steps or todo items, or never finished. Each carries a
+confidence label and a handle to open it. Time is estimated from turn
+timestamps with a 20-minute idle cap and counts a chat and its side chats
+once; it is never elapsed span or billable time. An agent calling `summary`
+does not see its own current session.
+
+## `why`
+
+When a chat you know exists doesn't show up, `agrep why` says why:
+
+```
+agrep why 4f3c2a1b                            # a session id, prefix or printed handle
+agrep why ~/.claude/projects/x/abc.jsonl      # or the transcript file itself
+```
+
+The answer is one of: indexed (also under an alias or as a side chat), written
+after the last index, not yet in the search database, outside every store agrep
+reads, discovered but every record skipped (with counts by reason), or
+unreadable - each with the file the answer came from and the next step. It
+never indexes or changes anything.
+
 
 ## Meaning search
 
@@ -343,9 +377,10 @@ was omitted, and a compacted `session_start` queues hidden recovery for the next
 turn. The extension exports their exact session ID so bare `agrep postcompact`
 resolves the right conversation; it never hooks ordinary user messages.
 
-Both blocks stay short and delegate the full command surface to
-`agrep --help` (and each command's own `--help`), which lists the options
-shipped with the installed version.
+Both blocks stay short and carry the flags agents reach for most inline (the
+per-command count flags, around's context and tool-output caps, recall's
+budget), so a first call needs no help lookup; `agrep <command> --help` lists
+the rest of the options shipped with the installed version.
 
 [cc]: https://www.anthropic.com/constitution
 [tcw]: https://www.anthropic.com/research/teaching-claude-why
@@ -551,6 +586,8 @@ agrep resume <id>        # reopen a past session in its own agent, cd'd there
 agrep run <agent> [-- <args...>] # launch captured; pass agent arguments through
 agrep tail               # live agent events as JSON lines (--snapshot: state now)
 agrep chats [topic]      # indexed chats; topic searches identity + contents
+agrep summary            # per-project briefing: worked on, open items, estimated time
+agrep why <ref>          # why a chat is or isn't indexed, with evidence
 agrep board              # bounded live-activity window across agents
 agrep ui                 # private read-only History + live Board explorer
 agrep serve              # serve that explorer without opening a browser
