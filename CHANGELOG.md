@@ -168,6 +168,10 @@
   omission counts and a widening command only when something is hidden or
   the conversation role needs disclosure, rather than adding a scope
   preamble to an ordinary whole-chat or latest-tail read.
+- `recall --json` no longer says `no exact phrase match` while showing an
+  exact phrase hit. The note followed the tool-output lane's bag-of-words
+  fallback even when prose hits matched the phrase; it now appears only when
+  no hit matched the exact phrase.
 - Search and recall misses describe the indexed snapshot, not an index
   current to the millisecond. A verified snapshot stays usable during a
   healthy background refresh, and ordinary semantic misses tolerate
@@ -481,6 +485,26 @@
   query's content terms, grouped native scans skip candidates that cannot
   enter a family's retained hits, and compatible query vectors use an AVX2
   dot-product path.
+- Searches no longer walk every agent store on each query. A store census
+  observed within the last five seconds, by another agrep process or by the
+  background indexer while searches are active, is reused when the published
+  index, the ingest binary, the store discovery environment and, for relative
+  store roots, the working directory are unchanged. The freshness verdict is
+  still computed on the reader's clock; `doctor` and `status` always take a
+  live census and never save one.
+- The native census walks the stores once, in parallel across adapters, and
+  reports store rows and member paths together (`agrep-rs stores --census`).
+  On one real home it took 73 ms, against 238 ms for the separate `stores`
+  and `stores --paths` walks it replaces.
+- On macOS and Linux, read commands (`search`, `chats`, `around`, `recall`,
+  bare `agrep`, `--version`, `--help`) run in a forked child of a warm
+  resident process instead of starting Python and importing agrep each time:
+  on a 5,000-chat store a warm search went from 102 to 47 ms and `--version`
+  from 69 to 35 ms. The resident checks the caller's process id with the
+  kernel before serving, so self-exclusion matches a direct run, and any
+  failure before a command starts runs it directly. `AGREP_NO_RESIDENT=1`
+  turns it off, `AGREP_RESIDENT_IDLE_S` (default 600) sets how long it idles,
+  and `agrep remove` stops it.
 
 ## 0.3.1 — 2026-08-26
 
