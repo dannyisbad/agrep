@@ -81,6 +81,20 @@ command. Versioned machine-mode validation errors keep their structured shape.
   (`score`, `matched`, `who`, `match_ts`, `match_turn`, `match_handle`) as
   search `--json` spells them. An empty page remains one self-contained
   `agrep-meta` record with `hits: []`.
+- **Summary JSON keeps the same envelope.** `summary --json` leads with one
+  `agrep-meta` record (`mode`, `window`, `timezone`, `idle_cap`, `metric`,
+  counts including `unknown_timestamp_rows`, `family_dedup_ms` and
+  `self_excluded`, `caveats`, freshness), followed by one record per project
+  (`kind: project`), open item (`kind: pending`, with `status`, `confidence`
+  and a handle) or time slice (`kind: time`). Time is always labelled an
+  estimate; exits follow search: 0 something reported, 1 proven nothing,
+  2 unverified. Pinned in `py/test_summary.py`.
+- **Why JSON is one versioned verdict.** `why --json` prints one object with
+  `version` (1), `reference`, `verdict`, `exit`, `summary`, `candidates`,
+  `evidence` and `next_action`; every evidence line names the file it came
+  from. Exit 0 means the chat is indexed, 1 is an explained not-indexed
+  verdict, 2 is ambiguous, unprovable or a usage error. `why` never indexes
+  or writes. Pinned in `py/test_why.py`.
 - **Every surface states why it is empty.** A zero from a filter selecting a
   dimension the index holds no value for is not the same answer as a zero
   from a search that looked and found nothing, and the two must not render
