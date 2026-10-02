@@ -2068,14 +2068,13 @@ def _sentinel_remove() -> bool:
                 unit_dir / "timers.target.wants" / f"{_sentinel_task_name()}.timer",
             )
             marker = common.DATA_DIR / _LINUX_UNARMED_MARKER
+            no_units = not any(
+                path.exists() or path.is_symlink() for path in (*units, *links))
             try:
                 proven_unarmed = (
-                    not marker.is_symlink()
+                    no_units
+                    and not marker.is_symlink()
                     and marker.read_bytes() == b"not-armed\n"
-                    and not any(
-                        path.exists() or path.is_symlink()
-                        for path in (*units, *links)
-                    )
                 )
             except OSError:
                 proven_unarmed = False
@@ -2085,6 +2084,9 @@ def _sentinel_remove() -> bool:
                 absent = _systemd_disable(
                     f"{_sentinel_task_name()}.timer",
                     f"{_sentinel_task_name()}.path")
+                # Never armed here: no unit of ours and no user manager to ask.
+                if not absent and no_units and _user_manager_unavailable():
+                    absent = True
             absent = absent and _retire_legacy_linux_sentinel()
         else:
             absent = True
