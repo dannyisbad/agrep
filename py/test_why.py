@@ -123,7 +123,7 @@ class Sandbox:
         return self.spawn([sys.executable, str(ROOT / "cli.py"), *argv], env=env)
 
     def data_snapshot(self) -> dict:
-        return {str(p.relative_to(self.data)): (p.stat().st_mtime_ns, p.stat().st_size)
+        return {str(p.relative_to(self.data)): (p.stat().st_mtime_ns, p.stat().st_size, p.stat().st_ino)
                 for p in self.data.rglob("*")}
 
     def index(self) -> None:
@@ -137,16 +137,29 @@ class Sandbox:
         if result.returncode:
             raise AssertionError(f"rust ingest failed:\n{result.stderr}")
 
-    def why(self, *argv: str) -> subprocess.CompletedProcess:
-        return self.spawn([sys.executable, str(ROOT / "py" / "why.py"), *argv])
+    def why(self, *argv: str, env: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+        """Every `why` run must leave the data dir byte-for-byte alone (mtime, size, inode)."""
+        before = self.data_snapshot()
+        result = subprocess.run([sys.executable, str(ROOT / "py" / "why.py"), *argv],
+                                cwd=cwd or self.home, env=self.env if env is None else env,
+                                input="", capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=60, check=False)
+        after = self.data_snapshot()
+        if after != before:
+            raise AssertionError(f"why {argv} wrote the data dir:\n{result.stdout}{result.stderr}")
+        return result
 
-    def why_json(self, *argv: str) -> tuple[dict, int]:
-        result = self.why(*argv, "--json")
+    def why_json(self, *argv: str, env: dict | None = None, cwd: Path | None = None) -> tuple[dict, int]:
+        result = self.why(*argv, "--json", env=env, cwd=cwd)
         try:
             payload = json.loads(result.stdout)
         except ValueError as exc:
             raise AssertionError(f"not one JSON object:\n{result.stdout}{result.stderr}") from exc
         return payload, result.returncode
+
+    def without_daemon_guard(self) -> dict:
+        """The sandbox env with AGREP_NO_DAEMON unset: `why` must still never wake indexd."""
+        return {key: value for key, value in self.env.items() if key != "AGREP_NO_DAEMON"}
 
     def store(self, relative: str) -> Path:
         agent, rest = relative.split("/", 1)
@@ -166,15 +179,16 @@ class Sandbox:
 class _VerdictAssertions(unittest.TestCase):
     sandbox: Sandbox
 
-    def assert_verdict(self, verdict: str, *argv: str, next_action: object = None) -> dict:
-        payload, code = self.sandbox.why_json(*argv)
+    def assert_verdict(self, verdict: str, *argv: str, next_action: object = None,
+                       env: dict | None = None, cwd: Path | None = None) -> dict:
+        payload, code = self.sandbox.why_json(*argv, env=env, cwd=cwd)
         self.assertEqual(payload.get("verdict"), verdict, payload)
         self.assertEqual(code, VERDICT_EXIT.get(verdict, 1), payload)
         self.assertEqual(payload["exit"], code)
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["reference"], argv[0])
         self.assertEqual(payload.get("next_action"), next_action, payload)
-        human = self.sandbox.why(*argv)
+        human = self.sandbox.why(*argv, env=env, cwd=cwd)
         self.assertEqual(human.returncode, code, human.stdout + human.stderr)
         self.assertTrue(human.stdout, f"human form printed nothing\n{human.stderr}")
         first, *rest = human.stdout.splitlines()
@@ -277,11 +291,33 @@ class WhyReadOnlyVerdictTests(_VerdictAssertions):
         payload = self.assert_verdict("ambiguous", "11111111")
         sessions = {c["session"] for c in payload["candidates"]}
         self.assertEqual(sessions, {CLAUDE, CLAUDE_TWIN})
+        self.assertEqual(payload["evidence"]["lines"],
+                         ["sessions.jsonl: 2 chats match '11111111'; pass a full id, a @handle from "
+                          "a search hit, or the transcript path"])
         human = self.sandbox.why("11111111")
         self.assertEqual(human.returncode, 2)
         for session in sessions:
             self.assertIn(session, human.stdout)
         self.assertEqual(self.sandbox.why_json("lantern")[0]["verdict"], "ambiguous")
+
+    def test_same_named_file_in_cwd_does_not_shadow_a_reference(self) -> None:
+        """A bare word is a project label or id first; only path-shaped or transcript-named
+        references are looked up as files in the working directory."""
+        for name in ("cedar", "11111111-1111", "copper lantern launch"):
+            (self.sandbox.home / name).write_text("not a transcript\n", encoding="utf-8")
+        (self.sandbox.home / "stray.jsonl").write_text("{}\n", encoding="utf-8")
+        try:
+            for reference in ("cedar", "11111111-1111", "copper lantern launch"):
+                with self.subTest(reference=reference):
+                    payload = self.assert_verdict("indexed", reference)
+                    self.assertEqual(payload["evidence"]["index_row"]["session"], CLAUDE)
+            payload = self.assert_verdict("source-not-discovered", "stray.jsonl")
+            self.assertEqual(payload["evidence"]["path"], str(self.sandbox.home / "stray.jsonl"))
+            payload = self.assert_verdict("source-not-discovered", "./cedar")
+            self.assertEqual(payload["evidence"]["exists"], True)
+        finally:
+            for name in ("cedar", "11111111-1111", "copper lantern launch", "stray.jsonl"):
+                (self.sandbox.home / name).unlink()
 
     def test_unknown_reference_names_what_was_searched(self) -> None:
         payload = self.assert_verdict("source-not-discovered", "deadbeefcafe")
@@ -418,10 +454,14 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         payload = self.assert_verdict("corpus-behind-transcripts", "77777777",
                                       next_action="agrep index")
         self.assertEqual(payload["evidence"]["corpus"], {
-            "state": "ok", "rows": 0, "session_sig": False, "root": None, "side": None,
-            "stamp_current": False, "proof": "session_sig", "current": False, "published_rows": 1})
-        self.assertIn("corpus.db: 0 rows, session_sig absent, messages.jsonl publishes 1 row, "
+            "state": "ok", "served": "corpus.db", "scan_reason": None, "stamp_current": False,
+            "rows": 0, "session_sig": False, "root": None, "side": None,
+            "proof": "rows", "current": False, "published_rows": 1,
+            "published": {"text": 1, "tool": 0}, "missing": {"text": 1, "tool": 0},
+            "extra": {"text": 0, "tool": 0}, "concept_differs": False, "tools": "on"})
+        self.assertIn("corpus.db: 0 rows, 1 row messages.jsonl publishes not stored, "
                       "stamp behind the published sources", payload["evidence"]["lines"])
+        self.assertIn("the search database does not hold it", payload["summary"])
         self.sandbox.index()
         self.assert_verdict("indexed", "77777777")
 
@@ -440,13 +480,16 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         self.assertEqual(corpus["rows"], rows)
         self.assertEqual(corpus["session_sig"], True)
         self.assertEqual((corpus["proof"], corpus["stamp_current"], corpus["current"]),
-                         ("session_sig", False, False), corpus)
+                         ("rows", False, False), corpus)
         self.assertEqual(corpus["published_rows"], rows + 1)
-        self.assertIn("session_sig differs", payload["summary"])
+        self.assertEqual((corpus["missing"], corpus["extra"]),
+                         ({"text": 1, "tool": 0}, {"text": 0, "tool": 0}), corpus)
+        self.assertEqual(payload["summary"],
+                         "not fully searchable: the search database holds an older copy of claude "
+                         "chat 11111111 than messages.jsonl publishes (1 row not stored)")
         self.assertEqual(payload["evidence"]["lines"][1],
-                         f"corpus.db: {rows} rows, session_sig differs from the {rows + 1} rows "
-                         "messages.jsonl publishes, stamp behind the published sources, "
-                         f"family root {CLAUDE}")
+                         f"corpus.db: {rows} rows, 1 row messages.jsonl publishes not stored, "
+                         f"stamp behind the published sources, family root {CLAUDE}")
         self.assertEqual(payload["evidence"]["intake"][0]["fresh"], True)
         # A transcript written after that native publication is the upstream verdict again.
         _append_claude_turn(path, self.sandbox.home, "And one the ingest never saw.",
@@ -460,7 +503,7 @@ class WhyMutationVerdictTests(_VerdictAssertions):
                          ("stamp", True, rows + 2), after)
 
     def test_unchanged_chats_stay_indexed_while_another_lags(self) -> None:
-        """With the stamp behind, an untouched chat is proven current by its own session_sig."""
+        """With the stamp behind, an untouched chat is proven current by its own stored rows."""
         path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
         _append_claude_turn(path, self.sandbox.home, "A turn the search database never saw.",
                             "2000-01-20T12:04:00.000Z")
@@ -470,7 +513,145 @@ class WhyMutationVerdictTests(_VerdictAssertions):
             with self.subTest(reference=reference):
                 corpus = self.assert_verdict(verdict, reference)["evidence"]["corpus"]
                 self.assertEqual((corpus["proof"], corpus["stamp_current"], corpus["current"]),
-                                 ("session_sig", False, True), corpus)
+                                 ("rows", False, True), corpus)
+
+    def test_direct_scan_states_agree_with_search(self) -> None:
+        """Whenever the interactive reader serves the direct scan of messages.jsonl - no corpus.db,
+        a queued first build, a stale db behind a queued rebuild, another schema - the chat is
+        searchable, and `why` says so from the published rows without touching the data dir."""
+        shutil.rmtree(self.sandbox.data)
+        self.sandbox.data.mkdir()
+        (self.sandbox.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
+        self.sandbox.rust_index()
+        self.assertFalse((self.sandbox.data / "corpus.db").exists())
+        env = self.sandbox.without_daemon_guard()
+        payload = self.assert_verdict("indexed", CLAUDE, env=env)
+        self.assertEqual(payload["evidence"]["lines"][1],
+                         "corpus.db: missing; search scans messages.jsonl directly "
+                         "(4 rows published for this chat)")
+        self.assertEqual(payload["evidence"]["corpus"], {
+            "state": "missing", "served": "messages.jsonl", "scan_reason": "missing",
+            "stamp_current": False, "proof": "scan", "current": True, "published_rows": 4})
+        request = self.sandbox.data / ".search_index_request"
+        request.write_text(json.dumps({"requested": time.time()}), encoding="utf-8")
+        payload = self.assert_verdict("indexed", CLAUDE, env=env)
+        self.assertEqual(payload["evidence"]["corpus"]["scan_reason"], "not built yet, build queued")
+        self.assertIn("search scans messages.jsonl directly", payload["evidence"]["lines"][1])
+        request.unlink()
+        search = self.sandbox.cli("search", "copper lantern", "--json")
+        self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+
+        self.sandbox.index()
+        path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
+        _append_claude_turn(path, self.sandbox.home, "zephyr quartz marker", "2000-01-20T12:04:00.000Z")
+        self.sandbox.rust_index()
+        self.assert_verdict("corpus-behind-transcripts", CLAUDE, next_action="agrep index", env=env)
+        request.write_text(json.dumps({"requested": time.time()}), encoding="utf-8")
+        payload = self.assert_verdict("indexed", CLAUDE, env=env)
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["served"], corpus["proof"], corpus["rows"], corpus["published_rows"]),
+                         ("messages.jsonl", "scan", 4, 5), corpus)
+        self.assertEqual(payload["evidence"]["lines"][1],
+                         "corpus.db: 4 rows, stamp behind the published sources, rebuild queued; "
+                         "search scans messages.jsonl directly (5 rows published for this chat)")
+        search = self.sandbox.cli("search", "zephyr quartz", "--json")
+        self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+        request.unlink(missing_ok=True)
+
+        self.sandbox.index()
+        db = sqlite3.connect(self.sandbox.data / "corpus.db")
+        try:
+            with db:
+                db.execute("UPDATE meta SET value='14' WHERE key='schema'")
+        finally:
+            db.close()
+        payload = self.assert_verdict("indexed", CLAUDE, env=env)
+        self.assertEqual(payload["evidence"]["corpus"]["scan_reason"], "schema 14, this build reads 15")
+        self.assertNotIn("rows", payload["evidence"]["corpus"])
+        self.assertEqual(payload["evidence"]["lines"][1],
+                         "corpus.db: schema 14, this build reads 15; search scans messages.jsonl "
+                         "directly (5 rows published for this chat)")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_unreadable_search_database_is_not_provable(self) -> None:
+        corpus_db = self.sandbox.data / "corpus.db"
+        corpus_db.chmod(0)
+        try:
+            payload = self.assert_verdict("not-provable", CLAUDE, next_action="agrep doctor")
+        finally:
+            corpus_db.chmod(0o600)
+        self.assertEqual(payload["evidence"]["corpus"]["state"], "unreadable")
+        self.assertTrue(payload["evidence"]["lines"][1].startswith("corpus.db: unreadable ("),
+                        payload["evidence"]["lines"])
+        self.assertIn("cannot be read", payload["summary"])
+        self.assertNotIn("does not hold", payload["summary"])
+        self.assert_verdict("indexed", CLAUDE)
+
+    def test_concept_relabel_is_not_an_older_copy_but_a_tools_toggle_is(self) -> None:
+        """A concept publication moves the stamp and every affected session_sig while the served
+        text rows are unchanged; a tools toggle adds or removes tool rows for real."""
+        (self.sandbox.data / "concepts.json").write_text(
+            json.dumps([{"concept_id": 7, "name": "lantern launch"}]) + "\n", encoding="utf-8")
+        (self.sandbox.data / "session_concepts.jsonl").write_text(
+            json.dumps({"session": CLAUDE, "concept_id": 7}) + "\n", encoding="utf-8")
+        payload = self.assert_verdict("indexed", CLAUDE)
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["proof"], corpus["stamp_current"], corpus["current"],
+                          corpus["concept_differs"]), ("rows", False, True, True), corpus)
+        self.assertEqual(payload["evidence"]["lines"][1],
+                         "corpus.db: 4 rows, stored rows match the 4 rows messages.jsonl publishes "
+                         "(only the concept label from session_concepts.jsonl differs), "
+                         f"stamp behind the published sources, family root {CLAUDE}")
+
+        toggled = self.sandbox.cli("set", "tools", "off")
+        self.assertEqual(toggled.returncode, 0, toggled.stdout + toggled.stderr)
+        payload = self.assert_verdict("corpus-behind-transcripts", CLAUDE_TWIN, next_action="agrep index")
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["rows"], corpus["published_rows"], corpus["missing"], corpus["extra"]),
+                         (3, 2, {"text": 0, "tool": 0}, {"text": 0, "tool": 1}), corpus)
+        self.assertEqual(payload["summary"],
+                         "not current: the search database still holds 1 row of claude chat 11111111 "
+                         "that the event store (settings.json tools=off) no longer publishes")
+        self.assertEqual(payload["evidence"]["lines"][1],
+                         "corpus.db: 3 rows, 1 stored tool row the event store no longer publishes "
+                         "(settings.json tools=off), stamp behind the published sources, "
+                         f"family root {CLAUDE_TWIN}")
+        self.sandbox.index()
+        self.assertEqual(self.assert_verdict("indexed", CLAUDE_TWIN)["evidence"]["corpus"]["rows"], 2)
+        toggled = self.sandbox.cli("set", "tools", "on")
+        self.assertEqual(toggled.returncode, 0, toggled.stdout + toggled.stderr)
+        payload = self.assert_verdict("corpus-behind-transcripts", CLAUDE_TWIN, next_action="agrep index")
+        self.assertEqual(payload["evidence"]["corpus"]["missing"], {"text": 0, "tool": 1})
+        self.assertEqual(payload["summary"],
+                         "not fully searchable: the search database holds an older copy of claude chat "
+                         "11111111 than the event store publishes (1 row not stored)")
+        self.assertIn("1 tool row the event store publishes (settings.json tools=on) not stored",
+                      payload["evidence"]["lines"][1])
+
+    @unittest.skipIf(os.name == "nt", "symlinks need POSIX semantics")
+    def test_symlinked_transcript_paths_reach_the_discovered_file(self) -> None:
+        """A dotfile-managed store (`~/.claude -> <repo>/claude`) and a file-level link both name
+        the discovered transcript once paths are resolved on both sides."""
+        self.sandbox.close()
+        self.sandbox = Sandbox()
+        managed = self.sandbox.root / "dotfiles-claude"
+        shutil.move(str(self.sandbox.home / ".claude"), str(managed))
+        (self.sandbox.home / ".claude").symlink_to(managed)
+        link = self.sandbox.home / "link.jsonl"
+        link.symlink_to(managed / "projects" / "-projects-cedar" / f"{CLAUDE}.jsonl")
+        self.sandbox.index()
+        configured = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
+        for reference in (str(configured), str(managed / "projects" / "-projects-cedar" / f"{CLAUDE}.jsonl"),
+                          str(link), "~/link.jsonl", "link.jsonl"):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("indexed", reference)
+                self.assertEqual(payload["evidence"]["index_row"]["session"], CLAUDE)
+                self.assertEqual(payload["evidence"]["sources"], [str(configured)])
+        stray = managed / "projects" / "-projects-cedar" / "notes.txt"
+        stray.write_text("not a transcript\n", encoding="utf-8")
+        payload = self.assert_verdict("source-not-discovered", str(stray))
+        self.assertIn("claude: the path sits under its store root ~/.claude/projects but is not a "
+                      "transcript claude parses", payload["evidence"]["lines"])
 
     def test_damaged_event_store_never_wakes_the_daemon(self) -> None:
         """A lagging corpus makes `why` fingerprint event payloads; a bad digest kicks no repair."""

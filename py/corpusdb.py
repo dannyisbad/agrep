@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Mapping, NamedTuple
+from typing import Callable, Iterable, Mapping, NamedTuple
 
 import boundary_rank
 import common
@@ -2626,6 +2626,27 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
                 pass
 
 
+def _publication_compatible(
+        meta: Mapping[str, object], expected_build_id: str | None) -> bool:
+    """The gate every stale reader applies before serving a published database: the current
+    schema, plus the writer build the lane requires (None in the foreign-publication lane)."""
+    return bool(
+        meta.get("schema") == _SCHEMA
+        and (expected_build_id is None
+             or meta.get("build_id") == expected_build_id))
+
+
+def interactive_snapshot_lane(
+        stored_stamp: object, stamp: str, *,
+        build_pending: Callable[[], bool]) -> str:
+    """What the interactive reader serves from a schema-compatible published database: "current"
+    or "stale" from corpus.db, "scan" (messages.jsonl) when it is behind and a build is queued.
+    `build_pending` is read only when the stamp is behind, so a current snapshot costs no read."""
+    if stored_stamp is not None and _stamps_equal(str(stored_stamp), stamp):
+        return "current"
+    return "scan" if build_pending() else "stale"
+
+
 def _stale_db(
         busy_timeout_ms: int = 5000, *,
         expected_build_id: str | None = None,
@@ -2641,9 +2662,7 @@ def _stale_db(
         meta = dict(db.execute(
             "SELECT key, value FROM meta "
             "WHERE key IN ('schema', 'build_id')"))
-        if (meta.get("schema") == _SCHEMA
-                and (expected_build_id is None
-                     or meta.get("build_id") == expected_build_id)):
+        if _publication_compatible(meta, expected_build_id):
             db._source_build_id = meta.get("build_id")
             return db
         db.close()
@@ -2683,9 +2702,7 @@ def _foreign_stale_db(
         meta = dict(db.execute(
             "SELECT key, value FROM meta "
             "WHERE key IN ('schema', 'build_id')"))
-        if (meta.get("schema") == _SCHEMA
-                and (expected_build_id is None
-                     or meta.get("build_id") == expected_build_id)
+        if (_publication_compatible(meta, expected_build_id)
                 and (expected_identity is None
                      or db._source_identity == expected_identity)):
             db._source_build_id = meta.get("build_id")
@@ -2799,18 +2816,22 @@ def _interactive_snapshot(
                 _CONTENDED_READER_WAIT_MS,
                 expected_build_id=expected_build_id)
         )
-    current = False
+    stored_stamp = None
     if db is not None:
         try:
             row = db.execute(
                 "SELECT value FROM meta WHERE key = 'stamp'").fetchone()
-            current = bool(row and _stamps_equal(str(row[0]), stamp))
+            stored_stamp = row[0] if row else None
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             try:
                 db.close()
             except sqlite3.DatabaseError:
                 pass
             db = None
+    lane = "scan" if db is None else interactive_snapshot_lane(
+        stored_stamp, stamp,
+        build_pending=indexd_runtime.search_index_build_pending)
+    current = lane == "current"
     if db is not None:
         db._retained_snapshot = retained_replacement
         db._source_stamp_current = current
@@ -2825,7 +2846,7 @@ def _interactive_snapshot(
         common.dbg(
             "corpusdb: published db matches the source stamp -> read without maintenance")
         return db
-    if db is not None and indexd_runtime.search_index_build_pending():
+    if db is not None and lane == "scan":
         # `agrep index` returns promising the scan serves until the search
         # database lands. A snapshot whose stamp predates the rows just
         # published answers from exactly the generation that promise skipped.

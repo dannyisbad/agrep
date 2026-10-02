@@ -291,10 +291,14 @@ agrep why ~/.claude/projects/x/abc.jsonl      # or the transcript file itself
 ```
 
 The answer is one of: indexed (also under an alias or as a side chat), written
-after the last index, not yet in the search database, outside every store agrep
+after the last index, behind in the search database, outside every store agrep
 reads, discovered but every record skipped (with counts by reason), or
-unreadable - each with the file the answer came from and the next step. It
-never indexes or changes anything.
+unreadable - each with the file the answer came from and the next step.
+"Indexed" means what `agrep search` would serve: while the search database is
+still building, missing or of another schema, searches scan the transcripts
+directly, so a chat they publish is indexed and `why` says why. A search
+database it cannot read is unprovable rather than a verdict. It never indexes
+or changes anything.
 
 
 ## Meaning search

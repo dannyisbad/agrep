@@ -1,8 +1,8 @@
 """`agrep why <reference> [--json]` - explain why a chat is, or is not, indexed.
 
-Read-only by construction: it never indexes, never writes the data dir and never wakes
-the daemon. A reference resolves like `agrep resume` (id, handle, alias, project label,
-first-line fragment) after a path lane; every evidence line names the file it came from.
+Read-only by construction: never indexes, writes the data dir or wakes the daemon. "Searchable"
+is what `agrep search` would serve, decided by corpusdb's own reader predicates. A reference
+resolves like `agrep resume` after a path lane; every evidence line names the file it came from.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import common
@@ -34,6 +35,7 @@ _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 _HEX = re.compile(r"[0-9a-f]{6,}", re.I)
 _SKIP_ORDER = ("wrapper", "meta", "sidechain", "non_message", "non_human", "empty_text",
                "replay", "unreferenced", "throwaway")
+_TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json", ".db", ".sqlite", ".sqlite3", ".vscdb"})
 
 
 # --------------------------------------------------------------------------- evidence readers
@@ -93,51 +95,123 @@ def _ingest_sig() -> dict:
             "total": common.committed_message_total()}
 
 
+def _reader_lane(meta: dict | None) -> tuple[str, str | None]:
+    """The lane the interactive search reader takes for the published corpus.db whose meta table
+    reads `meta` (None: no database), from the reader's own read-only facts and predicates."""
+    import corpusdb
+    import indexd_runtime
+    if corpusdb._query_failure_matches_current() or corpusdb.query_rebuild_required():
+        return "scan", "marked for rebuild after a query failure"
+    if not corpusdb._trigram_ok():
+        return "scan", "this sqlite lacks trigram FTS5"
+    if meta is None:
+        pending = indexd_runtime.search_index_build_pending()
+        return "scan", "not built yet, build queued" if pending else "missing"
+    ownership = corpusdb._derived_write_ownership(for_write=True)
+    if ownership.replace_retained_db:
+        expected = ownership.retained_build_id
+        try:
+            identity = corpusdb._optional_sqlite_identity(corpusdb.DB_PATH)
+        except OSError:
+            identity = None
+        if identity != ownership.retained_reader_identity:
+            return "scan", "the retained publication moved"
+    elif not ownership.writable:
+        expected = None
+    else:
+        try:
+            expected = indexd_runtime.derived_writer_build_id(require_binary=True)
+        except OSError as exc:
+            return "scan", f"writer identity unavailable ({exc})"
+    if not corpusdb._publication_compatible(meta, expected):
+        if meta.get("schema") != corpusdb._SCHEMA:
+            return "scan", f"schema {meta.get('schema')}, this build reads {corpusdb._SCHEMA}"
+        return "scan", "published by another agrep build"
+    lane = corpusdb.interactive_snapshot_lane(
+        meta.get("stamp"), corpusdb._stamp(),
+        build_pending=indexd_runtime.search_index_build_pending)
+    return lane, "stamp behind the published sources, rebuild queued" if lane == "scan" else None
+
+
+def _stored_rows(db: sqlite3.Connection, session: str, facts: dict) -> list[tuple]:
+    """Fill `facts` with what corpus.db stores for `session`; returns the indexed rows."""
+    import corpusdb
+    rows = db.execute(f"SELECT {corpusdb._ROW_COLS} FROM msgs WHERE session=?",
+                      (session,)).fetchall()
+    sig = db.execute("SELECT sig FROM session_sig WHERE session=?", (session,)).fetchone()
+    family = db.execute("SELECT root, side FROM session_family WHERE session=?",
+                        (session,)).fetchone()
+    facts.update({"rows": len(rows), "session_sig": sig is not None,
+                  "root": family[0] if family else None,
+                  "side": bool(family[1]) if family else None})
+    return [tuple(row) for row in rows]
+
+
+def _row_diff(stored: list[tuple], published: list[tuple]) -> dict:
+    """Stored rows against the rows the sources publish, as multisets ignoring the concept column
+    the way corpusdb's incremental diff pairs them; `who == tool` rows come from the event store."""
+    def shape(row: tuple) -> tuple:
+        return row[:5] + row[6:]
+
+    def split(counter: Counter) -> dict:
+        tool = sum(n for row, n in counter.items() if row[7] == "tool")
+        return {"text": sum(counter.values()) - tool, "tool": tool}
+
+    kept, want = Counter(map(shape, stored)), Counter(map(shape, published))
+    missing, extra = want - kept, kept - want
+    relabelled = bool(stored and published) and (
+        {r[5] for r in stored} != {r[5] for r in published})
+    return {"proof": "rows", "current": not missing and not extra,
+            "published_rows": len(published), "published": split(want),
+            "missing": split(missing), "extra": split(extra),
+            "concept_differs": relabelled, "tools": common.setting("tools")}
+
+
 def _corpus_facts(session: str) -> dict:
-    """What the search database holds for one session, read in mode=ro, and whether that
-    copy is what messages.jsonl now publishes."""
-    path = common.DATA_DIR / "corpus.db"
-    if not path.exists():
-        return {"state": "missing"}
-    try:
-        uri = Path(os.path.abspath(os.fspath(path))).as_uri() + "?mode=ro"
-        db = sqlite3.connect(uri, uri=True, timeout=1.0)
-    except (sqlite3.Error, OSError, ValueError) as exc:
-        return {"state": "unreadable", "reason": str(exc)}
-    try:
-        rows = db.execute("SELECT count(*) FROM msgs WHERE session=?", (session,)).fetchone()[0]
-        sig = db.execute("SELECT sig FROM session_sig WHERE session=?", (session,)).fetchone()
-        family = db.execute("SELECT root, side FROM session_family WHERE session=?",
-                            (session,)).fetchone()
-        stamp = db.execute("SELECT value FROM meta WHERE key='stamp'").fetchone()
-    except sqlite3.Error as exc:
-        return {"state": "unreadable", "reason": str(exc)}
-    finally:
-        db.close()
-    facts = {"state": "ok", "rows": int(rows), "session_sig": sig is not None,
-             "root": family[0] if family else None,
-             "side": bool(family[1]) if family else None}
-    facts.update(_corpus_currency(session, sig[0] if sig else None, stamp[0] if stamp else ""))
-    return facts
-
-
-def _corpus_currency(session: str, stored_sig: str | None, stamp: str) -> dict:
-    """Is the stored copy of `session` current? A source stamp equal to the one the database
-    recorded proves every session current without a scan; otherwise this session's published
-    rows are fingerprinted with corpusdb's own signature and compared to the stored one."""
+    """Which engine search serves `session` from - corpus.db or the direct scan of messages.jsonl -
+    decided by the interactive reader's own predicates, and whether that copy is current."""
     import corpusdb
     import events
     # The scan validates event payloads; damage found there must not schedule indexd from `why`.
     events.set_event_repair_callback(lambda: False)
+    path = common.DATA_DIR / "corpus.db"
+    db, meta = None, None
     try:
-        if corpusdb._stamps_equal(stamp, corpusdb._stamp()):
-            return {"stamp_current": True, "proof": "stamp", "current": True}
-        rows = corpusdb._scan(only={session}).get(session, [])
-    except (OSError, RuntimeError, ValueError) as exc:
-        return {"stamp_current": False, "proof": None, "current": None, "reason": str(exc)}
-    published = corpusdb._session_sig(rows) if rows else None
-    return {"stamp_current": False, "proof": "session_sig",
-            "current": bool(rows) and published == stored_sig, "published_rows": len(rows)}
+        if path.exists():
+            try:
+                uri = Path(os.path.abspath(os.fspath(path))).as_uri() + "?mode=ro"
+                db = sqlite3.connect(uri, uri=True, timeout=1.0)
+                meta = dict(db.execute("SELECT key, value FROM meta "
+                                       "WHERE key IN ('schema', 'build_id', 'stamp')"))
+            except (sqlite3.Error, OSError, ValueError) as exc:
+                return {"state": "unreadable", "reason": str(exc)}
+        lane, scan_reason = _reader_lane(meta)
+        facts: dict = {"state": "ok" if meta is not None else "missing",
+                       "served": "messages.jsonl" if lane == "scan" else "corpus.db",
+                       "scan_reason": scan_reason, "stamp_current": lane == "current"}
+        stored: list[tuple] = []
+        if meta is not None and meta.get("schema") == corpusdb._SCHEMA:
+            try:
+                stored = _stored_rows(db, session, facts)
+            except sqlite3.Error as exc:
+                return {"state": "unreadable", "reason": str(exc)}
+        if lane == "current":
+            facts.update({"proof": "stamp", "current": True})
+            return facts
+        try:
+            published = corpusdb._scan(only={session}).get(session, [])
+        except (OSError, RuntimeError, ValueError) as exc:
+            facts.update({"proof": None, "current": None, "reason": str(exc)})
+            return facts
+        if lane == "scan":
+            facts.update({"proof": "scan", "current": bool(published),
+                          "published_rows": len(published)})
+            return facts
+        facts.update(_row_diff(stored, published))
+        return facts
+    finally:
+        if db is not None:
+            db.close()
 
 
 # --------------------------------------------------------------------------- formatting
@@ -231,6 +305,24 @@ class _Context:
         self.rows, self.index_present, self.index_skipped = _index_rows()
         self.payload, self.census_error = source_projection()
         self.sig = _ingest_sig()
+        self._real: dict[str, str] = {}
+        self._by_real: dict[str, dict] | None = None
+
+    def real(self, path: object) -> str:
+        text = str(path or "")
+        if text not in self._real:
+            self._real[text] = os.path.realpath(text) if text else ""
+        return self._real[text]
+
+    @property
+    def entries_by_real(self) -> dict[str, dict]:
+        """Discovered files and issues keyed by resolved path: a symlink alias finds its census entry."""
+        if self._by_real is None:
+            self._by_real = {}
+            for entry in self.sources + self.issues:
+                if entry.get("path"):
+                    self._by_real.setdefault(self.real(entry["path"]), entry)
+        return self._by_real
 
     @property
     def sources(self) -> list[dict]:
@@ -288,17 +380,19 @@ def _report(ctx: _Context, verdict: str, summary: str, lines: list[str], *,
             "evidence": evidence, "next_action": next_action}
 
 
-def _ambiguous(ctx: _Context, candidates: list[dict], what: str) -> dict:
+def _ambiguous(ctx: _Context, candidates: list[dict], what: str, origin: str) -> dict:
     return _report(
         ctx, "ambiguous",
         f"ambiguous: '{ctx.reference}' matches {len(candidates)} {what}",
-        ["pass a full id, a @handle from a search hit, or the transcript path"],
+        [f"{origin}: {len(candidates)} {what} match '{ctx.reference}'; pass a full id, "
+         "a @handle from a search hit, or the transcript path"],
         candidates=candidates)
 
 
 def _judge_rows(ctx: _Context, rows: list[dict], via: str) -> dict:
     if len(rows) > 1:
-        return _ambiguous(ctx, [_candidate_from_row(r, via=via) for r in rows], "chats")
+        return _ambiguous(ctx, [_candidate_from_row(r, via=via) for r in rows], "chats",
+                          "sessions.jsonl")
     return _judge_indexed(ctx, rows[0], via)
 
 
@@ -353,7 +447,14 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"not fully indexed: the transcript of {agent} chat {_short(session)} "
             "was written after the last index",
             lines, facts=facts, next_action="agrep index")
-    if corpus.get("state") != "ok" or not corpus.get("rows") or corpus.get("current") is False:
+    if corpus.get("state") == "unreadable":
+        lines.append(ctx.sig_line())
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: the search database cannot be read, so whether {agent} chat "
+            f"{_short(session)} is searchable is unknown",
+            lines, facts=facts, next_action="agrep doctor")
+    if corpus.get("current") is False or (corpus["served"] == "corpus.db" and not corpus["rows"]):
         lines.append(ctx.sig_line())
         return _report(
             ctx, "corpus-behind-transcripts", _corpus_behind_summary(corpus, agent, session),
@@ -378,44 +479,85 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     return _report(ctx, verdict, summary, lines, facts=facts)
 
 
+def _diff_text(corpus: dict) -> str:
+    """What differs between the stored rows and the published ones, each named by its source."""
+    published, missing, extra = corpus["published"], corpus["missing"], corpus["extra"]
+    tools = f"settings.json tools={corpus['tools']}"
+    if corpus["current"]:
+        source = ("messages.jsonl and the event store publish" if published["tool"]
+                  else "messages.jsonl publishes")
+        text = f"stored rows match the {_plural(corpus['published_rows'], 'row')} {source}"
+        if corpus["concept_differs"]:
+            text += " (only the concept label from session_concepts.jsonl differs)"
+        return text
+    parts = []
+    if missing["text"]:
+        parts.append(f"{_plural(missing['text'], 'row')} messages.jsonl publishes not stored")
+    if missing["tool"]:
+        parts.append(f"{_plural(missing['tool'], 'tool row')} the event store publishes "
+                     f"({tools}) not stored")
+    if extra["text"]:
+        parts.append(f"{_plural(extra['text'], 'stored row')} messages.jsonl no longer publishes")
+    if extra["tool"]:
+        parts.append(f"{_plural(extra['tool'], 'stored tool row')} the event store no longer "
+                     f"publishes ({tools})")
+    return "; ".join(parts)
+
+
 def _corpus_line(corpus: dict) -> str:
-    """The corpus.db evidence line, naming which proof of currency was used."""
-    if corpus.get("state") != "ok":
-        return (f"corpus.db: {corpus.get('state')}"
-                + (f" ({corpus['reason']})" if corpus.get("reason") else ""))
+    """The corpus.db evidence line: the engine search serves and the proof of currency used."""
+    if corpus.get("state") == "unreadable":
+        return f"corpus.db: unreadable ({corpus['reason']})"
+    rows = corpus.get("rows")
+    if corpus["served"] == "messages.jsonl":
+        held = f"{_plural(rows, 'row')}, " if rows is not None else ""
+        text = f"corpus.db: {held}{corpus['scan_reason']}; search scans messages.jsonl directly"
+        if corpus["proof"] == "scan":
+            return text + f" ({_plural(corpus['published_rows'], 'row')} published for this chat)"
+        return text + f", unverifiable ({corpus['reason']})"
     sig = "present" if corpus["session_sig"] else "absent"
-    if corpus["proof"] == "session_sig":
-        published = _plural(corpus["published_rows"], "row")
-        if corpus["current"]:
-            sig = f"matches the {published} messages.jsonl publishes"
-        elif corpus["session_sig"]:
-            sig = f"differs from the {published} messages.jsonl publishes"
-        else:
-            sig = f"absent, messages.jsonl publishes {published}"
-        sig += ", stamp behind the published sources"
+    if corpus["proof"] == "rows":
+        detail = _diff_text(corpus) + ", stamp behind the published sources"
     elif corpus["proof"] is None:
-        sig += (", stamp behind the published sources, messages.jsonl unverifiable "
-                f"({corpus['reason']})")
+        detail = (f"session_sig {sig}, stamp behind the published sources, "
+                  f"messages.jsonl unverifiable ({corpus['reason']})")
+    else:
+        detail = f"session_sig {sig}"
     family = (f", family root {corpus['root']}" + (" (side chat)" if corpus["side"] else "")
               if corpus.get("root") else "")
-    return f"corpus.db: {_plural(corpus['rows'], 'row')}, session_sig {sig}{family}"
+    return f"corpus.db: {_plural(rows, 'row')}, {detail}{family}"
 
 
 def _corpus_behind_summary(corpus: dict, agent: str, session: str) -> str:
-    if corpus.get("state") != "ok" or not corpus.get("rows"):
-        return (f"not searchable yet: transcripts list {agent} chat {_short(session)} "
-                "but the search database does not hold it")
-    return (f"not fully searchable: the search database holds an older copy of {agent} chat "
-            f"{_short(session)} than messages.jsonl publishes (session_sig differs)")
+    chat = f"{agent} chat {_short(session)}"
+    if corpus["served"] == "messages.jsonl" or corpus.get("published_rows") == 0:
+        return f"not searchable yet: transcripts list {chat} but messages.jsonl publishes no rows for it"
+    if not corpus["rows"]:
+        return f"not searchable yet: transcripts list {chat} but the search database does not hold it"
+    missing, extra = corpus["missing"], corpus["extra"]
+    gone, kept = sum(missing.values()), sum(extra.values())
+    if gone and not kept:
+        source = "messages.jsonl" if missing["text"] else "the event store"
+        return (f"not fully searchable: the search database holds an older copy of {chat} than "
+                f"{source} publishes ({_plural(gone, 'row')} not stored)")
+    if kept and not gone:
+        source = ("messages.jsonl" if extra["text"]
+                  else f"the event store (settings.json tools={corpus['tools']})")
+        return (f"not current: the search database still holds {_plural(kept, 'row')} of {chat} "
+                f"that {source} no longer publishes")
+    return (f"not fully searchable: the search database holds a different copy of {chat} than "
+            f"the sources publish ({_plural(gone, 'row')} not stored, {_plural(kept, 'stored row')} "
+            "no longer published)")
 
 
 _READABLE_ACTION = "make the file readable, then agrep index"
 
 
 def _issue_covering(ctx: _Context, path: str) -> dict | None:
-    """The first live or durable issue naming `path` or a directory above it."""
-    return next((i for i in ctx.issues
-                 if i.get("path") and (i["path"] == path or _under(path, i["path"]))), None)
+    """The first live or durable issue naming `path` or a directory above it, symlinks resolved."""
+    real = ctx.real(path)
+    return next((i for i in ctx.issues if i.get("path") and (
+        _under(path, i["path"]) or _under(real, ctx.real(i["path"])))), None)
 
 
 def _issue_line(ctx: _Context, issue: dict) -> str:
@@ -453,7 +595,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
     if session is None and len(entries) > 1:
         candidates = [{"agent": e.get("agent"), "path": path, "session": e.get("session"),
                        "rows": e.get("rows")} for e in entries[:_CANDIDATE_LINES]]
-        return _ambiguous(ctx, candidates, "conversations in that database")
+        return _ambiguous(ctx, candidates, "conversations in that database", "intake_stats.json")
     entry = entries[0] if entries else None
     if entry is None:
         if not ctx.sig.get("present"):
@@ -504,10 +646,16 @@ def _not_discovered(ctx: _Context, path: str) -> dict:
     exists, is_dir = os.path.exists(path), os.path.isdir(path)
     shown = ctx.display(path)
     lines = [ctx.census_line()]
+    real = ctx.real(path)
+
+    def within(root: object) -> bool:
+        root = str(root or "")
+        return bool(root) and (_under(path, root) or _under(real, ctx.real(root)))
+
     adapter = next(((a["name"], root) for a in payload.get("adapters", [])
-                    for root in a.get("roots", []) if _under(path, root)), None)
+                    for root in a.get("roots", []) if within(root)), None)
     detected = next(((d["name"], d["root"]) for d in payload.get("detected", [])
-                     if _under(path, d.get("root") or "")), None)
+                     if within(d.get("root"))), None)
     if adapter:
         lines.append(f"{adapter[0]}: the path sits under its store root "
                      f"{ctx.display(adapter[1])} but is "
@@ -560,6 +708,12 @@ def _looks_like_path(reference: str) -> bool:
         os.sep in text or "/" in text) and not compact.is_result_handle(text)
 
 
+def _names_a_file(reference: str) -> bool:
+    """Path-shaped or carrying a store file extension; a bare word never names a file in cwd."""
+    return _looks_like_path(reference) or (
+        os.path.splitext(reference.strip())[1].lower() in _TRANSCRIPT_EXTENSIONS)
+
+
 def _path_lane(ctx: _Context, reference: str) -> tuple[str, list[dict]]:
     expanded = _expand(reference, (ctx.payload or {}).get("home"))
     raw = reference.strip()
@@ -579,6 +733,10 @@ def _path_lane(ctx: _Context, reference: str) -> tuple[str, list[dict]]:
         consider(source.get("agent"), source.get("path"))
     for issue in ctx.issues:
         consider(issue.get("agent"), issue.get("path"))
+    if not found and _names_a_file(reference):
+        alias = ctx.entries_by_real.get(ctx.real(expanded))
+        if alias:
+            found[alias["path"]] = {"agent": alias.get("agent"), "path": alias["path"]}
     return expanded, list(found.values())
 
 
@@ -634,14 +792,14 @@ def diagnose(reference: str) -> dict:
     ctx = _Context(reference)
     expanded, matches = _path_lane(ctx, reference)
     if len(matches) > 1:
-        return _ambiguous(ctx, matches, "discovered files")
+        return _ambiguous(ctx, matches, "discovered files", "store census")
     if matches:
         return _judge_source(ctx, matches[0]["agent"], matches[0]["path"])
     if _looks_like_path(reference):
         covering = _issue_covering(ctx, expanded)
         if covering:
             return _judge_source(ctx, covering.get("agent"), expanded)
-    if ctx.payload is not None and os.path.isfile(expanded):
+    if ctx.payload is not None and _names_a_file(reference) and os.path.isfile(expanded):
         return _not_discovered(ctx, expanded)
 
     matched, human = resume._resolve_reference(ctx.rows, reference)
@@ -656,7 +814,8 @@ def diagnose(reference: str) -> dict:
         return _judge_rows(ctx, matched, "human")
     sources = _source_lane(ctx, identity)
     if len(sources) > 1:
-        return _ambiguous(ctx, sources, "discovered files")
+        return _ambiguous(ctx, sources, "discovered files",
+                          "parse cache, intake_stats.json and store census")
     if sources:
         return _judge_source(ctx, sources[0]["agent"], sources[0]["path"],
                              sources[0].get("session"))
