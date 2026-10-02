@@ -34,6 +34,20 @@
 
 ### Search
 
+- `agrep summary` gives a per-project briefing from your history: estimated
+  active time, the chats worked on, and open items - an agent's unanswered
+  question, unchecked next steps or todo items, unfinished work - each with a
+  confidence label and a handle to open it. `summary pending` lists only the
+  open items and `summary time` tabulates estimated active time by day, week
+  or month. Time comes from turn timestamps with a 20-minute idle cap, counts
+  a chat and its side chats once, and is never reported as elapsed or
+  billable time.
+- A flag that belongs to another command, or is spelled the way other tools
+  spell it, prints the corrected command instead of a bare usage error:
+  `agrep lantern --limit 2` answers `run: agrep search lantern -n 2`, and
+  recall's `--budget` on a search points to the same query as `agrep recall`.
+  `agrep --help` leads with the commands agents use most, one example each,
+  and lists the rest on one line.
 - `agrep resume` accepts every reference agrep prints: result handles
   (`@01a06003:4.82c5`, with or without a `~event:lo-hi` suffix), turn ranges,
   bare or `@`-prefixed ids, full uuids and `ses_` ids - plus a project name or
@@ -353,6 +367,13 @@
 
 ### Status, doctor and setup
 
+- `agrep why <ref>` explains why a chat is or isn't indexed. A session id,
+  printed handle, project, first-line text or transcript path resolves to a
+  verdict - indexed (also under an alias or as a side chat), written after the
+  last index, not yet in the search database, outside every store agrep
+  reads, discovered with every record skipped (counts by reason), or
+  unreadable - with the file each answer came from and the next step. It never
+  indexes or writes.
 - Every invocation starts faster: the CLI imports the index runtime and
   installer metadata only for commands that need them (import chain 37%
   faster; `--version` 13% and `search` 12% faster end to end on the
@@ -408,6 +429,10 @@
 
 ### Teaching your agents
 
+- Instruction block v39 no longer tells agents to run `agrep --help` before
+  first use; it carries the most-used flags inline instead. That ritual
+  accounted for 158 of 353 help lookups in one real history. Setup upgrades
+  older blocks.
 - Instruction block v38 speaks to every agent in the second person (the
   per-agent name slots are gone, so each non-codex target receives
   identical bytes) and teaches the cross-project index: read the project and
