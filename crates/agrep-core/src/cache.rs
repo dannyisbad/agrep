@@ -4269,7 +4269,8 @@ mod tests {
 
     #[test]
     fn restoring_missing_event_row_refreshes_generation() {
-        let dir = tmp_path(&std::env::temp_dir().join("agrep-event-manifest-test"));
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-manifest-test"));
+        let dir = root.join("events");
         let events = [test_event()];
         let fname = event_fname("codex", "session-1");
         let keep = HashSet::from([fname.clone()]);
@@ -4310,7 +4311,7 @@ mod tests {
         assert_eq!(fs::read(&generation_path).unwrap(), generation_body);
         assert!(fs::metadata(&generation_path).unwrap().modified().unwrap() > pinned_mtime);
 
-        fs::remove_dir_all(dir).ok();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
