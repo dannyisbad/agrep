@@ -1,0 +1,3 @@
+{"type":"session","id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","version":3,"cwd":"/work/alias","timestamp":"2000-01-02T03:04:05.000Z"}
+{"type":"message","id":"a1","parentId":null,"timestamp":"2000-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"why did the retry backoff cap at 30s"}],"timestamp":"2000-01-02T03:04:06.000Z"}}
+{"type":"message","id":"a2","parentId":"a1","timestamp":"2000-01-02T03:04:07.000Z","message":{"role":"assistant","model":"pi/sonnet-5","content":[{"type":"text","text":"the 60s ceiling tripped the account throttle"}],"timestamp":"2000-01-02T03:04:07.000Z"}}

@@ -2122,6 +2122,39 @@ impl Drop for StagedCache {
     }
 }
 
+/// `(source path, agent, session)`: one cached file's claim on an indexed session.
+pub type SessionSource = (PathBuf, &'static str, Arc<str>);
+
+fn session_sources_of(entries: &HashMap<String, Entry>) -> Vec<SessionSource> {
+    let mut out = Vec::new();
+    for (key, entry) in entries {
+        let Some(path) = source_path_from_key(key) else {
+            continue;
+        };
+        let first = out.len();
+        for msg in &entry.msgs {
+            if out[first..]
+                .iter()
+                .any(|(_, _, session)| session == &msg.session)
+            {
+                continue;
+            }
+            out.push((path.clone(), intern_agent(&msg.agent), msg.session.clone()));
+        }
+    }
+    out
+}
+
+/// Read-only [`IngestCache::session_sources`] of the cache at `path`, accepting a foreign owner:
+/// a diagnostic describes what was published and never stages over another build's cache.
+pub fn session_sources_at(
+    path: &Path,
+) -> Result<Vec<SessionSource>, CacheDecodeRefusal> {
+    let (entries, _generation, _backing) =
+        decode_cache_owned(path, WriterBuildId::current(), true)?;
+    Ok(session_sources_of(&entries))
+}
+
 impl IngestCache {
     /// Cold-mode field defaults; every load mode states only its deltas via struct update.
     fn base(entries: HashMap<String, Entry>, backing: CacheBacking) -> Self {
@@ -2479,24 +2512,8 @@ impl IngestCache {
 
     /// `(source path, agent, session)` for every cached file with rows: the identities the
     /// store's own filenames carry, resolved against the header ids at publication.
-    pub fn session_sources(&self) -> Vec<(PathBuf, &'static str, Arc<str>)> {
-        let mut out = Vec::new();
-        for (key, entry) in &self.entries {
-            let Some(path) = source_path_from_key(key) else {
-                continue;
-            };
-            let first = out.len();
-            for msg in &entry.msgs {
-                if out[first..]
-                    .iter()
-                    .any(|(_, _, session)| session == &msg.session)
-                {
-                    continue;
-                }
-                out.push((path.clone(), intern_agent(&msg.agent), msg.session.clone()));
-            }
-        }
-        out
+    pub fn session_sources(&self) -> Vec<SessionSource> {
+        session_sources_of(&self.entries)
     }
 
     fn published_inventory_blind_to(&self, agent: &str, scope: &Path) -> bool {

@@ -2342,16 +2342,20 @@ pub struct Detector {
     pub name: &'static str,
     /// Count of session-looking entries under home(), or 0 when the store is absent.
     pub probe: fn() -> usize,
+    /// The directory the probe inspects, so a diagnostic can place a path under it.
+    pub root: fn() -> PathBuf,
 }
 
 pub static DETECTED: &[Detector] = &[
     Detector {
         name: "copilot",
         probe: probe_copilot,
+        root: copilot_root,
     },
     Detector {
         name: "qwen",
         probe: probe_qwen,
+        root: qwen_root,
     },
 ];
 
@@ -2528,15 +2532,23 @@ fn count_subdirs(dir: &std::path::Path) -> usize {
 
 /// GitHub Copilot CLI: ~/.copilot/session-state/<uuid>/ - one dir per session. Location is
 /// confirmed (GitHub Docs); the per-event events.jsonl schema is not, so this stays a stub.
+fn copilot_root() -> PathBuf {
+    crate::ingest::home().join(".copilot").join("session-state")
+}
+
 fn probe_copilot() -> usize {
-    count_subdirs(&crate::ingest::home().join(".copilot").join("session-state"))
+    count_subdirs(&copilot_root())
 }
 
 /// qwen-code: ~/.qwen/tmp/<projectHash>/chats/*.json (root confirmed from QwenLM/qwen-code
 /// packages/core/src/config/storage.ts: QWEN_DIR=".qwen", tmp dir, chats/). A gemini-cli fork,
 /// so the shape likely matches the gemini adapter - but not yet confirmed against a real store.
+fn qwen_root() -> PathBuf {
+    crate::ingest::home().join(".qwen").join("tmp")
+}
+
 fn probe_qwen() -> usize {
-    let tmp = crate::ingest::home().join(".qwen").join("tmp");
+    let tmp = qwen_root();
     let mut n = 0;
     if !std::fs::symlink_metadata(&tmp)
         .map(|meta| meta.is_dir() && !metadata_is_link(&meta))

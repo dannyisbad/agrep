@@ -2503,6 +2503,14 @@ enum Cmd {
         #[arg(long, hide = true, requires = "audit")]
         agent: Option<String>,
     },
+    /// Read-only `{"version":1,...}` source projection for `agrep why`: discovered sources,
+    /// issues, parse-cache file->session claims, and per-file intake tallies.
+    #[command(name = "why-source", hide = true)]
+    WhySource {
+        /// Restrict the projection to these exact source paths (repeatable).
+        #[arg(long)]
+        path: Vec<PathBuf>,
+    },
     /// Evaluate one query over a JSON batch on stdin and return in-order boundary scores.
     BoundaryRank {
         #[arg(long, hide = true)]
@@ -2585,6 +2593,7 @@ fn run() -> anyhow::Result<()> {
             audit,
             agent,
         } => stores_cmd(paths, census, tokens, audit, agent.as_deref().unwrap_or("all")),
+        Cmd::WhySource { path } => why_source_cmd(&path),
         Cmd::BoundaryRank { serve } => boundary_rank_cmd(serve),
         Cmd::FallbackEventScan => fallback_event_scan_cmd(),
         Cmd::SemanticQ8Build {
@@ -3493,6 +3502,218 @@ fn source_health_records(data: &Path) -> anyhow::Result<Vec<serde_json::Value>> 
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("source health record is malformed"))?;
     Ok(records)
+}
+
+const WHY_SOURCE_VERSION: u32 = 1;
+
+fn fingerprint_label(fingerprint: ingest::registry::Fingerprint) -> &'static str {
+    match fingerprint {
+        ingest::registry::Fingerprint::Stat => "stat",
+        ingest::registry::Fingerprint::Token => "token",
+        ingest::registry::Fingerprint::Always => "always",
+    }
+}
+
+/// Read-only projection behind `agrep why`: it decodes the parse cache and intake book in
+/// place and never stages, publishes, or probes ownership, so no build may be refused here.
+fn why_source_cmd(only: &[PathBuf]) -> anyhow::Result<()> {
+    let data = data_dir()?;
+    let selected = |path: &str| only.is_empty() || only.iter().any(|p| p.as_os_str() == path);
+    let adapters: Vec<_> = ingest::registry::ADAPTERS
+        .iter()
+        .map(|adapter| {
+            serde_json::json!({
+                "name": adapter.name(),
+                "fingerprint": fingerprint_label(adapter.fingerprint()),
+                "roots": adapter.store_roots(),
+            })
+        })
+        .collect();
+    let detected: Vec<_> = ingest::registry::DETECTED
+        .iter()
+        .map(|detector| {
+            serde_json::json!({
+                "name": detector.name,
+                "root": (detector.root)(),
+                "count": (detector.probe)(),
+            })
+        })
+        .collect();
+
+    let mut sources = Vec::new();
+    let mut issues = Vec::new();
+    for diagnostic in ingest::registry::store_diagnostics() {
+        for path in diagnostic.paths() {
+            if !selected(path) {
+                continue;
+            }
+            sources.push(serde_json::json!({
+                "agent": diagnostic.name(),
+                "path": path,
+                "stat_key": agrep_core::intake::stat_key(Path::new(path)),
+            }));
+        }
+        for issue in diagnostic.issues() {
+            if !selected(issue.path()) {
+                continue;
+            }
+            issues.push(serde_json::json!({
+                "agent": issue.agent(),
+                "path": issue.path(),
+                "kind": issue.kind(),
+                "reason": issue.reason(),
+                "durable": false,
+            }));
+        }
+    }
+    let health_path = data.join(SOURCE_HEALTH_FILE);
+    match source_health_records(&data) {
+        Ok(records) => {
+            for record in records {
+                let path = record.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+                if !selected(path) {
+                    continue;
+                }
+                issues.push(serde_json::json!({
+                    "agent": record.get("agent").and_then(serde_json::Value::as_str).unwrap_or("all"),
+                    "path": path,
+                    "kind": record.get("kind").and_then(serde_json::Value::as_str).unwrap_or("source-read-failed"),
+                    "reason": record.get("reason").and_then(serde_json::Value::as_str).unwrap_or("read failed"),
+                    "durable": true,
+                }));
+            }
+        }
+        Err(error) => issues.push(serde_json::json!({
+            "agent": "all",
+            "path": health_path.to_string_lossy(),
+            "kind": "health-record-unreadable",
+            "reason": error.to_string(),
+            "durable": true,
+        })),
+    }
+
+    let mut tokens = Vec::new();
+    let mut live_tokens: HashMap<String, String> = HashMap::new();
+    for adapter in ingest::registry::ADAPTERS {
+        if adapter.fingerprint() != ingest::registry::Fingerprint::Token {
+            continue;
+        }
+        match adapter.intake_tokens() {
+            ingest::registry::TokenAvailability::Data(rows) => {
+                for (id, key) in rows {
+                    let path = agrep_core::intake::parse_token_id(&id).map(|(path, _)| path);
+                    if !path.as_deref().is_some_and(&selected) {
+                        continue;
+                    }
+                    tokens.push(serde_json::json!({
+                        "agent": adapter.name(), "id": id, "key": key, "state": "token",
+                    }));
+                    live_tokens.insert(id, key);
+                }
+            }
+            ingest::registry::TokenAvailability::Empty => {}
+            ingest::registry::TokenAvailability::Unreadable(unreadable) => {
+                for issue in unreadable {
+                    issues.push(serde_json::json!({
+                        "agent": adapter.name(),
+                        "path": issue.path,
+                        "kind": "token-census-unreadable",
+                        "reason": issue.reason,
+                        "durable": false,
+                    }));
+                }
+            }
+        }
+    }
+
+    let cache_path = data.join(".ingest_cache.bin");
+    let cache = match agrep_core::ingest_cache::session_sources_at(&cache_path) {
+        Ok(claims) => {
+            let sessions: Vec<_> = claims
+                .into_iter()
+                .filter(|(path, _, _)| selected(&path.to_string_lossy()))
+                .map(|(path, agent, session)| {
+                    let alias = ingest::registry::session_alias(agent, &path, &session);
+                    serde_json::json!({
+                        "path": path, "agent": agent, "session": session, "alias": alias,
+                    })
+                })
+                .collect();
+            serde_json::json!({"state": "ok", "sessions": sessions})
+        }
+        Err(refusal) => serde_json::json!({
+            "state": if refusal == agrep_core::ingest_cache::CacheDecodeRefusal::MissingFile {
+                "missing"
+            } else {
+                "unreadable"
+            },
+            "reason": refusal.label(),
+            "sessions": [],
+        }),
+    };
+
+    let book_path = data.join("intake_stats.json");
+    let intake = match agrep_core::intake::read_book(&book_path) {
+        Ok(None) => serde_json::json!({"state": "missing", "files": []}),
+        Ok(Some(book)) => {
+            let mut files = Vec::new();
+            for (id, entry) in book {
+                let token = agrep_core::intake::parse_token_id(&id);
+                let (path, session) = match &token {
+                    Some((path, session)) => (path.as_str(), Some(session.as_str())),
+                    None => (id.as_str(), None),
+                };
+                if !selected(path) {
+                    continue;
+                }
+                let current_key = if token.is_some() {
+                    live_tokens.get(&id).cloned()
+                } else {
+                    fs::metadata(path)
+                        .is_ok()
+                        .then(|| agrep_core::intake::stat_key(Path::new(path)))
+                };
+                let fresh = current_key.as_deref().map(|key| key == entry.key);
+                files.push(serde_json::json!({
+                    "id": id,
+                    "path": path,
+                    "session": session,
+                    "agent": entry.agent,
+                    "key": entry.key,
+                    "current_key": current_key,
+                    "fresh": fresh,
+                    "seen": entry.seen,
+                    "rows": entry.rows,
+                    "agent_rows": entry.agent_rows,
+                    "events": entry.events,
+                    "skips": entry.skips,
+                    "errors": entry.errors,
+                    "first_error": entry.first_error,
+                }));
+            }
+            serde_json::json!({"state": "ok", "files": files})
+        }
+        Err(error) => serde_json::json!({
+            "state": "unreadable", "reason": error.to_string(), "files": [],
+        }),
+    };
+
+    let payload = serde_json::json!({
+        "version": WHY_SOURCE_VERSION,
+        "home": ingest::home(),
+        "data_dir": data,
+        "adapters": adapters,
+        "detected": detected,
+        "sources": sources,
+        "issues": issues,
+        "tokens": tokens,
+        "cache": cache,
+        "intake": intake,
+    });
+    let mut encoded = serde_json::to_vec(&payload)?;
+    encoded.push(b'\n');
+    std::io::stdout().lock().write_all(&encoded)?;
+    Ok(())
 }
 
 fn write_source_health(data: &Path, mut records: Vec<serde_json::Value>) -> anyhow::Result<()> {

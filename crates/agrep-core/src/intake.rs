@@ -331,6 +331,23 @@ fn publish(path: &Path, book: &Book) -> anyhow::Result<()> {
     crate::cache::write_bytes_atomic(path, &body)
 }
 
+/// The persisted book as [`commit`] wrote it: `None` before any ingest, an error for an
+/// unreadable, malformed, or differently versioned file. Diagnostics read it; only commit writes.
+pub fn read_book(path: &Path) -> anyhow::Result<Option<BTreeMap<String, FileEntry>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let book: Book = serde_json::from_str(&text)?;
+    anyhow::ensure!(
+        book.version == BOOK_VERSION,
+        "intake book version {} is not {BOOK_VERSION}",
+        book.version
+    );
+    Ok(Some(book.files))
+}
+
 /// Fold this run's tallies into the persisted book at `path`: parsed units replace
 /// their old entries, unparsed-but-still-present entries survive (their source was
 /// served from the parse cache), entries whose source vanished are dropped by the
