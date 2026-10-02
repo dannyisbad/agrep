@@ -1,0 +1,428 @@
+"""Scale invariants over one agrep data dir; every check reports aggregate counts only."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import re
+import sqlite3
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import scrub
+import shapes
+
+GENERIC_CONTAINERS = frozenset((
+    "projects", "project", "private", "tmp", "temp", "users", "home", "var", "folders",
+    "desktop", "documents", "downloads", "src", "repos", "repositories", "code", "git",
+    "github", "work", "dev", "workspace", "workspaces", "t", "local", "library", "onedrive",
+    "appdata", "roaming", "locallow",
+))
+# pi publishes the raw cwd by contract (conformance goldens pin `<HOME>/projects/cedar`),
+# so only name-form labels are held to the container rule.
+PATH_LABEL_ADAPTERS = frozenset(("pi",))
+DURABLE_ARTIFACTS = ("messages.jsonl", "sessions.jsonl", "replies.jsonl", "intake_stats.json",
+                     "boundary_stats.json", "event_stats.json")
+_FNV_OFFSET_16 = 0xCBF29CE484222325 & 0xFFFF
+_FNV_PRIME_16 = 0x100000001B3 & 0xFFFF
+
+
+@dataclass
+class Check:
+    name: str
+    ok: bool
+    counts: dict = field(default_factory=dict)
+    detail: str = ""
+
+    def as_dict(self) -> dict:
+        return {"name": self.name, "ok": self.ok, "counts": self.counts, "detail": self.detail}
+
+
+def content_digest(text: str) -> str:
+    digest = _FNV_OFFSET_16
+    for byte in (text or "").encode("utf-8"):
+        digest = ((digest ^ byte) * _FNV_PRIME_16) & 0xFFFF
+    return f"{digest:04x}"
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with path.open("rb") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def intake_book(data: Path) -> dict[str, dict]:
+    book = json.loads((data / "intake_stats.json").read_text(encoding="utf-8"))
+    return book.get("files", {})
+
+
+def artifact_hashes(data: Path) -> dict[str, str]:
+    """Durable publication digests; event payloads are hashed logically out of the event store."""
+    hashes = {}
+    for name in DURABLE_ARTIFACTS:
+        path = data / name
+        if path.is_file():
+            hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    store = data / "events" / ".store.sqlite3"
+    if store.is_file():
+        digest = hashlib.sha256()
+        with sqlite3.connect(f"file:{store}?mode=ro", uri=True) as connection:
+            for row in connection.execute(
+                    "SELECT name, agent, session, hash, n_events, payload FROM event_sessions "
+                    "ORDER BY name"):
+                digest.update(repr(row[:5]).encode())
+                digest.update(row[5] if isinstance(row[5], bytes) else bytes(row[5]))
+        hashes["events/.store.sqlite3"] = digest.hexdigest()
+    return hashes
+
+
+def check_intake_identity(book: dict[str, dict]) -> Check:
+    broken = 0
+    rows_over_seen = 0
+    negative = 0
+    errors = 0
+    per_agent: Counter = Counter()
+    for entry in book.values():
+        skips = sum(entry.get("skips", {}).values())
+        seen = entry.get("seen", 0)
+        rows = entry.get("rows", 0)
+        agent_rows = entry.get("agent_rows", 0)
+        file_errors = entry.get("errors", 0)
+        per_agent[entry.get("agent", "?")] += 1
+        errors += file_errors
+        if min(seen, rows, agent_rows, file_errors, *entry.get("skips", {}).values(), 0) < 0:
+            negative += 1
+        if rows > seen:
+            rows_over_seen += 1
+        if seen != rows + agent_rows + skips + file_errors:
+            broken += 1
+    return Check(
+        "intake_identity", broken == 0 and rows_over_seen == 0 and negative == 0,
+        {"files": len(book), "identity_broken": broken, "rows_over_seen": rows_over_seen,
+         "negative_counts": negative, "errors_total": errors, "files_per_agent": dict(per_agent)})
+
+
+def tallied_extent(entry: dict, source: Path) -> tuple[str, int | None]:
+    """How much of `source` the tally covered: ("whole", None) while its `s:<mtime>:<size>` key still
+    matches, ("prefix", size) when the file only grew since (append-only JSONL), ("uncomparable",
+    None) when it was rewritten, shrank, or is compressed, so no byte range maps to the tally."""
+    key = str(entry.get("key", ""))
+    parts = key.split(":")
+    if len(parts) != 3 or parts[0] != "s" or not parts[2].isdigit():
+        return "whole", None
+    stat = source.stat()
+    if key == f"s:{stat.st_mtime_ns // 1_000_000}:{stat.st_size}":
+        return "whole", None
+    size = int(parts[2])
+    if stat.st_size > size and not source.name.endswith(".gz"):
+        return "prefix", size
+    return "uncomparable", None
+
+
+def check_source_bounds(book: dict[str, dict], home: Path, adapters=shapes.JSONL_ADAPTERS,
+                        sample: int | None = None, seed: int = 7) -> Check:
+    """Rows never exceed text-bearing non-synthetic candidates; synthetic mirrors are skips.
+    Live stores grow between tally and oracle, so the oracle reads the tallied extent."""
+    candidates = [(path, entry) for path, entry in book.items()
+                  if entry.get("agent") in adapters and not path.startswith("\0")]
+    if sample is not None and len(candidates) > sample:
+        candidates = random.Random(seed).sample(candidates, sample)
+    violations: Counter = Counter()
+    checked: Counter = Counter()
+    extents: Counter = Counter()
+    synthetic_total = 0
+    rows_total = 0
+    bound_total = 0
+    for path, entry in candidates:
+        source = Path(path)
+        if not source.is_file():
+            violations["missing_source"] += 1
+            continue
+        adapter = entry["agent"]
+        extent, limit = tallied_extent(entry, source)
+        extents[extent] += 1
+        if extent == "uncomparable":
+            continue
+        counts = shapes.oracle_counts(adapter, source, limit)
+        checked[adapter] += 1
+        bound = shapes.text_bearing_bound(adapter, counts)
+        rows = entry.get("rows", 0)
+        rows_total += rows
+        bound_total += bound
+        if rows > bound:
+            violations[f"{adapter}:rows_over_candidates"] += 1
+        skips = entry.get("skips", {})
+        synthetic = counts.get("synthetic_user", 0)
+        synthetic_total += synthetic
+        if synthetic > skips.get("sidechain", 0) + skips.get("unreferenced", 0):
+            violations[f"{adapter}:synthetic_not_skipped"] += 1
+        if entry.get("seen", 0) != counts["seen"]:
+            violations[f"{adapter}:seen_mismatch"] += 1
+    return Check(
+        "source_bounds", not violations,
+        {"files_checked": dict(checked), "rows": rows_total, "candidate_bound": bound_total,
+         "synthetic_records": synthetic_total, "tallied_extent": dict(extents),
+         "violations": dict(violations)})
+
+
+def check_coverage(discovered: list[tuple[str, Path]], book: dict[str, dict],
+                   sessions: list[dict]) -> Check:
+    """Every discovered content file has a tally, and a file with rows names a published session."""
+    published = {row["session"] for row in sessions}
+    aliases = {row["alias"] for row in sessions if row.get("alias")}
+    missing = 0
+    unmapped = 0
+    empty = 0
+    contributing = 0
+    skipped_only = 0
+    for adapter, path in discovered:
+        entry = book.get(str(path))
+        if entry is None:
+            missing += 1
+            continue
+        if entry.get("seen", 0) == 0:
+            empty += 1
+            continue
+        if entry.get("rows", 0) > 0:
+            contributing += 1
+            if adapter in shapes.JSONL_ADAPTERS:
+                ids = shapes.source_session_ids(adapter, path)
+                if not (ids & published or ids & aliases):
+                    unmapped += 1
+        else:
+            skipped_only += 1
+    return Check(
+        "file_coverage", missing == 0 and unmapped == 0,
+        {"discovered": len(discovered), "without_tally": missing, "rows_without_session": unmapped,
+         "empty_files": empty, "contributing": contributing, "skips_only": skipped_only})
+
+
+def check_duplicate_ids(messages: list[dict]) -> Check:
+    ids = Counter(row["id"] for row in messages)
+    turns = Counter((row["session"], row["turn"]) for row in messages)
+    dup_ids = sum(1 for count in ids.values() if count > 1)
+    dup_turns = sum(1 for count in turns.values() if count > 1)
+    return Check("duplicate_ids", dup_ids == 0 and dup_turns == 0,
+                 {"messages": len(messages), "duplicate_ids": dup_ids, "duplicate_turns": dup_turns})
+
+
+def check_family_closure(messages: list[dict], sessions: list[dict], corpus: Path) -> Check:
+    message_sessions = {row["session"] for row in messages}
+    index_sessions = {row["session"] for row in sessions}
+    counts = {"sessions": len(index_sessions)}
+    problems: Counter = Counter()
+    if message_sessions != index_sessions:
+        problems["message_session_mismatch"] = len(message_sessions ^ index_sessions)
+    per_session = Counter(row["session"] for row in messages)
+    for row in sessions:
+        if per_session.get(row["session"]) != row.get("n"):
+            problems["n_mismatch"] += 1
+    parents = {row["session"]: row["parent"] for row in sessions if row.get("parent")}
+    aliases = {row["alias"]: row["session"] for row in sessions if row.get("alias")}
+    counts["side_sessions"] = len(parents)
+    counts["aliases"] = len(aliases)
+    counts["orphan_parents"] = sum(1 for parent in parents.values() if parent not in index_sessions)
+    alias_counter = Counter(row["alias"] for row in sessions if row.get("alias"))
+    problems["alias_claimed_twice"] = sum(1 for n in alias_counter.values() if n > 1)
+    problems["alias_names_indexed_session"] = sum(1 for alias in aliases if alias in index_sessions)
+    with sqlite3.connect(f"file:{corpus}?mode=ro", uri=True) as connection:
+        family = {session: (root, side) for session, root, side in connection.execute(
+            "SELECT session, root, side FROM session_family")}
+    counts["family_rows"] = len(family)
+    for session in index_sessions:
+        entry = family.get(session)
+        if entry is None:
+            problems["session_without_family_row"] += 1
+            continue
+        root, side = entry
+        if bool(side) != (session in parents):
+            problems["side_flag_mismatch"] += 1
+        if root not in family or family[root][0] != root:
+            problems["root_not_fixed_point"] += 1
+    for alias, session in aliases.items():
+        entry = family.get(alias)
+        if entry is None or session not in family or entry[0] != family[session][0]:
+            problems["alias_family_mismatch"] += 1
+    problems = +problems
+    return Check("family_closure", not problems, {**counts, "problems": dict(problems)})
+
+
+def _source_cwd(adapter: str, path: Path) -> str | None:
+    for ordinal, (_offset, _raw, record) in enumerate(shapes.iter_records(path)):
+        if ordinal >= 400 or not isinstance(record, dict):
+            if ordinal >= 400:
+                break
+            continue
+        if adapter == "claude" and isinstance(record.get("cwd"), str):
+            return record["cwd"]
+        if adapter == "codex" and record.get("type") == "session_meta":
+            payload = record.get("payload")
+            return payload.get("cwd") if isinstance(payload, dict) else None
+    return None
+
+
+def _bare_container_cwd(agent: str, session: str, book: dict[str, dict]) -> bool:
+    """True when every source file of the session starts in a container with no repository below."""
+    seen = False
+    for path, entry in book.items():
+        if entry.get("agent") != agent or path.startswith("\0") or not Path(path).is_file():
+            continue
+        if session not in shapes.source_session_ids(agent, Path(path)):
+            continue
+        cwd = _source_cwd(agent, Path(path))
+        if cwd is None:
+            continue
+        seen = True
+        if scrub.project_root(cwd) is not None:
+            return False
+    return seen
+
+
+def check_project_labels(sessions: list[dict], book: dict[str, dict] | None = None) -> Check:
+    """Name-form labels are never a container unless the session's own cwd was that bare container."""
+    generic: Counter = Counter()
+    bare: Counter = Counter()
+    empty = 0
+    labels: Counter = Counter()
+    for row in sessions:
+        label = row.get("project", "")
+        if not label:
+            empty += 1
+            continue
+        labels[row["agent"]] += 1
+        if row["agent"] in PATH_LABEL_ADAPTERS or label.startswith(("/", "~", "\\")) or (
+                len(label) > 2 and label[1] == ":"):
+            continue
+        leaf = label.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+        if leaf in GENERIC_CONTAINERS or label.lower() in GENERIC_CONTAINERS:
+            if book is not None and _bare_container_cwd(row["agent"], row["session"], book):
+                bare[row["agent"]] += 1
+            else:
+                generic[row["agent"]] += 1
+    return Check("project_labels", not generic and empty == 0,
+                 {"sessions_per_agent": dict(labels), "generic_container_labels": dict(generic),
+                  "bare_container_cwd_labels": dict(bare), "empty_labels": empty})
+
+
+def check_per_adapter_bounds(messages: list[dict], book: dict[str, dict]) -> Check:
+    published: Counter = Counter(row["agent"] for row in messages)
+    user_rows: Counter = Counter(row["agent"] for row in messages if row["who"] == "user")
+    tallied: Counter = Counter()
+    for entry in book.values():
+        tallied[entry.get("agent", "?")] += entry.get("rows", 0)
+    over = {agent: (published[agent], tallied[agent]) for agent in published
+            if published[agent] > tallied[agent]}
+    return Check("per_adapter_row_bounds", not over,
+                 {"published_rows": dict(published), "user_rows": dict(user_rows),
+                  "tallied_rows": dict(tallied), "published_over_tallied": over})
+
+
+def check_warm_identity(before: dict[str, str], after: dict[str, str]) -> Check:
+    changed = sorted(name for name in before if after.get(name) != before[name])
+    missing = sorted(name for name in before if name not in after)
+    return Check("warm_reindex_identity", not changed and not missing,
+                 {"artifacts": len(before), "changed": changed, "missing": missing})
+
+
+def _parse_handle(handle: str) -> tuple[str, int, str] | None:
+    body = handle.lstrip("@")
+    if ":" not in body:
+        return None
+    session, _, rest = body.partition(":")
+    rest = rest.split("~", 1)[0]
+    turn, _, digest = rest.partition(".")
+    if not turn.isdigit() or len(digest) != 4:
+        return None
+    return session, int(turn), digest
+
+
+def check_handle_round_trip(runner, messages: list[dict], sessions: list[dict], *,
+                            sample: int = 24, seed: int = 11, corpus: Path | None = None) -> Check:
+    """search/chats handles reopen through `around --json` at the same session, turn and digest."""
+    rng = random.Random(seed)
+    by_key = {(row["session"], row["turn"]): row for row in messages}
+    published: dict[tuple[str, int], set[str]] = defaultdict(set)
+    if corpus is not None:
+        with sqlite3.connect(f"file:{corpus}?mode=ro", uri=True) as connection:
+            for session, turn, text in connection.execute("SELECT session, turn, text FROM msgs"):
+                published[(session, turn)].add(content_digest(text or ""))
+    chats = runner.cli(["chats", "--json", "-n", str(max(sample * 4, 50))])
+    handles = []
+    for row in runner.json_rows(chats):
+        handle = row.get("latest_handle")
+        if handle:
+            handles.append((handle, row["session"], "chat"))
+    for row in rng.sample(sessions, min(3, len(sessions))):
+        words = [word for word in row.get("first_text", "").split() if word.isalnum() and len(word) >= 4]
+        if not words:
+            continue
+        searched = runner.cli(["search", "--json", "-n", "100", words[0]])
+        for hit in runner.json_rows(searched):
+            if hit.get("handle") and hit.get("session"):
+                handles.append((hit["handle"], hit["session"], hit.get("who") or "hit"))
+    if len(handles) > sample:
+        handles = rng.sample(handles, sample)
+    aliases = [(row["alias"], row["session"]) for row in sessions if row.get("alias")]
+    if len(aliases) > sample:
+        aliases = rng.sample(aliases, sample)
+    failures: Counter = Counter()
+    for handle, session, who in handles:
+        parsed = _parse_handle(handle)
+        if parsed is None:
+            failures[f"{who}:unparseable_handle"] += 1
+            continue
+        prefix, turn, digest = parsed
+        if not session.startswith(prefix.split("~")[0]) and prefix != session:
+            failures[f"{who}:handle_prefix_mismatch"] += 1
+        if (session, turn) not in by_key:
+            failures[f"{who}:turn_not_indexed"] += 1
+        if corpus is not None and digest not in published.get((session, turn), set()):
+            failures[f"{who}:digest_not_in_corpus"] += 1
+        opened = runner.cli(["around", handle, "--json"])
+        rows = runner.json_rows(opened) if opened.returncode == 0 else []
+        meta = next((row for row in rows if row.get("kind") == "agrep-meta"), None)
+        shown = [row for row in rows if row.get("kind") == "msg" and row.get("turn") == turn]
+        if opened.returncode != 0 or meta is None:
+            failures[f"{who}:around_failed"] += 1
+            payload = opened.stdout.strip().splitlines()[0][:200] if opened.stdout.strip() else ""
+            code = re.search(r'"code":\s*"([a-z-]+)"', payload)
+            failures[f"{who}:around_{code.group(1) if code else f'rc{opened.returncode}'}"] += 1
+            continue
+        if meta.get("scope", {}).get("session") != session:
+            failures[f"{who}:around_session_mismatch"] += 1
+        if not shown:
+            failures[f"{who}:around_turn_missing"] += 1
+    for alias, session in aliases:
+        opened = runner.cli(["around", "@" + alias, "--json"])
+        rows = runner.json_rows(opened) if opened.returncode == 0 else []
+        meta = next((row for row in rows if row.get("kind") == "agrep-meta"), None)
+        if meta is None or meta.get("scope", {}).get("session") != session:
+            failures["alias_around_mismatch"] += 1
+    return Check("handle_round_trip", not failures,
+                 {"handles_checked": len(handles), "aliases_checked": len(aliases),
+                  "failures": dict(failures)})
+
+
+def check_search_first_lines(runner, sessions: list[dict], *, sample: int = 12,
+                             seed: int = 5) -> Check:
+    rng = random.Random(seed)
+    candidates = [row for row in sessions if len(row.get("first_text", "")) >= 12]
+    if len(candidates) > sample:
+        candidates = rng.sample(candidates, sample)
+    misses = 0
+    for row in candidates:
+        words = [word for word in row["first_text"].split() if word.isalnum() and len(word) >= 3]
+        if not words:
+            continue
+        query = " ".join(words[:3])
+        found = runner.cli(["search", "--json", "-n", "50", query])
+        hits = {hit.get("session") for hit in runner.json_rows(found) if hit.get("session")}
+        if row["session"] not in hits:
+            misses += 1
+    return Check("search_first_lines", misses == 0,
+                 {"queried": len(candidates), "misses": misses})
