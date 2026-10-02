@@ -1,0 +1,13 @@
+exit: 0
+--- stdout ---
+cedar  ·  estimated active time 34m  ·  3 chats  ·  16 turns  ·  last 17h
+  worked on:
+    @33333333 pi 17h 4t (+1 side)  Review the cedar lantern plan with a sidecar advisor. · agrep around @33333333:3.3bfd
+    @55555555 codex 1d 4t  Audit the copper lantern deployment manifest for cedar. · agrep around @55555555:3.a301
+    @11111111 claude 2d 8t  Please map the copper lantern launch checklist for cedar. · agrep around @11111111:7.d9cd
+maple  ·  estimated active time 5m  ·  1 chat  ·  3 turns  ·  last 4d
+  worked on:
+    @22222222 pi 4d 3t  Check the maple lantern against the glacier inventory. · agrep around @22222222:2.adc8
+--- stderr ---
+2 projects, 4 chats in the last 30d, most active first · estimated active time with a 20m idle cap, side chats folded into their family
+excluded 1 chat from the current window

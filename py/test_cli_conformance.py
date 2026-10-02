@@ -96,6 +96,14 @@ CASES = (
     Case("correct_around_cap", correction_of="refuse_around_cap"),
     Case("refuse_doctor_actions", ("doctor", "--json", "--fix", "--setup"), exit_code=2),
     Case("correct_doctor_actions", correction_of="refuse_doctor_actions"),
+    Case("refuse_unknown_limit", ("lantern", "--limit", "2"), exit_code=2),
+    Case("correct_unknown_limit", correction_of="refuse_unknown_limit"),
+    Case("why_session", ("why", "{session}")),
+    Case("why_handle", ("why", "{handle}")),
+    Case("why_outside_stores", ("why", "/nonexistent/agrep-why.jsonl"), exit_code=1),
+    Case("summary_brief", ("summary", "--since", "30d")),
+    Case("summary_pending", ("summary", "pending", "--since", "30d"), exit_code=1),
+    Case("help", ("--help",)),
     Case("version", ("--version",)),
     Case("status", ()),
 )
@@ -280,6 +288,10 @@ class ConformanceSandbox:
         text = re.sub(r"(?<=agrep --more )m\.[A-Za-z0-9_-]{8}(?![A-Za-z0-9_-])",
                       "m.<TOKEN>", text)
         text = re.sub(r"\btook \d+(?:\.\d+)?s\b", "took <DURATION>s", text)
+        # The slow-command self-explanation appears only when a loaded host crosses its threshold.
+        text = re.sub(r"(?m)^took <DURATION>s\b.*\n?", "", text)
+        # Ranking scores decay with age, so they drift between runs; row order pins the ranking.
+        text = re.sub(r'("score"\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', r'\1"<SCORE>"', text)
         text = re.sub(r"(?<=last indexed )\d+[smhd](?= ago)", "<AGE>", text)
         text = re.sub(r'("(?:corpus_age_s|age_s)"\s*:\s*)\d+(?:\.\d+)?',
                       r'\1"<AGE>"', text)

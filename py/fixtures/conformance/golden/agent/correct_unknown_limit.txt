@@ -1,0 +1,7 @@
+exit: 0
+--- stdout ---
+@33333333:3.3bfd pi/user cedar 17h Confirm the copper lantern handoff after the recap.
+@33333333:0.1afe pi/user cedar 17h Review the cedar lantern plan with a sidecar advisor.
+--- stderr ---
+25 matches · broader rerun (may repeat): agrep --deeper m.<TOKEN>
+excluded 4 hits from the current window

@@ -1,0 +1,4 @@
+exit: 2
+--- stdout ---
+--- stderr ---
+agrep: unrecognized arguments: --limit 2 (-n N caps hits here); run: agrep search lantern -n 2

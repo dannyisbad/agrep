@@ -1,6 +1,6 @@
 exit: 0
 --- stdout ---
-── @33333333:3.3bfd · pi · cedar · 2000-01-19 18:05
+── @33333333:3.3bfd · pi · cedar · 2000-01-19 18:35
      0 user: Review the cedar lantern plan with a sidecar advisor.
      0 agent: The sidecar advisor will inspect the cedar lantern rollback plan.
      1 user: Preserve the saffron recap after compaction.

@@ -1,7 +1,7 @@
-{"type":"session","id":"33333333-3333-4333-8333-333333333333","version":3,"cwd":"{{home}}/projects/cedar","timestamp":"{{t-1d+6h}}"}
-{"type":"message","id":"omp-0","parentId":null,"timestamp":"{{t-1d+6h+1m}}","message":{"role":"user","content":[{"type":"text","text":"Review the cedar lantern plan with a sidecar advisor."}]}}
-{"type":"message","id":"omp-1","parentId":"omp-0","timestamp":"{{t-1d+6h+2m}}","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"The sidecar advisor will inspect the cedar lantern rollback plan."}]}}
-{"type":"message","id":"omp-2","parentId":"omp-1","timestamp":"{{t-1d+6h+3m}}","message":{"role":"user","content":[{"type":"text","text":"Preserve the saffron recap after compaction."}]}}
-{"type":"compaction","id":"omp-compact","parentId":"omp-2","timestamp":"{{t-1d+6h+4m}}","summary":"Saffron recap: the copper lantern review is complete; preserve the rollback plan and turquoise latch.","tokensBefore":42000,"firstKeptEntryId":"omp-2"}
-{"type":"message","id":"omp-3","parentId":"omp-compact","timestamp":"{{t-1d+6h+5m}}","message":{"role":"user","content":[{"type":"text","text":"Confirm the copper lantern handoff after the recap."}]}}
-{"type":"message","id":"omp-4","parentId":"omp-3","timestamp":"{{t-1d+6h+6m}}","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"The copper lantern handoff retains the rollback plan."}]}}
+{"type":"session","id":"33333333-3333-4333-8333-333333333333","version":3,"cwd":"{{home}}/projects/cedar","timestamp":"{{t-1d+6h+30m}}"}
+{"type":"message","id":"omp-0","parentId":null,"timestamp":"{{t-1d+6h+31m}}","message":{"role":"user","content":[{"type":"text","text":"Review the cedar lantern plan with a sidecar advisor."}]}}
+{"type":"message","id":"omp-1","parentId":"omp-0","timestamp":"{{t-1d+6h+32m}}","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"The sidecar advisor will inspect the cedar lantern rollback plan."}]}}
+{"type":"message","id":"omp-2","parentId":"omp-1","timestamp":"{{t-1d+6h+33m}}","message":{"role":"user","content":[{"type":"text","text":"Preserve the saffron recap after compaction."}]}}
+{"type":"compaction","id":"omp-compact","parentId":"omp-2","timestamp":"{{t-1d+6h+34m}}","summary":"Saffron recap: the copper lantern review is complete; preserve the rollback plan and turquoise latch.","tokensBefore":42000,"firstKeptEntryId":"omp-2"}
+{"type":"message","id":"omp-3","parentId":"omp-compact","timestamp":"{{t-1d+6h+35m}}","message":{"role":"user","content":[{"type":"text","text":"Confirm the copper lantern handoff after the recap."}]}}
+{"type":"message","id":"omp-4","parentId":"omp-3","timestamp":"{{t-1d+6h+36m}}","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"The copper lantern handoff retains the rollback plan."}]}}
