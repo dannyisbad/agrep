@@ -27,6 +27,7 @@ DURABLE_ARTIFACTS = ("messages.jsonl", "sessions.jsonl", "replies.jsonl", "intak
                      "boundary_stats.json", "event_stats.json")
 _FNV_OFFSET_16 = 0xCBF29CE484222325 & 0xFFFF
 _FNV_PRIME_16 = 0x100000001B3 & 0xFFFF
+IN_CHAT_HITS = 100_000
 
 
 @dataclass
@@ -453,7 +454,10 @@ def check_search_first_lines(runner, sessions: list[dict], messages: list[dict],
         if turn is None:
             outcomes["first_line_row_not_published"] += 1
             continue
-        found = runner.cli(["search", "--json", "--chat", row["session"], "-n", "50", " ".join(rarest)])
+        # Orchestrated subagents repeat their opening prompt in every turn, so a hit cap inside
+        # one chat would measure rank again; the chat itself bounds the hits.
+        found = runner.cli(["search", "--json", "--chat", row["session"], "-n", str(IN_CHAT_HITS),
+                            " ".join(rarest)])
         if found.returncode not in (0, 1):
             outcomes[f"search_rc{found.returncode}"] += 1
             continue
