@@ -231,10 +231,10 @@ def _family_metadata(sessions: list[str], index: dict[str, dict]) -> dict[str, t
         for session in sessions}
 
 
-def _load_transcripts(chats: dict[str, _Chat]) -> bool:
-    """Fill turns and replies from the search db, else from the materialized JSONL.
-    Scope and last_ts come from sessions.jsonl, so a db behind that publication is skipped
-    whole: one chat never mixes a fresh session row with older turns."""
+def _load_transcripts(chats: dict[str, _Chat], excludes=None) -> bool:
+    """Fill turns and replies from the search db, else from the materialized JSONL. A db behind
+    sessions.jsonl is skipped whole so one chat never mixes generations. `excludes(session,
+    turn)` withholds rows before recaps fold, so a withheld recap is never activity or a reply."""
     sessions = list(chats)
     try:
         db = search._load_corpusdb().connect(allow_stale=True)
@@ -266,6 +266,7 @@ def _load_transcripts(chats: dict[str, _Chat]) -> bool:
                     chat.turns.append(_Turn(turn, int(ts or 0), str(who or "user"),
                                             str(text or ""), digest))
             for chat in chats.values():
+                _withhold(chat, excludes)
                 _fold_recaps(chat)
             return True
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
@@ -290,8 +291,21 @@ def _load_transcripts(chats: dict[str, _Chat]) -> bool:
             reply = replies.get(str(row.get("id") or ""))
             if reply is not None and reply["reply"]:
                 chat.replies[turn] = reply["reply"]
+        _withhold(chat, excludes)
         _fold_recaps(chat)
     return False
+
+
+def _withhold(chat: _Chat, excludes) -> None:
+    if excludes is None:
+        return
+    kept = [row for row in chat.turns if not excludes(chat.session, row.turn)]
+    if len(kept) == len(chat.turns):
+        return
+    chat.withheld = True
+    chat.turns = kept
+    kept_turns = {row.turn for row in kept}
+    chat.replies = {turn: text for turn, text in chat.replies.items() if turn in kept_turns}
 
 
 def _fold_recaps(chat: _Chat) -> None:
@@ -853,7 +867,8 @@ def _delegate_words(payload: object) -> list[str]:
     return _json_strings(payload)
 
 
-# a fragment this short ("running", an id) occurs in replies that were never handed back
+# a fragment this short ("running", an id) occurs in replies that were never handed back; only
+# a candidate equal to the whole reply proves receipt at any length
 _DELIVERY_MIN_CHARS = 24
 
 
@@ -864,8 +879,6 @@ def _delivers(output: str, final: str) -> bool:
     body = _TASK_RESULT_BODY_RE.search(text) if text.startswith("<task-result") else None
     if body is not None:
         text = body.group(1).strip()
-    if text and text == final:
-        return True
     candidates = [text]
     if text[:1] in ("{", "["):
         try:
@@ -874,6 +887,8 @@ def _delivers(output: str, final: str) -> bool:
             pass
     reply_head = final[:160]
     for candidate in candidates:
+        if candidate and candidate == final:
+            return True
         head = candidate[:160]
         if len(head) >= _DELIVERY_MIN_CHARS and head in final:
             return True
@@ -1108,28 +1123,22 @@ def main(argv: list[str] | None = None) -> int:
             sides.setdefault(session, []).append(side_chat)
     common.lap("identity-index", f"{len(roots)} root chats")
 
-    _load_transcripts(chats)
+    _load_transcripts(chats, self_policy.excludes if self_policy is not None else None)
     self_dropped = 0
-    if self_policy is not None:
-        for session in list(chats):
-            chat = chats[session]
-            kept = [row for row in chat.turns if not self_policy.excludes(session, row.turn)]
-            if len(kept) != len(chat.turns):
-                chat.withheld = True
-                chat.turns = kept
-                kept_turns = {row.turn for row in kept}
-                chat.replies = {turn: text for turn, text in chat.replies.items()
-                                if turn in kept_turns}
-                if not kept:
-                    chats.pop(session)
-                    if session in roots:
-                        roots.pop(session)
-                        self_dropped += 1
-                        sides.pop(session, None)
-                    else:
-                        sides[chat.root] = [c for c in sides.get(chat.root, ()) if c is not chat]
-                elif session in roots:
-                    self_dropped += 1
+    for session in list(chats):
+        chat = chats[session]
+        if not chat.withheld:
+            continue
+        if not chat.turns:
+            chats.pop(session)
+            if session in roots:
+                roots.pop(session)
+                self_dropped += 1
+                sides.pop(session, None)
+            else:
+                sides[chat.root] = [c for c in sides.get(chat.root, ()) if c is not chat]
+        elif session in roots:
+            self_dropped += 1
     for chat in chats.values():
         _load_events(chat)
     common.lap("transcripts", f"{len(chats)} chats")

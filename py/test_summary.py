@@ -104,6 +104,10 @@ MX_OMP_CAPPED_INIT = "om000008-0528-4000-8000-000000000528"  # 14-item init cut 
 MX_OMP_COMPACTED_MID_TURN = "om000009-0529-4000-8000-000000000529"
 MX_CODEX_WAIT_TIMED_OUT = "cx000008-0548-4000-8000-000000000548"
 MX_CODEX_WAIT_TIMED_OUT_SIDE = "01990808-0001-7000-8000-000000000801"
+MX_CODEX_SHORT_HAND_BACK = "cx000009-0549-4000-8000-000000000549"  # completed text is 22 chars
+# self-mx, timed relative to now: the caller's own chat auto-compacted mid-turn at t-90m
+SELF_TOOLS_ONLY = "db000001-0601-4000-8000-000000000601"  # only a tool call after the recap
+SELF_LIVE_PROMPT = "db000002-0602-4000-8000-000000000602"  # a live-window prompt at t-70m
 
 
 class SummarySandbox:
@@ -574,6 +578,13 @@ class SummaryTests(unittest.TestCase):
                          ("todo_open", "side-chat", MX_CODEX_WAIT_TIMED_OUT_SIDE,
                           ["rebuild the lima index", "report the lima rebuild"]))
 
+    def test_short_completed_codex_hand_back_is_received(self) -> None:
+        # wait_agent returned {"status":{id:{"completed":"Done, no stale caches."}}} and the
+        # worker's final reply is exactly that 22-char text; the root then replied cleanly
+        pending = self._pending_by_session("--agent", "codex")
+        self.assertNotIn(MX_CODEX_SHORT_HAND_BACK, pending)
+        self.assertIn(MX_CODEX_WAIT_TIMED_OUT, pending)
+
     def test_compaction_moments_count_as_activity_but_not_as_turns(self) -> None:
         # claude: 09:00 prompt, 09:30 auto-compaction, 10:00 prompt -> two capped 20m stretches;
         # omp: 09:00 prompt, 09:22 compaction, 09:24 prompt -> 20m + 2m
@@ -654,8 +665,9 @@ class SummaryTests(unittest.TestCase):
     def test_default_window_is_the_last_seven_days(self) -> None:
         meta, projects = _rows(self._ok("--json"))
         self.assertEqual(meta["window"]["since"], "7d")
-        self.assertEqual([(p["project"], p["chats"]) for p in projects], [("atlas", 1)])
-        self.assertEqual([c["session"] for c in projects[0]["worked_on"]], [S7])
+        self.assertEqual([(p["project"], p["chats"]) for p in projects],
+                         [("self-mx", 2), ("atlas", 1)])
+        self.assertEqual([c["session"] for c in projects[1]["worked_on"]], [S7])
 
     def test_until_alone_is_the_seven_days_before_it(self) -> None:
         meta, projects = _rows(self._ok("--until", "2026-03-20", "--json"))
@@ -681,18 +693,47 @@ class SummaryTests(unittest.TestCase):
 
     def test_calling_agents_own_chat_is_excluded_and_disclosed(self) -> None:
         caller = {"CLAUDE_CODE_SESSION_ID": S7}
-        hidden = self.sandbox.summary("pending", "--json", env_overrides=caller)
+        hidden = self.sandbox.summary("pending", "--project", "atlas", "--json",
+                                      env_overrides=caller)
         self.assertNotEqual(hidden.returncode, 0)
         meta, items = _rows(hidden)
         self.assertEqual((items, meta["self_excluded"]), ([], 1))
-        human = self.sandbox.summary("pending", env_overrides=caller)
+        human = self.sandbox.summary("pending", "--project", "atlas", env_overrides=caller)
         self.assertIn("excluded 1 chat from the current window", human.stderr)
-        with_self = self._ok("pending", "--self", "--json", env_overrides=caller)
+        with_self = self._ok("pending", "--project", "atlas", "--self", "--json",
+                             env_overrides=caller)
         self.assertEqual([i["session"] for i in _rows(with_self)[1]], [S7])
         # a human shell sees the chat without any notice
-        plain = self._ok("pending", "--json")
+        plain = self._ok("pending", "--project", "atlas", "--json")
         self.assertEqual([i["session"] for i in _rows(plain)[1]], [S7])
         self.assertEqual(_rows(plain)[0]["self_excluded"], 0)
+
+    def test_callers_live_window_starts_at_its_recap_before_folding(self) -> None:
+        # the live window begins at the newest recap: its moment and everything after it are
+        # the caller's own, so neither counts as time, a turn or an open item
+        def chats_for(session):
+            _meta, projects = _rows(self._ok("--project", "self-mx", "--json",
+                                             env_overrides={"CLAUDE_CODE_SESSION_ID": session}))
+            entry = projects[0]
+            return ({c["session"]: c for c in entry["worked_on"]},
+                    [o["session"] for o in entry["open"]])
+        chats, open_items = chats_for(SELF_TOOLS_ONLY)
+        own = chats[SELF_TOOLS_ONLY]
+        self.assertEqual((own.get("self"), own["turns"], own["estimated_active_ms"]),
+                         (True, 1, 20 * MINUTE))
+        self.assertNotIn(SELF_TOOLS_ONLY, open_items)
+        chats, _open = chats_for(SELF_LIVE_PROMPT)
+        own = chats[SELF_LIVE_PROMPT]
+        self.assertEqual((own.get("self"), own["turns"], own["estimated_active_ms"]),
+                         (True, 1, 20 * MINUTE))
+        # a human shell sees the whole chat: the compaction is activity and the open turn shows
+        _meta, projects = _rows(self._ok("--project", "self-mx", "--json"))
+        chats = {c["session"]: c for c in projects[0]["worked_on"]}
+        self.assertEqual((chats[SELF_TOOLS_ONLY]["estimated_active_ms"],
+                          chats[SELF_LIVE_PROMPT]["estimated_active_ms"]),
+                         (30 * MINUTE, 40 * MINUTE))
+        self.assertEqual([(o["session"], o["status"]) for o in projects[0]["open"]],
+                         [(SELF_TOOLS_ONLY, "agent_work_incomplete")])
 
     # --- json shape and argument contract ---
 
