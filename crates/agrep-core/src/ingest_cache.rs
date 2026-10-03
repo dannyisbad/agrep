@@ -8198,9 +8198,14 @@ where
                     .iter()
                     .any(|listed| source_path_eq(listed, path))
         });
+    // Two agreeing clean-absence preflights are the repeated witness a discarded base lacks;
+    // unrelated churn in other stores must not veto them.
+    let repeated_whole_store_absence =
+        file_count == 0 && cache.repeated_absent_agents.contains(agent);
     if cache.repair_mode
         && (missing_material_source || missing_expected_source)
         && !cache.stable_deletions_provable()
+        && !repeated_whole_store_absence
     {
         cache.mark_guarded_stale();
         if missing_expected_source && !cached_material_root {

@@ -4138,6 +4138,63 @@ fn undecodable_cache_recovery_needs_two_observations_for_a_vanished_store() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// A discarded base, a deleted whole store and unrelated churn between runs: the per-agent
+/// repeated clean absence must converge on the second observation without a byte-identical pair.
+#[test]
+fn discarded_base_whole_store_deletion_converges_despite_unrelated_churn() {
+    let home = opencode_home();
+    copy_dir(&fixture_home("claude"), &home);
+    let churn = claude_source(&home);
+    let store = home.join(".local").join("share").join("opencode");
+    let data = temp_dir("discarded-base-churn-data");
+    ingest_into("all", &home, &data, false);
+    let has_opencode_rows = |data: &Path| normalize(data).contains("\"agent\":\"opencode\"");
+    assert!(
+        has_opencode_rows(&data),
+        "the opencode fixture published no rows"
+    );
+
+    fs::remove_dir_all(&store).unwrap();
+    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+    append_claude_churn(&churn, 4);
+    let first = ingest_output("all", &home, &data, false);
+    assert_retained_generation_refusal(&first);
+    assert!(
+        has_opencode_rows(&data),
+        "a single absent observation dropped the published store"
+    );
+    assert!(data.join(".source_absence_pending").exists());
+    assert!(data.join(".ingest_pending.bin").exists());
+
+    append_claude_churn(&churn, 5);
+    let second = ingest_output("all", &home, &data, false);
+    assert!(
+        second.status.success(),
+        "repeated clean absence failed to converge under unrelated churn:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let published = normalize(&data);
+    assert!(
+        !has_opencode_rows(&data),
+        "a confirmed store deletion left rows behind"
+    );
+    assert!(
+        published.contains("churn probe 5"),
+        "the surviving store lost its newest turn"
+    );
+    assert!(!data.join(".source-health.json").exists());
+    assert!(!data.join(".ingest_pending.bin").exists());
+    assert!(!data.join(".source_absence_pending").exists());
+
+    append_claude_churn(&churn, 6);
+    ingest_into("all", &home, &data, false);
+    assert!(normalize(&data).contains("churn probe 6"));
+    assert!(!has_opencode_rows(&data));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 /// The row-loss guard outranks the discard: with no cache to serve a denied project from, the
 /// pass may not publish the reduced generation, and granting the permission converges it.
 #[cfg(unix)]
