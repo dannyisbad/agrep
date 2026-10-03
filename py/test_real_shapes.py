@@ -322,9 +322,10 @@ class SnapshotTests(unittest.TestCase):
         self.discovered = [("claude", self.transcript), ("opencode", self.database)]
         self.dest = self.temp / "frozen"
 
-    def freeze(self) -> dict:
+    def freeze(self, home: Path | None = None, discovered: list | None = None) -> dict:
         try:
-            return snapshot.freeze(self.home, self.dest, self.discovered)
+            return snapshot.freeze(home or self.home, self.dest,
+                                   self.discovered if discovered is None else discovered)
         except snapshot.SnapshotError as error:
             if "copy-on-write clones need" in str(error):
                 raise unittest.SkipTest(str(error))
@@ -359,16 +360,16 @@ class SnapshotTests(unittest.TestCase):
     def test_home_reached_through_a_symlink_is_frozen(self) -> None:
         # macOS temp dirs live under /var -> /private/var, so a given path rarely equals its resolved one
         link = self.temp.parent / f"{self.temp.name}-link"
-        link.symlink_to(self.temp, target_is_directory=True)
+        try:
+            link.symlink_to(self.temp, target_is_directory=True)
+        except OSError as error:
+            if os.name != "nt":
+                raise
+            raise unittest.SkipTest(f"symlinks need a privilege here: {error}") from error
         self.addCleanup(link.unlink)
         home = link / "home"
         discovered = [(adapter, home / path.relative_to(self.home)) for adapter, path in self.discovered]
-        try:
-            manifest = snapshot.freeze(home, self.dest, discovered)
-        except snapshot.SnapshotError as error:
-            if "copy-on-write clones need" in str(error):
-                raise unittest.SkipTest(str(error))
-            raise
+        manifest = self.freeze(home, discovered)
         self.assertEqual({root["relative"] for root in manifest["roots"]},
                          {".claude/projects", ".local/share/opencode"})
         frozen = self.dest / self.transcript.relative_to(self.home)

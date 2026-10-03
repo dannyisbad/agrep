@@ -160,7 +160,10 @@ class StoreCensusCacheTests(unittest.TestCase):
     def test_binary_symlink_target_identity_invalidates_cache(self) -> None:
         target = self.binary
         link = self.root / "binary-link"
-        link.symlink_to(target)
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
         self.binary = link
         with mock.patch.object(runtime.subprocess, "Popen", return_value=self.child()):
             self.query()

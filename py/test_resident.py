@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -105,7 +104,13 @@ class ResidentTests(unittest.TestCase):
                                     capture_output=True, timeout=30)
             return result.returncode, result.stdout, result.stderr
         import pty as terminal
+        import termios
         master, slave = terminal.openpty()
+        # Compare the program's own bytes: with output processing on, macOS ptys intermittently
+        # emit an extra CR before a translated newline.
+        attributes = termios.tcgetattr(slave)
+        attributes[1] &= ~termios.OPOST
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
         try:
             process = subprocess.Popen(command, cwd=cwd or ROOT, env=environ,
                                        stdin=subprocess.DEVNULL, stdout=slave,
@@ -425,6 +430,7 @@ assert __import__("threading").active_count() == 1
             self.assertEqual((child.returncode, stdout, stderr), expected)
 
     def test_concurrent_misses_start_one_server(self):
+        import fcntl
         env = {**self.env, "AGREP_RESIDENT_IDLE_S": "8"}
         path = self._socket_path(env)
         before = set(Path(path).parent.glob("*.sock"))
@@ -503,6 +509,7 @@ assert __import__("threading").active_count() == 1
         self.assertEqual(self._call(["--help"], served=True)[0], 0)
 
     def test_socket_removal_retires_server(self):
+        import fcntl
         env = {"AGREP_RESIDENT_IDLE_S": "11"}
         self._warm(env)
         path = self._socket_path({**self.env, **env})
@@ -558,6 +565,7 @@ else:
         self._warm()
 
     def test_stale_stopping_marker_is_reclaimed(self):
+        import fcntl
         env = self._private_runtime(AGREP_RESIDENT_IDLE_S="15")
         with mock.patch.dict(os.environ, env, clear=True):
             marker = Path(resident._directory()) / ".stopping"
@@ -619,6 +627,20 @@ else:
         stderr += self._read_until(err_read)
         self.assertIn(b"disconnected without reporting", stderr)
         self.assertEqual(len(stdout), filler, stdout[filler:])
+
+    def test_end_orphan_treats_an_unsignalable_group_as_gone(self):
+        """macOS answers signal 0 with EPERM for a group whose only member is exiting or a zombie."""
+        sent = []
+
+        def killpg(pid, signum):
+            sent.append((pid, signum))
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        started = time.monotonic()
+        with mock.patch.object(os, "killpg", killpg):
+            resident._end_orphan(424242)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(sent, [(424242, signal.SIGTERM), (424242, signal.SIGCONT), (424242, 0)])
 
     def test_terminal_stop_reaches_served_child(self):
         extra = {"AGREP_RESIDENT_IDLE_S": "14", "AGREP_DEBUG": "1"}

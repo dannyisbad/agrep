@@ -53,7 +53,7 @@ def sealed_env(*, home: Path, data: Path, scratch: Path, binary: Path,
     for name in ("tmp", "rt", "config", "cache", "share", "models", "callers"):
         (scratch / name).mkdir(mode=0o700, parents=True, exist_ok=True)
     store_home = store_home or home
-    return {
+    env = {
         "HOME": str(store_home), "AGREP_HOME": str(store_home),
         "AGREP_DATA_DIR": str(data), "AGREP_DATA_DIR_SOURCE": "env",
         "TMPDIR": str(scratch / "tmp"), "XDG_RUNTIME_DIR": str(runtime),
@@ -66,6 +66,14 @@ def sealed_env(*, home: Path, data: Path, scratch: Path, binary: Path,
         "AGREP_NO_FETCH": "1", "AGREP_RS_BIN": str(binary),
         "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
     }
+    if os.name == "nt":
+        # CPython and the ingest binary need the system roots; store discovery still resolves
+        # under AGREP_HOME, so the sandbox home stays the only one read.
+        env.update({key: os.environ[key] for key in (
+            "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "PATH") if key in os.environ})
+        env.update({"USERPROFILE": str(store_home), "TEMP": str(scratch / "tmp"),
+                    "TMP": str(scratch / "tmp")})
+    return env
 
 
 class CliRunner:
@@ -102,16 +110,26 @@ class CliRunner:
                 rows.append(json.loads(line))
         return rows
 
+    @staticmethod
+    def _process_listing() -> str:
+        """`pid args` per line. Windows has no ps; CIM reports each process's command line."""
+        if os.name == "nt":
+            command = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                       "Get-CimInstance Win32_Process | ForEach-Object "
+                       "{ '{0} {1}' -f $_.ProcessId, $_.CommandLine }"]
+            env = None
+        else:
+            command = ["ps", "-A", "-o", "pid=", "-o", "args="]
+            env = {"PATH": "/usr/bin:/bin"}
+        return subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=30, check=True).stdout
+
     def background_pids(self) -> set[int]:
-        """Children still bound to this data dir; POSIX ps shows argv only, Linux adds /proc environ."""
-        listing = subprocess.run(
-            ["ps", "-A", "-o", "pid=", "-o", "args="], env={"PATH": "/usr/bin:/bin"},
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
-            check=True)
+        """Children still bound to this data dir; the listing shows argv only, Linux adds /proc environ."""
         data = self.env["AGREP_DATA_DIR"]
         marker = f"AGREP_DATA_DIR={data}".encode()
         pids = set()
-        for line in listing.stdout.splitlines():
+        for line in self._process_listing().splitlines():
             fields = line.strip().split(None, 1)
             if len(fields) != 2 or int(fields[0]) == os.getpid():
                 continue
@@ -129,7 +147,9 @@ class CliRunner:
 
     def reap(self) -> int:
         stopped = 0
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        # Windows has no SIGKILL, and os.kill there terminates outright, so one pass suffices.
+        passes = (signal.SIGTERM,) if os.name == "nt" else (signal.SIGTERM, signal.SIGKILL)
+        for sig in passes:
             pids = self.background_pids()
             if not pids:
                 break

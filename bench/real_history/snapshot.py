@@ -52,10 +52,14 @@ def filesystem_type(path: Path) -> str:
 
 
 def require_clone_capable(source: Path, dest_parent: Path) -> str:
+    supported = CLONE_FILESYSTEMS.get(sys.platform)
+    if supported is None:
+        options = "; ".join(f"{name} with {' or '.join(kinds)}" for name, kinds in CLONE_FILESYSTEMS.items())
+        raise SnapshotError(f"{sys.platform} cannot clone; copy-on-write clones need {options}")
     kind = filesystem_type(dest_parent)
-    if kind not in CLONE_FILESYSTEMS.get(sys.platform, ()):
+    if kind not in supported:
         raise SnapshotError(f"{dest_parent} is {kind or 'unknown'}; copy-on-write clones need "
-                            f"{' or '.join(CLONE_FILESYSTEMS.get(sys.platform, ('an unsupported platform',)))}")
+                            f"{' or '.join(supported)}")
     if source.stat().st_dev != dest_parent.stat().st_dev:
         raise SnapshotError(f"{source} and {dest_parent} are on different volumes; cp would copy bytes")
     return kind

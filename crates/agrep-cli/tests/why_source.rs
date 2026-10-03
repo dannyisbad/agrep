@@ -55,6 +55,12 @@ fn by_path<'a>(rows: &'a Value, path: &Path) -> Vec<&'a Value> {
         .collect()
 }
 
+/// The binary joins store roots component by component, so expectations must too: a slash
+/// inside one component never equals Windows's native separator in a string comparison.
+fn under(root: &Path, components: &[&str]) -> std::path::PathBuf {
+    components.iter().fold(root.to_path_buf(), |path, part| path.join(part))
+}
+
 #[test]
 fn projection_without_an_index_reports_missing_derived_files_and_touches_nothing() {
     let home = fixture_home("pi");
@@ -82,21 +88,24 @@ fn projection_without_an_index_reports_missing_derived_files_and_touches_nothing
         .unwrap();
     assert_eq!(pi["fingerprint"], "stat");
     assert_eq!(pi["roots"].as_array().unwrap().len(), 4);
+    let omp_sessions = under(&home, &[".omp", "agent", "sessions"]);
     assert!(pi["roots"]
         .as_array()
         .unwrap()
-        .contains(&Value::String(home.join(".omp/agent/sessions").to_string_lossy().into_owned())));
+        .contains(&Value::String(omp_sessions.to_string_lossy().into_owned())));
     let detected: Vec<_> = payload["detected"]
         .as_array()
         .unwrap()
         .iter()
         .map(|row| (row["name"].as_str().unwrap(), row["root"].as_str().unwrap(), row["count"].as_u64()))
         .collect();
+    let copilot = under(&home, &[".copilot", "session-state"]);
+    let qwen = under(&home, &[".qwen", "tmp"]);
     assert_eq!(
         detected,
         [
-            ("copilot", home.join(".copilot/session-state").to_str().unwrap(), Some(0)),
-            ("qwen", home.join(".qwen/tmp").to_str().unwrap(), Some(0)),
+            ("copilot", copilot.to_str().unwrap(), Some(0)),
+            ("qwen", qwen.to_str().unwrap(), Some(0)),
         ]
     );
     assert!(fs::read_dir(&data).unwrap().next().is_none(), "why-source wrote into the data dir");
@@ -113,11 +122,26 @@ fn projection_after_ingest_joins_sources_cache_claims_and_intake_freshness() {
     let payload = why_source(&home, &data, &[]);
     assert_eq!(before, data_listing(&data), "why-source mutated the data dir");
 
-    let advisor = home.join(
-        ".omp/agent/sessions/-work-beta/2026-02-03T04-05-06-000Z_01940000-0000-7000-8000-000000000003/advisor.jsonl",
+    let advisor = under(
+        &home,
+        &[
+            ".omp",
+            "agent",
+            "sessions",
+            "-work-beta",
+            "2026-02-03T04-05-06-000Z_01940000-0000-7000-8000-000000000003",
+            "advisor.jsonl",
+        ],
     );
-    let alpha = home.join(
-        ".pi/agent/sessions/-work-alpha/2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl",
+    let alpha = under(
+        &home,
+        &[
+            ".pi",
+            "agent",
+            "sessions",
+            "-work-alpha",
+            "2026-01-02T03-04-05-000Z_01930000-0000-7000-8000-000000000001.jsonl",
+        ],
     );
     assert_eq!(payload["cache"]["state"], "ok");
     let claims = by_path(&payload["cache"]["sessions"], &advisor);
@@ -166,7 +190,7 @@ fn projection_after_ingest_joins_sources_cache_claims_and_intake_freshness() {
     assert_eq!(by_path(&changed["sources"], &alpha)[0]["stat_key"], stale["current_key"]);
 
     // A file whose header id differs from its filename id carries the filename id as alias.
-    let renamed_dir = home.join(".pi/agent/sessions/-work-alias");
+    let renamed_dir = under(&home, &[".pi", "agent", "sessions", "-work-alias"]);
     fs::create_dir_all(&renamed_dir).unwrap();
     let renamed = renamed_dir.join("2026-06-01T00-00-00-000Z_aaaaaaaa-0000-7000-8000-00000000000a.jsonl");
     fs::write(

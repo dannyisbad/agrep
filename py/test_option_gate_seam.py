@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import io
 import shlex
 import sys
@@ -483,11 +484,27 @@ class GateRemedyTests(unittest.TestCase):
 
     def test_tail_keeps_the_substring_and_repeated_agent_filters(self) -> None:
         import tail
-        expected = ["--chat", f"chat with spaces {self.HANDLE}", "--agent", "claude",
+        expected = ["--chat", "chat with spaces", "--agent", "claude",
                     "--snapshot", "--agent", "codex"]
         self.assertRemedy(
             tail.main, [*expected, "--events=done"], expected,
             surface.TAIL_OPTION_GATES, ["agrep", "tail"])
+
+    def test_tail_substring_embedding_a_handle_is_corrected_only_where_a_shell_takes_it(self) -> None:
+        import tail
+        expected = ["--chat", f"chat with spaces {self.HANDLE}", "--snapshot"]
+        argv = [*expected, "--events=done"]
+        if sys.platform != "win32":
+            self.assertRemedy(
+                tail.main, argv, expected, surface.TAIL_OPTION_GATES, ["agrep", "tail"])
+        # cmd.exe has no quoting for `@` inside a value: the refusal is named, the paste withheld
+        with mock.patch.object(surface, "render_cli_argv",
+                               functools.partial(surface.render_cli_argv, windows=True)):
+            rc, error = _exit_code(tail.main, argv)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("--events", error)
+        self.assertIn("--snapshot", error)
+        self.assertNotIn("; run: ", error)
 
     def test_doctor_repaired_commands_pass_its_action_parser(self) -> None:
         import doctor

@@ -24,7 +24,8 @@ RESIDENT_KEY_ENV = (
     "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP", "PATH", "PYTHONPATH", "PYTHONHOME",
     "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONCOERCECLOCALE", "PYTHONUNBUFFERED",
-    "PYTHONWARNINGS", "PYTHONSAFEPATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
+    "PYTHONWARNINGS", "PYTHONSAFEPATH", "_PYTHON_SUBPROCESS_USE_POSIX_SPAWN",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
 )
 PRELOAD_MODULES = (
     "cli", "search", "around", "recall", "indexd_runtime", "semantic", "semworker",
@@ -262,9 +263,10 @@ def _start(path: str) -> None:
 
 
 def _kill_group(pid: int, signum: int) -> None:
+    # macOS answers EPERM, not ESRCH, for a group whose only members are exiting or zombies.
     try:
         os.killpg(pid, signum)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -278,7 +280,7 @@ def _end_orphan(pid: int) -> None:
     while time.monotonic() < deadline:
         try:
             os.killpg(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return
         time.sleep(0.01)
     _kill_group(pid, signal.SIGKILL)
