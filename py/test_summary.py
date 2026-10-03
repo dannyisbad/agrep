@@ -118,6 +118,10 @@ MX_CLAUDE_USAGE_LIMIT = "ca000016-0516-4000-8000-000000000516"
 MX_CLAUDE_PROMPT_TOO_LONG = "ca000017-0517-4000-8000-000000000517"
 MX_CLAUDE_SIDE_API_ERROR = "ca000021-0521-4000-8000-000000000521"
 MX_CLAUDE_SIDE_API_ERROR_SIDE = "agent-ca21side01"
+# finished claude replies that only quote an error: mid-sentence, as a sentence opener, own line
+MX_CLAUDE_QUOTED_ERRORS = ("ca000022-0522-4000-8000-000000000522",
+                           "ca000023-0523-4000-8000-000000000523",
+                           "ca000024-0524-4000-8000-000000000524")
 # parked on a question tool: ExitPlanMode, AskUserQuestion (and one answered), omp ask
 MX_CLAUDE_EXIT_PLAN = "ca000018-0518-4000-8000-000000000518"
 MX_CLAUDE_ASK = "ca000019-0519-4000-8000-000000000519"
@@ -641,6 +645,35 @@ class SummaryTests(unittest.TestCase):
                                  ("agent_work_incomplete", "medium", source, evidence))
         self.assertEqual(pending[MX_CLAUDE_SIDE_API_ERROR]["evidence_session"],
                          MX_CLAUDE_SIDE_API_ERROR_SIDE)
+
+    def test_finished_reply_quoting_an_api_error_is_not_pending(self) -> None:
+        pending = self._pending_by_session("--project", "mx-claude")
+        for session in MX_CLAUDE_QUOTED_ERRORS:
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
+        import summary
+        reply = "API Error: 529 " + '{"type":"error","error":{"type":"overloaded_error"}}'
+        fields = {"session": "x", "project": "p", "root": "x", "side": False,
+                  "first_ts": 0, "last_ts": 0, "first_text": ""}
+        self.assertIsNone(summary._api_error(summary._Chat(agent="codex", **fields), reply))
+        claude = summary._Chat(agent="claude", **fields)
+        self.assertEqual(summary._api_error(claude, "Working on it. " + reply), reply)
+
+    def test_capped_question_input_shows_the_question_never_raw_json(self) -> None:
+        import summary
+        cut_inside = ('{"questions":[{"header":"Backend","multiSelect":false,"options":[],'
+                      '"question":"Which cache backend should I use for the uniform serv…')
+        self.assertEqual(summary._question_head({"name": "AskUserQuestion", "input": cut_inside}),
+                         "Which cache backend should I use for the uniform serv…")
+        cut_before = ('{"questions":[{"header":"Backend","multiSelect":false,"options":'
+                      '[{"description":"Shared cache across all API instances; …')
+        self.assertEqual(summary._question_head({"name": "AskUserQuestion", "input": cut_before}),
+                         "asked a question")
+        plan = '{"plan":"## Billing export rewrite\\n\\n1. Split the exporter \\u00e9 into…'
+        self.assertEqual(summary._question_head({"name": "ExitPlanMode", "input": plan}),
+                         "## Billing export rewrite 1. Split the exporter é into…")
+        self.assertEqual(summary._question_head({"name": "ExitPlanMode", "input": '{"options":[{"a'}),
+                         "presented a plan")
 
     def test_unanswered_question_or_plan_tool_is_waiting_on_user(self) -> None:
         pending = self._pending_by_session()

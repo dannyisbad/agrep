@@ -110,14 +110,19 @@ _TASK_RESULT_BODY_RE = re.compile(r"<(?:output|preview)[^>]*>(.*?)(?:</(?:output
                                   re.DOTALL)
 _YIELD_SECTION_RE = re.compile(r'"type"\s*:\s*\[')
 _CONTROL_STOP_RE = re.compile(r"interrupt|abort|cancel|stop", re.IGNORECASE)
-# Claude's synthetic rows (isApiErrorMessage, model "<synthetic>") end a turn's reply; the ingest
-# keeps them as prose joined by one space, so the reply's ending identifies them
+# Claude's synthetic error rows join a turn's reply after one space: only an exact shape ending
+# the reply counts, never prose quoting one
 _API_ERROR_RE = re.compile(
-    r"(?:^|[.!?:)\]`]\s+|\n\s*)(API Error: .+|You've hit your .*?limit\b.*|"
-    r"Claude AI usage limit reached\|\S*|"
-    r"Prompt is too long(?: ·.*)?|Input is too long for requested model.*|"
-    r"Context limit reached ·.*|Request timed out\b.*|Unable to connect to API\b.*|"
-    r"Credit balance is too low\b.*|Server is temporarily limiting requests\b.*)\s*$")
+    r"(?:\A|(?<=\S) )(API Error: (?:\d{3} \{.*\}|\d{3} status code \(no body\)|"
+    r"Repeated 529 Overloaded errors|Connection error\.|Request was aborted\.|"
+    r"Request timed out\.?|Rate limit reached)|"
+    r"Claude AI usage limit reached\|\d+|"
+    r"(?:[\w-]+ )?limit reached [∙·] resets [^\n]{1,60}|"
+    r"You've hit your (?:[\w-]+ )?limit(?: [∙·] resets [^\n]{1,60})?|"
+    r"Prompt is too long(?: [∙·] [^\n]{1,60})?|Input is too long for requested model|"
+    r"Context limit reached [∙·] [^\n]{1,60}|Credit balance is too low|"
+    r"Invalid API key [∙·] [^\n]{1,60}|Request timed out|"
+    r"Unable to connect to API(?: \([A-Z_]+\))?|Server is temporarily limiting requests)\s*\Z")
 # tools that stop the turn until the human answers: claude AskUserQuestion/ExitPlanMode, omp ask,
 # codex request_user_input, opencode question
 _QUESTION_TOOL_RE = re.compile(
@@ -280,7 +285,7 @@ def _load_transcripts(chats: dict[str, _Chat], excludes=None) -> bool:
                     chat.turns.append(_Turn(turn, int(ts or 0), str(who or "user"),
                                             str(text or ""), digest))
             # the db keeps no empty-text row, so a codex compaction survives only as the reply
-            # written after it, filed under the recap's turn: that turn is the recap
+            # written after it, filed under the recap's turn; one with no reply after it is lost here
             for (session, turn), ts in orphan_ts.items():
                 if turn not in seen[session]:
                     seen[session].add(turn)
@@ -783,7 +788,7 @@ def _question_head(event: dict) -> str:
     try:
         payload = json.loads(raw)
     except ValueError:
-        return common.one_line(raw)
+        payload = None
     if isinstance(payload, dict):
         questions = payload.get("questions")
         if isinstance(questions, list):
@@ -793,7 +798,25 @@ def _question_head(event: dict) -> str:
         for key in ("question", "plan", "prompt", "message"):
             if isinstance(payload.get(key), str) and payload[key].strip():
                 return common.one_line(payload[key])
+    # the ingest caps inputs as key-sorted JSON, so `question`/`plan` may survive only as a fragment
+    for key in ("question", "plan"):
+        found = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
+        if found and found.group(1).strip():
+            return common.one_line(_json_fragment(found.group(1)))
+    if payload is None and raw.lstrip().startswith(("{", "[")):
+        name = str(event.get("name") or "")
+        return "presented a plan" if name == "ExitPlanMode" else "asked a question"
     return common.one_line(raw)
+
+
+def _json_fragment(text: str) -> str:
+    """Decode a JSON string body that the input cap may have cut mid-escape."""
+    for end in range(len(text), max(len(text) - 6, -1), -1):
+        try:
+            return json.loads(f'"{text[:end]}"')
+        except ValueError:
+            continue
+    return text
 
 
 def _unanswered_question(chat: _Chat, last: _Turn) -> dict | None:
@@ -809,8 +832,10 @@ def _unanswered_question(chat: _Chat, last: _Turn) -> dict | None:
     return None
 
 
-def _api_error(reply: str) -> str | None:
+def _api_error(chat: _Chat, reply: str) -> str | None:
     """The synthetic API-error or usage-limit text a Claude turn ended on, or None."""
+    if chat.agent != "claude":
+        return None
     match = _API_ERROR_RE.search(reply)
     return common.one_line(match.group(1)) if match else None
 
@@ -828,7 +853,7 @@ def _classify_root(chat: _Chat) -> dict | None:
                       signals=[f"{question.get('name')} awaits your answer"],
                       evidence=_question_head(question))
         return record
-    error = _api_error(reply) if reply else None
+    error = _api_error(chat, reply) if reply else None
     if error is not None:
         record.update(status="agent_work_incomplete",
                       signals=["final reply is an API error"], evidence=error)
@@ -1008,7 +1033,7 @@ def _classify_side(chat: _Chat, root: _Chat) -> dict | None:
         record.update(status="agent_work_incomplete", signals=signals,
                       evidence=common.one_line(last.text))
         return record
-    error = _api_error(chat.replies[last.turn])
+    error = _api_error(chat, chat.replies[last.turn])
     if error is not None:
         record.update(status="agent_work_incomplete",
                       signals=["side chat's final reply is an API error"], evidence=error)
