@@ -117,8 +117,8 @@ def main(argv: list[str] | None = None) -> int:
             if path.is_file():
                 report["content_kilobytes"][adapter] = (
                     report["content_kilobytes"].get(adapter, 0) + path.stat().st_size // 1024)
-        # Clones share their blocks with the live store, so du would misreport them; what the run
-        # allocates is derived data, proportional to the content bytes the index actually reads.
+        # du counts a clone's shared blocks twice; the run allocates derived data (measured
+        # 0.26 x content) plus diverged clone blocks and SQLite backups, which the ratio's margin covers.
         content_kb = sum(report["content_kilobytes"].values())
         report["content_kilobytes"]["total"] = content_kb
         free_kb = shutil.disk_usage(scratch).free // 1024

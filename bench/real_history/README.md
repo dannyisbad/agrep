@@ -66,8 +66,12 @@ compares two readings of a file (`warm_reindex_identity`, `source_bounds`, `audi
 cloned copy-on-write (`cp -c` / clonefile on APFS, `cp --reflink=always` on btrfs/xfs; the tool
 refuses other filesystems and other volumes), SQLite stores are copied through the backup API
 from a read-only connection (never a raw copy of a live db plus WAL), and the manifest
-`.agrep-snapshot.json` records what the clone really allocated, measured as the free-space delta;
-a clone that silently fell back to copying bytes is deleted and refused. The live stores are
+`.agrep-snapshot.json` records an allocation estimate: the volume's free-space change during each
+copy. Other writers move that number too and a negative change reads as 0, so a 0 is not proof the
+clone cost nothing; it only catches a gross fallback. A clone whose estimate exceeds 1/8 of its
+size plus 64 MiB is treated as a byte copy, deleted and refused. Clones avoid copying the stores up
+front but share blocks only until either side changes: blocks agents rewrite during the run are
+allocated again, and SQLite backups are full copies. The live stores are
 only read. Running `--home ~` directly still works but its findings carry the live caveat.
 
 This is the one sanctioned exception to the sandbox-HOME rule. Safeguards:
@@ -83,8 +87,9 @@ This is the one sanctioned exception to the sandbox-HOME rule. Safeguards:
   `search --json`, `chats --json`, `around --json`, `audit --full --json`,
   `agrep-rs stores --paths`;
 - free-space guard over the content bytes the index will read (the files `stores --paths`
-  lists), not `du` of the roots: clones share their blocks with the live store, so `du` would
-  count the snapshot twice, while the run only allocates derived data (measured 0.26 x content).
+  lists), not `du` of the roots: `du` counts a clone's shared blocks a second time. The run
+  allocates derived data (measured 0.26 x content), plus the blocks agents rewrite while it runs
+  and full SQLite backups; the ratio's margin covers both.
   Refuses unless free disk is at least `--min-free-ratio` (1.0) times the content;
 - the scratch dir and a `--freeze` snapshot are deleted at the end unless `--keep`; background
   children bound to the scratch data dir are reaped.

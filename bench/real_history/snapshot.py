@@ -23,8 +23,8 @@ import sandbox  # noqa: E402
 MANIFEST_NAME = ".agrep-snapshot.json"
 SQLITE_HEADER = b"SQLite format 3\x00"
 CLONE_FILESYSTEMS = {"darwin": ("apfs",), "linux": ("btrfs", "xfs", "bcachefs")}
-# A clone that fell back to a byte copy shows up as allocation; a real clone allocates only
-# metadata. Databases are backed up (copied) and stay far below this slack.
+# A byte-copy fallback shows up as allocation; a fresh clone allocates mostly metadata. Free space
+# is volume-wide and other writers move it, so this catches a gross fallback, not the exact cost.
 ALLOCATION_SLACK_KB = 64 * 1024
 ALLOCATION_FRACTION = 1 / 8
 
@@ -149,8 +149,12 @@ def plan(source_home: Path, discovered: list[tuple[str, Path]]) -> list[dict]:
 
 def freeze(source_home: Path, dest: Path, discovered: list[tuple[str, Path]]) -> dict:
     """Clone every discovered store root of `source_home` under `dest`, back up SQLite stores,
-    measure the allocation the snapshot really consumed and write the manifest."""
+    estimate each copy's allocation from the volume's free-space change and write the manifest."""
+    given = Path(os.path.abspath(source_home))
     source_home = source_home.resolve()
+    # the census reports paths under the home as given; the root checks below compare resolved ones
+    discovered = [(adapter, source_home / path.relative_to(given) if given in path.parents else path)
+                  for adapter, path in discovered]
     dest = dest.resolve()
     if dest == source_home or dest in source_home.parents:
         raise SnapshotError(f"snapshot {dest} contains the source home {source_home}")
