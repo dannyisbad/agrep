@@ -96,6 +96,14 @@ MX = {
 }
 MX_CLAUDE_NONE_BULLET = "ca000008-0508-4000-8000-000000000508"  # "## Remaining" + "- None"
 MX_CLAUDE_MID_COMPACTION = "ca000009-0509-4000-8000-000000000509"  # recap, then a question
+MX_CLAUDE_COMPACTED_MID_TURN = "ca000010-0510-4000-8000-000000000510"  # auto-compact mid-turn
+MX_CLAUDE_NONE_TAILS = (  # "- None remaining." / "- None for now." / "- None left." / "- None at the moment."
+    "ca000011-0511-4000-8000-000000000511", "ca000012-0512-4000-8000-000000000512",
+    "ca000013-0513-4000-8000-000000000513", "ca000014-0514-4000-8000-000000000514")
+MX_OMP_CAPPED_INIT = "om000008-0528-4000-8000-000000000528"  # 14-item init cut by the event cap
+MX_OMP_COMPACTED_MID_TURN = "om000009-0529-4000-8000-000000000529"
+MX_CODEX_WAIT_TIMED_OUT = "cx000008-0548-4000-8000-000000000548"
+MX_CODEX_WAIT_TIMED_OUT_SIDE = "01990808-0001-7000-8000-000000000801"
 
 
 class SummarySandbox:
@@ -496,7 +504,7 @@ class SummaryTests(unittest.TestCase):
         todo = pending[MX["omp"]["todo"]]
         self.assertEqual((todo["status"], todo["confidence"]), ("todo_open", "medium"))
         self.assertEqual(todo["items"], ["port the env loader", "port the yaml loader"])
-        self.assertFalse(any(i["status"] == "unknown" for i in pending.values()), pending)
+        self.assertNotIn("caveats", todo)
 
     def test_codex_update_plan_is_the_chats_todo_list(self) -> None:
         pending = self._pending_by_session("--agent", "codex")
@@ -545,7 +553,47 @@ class SummaryTests(unittest.TestCase):
                 self.assertNotIn(MX[agent]["handed_back"], pending)
         meta, _items = _rows(self.sandbox.summary("pending", *MATRIX, "--project", "mx-omp",
                                                    "--json"))
-        self.assertEqual((meta["chats"], meta["side_chats"]), (7, 2))
+        self.assertEqual((meta["chats"], meta["side_chats"]), (9, 2))
+
+    def test_capped_omp_init_whose_later_ops_cannot_replay_is_unknown(self) -> None:
+        # the ingest keeps 800 chars of the sorted-key input, so the only phase object and the
+        # op are lost; the accepted start/done/start that follow address tasks never seen
+        pending = self._pending_by_session("--project", "mx-omp")
+        item = pending[MX_OMP_CAPPED_INIT]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("unknown", "low", []))
+        self.assertEqual(item["caveats"],
+                         ["todo list capped at index time; its later changes could not be replayed"])
+
+    def test_timed_out_codex_wait_is_not_a_hand_back(self) -> None:
+        # wait_agent returned {"status":{id:"running"},"timed_out":true}; the worker's reply
+        # contains the word "running" and its plan is still open
+        pending = self._pending_by_session("--agent", "codex")
+        item = pending[MX_CODEX_WAIT_TIMED_OUT]
+        self.assertEqual((item["status"], item["source"], item["evidence_session"], item["items"]),
+                         ("todo_open", "side-chat", MX_CODEX_WAIT_TIMED_OUT_SIDE,
+                          ["rebuild the lima index", "report the lima rebuild"]))
+
+    def test_compaction_moments_count_as_activity_but_not_as_turns(self) -> None:
+        # claude: 09:00 prompt, 09:30 auto-compaction, 10:00 prompt -> two capped 20m stretches;
+        # omp: 09:00 prompt, 09:22 compaction, 09:24 prompt -> 20m + 2m
+        claude = _time_table(self._ok("time", "--since", "2026-05-10", "--until", "2026-05-10 23:59",
+                                      "--project", "mx-claude", "--json"))
+        self.assertEqual(claude[("2026-05-10", "mx-claude")]["estimated_active_ms"], 40 * MINUTE)
+        omp = _time_table(self._ok("time", "--since", "2026-05-19", "--until", "2026-05-19 23:59",
+                                   "--project", "mx-omp", "--json"))
+        self.assertEqual(omp[("2026-05-19", "mx-omp")]["estimated_active_ms"], 22 * MINUTE)
+        _meta, projects = _rows(self._ok(*MATRIX, "-n", "0", "--json"))
+        turns = {chat["session"]: chat["turns"] for p in projects for chat in p["worked_on"]}
+        self.assertEqual((turns[MX_CLAUDE_COMPACTED_MID_TURN], turns[MX_OMP_COMPACTED_MID_TURN]),
+                         (2, 2))
+        self.assertNotIn(MX_CLAUDE_COMPACTED_MID_TURN, self._pending_by_session())
+
+    def test_none_bullets_with_a_tail_are_not_open_items(self) -> None:
+        pending = self._pending_by_session("--agent", "claude")
+        for session in MX_CLAUDE_NONE_TAILS:
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
 
     # --- briefing ---
 

@@ -80,11 +80,11 @@ _UNCHECKED_RE = re.compile(r"^\[\s\]")
 _ITEM_DONE_RE = re.compile(
     r"(?:^~~.*~~$)|(?:\((?:done|completed|cancelled|canceled|skipped)\)\s*$)|"
     r"(?:[-:—]\s*(?:done|completed|cancelled|canceled|skipped)\.?\s*$)", re.IGNORECASE)
-# a bullet that says the list is empty: "- None", "- N/A", "- Nothing else", "- No open items"
+# a bullet that says the list is empty: "- None", "- None for now", "- N/A", "- Nothing else"
 _NO_ITEM_RE = re.compile(
-    r"^(?:none|n/?a|nothing(?: else| more| further| remaining| left| open| outstanding)?|"
-    r"no(?:thing)? (?:open|remaining|outstanding|further|more|pending)\b.*|all done)\.?$",
-    re.IGNORECASE)
+    r"^(?:(?:none|nothing)(?: else| more| further| remaining| left| open| outstanding| pending|"
+    r" for now| so far| at (?:the|this) (?:moment|time|point)| at present)?|n/?a|all done|"
+    r"no(?:thing)? (?:open|remaining|outstanding|further|more|pending)\b.*)\.?$", re.IGNORECASE)
 # a closing courtesy after a list offers more help; any other prose after the list supersedes it
 _SIGN_OFF_RE = re.compile(
     r"\b(let me know|tell me|say the word|happy to|glad to|feel free|if you(?:'d| would)? "
@@ -134,6 +134,8 @@ class _Chat:
     turns: list[_Turn] = field(default_factory=list)
     replies: dict[int, str] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
+    # compaction moments: activity for the time estimate, never a turn
+    recap_ts: list[int] = field(default_factory=list)
     # turns the caller's live window withholds; the chat's state after them is not history
     withheld: bool = False
     # the unindexed parent of a side chat promoted to a family root of its own
@@ -293,14 +295,15 @@ def _load_transcripts(chats: dict[str, _Chat]) -> bool:
 
 
 def _fold_recaps(chat: _Chat) -> None:
-    """A compaction recap is not a prompt. The adapters attach whatever the agent wrote after
-    compacting to the recap row, so that reply continues the prompt before it; a recap with
-    nothing after it leaves that prompt as the chat's last turn. A recap that opens a chat stays."""
+    """A compaction recap is not a prompt: its timestamp is kept as activity, and the reply the
+    adapters attached to it continues the prompt before it. A recap that opens a chat stays."""
     kept: list[_Turn] = []
     for row in sorted(chat.turns, key=lambda row: (row.turn, row.ts)):
         if row.who != "recap" or not kept:
             kept.append(row)
             continue
+        if row.ts > 0:
+            chat.recap_ts.append(row.ts)
         carried = chat.replies.pop(row.turn, "")
         if carried:
             prior = kept[-1].turn
@@ -337,14 +340,13 @@ def _span(intervals: list[tuple[int, int]]) -> int:
 
 def _chat_intervals(chat: _Chat, cap_ms: int) -> tuple[list[tuple[int, int]], int]:
     """Merged active intervals for one chat plus its count of unknown-timestamp turns."""
-    usable = sorted((row.ts, row.turn) for row in chat.turns if row.ts > 0)
+    points = sorted({row.ts for row in chat.turns if row.ts > 0} | set(chat.recap_ts))
     unknown = sum(1 for row in chat.turns if row.ts <= 0)
-    if not usable:
+    if not points:
         return [], unknown
-    intervals = []
-    for (start, _), (following, _) in zip(usable, usable[1:]):
-        intervals.append((start, min(following, start + cap_ms)))
-    last = usable[-1][0]
+    intervals = [(start, min(following, start + cap_ms))
+                 for start, following in zip(points, points[1:])]
+    last = points[-1]
     latest_event = max((int(event.get("ts") or 0) for event in chat.events), default=0)
     if latest_event > last:
         intervals.append((last, min(latest_event, last + cap_ms)))
@@ -555,21 +557,27 @@ def _todo_targets(tasks: list[list[str]], payload: dict) -> list[list[str]] | No
     return tasks
 
 
+def _todo_op(payload: dict, tasks: list[list[str]]) -> str | None:
+    """The op an omp todo call names, or the one omp infers when it is missing."""
+    op = payload.get("op")
+    if isinstance(op, str):
+        return op
+    items = payload.get("items") if isinstance(payload.get("items"), list) else None
+    if isinstance(payload.get("list"), list) and payload["list"]:
+        return "init"
+    if items and isinstance(payload.get("phase"), str) and payload["phase"]:
+        return "append"
+    if items and not tasks:
+        return "init"
+    return None
+
+
 def _apply_todo_op(tasks: list[list[str]], payload: dict) -> list[list[str]] | None:
     """omp's todo ops replayed over [phase, content, status] rows; None when the op is one
     omp would have rejected, so the state is unchanged."""
-    op = payload.get("op")
+    op = _todo_op(payload, tasks)
     items = payload.get("items") if isinstance(payload.get("items"), list) else None
     phases = payload.get("list") if isinstance(payload.get("list"), list) else None
-    if not isinstance(op, str):
-        if phases:
-            op = "init"
-        elif items and isinstance(payload.get("phase"), str) and payload["phase"]:
-            op = "append"
-        elif items and not tasks:
-            op = "init"
-        else:
-            return None
     if op not in _TODO_OPS:
         return None
     if op == "init":
@@ -623,16 +631,22 @@ def _apply_todo_op(tasks: list[list[str]], payload: dict) -> list[list[str]] | N
     return out
 
 
-def _apply_capped_todo_op(tasks: list[list[str]], raw: str) -> list[list[str]] | None:
-    """An omp op whose input the ingest cap cut: only init and append can be replayed, from the
-    list elements still complete. Anything else leaves the state unknowable."""
+def _capped_todo_op(raw: str, tasks: list[list[str]]) -> str | None:
+    """The op of a todo call whose input the ingest cap cut, read from the text that survived."""
     match = _TODO_OP_RE.search(raw)
-    op = match.group(1) if match else None
-    if op is None:
-        if '"list"' in raw:
-            op = "init"
-        elif '"items"' in raw:
-            op = "append" if _TODO_PHASE_RE.search(raw) else ("init" if not tasks else None)
+    if match:
+        return match.group(1)
+    if '"list"' in raw:
+        return "init"
+    if '"items"' in raw:
+        return "append" if _TODO_PHASE_RE.search(raw) else ("init" if not tasks else None)
+    return None
+
+
+def _apply_capped_todo_op(tasks: list[list[str]], raw: str,
+                          op: str | None) -> list[list[str]] | None:
+    """A capped op replayed from the list elements still complete: only init and append can be;
+    anything else leaves the state unknowable."""
     if op == "init":
         payload: dict = {"op": "init"}
         if '"list"' in raw:
@@ -649,12 +663,18 @@ def _apply_capped_todo_op(tasks: list[list[str]], raw: str) -> list[list[str]] |
     return None
 
 
-def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool]:
-    """(items after the chat's last todo write, whether any todo event existed, whether a cap
-    hid items). Whole-list writes replace the state; omp ops are replayed in order. None items
-    mean the state is not knowable: an unknown shape, or an op the cap cut that cannot replay."""
+_TODO_UNKNOWN_SHAPE = "todo list captured in an unknown shape"
+_TODO_UNREPLAYABLE = "todo list uses an op this build cannot replay"
+_TODO_CAP_DRIFT = "todo list capped at index time; its later changes could not be replayed"
+
+
+def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, str]:
+    """(items after the last todo write, present, capped, why unknowable). Whole-list writes
+    replace the state; omp ops replay in order. An op omp rejected (`ok` false) left its state
+    alone; any other op the replay cannot apply is drift, so the state is unknown from there."""
     tasks: list[list[str]] = []
-    present = capped = unknown = False
+    present = capped = False
+    unknown = ""
     for event in chat.events:
         if event.get("kind") != "tool" or not _TODO_TOOL_RE.search(str(event.get("name") or "")):
             continue
@@ -667,42 +687,50 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool]:
             payload: object = json.loads(raw) if raw else {}
         except ValueError:
             if not cut:
-                unknown = True
+                unknown = _TODO_UNKNOWN_SHAPE
                 continue
             payload = None
         snapshot = _snapshot_tasks(payload, raw, cut)
         if snapshot is not None:
-            tasks, capped, unknown = snapshot, cut, False
+            tasks, capped, unknown = snapshot, cut, ""
             continue
         if payload == {}:
             continue
         if payload is None:
-            applied = _apply_capped_todo_op(tasks, raw)
+            op = _capped_todo_op(raw, tasks)
+            applied = _apply_capped_todo_op(tasks, raw, op)
             if applied is None:
-                unknown = True
+                unknown = _TODO_CAP_DRIFT
                 continue
             tasks, capped = applied, True
+            if op == "init":
+                unknown = ""
             continue
         if not isinstance(payload, dict) or not any(
                 key in payload for key in ("op", "list", "items", "task", "phase")):
-            unknown = True
+            unknown = _TODO_UNKNOWN_SHAPE
             continue
+        op = _todo_op(payload, tasks)
         applied = _apply_todo_op(tasks, payload)
-        if applied is not None:
-            tasks = applied
+        if applied is None:
+            unknown = _TODO_CAP_DRIFT if capped else _TODO_UNREPLAYABLE
+            continue
+        tasks = applied
+        if op == "init":
+            capped, unknown = False, ""
     if unknown:
-        return None, present, capped
-    return [(content, status) for _phase, content, status in tasks], present, capped
+        return None, present, capped, unknown
+    return [(content, status) for _phase, content, status in tasks], present, capped, ""
 
 
 def _open_todos(chat: _Chat) -> tuple[list[str], list[str]]:
     """(open todo items, caveats). A capped list whose kept items are all closed is no evidence:
     the final reply decides."""
-    items, present, capped = _todo_state(chat)
+    items, present, capped, reason = _todo_state(chat)
     if not present:
         return [], []
     if items is None:
-        return [], ["todo list captured in an unknown shape"]
+        return [], [reason]
     open_items = [name for name, status in items
                   if status in _TODO_OPEN_STATUSES or
                   (status not in _TODO_CLOSED_STATUSES and status == "")]
@@ -775,10 +803,10 @@ def _classify_root(chat: _Chat) -> dict | None:
 
 
 def _latest_ts(chat: _Chat) -> int:
-    """The latest moment the index places in a chat: its last prompt or its latest tool call.
-    Replies carry no timestamp of their own."""
+    """The latest moment the index places in a chat: its last prompt, latest tool call or
+    compaction. Replies carry no timestamp of their own."""
     last = chat.last_turn()
-    return max(last.ts if last is not None else 0,
+    return max(last.ts if last is not None else 0, *chat.recap_ts,
                *(int(event.get("ts") or 0) for event in chat.events), 0)
 
 
@@ -813,6 +841,22 @@ def _json_strings(value: object) -> list[str]:
     return []
 
 
+def _delegate_words(payload: object) -> list[str]:
+    """The string leaves of a delegation result that are the delegate's own words. A codex wait
+    reports per-agent status: only a `completed` entry carries the final message, and a wait
+    that timed out delivered nothing."""
+    if isinstance(payload, dict) and isinstance(payload.get("status"), dict):
+        if payload.get("timed_out") is True:
+            return []
+        return [s for state in payload["status"].values() if isinstance(state, dict)
+                for s in _json_strings(state.get("completed"))]
+    return _json_strings(payload)
+
+
+# a fragment this short ("running", an id) occurs in replies that were never handed back
+_DELIVERY_MIN_CHARS = 24
+
+
 def _delivers(output: str, final: str) -> bool:
     """Does a delegation result carry the side chat's final reply? Claude and opencode return
     the reply itself; omp wraps it in a task-result envelope; codex nests it in JSON."""
@@ -820,18 +864,20 @@ def _delivers(output: str, final: str) -> bool:
     body = _TASK_RESULT_BODY_RE.search(text) if text.startswith("<task-result") else None
     if body is not None:
         text = body.group(1).strip()
+    if text and text == final:
+        return True
     candidates = [text]
     if text[:1] in ("{", "["):
         try:
-            candidates += [" ".join(s.split()) for s in _json_strings(json.loads(text))]
+            candidates += [" ".join(s.split()) for s in _delegate_words(json.loads(text))]
         except ValueError:
             pass
     reply_head = final[:160]
     for candidate in candidates:
         head = candidate[:160]
-        if head and head in final:
+        if len(head) >= _DELIVERY_MIN_CHARS and head in final:
             return True
-        if len(reply_head) >= 24 and reply_head in candidate:
+        if len(reply_head) >= _DELIVERY_MIN_CHARS and reply_head in candidate:
             return True
     return False
 
@@ -839,8 +885,7 @@ def _delivers(output: str, final: str) -> bool:
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
     """Did the side chat hand its result back? A terminal `yield` is the hand-back itself; else
     the root's delegation result must carry the side chat's final reply, the only indexed proof
-    the root went on after the side chat ended. None when the side reply is capped and the
-    comparison cannot be made."""
+    the root went on after the side chat ended. None when the capped side reply cannot be compared."""
     if _side_yielded(side):
         return True
     last = side.last_turn()
