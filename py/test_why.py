@@ -527,9 +527,48 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
         self.sandbox.index()
         payload = self.assert_verdict("source-not-discovered", CLAUDE)
-        self.assertIn("corpus.db: no stored chat with that id", payload["evidence"]["lines"])
+        self.assertIn("corpus.db: every stored chat is listed in sessions.jsonl",
+                      payload["evidence"]["lines"])
         search = self.sandbox.cli("search", "copper lantern", "--json")
         self.assertNotIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+
+    def test_deleted_transcript_resolves_by_project_and_first_line_like_resume(self) -> None:
+        """The chats only corpus.db still holds answer to a project label or a first-line fragment
+        the way `agrep resume` resolves them, with a listed chat always winning."""
+        second = "55555555-5555-4555-8555-555555555555"
+        _append_claude_turn(self.sandbox.store(f"claude/projects/-projects-cedar/{second}.jsonl"),
+                            self.sandbox.home, "Second cedar question.", "2000-01-22T12:00:00.000Z",
+                            session=second)
+        self.sandbox.index()
+        self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl").unlink()
+        self.sandbox.rust_index()
+        for reference in ("copper lantern", "Map the copper", "COPPER LANTERN LAUNCH"):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("corpus-behind-transcripts", reference,
+                                              next_action="agrep index")
+                stored = payload["evidence"]["stored_row"]
+                self.assertEqual((stored["session"], stored["project"], stored["via"]),
+                                 (CLAUDE, "cedar", "corpus.db"), stored)
+                self.assertEqual(stored["first_text"], "Map the copper lantern launch checklist for cedar.")
+                self.assertIn("still holds 4 rows of claude chat 11111111", payload["summary"])
+        payload = self.assert_verdict("source-not-discovered", "no such first line")
+        self.assertIn("corpus.db: 1 stored chat sessions.jsonl no longer lists, none match by id, "
+                      "project or first line", payload["evidence"]["lines"])
+        # Listed chats win outright, as in resume; corpus.db answers only once none of them does.
+        self.assertEqual(self.assert_verdict("indexed", "cedar")["evidence"]["index_row"]["session"], second)
+        payload = self.assert_verdict("ambiguous", "lantern")
+        self.assertEqual({c["session"] for c in payload["candidates"]}, {CLAUDE_TWIN, OMP_ROOT})
+        self.assertTrue(payload["evidence"]["lines"][0].startswith("sessions.jsonl: 2 chats match"))
+        self.sandbox.store(f"claude/projects/-projects-cedar/{second}.jsonl").unlink()
+        self.sandbox.rust_index()
+        payload = self.assert_verdict("ambiguous", "cedar")
+        self.assertEqual({c["session"] for c in payload["candidates"]}, {CLAUDE, second})
+        self.assertEqual(payload["evidence"]["lines"],
+                         ["corpus.db: 2 chats match 'cedar'; pass a full id, a @handle from a search "
+                          "hit, or the transcript path"])
+        payload = self.assert_verdict("corpus-behind-transcripts", "second cedar", next_action="agrep index")
+        self.assertEqual(payload["evidence"]["stored_row"]["session"], second)
+        self.assertIn(CLAUDE, self.sandbox.cli("search", "copper lantern", "--json").stdout)
 
     def test_deleted_store_converges_through_the_lagging_search_database(self) -> None:
         """A whole store's removal drops its rows from sessions.jsonl on the second ingest; until
