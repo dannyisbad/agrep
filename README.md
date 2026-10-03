@@ -295,11 +295,11 @@ after the last index, behind in the search database, outside every store agrep
 reads, discovered but every record skipped (with counts by reason), or
 unreadable - each with the file the answer came from and the next step.
 "Indexed" means what `agrep search` would serve: while the search database is
-still building, missing, busy under a writer's lock or of another schema,
-searches scan the transcripts directly, so a chat they publish is indexed and
-`why` says why; a chat whose transcript vanished but which the lagging search
-database still serves is reported from those stored rows. A search database
-it cannot read is unprovable rather than a verdict. It never indexes or
+still building, missing, busy under a writer's lock, of another schema or
+unreadable, searches scan the transcripts directly, so a chat they publish is
+indexed and `why` says why (pointing at `agrep doctor` when the database is
+damaged); a chat whose transcript vanished but which the lagging search
+database still serves is reported from those stored rows. It never indexes or
 changes anything.
 
 

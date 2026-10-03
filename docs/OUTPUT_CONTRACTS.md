@@ -96,11 +96,18 @@ command. Versioned machine-mode validation errors keep their structured shape.
   verdict, 2 is ambiguous, unprovable or a usage error. "Indexed" is what
   `agrep search` would serve: `evidence.corpus.served` names that engine
   (`corpus.db` or the direct scan of `messages.jsonl`), decided by corpusdb's
-  own reader predicates (`interactive_snapshot_lane`, `protected_read_lane`,
-  `sqlite_failure_is_contention`), so `why` and search never disagree about a
-  chat: a lock held by a writer is the busy direct-scan lane, and a chat only
-  the lagging `corpus.db` still holds resolves there when search serves it.
-  `why` never indexes or writes. Pinned in `py/test_why.py`.
+  own reader predicates and connectors (`interactive_snapshot_lane`,
+  `protected_read_lane`, `sqlite_failure_is_contention`,
+  `_connect_read_direct`/`_connect_read_snapshot` by ownership), so `why` and
+  search never disagree about a chat: a lock held by a writer is the busy
+  direct-scan lane, a database the reader cannot open is the direct-scan lane
+  with `agrep doctor` as the next step, a dead writer's hot journal reads from
+  the reader's private snapshot, a chat only the lagging `corpus.db` still
+  holds resolves there when search serves it, and a torn `sessions.jsonl`
+  falls back to the rows `messages.jsonl` derives, as resume does. A moved
+  store-wide intake key (one database holding many chats) is a caveat, never a
+  verdict against an untouched chat. `why` never indexes or writes. Pinned in
+  `py/test_why.py`.
 - **Every surface states why it is empty.** A zero from a filter selecting a
   dimension the index holds no value for is not the same answer as a zero
   from a search that looked and found nothing, and the two must not render

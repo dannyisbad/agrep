@@ -1,9 +1,10 @@
 """`agrep why <reference> [--json]` - explain why a chat is, or is not, indexed.
 
 Read-only by construction: never indexes, writes the data dir or wakes the daemon. "Searchable"
-is what `agrep search` would serve, decided by corpusdb's own reader predicates. A reference
-resolves like `agrep resume` after a path lane, then against the chats corpus.db still holds
-when search serves it; every evidence line names the file it came from.
+is what `agrep search` would serve, decided by corpusdb's own reader predicates and connectors.
+A reference resolves like `agrep resume` after a path lane (a torn sessions.jsonl falls back to
+messages.jsonl as resume does), then against the chats corpus.db still holds when search
+serves it; every evidence line names the file it came from.
 """
 
 from __future__ import annotations
@@ -36,7 +37,23 @@ _UUID_PREFIX = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{0,4}){0,3}(-[0-9a-f]{0,12})?",
 _HEX = re.compile(r"[0-9a-f]{6,}", re.I)
 _SKIP_ORDER = ("wrapper", "meta", "sidechain", "non_message", "non_human", "empty_text",
                "replay", "unreferenced", "throwaway")
-_TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json", ".db", ".sqlite", ".sqlite3", ".vscdb"})
+_DATABASE_EXTENSIONS = frozenset({".db", ".sqlite", ".sqlite3", ".vscdb"})
+_TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json"}) | _DATABASE_EXTENSIONS
+_TOKEN_ID_PREFIX = "\0agrep-intake-token-v1\0"
+
+
+def _token_identity(token_id: object) -> tuple[str, str] | None:
+    """(store path, conversation) from a token-keyed intake id, the frame intake.rs writes."""
+    text = str(token_id or "")
+    if not text.startswith(_TOKEN_ID_PREFIX):
+        return None
+    try:
+        path, session = json.loads(text[len(_TOKEN_ID_PREFIX):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(path, str) or not isinstance(session, str) or not path or not session:
+        return None
+    return path, session
 
 
 # --------------------------------------------------------------------------- evidence readers
@@ -78,13 +95,34 @@ def source_projection() -> tuple[dict | None, str | None]:
     return payload, None
 
 
-def _index_rows() -> tuple[list[dict], bool, int]:
-    """sessions.jsonl rows (newest first), whether the file exists, corrupt lines skipped."""
+def _derived_rows() -> dict[str, dict]:
+    """The aggregate explore derives from messages.jsonl when sessions.jsonl holds no row."""
+    out = {}
+    for session, rows in explore._messages_by_session_read()[0].items():
+        first = next((r.get("text", "") for r in sorted(rows, key=lambda r: r.get("turn", 0))
+                      if r.get("text", "").strip() and r.get("who") != "recap"), "")
+        out[session] = {"session": session, "agent": rows[0].get("agent", ""),
+                        "project": rows[0].get("project", ""), "n": len(rows),
+                        "first_ts": min((r.get("ts", 0) for r in rows if r.get("ts", 0)), default=0),
+                        "last_ts": max((r.get("ts", 0) for r in rows), default=0),
+                        "first_text": common.one_line(first)[:120]}
+    return out
+
+
+def _index_rows() -> tuple[list[dict], bool, int, str]:
+    """Index rows (newest first), whether sessions.jsonl exists, corrupt lines skipped, and the
+    file the rows came from: messages.jsonl when sessions.jsonl is torn, the way resume reads."""
+    # A torn aggregate is repaired by the daemon on resume's path; `why` only reads it.
+    explore._kick_derived_repair = lambda: None
     explore._session_index_read.cache_clear()
     present = (common.DATA_DIR / "sessions.jsonl").exists()
     rows, skipped = explore._session_index_read()
+    origin = "sessions.jsonl"
+    if not rows and common.MESSAGES_PATH.exists():
+        explore._messages_by_session_read.cache_clear()
+        rows, origin = _derived_rows(), "messages.jsonl"
     ordered = sorted(rows.values(), key=lambda row: row.get("last_ts", 0), reverse=True)
-    return ordered, present, skipped
+    return ordered, present, skipped, origin
 
 
 def _ingest_sig() -> dict:
@@ -96,7 +134,7 @@ def _ingest_sig() -> dict:
             "total": common.committed_message_total()}
 
 
-def _reader_lane(meta: dict | None) -> tuple[str, str | None]:
+def _reader_lane(meta: dict | None, ownership) -> tuple[str, str | None]:
     """The lane the interactive search reader takes for the published corpus.db whose meta table
     reads `meta` (None: no database), from the reader's own read-only facts and predicates."""
     import corpusdb
@@ -110,7 +148,6 @@ def _reader_lane(meta: dict | None) -> tuple[str, str | None]:
     if meta is None:
         pending = indexd_runtime.search_index_build_pending()
         return "scan", "not built yet, build queued" if pending else "missing"
-    ownership = corpusdb._derived_write_ownership(for_write=True)
     if ownership.replace_retained_db:
         expected = ownership.retained_build_id
         try:
@@ -136,9 +173,23 @@ def _reader_lane(meta: dict | None) -> tuple[str, str | None]:
     return lane, "stamp behind the published sources, rebuild queued" if lane == "scan" else None
 
 
-def _open_published(path: Path) -> sqlite3.Connection:
-    uri = Path(os.path.abspath(os.fspath(path))).as_uri() + "?mode=ro"
-    return sqlite3.connect(uri, uri=True, timeout=1.0)
+def _open_published(path: Path) -> tuple[sqlite3.Connection, object]:
+    """corpus.db through the connector the interactive reader takes for the current ownership:
+    this build's own publication opens directly in mode=ro; a refused or retained one opens as
+    the private system-temp snapshot, where a dead writer's hot journal is recovered in the
+    clone and never beside the data dir. Returns the connection and the ownership it mirrors."""
+    import corpusdb
+    ownership = corpusdb._derived_write_ownership(for_write=True)
+    contended = ownership.journal_blocked or corpusdb.sqlite_failure_is_contention(
+        ownership.sqlite_failure)
+    wait = corpusdb._CONTENDED_READER_WAIT_MS / 1000
+    if not ownership.writable or ownership.replace_retained_db:
+        db = corpusdb._connect_read_snapshot(
+            path, wait if contended else 0,
+            max_clone_bytes=corpusdb._ROUTINE_ALIAS_CLONE_MAX_BYTES)
+    else:
+        db = corpusdb._connect_read_direct(path, wait)
+    return db, ownership
 
 
 def _published_meta(db: sqlite3.Connection) -> dict:
@@ -188,29 +239,27 @@ def _corpus_facts(session: str) -> dict:
     # The scan validates event payloads; damage found there must not schedule indexd from `why`.
     events.set_event_repair_callback(lambda: False)
     path = common.DATA_DIR / "corpus.db"
-    meta, stored, held, busy = None, [], {}, None
+    meta, stored, held, state, failure = None, [], {}, "missing", None
     if path.exists():
+        state = "ok"
         try:
-            db = _open_published(path)
+            db, ownership = _open_published(path)
             try:
                 meta = _published_meta(db)
                 if meta.get("schema") == corpusdb._SCHEMA:
                     stored = _stored_rows(db, session, held)
             finally:
                 db.close()
-        except sqlite3.Error as exc:
-            # A writer's lock is contention, which the reader answers from messages.jsonl.
-            if not corpusdb.sqlite_failure_is_contention(exc):
-                return {"state": "unreadable", "reason": str(exc)}
-            busy = exc
-        except (OSError, ValueError) as exc:
-            return {"state": "unreadable", "reason": str(exc)}
-    if busy is not None:
-        lane, scan_reason = "scan", f"busy updating ({busy})"
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            # The reader serves messages.jsonl whenever its connector fails: a writer's lock is
+            # busy, anything else is damage search copes with and doctor repairs.
+            contention = isinstance(exc, sqlite3.Error) and corpusdb.sqlite_failure_is_contention(exc)
+            state, failure = ("busy" if contention else "unreadable"), exc
+    if failure is not None:
+        lane, scan_reason = "scan", f"{'busy updating' if state == 'busy' else 'unreadable'} ({failure})"
     else:
-        lane, scan_reason = _reader_lane(meta)
-    facts: dict = {"state": "busy" if busy is not None else "ok" if meta is not None else "missing",
-                   "served": "messages.jsonl" if lane == "scan" else "corpus.db",
+        lane, scan_reason = _reader_lane(meta, ownership if meta is not None else None)
+    facts: dict = {"state": state, "served": "messages.jsonl" if lane == "scan" else "corpus.db",
                    "scan_reason": scan_reason, "stamp_current": lane == "current"}
     facts.update(held)
     if lane == "current":
@@ -260,9 +309,10 @@ def _short(session: object) -> str:
     return str(session or "")[:8]
 
 
-def _index_line(row: dict) -> str:
+def _index_line(ctx: _Context, row: dict) -> str:
     agent = row.get("agent") or "?"
-    text = f"sessions.jsonl: {agent} chat {row.get('session')}, {_plural(int(row.get('n') or 0), 'message')}"
+    text = (f"{ctx.index_origin}: {agent} chat {row.get('session')}, "
+            f"{_plural(int(row.get('n') or 0), 'message')}")
     if row.get("project"):
         text += f", project {row['project']}"
     if row.get("first_text"):
@@ -317,7 +367,9 @@ def _candidate_label(candidate: dict) -> str:
 class _Context:
     def __init__(self, reference: str) -> None:
         self.reference = reference
-        self.rows, self.index_present, self.index_skipped = _index_rows()
+        self.rows, self.index_present, self.index_skipped, origin = _index_rows()
+        self.index_origin = ("sessions.jsonl" if origin == "sessions.jsonl"
+                             else "messages.jsonl (sessions.jsonl torn)")
         self.payload, self.census_error = source_projection()
         self.sig = _ingest_sig()
         self._real: dict[str, str] = {}
@@ -354,6 +406,16 @@ class _Context:
     @property
     def intake_files(self) -> list[dict]:
         return list(self.payload["intake"].get("files") or []) if self.payload else []
+
+    @property
+    def token_conversations(self) -> list[dict]:
+        """Conversations the token-keyed stores (crush, cursor) hold right now, from the census."""
+        found = []
+        for token in (self.payload or {}).get("tokens") or []:
+            parsed = _token_identity(token.get("id"))
+            if parsed:
+                found.append({"agent": token.get("agent"), "path": parsed[0], "session": parsed[1]})
+        return found
 
     def row_for(self, session: str) -> dict | None:
         return next((r for r in self.rows if r.get("session") == session), None)
@@ -407,8 +469,25 @@ def _ambiguous(ctx: _Context, candidates: list[dict], what: str, origin: str) ->
 def _judge_rows(ctx: _Context, rows: list[dict], via: str) -> dict:
     if len(rows) > 1:
         return _ambiguous(ctx, [_candidate_from_row(r, via=via) for r in rows], "chats",
-                          "sessions.jsonl")
+                          ctx.index_origin)
     return _judge_indexed(ctx, rows[0], via)
+
+
+def _store_wide_move(ctx: _Context, entry: dict, session: str) -> str | None:
+    """Why a moved intake key says nothing about this chat: the parse-cache claims on the path
+    cover other chats too (opencode's one stat key per database), or the token's own
+    per-conversation part is unchanged and only the database generation (`x:`) moved (crush)."""
+    key, now = str(entry.get("key") or ""), str(entry.get("current_key") or "")
+    if entry.get("session"):
+        own, current = key.split(":x:", 1)[0], now.split(":x:", 1)[0]
+        if ":x:" in key and own == current:
+            return f"its own part {own} is unchanged, only the database generation moved"
+        return None
+    others = {c.get("session") for c in ctx.cache_sessions
+              if c.get("path") == entry.get("path") and c.get("session") != session}
+    if others:
+        return f"the store holds {_plural(len(others) + 1, 'chat')}, so the move singles out none"
+    return None
 
 
 def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
@@ -420,11 +499,17 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     paths = [c["path"] for c in claims if c.get("path")]
     entries = [e for e in ctx.intake_files if e.get("path") in paths and not e.get("session")]
     entries += [e for e in ctx.intake_files if e.get("session") == session]
-    stale = [e for e in entries if e.get("fresh") is False]
+    moved = {id(e): _store_wide_move(ctx, e, session) for e in entries if e.get("fresh") is False}
+    stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
     issue = next((i for i in (_issue_covering(ctx, p) for p in paths) if i), None)
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
              "sources": paths, "intake": entries, "issue": issue}
-    lines = [_index_line(row), _corpus_line(corpus)]
+    lines = [_index_line(ctx, row), _corpus_line(corpus)]
+    for entry in entries:
+        if moved.get(id(entry)):
+            lines.append(f"intake_stats.json: {ctx.display(entry.get('path'))} moved since its "
+                         f"parse ({entry.get('key')} -> {entry.get('current_key')}), but "
+                         f"{moved[id(entry)]}")
     if ctx.payload is None:
         lines.append(f"store census: unavailable ({ctx.census_error}); freshness unverified")
     elif paths:
@@ -445,7 +530,7 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
 
     if issue:
         lines.insert(1, _issue_line(ctx, issue))
-        lines.insert(2, f"sessions.jsonl still serves the last good parse ({count})")
+        lines.insert(2, f"{ctx.index_origin} still serves the last good parse ({count})")
         return _report(
             ctx, "source-unreadable",
             f"not fully indexed: agrep cannot read the transcript of {agent} chat "
@@ -462,12 +547,12 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"not fully indexed: the transcript of {agent} chat {_short(session)} "
             "was written after the last index",
             lines, facts=facts, next_action="agrep index")
-    if corpus.get("state") == "unreadable":
+    if corpus.get("current") is None and corpus.get("state") == "unreadable":
         lines.append(ctx.sig_line())
         return _report(
             ctx, "not-provable",
-            f"unprovable: the search database cannot be read, so whether {agent} chat "
-            f"{_short(session)} is searchable is unknown",
+            f"unprovable: neither the search database nor messages.jsonl can be read, so whether "
+            f"{agent} chat {_short(session)} is searchable is unknown",
             lines, facts=facts, next_action="agrep doctor")
     if corpus.get("current") is False or (corpus["served"] == "corpus.db" and not corpus["rows"]):
         lines.append(ctx.sig_line())
@@ -491,7 +576,8 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"{row.get('parent') or corpus.get('root')} ({count})")
     else:
         verdict, summary = "indexed", f"indexed: {agent} chat {session} is searchable ({count})"
-    return _report(ctx, verdict, summary, lines, facts=facts)
+    return _report(ctx, verdict, summary, lines, facts=facts,
+                   next_action="agrep doctor" if corpus.get("state") == "unreadable" else None)
 
 
 def _judge_stored(ctx: _Context, row: dict) -> dict:
@@ -500,16 +586,10 @@ def _judge_stored(ctx: _Context, row: dict) -> dict:
     session, agent = str(row["session"]), row.get("agent") or "?"
     corpus = _corpus_facts(session)
     skipped = f" ({ctx.index_skipped} corrupt line(s) skipped)" if ctx.index_skipped else ""
-    lines = [f"sessions.jsonl: {len(ctx.rows)} chats, none with id {session}{skipped}",
+    lines = [f"{ctx.index_origin}: {len(ctx.rows)} chats, none with id {session}{skipped}",
              _corpus_line(corpus)]
     facts = {"index_row": None, "stored_row": row, "corpus": corpus, "sources": [],
              "intake": [], "issue": None}
-    if corpus.get("state") == "unreadable":
-        return _report(
-            ctx, "not-provable",
-            f"unprovable: the search database cannot be read, so whether {agent} chat "
-            f"{_short(session)} is searchable is unknown",
-            lines + [ctx.sig_line()], facts=facts, next_action="agrep doctor")
     if corpus["served"] != "corpus.db" or not corpus["rows"]:
         # A refresh or a writer's lock landed between the two reads: search no longer serves it.
         return _no_match(ctx, _corpus_line(corpus))
@@ -533,7 +613,7 @@ def _judge_stored(ctx: _Context, row: dict) -> dict:
     return _report(
         ctx, "indexed",
         f"indexed: {agent} chat {session} is searchable from the search database "
-        f"({_plural(corpus['rows'], 'row')}), though sessions.jsonl no longer lists it",
+        f"({_plural(corpus['rows'], 'row')}), though {ctx.index_origin} no longer lists it",
         lines, facts=facts)
 
 
@@ -564,8 +644,6 @@ def _diff_text(corpus: dict) -> str:
 
 def _corpus_line(corpus: dict) -> str:
     """The corpus.db evidence line: the engine search serves and the proof of currency used."""
-    if corpus.get("state") == "unreadable":
-        return f"corpus.db: unreadable ({corpus['reason']})"
     rows = corpus.get("rows")
     if corpus["served"] == "messages.jsonl":
         held = f"{_plural(rows, 'row')}, " if rows is not None else ""
@@ -648,7 +726,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             ctx, "not-provable",
             f"unprovable: the parse cache attributes {label} to a session the index does not list",
             ["parse cache: session " + ", ".join(c["session"] for c in claims),
-             f"sessions.jsonl: {len(ctx.rows)} chats, none with that id", ctx.sig_line()],
+             f"{ctx.index_origin}: {len(ctx.rows)} chats, none with that id", ctx.sig_line()],
             facts=facts, next_action="agrep index")
     if session is None and len(entries) > 1:
         candidates = [{"agent": e.get("agent"), "path": path, "session": e.get("session"),
@@ -740,14 +818,36 @@ def _not_discovered(ctx: _Context, path: str) -> dict:
                "under_detected": detected})
 
 
+def _moved_store_line(ctx: _Context) -> str | None:
+    """A database store (one stat key for every chat it holds) that moved since its parse may
+    hold the chat; a transcript file that moved is one chat and names itself in the census."""
+    for entry in ctx.intake_files:
+        if (entry.get("fresh") is not False or entry.get("session")
+                or os.path.splitext(str(entry.get("path") or ""))[1].lower() not in _DATABASE_EXTENSIONS):
+            continue
+        chats = {c.get("session") for c in ctx.cache_sessions if c.get("path") == entry.get("path")}
+        then, now = entry.get("key"), entry.get("current_key")
+        return (f"intake_stats.json: {ctx.display(entry.get('path'))} holds "
+                f"{_plural(len(chats), 'chat')} and changed since its parse at "
+                f"{_when(_key_mtime_ms(then))} ({then}), now {_when(_key_mtime_ms(now))} ({now})")
+    return None
+
+
 def _no_match(ctx: _Context, stored_line: str | None = None) -> dict:
-    lines = [f"sessions.jsonl: {len(ctx.rows)} chats, none match by id, alias, project or first line",
+    lines = [f"{ctx.index_origin}: {len(ctx.rows)} chats, none match by id, alias, project or first line",
              ctx.census_line(),
              "parse cache and intake_stats.json: no file or conversation named like it"]
     if stored_line:
         lines.append(stored_line)
     if ctx.index_skipped:
         lines.append(f"sessions.jsonl: {ctx.index_skipped} corrupt line(s) were skipped")
+    moved = _moved_store_line(ctx)
+    if moved:
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: nothing agrep discovered matches '{ctx.reference}', but a store that "
+            "changed since the last index may hold it",
+            [moved, *lines], next_action="agrep index")
     return _report(ctx, "source-not-discovered",
                    f"not indexed: nothing agrep discovered matches '{ctx.reference}'", lines)
 
@@ -797,7 +897,9 @@ def _path_lane(ctx: _Context, reference: str) -> tuple[str, list[dict]]:
         alias = ctx.entries_by_real.get(ctx.real(expanded))
         if alias:
             found[alias["path"]] = {"agent": alias.get("agent"), "path": alias["path"]}
-    return expanded, list(found.values())
+    # The file the reference names outranks every same-named sidecar a trailing part also fits.
+    exact = [c for p, c in found.items() if p == expanded or ctx.real(p) == ctx.real(expanded)]
+    return expanded, exact or list(found.values())
 
 
 def _alias_rows(rows: list[dict], identity: str) -> list[dict]:
@@ -835,7 +937,7 @@ def _source_lane(ctx: _Context, identity: str) -> list[dict]:
         if named(claim.get("session")) or named(claim.get("alias")):
             found.setdefault((claim.get("path"), None),
                              {"agent": claim.get("agent"), "path": claim.get("path")})
-    for entry in ctx.intake_files:
+    for entry in ctx.intake_files + ctx.token_conversations:
         if entry.get("session") and named(entry["session"]):
             found.setdefault((entry.get("path"), entry["session"]),
                              {"agent": entry.get("agent"), "path": entry.get("path"),
@@ -873,10 +975,10 @@ def _stored_lane(ctx: _Context, reference: str, identity: str) -> tuple[list[dic
     if not path.exists():
         return [], None
     try:
-        db = _open_published(path)
+        db, ownership = _open_published(path)
         try:
             meta = _published_meta(db)
-            if meta.get("schema") != corpusdb._SCHEMA or _reader_lane(meta)[0] == "scan":
+            if meta.get("schema") != corpusdb._SCHEMA or _reader_lane(meta, ownership)[0] == "scan":
                 return [], None
             listed = {str(r.get("session") or "") for r in ctx.rows}
             stale = [s for (s,) in db.execute("SELECT session FROM session_sig ORDER BY session")
@@ -944,7 +1046,7 @@ def diagnose(reference: str) -> dict:
         return _report(
             ctx, "not-provable",
             f"unprovable: no indexed chat matches '{reference}' and the source census is unavailable",
-            [f"sessions.jsonl: {len(ctx.rows)} chats, none match", ctx.census_line()])
+            [f"{ctx.index_origin}: {len(ctx.rows)} chats, none match", ctx.census_line()])
     if _looks_like_path(reference):
         return _not_discovered(ctx, expanded)
     return _no_match(ctx, stored_line)

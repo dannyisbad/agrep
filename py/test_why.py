@@ -77,6 +77,80 @@ def _pi_transcript(path: Path, session: str, text: str) -> None:
         encoding="utf-8")
 
 
+_CRUSH_SCHEMA = """
+CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, title TEXT,
+                      updated_at INTEGER, created_at INTEGER);
+CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, parts TEXT, model TEXT,
+                      created_at INTEGER, updated_at INTEGER);
+"""
+_OPENCODE_SCHEMA = """
+CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+                        directory TEXT NOT NULL, title TEXT, model TEXT, agent TEXT,
+                        time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                             seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                             time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+                             UNIQUE(session_id, seq));
+"""
+
+
+def _crush_add(path: Path, session: str, at: int, text: str, *, new_session: bool = True) -> None:
+    """One user turn in a crush store; a new session row or a bump of an existing one's updated_at."""
+    db = sqlite3.connect(str(path))
+    try:
+        with db:
+            if new_session:
+                db.execute("INSERT INTO sessions VALUES (?, '', ?, ?, ?)", (session, text[:10], at, at))
+            else:
+                db.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (at, session))
+            db.execute("INSERT INTO messages VALUES (?, ?, 'user', ?, '', ?, ?)",
+                       (f"{session}-{at}", session, json.dumps([{"type": "text", "data": {"text": text}}]),
+                        at, at))
+    finally:
+        db.close()
+
+
+def _crush_store(path: Path, turns: list[tuple[str, int, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path))
+    try:
+        db.executescript(_CRUSH_SCHEMA)
+    finally:
+        db.close()
+    for session, at, text in turns:
+        _crush_add(path, session, at, text)
+
+
+def _opencode_add(path: Path, home: Path, session: str, at: int, text: str, *,
+                  new_session: bool = True) -> None:
+    db = sqlite3.connect(str(path))
+    try:
+        with db:
+            if new_session:
+                db.execute("INSERT INTO session_v2 VALUES (?, 'oak', NULL, ?, ?, NULL, 'build', ?, ?)",
+                           (session, str(home / "projects" / "oak"), text[:10], at, at))
+            else:
+                db.execute("UPDATE session_v2 SET time_updated = ? WHERE id = ?", (at, session))
+            seq = db.execute("SELECT count(*) FROM session_message WHERE session_id = ?",
+                             (session,)).fetchone()[0] + 1
+            db.execute("INSERT INTO session_message VALUES (?, ?, 'user', ?, ?, ?, ?)",
+                       (f"msg_{session}_{seq}", session, seq, at, at,
+                        json.dumps({"time": {"created": at}, "text": text, "files": [], "agents": []})))
+    finally:
+        db.close()
+
+
+def _opencode_store(path: Path, home: Path, turns: list[tuple[str, int, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path))
+    try:
+        db.executescript(_OPENCODE_SCHEMA)
+    finally:
+        db.close()
+    for session, at, text in turns:
+        _opencode_add(path, home, session, at, text)
+
+
 def _append_claude_turn(path: Path, home: Path, text: str, stamp: str, *,
                         session: str = CLAUDE, project: str = "cedar") -> None:
     with path.open("a", encoding="utf-8") as handle:
@@ -202,6 +276,10 @@ class Sandbox:
     def store(self, relative: str) -> Path:
         agent, rest = relative.split("/", 1)
         return self.home / ("." + agent) / rest
+
+    def display(self, path: Path) -> str:
+        """A sandbox-home path the way `why` prints it."""
+        return "~" + str(path)[len(str(self.home)):]
 
     def close(self) -> None:
         if os.name != "nt":
@@ -860,19 +938,166 @@ class WhyMutationVerdictTests(_VerdictAssertions):
                          "directly (5 rows published for this chat)")
 
     @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
-    def test_unreadable_search_database_is_not_provable(self) -> None:
+    def test_unreadable_search_database_is_the_direct_scan_lane_with_a_doctor_hint(self) -> None:
+        """The reader serves messages.jsonl when it cannot open corpus.db at all; `why` judges
+        from the published rows and still points at doctor for the damaged database."""
         corpus_db = self.sandbox.data / "corpus.db"
         corpus_db.chmod(0)
         try:
-            payload = self.assert_verdict("not-provable", CLAUDE, next_action="agrep doctor")
+            payload = self.assert_verdict("indexed", CLAUDE, next_action="agrep doctor")
+            search = self.sandbox.cli("search", "copper lantern", "--json")
         finally:
             corpus_db.chmod(0o600)
-        self.assertEqual(payload["evidence"]["corpus"]["state"], "unreadable")
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["state"], corpus["served"], corpus["proof"], corpus["published_rows"]),
+                         ("unreadable", "messages.jsonl", "scan", 4), corpus)
         self.assertTrue(payload["evidence"]["lines"][1].startswith("corpus.db: unreadable ("),
                         payload["evidence"]["lines"])
-        self.assertIn("cannot be read", payload["summary"])
-        self.assertNotIn("does not hold", payload["summary"])
+        self.assertIn("search scans messages.jsonl directly (4 rows published for this chat)",
+                      payload["evidence"]["lines"][1])
+        self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
         self.assert_verdict("indexed", CLAUDE)
+
+    def test_dead_writers_hot_journal_reads_like_search(self) -> None:
+        """A writer killed mid-transaction leaves a hot corpus.db-journal; the reader recovers it
+        in a private system-temp clone and serves the last commit, and so must `why`, leaving
+        the journal and the data dir untouched."""
+        crash = ("import os, sqlite3, sys; db = sqlite3.connect(sys.argv[1], isolation_level=None); "
+                 "db.execute('PRAGMA journal_mode=DELETE'); db.execute('PRAGMA cache_size=2'); "
+                 "db.execute('BEGIN IMMEDIATE'); db.execute(\"UPDATE msgs SET text = text || ' torn'\"); "
+                 "os._exit(0)")
+        crashed = subprocess.run([sys.executable, "-c", crash, str(self.sandbox.data / "corpus.db")],
+                                 capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        journal = self.sandbox.data / "corpus.db-journal"
+        self.assertTrue(journal.exists() and journal.stat().st_size > 0, "no hot journal was left")
+        payload = self.assert_verdict("indexed", CLAUDE)
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["state"], corpus["served"], corpus["proof"], corpus["rows"]),
+                         ("ok", "corpus.db", "stamp", 4), corpus)
+        self.assertTrue(journal.exists(), "why recovered the journal against the data dir")
+        search = self.sandbox.cli("search", "copper lantern", "--json")
+        self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+        self.assertNotIn("torn", search.stdout)
+
+    def test_torn_sessions_index_falls_back_to_messages_like_resume(self) -> None:
+        """sessions.jsonl holding no parseable row is agrep's own derived damage: resume and search
+        answer from messages.jsonl, so `why` derives the same rows, without waking the daemon."""
+        (self.sandbox.data / "sessions.jsonl").write_text("{torn\n", encoding="utf-8")
+        env = self.sandbox.without_daemon_guard()
+        for reference in (CLAUDE, "11111111-1111", "cedar"):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("indexed", reference, env=env)
+                self.assertEqual(payload["evidence"]["index_row"]["session"], CLAUDE)
+                self.assertTrue(payload["evidence"]["lines"][0].startswith(
+                    f"messages.jsonl (sessions.jsonl torn): claude chat {CLAUDE}, 2 messages"),
+                    payload["evidence"]["lines"])
+        payload = self.assert_verdict("ambiguous", "11111111", env=env)
+        self.assertEqual({c["session"] for c in payload["candidates"]}, {CLAUDE, CLAUDE_TWIN})
+        self.assertEqual(self.assert_verdict("indexed-as-side-chat", "44444444", env=env)["evidence"]["corpus"]["root"],
+                         OMP_ROOT)
+        self.assertIn(CLAUDE, self.sandbox.cli("search", "copper lantern", "--json").stdout)
+
+    def test_relative_sidecar_path_from_its_own_directory_is_exact(self) -> None:
+        """`./advisor.jsonl` run inside a session directory names one file even when other
+        sessions carry a same-named sidecar; the exact path outranks every trailing-part match."""
+        other = self.sandbox.store("omp/agent/sessions/-work-gamma/"
+                                   "2000-02-04T04-05-06-000Z_66666666-6666-4666-8666-666666666666")
+        other.mkdir(parents=True)
+        (other.parent / (other.name + ".jsonl")).write_text(
+            json.dumps({"type": "session", "id": "66666666-6666-4666-8666-666666666666", "version": 3,
+                        "cwd": "/work/gamma", "timestamp": "2000-02-04T04:05:06.000Z"}) + "\n"
+            + json.dumps({"type": "message", "id": "g1", "parentId": None,
+                          "timestamp": "2000-02-04T04:05:07.000Z",
+                          "message": {"role": "user", "content": [{"type": "text", "text": "gamma plan"}],
+                                      "timestamp": "2000-02-04T04:05:07.000Z"}}) + "\n",
+            encoding="utf-8")
+        (other / "advisor.jsonl").write_text(
+            json.dumps({"type": "session", "id": "77777777-7777-4777-8777-777777777777", "version": 3,
+                        "cwd": "/work/gamma", "timestamp": "2000-02-04T04:05:11.000Z"}) + "\n"
+            + json.dumps({"type": "message", "id": "ga1", "parentId": None,
+                          "timestamp": "2000-02-04T04:05:12.000Z",
+                          "message": {"role": "user", "content": [{"type": "text", "text": "gamma advisor"}],
+                                      "timestamp": "2000-02-04T04:05:12.000Z"}}) + "\n",
+            encoding="utf-8")
+        self.sandbox.index()
+        beta = self.sandbox.store(f"omp/agent/sessions/{OMP_CONTAINER}")
+        for cwd, session in ((beta, OMP_SIDE), (other, PI_NEW)):
+            for reference in ("./advisor.jsonl", "advisor.jsonl"):
+                with self.subTest(cwd=cwd.name, reference=reference):
+                    payload = self.assert_verdict("indexed-as-side-chat", reference, cwd=cwd)
+                    self.assertEqual(payload["evidence"]["index_row"]["session"], session)
+                    self.assertEqual(payload["evidence"]["sources"], [str(cwd / "advisor.jsonl")])
+        payload = self.assert_verdict("ambiguous", "advisor.jsonl")
+        self.assertEqual(len(payload["candidates"]), 2)
+
+    def test_new_token_store_conversation_is_written_after_last_index(self) -> None:
+        """A crush conversation created after the index is in the census token list but in no
+        parse-cache claim or intake record: it appeared after the last index, like a new file."""
+        crush = self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
+        _crush_store(crush, [("sc1", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        self.assert_verdict("indexed", "sc1")
+        _crush_add(crush, "sc9new", 9000, "spruce gauge question")
+        payload = self.assert_verdict("written-after-last-index", "sc9new", next_action="agrep index")
+        self.assertEqual((payload["evidence"]["path"], payload["evidence"]["session"], payload["evidence"]["agent"]),
+                         (str(crush), "sc9new", "crush"), payload["evidence"])
+        self.assertEqual(payload["evidence"]["lines"][0],
+                         "intake_stats.json: no record of this file, so no index has parsed it")
+        self.assertIn(f"crush file {_tilde('.local/share/crush/crush.db')} conversation sc9new appeared "
+                      "after the last index", payload["summary"])
+        self.sandbox.index()
+        self.assert_verdict("indexed", "sc9new")
+
+    def test_new_chat_in_a_moved_stat_store_is_not_provable(self) -> None:
+        """opencode keys its whole database by one stat key, so a new `ses_` id after the index
+        has only that moved key as evidence: unprovable, naming the store, not undiscovered."""
+        opencode = self.sandbox.home / ".local" / "share" / "opencode" / "opencode.db"
+        _opencode_store(opencode, self.sandbox.home, [("ses_oc0001", 1_000_000, "oscar parser fix")])
+        self.sandbox.index()
+        self.assert_verdict("source-not-discovered", "ses_oc0002")
+        _opencode_add(opencode, self.sandbox.home, "ses_oc0002", 2_000_000, "zephyr quartz question")
+        payload = self.assert_verdict("not-provable", "ses_oc0002", next_action="agrep index")
+        self.assertTrue(payload["evidence"]["lines"][0].startswith(
+            f"intake_stats.json: {_tilde('.local/share/opencode/opencode.db')} holds 1 chat and changed "
+            "since its parse at"), payload["evidence"]["lines"])
+        self.assertIn("a store that changed since the last index may hold it", payload["summary"])
+        self.sandbox.index()
+        self.assert_verdict("indexed", "ses_oc0002")
+
+    def test_store_wide_key_move_does_not_mark_untouched_chats(self) -> None:
+        """Writing one conversation moves opencode's stat key and crush's database generation for
+        every chat in the store; an untouched chat stays the corpus verdict, with the move as a
+        caveat, while a chat whose own token moved is written-after-last-index."""
+        crush = self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
+        _crush_store(crush, [("sc1", 1000, "walnut ledger question"), ("sc2", 2000, "hazel invoice question")])
+        opencode = self.sandbox.home / ".local" / "share" / "opencode" / "opencode.db"
+        _opencode_store(opencode, self.sandbox.home,
+                        [("ses_oc0001", 1_000_000, "oscar parser fix"), ("ses_oc0002", 2_000_000, "quartz question")])
+        self.sandbox.index()
+        _crush_add(crush, "sc2", 2500, "hazel follow-up", new_session=False)
+        _opencode_add(opencode, self.sandbox.home, "ses_oc0002", 2_500_000, "quartz follow-up",
+                      new_session=False)
+        for reference, store in (("sc1", crush), ("ses_oc0001", opencode)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("indexed", reference)
+                corpus = payload["evidence"]["corpus"]
+                self.assertEqual((corpus["served"], corpus["proof"], corpus["current"]),
+                                 ("corpus.db", "stamp", True), corpus)
+                self.assertEqual(payload["evidence"]["intake"][0]["fresh"], False)
+                caveat = [line for line in payload["evidence"]["lines"]
+                          if line.startswith(f"intake_stats.json: {self.sandbox.display(store)} moved since its parse")]
+                self.assertEqual(len(caveat), 1, payload["evidence"]["lines"])
+        self.assertIn("its own part u:1000 is unchanged, only the database generation moved",
+                      self.sandbox.why_json("sc1")[0]["evidence"]["lines"][2])
+        self.assertIn("the store holds 2 chats, so the move singles out none",
+                      self.sandbox.why_json("ses_oc0001")[0]["evidence"]["lines"][2])
+        payload = self.assert_verdict("written-after-last-index", "sc2", next_action="agrep index")
+        self.assertIn("(u:2000:x:", payload["evidence"]["lines"][1])
+        self.assertIn("now unknown time (u:2500:x:", payload["evidence"]["lines"][1])
+        for reference in ("sc1", "ses_oc0001"):
+            search = self.sandbox.cli("search", "walnut ledger" if reference == "sc1" else "oscar parser", "--json")
+            self.assertIn(reference, search.stdout, search.stdout + search.stderr)
 
     def test_concept_relabel_is_not_an_older_copy_but_a_tools_toggle_is(self) -> None:
         """A concept publication moves the stamp and every affected session_sig while the served
