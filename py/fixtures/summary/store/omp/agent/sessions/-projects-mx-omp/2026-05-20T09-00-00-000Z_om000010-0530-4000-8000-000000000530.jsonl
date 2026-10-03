@@ -1,0 +1,3 @@
+{"type":"session","id":"om000010-0530-4000-8000-000000000530","version":3,"cwd":"{{home}}/projects/mx-omp","timestamp":"2026-05-20T09:00:00.000Z"}
+{"type":"message","id":"om10-0","parentId":null,"timestamp":"2026-05-20T09:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Add a cache to the whiskey service."}]}}
+{"type":"message","id":"om10-1","parentId":"om10-0","timestamp":"2026-05-20T09:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Two backends fit here."},{"type":"toolCall","id":"ask-om10","name":"ask","arguments":{"questions":[{"id":"backend","question":"Which cache backend should the whiskey service use?","options":[{"label":"SQLite"},{"label":"Redis"}],"recommended":0}]}}],"model":"gpt-5"}}

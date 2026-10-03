@@ -108,6 +108,21 @@ MX_CODEX_SHORT_HAND_BACK = "cx000009-0549-4000-8000-000000000549"  # completed t
 # self-mx, timed relative to now: the caller's own chat auto-compacted mid-turn at t-90m
 SELF_TOOLS_ONLY = "db000001-0601-4000-8000-000000000601"  # only a tool call after the recap
 SELF_LIVE_PROMPT = "db000002-0602-4000-8000-000000000602"  # a live-window prompt at t-70m
+# codex compacted mid-turn: the search db keeps no empty-text recap row
+MX_CODEX_COMPACTED_FINISHED = "cx000010-0550-4000-8000-000000000550"
+MX_CODEX_COMPACTED_NEXT_STEPS = "cx000011-0551-4000-8000-000000000551"
+MX_CODEX_COMPACTED_BETWEEN = "cx000012-0552-4000-8000-000000000552"  # 09:00, 09:30, 10:00
+# claude synthetic API-error rows: alone, after work, after a sentence, in a subagent
+MX_CLAUDE_API_ERROR_ONLY = "ca000015-0515-4000-8000-000000000515"
+MX_CLAUDE_USAGE_LIMIT = "ca000016-0516-4000-8000-000000000516"
+MX_CLAUDE_PROMPT_TOO_LONG = "ca000017-0517-4000-8000-000000000517"
+MX_CLAUDE_SIDE_API_ERROR = "ca000021-0521-4000-8000-000000000521"
+MX_CLAUDE_SIDE_API_ERROR_SIDE = "agent-ca21side01"
+# parked on a question tool: ExitPlanMode, AskUserQuestion (and one answered), omp ask
+MX_CLAUDE_EXIT_PLAN = "ca000018-0518-4000-8000-000000000518"
+MX_CLAUDE_ASK = "ca000019-0519-4000-8000-000000000519"
+MX_CLAUDE_ASK_ANSWERED = "ca000020-0520-4000-8000-000000000520"
+MX_OMP_ASK = "om000010-0530-4000-8000-000000000530"
 
 
 class SummarySandbox:
@@ -557,7 +572,7 @@ class SummaryTests(unittest.TestCase):
                 self.assertNotIn(MX[agent]["handed_back"], pending)
         meta, _items = _rows(self.sandbox.summary("pending", *MATRIX, "--project", "mx-omp",
                                                    "--json"))
-        self.assertEqual((meta["chats"], meta["side_chats"]), (9, 2))
+        self.assertEqual((meta["chats"], meta["side_chats"]), (10, 2))
 
     def test_capped_omp_init_whose_later_ops_cannot_replay_is_unknown(self) -> None:
         # the ingest keeps 800 chars of the sorted-key input, so the only phase object and the
@@ -584,6 +599,65 @@ class SummaryTests(unittest.TestCase):
         pending = self._pending_by_session("--agent", "codex")
         self.assertNotIn(MX_CODEX_SHORT_HAND_BACK, pending)
         self.assertIn(MX_CODEX_WAIT_TIMED_OUT, pending)
+
+    def test_codex_compaction_survives_the_search_db(self) -> None:
+        # corpus.db drops empty-text rows, so a codex `compacted` recap reaches summary only as
+        # the reply filed under its turn; both the db path and the JSONL fallback must agree
+        def verdicts():
+            pending = self._pending_by_session("--agent", "codex")
+            table = _time_table(self._ok("time", "--since", "2026-06-03",
+                                         "--until", "2026-06-03 23:59", "--project", "mx-codex",
+                                         "--json"))
+            return (pending.get(MX_CODEX_COMPACTED_FINISHED),
+                    pending[MX_CODEX_COMPACTED_NEXT_STEPS]["status"],
+                    pending[MX_CODEX_COMPACTED_NEXT_STEPS]["items"],
+                    MX_CODEX_COMPACTED_BETWEEN in pending,
+                    table[("2026-06-03", "mx-codex")]["estimated_active_ms"])
+        expected = (None, "open_next_steps", ["port the oscar writer", "update the oscar docs"],
+                    False, 40 * MINUTE)
+        self.assertEqual(verdicts(), expected)
+        database = self.sandbox.data / "corpus.db"
+        parked = database.with_name("corpus.db.parked")
+        database.rename(parked)
+        try:
+            self.assertEqual(verdicts(), expected)
+        finally:
+            parked.rename(database)
+
+    def test_final_api_error_or_usage_limit_is_unfinished_work(self) -> None:
+        pending = self._pending_by_session("--project", "mx-claude")
+        expected = {
+            MX_CLAUDE_API_ERROR_ONLY: ("root", "API Error: Repeated 529 Overloaded errors"),
+            MX_CLAUDE_USAGE_LIMIT: ("root",
+                                    "You've hit your weekly limit · resets May 18 at 4pm (Europe/Berlin)"),
+            MX_CLAUDE_PROMPT_TOO_LONG: ("root", "Prompt is too long"),
+            MX_CLAUDE_SIDE_API_ERROR: ("side-chat", "API Error: Rate limit reached"),
+        }
+        for session, (source, evidence) in expected.items():
+            with self.subTest(session=session):
+                item = pending[session]
+                self.assertEqual((item["status"], item["confidence"], item["source"],
+                                  item["evidence"]),
+                                 ("agent_work_incomplete", "medium", source, evidence))
+        self.assertEqual(pending[MX_CLAUDE_SIDE_API_ERROR]["evidence_session"],
+                         MX_CLAUDE_SIDE_API_ERROR_SIDE)
+
+    def test_unanswered_question_or_plan_tool_is_waiting_on_user(self) -> None:
+        pending = self._pending_by_session()
+        expected = {
+            MX_CLAUDE_EXIT_PLAN: ("ExitPlanMode", "## Tango auth refactor 1. Split login into"),
+            MX_CLAUDE_ASK: ("AskUserQuestion",
+                            "Which cache backend should I use for the uniform service?"),
+            MX_OMP_ASK: ("ask", "Which cache backend should the whiskey service use?"),
+        }
+        for session, (tool, head) in expected.items():
+            with self.subTest(session=session):
+                item = pending[session]
+                self.assertEqual((item["status"], item["confidence"], item["signals"]),
+                                 ("waiting_on_user", "high", [f"{tool} awaits your answer"]))
+                self.assertTrue(item["evidence"].startswith(head), item["evidence"])
+        # an answered question followed by a clean reply is finished
+        self.assertNotIn(MX_CLAUDE_ASK_ANSWERED, pending)
 
     def test_compaction_moments_count_as_activity_but_not_as_turns(self) -> None:
         # claude: 09:00 prompt, 09:30 auto-compaction, 10:00 prompt -> two capped 20m stretches;

@@ -110,6 +110,18 @@ _TASK_RESULT_BODY_RE = re.compile(r"<(?:output|preview)[^>]*>(.*?)(?:</(?:output
                                   re.DOTALL)
 _YIELD_SECTION_RE = re.compile(r'"type"\s*:\s*\[')
 _CONTROL_STOP_RE = re.compile(r"interrupt|abort|cancel|stop", re.IGNORECASE)
+# Claude's synthetic rows (isApiErrorMessage, model "<synthetic>") end a turn's reply; the ingest
+# keeps them as prose joined by one space, so the reply's ending identifies them
+_API_ERROR_RE = re.compile(
+    r"(?:^|[.!?:)\]`]\s+|\n\s*)(API Error: .+|You've hit your .*?limit\b.*|"
+    r"Claude AI usage limit reached\|\S*|"
+    r"Prompt is too long(?: ·.*)?|Input is too long for requested model.*|"
+    r"Context limit reached ·.*|Request timed out\b.*|Unable to connect to API\b.*|"
+    r"Credit balance is too low\b.*|Server is temporarily limiting requests\b.*)\s*$")
+# tools that stop the turn until the human answers: claude AskUserQuestion/ExitPlanMode, omp ask,
+# codex request_user_input, opencode question
+_QUESTION_TOOL_RE = re.compile(
+    r"^(?:AskUserQuestion|ExitPlanMode|ask|request_user_input|question)$", re.IGNORECASE)
 
 
 @dataclass
@@ -245,6 +257,7 @@ def _load_transcripts(chats: dict[str, _Chat], excludes=None) -> bool:
         db = None
     if db is not None:
         seen: dict[str, set[int]] = {session: set() for session in sessions}
+        orphan_ts: dict[tuple[str, int], int] = {}
         try:
             for start in range(0, len(sessions), 400):
                 page = sessions[start:start + 400]
@@ -259,12 +272,19 @@ def _load_transcripts(chats: dict[str, _Chat], excludes=None) -> bool:
                     turn = int(turn or 0)
                     if who == "agent":
                         chat.replies.setdefault(turn, str(text or ""))
+                        orphan_ts.setdefault((session, turn), int(ts or 0))
                         continue
                     if turn in seen[session]:
                         continue
                     seen[session].add(turn)
                     chat.turns.append(_Turn(turn, int(ts or 0), str(who or "user"),
                                             str(text or ""), digest))
+            # the db keeps no empty-text row, so a codex compaction survives only as the reply
+            # written after it, filed under the recap's turn: that turn is the recap
+            for (session, turn), ts in orphan_ts.items():
+                if turn not in seen[session]:
+                    seen[session].add(turn)
+                    chats[session].turns.append(_Turn(turn, ts, "recap", "", None))
             for chat in chats.values():
                 _withhold(chat, excludes)
                 _fold_recaps(chat)
@@ -472,8 +492,8 @@ def _open_section_items(reply: str) -> tuple[str, list[str], int] | None:
             trailing.append(candidate.strip())
     if not bullets:
         return None
-    # the index keeps no block boundary: the last bullet ends at its first sentence boundary and
-    # whatever follows it on the line is the next block's prose
+    # the ingest joins blocks with one space, so a later block glued to an unpunctuated last
+    # bullet reads as part of it; a newline join would change stored replies and their handles
     head, *rest = _SENTENCE_END_RE.split(bullets[-1], maxsplit=1)
     bullets[-1] = head
     tail = " ".join(rest + trailing)
@@ -757,6 +777,44 @@ def _events_after(chat: _Chat, ts: int) -> list[dict]:
     return [event for event in chat.events if int(event.get("ts") or 0) >= ts]
 
 
+def _question_head(event: dict) -> str:
+    """The question or plan a parked question tool put to the human, from its captured input."""
+    raw = str(event.get("input") or "")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return common.one_line(raw)
+    if isinstance(payload, dict):
+        questions = payload.get("questions")
+        if isinstance(questions, list):
+            for item in questions:
+                if isinstance(item, dict) and isinstance(item.get("question"), str):
+                    return common.one_line(item["question"])
+        for key in ("question", "plan", "prompt", "message"):
+            if isinstance(payload.get(key), str) and payload[key].strip():
+                return common.one_line(payload[key])
+    return common.one_line(raw)
+
+
+def _unanswered_question(chat: _Chat, last: _Turn) -> dict | None:
+    """The question tool the last turn is parked on: its latest event, still without a result."""
+    later = _events_after(chat, last.ts) if last.ts > 0 else list(chat.events)
+    tools = [event for event in later if event.get("kind") == "tool"]
+    if not tools:
+        return None
+    event = max(tools, key=lambda e: (int(e.get("ts") or 0), int(e.get("i") or 0)))
+    if (_QUESTION_TOOL_RE.match(str(event.get("name") or "")) and event.get("ok") is None
+            and not str(event.get("output") or "").strip()):
+        return event
+    return None
+
+
+def _api_error(reply: str) -> str | None:
+    """The synthetic API-error or usage-limit text a Claude turn ended on, or None."""
+    match = _API_ERROR_RE.search(reply)
+    return common.one_line(match.group(1)) if match else None
+
+
 def _classify_root(chat: _Chat) -> dict | None:
     last = chat.last_turn()
     if last is None:
@@ -764,6 +822,17 @@ def _classify_root(chat: _Chat) -> dict | None:
     reply = chat.replies.get(last.turn, "")
     record = {"turn": last.turn, "turn_ts": last.ts, "signals": [], "evidence": "",
               "items": [], "caveats": []}
+    question = _unanswered_question(chat, last)
+    if question is not None:
+        record.update(status="waiting_on_user",
+                      signals=[f"{question.get('name')} awaits your answer"],
+                      evidence=_question_head(question))
+        return record
+    error = _api_error(reply) if reply else None
+    if error is not None:
+        record.update(status="agent_work_incomplete",
+                      signals=["final reply is an API error"], evidence=error)
+        return record
     request = _direct_request(reply) if reply else None
     if request is not None:
         record.update(status="waiting_on_user", signals=["final reply asks you something"],
@@ -938,6 +1007,11 @@ def _classify_side(chat: _Chat, root: _Chat) -> dict | None:
             signals.append(f"latest tool failed ({failed.get('name') or 'tool'})")
         record.update(status="agent_work_incomplete", signals=signals,
                       evidence=common.one_line(last.text))
+        return record
+    error = _api_error(chat.replies[last.turn])
+    if error is not None:
+        record.update(status="agent_work_incomplete",
+                      signals=["side chat's final reply is an API error"], evidence=error)
         return record
     open_items, _caveats = _open_todos(chat)
     if open_items:
