@@ -96,9 +96,11 @@ command. Versioned machine-mode validation errors keep their structured shape.
   verdict, 2 is ambiguous, unprovable or a usage error. "Indexed" is what
   `agrep search` would serve: `evidence.corpus.served` names that engine
   (`corpus.db` or the direct scan of `messages.jsonl`), decided by corpusdb's
-  own reader predicates (`interactive_snapshot_lane`), so `why` and search
-  never disagree about a chat. `why` never indexes or writes. Pinned in
-  `py/test_why.py`.
+  own reader predicates (`interactive_snapshot_lane`, `protected_read_lane`,
+  `sqlite_failure_is_contention`), so `why` and search never disagree about a
+  chat: a lock held by a writer is the busy direct-scan lane, and a chat only
+  the lagging `corpus.db` still holds resolves there when search serves it.
+  `why` never indexes or writes. Pinned in `py/test_why.py`.
 - **Every surface states why it is empty.** A zero from a filter selecting a
   dimension the index holds no value for is not the same answer as a zero
   from a search that looked and found nothing, and the two must not render

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -28,6 +29,7 @@ CLAUDE = "11111111-1111-4111-8111-111111111111"
 CLAUDE_TWIN = "11111111-2222-4222-8222-222222222222"
 PI_ALIAS = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 PI_HEADER = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+PI_NEW = "77777777-7777-4777-8777-777777777777"
 OMP_ROOT = "33333333-3333-4333-8333-333333333333"
 OMP_SIDE = "44444444-4444-4444-8444-444444444444"
 OMP_CONTAINER = f"-work-beta/2000-02-03T04-05-06-000Z_{OMP_ROOT}"
@@ -47,10 +49,32 @@ def _rust_bin() -> Path:
 
 def _dead_explorer_descriptor() -> str:
     """A `.server` record in the shape legacy_cleanup retires: its owner pid has exited."""
-    child = subprocess.Popen(["/bin/sh", "-c", ":"], env={"PATH": "/usr/bin:/bin"})
-    child.wait(timeout=10)
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=30)
     return json.dumps({"pid": child.pid, "port": 1, "mode": "explorer",
                        "process_start": "unknown"}) + "\n"
+
+
+def _native(relative: str) -> str:
+    """A fixture-relative path spelled with this platform's separator."""
+    return relative.replace("/", os.sep)
+
+
+def _tilde(relative: str) -> str:
+    """The way `why` displays a path under the sandbox home."""
+    return "~" + os.sep + _native(relative)
+
+
+def _pi_transcript(path: Path, session: str, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"type": "session", "id": session, "version": 3, "cwd": "/work/new",
+                    "timestamp": "2000-05-01T00:00:00.000Z"}) + "\n"
+        + json.dumps({"type": "message", "id": "n1", "parentId": None,
+                      "timestamp": "2000-05-01T00:00:01.000Z",
+                      "message": {"role": "user", "content": [{"type": "text", "text": text}],
+                                  "timestamp": "2000-05-01T00:00:01.000Z"}}) + "\n",
+        encoding="utf-8")
 
 
 def _append_claude_turn(path: Path, home: Path, text: str, stamp: str, *,
@@ -97,7 +121,7 @@ class Sandbox:
             relative = source.relative_to(FIXTURES)
             target = self.home / ("." + relative.parts[0]) / Path(*relative.parts[1:])
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(source.read_text(encoding="utf-8").replace("{{home}}", str(self.home)),
+            target.write_text(self._substitute_home(source.read_text(encoding="utf-8")),
                               encoding="utf-8")
         (self.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
         self.env = {
@@ -111,6 +135,20 @@ class Sandbox:
             "AGREP_CALLER_PUBLICATION_DIR": str(self.root / "callers"),
             "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "py"))),
         }
+        if os.name == "nt":
+            # CPython and the ingest binary need the system roots; store discovery still
+            # resolves under AGREP_HOME, so the sandbox home stays the only one read.
+            self.env.update({key: os.environ[key] for key in (
+                "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "PATH") if key in os.environ})
+            self.env.update({"USERPROFILE": str(self.home), "TEMP": str(self.tmp),
+                             "TMP": str(self.tmp)})
+
+    def _substitute_home(self, text: str) -> str:
+        """`{{home}}/a/b` becomes the native sandbox path, escaped for the JSON string it sits in."""
+        def native(match: re.Match) -> str:
+            parts = [part for part in match.group(1).split("/") if part]
+            return json.dumps(str(self.home.joinpath(*parts)))[1:-1]
+        return re.sub(r"\{\{home\}\}((?:/[^\"/\\]+)*)", native, text)
 
     def spawn(self, command: list[str], *, timeout: float = 60,
               env: dict | None = None) -> subprocess.CompletedProcess:
@@ -225,7 +263,7 @@ class WhyReadOnlyVerdictTests(_VerdictAssertions):
                 self.assertIn(f"sessions.jsonl: claude chat {CLAUDE}, 2 messages", lines[0])
                 self.assertTrue(lines[1].startswith("corpus.db: "), lines)
                 self.assertIn("session_sig present", lines[1])
-                self.assertTrue(any(line.startswith("parse cache: ~/.claude/projects/")
+                self.assertTrue(any(line.startswith("parse cache: " + _tilde(".claude/projects/"))
                                     for line in lines), lines)
                 self.assertTrue(any("source unchanged since that parse" in line for line in lines))
                 self.assertEqual(payload["evidence"]["corpus"]["session_sig"], True)
@@ -256,7 +294,7 @@ class WhyReadOnlyVerdictTests(_VerdictAssertions):
     def test_sidecar_of_synthetic_mirrors_is_discovered_with_no_rows(self) -> None:
         path = self.sandbox.store(f"omp/agent/sessions/{OMP_CONTAINER}/mirror.jsonl")
         for reference in (str(path), "~" + str(path)[len(str(self.sandbox.home)):],
-                          f"{OMP_CONTAINER}/mirror.jsonl", "mirror.jsonl"):
+                          _native(f"{OMP_CONTAINER}/mirror.jsonl"), "mirror.jsonl"):
             with self.subTest(reference=reference):
                 payload = self.assert_verdict("discovered-no-rows", reference)
                 line = payload["evidence"]["lines"][0]
@@ -272,20 +310,21 @@ class WhyReadOnlyVerdictTests(_VerdictAssertions):
                 payload = self.assert_verdict("source-not-discovered", reference)
                 lines = payload["evidence"]["lines"]
                 self.assertTrue(lines[0].startswith("store census: 6 discovered file(s) across claude, pi"), lines)
-                self.assertTrue(any("present here: claude (~/.claude/projects), pi (~/.pi/agent/sessions)" in line
+                self.assertTrue(any(f"present here: claude ({_tilde('.claude/projects')}), "
+                                    f"pi ({_tilde('.pi/agent/sessions')})" in line
                                     for line in lines), lines)
                 self.assertEqual(payload["evidence"]["exists"], reference == str(elsewhere))
         under_root = self.sandbox.store("claude/projects/-projects-cedar/notes.txt")
         under_root.write_text("not a transcript\n", encoding="utf-8")
         payload = self.assert_verdict("source-not-discovered", str(under_root))
-        self.assertIn("claude: the path sits under its store root ~/.claude/projects but is not a "
-                      "transcript claude parses", payload["evidence"]["lines"])
+        self.assertIn(f"claude: the path sits under its store root {_tilde('.claude/projects')} but "
+                      "is not a transcript claude parses", payload["evidence"]["lines"])
         copilot = self.sandbox.home / ".copilot" / "session-state" / "x" / "events.jsonl"
         copilot.parent.mkdir(parents=True)
         copilot.write_text("{}\n", encoding="utf-8")
         payload = self.assert_verdict("source-not-discovered", str(copilot))
-        self.assertIn("copilot: detected-only store ~/.copilot/session-state; agrep does not index copilot yet",
-                      payload["evidence"]["lines"])
+        self.assertIn(f"copilot: detected-only store {_tilde('.copilot/session-state')}; agrep does "
+                      "not index copilot yet", payload["evidence"]["lines"])
 
     def test_ambiguous_fragment_lists_candidates_without_guessing(self) -> None:
         payload = self.assert_verdict("ambiguous", "11111111")
@@ -422,7 +461,8 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         payload = self.assert_verdict("written-after-last-index", "11111111-1111",
                                       next_action="agrep index")
         lines = payload["evidence"]["lines"]
-        self.assertRegex(lines[1], r"^intake_stats\.json: ~/.claude/projects/.* parsed at .* \(s:\d+:\d+\), now .* \(s:\d+:\d+\)$")
+        self.assertRegex(lines[1], r"^intake_stats\.json: " + re.escape(_tilde(".claude/projects/"))
+                         + r".* parsed at .* \(s:\d+:\d+\), now .* \(s:\d+:\d+\)$")
         self.assertTrue(lines[2].startswith(".ingest.sig: last index published"), lines)
         self.assertEqual(payload["evidence"]["intake"][0]["fresh"], False)
         corpus = payload["evidence"]["corpus"]
@@ -444,12 +484,8 @@ class WhyMutationVerdictTests(_VerdictAssertions):
                          "intake_stats.json: no record of this file, so no index has parsed it")
 
     def test_corpus_behind_transcripts(self) -> None:
-        fresh = self.sandbox.store("pi/agent/sessions/-work-new/2000-05-01T00-00-00-000Z_77777777-7777-4777-8777-777777777777.jsonl")
-        fresh.parent.mkdir(parents=True)
-        fresh.write_text(
-            '{"type":"session","id":"77777777-7777-4777-8777-777777777777","version":3,"cwd":"/work/new","timestamp":"2000-05-01T00:00:00.000Z"}\n'
-            '{"type":"message","id":"n1","parentId":null,"timestamp":"2000-05-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"fresh question"}],"timestamp":"2000-05-01T00:00:01.000Z"}}\n',
-            encoding="utf-8")
+        _pi_transcript(self.sandbox.store(f"pi/agent/sessions/-work-new/2000-05-01T00-00-00-000Z_{PI_NEW}.jsonl"),
+                       PI_NEW, "fresh question")
         self.sandbox.rust_index()
         payload = self.assert_verdict("corpus-behind-transcripts", "77777777",
                                       next_action="agrep index")
@@ -464,6 +500,115 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         self.assertIn("the search database does not hold it", payload["summary"])
         self.sandbox.index()
         self.assert_verdict("indexed", "77777777")
+
+    def test_deleted_transcript_is_still_served_from_the_lagging_search_database(self) -> None:
+        """Between the ingest that drops a removed transcript and the next corpus refresh, search
+        still serves the chat from corpus.db; `why` names those stale rows instead of nothing."""
+        self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl").unlink()
+        self.sandbox.rust_index()
+        for reference in (CLAUDE, "11111111-1111"):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("corpus-behind-transcripts", reference,
+                                              next_action="agrep index")
+                self.assertEqual(payload["summary"],
+                                 "not current: the search database still holds 4 rows of claude "
+                                 "chat 11111111 that messages.jsonl no longer publishes")
+                self.assertIsNone(payload["evidence"]["index_row"])
+                self.assertEqual(payload["evidence"]["stored_row"]["session"], CLAUDE)
+                self.assertEqual(payload["evidence"]["stored_row"]["via"], "corpus.db")
+                corpus = payload["evidence"]["corpus"]
+                self.assertEqual((corpus["served"], corpus["rows"], corpus["published_rows"],
+                                  corpus["extra"]), ("corpus.db", 4, 0, {"text": 4, "tool": 0}))
+                self.assertEqual(payload["evidence"]["lines"][:2], [
+                    f"sessions.jsonl: 4 chats, none with id {CLAUDE}",
+                    "corpus.db: 4 rows, 4 stored rows messages.jsonl no longer publishes, "
+                    f"stamp behind the published sources, family root {CLAUDE}"])
+        search = self.sandbox.cli("search", "copper lantern", "--json")
+        self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+        self.sandbox.index()
+        payload = self.assert_verdict("source-not-discovered", CLAUDE)
+        self.assertIn("corpus.db: no stored chat with that id", payload["evidence"]["lines"])
+        search = self.sandbox.cli("search", "copper lantern", "--json")
+        self.assertNotIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+
+    def test_deleted_store_converges_through_the_lagging_search_database(self) -> None:
+        """A whole store's removal drops its rows from sessions.jsonl on the second ingest; until
+        the corpus refresh, search and `why` both still answer from corpus.db."""
+        shutil.rmtree(self.sandbox.home / ".claude")
+        self.sandbox.rust_index()
+        self.assertIn(CLAUDE, self.sandbox.cli("search", "copper lantern", "--json").stdout)
+        self.sandbox.rust_index()
+        listed = {json.loads(line)["session"]
+                  for line in (self.sandbox.data / "sessions.jsonl").read_text(encoding="utf-8").splitlines()
+                  if line.strip()}
+        self.assertNotIn(CLAUDE, listed)
+        payload = self.assert_verdict("corpus-behind-transcripts", CLAUDE, next_action="agrep index")
+        self.assertIn("still holds 4 rows of claude chat 11111111 that messages.jsonl no longer publishes",
+                      payload["summary"])
+        self.assertIn(CLAUDE, self.sandbox.cli("search", "copper lantern", "--json").stdout)
+        self.sandbox.index()
+        self.assert_verdict("source-not-discovered", CLAUDE)
+        self.assertNotIn(CLAUDE, self.sandbox.cli("search", "copper lantern", "--json").stdout)
+
+    def test_locked_search_database_is_the_busy_direct_scan_lane(self) -> None:
+        """A writer's exclusive lock is contention, not damage: search answers from messages.jsonl
+        and discloses the busy index, and `why` judges from the same published rows."""
+        holder = sqlite3.connect(str(self.sandbox.data / "corpus.db"), isolation_level=None)
+        try:
+            holder.execute("BEGIN EXCLUSIVE")
+            payload = self.assert_verdict("indexed", CLAUDE)
+            self.assertEqual(payload["evidence"]["corpus"], {
+                "state": "busy", "served": "messages.jsonl",
+                "scan_reason": "busy updating (database is locked)", "stamp_current": False,
+                "proof": "scan", "current": True, "published_rows": 4})
+            self.assertEqual(payload["evidence"]["lines"][1],
+                             "corpus.db: busy updating (database is locked); search scans "
+                             "messages.jsonl directly (4 rows published for this chat)")
+            search = self.sandbox.cli("search", "copper lantern", "--json")
+            self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+            self.assertIn("the search index is busy updating", search.stderr)
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        corpus = self.assert_verdict("indexed", CLAUDE)["evidence"]["corpus"]
+        self.assertEqual((corpus["state"], corpus["served"], corpus["proof"]), ("ok", "corpus.db", "stamp"))
+
+    def test_protected_data_dir_takes_the_lane_search_takes(self) -> None:
+        """Under AGREP_DATA_READONLY, connect() serves the published database as it stands: a
+        queued build or a rebuild marker sends neither search nor `why` to the direct scan."""
+        _pi_transcript(self.sandbox.store(f"pi/agent/sessions/-work-new/2000-05-01T00-00-00-000Z_{PI_NEW}.jsonl"),
+                       PI_NEW, "zephyr quartz question")
+        self.sandbox.rust_index()
+        request = self.sandbox.data / ".search_index_request"
+        request.write_text(json.dumps({"requested": time.time()}), encoding="utf-8")
+        protected = dict(self.sandbox.env, AGREP_DATA_READONLY=str(self.sandbox.data))
+        payload = self.assert_verdict("corpus-behind-transcripts", "77777777",
+                                      next_action="agrep index", env=protected)
+        corpus = payload["evidence"]["corpus"]
+        self.assertEqual((corpus["served"], corpus["scan_reason"], corpus["proof"], corpus["rows"],
+                          corpus["current"]), ("corpus.db", None, "rows", 0, False), corpus)
+        self.assertIn("the search database does not hold it", payload["summary"])
+        search = self.sandbox.cli("search", "zephyr quartz", "--json", env=protected)
+        self.assertNotIn(PI_NEW, search.stdout, search.stdout + search.stderr)
+        payload = self.assert_verdict("indexed", "77777777")
+        self.assertEqual(payload["evidence"]["corpus"]["served"], "messages.jsonl")
+        self.assertIn(PI_NEW, self.sandbox.cli("search", "zephyr quartz", "--json").stdout)
+        request.unlink()
+
+        marker = self.sandbox.spawn([sys.executable, "-c", (
+            "import json, corpusdb; print(json.dumps({'version': 1, 'build_id': corpusdb._database_build_id()[1], "
+            "'database_identity': list(corpusdb._sqlite_file_identity(corpusdb.DB_PATH))}))")])
+        self.assertEqual(marker.returncode, 0, marker.stderr)
+        (self.sandbox.data / ".corpusdb-rebuild").write_text(marker.stdout, encoding="utf-8")
+        payload = self.assert_verdict("indexed", CLAUDE)
+        self.assertEqual((payload["evidence"]["corpus"]["served"], payload["evidence"]["corpus"]["scan_reason"]),
+                         ("messages.jsonl", "marked for rebuild after a query failure"))
+        payload = self.assert_verdict("indexed", CLAUDE, env=protected)
+        self.assertEqual((payload["evidence"]["corpus"]["served"], payload["evidence"]["corpus"]["proof"]),
+                         ("corpus.db", "rows"))
+        search = self.sandbox.cli("search", "copper lantern", "--json", env=protected)
+        self.assertIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+        self.assertNotIn("busy updating", search.stderr)
 
     def test_native_only_ingest_leaves_corpus_behind(self) -> None:
         path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
@@ -650,8 +795,8 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         stray = managed / "projects" / "-projects-cedar" / "notes.txt"
         stray.write_text("not a transcript\n", encoding="utf-8")
         payload = self.assert_verdict("source-not-discovered", str(stray))
-        self.assertIn("claude: the path sits under its store root ~/.claude/projects but is not a "
-                      "transcript claude parses", payload["evidence"]["lines"])
+        self.assertIn(f"claude: the path sits under its store root {_tilde('.claude/projects')} but "
+                      "is not a transcript claude parses", payload["evidence"]["lines"])
 
     def test_damaged_event_store_never_wakes_the_daemon(self) -> None:
         """A lagging corpus makes `why` fingerprint event payloads; a bad digest kicks no repair."""

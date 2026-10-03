@@ -2636,6 +2636,13 @@ def _publication_compatible(
              or meta.get("build_id") == expected_build_id))
 
 
+def protected_read_lane() -> bool:
+    """connect()'s read-only branch (AGREP_DATA_READONLY names this data dir): the published
+    database is served as it stands, so neither a stale stamp, a queued build nor the rebuild
+    marker sends the reader to the direct scan. `why` mirrors the lane through this predicate."""
+    return indexd_runtime._data_dir_readonly()
+
+
 def interactive_snapshot_lane(
         stored_stamp: object, stamp: str, *,
         build_pending: Callable[[], bool]) -> str:
@@ -3238,7 +3245,7 @@ def connect(quiet: bool = False, allow_stale: bool = False,
     whatever published db exists, never refresh, never sweep - a dev-tree process
     must not rewrite a data dir owned by the installed daemon (mixed-version
     writers tear each other's caches)."""
-    protected_read = indexd_runtime._data_dir_readonly()
+    protected_read = protected_read_lane()
     if (read_only or protected_read or allow_stale) \
             and _query_failure_matches_current():
         return None

@@ -2,7 +2,8 @@
 
 Read-only by construction: never indexes, writes the data dir or wakes the daemon. "Searchable"
 is what `agrep search` would serve, decided by corpusdb's own reader predicates. A reference
-resolves like `agrep resume` after a path lane; every evidence line names the file it came from.
+resolves like `agrep resume` after a path lane, then against the chats corpus.db still holds
+when search serves it; every evidence line names the file it came from.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ _EVIDENCE_LINES = 4
 _CANDIDATE_LINES = 20
 _INDEXED = ("indexed", "indexed-under-alias", "indexed-as-side-chat")
 _UNPROVABLE = ("ambiguous", "not-provable")
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_UUID_PREFIX = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{0,4}){0,3}(-[0-9a-f]{0,12})?", re.I)
 _HEX = re.compile(r"[0-9a-f]{6,}", re.I)
 _SKIP_ORDER = ("wrapper", "meta", "sidechain", "non_message", "non_human", "empty_text",
                "replay", "unreferenced", "throwaway")
@@ -100,7 +101,9 @@ def _reader_lane(meta: dict | None) -> tuple[str, str | None]:
     reads `meta` (None: no database), from the reader's own read-only facts and predicates."""
     import corpusdb
     import indexd_runtime
-    if corpusdb._query_failure_matches_current() or corpusdb.query_rebuild_required():
+    protected = corpusdb.protected_read_lane()
+    if corpusdb._query_failure_matches_current() or (
+            not protected and corpusdb.query_rebuild_required()):
         return "scan", "marked for rebuild after a query failure"
     if not corpusdb._trigram_ok():
         return "scan", "this sqlite lacks trigram FTS5"
@@ -129,8 +132,18 @@ def _reader_lane(meta: dict | None) -> tuple[str, str | None]:
         return "scan", "published by another agrep build"
     lane = corpusdb.interactive_snapshot_lane(
         meta.get("stamp"), corpusdb._stamp(),
-        build_pending=indexd_runtime.search_index_build_pending)
+        build_pending=(lambda: False) if protected else indexd_runtime.search_index_build_pending)
     return lane, "stamp behind the published sources, rebuild queued" if lane == "scan" else None
+
+
+def _open_published(path: Path) -> sqlite3.Connection:
+    uri = Path(os.path.abspath(os.fspath(path))).as_uri() + "?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=1.0)
+
+
+def _published_meta(db: sqlite3.Connection) -> dict:
+    return dict(db.execute("SELECT key, value FROM meta "
+                           "WHERE key IN ('schema', 'build_id', 'stamp')"))
 
 
 def _stored_rows(db: sqlite3.Connection, session: str, facts: dict) -> list[tuple]:
@@ -175,43 +188,45 @@ def _corpus_facts(session: str) -> dict:
     # The scan validates event payloads; damage found there must not schedule indexd from `why`.
     events.set_event_repair_callback(lambda: False)
     path = common.DATA_DIR / "corpus.db"
-    db, meta = None, None
-    try:
-        if path.exists():
-            try:
-                uri = Path(os.path.abspath(os.fspath(path))).as_uri() + "?mode=ro"
-                db = sqlite3.connect(uri, uri=True, timeout=1.0)
-                meta = dict(db.execute("SELECT key, value FROM meta "
-                                       "WHERE key IN ('schema', 'build_id', 'stamp')"))
-            except (sqlite3.Error, OSError, ValueError) as exc:
-                return {"state": "unreadable", "reason": str(exc)}
-        lane, scan_reason = _reader_lane(meta)
-        facts: dict = {"state": "ok" if meta is not None else "missing",
-                       "served": "messages.jsonl" if lane == "scan" else "corpus.db",
-                       "scan_reason": scan_reason, "stamp_current": lane == "current"}
-        stored: list[tuple] = []
-        if meta is not None and meta.get("schema") == corpusdb._SCHEMA:
-            try:
-                stored = _stored_rows(db, session, facts)
-            except sqlite3.Error as exc:
-                return {"state": "unreadable", "reason": str(exc)}
-        if lane == "current":
-            facts.update({"proof": "stamp", "current": True})
-            return facts
+    meta, stored, held, busy = None, [], {}, None
+    if path.exists():
         try:
-            published = corpusdb._scan(only={session}).get(session, [])
-        except (OSError, RuntimeError, ValueError) as exc:
-            facts.update({"proof": None, "current": None, "reason": str(exc)})
-            return facts
-        if lane == "scan":
-            facts.update({"proof": "scan", "current": bool(published),
-                          "published_rows": len(published)})
-            return facts
-        facts.update(_row_diff(stored, published))
+            db = _open_published(path)
+            try:
+                meta = _published_meta(db)
+                if meta.get("schema") == corpusdb._SCHEMA:
+                    stored = _stored_rows(db, session, held)
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            # A writer's lock is contention, which the reader answers from messages.jsonl.
+            if not corpusdb.sqlite_failure_is_contention(exc):
+                return {"state": "unreadable", "reason": str(exc)}
+            busy = exc
+        except (OSError, ValueError) as exc:
+            return {"state": "unreadable", "reason": str(exc)}
+    if busy is not None:
+        lane, scan_reason = "scan", f"busy updating ({busy})"
+    else:
+        lane, scan_reason = _reader_lane(meta)
+    facts: dict = {"state": "busy" if busy is not None else "ok" if meta is not None else "missing",
+                   "served": "messages.jsonl" if lane == "scan" else "corpus.db",
+                   "scan_reason": scan_reason, "stamp_current": lane == "current"}
+    facts.update(held)
+    if lane == "current":
+        facts.update({"proof": "stamp", "current": True})
         return facts
-    finally:
-        if db is not None:
-            db.close()
+    try:
+        published = corpusdb._scan(only={session}).get(session, [])
+    except (OSError, RuntimeError, ValueError) as exc:
+        facts.update({"proof": None, "current": None, "reason": str(exc)})
+        return facts
+    if lane == "scan":
+        facts.update({"proof": "scan", "current": bool(published),
+                      "published_rows": len(published)})
+        return facts
+    facts.update(_row_diff(stored, published))
+    return facts
 
 
 # --------------------------------------------------------------------------- formatting
@@ -479,6 +494,42 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     return _report(ctx, verdict, summary, lines, facts=facts)
 
 
+def _judge_stored(ctx: _Context, row: dict) -> dict:
+    """A chat sessions.jsonl no longer lists while the search database search serves still holds
+    its rows: a transcript removed between the ingest and the next corpus refresh."""
+    session, agent = str(row["session"]), row.get("agent") or "?"
+    corpus = _corpus_facts(session)
+    if corpus.get("served") != "corpus.db" or not corpus.get("rows"):
+        return _no_match(ctx, stored_checked=True)
+    facts = {"index_row": None, "stored_row": row, "corpus": corpus, "sources": [],
+             "intake": [], "issue": None}
+    skipped = f" ({ctx.index_skipped} corrupt line(s) skipped)" if ctx.index_skipped else ""
+    lines = [f"sessions.jsonl: {len(ctx.rows)} chats, none with id {session}{skipped}",
+             _corpus_line(corpus)]
+    if ctx.payload is None:
+        lines.append(f"store census: unavailable ({ctx.census_error})")
+    else:
+        paths = [c["path"] for c in ctx.cache_sessions if c.get("session") == session and c.get("path")]
+        lines.append("parse cache: " + (", ".join(ctx.display(p) for p in paths) if paths
+                                        else "no file claims this session"))
+    lines.append(ctx.sig_line())
+    if corpus.get("current") is None:
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: the search database is behind the published sources and {agent} "
+            f"chat {_short(session)} could not be compared",
+            lines, facts=facts, next_action="agrep index")
+    if corpus.get("current") is False:
+        return _report(
+            ctx, "corpus-behind-transcripts", _corpus_behind_summary(corpus, agent, session),
+            lines, facts=facts, next_action="agrep index")
+    return _report(
+        ctx, "indexed",
+        f"indexed: {agent} chat {session} is searchable from the search database "
+        f"({_plural(corpus['rows'], 'row')}), though sessions.jsonl no longer lists it",
+        lines, facts=facts)
+
+
 def _diff_text(corpus: dict) -> str:
     """What differs between the stored rows and the published ones, each named by its source."""
     published, missing, extra = corpus["published"], corpus["missing"], corpus["extra"]
@@ -530,7 +581,7 @@ def _corpus_line(corpus: dict) -> str:
 
 def _corpus_behind_summary(corpus: dict, agent: str, session: str) -> str:
     chat = f"{agent} chat {_short(session)}"
-    if corpus["served"] == "messages.jsonl" or corpus.get("published_rows") == 0:
+    if corpus["served"] == "messages.jsonl":
         return f"not searchable yet: transcripts list {chat} but messages.jsonl publishes no rows for it"
     if not corpus["rows"]:
         return f"not searchable yet: transcripts list {chat} but the search database does not hold it"
@@ -682,10 +733,12 @@ def _not_discovered(ctx: _Context, path: str) -> dict:
                "under_detected": detected})
 
 
-def _no_match(ctx: _Context) -> dict:
+def _no_match(ctx: _Context, stored_checked: bool = False) -> dict:
     lines = [f"sessions.jsonl: {len(ctx.rows)} chats, none match by id, alias, project or first line",
              ctx.census_line(),
              "parse cache and intake_stats.json: no file or conversation named like it"]
+    if stored_checked:
+        lines.append("corpus.db: no stored chat with that id")
     if ctx.index_skipped:
         lines.append(f"sessions.jsonl: {ctx.index_skipped} corrupt line(s) were skipped")
     return _report(ctx, "source-not-discovered",
@@ -754,7 +807,8 @@ def _alias_rows(rows: list[dict], identity: str) -> list[dict]:
 
 
 def _id_like(identity: str) -> bool:
-    return bool(_UUID.fullmatch(identity) or identity.startswith("ses_")
+    """A session id or a prefix of one: a uuid (or its dashed head), a `ses_` id, a hex run."""
+    return bool(_UUID_PREFIX.fullmatch(identity) or identity.startswith("ses_")
                 or _HEX.fullmatch(identity))
 
 
@@ -785,6 +839,42 @@ def _source_lane(ctx: _Context, identity: str) -> list[dict]:
             found.setdefault((path, None), {"agent": source.get("agent"), "path": path})
     return sorted(found.values(),
                   key=lambda c: (str(c.get("path") or ""), str(c.get("session") or "")))
+
+
+def _stored_candidate(db: sqlite3.Connection, session: str) -> dict | None:
+    row = db.execute("SELECT agent, project, text FROM msgs WHERE session = ? "
+                     "ORDER BY who <> 'user', turn, id LIMIT 1", (session,)).fetchone()
+    if row is None:
+        return None
+    return {"agent": row[0], "session": session, "project": row[1], "first_text": row[2],
+            "alias": None, "parent": None, "via": "corpus.db"}
+
+
+def _stored_lane(identity: str) -> tuple[list[dict], bool]:
+    """Chats corpus.db holds under `identity` (exact id, else prefix) while search serves that
+    database; the flag says whether it was consulted (not on the scan lane or when unreadable)."""
+    import corpusdb
+    path = common.DATA_DIR / "corpus.db"
+    if len(identity) < 6 or not identity.isascii() or not path.exists():
+        return [], False
+    try:
+        db = _open_published(path)
+        try:
+            meta = _published_meta(db)
+            if meta.get("schema") != corpusdb._SCHEMA or _reader_lane(meta)[0] == "scan":
+                return [], False
+            upper = identity[:-1] + chr(ord(identity[-1]) + 1)
+            found: set[str] = set()
+            for table in ("session_sig", "msgs"):
+                found.update(row[0] for row in db.execute(
+                    f"SELECT DISTINCT session FROM {table} WHERE session >= ? AND session < ?",
+                    (identity, upper)))
+            sessions = [identity] if identity in found else sorted(found)
+            return [c for c in (_stored_candidate(db, s) for s in sessions) if c], True
+        finally:
+            db.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return [], False
 
 
 def diagnose(reference: str) -> dict:
@@ -821,6 +911,11 @@ def diagnose(reference: str) -> dict:
                              sources[0].get("session"))
     if matched:
         return _judge_rows(ctx, matched, "human")
+    stored, stored_checked = _stored_lane(identity) if id_like else ([], False)
+    if len(stored) > 1:
+        return _ambiguous(ctx, stored, "chats", "corpus.db")
+    if stored:
+        return _judge_stored(ctx, stored[0])
     if ctx.payload is None:
         return _report(
             ctx, "not-provable",
@@ -828,7 +923,7 @@ def diagnose(reference: str) -> dict:
             [f"sessions.jsonl: {len(ctx.rows)} chats, none match", ctx.census_line()])
     if _looks_like_path(reference):
         return _not_discovered(ctx, expanded)
-    return _no_match(ctx)
+    return _no_match(ctx, stored_checked)
 
 
 # --------------------------------------------------------------------------- surface
