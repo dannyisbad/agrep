@@ -570,6 +570,109 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         self.assertEqual(payload["evidence"]["stored_row"]["session"], second)
         self.assertIn(CLAUDE, self.sandbox.cli("search", "copper lantern", "--json").stdout)
 
+    def test_stored_chat_that_moves_between_the_two_reads_is_reported_not_crashed(self) -> None:
+        """_judge_stored re-reads corpus.db after the stored lane picked a chat; a refresh that
+        dropped it, or a writer's lock, in between is an honest no-match, never a traceback."""
+        probe = ("import json, sys, why; row = {'session': sys.argv[1], 'agent': 'claude', "
+                 "'via': 'corpus.db'}; print(json.dumps(why._judge_stored(why._Context(sys.argv[1]), row)))")
+        before = self.sandbox.data_snapshot()
+        gone = self.sandbox.spawn([sys.executable, "-c", probe, "66666666-6666-4666-8666-666666666666"])
+        self.assertEqual(gone.returncode, 0, gone.stderr)
+        payload = json.loads(gone.stdout)
+        self.assertEqual((payload["verdict"], payload["exit"]), ("source-not-discovered", 1), payload)
+        self.assertIn("corpus.db: 0 rows, session_sig absent", payload["evidence"]["lines"])
+        holder = sqlite3.connect(str(self.sandbox.data / "corpus.db"), isolation_level=None)
+        try:
+            holder.execute("BEGIN EXCLUSIVE")
+            busy = self.sandbox.spawn([sys.executable, "-c", probe, CLAUDE])
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertEqual(busy.returncode, 0, busy.stderr)
+        payload = json.loads(busy.stdout)
+        self.assertEqual((payload["verdict"], payload["exit"]), ("source-not-discovered", 1), payload)
+        self.assertIn("corpus.db: busy updating (database is locked); search scans messages.jsonl "
+                      "directly (4 rows published for this chat)", payload["evidence"]["lines"])
+        self.assertEqual(self.sandbox.data_snapshot(), before, "the probe wrote the data dir")
+
+    def test_stored_first_line_skips_replies_and_recaps_like_sessions_jsonl(self) -> None:
+        """A chat resumed after /compact opens with a recap and its assistant reply; sessions.jsonl
+        takes the first real user line, and so must the stored lane once the file is gone."""
+        session = "88888888-8888-4888-8888-888888888888"
+        path = self.sandbox.store(f"claude/projects/-projects-cedar/{session}.jsonl")
+        cwd = str(self.sandbox.home / "projects" / "cedar")
+        path.write_text("".join(json.dumps(row) + "\n" for row in (
+            {"sessionId": session, "cwd": cwd, "type": "user", "userType": "external",
+             "isCompactSummary": True, "timestamp": "2000-01-23T12:00:00.000Z",
+             "message": {"role": "user", "content": "Summary of the walnut ledger so far."}},
+            {"sessionId": session, "cwd": cwd, "type": "assistant", "timestamp": "2000-01-23T12:00:30.000Z",
+             "message": {"role": "assistant", "model": "claude-sonnet-4",
+                         "content": [{"type": "text", "text": "Understood, resuming the walnut ledger."}]}},
+            {"sessionId": session, "cwd": cwd, "type": "user", "userType": "external",
+             "timestamp": "2000-01-23T12:01:00.000Z",
+             "message": {"role": "user", "content": "Now polish the hazel invoice template."}})),
+            encoding="utf-8")
+        self.sandbox.index()
+        listed = self.assert_verdict("indexed", "hazel invoice")["evidence"]["index_row"]
+        self.assertEqual((listed["session"], listed["first_text"]),
+                         (session, "Now polish the hazel invoice template."))
+        path.unlink()
+        self.sandbox.rust_index()
+        payload = self.assert_verdict("corpus-behind-transcripts", "hazel invoice", next_action="agrep index")
+        self.assertEqual(payload["evidence"]["stored_row"]["first_text"], "Now polish the hazel invoice template.")
+        self.assertEqual(payload["evidence"]["stored_row"]["session"], session)
+        self.assertEqual(self.assert_verdict("source-not-discovered", "resuming the walnut")["verdict"],
+                         "source-not-discovered")
+
+    def test_stored_chat_without_a_first_line_still_resolves_by_id_and_project(self) -> None:
+        """sessions.jsonl lists a recap-only chat with an empty first line and resume finds it by
+        id or project; the stored lane keeps it as a candidate with first_text '' once it is gone."""
+        session = "99999999-9999-4999-8999-999999999999"
+        path = self.sandbox.store(f"claude/projects/-projects-oak/{session}.jsonl")
+        path.parent.mkdir()
+        path.write_text(json.dumps({
+            "sessionId": session, "cwd": str(self.sandbox.home / "projects" / "oak"), "type": "user",
+            "userType": "external", "isCompactSummary": True, "timestamp": "2000-01-24T12:00:00.000Z",
+            "message": {"role": "user", "content": "Summary: the walnut ledger is balanced."}}) + "\n",
+            encoding="utf-8")
+        self.sandbox.index()
+        self.assertEqual(self.assert_verdict("indexed", "oak")["evidence"]["index_row"]["first_text"], "")
+        path.unlink()
+        self.sandbox.rust_index()
+        self.assertIn(session, self.sandbox.cli("search", "walnut ledger", "--json").stdout)
+        for reference in (session, "99999999", "oak"):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("corpus-behind-transcripts", reference, next_action="agrep index")
+                stored = payload["evidence"]["stored_row"]
+                self.assertEqual((stored["session"], stored["project"], stored["first_text"]),
+                                 (session, "oak", ""), stored)
+
+    def test_stored_side_chat_ids_match_exactly_and_by_prefix_like_resume(self) -> None:
+        """Claude side chats are stored under their file stem (`agent-child1`), which is not
+        uuid-shaped; resume matches such ids exactly and by prefix, so the stored lane must too."""
+        child = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}/subagents/agent-child1.jsonl")
+        child.parent.mkdir(parents=True)
+        child.write_text(json.dumps({
+            "sessionId": CLAUDE, "cwd": str(self.sandbox.home / "projects" / "cedar"), "type": "user",
+            "userType": "external", "timestamp": "2000-01-20T12:03:00.000Z",
+            "message": {"role": "user", "content": "Calibrate the spruce gauge."}}) + "\n",
+            encoding="utf-8")
+        self.sandbox.index()
+        for reference in ("agent-child1", "agent-child"):
+            with self.subTest(reference=reference, listed=True):
+                self.assertEqual(self.assert_verdict("indexed-as-side-chat", reference)["evidence"]["index_row"]["session"],
+                                 "agent-child1")
+        child.unlink()
+        self.sandbox.rust_index()
+        self.assertIn("agent-child1", self.sandbox.cli("search", "spruce gauge", "--json").stdout)
+        for reference in ("agent-child1", "agent-child", "spruce gauge"):
+            with self.subTest(reference=reference, listed=False):
+                payload = self.assert_verdict("corpus-behind-transcripts", reference, next_action="agrep index")
+                self.assertEqual(payload["evidence"]["stored_row"]["session"], "agent-child1")
+        payload = self.assert_verdict("source-not-discovered", "agent-nobody")
+        self.assertIn("corpus.db: 1 stored chat sessions.jsonl no longer lists, none match by id, "
+                      "project or first line", payload["evidence"]["lines"])
+
     def test_deleted_store_converges_through_the_lagging_search_database(self) -> None:
         """A whole store's removal drops its rows from sessions.jsonl on the second ingest; until
         the corpus refresh, search and `why` both still answer from corpus.db."""

@@ -499,13 +499,20 @@ def _judge_stored(ctx: _Context, row: dict) -> dict:
     its rows: a transcript removed between the ingest and the next corpus refresh."""
     session, agent = str(row["session"]), row.get("agent") or "?"
     corpus = _corpus_facts(session)
-    if corpus.get("served") != "corpus.db" or not corpus.get("rows"):
-        return _no_match(ctx, stored_checked=True)
-    facts = {"index_row": None, "stored_row": row, "corpus": corpus, "sources": [],
-             "intake": [], "issue": None}
     skipped = f" ({ctx.index_skipped} corrupt line(s) skipped)" if ctx.index_skipped else ""
     lines = [f"sessions.jsonl: {len(ctx.rows)} chats, none with id {session}{skipped}",
              _corpus_line(corpus)]
+    facts = {"index_row": None, "stored_row": row, "corpus": corpus, "sources": [],
+             "intake": [], "issue": None}
+    if corpus.get("state") == "unreadable":
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: the search database cannot be read, so whether {agent} chat "
+            f"{_short(session)} is searchable is unknown",
+            lines + [ctx.sig_line()], facts=facts, next_action="agrep doctor")
+    if corpus["served"] != "corpus.db" or not corpus["rows"]:
+        # A refresh or a writer's lock landed between the two reads: search no longer serves it.
+        return _no_match(ctx, _corpus_line(corpus))
     if ctx.payload is None:
         lines.append(f"store census: unavailable ({ctx.census_error})")
     else:
@@ -842,24 +849,25 @@ def _source_lane(ctx: _Context, identity: str) -> list[dict]:
 
 
 def _stored_candidate(db: sqlite3.Connection, session: str) -> dict | None:
-    """The stored chat as a candidate row, its first line derived the way sessions.jsonl derives
-    `first_text` (first non-empty, non-recap text row, whitespace collapsed, 120 chars)."""
-    row = db.execute("SELECT agent, project, text FROM msgs WHERE session = ? AND who <> 'tool' "
-                     "AND who <> 'recap' AND text <> '' ORDER BY turn, id LIMIT 1",
-                     (session,)).fetchone()
-    if row is None:
+    """The stored chat as a candidate row. `first_text` is derived as sessions.jsonl derives it:
+    the first messages.jsonl row (never a reply or tool row) that is not a recap and has text,
+    whitespace collapsed, 120 chars; "" when no such row exists. None only without any row."""
+    head = db.execute("SELECT agent, project FROM msgs WHERE session = ? ORDER BY turn, id LIMIT 1",
+                      (session,)).fetchone()
+    if head is None:
         return None
-    return {"agent": row[0], "session": session, "project": row[1],
-            "first_text": " ".join(str(row[2]).split())[:120],
+    texts = db.execute("SELECT text FROM msgs WHERE session = ? AND who <> 'tool' AND who <> 'agent' "
+                       "AND who <> 'recap' ORDER BY turn, id", (session,))
+    first = next((" ".join(str(text).split())[:120] for (text,) in texts if str(text or "").split()), "")
+    return {"agent": head[0], "session": session, "project": head[1], "first_text": first,
             "alias": None, "parent": None, "via": "corpus.db"}
 
 
-def _stored_lane(ctx: _Context, reference: str, identity: str, id_like: bool,
-                 ) -> tuple[list[dict], str | None]:
+def _stored_lane(ctx: _Context, reference: str, identity: str) -> tuple[list[dict], str | None]:
     """Chats corpus.db still holds that sessions.jsonl no longer lists, matched the way resume
-    matches (id, prefix or hex fragment, then project label, then first-line substring) while
-    search serves that database. The text is the evidence line for a miss, None if not consulted.
-    Cost is one session_sig scan plus one indexed seek per unlisted chat, never a scan of msgs."""
+    matches (exact id or prefix, a hex fragment, then project label, then first-line substring)
+    while search serves that database. The text is the evidence line for a miss, None if not
+    consulted. Cost is one session_sig scan plus one indexed read per unlisted chat."""
     import corpusdb
     path = common.DATA_DIR / "corpus.db"
     if not path.exists():
@@ -875,13 +883,9 @@ def _stored_lane(ctx: _Context, reference: str, identity: str, id_like: bool,
                      if s not in listed]
             if not stale:
                 return [], "corpus.db: every stored chat is listed in sessions.jsonl"
-            found: list[str] = []
-            if id_like:
-                needle = identity.lower()
-                found = ([s for s in stale if s == identity]
-                         or [s for s in stale if s.startswith(identity)]
-                         or ([s for s in stale if needle in s.lower()]
-                             if _HEX.fullmatch(needle) else []))
+            needle = identity.lower()
+            found = common.match_session_ids(stale, identity) or (
+                [s for s in stale if needle in s.lower()] if _HEX.fullmatch(needle) else [])
             candidates = [c for c in (_stored_candidate(db, s) for s in found or stale) if c]
             if not found:
                 query = reference.strip()
@@ -931,7 +935,7 @@ def diagnose(reference: str) -> dict:
                              sources[0].get("session"))
     if matched:
         return _judge_rows(ctx, matched, "human")
-    stored, stored_line = _stored_lane(ctx, reference, identity, id_like)
+    stored, stored_line = _stored_lane(ctx, reference, identity)
     if len(stored) > 1:
         return _ambiguous(ctx, stored, "chats", "corpus.db")
     if stored:
