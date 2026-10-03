@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,53 @@ S17_SIDE = "agent-h7side0001"
 MARCH = ("--since", "2026-03-01", "--until", "2026-03-20")
 APRIL = ("--since", "2026-04-01", "--until", "2026-04-30")
 DAY_MS = 86_400_000
+# the per-agent matrix (May/June 2026): finished, finished after compaction, open native todo,
+# open next steps, waiting on user, subagent handed back, background subagent still running
+MATRIX = ("--since", "2026-05-01", "--until", "2026-06-30")
+MX = {
+    "claude": {
+        "finished": "ca000001-0501-4000-8000-000000000501",
+        "compacted": "ca000002-0502-4000-8000-000000000502",
+        "todo": "ca000003-0503-4000-8000-000000000503",
+        "next_steps": "ca000004-0504-4000-8000-000000000504",
+        "waiting": "ca000005-0505-4000-8000-000000000505",
+        "handed_back": "ca000006-0506-4000-8000-000000000506",
+        "background": "ca000007-0507-4000-8000-000000000507",
+        "background_side": "agent-ca07side01",
+    },
+    "omp": {
+        "finished": "om000001-0521-4000-8000-000000000521",
+        "compacted": "om000002-0522-4000-8000-000000000522",
+        "todo": "om000003-0523-4000-8000-000000000523",
+        "next_steps": "om000004-0524-4000-8000-000000000524",
+        "waiting": "om000005-0525-4000-8000-000000000525",
+        "handed_back": "om000006-0526-4000-8000-000000000526",
+        "background": "om000007-0527-4000-8000-000000000527",
+        "background_side": "om0007s1-0527-4000-8000-00000000s527",
+    },
+    "codex": {
+        "finished": "cx000001-0541-4000-8000-000000000541",
+        "compacted": "cx000002-0542-4000-8000-000000000542",
+        "todo": "cx000003-0543-4000-8000-000000000543",
+        "next_steps": "cx000004-0544-4000-8000-000000000544",
+        "waiting": "cx000005-0545-4000-8000-000000000545",
+        "handed_back": "cx000006-0546-4000-8000-000000000546",
+        "background": "cx000007-0547-4000-8000-000000000547",
+        "background_side": "01990707-0001-7000-8000-000000000701",
+    },
+    "opencode": {
+        "finished": "ses_oc000001mx",
+        "compacted": "ses_oc000002mx",
+        "todo": "ses_oc000003mx",
+        "next_steps": "ses_oc000004mx",
+        "waiting": "ses_oc000005mx",
+        "handed_back": "ses_oc000006mx",
+        "background": "ses_oc000007mx",
+        "background_side": "ses_oc000007sx",
+    },
+}
+MX_CLAUDE_NONE_BULLET = "ca000008-0508-4000-8000-000000000508"  # "## Remaining" + "- None"
+MX_CLAUDE_MID_COMPACTION = "ca000009-0509-4000-8000-000000000509"  # recap, then a question
 
 
 class SummarySandbox:
@@ -99,6 +147,16 @@ class SummarySandbox:
             if "{{" in content:
                 raise AssertionError(f"unexpanded fixture template: {source}")
             destination.write_text(content, encoding="utf-8")
+        # opencode keeps its chats in SQLite; the seed carries the same synthetic matrix
+        seed = FIXTURES / "store" / "opencode" / "seed.sql"
+        database = self.home / ".local" / "share" / "opencode" / "opencode.db"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                seed.read_text(encoding="utf-8").replace("{{home}}", str(self.home)))
+        finally:
+            connection.close()
 
     def spawn(self, command, *, env_overrides=None, executable=None):
         env = dict(self.env)
@@ -368,6 +426,126 @@ class SummaryTests(unittest.TestCase):
         chats = {chat["session"]: chat for chat in projects[0]["worked_on"]}
         self.assertEqual(chats[S1]["turns"], 4)
         self.assertRegex(chats[S1]["latest_handle"], r"^@a1a1a1a1:3\.[0-9a-f]{4}$")
+
+    # --- pending: per-agent matrix and the shapes the third review found ---
+
+    def _pending_by_session(self, *argv) -> dict[str, dict]:
+        result = self.sandbox.summary("pending", *MATRIX, *argv, "--json")
+        _meta, items = _rows(result)
+        return {item["session"]: item for item in items}
+
+    def test_matrix_finished_chats_are_not_pending(self) -> None:
+        pending = self._pending_by_session()
+        for agent, chats in MX.items():
+            with self.subTest(agent=agent, shape="finished"):
+                self.assertNotIn(chats["finished"], pending)
+            with self.subTest(agent=agent, shape="finished-after-compaction"):
+                self.assertNotIn(chats["compacted"], pending)
+            with self.subTest(agent=agent, shape="subagent-handed-back"):
+                self.assertNotIn(chats["handed_back"], pending)
+
+    def test_matrix_open_shapes_report_their_status(self) -> None:
+        pending = self._pending_by_session()
+        expected = {
+            ("claude", "todo"): ("todo_open", ["write the tango report"]),
+            ("omp", "todo"): ("todo_open", ["port the env loader", "port the yaml loader"]),
+            ("codex", "todo"): ("todo_open", ["port the papa writer", "update the papa docs"]),
+            ("opencode", "todo"): ("todo_open", ["port the env loader"]),
+            ("claude", "next_steps"): ("open_next_steps", ["add tests for the tango parser",
+                                                           "update the tango docs"]),
+            ("omp", "next_steps"): ("open_next_steps", ["wire the romeo reader into the CLI",
+                                                        "add romeo fixtures"]),
+            ("codex", "next_steps"): ("open_next_steps", ["add tests for the quebec parser",
+                                                          "update the quebec docs"]),
+            ("opencode", "next_steps"): ("open_next_steps", ["add tests for the tango parser",
+                                                             "update the tango docs"]),
+            ("claude", "waiting"): ("waiting_on_user", []),
+            ("omp", "waiting"): ("waiting_on_user", []),
+            ("codex", "waiting"): ("waiting_on_user", []),
+            ("opencode", "waiting"): ("waiting_on_user", []),
+        }
+        for (agent, shape), (status, items) in expected.items():
+            with self.subTest(agent=agent, shape=shape):
+                item = pending[MX[agent][shape]]
+                # the .omp store is read by the pi adapter and carries its label
+                self.assertEqual((item["status"], item["items"], item["source"], item["agent"]),
+                                 (status, items, "root", "pi" if agent == "omp" else agent))
+                self.assertNotIn("caveats", item)
+
+    def test_matrix_background_subagent_rolls_up_from_the_side_chat(self) -> None:
+        # claude and omp children spoke before their todo list; codex and opencode children have
+        # no reply yet, so their unfinished turn is the evidence
+        pending = self._pending_by_session()
+        expected = {"claude": "todo_open", "omp": "todo_open",
+                    "codex": "agent_work_incomplete", "opencode": "agent_work_incomplete"}
+        for agent, status in expected.items():
+            with self.subTest(agent=agent):
+                item = pending[MX[agent]["background"]]
+                self.assertEqual((item["status"], item["source"], item["evidence_session"]),
+                                 (status, "side-chat", MX[agent]["background_side"]))
+        self.assertEqual(pending[MX["claude"]["background"]]["items"],
+                         ["rebuild the whiskey index", "report the whiskey rebuild"])
+        self.assertEqual(pending[MX["omp"]["background"]]["items"],
+                         ["rebuild the uniform index", "report the uniform rebuild"])
+
+    def test_omp_todo_ops_replay_into_the_current_list(self) -> None:
+        # init + start + done(all) ends clean; init/start/done/append/start/block leaves two
+        # open items, the blocked one included, and neither chat is an unknown shape
+        pending = self._pending_by_session("--project", "mx-omp")
+        self.assertNotIn(MX["omp"]["finished"], pending)
+        todo = pending[MX["omp"]["todo"]]
+        self.assertEqual((todo["status"], todo["confidence"]), ("todo_open", "medium"))
+        self.assertEqual(todo["items"], ["port the env loader", "port the yaml loader"])
+        self.assertFalse(any(i["status"] == "unknown" for i in pending.values()), pending)
+
+    def test_codex_update_plan_is_the_chats_todo_list(self) -> None:
+        pending = self._pending_by_session("--agent", "codex")
+        plan = pending[MX["codex"]["todo"]]
+        self.assertEqual((plan["status"], plan["items"]),
+                         ("todo_open", ["port the papa writer", "update the papa docs"]))
+        self.assertNotIn(MX["codex"]["finished"], pending)
+
+    def test_trailing_compaction_recap_does_not_reopen_a_finished_chat(self) -> None:
+        # claude: manual /compact after the final reply; omp: auto-compaction after it; codex: a
+        # compacted boundary; opencode: a summary message. None is a prompt, none counts a turn
+        pending = self._pending_by_session()
+        for agent in MX:
+            with self.subTest(agent=agent):
+                self.assertNotIn(MX[agent]["compacted"], pending)
+        _meta, projects = _rows(self._ok(*MATRIX, "-n", "0", "--json"))
+        turns = {chat["session"]: chat["turns"] for p in projects for chat in p["worked_on"]}
+        for agent in MX:
+            with self.subTest(agent=agent):
+                self.assertEqual(turns[MX[agent]["compacted"]], 1)
+        # a recap in the middle of a chat carries the reply written after it to the prompt before
+        item = pending[MX_CLAUDE_MID_COMPACTION]
+        self.assertEqual((item["status"], item["evidence"]),
+                         ("waiting_on_user", "Should I also port the sierra tests?"))
+        self.assertEqual(turns[MX_CLAUDE_MID_COMPACTION], 1)
+
+    def test_next_steps_headings_with_inner_colons_and_remaining_work(self) -> None:
+        # **Next steps:** (claude), ### Remaining work (omp), __Next steps:__ (codex),
+        # **Open items:** (opencode)
+        pending = self._pending_by_session()
+        for agent in MX:
+            with self.subTest(agent=agent):
+                self.assertEqual(pending[MX[agent]["next_steps"]]["status"], "open_next_steps")
+
+    def test_none_bullet_under_a_remaining_heading_is_not_an_open_item(self) -> None:
+        pending = self._pending_by_session("--agent", "claude")
+        self.assertNotIn(MX_CLAUDE_NONE_BULLET, pending)
+
+    def test_non_claude_subagent_hand_back_is_recognised(self) -> None:
+        # omp: the side chat ends in a terminal `yield` with no closing text and the root's `task`
+        # result wraps it in <task-result>; codex: wait_agent returns it inside JSON; opencode: the
+        # root's `task` tool output is the child's reply. Each root replied cleanly afterwards
+        pending = self._pending_by_session()
+        for agent in ("omp", "codex", "opencode"):
+            with self.subTest(agent=agent):
+                self.assertNotIn(MX[agent]["handed_back"], pending)
+        meta, _items = _rows(self.sandbox.summary("pending", *MATRIX, "--project", "mx-omp",
+                                                   "--json"))
+        self.assertEqual((meta["chats"], meta["side_chats"]), (7, 2))
 
     # --- briefing ---
 

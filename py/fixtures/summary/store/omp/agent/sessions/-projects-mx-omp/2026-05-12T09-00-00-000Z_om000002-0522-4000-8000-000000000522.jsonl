@@ -1,0 +1,4 @@
+{"type":"session","id":"om000002-0522-4000-8000-000000000522","version":3,"cwd":"{{home}}/projects/mx-omp","timestamp":"2026-05-12T09:00:00.000Z"}
+{"type":"message","id":"om02-0","parentId":null,"timestamp":"2026-05-12T09:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Fix the papa loader."}]}}
+{"type":"message","id":"om02-1","parentId":"om02-0","timestamp":"2026-05-12T09:03:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixed the papa loader; the papa tests pass."}],"model":"gpt-5"}}
+{"type":"compaction","id":"om02-compact","parentId":"om02-1","timestamp":"2026-05-12T09:03:30.000Z","summary":"Recap: the papa loader fix is complete and its tests pass.","tokensBefore":180000,"tokensAfter":9000,"firstKeptEntryId":"om02-1"}

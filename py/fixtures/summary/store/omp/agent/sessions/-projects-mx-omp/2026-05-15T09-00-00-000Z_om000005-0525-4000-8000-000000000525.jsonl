@@ -1,0 +1,3 @@
+{"type":"session","id":"om000005-0525-4000-8000-000000000525","version":3,"cwd":"{{home}}/projects/mx-omp","timestamp":"2026-05-15T09:00:00.000Z"}
+{"type":"message","id":"om05-0","parentId":null,"timestamp":"2026-05-15T09:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Draft the sierra schema."}]}}
+{"type":"message","id":"om05-1","parentId":"om05-0","timestamp":"2026-05-15T09:03:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The sierra schema is drafted. Do you want the sierra migration applied now?"}],"model":"gpt-5"}}

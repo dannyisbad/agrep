@@ -11,8 +11,11 @@ and unioned across a chat and its side chats so a subagent minute never counts
 twice. It is never elapsed session span and never billable time.
 
 Pending status reads each root chat's final reply, its latest tool events and
-its last todo list, and reports a status with a stated confidence. Explicit
-completion always wins over an open-looking bullet.
+its todo list (whole-list writes, omp's ops replayed, codex plans), and reports
+a status with a stated confidence. Explicit completion always wins over an
+open-looking bullet. A compaction recap is never a turn of its own, and a side
+chat that handed its result back (a terminal yield, or a delegation result that
+carries its reply) never reopens a finished family.
 """
 
 from __future__ import annotations
@@ -68,26 +71,44 @@ _REQUEST_NO_QUESTION_RE = re.compile(
     re.IGNORECASE)
 # the heading must be the whole line: "To do this, I changed:" introduces a done list, not a todo
 _SECTION_RE = re.compile(
-    r"^\s*(?:#+\s*)?(?:\*\*)?(next steps?|remaining|follow[- ]?ups?|to-?do|open items?|"
-    r"outstanding|still to do|left to do)(?:\*\*)?\s*:?\s*$", re.IGNORECASE)
+    r"^\s*(?:#+\s*)?(?:\*\*|__)?\s*(next steps?|remaining(?: work| items?| tasks?| steps?)?|"
+    r"follow[- ]?ups?|to-?dos?|open items?|outstanding(?: work| items?| tasks?)?|still to do|"
+    r"left to do|what'?s left)\s*:?\s*(?:\*\*|__)?\s*:?\s*$", re.IGNORECASE)
 _BULLET_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+(.*\S)\s*$")
 _CHECKED_RE = re.compile(r"^\[[xX✓✔]\]")
 _UNCHECKED_RE = re.compile(r"^\[\s\]")
 _ITEM_DONE_RE = re.compile(
     r"(?:^~~.*~~$)|(?:\((?:done|completed|cancelled|canceled|skipped)\)\s*$)|"
     r"(?:[-:—]\s*(?:done|completed|cancelled|canceled|skipped)\.?\s*$)", re.IGNORECASE)
+# a bullet that says the list is empty: "- None", "- N/A", "- Nothing else", "- No open items"
+_NO_ITEM_RE = re.compile(
+    r"^(?:none|n/?a|nothing(?: else| more| further| remaining| left| open| outstanding)?|"
+    r"no(?:thing)? (?:open|remaining|outstanding|further|more|pending)\b.*|all done)\.?$",
+    re.IGNORECASE)
 # a closing courtesy after a list offers more help; any other prose after the list supersedes it
 _SIGN_OFF_RE = re.compile(
     r"\b(let me know|tell me|say the word|happy to|glad to|feel free|if you(?:'d| would)? "
     r"(?:like|want|prefer|need)|want me to|i can (?:also|then|take)|just (?:say|ask)|shout|"
     r"ping me)\b", re.IGNORECASE)
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=\S)")
-_TODO_TOOL_RE = re.compile(r"todo", re.IGNORECASE)
+# claude TodoWrite/TodoRead, opencode todowrite/todoread, omp todo, codex update_plan
+_TODO_TOOL_RE = re.compile(r"todo|update_plan", re.IGNORECASE)
 _TODO_OPEN_STATUSES = frozenset({
     "pending", "in_progress", "in-progress", "not_started", "not-started", "open",
     "todo", "active", "blocked", "queued"})
 _TODO_CLOSED_STATUSES = frozenset({
-    "completed", "complete", "done", "cancelled", "canceled", "skipped", "closed"})
+    "completed", "complete", "done", "cancelled", "canceled", "skipped", "closed", "abandoned"})
+# omp's op-based todo tool; a missing op is inferred the way omp infers it
+_TODO_OPS = frozenset({"init", "append", "start", "done", "drop", "block", "unblock", "rm", "view"})
+_TODO_DEFAULT_PHASE = "Tasks"
+_TODO_OP_RE = re.compile(r'"op"\s*:\s*"([a-z_]+)"')
+_TODO_PHASE_RE = re.compile(r'"phase"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# root tools that run a delegated agent and return its result: omp/pi/opencode task, codex collab
+_DELEGATION_TOOL_RE = re.compile(r"^(?:task|agent|subagent|spawn_agent|wait_agent)$", re.IGNORECASE)
+# the omp task result envelope; the delegate's own words sit inside output/preview
+_TASK_RESULT_BODY_RE = re.compile(r"<(?:output|preview)[^>]*>(.*?)(?:</(?:output|preview)>|$)",
+                                  re.DOTALL)
+_YIELD_SECTION_RE = re.compile(r'"type"\s*:\s*\[')
 _CONTROL_STOP_RE = re.compile(r"interrupt|abort|cancel|stop", re.IGNORECASE)
 
 
@@ -242,6 +263,8 @@ def _load_transcripts(chats: dict[str, _Chat]) -> bool:
                     seen[session].add(turn)
                     chat.turns.append(_Turn(turn, int(ts or 0), str(who or "user"),
                                             str(text or ""), digest))
+            for chat in chats.values():
+                _fold_recaps(chat)
             return True
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             for chat in chats.values():
@@ -265,7 +288,25 @@ def _load_transcripts(chats: dict[str, _Chat]) -> bool:
             reply = replies.get(str(row.get("id") or ""))
             if reply is not None and reply["reply"]:
                 chat.replies[turn] = reply["reply"]
+        _fold_recaps(chat)
     return False
+
+
+def _fold_recaps(chat: _Chat) -> None:
+    """A compaction recap is not a prompt. The adapters attach whatever the agent wrote after
+    compacting to the recap row, so that reply continues the prompt before it; a recap with
+    nothing after it leaves that prompt as the chat's last turn. A recap that opens a chat stays."""
+    kept: list[_Turn] = []
+    for row in sorted(chat.turns, key=lambda row: (row.turn, row.ts)):
+        if row.who != "recap" or not kept:
+            kept.append(row)
+            continue
+        carried = chat.replies.pop(row.turn, "")
+        if carried:
+            prior = kept[-1].turn
+            chat.replies[prior] = "\n\n".join(
+                part for part in (chat.replies.get(prior, ""), carried) if part)
+    chat.turns = kept
 
 
 def _load_events(chat: _Chat) -> None:
@@ -428,8 +469,9 @@ def _open_section_items(reply: str) -> tuple[str, list[str], int] | None:
         if _CHECKED_RE.match(item) or _ITEM_DONE_RE.search(item):
             closed += 1
             continue
-        item = _UNCHECKED_RE.sub("", item).strip()
-        open_items.append(common.one_line(_MARKUP_RE.sub(" ", item)))
+        item = common.one_line(_MARKUP_RE.sub(" ", _UNCHECKED_RE.sub("", item).strip())).strip()
+        if item and not _NO_ITEM_RE.match(item):
+            open_items.append(item)
     return heading, open_items, closed
 
 
@@ -443,10 +485,11 @@ def _input_capped(event: dict) -> bool:
     return raw.endswith("…") and chars >= len(raw)
 
 
-def _capped_list_items(raw: str) -> list:
-    """Every list element still complete in a JSON input the ingest cap cut short."""
+def _capped_list_items(raw: str, key: str) -> list:
+    """Every element still complete in the `key` list of a JSON input the ingest cap cut short."""
     decoder = json.JSONDecoder()
-    pos = raw.find("[")
+    at = raw.find(f'"{key}"')
+    pos = raw.find("[", at) if at >= 0 else -1
     if pos < 0:
         return []
     out: list = []
@@ -463,46 +506,199 @@ def _capped_list_items(raw: str) -> list:
         out.append(item)
 
 
-def _todo_items(event: dict) -> list[tuple[str, str]] | None:
-    """(item, status) pairs from a todo tool's captured input; None when its shape is unknown.
-    A capped input yields the items that are still complete, possibly none."""
-    raw = str(event.get("input") or "")
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        if not _input_capped(event):
+def _todo_entry(item: object) -> tuple[str, str] | None:
+    """(content, status) of one todo/plan element: a string, or a dict naming the item."""
+    if isinstance(item, str):
+        return (common.one_line(item), "open") if item.strip() else None
+    if not isinstance(item, dict):
+        return None
+    name = next((str(item[key]) for key in ("content", "title", "task", "step", "text", "name")
+                 if isinstance(item.get(key), str) and item[key].strip()), "")
+    status = str(item.get("status") or item.get("state") or "").strip().lower()
+    return (common.one_line(name), status) if name else None
+
+
+def _snapshot_tasks(payload: object, raw: str, capped: bool) -> list[list[str]] | None:
+    """[phase, content, status] rows from a whole-list todo write: claude/opencode `todos`,
+    codex `plan`, or a bare list. None when the payload is not that shape."""
+    key = next((k for k in ("todos", "plan") if isinstance(payload, dict) and k in payload), None)
+    if capped:
+        key = next((k for k in ("todos", "plan") if f'"{k}"' in raw), None)
+        if key is None:
             return None
-        payload = _capped_list_items(raw)
-    items = payload.get("todos") if isinstance(payload, dict) else payload
+        items: object = _capped_list_items(raw, key)
+    elif key is not None:
+        items = payload[key]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return None
     if not isinstance(items, list):
         return None
-    out = []
+    rows = []
     for item in items:
-        if isinstance(item, str):
-            out.append((common.one_line(item), "open"))
+        entry = _todo_entry(item)
+        if entry is not None:
+            rows.append(["", entry[0], entry[1]])
+    return rows
+
+
+def _todo_targets(tasks: list[list[str]], payload: dict) -> list[list[str]] | None:
+    """The rows an omp op addresses: one task by verbatim content, one phase, or every task.
+    None when the named task or phase does not exist (omp rejects the op)."""
+    task, phase = payload.get("task"), payload.get("phase")
+    if isinstance(task, str) and task:
+        task = common.one_line(task)
+        return [row for row in tasks if row[1] == task] or None
+    if isinstance(phase, str) and phase:
+        return [row for row in tasks if row[0] == phase] or None
+    return tasks
+
+
+def _apply_todo_op(tasks: list[list[str]], payload: dict) -> list[list[str]] | None:
+    """omp's todo ops replayed over [phase, content, status] rows; None when the op is one
+    omp would have rejected, so the state is unchanged."""
+    op = payload.get("op")
+    items = payload.get("items") if isinstance(payload.get("items"), list) else None
+    phases = payload.get("list") if isinstance(payload.get("list"), list) else None
+    if not isinstance(op, str):
+        if phases:
+            op = "init"
+        elif items and isinstance(payload.get("phase"), str) and payload["phase"]:
+            op = "append"
+        elif items and not tasks:
+            op = "init"
+        else:
+            return None
+    if op not in _TODO_OPS:
+        return None
+    if op == "init":
+        if phases is None:
+            if not items:
+                return None
+            phases = [{"phase": payload.get("phase") or _TODO_DEFAULT_PHASE, "items": items}]
+        return [[str(phase.get("phase") or _TODO_DEFAULT_PHASE), common.one_line(item), "pending"]
+                for phase in phases if isinstance(phase, dict)
+                for item in (phase.get("items") or []) if isinstance(item, str) and item.strip()]
+    if op == "append":
+        phase = payload.get("phase")
+        if not items or not isinstance(phase, str) or not phase:
+            return None
+        fresh = [common.one_line(item) for item in items if isinstance(item, str) and item.strip()]
+        if any(row[1] == item for row in tasks for item in fresh):
+            return None
+        return tasks + [[phase, item, "pending"] for item in fresh]
+    if op == "view":
+        return tasks
+    if op == "rm":
+        targets = _todo_targets(tasks, payload)
+        if targets is None:
+            return None
+        gone = {id(row) for row in targets}
+        return [row for row in tasks if id(row) not in gone]
+    if op in ("block", "unblock") and not (payload.get("task") or payload.get("phase")):
+        return None
+    if op == "start" and not payload.get("task"):
+        return None
+    targets = _todo_targets(tasks, payload)
+    if targets is None:
+        return None
+    out = [list(row) for row in tasks]
+    hit = {id(row) for row in targets}
+    for row, fresh in zip(tasks, out):
+        if op == "start" and fresh[2] == "in_progress":
+            fresh[2] = "pending"
+        if id(row) not in hit:
             continue
-        if not isinstance(item, dict):
-            continue
-        name = next((str(item[key]) for key in ("content", "title", "task", "text", "name")
-                     if isinstance(item.get(key), str) and item[key].strip()), "")
-        status = str(item.get("status") or item.get("state") or "").strip().lower()
-        if name:
-            out.append((common.one_line(name), status))
+        if op == "start":
+            fresh[2] = "in_progress"
+        elif op == "done":
+            fresh[2] = "completed"
+        elif op == "drop":
+            fresh[2] = "abandoned"
+        elif op == "block" and fresh[2] in ("pending", "in_progress", "blocked"):
+            fresh[2] = "blocked"
+        elif op == "unblock" and fresh[2] == "blocked":
+            fresh[2] = "pending"
     return out
 
 
-def _latest_todo(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool]:
-    """(items of the last todo event, whether one existed, whether its input was capped)."""
-    for event in reversed(chat.events):
-        if event.get("kind") == "tool" and _TODO_TOOL_RE.search(str(event.get("name") or "")):
-            return _todo_items(event), True, _input_capped(event)
-    return None, False, False
+def _apply_capped_todo_op(tasks: list[list[str]], raw: str) -> list[list[str]] | None:
+    """An omp op whose input the ingest cap cut: only init and append can be replayed, from the
+    list elements still complete. Anything else leaves the state unknowable."""
+    match = _TODO_OP_RE.search(raw)
+    op = match.group(1) if match else None
+    if op is None:
+        if '"list"' in raw:
+            op = "init"
+        elif '"items"' in raw:
+            op = "append" if _TODO_PHASE_RE.search(raw) else ("init" if not tasks else None)
+    if op == "init":
+        payload: dict = {"op": "init"}
+        if '"list"' in raw:
+            payload["list"] = _capped_list_items(raw, "list")
+        else:
+            payload["items"] = _capped_list_items(raw, "items")
+        return _apply_todo_op([], payload)
+    if op == "append":
+        phase = _TODO_PHASE_RE.search(raw)
+        items = [item for item in _capped_list_items(raw, "items")
+                 if isinstance(item, str) and not any(row[1] == item for row in tasks)]
+        return _apply_todo_op(tasks, {"op": "append", "items": items,
+                                      "phase": phase.group(1) if phase else _TODO_DEFAULT_PHASE})
+    return None
+
+
+def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool]:
+    """(items after the chat's last todo write, whether any todo event existed, whether a cap
+    hid items). Whole-list writes replace the state; omp ops are replayed in order. None items
+    mean the state is not knowable: an unknown shape, or an op the cap cut that cannot replay."""
+    tasks: list[list[str]] = []
+    present = capped = unknown = False
+    for event in chat.events:
+        if event.get("kind") != "tool" or not _TODO_TOOL_RE.search(str(event.get("name") or "")):
+            continue
+        present = True
+        if event.get("ok") is False:
+            continue
+        raw = str(event.get("input") or "")
+        cut = _input_capped(event)
+        try:
+            payload: object = json.loads(raw) if raw else {}
+        except ValueError:
+            if not cut:
+                unknown = True
+                continue
+            payload = None
+        snapshot = _snapshot_tasks(payload, raw, cut)
+        if snapshot is not None:
+            tasks, capped, unknown = snapshot, cut, False
+            continue
+        if payload == {}:
+            continue
+        if payload is None:
+            applied = _apply_capped_todo_op(tasks, raw)
+            if applied is None:
+                unknown = True
+                continue
+            tasks, capped = applied, True
+            continue
+        if not isinstance(payload, dict) or not any(
+                key in payload for key in ("op", "list", "items", "task", "phase")):
+            unknown = True
+            continue
+        applied = _apply_todo_op(tasks, payload)
+        if applied is not None:
+            tasks = applied
+    if unknown:
+        return None, present, capped
+    return [(content, status) for _phase, content, status in tasks], present, capped
 
 
 def _open_todos(chat: _Chat) -> tuple[list[str], list[str]]:
     """(open todo items, caveats). A capped list whose kept items are all closed is no evidence:
     the final reply decides."""
-    items, present, capped = _latest_todo(chat)
+    items, present, capped = _todo_state(chat)
     if not present:
         return [], []
     if items is None:
@@ -586,10 +782,67 @@ def _latest_ts(chat: _Chat) -> int:
                *(int(event.get("ts") or 0) for event in chat.events), 0)
 
 
+def _side_yielded(side: _Chat) -> bool:
+    """Did the side chat end by submitting its result? pi/omp subagents hand back through a
+    terminal `yield` call and often write no closing text; a `type` list marks an incremental
+    section, which is not the hand-back."""
+    if not side.events:
+        return False
+    event = max(side.events, key=lambda e: (int(e.get("ts") or 0), int(e.get("i") or 0)))
+    if (event.get("kind") != "tool" or str(event.get("name") or "").lower() != "yield"
+            or event.get("ok") is False):
+        return False
+    last = side.last_turn()
+    if last is not None and last.ts > int(event.get("ts") or 0):
+        return False
+    raw = str(event.get("input") or "")
+    try:
+        payload = json.loads(raw) if raw else {}
+    except ValueError:
+        return _YIELD_SECTION_RE.search(raw) is None
+    return not (isinstance(payload, dict) and isinstance(payload.get("type"), list))
+
+
+def _json_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _json_strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _json_strings(v)]
+    return []
+
+
+def _delivers(output: str, final: str) -> bool:
+    """Does a delegation result carry the side chat's final reply? Claude and opencode return
+    the reply itself; omp wraps it in a task-result envelope; codex nests it in JSON."""
+    text = " ".join(output.rstrip("…").split())
+    body = _TASK_RESULT_BODY_RE.search(text) if text.startswith("<task-result") else None
+    if body is not None:
+        text = body.group(1).strip()
+    candidates = [text]
+    if text[:1] in ("{", "["):
+        try:
+            candidates += [" ".join(s.split()) for s in _json_strings(json.loads(text))]
+        except ValueError:
+            pass
+    reply_head = final[:160]
+    for candidate in candidates:
+        head = candidate[:160]
+        if head and head in final:
+            return True
+        if len(reply_head) >= 24 and reply_head in candidate:
+            return True
+    return False
+
+
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
-    """Did the root get the side chat's final reply back as a subagent result? That receipt is
-    the only indexed proof the root went on after the side chat ended. None when the side reply
-    is capped and the comparison cannot be made."""
+    """Did the side chat hand its result back? A terminal `yield` is the hand-back itself; else
+    the root's delegation result must carry the side chat's final reply, the only indexed proof
+    the root went on after the side chat ended. None when the side reply is capped and the
+    comparison cannot be made."""
+    if _side_yielded(side):
+        return True
     last = side.last_turn()
     reply = side.replies.get(last.turn, "") if last is not None else ""
     if not reply:
@@ -598,10 +851,11 @@ def _result_received(root: _Chat, side: _Chat) -> bool | None:
         return None
     final = " ".join(reply.split())
     for event in root.events:
-        if event.get("kind") != "subagent_start":
+        if event.get("kind") != "subagent_start" and not (
+                event.get("kind") == "tool"
+                and _DELEGATION_TOOL_RE.match(str(event.get("name") or ""))):
             continue
-        head = " ".join(str(event.get("output") or "").rstrip("…").split())[:160]
-        if head and head in final:
+        if _delivers(str(event.get("output") or ""), final):
             return True
     return False
 
