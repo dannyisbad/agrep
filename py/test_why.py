@@ -33,6 +33,11 @@ PI_NEW = "77777777-7777-4777-8777-777777777777"
 OMP_ROOT = "33333333-3333-4333-8333-333333333333"
 OMP_SIDE = "44444444-4444-4444-8444-444444444444"
 OMP_CONTAINER = f"-work-beta/2000-02-03T04-05-06-000Z_{OMP_ROOT}"
+WHOLE_STORE_SESSIONS = (
+    ("kimi", "55555555-5555-4555-8555-555555555555"),
+    ("cline", "1767348000000"),
+    ("antigravity", "66666666-6666-4666-8666-666666666666"),
+)
 VERDICT_EXIT = {"indexed": 0, "indexed-under-alias": 0, "indexed-as-side-chat": 0,
                 "ambiguous": 2, "not-provable": 2}
 NOT_SERVED = 97
@@ -149,6 +154,52 @@ def _opencode_store(path: Path, home: Path, turns: list[tuple[str, int, str]]) -
         db.close()
     for session, at, text in turns:
         _opencode_add(path, home, session, at, text)
+
+
+def _cursor_store(path: Path, turns: list[tuple[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path))
+    try:
+        with db:
+            db.executescript(
+                "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value BLOB);"
+                "CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY, workspaceId TEXT);")
+            for session, text in turns:
+                db.execute("INSERT INTO cursorDiskKV VALUES (?, ?)",
+                           (f"composerData:{session}", json.dumps({
+                               "createdAt": 946684800000,
+                               "fullConversationHeadersOnly": [{"bubbleId": "u", "type": 1}]})))
+                db.execute("INSERT INTO cursorDiskKV VALUES (?, ?)",
+                           (f"bubbleId:{session}:u", json.dumps({"type": 1, "text": text})))
+    finally:
+        db.close()
+
+
+def _whole_store_add(path: Path, agent: str, text: str) -> None:
+    if agent == "cline":
+        messages = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        messages.append({"role": "user", "content": text})
+        path.write_text(json.dumps(messages) + "\n", encoding="utf-8")
+    else:
+        message = ({"role": "user", "content": text} if agent == "kimi" else
+                   {"type": "USER_INPUT", "source": "USER_EXPLICIT",
+                    "content": f"<USER_REQUEST>{text}</USER_REQUEST>",
+                    "created_at": "2000-01-01T00:00:00.000Z"})
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(message) + "\n")
+
+
+def _whole_store_transcript(home: Path, agent: str, session: str) -> Path:
+    if agent == "kimi":
+        path = home / ".kimi" / "sessions" / ("0" * 32) / session / "context.jsonl"
+    elif agent == "cline":
+        path = home / ".cline" / "data" / "tasks" / session / "api_conversation_history.json"
+    else:
+        path = (home / ".gemini" / "antigravity-cli" / "brain" / session
+                / ".system_generated" / "logs" / "transcript.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _whole_store_add(path, agent, "asciidoc ledger question")
+    return path
 
 
 def _append_claude_turn(path: Path, home: Path, text: str, stamp: str, *,
@@ -1227,6 +1278,136 @@ class WhyMutationVerdictTests(_VerdictAssertions):
                       payload["evidence"]["lines"][1])
         payload = self.assert_verdict("indexed", "11111111-1111")
         self.assertTrue(any("freshness unverified" in line for line in payload["evidence"]["lines"]))
+
+
+class WhyUnclaimedStoreTests(_VerdictAssertions):
+    def setUp(self) -> None:
+        self.sandbox = Sandbox()
+
+    def tearDown(self) -> None:
+        self.sandbox.close()
+
+    def whole_stores(self) -> list[tuple[str, str, Path]]:
+        return [(agent, session, _whole_store_transcript(self.sandbox.home, agent, session))
+                for agent, session in WHOLE_STORE_SESSIONS]
+
+    def cursor_path(self) -> Path:
+        return (self.sandbox.home / ".config" / "Cursor" / "User"
+                / "globalStorage" / "state.vscdb")
+
+    def test_whole_store_changed_transcripts_are_not_fully_indexed(self) -> None:
+        stores = self.whole_stores()
+        self.sandbox.index()
+        for agent, session, path in stores:
+            self.assert_verdict("indexed", session)
+            _whole_store_add(path, agent, "walnut follow-up question")
+        search = self.sandbox.cli("search", "walnut", "--json")
+        self.assertEqual(search.returncode, 2, search.stderr)
+        self.assertEqual(json.loads(search.stdout)["completeness"]["shown"], 0)
+        for agent, session, path in stores:
+            for reference in dict.fromkeys((session, session.split("-")[0], str(path))):
+                with self.subTest(agent=agent, reference=reference):
+                    payload = self.assert_verdict("written-after-last-index", reference,
+                                                  next_action="agrep index")
+                    self.assertTrue(any(e["path"] == str(path) and e["fresh"] is False
+                                        for e in payload["evidence"]["intake"]), payload)
+        self.sandbox.index()
+        for _, session, _ in stores:
+            self.assert_verdict("indexed", session)
+        search = self.sandbox.cli("search", "walnut", "--json")
+        self.assertEqual(search.returncode, 0, search.stderr)
+        self.assertEqual({r["session"] for r in map(json.loads, search.stdout.splitlines()) if "session" in r},
+                         {session for _, session, _ in stores})
+
+    def test_whole_store_transcript_paths_resolve_indexed_chats(self) -> None:
+        stores = self.whole_stores()
+        self.sandbox.index()
+        for agent, session, path in stores:
+            with self.subTest(agent=agent):
+                payload = self.assert_verdict("indexed", str(path))
+                self.assertEqual(payload["evidence"]["index_row"]["session"], session)
+                self.assertEqual(payload["evidence"]["index_row"]["agent"], agent)
+                self.assertEqual(payload["evidence"]["sources"], [str(path)])
+                self.assertTrue(all(e["fresh"] is True for e in payload["evidence"]["intake"]))
+        search = self.sandbox.cli("search", "asciidoc", "--json")
+        self.assertEqual(search.returncode, 0, search.stderr)
+        self.assertEqual({r["session"] for r in map(json.loads, search.stdout.splitlines()) if "session" in r},
+                         {session for _, session, _ in stores})
+
+    def test_whole_store_without_session_intake_is_unverified(self) -> None:
+        stores = self.whole_stores()
+        self.sandbox.index()
+        (self.sandbox.data / "intake_stats.json").unlink()
+        for agent, session, _ in stores:
+            with self.subTest(agent=agent):
+                payload = self.assert_verdict("not-provable", session)
+                self.assertEqual(payload["evidence"]["intake"], [])
+                self.assertTrue(any("freshness unverified" in line
+                                    for line in payload["evidence"]["lines"]), payload)
+
+    def test_whole_store_session_matching_uses_complete_path_components(self) -> None:
+        stores = self.whole_stores()
+        neighbors = [(agent, _whole_store_transcript(self.sandbox.home, agent, session + "0"))
+                     for agent, session, _ in stores]
+        self.sandbox.index()
+        for agent, path in neighbors:
+            _whole_store_add(path, agent, "walnut in another session")
+        for agent, session, path in stores:
+            with self.subTest(agent=agent):
+                payload = self.assert_verdict("indexed", session)
+                self.assertEqual(payload["evidence"]["sources"], [str(path)])
+                self.assertEqual([e["path"] for e in payload["evidence"]["intake"]], [str(path)])
+                self.assertTrue(all(e["fresh"] is True for e in payload["evidence"]["intake"]))
+
+    def test_crush_database_path_resolves_indexed_chat(self) -> None:
+        path = self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
+        _crush_store(path, [("sc1", 1000, "asciidoc ledger question")])
+        self.sandbox.index()
+        self.assert_verdict("indexed", "sc1")
+        search = self.sandbox.cli("search", "asciidoc", "--json")
+        self.assertEqual(search.returncode, 0, search.stderr)
+        self.assertEqual({r["session"] for r in map(json.loads, search.stdout.splitlines()) if "session" in r},
+                         {"sc1"})
+        payload = self.assert_verdict("indexed", str(path))
+        self.assertEqual(payload["evidence"]["index_row"]["session"], "sc1")
+        _crush_add(path, "sc1", 2000, "walnut follow-up", new_session=False)
+        self.assert_verdict("written-after-last-index", str(path), next_action="agrep index")
+
+    def test_cursor_database_path_resolves_indexed_chat(self) -> None:
+        path = self.cursor_path()
+        _cursor_store(path, [("cursor-chat-one", "asciidoc ledger question")])
+        self.sandbox.index()
+        self.assert_verdict("indexed", "cursor-chat-one")
+        payload = self.assert_verdict("indexed", str(path))
+        self.assertEqual(payload["evidence"]["index_row"]["session"], "cursor-chat-one")
+        self.assertEqual(payload["candidates"], [])
+
+    def test_cursor_database_candidates_exclude_census(self) -> None:
+        path = self.cursor_path()
+        sessions = {"cursor-chat-one", "cursor-chat-two", "cursor-chat-three"}
+        _cursor_store(path, [(session, "asciidoc ledger question") for session in sorted(sessions)])
+        self.sandbox.index()
+        payload = self.assert_verdict("ambiguous", str(path))
+        self.assertEqual({c["session"] for c in payload["candidates"]}, sessions)
+        self.assertTrue(all(c.get("via") == "path" for c in payload["candidates"]), payload)
+
+    def test_cursor_unindexed_candidates_exclude_census(self) -> None:
+        path = self.cursor_path()
+        sessions = {"cursor-chat-one", "cursor-chat-two"}
+        _cursor_store(path, [(session, "") for session in sorted(sessions)])
+        self.sandbox.index()
+        payload = self.assert_verdict("ambiguous", str(path))
+        self.assertEqual({c["session"] for c in payload["candidates"]}, sessions)
+        self.assertTrue(all(c["rows"] == 0 for c in payload["candidates"]), payload)
+
+    def test_cursor_empty_conversation_keeps_its_intake_tally(self) -> None:
+        path = self.cursor_path()
+        _cursor_store(path, [("cursor-empty-chat", "")])
+        self.sandbox.index()
+        payload = self.assert_verdict("discovered-no-rows", str(path))
+        self.assertEqual(payload["candidates"], [])
+        self.assertTrue(any(e["session"] == "cursor-empty-chat" and e["seen"] == 1 and e["rows"] == 0
+                            for e in payload["evidence"]["intake"]), payload)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,9 @@ is what `agrep search` would serve, decided by corpusdb's own reader predicates 
 A reference resolves like `agrep resume` after a path lane (a torn sessions.jsonl falls back to
 messages.jsonl as resume does), then against the chats corpus.db still holds when search
 serves it; every evidence line names the file it came from.
+
+Token-store conversations resolve through intake session keys; whole-store adapters resolve
+through session-directory components. Without that link, whole-store freshness is unverified.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ _SKIP_ORDER = ("wrapper", "meta", "sidechain", "non_message", "non_human", "empt
 _DATABASE_EXTENSIONS = frozenset({".db", ".sqlite", ".sqlite3", ".vscdb"})
 _TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json"}) | _DATABASE_EXTENSIONS
 _TOKEN_ID_PREFIX = "\0agrep-intake-token-v1\0"
+_CURSOR_CENSUS_SESSION = "\0census\0"
 
 
 def _token_identity(token_id: object) -> tuple[str, str] | None:
@@ -490,15 +494,26 @@ def _store_wide_move(ctx: _Context, entry: dict, session: str) -> str | None:
     return None
 
 
+def _session_in_path(session: str, path: object) -> bool:
+    """Whole-store adapters name session directories, not parse-cache claims."""
+    return bool(session) and session in Path(str(path or "")).parts
+
+
 def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     session = str(row.get("session") or "")
     agent = row.get("agent") or "?"
+    whole_store = ctx.fingerprint(agent) == "always"
     count = _plural(int(row.get("n") or 0), "message")
     corpus = _corpus_facts(session)
     claims = [c for c in ctx.cache_sessions if c.get("session") == session]
     paths = [c["path"] for c in claims if c.get("path")]
-    entries = [e for e in ctx.intake_files if e.get("path") in paths and not e.get("session")]
-    entries += [e for e in ctx.intake_files if e.get("session") == session]
+    if whole_store:
+        entries = [e for e in ctx.intake_files if e.get("agent") == agent and not e.get("session")
+                   and _session_in_path(session, e.get("path"))]
+        paths = [e["path"] for e in entries]
+    else:
+        entries = [e for e in ctx.intake_files if e.get("path") in paths and not e.get("session")]
+        entries += [e for e in ctx.intake_files if e.get("session") == session]
     moved = {id(e): _store_wide_move(ctx, e, session) for e in entries if e.get("fresh") is False}
     stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
     issue = next((i for i in (_issue_covering(ctx, p) for p in paths) if i), None)
@@ -513,15 +528,16 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     if ctx.payload is None:
         lines.append(f"store census: unavailable ({ctx.census_error}); freshness unverified")
     elif paths:
-        lines.append("parse cache: " + ", ".join(ctx.display(p) for p in paths))
+        origin = "intake_stats.json: session-directory files: " if whole_store else "parse cache: "
+        lines.append(origin + ", ".join(ctx.display(p) for p in paths))
         lines.extend(_intake_line(e) for e in entries[:1])
     elif entries and entries[0].get("session"):
         lines.append(f"intake_stats.json: conversation keyed by store token in "
                      f"{ctx.display(entries[0].get('path'))}")
         lines.append(_intake_line(entries[0]))
-    elif ctx.fingerprint(agent) == "always":
+    elif whole_store:
         lines.append(f"parse cache: {agent} reparses its whole store on every index, "
-                     "so no single file is claimed")
+                     "so no single file is claimed; freshness unverified")
     else:
         state = ctx.payload["cache"].get("state")
         detail = ctx.payload["cache"].get("reason") or state
@@ -566,6 +582,12 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"unprovable: the search database is behind the published sources and {agent} "
             f"chat {_short(session)} could not be compared",
             lines, facts=facts, next_action="agrep index")
+    if whole_store and not entries:
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: freshness unverified for {agent} chat {_short(session)}; "
+            "no intake file identifies its session directory",
+            lines, facts=facts)
     if via == "alias" or (via == "path" and row.get("alias")):
         verdict, summary = "indexed-under-alias", (
             f"indexed under an alias: {agent} chat {row.get('alias')} is stored as "
@@ -703,15 +725,24 @@ def _issue_line(ctx: _Context, issue: dict) -> str:
 
 
 def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | None = None) -> dict:
-    """A discovered file (or one tallied conversation in it) that no index row answered."""
+    """Resolve a discovered file to indexed chats before judging its intake tallies."""
     issue = _issue_covering(ctx, path)
     claims = [c for c in ctx.cache_sessions if c.get("path") == path
               and (session is None or c.get("session") == session)]
-    indexed = [r for r in (ctx.row_for(c["session"]) for c in claims) if r]
-    if indexed:
-        return _judge_rows(ctx, indexed, "path")
     entries = [e for e in ctx.intake_files if e.get("path") == path
                and (session is None or e.get("session") == session)]
+    conversations = [e for e in entries if e.get("session") != _CURSOR_CENSUS_SESSION]
+    indexed = [r for r in (ctx.row_for(c["session"]) for c in claims) if r]
+    if not claims:
+        if ctx.fingerprint(agent or "") == "always":
+            indexed = [r for r in ctx.rows if r.get("agent") == agent
+                       and (session is None or r.get("session") == session)
+                       and _session_in_path(str(r.get("session") or ""), path)]
+        else:
+            indexed = [r for r in (ctx.row_for(e["session"]) for e in conversations
+                                   if e.get("session")) if r]
+    if indexed:
+        return _judge_rows(ctx, indexed, "path")
     label = (f"{agent or 'the store'} file {ctx.display(path)}"
              + (f" conversation {session}" if session else ""))
     facts = {"path": path, "agent": agent, "session": session, "issue": issue,
@@ -728,11 +759,12 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             ["parse cache: session " + ", ".join(c["session"] for c in claims),
              f"{ctx.index_origin}: {len(ctx.rows)} chats, none with that id", ctx.sig_line()],
             facts=facts, next_action="agrep index")
-    if session is None and len(entries) > 1:
+    if session is None and len(conversations) > 1:
         candidates = [{"agent": e.get("agent"), "path": path, "session": e.get("session"),
-                       "rows": e.get("rows")} for e in entries[:_CANDIDATE_LINES]]
+                       "rows": e.get("rows")} for e in conversations[:_CANDIDATE_LINES]]
         return _ambiguous(ctx, candidates, "conversations in that database", "intake_stats.json")
-    entry = entries[0] if entries else None
+    tallies = conversations or entries
+    entry = tallies[0] if tallies else None
     if entry is None:
         if not ctx.sig.get("present"):
             return _report(
@@ -938,7 +970,8 @@ def _source_lane(ctx: _Context, identity: str) -> list[dict]:
             found.setdefault((claim.get("path"), None),
                              {"agent": claim.get("agent"), "path": claim.get("path")})
     for entry in ctx.intake_files + ctx.token_conversations:
-        if entry.get("session") and named(entry["session"]):
+        if (entry.get("session") and entry["session"] != _CURSOR_CENSUS_SESSION
+                and named(entry["session"])):
             found.setdefault((entry.get("path"), entry["session"]),
                              {"agent": entry.get("agent"), "path": entry.get("path"),
                               "session": entry["session"]})
