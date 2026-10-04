@@ -38,6 +38,9 @@ WHOLE_STORE_SESSIONS = (
     ("cline", "1767348000000"),
     ("antigravity", "66666666-6666-4666-8666-666666666666"),
 )
+KIMI_NEW = "88888888-8888-4888-8888-888888888888"
+KIMI_CHILD = "99999999-9999-4999-8999-999999999999"
+CLINE_NEW = "1767349000000"
 VERDICT_EXIT = {"indexed": 0, "indexed-under-alias": 0, "indexed-as-side-chat": 0,
                 "ambiguous": 2, "not-provable": 2}
 NOT_SERVED = 97
@@ -162,8 +165,8 @@ def _cursor_store(path: Path, turns: list[tuple[str, str]]) -> None:
     try:
         with db:
             db.executescript(
-                "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value BLOB);"
-                "CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY, workspaceId TEXT);")
+                "CREATE TABLE IF NOT EXISTS cursorDiskKV(key TEXT PRIMARY KEY, value BLOB);"
+                "CREATE TABLE IF NOT EXISTS composerHeaders(composerId TEXT PRIMARY KEY, workspaceId TEXT);")
             for session, text in turns:
                 db.execute("INSERT INTO cursorDiskKV VALUES (?, ?)",
                            (f"composerData:{session}", json.dumps({
@@ -189,9 +192,10 @@ def _whole_store_add(path: Path, agent: str, text: str) -> None:
             handle.write(json.dumps(message) + "\n")
 
 
-def _whole_store_transcript(home: Path, agent: str, session: str) -> Path:
+def _whole_store_transcript(home: Path, agent: str, session: str, *, parent: str | None = None) -> Path:
     if agent == "kimi":
-        path = home / ".kimi" / "sessions" / ("0" * 32) / session / "context.jsonl"
+        chat = Path(parent, "subagents", session) if parent else Path(session)
+        path = home / ".kimi" / "sessions" / ("0" * 32) / chat / "context.jsonl"
     elif agent == "cline":
         path = home / ".cline" / "data" / "tasks" / session / "api_conversation_history.json"
     else:
@@ -199,6 +203,15 @@ def _whole_store_transcript(home: Path, agent: str, session: str) -> Path:
                 / ".system_generated" / "logs" / "transcript.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     _whole_store_add(path, agent, "asciidoc ledger question")
+    return path
+
+
+def _kimi_wire(session_dir: Path) -> Path:
+    """The UI event log kimi writes beside context.jsonl: one turn start, no message of its own."""
+    path = session_dir / "wire.jsonl"
+    path.write_text(json.dumps({"timestamp": 946684800.0,
+                                "message": {"type": "TurnBegin", "payload": {}}}) + "\n",
+                    encoding="utf-8")
     return path
 
 
@@ -1408,6 +1421,145 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
         self.assertEqual(payload["candidates"], [])
         self.assertTrue(any(e["session"] == "cursor-empty-chat" and e["seen"] == 1 and e["rows"] == 0
                             for e in payload["evidence"]["intake"]), payload)
+
+    def test_new_file_in_an_indexed_session_directory_is_not_indexed(self) -> None:
+        """A mailbox message or a subagent that lands in an indexed session directory has no intake
+        record until the next index; a rotated context the adapter never parses is no such file."""
+        stores = {agent: (session, path) for agent, session, path in self.whole_stores()}
+        kimi, kimi_path = stores["kimi"]
+        brain, transcript = stores["antigravity"]
+        mailbox = transcript.parents[1] / "messages"
+        mailbox.mkdir()
+        (mailbox / "m1.json").write_text(json.dumps({"sender": "system", "content": "hello"}),
+                                         encoding="utf-8")
+        rotated = kimi_path.with_name("context_1.jsonl")
+        rotated.write_text(json.dumps({"role": "user", "content": "pre-clear question"}) + "\n",
+                           encoding="utf-8")
+        os.utime(rotated, (time.time() - 3600,) * 2)
+        self.sandbox.index()
+        for session in (kimi, brain):
+            self.assert_verdict("indexed", session)
+        arrived = mailbox / "m2.json"
+        arrived.write_text(json.dumps({"sender": f"{brain}/task-1", "content": "zeppelin result"}),
+                           encoding="utf-8")
+        child = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_CHILD, parent=kimi)
+        for reference in (brain, str(transcript)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("written-after-last-index", reference,
+                                              next_action="agrep index")
+                self.assertEqual(payload["evidence"]["index_row"]["session"], brain)
+                self.assertEqual(payload["evidence"]["unparsed"], [str(arrived)])
+        for path in (arrived, child):
+            with self.subTest(path=path):
+                payload = self.assert_verdict("written-after-last-index", str(path),
+                                              next_action="agrep index")
+                self.assertIn("appeared after the last index", payload["summary"])
+                self.assertEqual(payload["evidence"]["intake"], [])
+        payload = self.assert_verdict("indexed", kimi)
+        self.assertEqual(payload["evidence"]["sources"], [str(kimi_path)])
+        self.sandbox.index()
+        self.assert_verdict("indexed", brain)
+        self.assert_verdict("indexed-as-side-chat", str(child))
+
+    def test_kimi_subagent_files_belong_to_the_child_chat(self) -> None:
+        """Kimi keeps a subagent under its parent (`<P>/subagents/<C>/context.jsonl`); that file is
+        the child's alone, so its writes leave the parent current and its path names one chat."""
+        kimi = WHOLE_STORE_SESSIONS[0][1]
+        path = _whole_store_transcript(self.sandbox.home, "kimi", kimi)
+        child = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_CHILD, parent=kimi)
+        self.sandbox.index()
+        payload = self.assert_verdict("indexed", kimi)
+        self.assertEqual(payload["evidence"]["sources"], [str(path)])
+        payload = self.assert_verdict("indexed-as-side-chat", str(child))
+        self.assertEqual(payload["evidence"]["index_row"]["session"], KIMI_CHILD)
+        _whole_store_add(child, "kimi", "walnut follow-up question")
+        for reference in (kimi, str(path)):
+            with self.subTest(reference=reference):
+                self.assert_verdict("indexed", reference)
+        for reference in (KIMI_CHILD, str(child)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("written-after-last-index", reference,
+                                              next_action="agrep index")
+                self.assertEqual(payload["evidence"]["index_row"]["session"], KIMI_CHILD)
+                self.assertEqual([e["path"] for e in payload["evidence"]["intake"]], [str(child)])
+
+    def test_token_store_path_with_a_new_conversation_is_not_indexed(self) -> None:
+        """A conversation created after the index is in the census token list but in no intake
+        record, so the database path is not indexed, whatever its indexed chats would say."""
+        crush = self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
+        _crush_store(crush, [("sc1", 1000, "asciidoc ledger question")])
+        cursor = self.cursor_path()
+        _cursor_store(cursor, [("cursor-chat-one", "asciidoc ledger question"),
+                               ("cursor-chat-two", "asciidoc ledger question")])
+        self.sandbox.index()
+        self.assert_verdict("indexed", str(crush))
+        self.assert_verdict("ambiguous", str(cursor))
+        _crush_add(crush, "sc2", 2000, "walnut follow-up question")
+        _cursor_store(cursor, [("cursor-chat-three", "walnut follow-up question")])
+        for path, new in ((crush, "sc2"), (cursor, "cursor-chat-three")):
+            with self.subTest(path=path):
+                payload = self.assert_verdict("written-after-last-index", str(path),
+                                              next_action="agrep index")
+                self.assertEqual(payload["evidence"]["unparsed"], [new])
+                self.assertEqual(payload["candidates"], [])
+        search = self.sandbox.cli("search", "walnut", "--json")
+        self.assertEqual(search.returncode, 2, search.stderr)
+        self.sandbox.index()
+        for path, sessions in ((crush, {"sc1", "sc2"}),
+                               (cursor, {"cursor-chat-one", "cursor-chat-two", "cursor-chat-three"})):
+            with self.subTest(path=path):
+                payload = self.assert_verdict("ambiguous", str(path))
+                self.assertEqual({c["session"] for c in payload["candidates"]}, sessions)
+
+    def test_new_whole_store_chats_resolve_by_id(self) -> None:
+        """A kimi session, a kimi subagent or a cline task created after the index is found by its
+        directory id, one candidate per chat however many of its files the census lists."""
+        stores = {agent: (session, path) for agent, session, path in self.whole_stores()}
+        kimi, kimi_path = stores["kimi"]
+        _kimi_wire(kimi_path.parent)
+        self.sandbox.index()
+        fresh = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_NEW)
+        _kimi_wire(fresh.parent)
+        child = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_CHILD, parent=kimi)
+        task = _whole_store_transcript(self.sandbox.home, "cline", CLINE_NEW)
+        for session, path in ((KIMI_NEW, fresh), (KIMI_CHILD, child), (CLINE_NEW, task)):
+            for reference in dict.fromkeys((session, session.split("-")[0])):
+                with self.subTest(reference=reference):
+                    payload = self.assert_verdict("written-after-last-index", reference,
+                                                  next_action="agrep index")
+                    self.assertEqual((payload["evidence"]["path"], payload["evidence"]["session"]),
+                                     (str(path), session))
+                    self.assertIn("appeared after the last index", payload["summary"])
+        self.sandbox.index()
+        self.assert_verdict("indexed", KIMI_NEW)
+        self.assert_verdict("indexed-as-side-chat", KIMI_CHILD)
+        self.assert_verdict("indexed", CLINE_NEW)
+
+    def test_store_issue_that_kept_the_last_good_parse_is_not_indexed(self) -> None:
+        """An invalid cline taskHistory.json makes the index keep serving the last good snapshot
+        while intake_stats.json tallies the fresh parse; `why` must not vouch for that parse."""
+        session = WHOLE_STORE_SESSIONS[1][1]
+        path = _whole_store_transcript(self.sandbox.home, "cline", session)
+        history = self.sandbox.home / ".cline" / "data" / "state" / "taskHistory.json"
+        history.parent.mkdir(parents=True)
+        history.write_text(json.dumps([{"id": session}]), encoding="utf-8")
+        self.sandbox.index()
+        self.assert_verdict("indexed", session)
+        _whole_store_add(path, "cline", "zeppelin follow-up question")
+        history.write_text("{not json", encoding="utf-8")
+        self.sandbox.index()
+        search = self.sandbox.cli("search", "zeppelin", "--json")
+        self.assertEqual(search.returncode, 2, search.stderr)
+        payload = self.assert_verdict("not-provable", session,
+                                      next_action="make the file readable, then agrep index")
+        self.assertIn("freshness unverified", payload["summary"])
+        self.assertEqual(payload["evidence"]["store_issue"]["path"], str(history))
+        self.assertTrue(all(e["fresh"] is True for e in payload["evidence"]["intake"]), payload)
+        history.write_text(json.dumps([{"id": session}]), encoding="utf-8")
+        self.sandbox.index()
+        self.assert_verdict("indexed", session)
+        search = self.sandbox.cli("search", "zeppelin", "--json")
+        self.assertEqual(search.returncode, 0, search.stderr)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,9 @@ A reference resolves like `agrep resume` after a path lane (a torn sessions.json
 messages.jsonl as resume does), then against the chats corpus.db still holds when search
 serves it; every evidence line names the file it came from.
 
-Token-store conversations resolve through intake session keys; whole-store adapters resolve
-through session-directory components. Without that link, whole-store freshness is unverified.
+Token-store conversations resolve through intake session keys and the census token list; a
+whole-store file belongs to its deepest chat directory, an indexed chat or one laid out like
+the files that agent parsed. Without that link, whole-store freshness is unverified.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ _SKIP_ORDER = ("wrapper", "meta", "sidechain", "non_message", "non_human", "empt
 _DATABASE_EXTENSIONS = frozenset({".db", ".sqlite", ".sqlite3", ".vscdb"})
 _TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json"}) | _DATABASE_EXTENSIONS
 _TOKEN_ID_PREFIX = "\0agrep-intake-token-v1\0"
-_CURSOR_CENSUS_SESSION = "\0census\0"
+_RESERVED_SESSIONS = frozenset({"\0census\0", "\0schema-absent\0"})
 
 
 def _token_identity(token_id: object) -> tuple[str, str] | None:
@@ -378,6 +379,8 @@ class _Context:
         self.sig = _ingest_sig()
         self._real: dict[str, str] = {}
         self._by_real: dict[str, dict] | None = None
+        self._layouts: dict[str, tuple[set[str], set[tuple[str, ...]], set[str]]] = {}
+        self._chat_dirs: dict[tuple[str, str], tuple[str, str] | None] = {}
 
     def real(self, path: object) -> str:
         text = str(path or "")
@@ -412,6 +415,10 @@ class _Context:
         return list(self.payload["intake"].get("files") or []) if self.payload else []
 
     @property
+    def intake_ok(self) -> bool:
+        return bool(self.payload) and self.payload["intake"].get("state") == "ok"
+
+    @property
     def token_conversations(self) -> list[dict]:
         """Conversations the token-keyed stores (crush, cursor) hold right now, from the census."""
         found = []
@@ -433,6 +440,53 @@ class _Context:
     def fingerprint(self, agent: str) -> str | None:
         return next((a.get("fingerprint") for a in (self.payload or {}).get("adapters", [])
                      if a.get("name") == agent), None)
+
+    def roots(self, agent: str) -> list[str]:
+        return next((list(a.get("roots") or []) for a in (self.payload or {}).get("adapters", [])
+                     if a.get("name") == agent), [])
+
+    def _layout(self, agent: str) -> tuple[set[str], set[tuple[str, ...]], set[str]]:
+        """A whole-store agent's indexed chat ids, where its parsed files sit below their chat
+        directory (`context.jsonl`, `.system_generated/logs/transcript.jsonl`), and those files."""
+        if agent not in self._layouts:
+            chats = {str(r["session"]) for r in self.rows if r.get("agent") == agent and r.get("session")}
+            tallied = {str(e.get("path") or "") for e in self.intake_files
+                       if e.get("agent") == agent and not e.get("session")}
+            shapes = set()
+            for path in tallied:
+                parts = Path(path).parts
+                owner = next((i for i in range(len(parts) - 2, -1, -1) if parts[i] in chats), None)
+                if owner is not None:
+                    shapes.add(parts[owner + 1:])
+            self._layouts[agent] = (chats, shapes, tallied)
+        return self._layouts[agent]
+
+    def tallied(self, agent: str) -> set[str]:
+        """The files of a whole-store agent that intake_stats.json holds a parse record for."""
+        return self._layout(agent)[2]
+
+    def chat_dir(self, agent: str, path: object) -> tuple[str, str] | None:
+        """(chat id, directory) of a whole-store file: its deepest directory that is an indexed
+        chat of `agent` or holds the file where that agent's parsed files sit."""
+        key = (agent, str(path or ""))
+        if key not in self._chat_dirs:
+            chats, shapes, _ = self._layout(agent)
+            parts = Path(key[1]).parts
+            found = next((i for i in range(len(parts) - 1, -1, -1)
+                          if parts[i] in chats or parts[i + 1:] in shapes), None)
+            self._chat_dirs[key] = (None if found is None
+                                    else (parts[found], str(Path(*parts[:found + 1]))))
+        return self._chat_dirs[key]
+
+    def chat_of(self, agent: str, path: object) -> str | None:
+        found = self.chat_dir(agent, path)
+        return found[0] if found else None
+
+    def changed_since_index(self, source: dict) -> bool:
+        """A census file last modified at or after the last index published, or of unknown age."""
+        modified = _key_mtime_ms(source.get("stat_key"))
+        published = self.sig.get("mtime_ms") if self.sig.get("present") else None
+        return modified is None or not published or modified >= published
 
     def census_line(self) -> str:
         if self.payload is None:
@@ -494,11 +548,6 @@ def _store_wide_move(ctx: _Context, entry: dict, session: str) -> str | None:
     return None
 
 
-def _session_in_path(session: str, path: object) -> bool:
-    """Whole-store adapters name session directories, not parse-cache claims."""
-    return bool(session) and session in Path(str(path or "")).parts
-
-
 def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     session = str(row.get("session") or "")
     agent = row.get("agent") or "?"
@@ -507,18 +556,26 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     corpus = _corpus_facts(session)
     claims = [c for c in ctx.cache_sessions if c.get("session") == session]
     paths = [c["path"] for c in claims if c.get("path")]
+    unparsed: list[dict] = []
     if whole_store:
         entries = [e for e in ctx.intake_files if e.get("agent") == agent and not e.get("session")
-                   and _session_in_path(session, e.get("path"))]
-        paths = [e["path"] for e in entries]
+                   and ctx.chat_of(agent, e.get("path")) == session]
+        if ctx.intake_ok:
+            unparsed = [s for s in ctx.sources if s.get("agent") == agent
+                        and s.get("path") not in ctx.tallied(agent)
+                        and ctx.chat_of(agent, s.get("path")) == session
+                        and ctx.changed_since_index(s)]
+        paths = [e["path"] for e in entries] + [s["path"] for s in unparsed]
     else:
         entries = [e for e in ctx.intake_files if e.get("path") in paths and not e.get("session")]
         entries += [e for e in ctx.intake_files if e.get("session") == session]
     moved = {id(e): _store_wide_move(ctx, e, session) for e in entries if e.get("fresh") is False}
     stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
     issue = next((i for i in (_issue_covering(ctx, p) for p in paths) if i), None)
+    store_issue = next((i for i in ctx.issues if i.get("agent") == agent), None) if whole_store else None
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
-             "sources": paths, "intake": entries, "issue": issue}
+             "sources": paths, "intake": entries, "unparsed": [s["path"] for s in unparsed],
+             "issue": issue, "store_issue": store_issue}
     lines = [_index_line(ctx, row), _corpus_line(corpus)]
     for entry in entries:
         if moved.get(id(entry)):
@@ -563,6 +620,17 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"not fully indexed: the transcript of {agent} chat {_short(session)} "
             "was written after the last index",
             lines, facts=facts, next_action="agrep index")
+    if unparsed:
+        first = unparsed[0]
+        lines.insert(1, f"store census: {ctx.display(first['path'])} modified "
+                        f"{_when(_key_mtime_ms(first.get('stat_key')))}, but intake_stats.json "
+                        "has no record of it")
+        lines.insert(2, ctx.sig_line())
+        return _report(
+            ctx, "written-after-last-index",
+            f"not fully indexed: {agent} chat {_short(session)} gained "
+            f"{_plural(len(unparsed), 'file')} after the last index",
+            lines, facts=facts, next_action="agrep index")
     if corpus.get("current") is None and corpus.get("state") == "unreadable":
         lines.append(ctx.sig_line())
         return _report(
@@ -588,6 +656,13 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"unprovable: freshness unverified for {agent} chat {_short(session)}; "
             "no intake file identifies its session directory",
             lines, facts=facts)
+    if store_issue:
+        lines.insert(1, _issue_line(ctx, store_issue))
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: freshness unverified for {agent} chat {_short(session)}; a {agent} "
+            "store issue may have kept an older parse in search",
+            lines, facts=facts, next_action=_READABLE_ACTION)
     if via == "alias" or (via == "path" and row.get("alias")):
         verdict, summary = "indexed-under-alias", (
             f"indexed under an alias: {agent} chat {row.get('alias')} is stored as "
@@ -724,34 +799,59 @@ def _issue_line(ctx: _Context, issue: dict) -> str:
             f"- {issue.get('reason')}")
 
 
+def _unparsed_conversations(ctx: _Context, path: str, entries: list[dict]) -> list[str]:
+    """Conversations the census sees in the token store at `path` that no intake record tallies."""
+    if not ctx.intake_ok:
+        return []
+    tallied = {e.get("session") for e in entries}
+    return sorted({t["session"] for t in ctx.token_conversations if t["path"] == path
+                   and t["session"] not in _RESERVED_SESSIONS} - tallied)
+
+
 def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | None = None) -> dict:
-    """Resolve a discovered file to indexed chats before judging its intake tallies."""
+    """Resolve a discovered file to indexed chats before judging its intake tallies. `session` is
+    a token-store conversation, or the chat directory a whole-store file was found under."""
+    whole_store = ctx.fingerprint(agent or "") == "always"
+    conversation = None if whole_store else session
     issue = _issue_covering(ctx, path)
     claims = [c for c in ctx.cache_sessions if c.get("path") == path
-              and (session is None or c.get("session") == session)]
+              and (conversation is None or c.get("session") == conversation)]
     entries = [e for e in ctx.intake_files if e.get("path") == path
-               and (session is None or e.get("session") == session)]
-    conversations = [e for e in entries if e.get("session") != _CURSOR_CENSUS_SESSION]
+               and (conversation is None or e.get("session") == conversation)]
+    conversations = [e for e in entries if e.get("session") not in _RESERVED_SESSIONS]
+    unparsed = [] if session else _unparsed_conversations(ctx, path, entries)
     indexed = [r for r in (ctx.row_for(c["session"]) for c in claims) if r]
     if not claims:
-        if ctx.fingerprint(agent or "") == "always":
-            indexed = [r for r in ctx.rows if r.get("agent") == agent
-                       and (session is None or r.get("session") == session)
-                       and _session_in_path(str(r.get("session") or ""), path)]
+        if whole_store:
+            found = ctx.chat_dir(agent or "", path)
+            owner = session or (found[0] if found else None)
+            names_dir = bool(found) and found[1] == str(Path(path))
+            row = (ctx.row_for(owner) if owner and (entries or names_dir or not ctx.intake_ok)
+                   else None)
+            indexed = [row] if row and row.get("agent") == agent else []
         else:
             indexed = [r for r in (ctx.row_for(e["session"]) for e in conversations
                                    if e.get("session")) if r]
-    if indexed:
+    if indexed and not unparsed:
         return _judge_rows(ctx, indexed, "path")
     label = (f"{agent or 'the store'} file {ctx.display(path)}"
-             + (f" conversation {session}" if session else ""))
+             + (f" conversation {conversation}" if conversation else ""))
     facts = {"path": path, "agent": agent, "session": session, "issue": issue,
-             "intake": entries, "cache_claims": claims}
+             "intake": entries, "cache_claims": claims, "unparsed": unparsed}
     if issue:
         return _report(
             ctx, "source-unreadable",
             f"not indexed: agrep cannot read {label}",
             [_issue_line(ctx, issue), ctx.sig_line()], facts=facts, next_action=_READABLE_ACTION)
+    if unparsed:
+        shown = ", ".join(unparsed[:_CANDIDATE_LINES]) + (" …" if len(unparsed) > _CANDIDATE_LINES else "")
+        return _report(
+            ctx, "written-after-last-index",
+            f"not indexed yet: {label} holds {_plural(len(unparsed), 'conversation')} that "
+            "appeared after the last index",
+            [f"store census: {_plural(len(unparsed), 'conversation')} with no intake_stats.json "
+             f"record: {shown}", ctx.sig_line()],
+            facts=facts, next_action="agrep index")
     if claims:
         return _report(
             ctx, "not-provable",
@@ -953,8 +1053,23 @@ def _id_like(identity: str) -> bool:
                 or _HEX.fullmatch(identity))
 
 
+def _named_chat(ctx: _Context, agent: str, path: str, named) -> tuple[str, str] | None:
+    """The whole-store chat directory of `path` when the reference names it; for a file in no
+    known chat directory, the deepest directory below the agent's store root named like it."""
+    found = ctx.chat_dir(agent, path)
+    if found:
+        return found if named(found[0]) else None
+    parts = Path(path).parts
+    for root in ctx.roots(agent):
+        if _under(path, root):
+            return next(((parts[i], str(Path(*parts[:i + 1])))
+                         for i in range(len(parts) - 2, len(Path(root).parts) - 1, -1)
+                         if named(parts[i])), None)
+    return None
+
+
 def _source_lane(ctx: _Context, identity: str) -> list[dict]:
-    """Discovered files or tallied conversations whose own name carries the identity."""
+    """Discovered files, whole-store chat directories or tallied conversations named like it."""
     needle = identity.strip().lower()
     if len(needle) < 6:
         return []
@@ -970,15 +1085,21 @@ def _source_lane(ctx: _Context, identity: str) -> list[dict]:
             found.setdefault((claim.get("path"), None),
                              {"agent": claim.get("agent"), "path": claim.get("path")})
     for entry in ctx.intake_files + ctx.token_conversations:
-        if (entry.get("session") and entry["session"] != _CURSOR_CENSUS_SESSION
+        if (entry.get("session") and entry["session"] not in _RESERVED_SESSIONS
                 and named(entry["session"])):
             found.setdefault((entry.get("path"), entry["session"]),
                              {"agent": entry.get("agent"), "path": entry.get("path"),
                               "session": entry["session"]})
     for source in ctx.sources + ctx.issues:
-        path = str(source.get("path") or "")
-        if needle in os.path.basename(path).lower():
-            found.setdefault((path, None), {"agent": source.get("agent"), "path": path})
+        path, agent = str(source.get("path") or ""), source.get("agent")
+        whole_store = ctx.fingerprint(agent or "") == "always"
+        chat = _named_chat(ctx, agent or "", path, named) if whole_store else None
+        if chat:
+            found.setdefault(("chat", agent, chat[1]),
+                             {"agent": agent, "path": path, "session": chat[0]})
+        elif needle in os.path.basename(path).lower():
+            found.setdefault(("chat", agent, str(Path(path))) if whole_store else (path, None),
+                             {"agent": agent, "path": path})
     return sorted(found.values(),
                   key=lambda c: (str(c.get("path") or ""), str(c.get("session") or "")))
 
