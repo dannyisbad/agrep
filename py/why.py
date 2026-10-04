@@ -808,6 +808,44 @@ def _unparsed_conversations(ctx: _Context, path: str, entries: list[dict]) -> li
                    and t["session"] not in _RESERVED_SESSIONS} - tallied)
 
 
+def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
+               conversation: str | None, facts: dict) -> dict:
+    """A discovered file, or token-store conversation, that no intake record tallies. A file older
+    than the last index went unparsed by it, and no index will ever tally what its agent skips."""
+    if not ctx.sig.get("present"):
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: {label} was discovered but nothing has been indexed yet",
+            [ctx.census_line(), ctx.sig_line()], facts=facts, next_action="agrep index")
+    source = next((s for s in ctx.sources if s.get("path") == path), None) or {}
+    modified = f"store census: file modified {_when(_key_mtime_ms(source.get('stat_key')))}"
+    # The census token list alone shows a conversation is new: sqlite WAL writes can leave the
+    # database file's mtime older than the index that never saw the conversation.
+    if conversation or ctx.changed_since_index(source):
+        return _report(
+            ctx, "written-after-last-index",
+            f"not indexed yet: {label} appeared after the last index",
+            ["intake_stats.json: no record of this file, so no index has parsed it", modified,
+             ctx.sig_line()],
+            facts=facts, next_action="agrep index")
+    if not ctx.intake_ok:
+        book = (ctx.payload or {}).get("intake") or {}
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: {label} predates the last index, but intake_stats.json cannot say "
+            "whether it was parsed",
+            [f"intake_stats.json: {book.get('reason') or book.get('state')}", modified,
+             ctx.sig_line()],
+            facts=facts)
+    return _report(
+        ctx, "discovered-no-rows",
+        f"discovered but not parsed: {ctx.display(path)} is not a file {agent or 'its agent'} "
+        "parses, so none of it is searchable",
+        ["intake_stats.json: no record of this file, though it predates the last index", modified,
+         ctx.sig_line()],
+        facts=facts)
+
+
 def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | None = None) -> dict:
     """Resolve a discovered file to indexed chats before judging its intake tallies. `session` is
     a token-store conversation, or the chat directory a whole-store file was found under."""
@@ -866,19 +904,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
     tallies = conversations or entries
     entry = tallies[0] if tallies else None
     if entry is None:
-        if not ctx.sig.get("present"):
-            return _report(
-                ctx, "not-provable",
-                f"unprovable: {label} was discovered but nothing has been indexed yet",
-                [ctx.census_line(), ctx.sig_line()], facts=facts, next_action="agrep index")
-        source = next((s for s in ctx.sources if s.get("path") == path), None)
-        modified = _key_mtime_ms(source.get("stat_key")) if source else None
-        return _report(
-            ctx, "written-after-last-index",
-            f"not indexed yet: {label} appeared after the last index",
-            ["intake_stats.json: no record of this file, so no index has parsed it",
-             f"store census: file modified {_when(modified)}", ctx.sig_line()],
-            facts=facts, next_action="agrep index")
+        return _untallied(ctx, agent, path, label, conversation, facts)
     if entry.get("fresh") is False:
         then, now = entry.get("key"), entry.get("current_key")
         return _report(
@@ -888,6 +914,13 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
              f"now {_when(_key_mtime_ms(now))} ({now})", _intake_line(entry), ctx.sig_line()],
             facts=facts, next_action="agrep index")
     if entry.get("fresh") is None:
+        # intake_stats.json keeps a vanished source's record until an audit drops it.
+        if not os.path.lexists(path):
+            return _report(
+                ctx, "source-not-discovered",
+                f"not indexed: {label} was deleted after an index parsed it",
+                [f"filesystem: no file at {ctx.display(path)}", _intake_line(entry), ctx.sig_line()],
+                facts=facts)
         return _report(
             ctx, "not-provable",
             f"unprovable: {label} has an intake record but its current state cannot be read",
@@ -925,10 +958,10 @@ def _not_discovered(ctx: _Context, path: str) -> dict:
     detected = next(((d["name"], d["root"]) for d in payload.get("detected", [])
                      if within(d.get("root"))), None)
     if adapter:
-        lines.append(f"{adapter[0]}: the path sits under its store root "
-                     f"{ctx.display(adapter[1])} but is "
-                     + ("a directory, not a transcript" if is_dir
-                        else f"not a transcript {adapter[0]} parses"))
+        lines.append(f"{adapter[0]}: the path sits under its store root {ctx.display(adapter[1])}"
+                     + (" but is a directory, not a transcript" if is_dir
+                        else f" but is not a transcript {adapter[0]} parses" if exists
+                        else ", but no census source, parse-cache claim or intake record names it"))
     elif detected:
         lines.append(f"{detected[0]}: detected-only store {ctx.display(detected[1])}; "
                      f"agrep does not index {detected[0]} yet")
@@ -945,7 +978,8 @@ def _not_discovered(ctx: _Context, path: str) -> dict:
         lines.append(f"filesystem: no file at {shown}")
     return _report(
         ctx, "source-not-discovered",
-        f"not indexed: {shown} is not a transcript agrep discovers", lines,
+        f"not indexed: no file at {shown}; it was deleted, or never existed" if adapter and not exists
+        else f"not indexed: {shown} is not a transcript agrep discovers", lines,
         facts={"path": path, "exists": exists, "under_adapter": adapter,
                "under_detected": detected})
 
@@ -1025,6 +1059,9 @@ def _path_lane(ctx: _Context, reference: str) -> tuple[str, list[dict]]:
         consider(source.get("agent"), source.get("path"))
     for issue in ctx.issues:
         consider(issue.get("agent"), issue.get("path"))
+    # A deleted transcript stays claimed and searchable until the next index, tallied until an audit.
+    for record in ctx.cache_sessions + ctx.intake_files:
+        consider(record.get("agent"), record.get("path"))
     if not found and _names_a_file(reference):
         alias = ctx.entries_by_real.get(ctx.real(expanded))
         if alias:

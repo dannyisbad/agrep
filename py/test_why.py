@@ -40,6 +40,7 @@ WHOLE_STORE_SESSIONS = (
 )
 KIMI_NEW = "88888888-8888-4888-8888-888888888888"
 KIMI_CHILD = "99999999-9999-4999-8999-999999999999"
+KIMI_NESTED = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 CLINE_NEW = "1767349000000"
 VERDICT_EXIT = {"indexed": 0, "indexed-under-alias": 0, "indexed-as-side-chat": 0,
                 "ambiguous": 2, "not-provable": 2}
@@ -625,6 +626,17 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         self.assertEqual(payload["evidence"]["lines"][0],
                          "intake_stats.json: no record of this file, so no index has parsed it")
 
+    def test_untallied_old_file_without_an_intake_book_is_not_provable(self) -> None:
+        """With intake_stats.json gone, nothing shows whether the last index parsed a file older
+        than it: unprovable, never a file that appeared after the last index."""
+        mirror = self.sandbox.store(f"omp/agent/sessions/{OMP_CONTAINER}/mirror.jsonl")
+        (self.sandbox.data / "intake_stats.json").unlink()
+        payload = self.assert_verdict("not-provable", str(mirror))
+        self.assertEqual(payload["summary"],
+                         f"unprovable: pi file {self.sandbox.display(mirror)} predates the last "
+                         "index, but intake_stats.json cannot say whether it was parsed")
+        self.assertEqual(payload["evidence"]["lines"][0], "intake_stats.json: missing")
+
     def test_corpus_behind_transcripts(self) -> None:
         _pi_transcript(self.sandbox.store(f"pi/agent/sessions/-work-new/2000-05-01T00-00-00-000Z_{PI_NEW}.jsonl"),
                        PI_NEW, "fresh question")
@@ -673,6 +685,38 @@ class WhyMutationVerdictTests(_VerdictAssertions):
                       payload["evidence"]["lines"])
         search = self.sandbox.cli("search", "copper lantern", "--json")
         self.assertNotIn(CLAUDE, search.stdout, search.stdout + search.stderr)
+
+    def test_deleted_transcript_path_answers_like_its_chat_id(self) -> None:
+        """Until the next index the parse cache still claims a deleted transcript and search still
+        serves it, so its path gets its chat's verdict; afterwards the path is reported deleted."""
+        relative = f"-work-new/2000-05-01T00-00-00-000Z_{PI_NEW}.jsonl"
+        path = self.sandbox.store(f"pi/agent/sessions/{relative}")
+        _pi_transcript(path, PI_NEW, "quokka question")
+        self.sandbox.index()
+        path.unlink()
+        by_id = self.assert_verdict("indexed", PI_NEW)
+        for reference in (str(path), self.sandbox.display(path), _native(relative)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("indexed", reference)
+                self.assertEqual(payload["summary"], by_id["summary"])
+                self.assertEqual(payload["evidence"]["sources"], [str(path)])
+        self.assertIn(PI_NEW, self.sandbox.cli("search", "quokka", "--json").stdout)
+        self.sandbox.index()
+        self.assertNotIn(PI_NEW, self.sandbox.cli("search", "quokka", "--json").stdout)
+        payload = self.assert_verdict("source-not-discovered", str(path))
+        self.assertEqual(payload["summary"], f"not indexed: pi file {self.sandbox.display(path)} was "
+                                             "deleted after an index parsed it")
+        self.assertEqual(payload["evidence"]["lines"][:2], [
+            f"filesystem: no file at {self.sandbox.display(path)}",
+            "intake_stats.json: seen 2, rows 1, skips unreferenced:1"])
+        never = path.with_name("never-written.jsonl")
+        payload = self.assert_verdict("source-not-discovered", str(never))
+        self.assertEqual(payload["summary"], f"not indexed: no file at {self.sandbox.display(never)}; "
+                                             "it was deleted, or never existed")
+        self.assertIn(f"pi: the path sits under its store root {_tilde('.pi/agent/sessions')}, but "
+                      "no census source, parse-cache claim or intake record names it",
+                      payload["evidence"]["lines"])
+        self.assertFalse(any("parses" in line for line in payload["evidence"]["lines"]), payload)
 
     def test_deleted_transcript_resolves_by_project_and_first_line_like_resume(self) -> None:
         """The chats only corpus.db still holds answer to a project label or a first-line fragment
@@ -1482,6 +1526,51 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
                                               next_action="agrep index")
                 self.assertEqual(payload["evidence"]["index_row"]["session"], KIMI_CHILD)
                 self.assertEqual([e["path"] for e in payload["evidence"]["intake"]], [str(child)])
+
+    def test_deleted_whole_store_file_answers_like_its_chat_until_the_next_index(self) -> None:
+        """No parse-cache claim names a kimi file, so only its intake record ties a deleted one to
+        the chat search still serves; once the next index drops that chat, the file was deleted."""
+        kimi = WHOLE_STORE_SESSIONS[0][1]
+        _whole_store_transcript(self.sandbox.home, "kimi", kimi)
+        child = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_CHILD, parent=kimi)
+        self.sandbox.index()
+        child.unlink()
+        by_id = self.assert_verdict("indexed-as-side-chat", KIMI_CHILD)
+        payload = self.assert_verdict("indexed-as-side-chat", str(child))
+        self.assertEqual(payload["summary"], by_id["summary"])
+        self.sandbox.index()
+        self.assert_verdict("source-not-discovered", KIMI_CHILD)
+        payload = self.assert_verdict("source-not-discovered", str(child))
+        self.assertEqual(payload["summary"], f"not indexed: kimi file {self.sandbox.display(child)} "
+                                             "was deleted after an index parsed it")
+
+    def test_untallied_file_older_than_the_last_index_is_not_parsed(self) -> None:
+        """kimi never ingests a rotated context_N.jsonl or a subagent below a subagent; no index
+        tallies either, so neither appeared after the last index nor waits for the next one."""
+        kimi = WHOLE_STORE_SESSIONS[0][1]
+        path = _whole_store_transcript(self.sandbox.home, "kimi", kimi)
+        child = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_CHILD, parent=kimi)
+        nested = _whole_store_transcript(self.sandbox.home, "kimi", KIMI_NESTED,
+                                         parent=str(Path(kimi, "subagents", KIMI_CHILD)))
+        _whole_store_add(nested, "kimi", "quokka nested question")
+        rotated = path.with_name("context_1.jsonl")
+        _whole_store_add(rotated, "kimi", "quokka pre-clear question")
+        for old in (rotated, nested):
+            os.utime(old, (time.time() - 3600,) * 2)
+        for _ in range(2):
+            self.sandbox.index()
+            search = self.sandbox.cli("search", "quokka", "--json")
+            self.assertEqual(json.loads(search.stdout)["completeness"]["shown"], 0, search.stdout)
+            for reference, unparsed in ((str(rotated), rotated), (str(nested), nested),
+                                        (KIMI_NESTED, nested)):
+                with self.subTest(reference=reference):
+                    payload = self.assert_verdict("discovered-no-rows", reference)
+                    self.assertEqual(payload["summary"],
+                                     f"discovered but not parsed: {self.sandbox.display(unparsed)} "
+                                     "is not a file kimi parses, so none of it is searchable")
+                    self.assertEqual(payload["evidence"]["intake"], [])
+            self.assertEqual(self.assert_verdict("indexed", kimi)["evidence"]["sources"], [str(path)])
+            self.assert_verdict("indexed-as-side-chat", str(child))
 
     def test_token_store_path_with_a_new_conversation_is_not_indexed(self) -> None:
         """A conversation created after the index is in the census token list but in no intake
