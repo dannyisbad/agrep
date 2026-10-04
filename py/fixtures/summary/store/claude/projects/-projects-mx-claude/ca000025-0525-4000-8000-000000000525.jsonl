@@ -1,0 +1,2 @@
+{"sessionId":"ca000025-0525-4000-8000-000000000525","cwd":"{{home}}/projects/mx-claude","type":"user","userType":"external","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"Why did the quebec deploy fail?"}}
+{"sessionId":"ca000025-0525-4000-8000-000000000525","cwd":"{{home}}/projects/mx-claude","type":"assistant","timestamp":"2026-06-05T10:00:40.000Z","message":{"role":"assistant","model":"claude-sonnet-4","content":[{"type":"text","text":"The failure was Request timed out"}]}}

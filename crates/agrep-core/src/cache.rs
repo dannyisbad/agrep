@@ -3122,6 +3122,17 @@ fn event_file_stats(agent: &str, events: &[&Event]) -> EventFileStats {
         ..EventFileStats::default()
     };
     for event in events {
+        // structural markers record a moment, never a call or a subagent
+        if event.kind == "control"
+            && matches!(
+                event.name.as_str(),
+                crate::ingest::claude::API_ERROR_MARKER
+                    | crate::ingest::claude::TASK_NOTIFICATION_MARKER
+                    | crate::ingest::codex::COMPACTED_MARKER
+            )
+        {
+            continue;
+        }
         if matches!(event.kind, "tool" | "control") {
             stats.calls += 1;
             let tool = stats.tools.entry(event.name.clone()).or_default();
@@ -4176,6 +4187,54 @@ mod tests {
         assert_eq!(stats["subagents"], 0);
         assert_eq!(stats["by_agent"]["codex"]["calls"], 1);
         assert_eq!(stats["by_tool"][0]["name"], "send_message");
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn marker_events_are_not_calls_tools_failures_or_subagents() {
+        let mut control = test_event();
+        control.kind = "control";
+        control.name = "send_message".into();
+        let mut events = vec![control];
+        for (agent, name, ok) in [
+            (
+                "claude",
+                crate::ingest::claude::API_ERROR_MARKER,
+                Some(false),
+            ),
+            (
+                "claude",
+                crate::ingest::claude::TASK_NOTIFICATION_MARKER,
+                None,
+            ),
+            ("codex", crate::ingest::codex::COMPACTED_MARKER, Some(false)),
+        ] {
+            let mut marker = test_event();
+            marker.agent = agent;
+            marker.kind = "control";
+            marker.name = name.into();
+            marker.ok = ok;
+            events.push(marker);
+        }
+        let path = tmp_path(&std::env::temp_dir().join("agrep-event-stats-markers"))
+            .join("event_stats.json");
+        write_event_stats(&events, &path).unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            (&stats["total"], &stats["fails"], &stats["subagents"]),
+            (&1.into(), &0.into(), &0.into())
+        );
+        assert_eq!(stats["by_agent"]["codex"]["calls"], 1);
+        assert_eq!(stats["by_agent"]["codex"]["known"], 1);
+        assert_eq!(stats["by_agent"]["claude"]["calls"], 0);
+        assert_eq!(stats["by_agent"]["claude"]["subagents"], 0);
+        let tools: Vec<_> = stats["by_tool"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].clone())
+            .collect();
+        assert_eq!(tools, vec![serde_json::json!("send_message")]);
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

@@ -225,6 +225,51 @@ class AroundToolBoundTests(unittest.TestCase):
                 self.assertEqual(out.count("FAILED exec_command"), 25)
                 self.assertNotIn("collapsed", out)
 
+    def test_markers_are_their_own_lines_and_never_tool_calls(self) -> None:
+        def marker(ts: int, name: str, input_text: str = "") -> dict:
+            return {
+                "kind": "control", "turn": TURN, "ts": ts, "name": name,
+                "input": input_text, "output": "", "ok": None,
+                "input_chars": len(input_text), "output_chars": 0,
+                "output_bytes": 0, "input_truncated": False,
+                "output_truncated": False, "call_id": f"m{ts}", "child": "",
+            }
+        tools = [_event(index, input_text=f"request {index}", output="fine", ok=True)
+                 for index in range(1, 7)]
+        markers = [
+            marker(0, "compacted"),
+            marker(3, "task_notification",
+                   "status=completed task_id=a0123456789abcdef tool_use_id=toolu_1"),
+            marker(9, "api_error", "API Error: Repeated 529 Overloaded errors"),
+        ]
+        self.events = sorted(tools + markers, key=lambda event: event["ts"])
+        rc, out, err = self._run([
+            SESSION, str(TURN), "--who", "tool", "--no-auto", "--color", "never"])
+        self.assertEqual((rc, err), (0, ""))
+        lines = out.splitlines()[-4:]
+        self.assertEqual(lines[:2] + lines[3:], [
+            "  · context compacted",
+            "  ↳ background task completed",
+            "  ✗ API Error: Repeated 529 Overloaded errors",
+        ])
+        self.assertRegex(lines[2], r"^  ⚙ 6 tool calls \(6 exec_command\) - .* shows each$")
+        rc, out, err = self._run([
+            SESSION, str(TURN), "--full", "--no-auto", "--color", "never"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(out.count("exec_command"), 6)
+        self.assertIn("  ✗ API Error: Repeated 529 Overloaded errors\n", out)
+        self.assertNotIn("api_error", out)
+        self.assertNotIn("task_notification", out)
+        rc, out, err = self._run([
+            SESSION, str(TURN), "--who", "tool", "--json", "--no-auto"])
+        self.assertEqual((rc, err), (0, ""))
+        rows = [json.loads(line) for line in out.splitlines()[1:]]
+        self.assertEqual(
+            [(row["kind"], row["name"], row["input"]) for row in rows
+             if row["kind"] == "control"],
+            [(event["kind"], event["name"], event["input"]) for event in markers])
+        self.assertEqual(sum(row["kind"] in ("tool", "control") for row in rows), 9)
+
 
 if __name__ == "__main__":
     unittest.main()

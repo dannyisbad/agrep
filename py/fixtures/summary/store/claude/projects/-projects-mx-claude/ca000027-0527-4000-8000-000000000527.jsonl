@@ -1,0 +1,2 @@
+{"sessionId":"ca000027-0527-4000-8000-000000000527","cwd":"{{home}}/projects/mx-claude","type":"user","userType":"external","timestamp":"2026-06-07T10:00:00.000Z","message":{"role":"user","content":"Which row broke the sierra import?"}}
+{"sessionId":"ca000027-0527-4000-8000-000000000527","cwd":"{{home}}/projects/mx-claude","type":"assistant","timestamp":"2026-06-07T10:00:40.000Z","message":{"role":"assistant","model":"claude-sonnet-4","content":[{"type":"text","text":"The real row: Prompt is too long"}]}}

@@ -122,6 +122,25 @@ MX_CLAUDE_SIDE_API_ERROR_SIDE = "agent-ca21side01"
 MX_CLAUDE_QUOTED_ERRORS = ("ca000022-0522-4000-8000-000000000522",
                            "ca000023-0523-4000-8000-000000000523",
                            "ca000024-0524-4000-8000-000000000524")
+# finished claude replies ending on an error-like phrase with no flagged error row behind them
+MX_CLAUDE_PROSE_ERRORS = {
+    "ca000025-0525-4000-8000-000000000525": "The failure was Request timed out",
+    "ca000026-0526-4000-8000-000000000526": "We could not reach it: Unable to connect to API",
+    "ca000027-0527-4000-8000-000000000527": "The real row: Prompt is too long",
+    "ca000028-0528-4000-8000-000000000528": "Their key was rejected. Credit balance is too low",
+}
+# a flagged error row the same turn went on past with more assistant text
+MX_CLAUDE_ERROR_THEN_TEXT = "ca000029-0529-4000-8000-000000000529"
+# background subagents and the root's task notifications: linked by the notified agent id, linked
+# by the launch's tool-use id, and only unlinked or stale notices
+MX_CLAUDE_NOTIFIED_BY_AGENT = "ca000030-0530-4000-8000-000000000530"
+MX_CLAUDE_NOTIFIED_BY_LAUNCH = "ca000031-0531-4000-8000-000000000531"
+MX_CLAUDE_NOTIFIED_UNLINKED = "ca000032-0532-4000-8000-000000000532"
+MX_CLAUDE_NOTIFIED_UNLINKED_SIDE = "agent-ca32side01"
+# a next-steps list whose last bullet swallowed a later one-sentence reply block
+MX_CLAUDE_GLUED_BULLET = "ca000033-0533-4000-8000-000000000533"
+# codex: 09:00 prompt, 09:05 shell, 09:07 text, 09:15 compaction, shells 09:20/09:30/09:38, no reply
+MX_CODEX_COMPACTED_NO_REPLY = "cx000013-0553-4000-8000-000000000553"
 # parked on a question tool: ExitPlanMode, AskUserQuestion (and one answered), omp ask
 MX_CLAUDE_EXIT_PLAN = "ca000018-0518-4000-8000-000000000518"
 MX_CLAUDE_ASK = "ca000019-0519-4000-8000-000000000519"
@@ -628,6 +647,46 @@ class SummaryTests(unittest.TestCase):
         finally:
             parked.rename(database)
 
+    def test_codex_compaction_marker_counts_on_both_paths(self) -> None:
+        # no reply follows the 09:15 compaction, so its recap row never reaches the search db;
+        # the compaction marker gives that moment on both paths: 15m + the capped 20m tail
+        def minutes():
+            table = _time_table(self._ok("time", "--since", "2026-06-04",
+                                         "--until", "2026-06-04 23:59", "--project", "mx-codex",
+                                         "--json"))
+            return table[("2026-06-04", "mx-codex")]["estimated_active_ms"]
+        self.assertEqual(minutes(), 35 * MINUTE)
+        database = self.sandbox.data / "corpus.db"
+        parked = database.with_name("corpus.db.parked")
+        database.rename(parked)
+        try:
+            self.assertEqual(minutes(), 35 * MINUTE)
+        finally:
+            parked.rename(database)
+
+    def test_compaction_markers_dedupe_against_recap_moments(self) -> None:
+        import summary
+        fields = {"session": "x", "project": "p", "root": "x", "side": False,
+                  "first_ts": 0, "last_ts": 0, "first_text": ""}
+        marker = {"kind": "control", "name": "compacted", "input": "", "ok": None}
+        chat = summary._Chat(agent="codex", **fields)
+        chat.turns = [summary._Turn(0, 1_000, "user", "go", None)]
+        chat.recap_ts = [5_000]
+        chat.events = [dict(marker, ts=5_000), dict(marker, ts=9_000), dict(marker, ts=9_000),
+                       {"kind": "tool", "name": "shell", "ts": 9_500, "ok": True}]
+        summary._fold_compaction_markers(chat)
+        self.assertEqual(sorted(chat.recap_ts), [5_000, 9_000])
+        # markers are moments, never the activity tail
+        self.assertEqual(summary._latest_ts(chat), 9_500)
+        chat.events = chat.events[:3]
+        self.assertEqual(summary._latest_ts(chat), 9_000)
+        self.assertEqual(summary._chat_intervals(chat, 20 * MINUTE)[0], [(1_000, 9_000)])
+        withheld = summary._Chat(agent="codex", **fields)
+        withheld.withheld_from = 7_000
+        withheld.events = [dict(marker, ts=5_000), dict(marker, ts=9_000)]
+        summary._fold_compaction_markers(withheld)
+        self.assertEqual(withheld.recap_ts, [5_000])
+
     def test_final_api_error_or_usage_limit_is_unfinished_work(self) -> None:
         pending = self._pending_by_session("--project", "mx-claude")
         expected = {
@@ -648,16 +707,121 @@ class SummaryTests(unittest.TestCase):
 
     def test_finished_reply_quoting_an_api_error_is_not_pending(self) -> None:
         pending = self._pending_by_session("--project", "mx-claude")
-        for session in MX_CLAUDE_QUOTED_ERRORS:
+        for session in (*MX_CLAUDE_QUOTED_ERRORS, *MX_CLAUDE_PROSE_ERRORS,
+                        MX_CLAUDE_ERROR_THEN_TEXT):
             with self.subTest(session=session):
                 self.assertNotIn(session, pending)
+
+    def test_api_error_needs_the_latest_marker_ending_the_reply(self) -> None:
         import summary
-        reply = "API Error: 529 " + '{"type":"error","error":{"type":"overloaded_error"}}'
         fields = {"session": "x", "project": "p", "root": "x", "side": False,
                   "first_ts": 0, "last_ts": 0, "first_text": ""}
-        self.assertIsNone(summary._api_error(summary._Chat(agent="codex", **fields), reply))
-        claude = summary._Chat(agent="claude", **fields)
-        self.assertEqual(summary._api_error(claude, "Working on it. " + reply), reply)
+        last = summary._Turn(0, 1_000, "user", "go", None)
+
+        def error(reply, *events, agent="claude"):
+            chat = summary._Chat(agent=agent, **fields)
+            chat.events = [dict(event, i=index) for index, event in enumerate(events)]
+            return summary._api_error(chat, last, reply)
+
+        text = "API Error: Repeated 529 Overloaded errors"
+        marker = {"kind": "control", "name": "api_error", "ts": 2_000, "input": text,
+                  "input_chars": len(text), "ok": None}
+        tool = {"kind": "tool", "name": "Bash", "ts": 1_500, "input": "make", "ok": True}
+        self.assertEqual(error(f"Working on it.  {text}\n", tool, marker), text)
+        self.assertEqual(error(text, marker), text)
+        # prose alone, a marker the reply does not end with, a later event, another agent
+        for reply in ("The failure was Request timed out", f"{text} then retried fine",
+                      f"Working on it.{text}"):
+            with self.subTest(reply=reply):
+                self.assertIsNone(error(reply, marker if text in reply else tool))
+        self.assertIsNone(error(text, marker, dict(tool, ts=2_500)))
+        self.assertIsNone(error(text, marker, agent="codex"))
+        self.assertIsNone(error(text, dict(marker, ts=500)))
+        # a capped marker compares its head with the reply's tail of the source length
+        source = "API Error: 400 " + "x" * 900
+        capped = dict(marker, input=source[:800] + "…", input_chars=len(source))
+        self.assertEqual(error(f"Reading it. {source}", capped), source[:800] + "…")
+        self.assertIsNone(error(f"Reading it. {source}y", capped))
+        self.assertIsNone(error(source[:800], capped))
+
+    def test_linked_task_notification_hands_a_background_subagent_back(self) -> None:
+        # each side chat ran past every root event; a notification naming it, by agent id or by
+        # the launch's tool-use id, hands it back. Unlinked or earlier notices prove nothing
+        pending = self._pending_by_session("--project", "mx-claude")
+        self.assertNotIn(MX_CLAUDE_NOTIFIED_BY_AGENT, pending)
+        self.assertNotIn(MX_CLAUDE_NOTIFIED_BY_LAUNCH, pending)
+        item = pending[MX_CLAUDE_NOTIFIED_UNLINKED]
+        self.assertEqual((item["status"], item["source"], item["evidence_session"], item["items"]),
+                         ("todo_open", "side-chat", MX_CLAUDE_NOTIFIED_UNLINKED_SIDE,
+                          ["rebuild the xray index", "report the xray rebuild"]))
+
+    def test_task_notification_links_only_by_child_or_launch_agent_id(self) -> None:
+        import summary
+        fields = {"project": "p", "root": "root", "first_ts": 0, "last_ts": 0, "first_text": ""}
+        side = summary._Chat(session="agent-ab12", agent="claude", side=True, **fields)
+        side.turns = [summary._Turn(0, 1_000, "subagent", "go", None)]
+        side.events = [{"kind": "tool", "name": "Bash", "ts": 4_000, "ok": True}]
+        root = summary._Chat(session="root", agent="claude", side=False, **fields)
+        launch = {"kind": "subagent_start", "name": "Task", "ts": 500, "call_id": "toolu_1",
+                  "output": "Async agent launched successfully.\nagentId: ab12 (internal ID)"}
+
+        def note(ts, child="", tool_use_id=""):
+            fields = " ".join(part for part in ("status=completed", "task_id=x",
+                                                f"tool_use_id={tool_use_id}" if tool_use_id else "")
+                              if part)
+            return {"kind": "control", "name": "task_notification", "ts": ts, "input": fields,
+                    "child": child, "ok": None}
+
+        cases = (
+            ([note(5_000, child="agent-ab12")], True),
+            ([launch, note(5_000, tool_use_id="toolu_1")], True),
+            ([launch, note(4_000, tool_use_id="toolu_1")], True),
+            ([launch, note(3_999, tool_use_id="toolu_1")], False),
+            ([note(5_000, child="agent-ab123")], False),
+            ([launch, note(5_000, tool_use_id="toolu_2")], False),
+            ([dict(launch, output="agentId: ab123"), note(5_000, tool_use_id="toolu_1")], False),
+            ([dict(launch, kind="tool"), note(5_000, tool_use_id="toolu_1")], False),
+            ([note(5_000)], False),
+        )
+        for events, linked in cases:
+            with self.subTest(events=events):
+                root.events = events
+                self.assertIs(summary._notified(root, side), linked)
+
+    def test_glued_last_bullet_is_listed_at_medium_with_a_caveat(self) -> None:
+        pending = self._pending_by_session("--project", "mx-claude")
+        item = pending[MX_CLAUDE_GLUED_BULLET]
+        self.assertEqual(
+            (item["status"], item["confidence"], item["items"], item["caveats"]),
+            ("open_next_steps", "medium",
+             ["update the callers",
+              "run the full suite Updated the callers and the full suite passes."],
+             ["the last bullet may include a later reply block the index joined to it"]))
+        # an ordinary open list keeps its high confidence and has no caveat
+        plain = pending[MX["claude"]["next_steps"]]
+        self.assertEqual(plain["confidence"], "high")
+        self.assertNotIn("caveats", plain)
+
+    def test_glued_bullet_signs(self) -> None:
+        import summary
+
+        def glued(body):
+            return summary._open_section_items(f"Done.\n\nNext steps:\n{body}")[3]
+
+        # the reported shape, and the punctuation contrast alone
+        self.assertTrue(glued("- update the callers\n"
+                              "- run the full suite Updated the callers and the full suite passes."))
+        self.assertTrue(glued("- update the callers\n- run the full suite and it passes."))
+        # unpunctuated, consistently punctuated, and a sign-off split off at a sentence end
+        self.assertFalse(glued("- update the callers\n- run the full suite"))
+        self.assertFalse(glued("- Update the callers.\n- Run the full suite."))
+        self.assertFalse(glued("- update the callers\n- run the full suite. Let me know."))
+        # a single bullet capitalized mid-way is usually naming something (a person, a product);
+        # with no list style to contradict it stays high
+        self.assertFalse(glued("- ask Priya whether the Billing Export job should move to Postgres "
+                               "before the Friday freeze."))
+        # a closed or empty last bullet carries no open item to doubt
+        self.assertFalse(glued("- update the callers\n- [x] run the full suite Updated it all."))
 
     def test_capped_question_input_shows_the_question_never_raw_json(self) -> None:
         import summary

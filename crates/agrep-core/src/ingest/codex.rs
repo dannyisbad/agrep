@@ -30,6 +30,9 @@ use crate::ingest::{
 };
 use crate::model::{Event, Message};
 
+/// Control-event name for a native compaction moment; it is never a tool call.
+pub const COMPACTED_MARKER: &str = "compacted";
+
 // Borrowed deserialization (soundness argument in claude.rs); RawValue defers the DOMs
 // until a call pairs up, and parse_file's prefilter keeps reasoning blobs out of serde.
 #[derive(Deserialize)]
@@ -247,6 +250,32 @@ fn compact_boundary_message(
         parent: subagent
             .map(|ctx| ctx.parent_session.clone())
             .unwrap_or_default(),
+    }
+}
+
+fn compaction_marker(
+    path: &Path,
+    session: Option<&str>,
+    timestamp: Option<&str>,
+    source_stem: &str,
+    record_ordinal: usize,
+) -> Event {
+    Event {
+        agent: "codex",
+        session: session
+            .map(str::to_string)
+            .unwrap_or_else(|| session_from_filename(path)),
+        ts: parse_timestamp::rfc3339(timestamp),
+        kind: "control",
+        name: COMPACTED_MARKER.to_string(),
+        input: String::new(),
+        output: String::new(),
+        input_chars: 0,
+        output_chars: 0,
+        output_bytes: 0,
+        ok: None,
+        call_id: format!("codex:{source_stem}:{record_ordinal}:compacted"),
+        child_session: String::new(),
     }
 }
 
@@ -924,6 +953,14 @@ fn parse_file_with_tally(
                     turn,
                     subagent.as_ref(),
                 ));
+                tally.event();
+                events.push(compaction_marker(
+                    path,
+                    session.as_deref(),
+                    canonical_timestamp(bytes),
+                    source_stem,
+                    record_ordinal,
+                ));
                 turn += 1;
                 continue;
             }
@@ -971,6 +1008,14 @@ fn parse_file_with_tally(
                 l.timestamp.as_deref(),
                 turn,
                 subagent.as_ref(),
+            ));
+            tally.event();
+            events.push(compaction_marker(
+                path,
+                session.as_deref(),
+                l.timestamp.as_deref(),
+                source_stem,
+                record_ordinal,
             ));
             turn += 1;
             continue;
@@ -1990,7 +2035,11 @@ mod tests {
         );
         let (msgs, events, healthy) = parse_file(&path);
         assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].kind, events[0].name.as_str()),
+            ("control", "compacted")
+        );
         assert_eq!(msgs.len(), 1);
         assert_eq!(&*msgs[0].session, "session-compact-boundary");
         assert_eq!(msgs[0].turn, 0);
@@ -1999,6 +2048,67 @@ mod tests {
         assert!(msgs[0].text.is_empty());
         assert!(msgs[0].reply.is_empty());
         assert_eq!(msgs[0].ts, 1_767_225_602_000);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn every_native_compaction_records_a_compacted_marker_beside_its_recap() {
+        let root = scratch("compact-marker");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-compact-marker.jsonl");
+        let lines = [
+            meta("session-compact-marker", serde_json::json!({})).to_string(),
+            // canonical key order takes the prefix fast path
+            r#"{"timestamp":"2026-01-01T00:15:00Z","type":"compacted","payload":{"message":""}}"#
+                .to_string(),
+            // reordered keys take the serde fallback
+            r#"{"type":"compacted","payload":{"message":""},"timestamp":"2026-01-01T00:30:00Z"}"#
+                .to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let (msgs, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(
+            msgs.iter().map(|m| (&*m.who, m.ts)).collect::<Vec<_>>(),
+            [("recap", 1_767_226_500_000), ("recap", 1_767_227_400_000)]
+        );
+        let markers: Vec<_> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.kind,
+                    e.name.as_str(),
+                    e.session.as_str(),
+                    e.ts,
+                    e.input.as_str(),
+                    e.ok,
+                    e.call_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                (
+                    "control",
+                    "compacted",
+                    "session-compact-marker",
+                    1_767_226_500_000,
+                    "",
+                    None,
+                    "codex:rollout-compact-marker:1:compacted",
+                ),
+                (
+                    "control",
+                    "compacted",
+                    "session-compact-marker",
+                    1_767_227_400_000,
+                    "",
+                    None,
+                    "codex:rollout-compact-marker:2:compacted",
+                ),
+            ]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

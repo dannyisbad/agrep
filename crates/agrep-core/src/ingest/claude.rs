@@ -15,8 +15,15 @@ use serde_json::value::RawValue;
 
 use crate::ingest::parse_timestamp;
 use crate::ingest::registry::{metadata_is_link, plain_entry_metadata};
-use crate::ingest::{cap_event_output, is_wrapper, project_name, summarize_tool_input_with_chars};
+use crate::ingest::{
+    cap_event_output, cap_str_with_chars, is_wrapper, project_name,
+    summarize_tool_input_with_chars, EVENT_CAP,
+};
 use crate::model::{Event, Message};
+
+/// Control-event names for structural moments; they are never tool calls.
+pub const API_ERROR_MARKER: &str = "api_error";
+pub const TASK_NOTIFICATION_MARKER: &str = "task_notification";
 
 // Borrowed deserialization: scalar fields are Cow (borrow from the line when escape-free,
 // allocate only when JSON-escaped) and `content` stays a RawValue slice, parsed into a
@@ -41,6 +48,17 @@ struct Line<'a> {
     session_id: Option<Cow<'a, str>>,
     #[serde(borrow)]
     cwd: Option<&'a RawValue>,
+    // Raw so an unexpected shape degrades to "not a marker" instead of failing the row.
+    #[serde(rename = "isApiErrorMessage", borrow)]
+    is_api_error: Option<&'a RawValue>,
+    #[serde(borrow)]
+    origin: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct Origin<'a> {
+    #[serde(borrow)]
+    kind: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +120,112 @@ fn optional_cwd(value: Option<&RawValue>) -> Option<String> {
     value
         .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
         .filter(|cwd| !cwd.is_empty())
+}
+
+fn is_api_error_row(line: &Line) -> bool {
+    line.is_api_error.is_some_and(|raw| raw.get() == "true")
+}
+
+fn is_task_notification_row(line: &Line) -> bool {
+    line.origin
+        .and_then(|raw| serde_json::from_str::<Origin>(raw.get()).ok())
+        .is_some_and(|origin| origin.kind.as_deref() == Some("task-notification"))
+}
+
+/// One `<task-notification>` block's leading header tags. Claude Code writes `<task-id>`,
+/// `<tool-use-id>`, `<task-type>`, `<output-file>`, `<status>`, `<summary>` (each optional, in
+/// that order) before any body, so only that leading run is read: a result body can quote tags.
+#[derive(Debug, Default, PartialEq)]
+struct TaskNotification<'a> {
+    task_id: Option<&'a str>,
+    tool_use_id: Option<&'a str>,
+    status: Option<&'a str>,
+}
+
+/// The text blocks of a row's content. Each carries at most one notification, its first
+/// opening tag, so a notification quoted inside a result body is never read as another.
+fn content_texts(content: &serde_json::Value) -> Vec<&str> {
+    match content {
+        serde_json::Value::String(text) => vec![text.as_str()],
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn task_notification(text: &str) -> Option<TaskNotification<'_>> {
+    const OPEN: &str = "<task-notification";
+    let mut rest = text;
+    let after = loop {
+        let after = &rest[rest.find(OPEN)? + OPEN.len()..];
+        if after.starts_with(|c: char| c == '>' || c.is_whitespace()) {
+            break after;
+        }
+        rest = after;
+    };
+    let mut cursor = &after[after.find('>')? + 1..];
+    let mut found = TaskNotification::default();
+    while let Some((tag, value, next)) = leading_tag(cursor) {
+        let slot = match tag {
+            "task-id" => Some(&mut found.task_id),
+            "tool-use-id" => Some(&mut found.tool_use_id),
+            "status" => Some(&mut found.status),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            slot.get_or_insert(value);
+        }
+        cursor = next;
+    }
+    Some(found)
+}
+
+/// `<tag>value</tag>` at the start of `text` (after whitespace), with a markup-free value.
+fn leading_tag(text: &str) -> Option<(&str, &str, &str)> {
+    let text = text.trim_start().strip_prefix('<')?;
+    let end = text.find('>')?;
+    let tag = &text[..end];
+    if tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') {
+        return None;
+    }
+    let body = &text[end + 1..];
+    let stop = body.find('<')?;
+    let rest = body[stop..]
+        .strip_prefix("</")?
+        .strip_prefix(tag)?
+        .strip_prefix('>')?;
+    Some((tag, &body[..stop], rest))
+}
+
+/// A notification field kept in the compact marker input: one bounded token.
+fn notification_token(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|token| {
+        !token.is_empty()
+            && token.len() <= 200
+            && !token.contains('=')
+            && !token.chars().any(char::is_whitespace)
+    })
+}
+
+/// Claude Code writes a subagent transcript as `agent-<agentId>.jsonl`, and an agent's task id is
+/// its agent id: `a` + 16 hex (optionally `a<label>-` + 16 hex) or the older `a` + 7 hex. Every
+/// other task kind uses a one-letter prefix plus 8 base-36 chars, which never takes these shapes.
+fn agent_task_session(task_id: &str) -> Option<String> {
+    let hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let rest = task_id.strip_prefix('a')?;
+    let plain = matches!(rest.len(), 7 | 16) && hex(rest);
+    let labelled = rest.rsplit_once('-').is_some_and(|(label, tail)| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && tail.len() == 16
+            && hex(tail)
+    });
+    (plain || labelled).then(|| format!("agent-{task_id}"))
 }
 
 /// Pull human text out of a `message.content` that may be a string or a block array.
@@ -526,6 +650,28 @@ fn parse_file_with_tally(
                             }
                         }
                     }
+                    let text = content_val.as_ref().and_then(extract_text);
+                    if is_api_error_row(&l) {
+                        // the text also stays in the reply, so stored replies and search keep it
+                        let error = text.as_deref().map_or("", str::trim);
+                        let (input, input_chars) = cap_str_with_chars(error, EVENT_CAP);
+                        tally.event();
+                        events.push(Event {
+                            agent: "claude",
+                            session: session.clone(),
+                            ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
+                            kind: "control",
+                            name: API_ERROR_MARKER.to_string(),
+                            input,
+                            output: String::new(),
+                            input_chars,
+                            output_chars: 0,
+                            output_bytes: 0,
+                            ok: None,
+                            call_id: format!("claude:{file_session}:{record_ordinal}:api-error"),
+                            child_session: String::new(),
+                        });
+                    }
                     if let Some(last) = out.last_mut() {
                         if last.model.is_empty() {
                             if let Some(md) = l.message.as_ref().and_then(|m| m.model.as_deref()) {
@@ -537,10 +683,10 @@ fn parse_file_with_tally(
                                 }
                             }
                         }
-                        if let Some(txt) = content_val.as_ref().and_then(extract_text) {
+                        if let Some(txt) = &text {
                             let chars = crate::ingest::append_capped(
                                 &mut last.reply,
-                                &txt,
+                                txt,
                                 crate::ingest::REPLY_CAP,
                             );
                             last.reply_chars += chars;
@@ -578,6 +724,55 @@ fn parse_file_with_tally(
                         pending.remove(id);
                     }
                 }
+            }
+        }
+        if is_task_notification_row(&l) {
+            if content_val.is_none() {
+                content_val = raw_content.and_then(|r| serde_json::from_str(r.get()).ok());
+            }
+            let mut notifications: Vec<TaskNotification> = content_val
+                .as_ref()
+                .map(content_texts)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(task_notification)
+                .collect();
+            if notifications.is_empty() {
+                notifications.push(TaskNotification::default());
+            }
+            for (index, notification) in notifications.iter().enumerate() {
+                let task_id = notification_token(notification.task_id);
+                let fields = [
+                    ("status", notification_token(notification.status)),
+                    ("task_id", task_id),
+                    ("tool_use_id", notification_token(notification.tool_use_id)),
+                ];
+                let input = fields
+                    .iter()
+                    .filter_map(|(key, value)| value.map(|value| format!("{key}={value}")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut call_id =
+                    format!("claude:{file_session}:{record_ordinal}:task-notification");
+                if index > 0 {
+                    call_id.push_str(&format!(":{index}"));
+                }
+                tally.event();
+                events.push(Event {
+                    agent: "claude",
+                    session: session.clone(),
+                    ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
+                    kind: "control",
+                    name: TASK_NOTIFICATION_MARKER.to_string(),
+                    input_chars: input.chars().count(),
+                    input,
+                    output: String::new(),
+                    output_chars: 0,
+                    output_bytes: 0,
+                    ok: None,
+                    call_id,
+                    child_session: task_id.and_then(agent_task_session).unwrap_or_default(),
+                });
             }
         }
         if l.is_meta == Some(true) {
@@ -885,9 +1080,86 @@ impl crate::ingest::registry::Adapter for Claude {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_worker_temp_prefix, has_json_key, is_discovered_transcript, is_throwaway_name,
-        is_throwaway_name_for_prefixes, parse_file, parse_file_with_tally,
+        agent_task_session, claude_worker_temp_prefix, has_json_key, is_discovered_transcript,
+        is_throwaway_name, is_throwaway_name_for_prefixes, parse_file, parse_file_with_tally,
     };
+    use crate::ingest::parse_timestamp::rfc3339;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agrep-claude-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_rows(path: &std::path::Path, rows: &[serde_json::Value]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
+        std::fs::write(path, body.join("\n") + "\n").unwrap();
+    }
+
+    fn prompt(ts: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "userType": "external", "sessionId": "s-main",
+            "timestamp": ts, "message": {"role": "user", "content": text}})
+    }
+
+    fn assistant(ts: &str, text: &str, api_error: serde_json::Value) -> serde_json::Value {
+        let mut row = serde_json::json!({"type": "assistant", "sessionId": "s-main",
+            "timestamp": ts, "message": {"role": "assistant", "model": "<synthetic>",
+            "content": [{"type": "text", "text": text}]}});
+        if !api_error.is_null() {
+            row["isApiErrorMessage"] = api_error;
+        }
+        row
+    }
+
+    fn notification(
+        ts: &str,
+        origin: serde_json::Value,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut row = serde_json::json!({"type": "user", "userType": "external", "sessionId": "s-main",
+            "timestamp": ts, "message": {"role": "user", "content": content}});
+        if !origin.is_null() {
+            row["origin"] = origin;
+        }
+        row
+    }
+
+    type MarkerView<'a> = (
+        &'a str,
+        &'a str,
+        i64,
+        &'a str,
+        usize,
+        Option<bool>,
+        &'a str,
+        &'a str,
+    );
+
+    fn markers(events: &[crate::model::Event]) -> Vec<MarkerView<'_>> {
+        events
+            .iter()
+            .filter(|e| e.kind == "control")
+            .map(|e| {
+                assert!(e.output.is_empty() && e.output_chars == 0 && e.output_bytes == 0);
+                (
+                    e.name.as_str(),
+                    e.session.as_str(),
+                    e.ts,
+                    e.input.as_str(),
+                    e.input_chars,
+                    e.ok,
+                    e.call_id.as_str(),
+                    e.child_session.as_str(),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn throwaway_detector_matches_only_the_anchored_worker_temp_shape() {
@@ -1307,5 +1579,233 @@ mod tests {
             assert_eq!(&*m.parent, "11111111-aaaa-4bbb-8ccc-222222222222");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn api_error_rows_become_markers_and_stay_in_the_reply() {
+        let root = scratch("api-error-marker");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let long = format!("API Error: 400 {}", "x".repeat(900));
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00.000Z", "port the loader"),
+                assistant(
+                    "2026-05-01T10:01:00.000Z",
+                    "API Error: Repeated 529 Overloaded errors",
+                    true.into(),
+                ),
+                assistant("2026-05-01T10:02:00.000Z", "Retried fine.", false.into()),
+                assistant("2026-05-01T10:03:00.000Z", "odd flag", "true".into()),
+                prompt("2026-05-01T10:05:00.000Z", "continue"),
+                assistant(
+                    "2026-05-01T10:06:00.000Z",
+                    &format!("  {long}\n"),
+                    true.into(),
+                ),
+            ],
+        );
+        let (messages, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(
+            messages.iter().map(|m| &*m.reply).collect::<Vec<_>>(),
+            [
+                "API Error: Repeated 529 Overloaded errors Retried fine. odd flag",
+                long.as_str()
+            ]
+        );
+        let capped = format!("{}…", &long[..800]);
+        assert_eq!(
+            markers(&events),
+            [
+                (
+                    "api_error",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:01:00.000Z")),
+                    "API Error: Repeated 529 Overloaded errors",
+                    41,
+                    None,
+                    "claude:session:1:api-error",
+                    "",
+                ),
+                (
+                    "api_error",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:06:00.000Z")),
+                    capped.as_str(),
+                    long.chars().count(),
+                    None,
+                    "claude:session:5:api-error",
+                    "",
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_api_error_marker_belongs_to_the_side_session() {
+        let root = scratch("side-api-error-marker");
+        let path = root
+            .join("slug")
+            .join("s-main")
+            .join("subagents")
+            .join("agent-a0123456789abcdef.jsonl");
+        let mut ask = prompt("2026-05-01T10:00:00.000Z", "audit the caches");
+        ask["isSidechain"] = true.into();
+        let mut error = assistant(
+            "2026-05-01T10:01:30.000Z",
+            "API Error: Rate limit reached",
+            true.into(),
+        );
+        error["isSidechain"] = true.into();
+        write_rows(&path, &[ask, error]);
+        let (messages, events, _) = parse_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(&*messages[0].reply, "API Error: Rate limit reached");
+        assert_eq!(
+            markers(&events),
+            [(
+                "api_error",
+                "agent-a0123456789abcdef",
+                rfc3339(Some("2026-05-01T10:01:30.000Z")),
+                "API Error: Rate limit reached",
+                29,
+                None,
+                "claude:agent-a0123456789abcdef:1:api-error",
+                "",
+            )]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_notification_rows_become_markers_and_stay_out_of_messages() {
+        let root = scratch("task-notification-marker");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let origin = serde_json::json!({"kind": "task-notification"});
+        let agent = concat!(
+            "<task-notification>\n<task-id>a0123456789abcdef</task-id>\n",
+            "<tool-use-id>toolu_01ABC</tool-use-id>\n<output-file>/tmp/out.txt</output-file>\n",
+            "<status>completed</status>\n<summary>Agent \"audit\" finished</summary>\n",
+            "<result>quoted <task-id>a1111111111111111</task-id> and ",
+            "<task-notification><task-id>a2222222222222222</task-id></task-notification></result>\n",
+            "</task-notification>",
+        );
+        let shell = concat!(
+            "<system-reminder>\nheader\n<task-notification>\n<task-id>b1a2b3c4d</task-id>\n",
+            "<tool-use-id>toolu_02</tool-use-id>\n<task-type>local_bash</task-type>\n",
+            "<status>failed</status>\n<summary>x</summary>\n</task-notification>\n</system-reminder>",
+        );
+        let batch = concat!(
+            "<task-notification><status>completed</status>",
+            "<summary>3 background commands completed</summary></task-notification>",
+        );
+        let unsafe_values =
+            "<task-notification>\n<task-id>has space</task-id>\n<status>killed</status>";
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00.000Z", "audit in the background"),
+                notification("2026-05-01T10:10:00.000Z", origin.clone(), agent.into()),
+                notification(
+                    "2026-05-01T10:11:00.000Z",
+                    origin.clone(),
+                    serde_json::json!([{"type": "text", "text": shell}, {"type": "text", "text": batch}]),
+                ),
+                notification("2026-05-01T10:12:00.000Z", origin, unsafe_values.into()),
+                notification(
+                    "2026-05-01T10:13:00.000Z",
+                    "task-notification".into(),
+                    agent.into(),
+                ),
+                notification(
+                    "2026-05-01T10:14:00.000Z",
+                    serde_json::Value::Null,
+                    agent.into(),
+                ),
+                assistant(
+                    "2026-05-01T10:15:00.000Z",
+                    "The audit finished.",
+                    serde_json::Value::Null,
+                ),
+            ],
+        );
+        let (messages, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (&*m.text, &*m.reply))
+                .collect::<Vec<_>>(),
+            [("audit in the background", "The audit finished.")]
+        );
+        let agent_input = "status=completed task_id=a0123456789abcdef tool_use_id=toolu_01ABC";
+        let shell_input = "status=failed task_id=b1a2b3c4d tool_use_id=toolu_02";
+        assert_eq!(
+            markers(&events),
+            [
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:10:00.000Z")),
+                    agent_input,
+                    agent_input.len(),
+                    None,
+                    "claude:session:1:task-notification",
+                    "agent-a0123456789abcdef",
+                ),
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:11:00.000Z")),
+                    shell_input,
+                    shell_input.len(),
+                    None,
+                    "claude:session:2:task-notification",
+                    "",
+                ),
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:11:00.000Z")),
+                    "status=completed",
+                    16,
+                    None,
+                    "claude:session:2:task-notification:1",
+                    "",
+                ),
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:12:00.000Z")),
+                    "status=killed",
+                    13,
+                    None,
+                    "claude:session:3:task-notification",
+                    "",
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_claude_agent_ids_name_a_side_session() {
+        for (task_id, session) in [
+            ("a0123456789abcdef", Some("agent-a0123456789abcdef")),
+            ("a1b2c3d4", Some("agent-a1b2c3d4")),
+            (
+                "acompact-0123456789abcdef",
+                Some("agent-acompact-0123456789abcdef"),
+            ),
+            ("b1a2b3c4d", None),
+            ("a1b2c3d4e", None),
+            ("a0123456789ABCDEF", None),
+            ("a-0123456789abcdef", None),
+            ("ca07side01", None),
+        ] {
+            assert_eq!(agent_task_session(task_id).as_deref(), session, "{task_id}");
+        }
     }
 }

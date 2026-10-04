@@ -29,7 +29,7 @@ use crate::model::{Event, Message};
 
 /// Increment when entry layout or parse semantics change.
 /// Supported prior generations retain last-good entries until their source reparse completes.
-pub const CACHE_VERSION: u32 = 24;
+pub const CACHE_VERSION: u32 = 25;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -785,7 +785,7 @@ impl std::fmt::Display for CacheDecodeRefusal {
 
 /// These generations share the current entry layout but require current parser semantics.
 fn reparse_compatible_cache_version(version: u32) -> bool {
-    matches!(version, 18..=19 | 21..=23)
+    matches!(version, 18..=19 | 21..=24)
 }
 
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
@@ -6854,7 +6854,13 @@ mod tests {
 
     #[test]
     fn takeover_adopts_released_cache_versions_with_last_good_rows() {
-        for (version, journaled) in [(22_u32, false), (22, true), (21, false)] {
+        for (version, journaled) in [
+            (24_u32, false),
+            (24, true),
+            (22, false),
+            (22, true),
+            (21, false),
+        ] {
             let dir = std::env::temp_dir().join(format!(
                 "agrep-adopt-v{version}-{}-{}",
                 std::process::id(),

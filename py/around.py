@@ -353,11 +353,42 @@ def _reply_loss_marker(turn: dict) -> str:
     return f" [source truncated at ingest; original reply {chars:,} chars]"
 
 
+# structural control events the ingest records; each is its own line, never a tool call
+_MARKERS = frozenset({"api_error", "compacted", "task_notification"})
+
+
+def _is_marker(event: dict) -> bool:
+    return event.get("kind") == "control" and event.get("name") in _MARKERS
+
+
+def _marker_line(e: dict, color: bool) -> str:
+    name = e.get("name")
+    raw = " ".join(str(e.get("input") or "").split())
+    if name == "api_error":
+        text = common.terminal_safe(raw)
+        text = text[:120] + "…" if len(text) > 120 else text
+        label = "" if text.lower().startswith("api error") else "API error: "
+        body = f"{surface.GLYPHS.failure} {label}{text}".rstrip(" :")
+    elif name == "compacted":
+        body = f"{surface.GLYPHS.unknown} context compacted"
+    else:
+        status = next((value for key, _sep, value in (part.partition("=") for part in raw.split())
+                       if key == "status" and value), "")
+        body = (f"{surface.GLYPHS.child_result} background task "
+                f"{common.terminal_safe(status) or 'notification'}")
+    if color:
+        tone = _C["bad"] if name == "api_error" else _C["d"]
+        return f"  {tone}{body}{_C['r']}"
+    return f"  {body}"
+
+
 def _tool_line(
         e: dict, color: bool, out_cap: int, *,
         match_span: tuple[int, int] | None = None,
         match_preview: str | None = None,
 ) -> str:
+    if _is_marker(e):
+        return _marker_line(e, color)
     inp = common.terminal_safe(" ".join((e.get("input") or "").split()))
     if len(inp) > 120:
         inp = inp[:120] + "…"
@@ -505,7 +536,28 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
                 expand: str, *, collapse: bool, session: str = "",
                 selected_event_identity: str | None = None,
                 selected_match_span: tuple[int, int] | None = None) -> list[str]:
-    """Keep decisive tool evidence visible while bounding pathological tails."""
+    """Keep decisive tool evidence visible while bounding pathological tails. Markers (an API
+    error, a compaction, a background task's notice) are lines of their own, in place, and never
+    count among the tool calls; any collapse summary follows the last tool event."""
+    position = {id(event): index for index, event in enumerate(events)}
+    tools = [event for event in events if not _is_marker(event)]
+    rows = _tool_rows(tools, color, tool_output, expand, collapse=collapse, session=session,
+                      selected_event_identity=selected_event_identity,
+                      selected_match_span=selected_match_span)
+    summary_at = max((position[id(event)] for event in tools), default=-1) + 0.5
+    placed = [(summary_at if event is None else position[id(event)], line)
+              for event, line in rows]
+    placed += [(position[id(event)], _marker_line(event, color))
+               for event in events if _is_marker(event)]
+    placed.sort(key=lambda row: row[0])
+    return [line for _at, line in placed]
+
+
+def _tool_rows(events: list[dict], color: bool, tool_output: int,
+               expand: str, *, collapse: bool, session: str,
+               selected_event_identity: str | None,
+               selected_match_span: tuple[int, int] | None) -> list[tuple[dict | None, str]]:
+    """(event, line) per rendered tool event; None marks a collapse summary."""
     selected: dict[int, _SelectedToolMatch] = {}
     for event in events:
         match = _selected_tool_match(
@@ -513,34 +565,27 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
         if match.selected:
             selected[id(event)] = match
             break
+
+    def line(event: dict) -> tuple[dict, str]:
+        return event, _tool_line(
+            event, color, tool_output,
+            match_span=(selected[id(event)].output_span if id(event) in selected else None),
+            match_preview=(selected[id(event)].preview if id(event) in selected else None))
+
     plain = [e for e in events
              if e["kind"] not in ("subagent_start", "subagent_result")
              and e.get("ok") is True and id(e) not in selected]
     if not collapse or tool_output > 0:
-        return [_tool_line(
-            e, color, tool_output,
-            match_span=(selected[id(e)].output_span if id(e) in selected else None),
-            match_preview=(selected[id(e)].preview if id(e) in selected else None))
-                for e in events]
+        return [line(e) for e in events]
     if len(plain) < _TOOL_RUN_MIN and len(events) <= _TOOL_DETAIL_MAX:
-        return [_tool_line(
-            e, color, tool_output,
-            match_span=(selected[id(e)].output_span if id(e) in selected else None),
-            match_preview=(selected[id(e)].preview if id(e) in selected else None))
-                for e in events]
+        return [line(e) for e in events]
 
     plain_ids = {id(event) for event in plain}
     details = [event for event in events if id(event) not in plain_ids]
     if (len(plain) >= _TOOL_RUN_MIN
             and len(details) + 1 <= _TOOL_DETAIL_MAX):
-        lines = [_tool_line(
-            event, color, tool_output,
-            match_span=(selected[id(event)].output_span
-                        if id(event) in selected else None),
-            match_preview=(selected[id(event)].preview
-                           if id(event) in selected else None))
-                 for event in details]
-        lines.append(_tool_run_summary(plain, color, expand))
+        lines = [line(event) for event in details]
+        lines.append((None, _tool_run_summary(plain, color, expand)))
         return lines
 
     groups: list[dict] = []
@@ -581,16 +626,12 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
     chosen.extend(_spread_tool_groups(other, slots))
     chosen.sort(key=lambda group: group["index"])
 
-    lines = [_tool_line(
-        group["event"], color, tool_output,
-        match_span=(selected[id(group["event"])].output_span
-                    if id(group["event"]) in selected else None),
-        match_preview=(selected[id(group["event"])].preview
-                       if id(group["event"]) in selected else None))
-             for group in chosen]
-    for line_index, group in enumerate(chosen):
+    lines: list[tuple[dict | None, str]] = []
+    for group in chosen:
+        event, text = line(group["event"])
         if group["count"] > 1:
-            lines[line_index] += f" [\u00d7{group['count']:,} identical]"
+            text += f" [\u00d7{group['count']:,} identical]"
+        lines.append((event, text))
 
     collapsed = len(events) - len(chosen)
     collapsed_failed = sum(
@@ -598,12 +639,12 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
         for group in groups if group["event"].get("ok") is False)
     if (len(plain) >= _TOOL_RUN_MIN
             and collapsed == len(plain) and not collapsed_failed):
-        lines.append(_tool_run_summary(plain, color, expand))
+        lines.append((None, _tool_run_summary(plain, color, expand)))
     else:
         failed = f" ({collapsed_failed:,} failed)" if collapsed_failed else ""
         body = (f"{surface.GLYPHS.tool} {collapsed:,} tool event details "
                 f"collapsed{failed} - {expand} shows each")
-        lines.append(f"  {_C['d']}{body}{_C['r']}" if color else f"  {body}")
+        lines.append((None, f"  {_C['d']}{body}{_C['r']}" if color else f"  {body}"))
     return lines
 
 

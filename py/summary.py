@@ -91,6 +91,10 @@ _SIGN_OFF_RE = re.compile(
     r"(?:like|want|prefer|need)|want me to|i can (?:also|then|take)|just (?:say|ask)|shout|"
     r"ping me)\b", re.IGNORECASE)
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=\S)")
+_ENDS_SENTENCE_RE = re.compile(r"[.!?][)\]\"'”’]*$")
+# a lowercase word, then a capitalized word opening a run of at least three words
+_CAPITAL_BREAK_RE = re.compile(r"\b[a-z][a-z'’]*\s+[A-Z][a-z][\w'’-]*(?:\s+\S+){2,}$")
+_GLUED_BULLET_CAVEAT = "the last bullet may include a later reply block the index joined to it"
 # claude TodoWrite/TodoRead, opencode todowrite/todoread, omp todo, codex update_plan
 _TODO_TOOL_RE = re.compile(r"todo|update_plan", re.IGNORECASE)
 _TODO_OPEN_STATUSES = frozenset({
@@ -110,19 +114,12 @@ _TASK_RESULT_BODY_RE = re.compile(r"<(?:output|preview)[^>]*>(.*?)(?:</(?:output
                                   re.DOTALL)
 _YIELD_SECTION_RE = re.compile(r'"type"\s*:\s*\[')
 _CONTROL_STOP_RE = re.compile(r"interrupt|abort|cancel|stop", re.IGNORECASE)
-# Claude's synthetic error rows join a turn's reply after one space: only an exact shape ending
-# the reply counts, never prose quoting one
-_API_ERROR_RE = re.compile(
-    r"(?:\A|(?<=\S) )(API Error: (?:\d{3} \{.*\}|\d{3} status code \(no body\)|"
-    r"Repeated 529 Overloaded errors|Connection error\.|Request was aborted\.|"
-    r"Request timed out\.?|Rate limit reached)|"
-    r"Claude AI usage limit reached\|\d+|"
-    r"(?:[\w-]+ )?limit reached [∙·] resets [^\n]{1,60}|"
-    r"You've hit your (?:[\w-]+ )?limit(?: [∙·] resets [^\n]{1,60})?|"
-    r"Prompt is too long(?: [∙·] [^\n]{1,60})?|Input is too long for requested model|"
-    r"Context limit reached [∙·] [^\n]{1,60}|Credit balance is too low|"
-    r"Invalid API key [∙·] [^\n]{1,60}|Request timed out|"
-    r"Unable to connect to API(?: \([A-Z_]+\))?|Server is temporarily limiting requests)\s*\Z")
+# structural control events the ingest records: moments, never tool calls or activity of their own
+_API_ERROR = "api_error"
+_TASK_NOTIFICATION = "task_notification"
+_COMPACTED = "compacted"
+_MARKERS = frozenset({_API_ERROR, _TASK_NOTIFICATION, _COMPACTED})
+_AGENT_SESSION_PREFIX = "agent-"
 # tools that stop the turn until the human answers: claude AskUserQuestion/ExitPlanMode, omp ask,
 # codex request_user_input, opencode question
 _QUESTION_TOOL_RE = re.compile(
@@ -155,6 +152,8 @@ class _Chat:
     recap_ts: list[int] = field(default_factory=list)
     # turns the caller's live window withholds; the chat's state after them is not history
     withheld: bool = False
+    # the earliest timestamp the live window withholds; later compaction markers are not history
+    withheld_from: int | None = None
     # the unindexed parent of a side chat promoted to a family root of its own
     parent: str = ""
 
@@ -197,8 +196,9 @@ def _parser() -> surface.ArgumentParser:
                "  agrep summary --project webapp --json\n"
                "\nTime is an estimate from turn timestamps (idle cap, side chats folded "
                "into their family), never elapsed span or billable time. Pending "
-               "statuses: waiting_on_user (high), open_next_steps (high), "
-               "agent_work_incomplete (medium), todo_open (medium), unknown (low).\n"
+               "statuses: waiting_on_user (high), open_next_steps (high; medium when its last "
+               "bullet may hold a later reply block), agent_work_incomplete (medium), "
+               "todo_open (medium), unknown (low).\n"
                "exit: 0 something to report, 1 proven nothing, 2 no index or unverified.")
     ap.add_argument("mode", nargs="?", choices=MODES, default=None,
                     help="pending: open items only; time: estimated active time table; "
@@ -284,8 +284,8 @@ def _load_transcripts(chats: dict[str, _Chat], excludes=None) -> bool:
                     seen[session].add(turn)
                     chat.turns.append(_Turn(turn, int(ts or 0), str(who or "user"),
                                             str(text or ""), digest))
-            # the db keeps no empty-text row, so a codex compaction survives only as the reply
-            # written after it, filed under the recap's turn; one with no reply after it is lost here
+            # the db keeps no empty-text row: a codex recap reaches it only as the reply filed
+            # under its turn, and the compaction marker carries the moment either way
             for (session, turn), ts in orphan_ts.items():
                 if turn not in seen[session]:
                     seen[session].add(turn)
@@ -328,6 +328,8 @@ def _withhold(chat: _Chat, excludes) -> None:
     if len(kept) == len(chat.turns):
         return
     chat.withheld = True
+    chat.withheld_from = min((row.ts for row in chat.turns
+                              if row.ts > 0 and excludes(chat.session, row.turn)), default=None)
     chat.turns = kept
     kept_turns = {row.turn for row in kept}
     chat.replies = {turn: text for turn, text in chat.replies.items() if turn in kept_turns}
@@ -357,6 +359,33 @@ def _load_events(chat: _Chat) -> None:
         chat.events = explore.get_events(chat.agent, chat.session)
     except Exception:  # noqa: BLE001 -- events are evidence, never a reason to fail a briefing
         chat.events = []
+    _fold_compaction_markers(chat)
+
+
+def _is_marker(event: dict, name: str | None = None) -> bool:
+    if event.get("kind") != "control":
+        return False
+    marker = str(event.get("name") or "")
+    return marker == name if name is not None else marker in _MARKERS
+
+
+def _activity(chat: _Chat) -> list[dict]:
+    """Events that are the chat's own activity; markers enter only as compaction moments."""
+    return [event for event in chat.events if not _is_marker(event)]
+
+
+def _fold_compaction_markers(chat: _Chat) -> None:
+    """A compaction marker is a compaction moment whether or not its recap row reached this
+    path; a moment a recap row already gave counts once, and one in a withheld window never."""
+    known = set(chat.recap_ts) | {row.ts for row in chat.turns if row.who == "recap"}
+    for event in chat.events:
+        ts = int(event.get("ts") or 0)
+        if ts <= 0 or ts in known or not _is_marker(event, _COMPACTED):
+            continue
+        if chat.withheld_from is not None and ts >= chat.withheld_from:
+            continue
+        known.add(ts)
+        chat.recap_ts.append(ts)
 
 
 # --- time ------------------------------------------------------------------
@@ -386,7 +415,7 @@ def _chat_intervals(chat: _Chat, cap_ms: int) -> tuple[list[tuple[int, int]], in
     intervals = [(start, min(following, start + cap_ms))
                  for start, following in zip(points, points[1:])]
     last = points[-1]
-    latest_event = max((int(event.get("ts") or 0) for event in chat.events), default=0)
+    latest_event = max((int(event.get("ts") or 0) for event in _activity(chat)), default=0)
     if latest_event > last:
         intervals.append((last, min(latest_event, last + cap_ms)))
     return _merge(intervals), unknown
@@ -475,10 +504,11 @@ def _direct_request(reply: str) -> str | None:
     return None
 
 
-def _open_section_items(reply: str) -> tuple[str, list[str], int] | None:
-    """(heading, open items, closed count) for a next-steps style section that ends the reply.
-    A turn's reply joins every assistant text block, so prose after the bullets is a later
-    block that supersedes the list; only a short sign-off may follow it."""
+def _open_section_items(reply: str) -> tuple[str, list[str], int, bool] | None:
+    """(heading, open items, closed count, glued) for a next-steps style section that ends the
+    reply. A turn's reply joins every assistant text block, so prose after the bullets is a later
+    block that supersedes the list; only a short sign-off may follow it. `glued` says the last
+    open bullet looks like it swallowed such a block."""
     lines = _prose(reply).splitlines()
     heading_at = next((i for i in range(len(lines) - 1, -1, -1) if _SECTION_RE.match(lines[i])),
                       None)
@@ -497,8 +527,8 @@ def _open_section_items(reply: str) -> tuple[str, list[str], int] | None:
             trailing.append(candidate.strip())
     if not bullets:
         return None
-    # the ingest joins blocks with one space, so a later block glued to an unpunctuated last
-    # bullet reads as part of it; a newline join would change stored replies and their handles
+    # the ingest joins blocks with one space and keeps no block boundary, so a later block glued
+    # to an unpunctuated last bullet cannot be split off; its shape can only lower the confidence
     head, *rest = _SENTENCE_END_RE.split(bullets[-1], maxsplit=1)
     bullets[-1] = head
     tail = " ".join(rest + trailing)
@@ -506,14 +536,30 @@ def _open_section_items(reply: str) -> tuple[str, list[str], int] | None:
         return None
     open_items: list[str] = []
     closed = 0
-    for item in bullets:
+    last_open = False
+    for index, item in enumerate(bullets):
         if _CHECKED_RE.match(item) or _ITEM_DONE_RE.search(item):
             closed += 1
             continue
         item = common.one_line(_MARKUP_RE.sub(" ", _UNCHECKED_RE.sub("", item).strip())).strip()
         if item and not _NO_ITEM_RE.match(item):
             open_items.append(item)
-    return heading, open_items, closed
+            last_open = index == len(bullets) - 1
+    glued = last_open and _glued_last_bullet(bullets, split=bool(rest))
+    return heading, open_items, closed, glued
+
+
+def _glued_last_bullet(bullets: list[str], *, split: bool) -> bool:
+    """Signs that the last bullet ends in a later block: it closes a sentence while the earlier
+    bullets do not, or a lowercase word runs into a capitalized sentence. A single bullet has no
+    list style to contradict and its mid-sentence capitals are usually names, so it never is."""
+    *earlier, last = [_MARKUP_RE.sub(" ", item).strip() for item in bullets]
+    if not earlier or not _ENDS_SENTENCE_RE.search(last):
+        return False
+    if _CAPITAL_BREAK_RE.search(last):
+        return True
+    # a sign-off split off at a sentence end leaves the bullet's own punctuation behind
+    return not split and not any(_ENDS_SENTENCE_RE.search(item) for item in earlier)
 
 
 def _input_capped(event: dict) -> bool:
@@ -832,12 +878,30 @@ def _unanswered_question(chat: _Chat, last: _Turn) -> dict | None:
     return None
 
 
-def _api_error(chat: _Chat, reply: str) -> str | None:
-    """The synthetic API-error or usage-limit text a Claude turn ended on, or None."""
-    if chat.agent != "claude":
+def _api_error(chat: _Chat, last: _Turn, reply: str) -> str | None:
+    """The error a Claude turn stopped on: its latest event is an `api_error` marker whose text
+    ends the reply (whitespace normalized). A capped marker's head must open the reply's tail of
+    the marker's source length. Prose that only reads like an error is never one."""
+    if chat.agent != "claude" or not reply:
         return None
-    match = _API_ERROR_RE.search(reply)
-    return common.one_line(match.group(1)) if match else None
+    later = _events_after(chat, last.ts) if last.ts > 0 else list(chat.events)
+    if not later:
+        return None
+    event = max(later, key=lambda e: (int(e.get("ts") or 0), int(e.get("i") or 0)))
+    if not _is_marker(event, _API_ERROR):
+        return None
+    text = str(event.get("input") or "")
+    if _input_capped(event):
+        chars = int(event.get("input_chars") or 0)
+        head, tail, before = text[:-1], reply[-chars:], reply[:-chars]
+        head = " ".join(head.split())
+        ends = (len(reply) >= chars and (not before or before[-1].isspace())
+                and " ".join(tail.split()).startswith(head))
+    else:
+        head = " ".join(text.split())
+        flat = " ".join(reply.split())
+        ends = flat == head or flat.endswith(" " + head)
+    return common.one_line(text) if head and ends else None
 
 
 def _classify_root(chat: _Chat) -> dict | None:
@@ -853,7 +917,7 @@ def _classify_root(chat: _Chat) -> dict | None:
                       signals=[f"{question.get('name')} awaits your answer"],
                       evidence=_question_head(question))
         return record
-    error = _api_error(chat, reply) if reply else None
+    error = _api_error(chat, last, reply)
     if error is not None:
         record.update(status="agent_work_incomplete",
                       signals=["final reply is an API error"], evidence=error)
@@ -865,12 +929,14 @@ def _classify_root(chat: _Chat) -> dict | None:
         return record
     section = _open_section_items(reply) if reply else None
     if section is not None and section[1]:
-        heading, open_items, closed = section
+        heading, open_items, closed, glued = section
         record.update(status="open_next_steps", items=open_items,
                       signals=[f"{heading} section lists {len(open_items)} open item"
                                f"{'s' if len(open_items) != 1 else ''}"
                                + (f" ({closed} done)" if closed else "")],
                       evidence=open_items[0])
+        if glued:
+            record.update(confidence="medium", caveats=[_GLUED_BULLET_CAVEAT])
         return record
     later = _events_after(chat, last.ts) if last.ts > 0 else list(chat.events)
     failed = next((event for event in reversed(later)
@@ -915,16 +981,17 @@ def _latest_ts(chat: _Chat) -> int:
     compaction. Replies carry no timestamp of their own."""
     last = chat.last_turn()
     return max(last.ts if last is not None else 0, *chat.recap_ts,
-               *(int(event.get("ts") or 0) for event in chat.events), 0)
+               *(int(event.get("ts") or 0) for event in _activity(chat)), 0)
 
 
 def _side_yielded(side: _Chat) -> bool:
     """Did the side chat end by submitting its result? pi/omp subagents hand back through a
     terminal `yield` call and often write no closing text; a `type` list marks an incremental
     section, which is not the hand-back."""
-    if not side.events:
+    activity = _activity(side)
+    if not activity:
         return False
-    event = max(side.events, key=lambda e: (int(e.get("ts") or 0), int(e.get("i") or 0)))
+    event = max(activity, key=lambda e: (int(e.get("ts") or 0), int(e.get("i") or 0)))
     if (event.get("kind") != "tool" or str(event.get("name") or "").lower() != "yield"
             or event.get("ok") is False):
         return False
@@ -991,11 +1058,42 @@ def _delivers(output: str, final: str) -> bool:
     return False
 
 
+def _marker_field(event: dict, key: str) -> str:
+    """One `key=value` field of a marker's compact input."""
+    for part in str(event.get("input") or "").split():
+        name, sep, value = part.partition("=")
+        if sep and name == key:
+            return value
+    return ""
+
+
+def _notified(root: _Chat, side: _Chat) -> bool:
+    """Did the root receive a task notification exactly linked to the side chat, at or after
+    its latest activity? Linked: the marker names the side session, or its tool-use id is the
+    root's launch call whose result names the side chat's agent id. Others prove nothing."""
+    latest = _latest_ts(side)
+    agent_id = (side.session[len(_AGENT_SESSION_PREFIX):]
+                if side.session.startswith(_AGENT_SESSION_PREFIX) else "")
+    named = (re.compile(rf"(?<![\w-]){re.escape(agent_id)}(?![\w-])") if agent_id else None)
+    launches = {str(event.get("call_id")): str(event.get("output") or "")
+                for event in root.events
+                if event.get("kind") == "subagent_start" and event.get("call_id")}
+    for event in root.events:
+        if not _is_marker(event, _TASK_NOTIFICATION) or int(event.get("ts") or 0) < latest:
+            continue
+        if str(event.get("child") or "") == side.session:
+            return True
+        launch = launches.get(_marker_field(event, "tool_use_id"))
+        if launch is not None and named is not None and named.search(launch):
+            return True
+    return False
+
+
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
-    """Did the side chat hand its result back? A terminal `yield` is the hand-back itself; else
-    the root's delegation result must carry the side chat's final reply, the only indexed proof
-    the root went on after the side chat ended. None when the capped side reply cannot be compared."""
-    if _side_yielded(side):
+    """Did the side chat hand its result back? A terminal `yield` or a linked task notification
+    is the hand-back itself; else the root's delegation result must carry the side chat's final
+    reply, the only indexed proof the root went on after it. None when a capped reply can't say."""
+    if _side_yielded(side) or _notified(root, side):
         return True
     last = side.last_turn()
     reply = side.replies.get(last.turn, "") if last is not None else ""
@@ -1033,7 +1131,7 @@ def _classify_side(chat: _Chat, root: _Chat) -> dict | None:
         record.update(status="agent_work_incomplete", signals=signals,
                       evidence=common.one_line(last.text))
         return record
-    error = _api_error(chat, chat.replies[last.turn])
+    error = _api_error(chat, last, chat.replies[last.turn])
     if error is not None:
         record.update(status="agent_work_incomplete",
                       signals=["side chat's final reply is an API error"], evidence=error)
@@ -1064,7 +1162,7 @@ def _pending_item(root: _Chat, sides: list[_Chat], handles) -> dict | None:
     item = {
         "kind": "pending",
         "status": status,
-        "confidence": STATUS_CONFIDENCE[status],
+        "confidence": record.get("confidence") or STATUS_CONFIDENCE[status],
         "project": root.label,
         "project_label": root.project,
         "agent": root.agent,
