@@ -4195,6 +4195,166 @@ fn discarded_base_whole_store_deletion_converges_despite_unrelated_churn() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// pi reads two homes: `~/.pi` holds sessions 0192/0193/0195, `~/.omp` holds 0194.
+fn pi_root_rows(data: &Path) -> (usize, usize) {
+    let deleted = ["01920000", "01930000", "01950000"]
+        .iter()
+        .map(|session| session_rows(data, session))
+        .sum();
+    (deleted, session_rows(data, "01940000"))
+}
+
+fn assert_no_deletion_residue(data: &Path) {
+    for name in [
+        ".source-health.json",
+        ".ingest_pending.bin",
+        ".source_absence_pending",
+    ] {
+        assert!(!data.join(name).exists(), "{name} outlived convergence");
+    }
+}
+
+/// Deleting ONE root of a multi-root store must converge like a whole-store deletion: the first
+/// clean absence retains, a root that returns loses nothing, and the repeated observation drops
+/// that root's rows while the sibling root keeps its own and the warm shortcut comes back.
+#[test]
+fn one_vanished_root_of_a_multi_root_store_converges_with_an_intact_cache() {
+    let home = temp_dir("pi-one-root-home");
+    copy_dir(&fixture_home("pi"), &home);
+    let pi_home = home.join(".pi");
+    let parked = home.join("pi-unmounted");
+    let data = temp_dir("pi-one-root-data");
+    ingest_into("pi", &home, &data, false);
+    let baseline = normalize(&data);
+    let (pi_rows, omp_rows) = pi_root_rows(&data);
+    assert!(
+        pi_rows > 0 && omp_rows > 0,
+        "fixture lost a root:\n{baseline}"
+    );
+
+    fs::rename(&pi_home, &parked).unwrap();
+    ingest_into("pi", &home, &data, false);
+    assert_eq!(normalize(&data), baseline, "one absence deleted a root");
+    fs::rename(&parked, &pi_home).unwrap();
+    ingest_into("pi", &home, &data, false);
+    ingest_into("pi", &home, &data, false);
+    assert_eq!(normalize(&data), baseline, "a returning root lost rows");
+
+    fs::remove_dir_all(&pi_home).unwrap();
+    ingest_into("pi", &home, &data, false);
+    assert_eq!(
+        normalize(&data),
+        baseline,
+        "first stable absence deleted a root"
+    );
+    let second = ingest_output("pi", &home, &data, false);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        pi_root_rows(&data),
+        (0, omp_rows),
+        "the repeated root absence did not converge:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_no_deletion_residue(&data);
+    let warm = ingest_output("pi", &home, &data, false);
+    assert!(String::from_utf8_lossy(&warm.stdout).contains("unchanged since last index"));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// The discarded-base lane of the same deletion, under `--agent all` with unrelated churn
+/// between runs: no last-good rows and no byte-identical preflight pair, so only the per-root
+/// repeated clean absence may retire the vanished root.
+#[test]
+fn one_vanished_root_converges_from_a_discarded_base_despite_unrelated_churn() {
+    let home = temp_dir("pi-one-root-discard-home");
+    copy_dir(&fixture_home("pi"), &home);
+    copy_dir(&fixture_home("claude"), &home);
+    let churn = claude_source(&home);
+    let data = temp_dir("pi-one-root-discard-data");
+    ingest_into("all", &home, &data, false);
+    let (pi_rows, omp_rows) = pi_root_rows(&data);
+    assert!(pi_rows > 0 && omp_rows > 0, "fixture lost a root");
+
+    fs::remove_dir_all(home.join(".pi")).unwrap();
+    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+    append_claude_churn(&churn, 4);
+    let first = ingest_output("all", &home, &data, false);
+    assert_retained_generation_refusal(&first);
+    assert_eq!(pi_root_rows(&data), (pi_rows, omp_rows));
+    assert!(data.join(".source_absence_pending").exists());
+
+    append_claude_churn(&churn, 5);
+    let second = ingest_output("all", &home, &data, false);
+    assert!(
+        second.status.success(),
+        "repeated root absence failed to converge under churn:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(pi_root_rows(&data), (0, omp_rows));
+    assert!(normalize(&data).contains("churn probe 5"));
+    assert_no_deletion_residue(&data);
+
+    append_claude_churn(&churn, 6);
+    ingest_into("all", &home, &data, false);
+    assert!(normalize(&data).contains("churn probe 6"));
+    assert_eq!(pi_root_rows(&data), (0, omp_rows));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// Per-root absence is scoped both ways: a denied root never counts as absent however often it
+/// is observed, and a denial under the sibling root cannot veto a real deletion beside it.
+#[cfg(unix)]
+#[test]
+fn root_absence_ignores_denied_roots_and_survives_a_denied_sibling() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_dir("pi-root-denial-home");
+    copy_dir(&fixture_home("pi"), &home);
+    let pi_sessions = home.join(".pi/agent/sessions");
+    let omp_sessions = home.join(".omp/agent/sessions");
+    let data = temp_dir("pi-root-denial-data");
+    ingest_into("pi", &home, &data, false);
+    let (pi_rows, omp_rows) = pi_root_rows(&data);
+
+    fs::set_permissions(&pi_sessions, fs::Permissions::from_mode(0o000)).unwrap();
+    for _ in 0..3 {
+        let _ = ingest_output("pi", &home, &data, false);
+    }
+    fs::set_permissions(&pi_sessions, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        pi_root_rows(&data),
+        (pi_rows, omp_rows),
+        "a denied root was deleted"
+    );
+    ingest_into("pi", &home, &data, false);
+
+    fs::remove_dir_all(home.join(".pi")).unwrap();
+    fs::set_permissions(&omp_sessions, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut last = None;
+    for _ in 0..3 {
+        last = Some(ingest_output("pi", &home, &data, false));
+    }
+    fs::set_permissions(&omp_sessions, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        pi_root_rows(&data),
+        (0, omp_rows),
+        "a sibling denial vetoed the vanished root:\n{}",
+        String::from_utf8_lossy(&last.unwrap().stderr)
+    );
+    ingest_into("pi", &home, &data, false);
+    assert_eq!(pi_root_rows(&data), (0, omp_rows));
+    assert_no_deletion_residue(&data);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 /// The row-loss guard outranks the discard: with no cache to serve a denied project from, the
 /// pass may not publish the reduced generation, and granting the permission converges it.
 #[cfg(unix)]

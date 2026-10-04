@@ -4139,7 +4139,16 @@ fn harness_policy() -> anyhow::Result<(Vec<u8>, Vec<String>)> {
     Ok((snapshot, prefixes))
 }
 
-fn read_source_absence(path: &Path) -> anyhow::Result<Option<HashSet<String>>> {
+/// Clean-absence observations one preflight recorded: whole agents, and single store roots of an
+/// agent whose other roots still hold sources. Root lines are `agent<TAB>hex(path)`; a build
+/// that predates them reads each as an agent name no adapter has, so it simply ignores them.
+#[derive(Default)]
+struct SourceAbsence {
+    agents: HashSet<String>,
+    roots: HashSet<(String, PathBuf)>,
+}
+
+fn read_source_absence(path: &Path) -> anyhow::Result<Option<SourceAbsence>> {
     let Some(bytes) = read_optional_bytes(path, SOURCE_ABSENCE_MAX_BYTES)? else {
         return Ok(None);
     };
@@ -4149,23 +4158,86 @@ fn read_source_absence(path: &Path) -> anyhow::Result<Option<HashSet<String>>> {
     let Some(rows) = body.strip_prefix(SOURCE_ABSENCE_HEADER) else {
         return Ok(None);
     };
-    Ok(Some(
-        rows.lines()
-            .filter(|agent| !agent.is_empty())
-            .map(str::to_string)
-            .collect(),
-    ))
+    let mut absence = SourceAbsence::default();
+    for row in rows.lines().filter(|row| !row.is_empty()) {
+        match row.split_once('\t') {
+            // An undecodable root is no observation: its rows wait for two fresh ones.
+            Some((agent, hex)) => {
+                if let Some(root) = absence_path_from_hex(hex) {
+                    absence.roots.insert((agent.to_string(), root));
+                }
+            }
+            None => {
+                absence.agents.insert(row.to_string());
+            }
+        }
+    }
+    Ok(Some(absence))
 }
 
-fn write_source_absence(path: &Path, agents: &HashSet<String>) -> anyhow::Result<()> {
-    let mut agents: Vec<_> = agents.iter().collect();
+fn write_source_absence(path: &Path, absence: &SourceAbsence) -> anyhow::Result<()> {
+    let mut agents: Vec<_> = absence.agents.iter().collect();
     agents.sort_unstable();
+    let mut roots: Vec<_> = absence
+        .roots
+        .iter()
+        .map(|(agent, root)| format!("{agent}\t{}", absence_path_hex(root)))
+        .collect();
+    roots.sort_unstable();
     let mut body = SOURCE_ABSENCE_HEADER.as_bytes().to_vec();
-    for agent in agents {
-        body.extend_from_slice(agent.as_bytes());
+    for row in agents.into_iter().chain(roots.iter()) {
+        body.extend_from_slice(row.as_bytes());
         body.push(b'\n');
     }
     cache::write_bytes_atomic(path, &body)
+}
+
+#[cfg(not(windows))]
+fn absence_path_hex(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    let mut hex = String::new();
+    for byte in path.as_os_str().as_bytes() {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+#[cfg(windows)]
+fn absence_path_hex(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::windows::ffi::OsStrExt;
+    let mut hex = String::new();
+    for unit in path.as_os_str().encode_wide() {
+        write!(hex, "{unit:04x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+#[cfg(not(windows))]
+fn absence_path_from_hex(hex: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+}
+
+#[cfg(windows)]
+fn absence_path_from_hex(hex: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    if hex.is_empty() || !hex.len().is_multiple_of(4) || !hex.is_ascii() {
+        return None;
+    }
+    let units = (0..hex.len())
+        .step_by(4)
+        .map(|at| u16::from_str_radix(&hex[at..at + 4], 16).ok())
+        .collect::<Option<Vec<u16>>>()?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
 }
 
 /// Re-read the source snapshot after ingest and return it only when it still matches the
@@ -4624,6 +4696,22 @@ struct SourcePublishOutcome {
     pending_promoted: bool,
 }
 
+/// A racy stamp licenses no source-identical shortcut: the parse cache re-verifies that file
+/// next run, so the published generation must not let that run's preflight match it.
+fn withhold_racy_stamps(
+    snapshots: Option<(Vec<u8>, Vec<u8>)>,
+    racy: &HashSet<PathBuf>,
+) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    snapshots
+        .map(|(source, policy)| {
+            Ok((
+                ingest::registry::withhold_racy_stamps(&source, racy)?,
+                policy,
+            ))
+        })
+        .transpose()
+}
+
 /// Commit the validated source generation last. The snapshot is the permission slip for the
 /// next all-hit shortcut, so it may never precede messages/replies/sessions/events publication.
 /// A failed validation deliberately preserves both the last published snapshot and the pending
@@ -5029,6 +5117,9 @@ fn index_cmd_locked(
         // streamed rows must classify exactly as this run's normalize pass will
         agrep_core::emit::set_harness_prefixes(&harness_prefixes);
     }
+    // Every stat this run takes - preflight and parse cache - happens after this instant, so a
+    // stamp not safely older than it may be shared by a later same-size rewrite (racy-clean).
+    let scan_start = std::time::SystemTime::now();
     let (source_before, source_preflight_error) = if emit_rows {
         (None, None)
     } else {
@@ -5166,6 +5257,10 @@ fn index_cmd_locked(
     let source_before_view = source_before
         .as_deref()
         .and_then(ingest::registry::source_snapshot_view);
+    let racy_sources = source_before_view
+        .as_ref()
+        .map(|snapshot| snapshot.racy_paths(scan_start))
+        .unwrap_or_default();
     // A byte-identical pending/preflight pair is the equivalence publication already trusts:
     // an identical incomplete pair carries the same issue records, so the unreadable subset
     // is a stable disclosed fact and completeness is not required of the second observation.
@@ -5174,33 +5269,43 @@ fn index_cmd_locked(
     // A token store enumerating cleanly to zero conversations is the same deletion-shaped
     // observation as clean ENOENT: present, readable, validly empty. Two agreeing passes
     // confirm either; torn/garbage reads record issues and never enter these sets.
-    let deletion_observed_agents = |snapshot: &ingest::registry::SourceSnapshotView| {
+    let deletion_observed = |snapshot: &ingest::registry::SourceSnapshotView| {
         let mut agents = snapshot.cleanly_absent_agents();
         agents.extend(snapshot.cleanly_empty_token_store_agents());
-        agents
+        SourceAbsence {
+            agents,
+            roots: snapshot.cleanly_absent_roots(),
+        }
     };
-    let current_absent_agents = source_before_view
+    let current_absence = source_before_view
         .as_ref()
-        .map(deletion_observed_agents)
+        .map(deletion_observed)
         .unwrap_or_default();
-    let previous_absent_agents = if emit_rows {
+    let previous_absence = if emit_rows {
         None
     } else {
         read_source_absence(&absence_path)?.or_else(|| {
             pending_source
                 .as_deref()
                 .and_then(ingest::registry::source_snapshot_view)
-                .map(|snapshot| deletion_observed_agents(&snapshot))
+                .map(|snapshot| deletion_observed(&snapshot))
         })
-    };
-    // Adapter-local observations confirm ENOENT even while another adapter stays unreadable.
-    let repeated_absent_agents: HashSet<String> = previous_absent_agents
-        .unwrap_or_default()
+    }
+    .unwrap_or_default();
+    // Adapter-local observations confirm ENOENT even while another adapter stays unreadable,
+    // and root-local ones while the same agent's other roots keep their sources.
+    let repeated_absent_agents: HashSet<String> = previous_absence
+        .agents
         .into_iter()
-        .filter(|agent| current_absent_agents.contains(agent))
+        .filter(|agent| current_absence.agents.contains(agent))
+        .collect();
+    let repeated_absent_roots: HashSet<(String, PathBuf)> = previous_absence
+        .roots
+        .into_iter()
+        .filter(|root| current_absence.roots.contains(root))
         .collect();
     if !emit_rows {
-        write_source_absence(&absence_path, &current_absent_agents)?;
+        write_source_absence(&absence_path, &current_absence)?;
     }
     if repair_events {
         agrep_core::emit::human_line(format_args!(
@@ -5333,6 +5438,10 @@ fn index_cmd_locked(
     if (retry_sources || full) && !repeated_absent_agents.is_empty() {
         pcache.allow_repeated_missing_roots(repeated_absent_agents);
     }
+    if (retry_sources || full) && !repeated_absent_roots.is_empty() {
+        pcache.allow_repeated_missing_store_roots(repeated_absent_roots);
+    }
+    pcache.set_scan_start(scan_start);
     // Event payloads are absent from the parse cache, so repair force-parses every survivor;
     // exact preflight coverage and adapter reads prove individual tombstones.
     if repair_events {
@@ -5594,7 +5703,12 @@ fn index_cmd_locked(
         )?;
         lap!("write-events");
         let source_published = source_after.is_some();
-        publish_source_snapshot(source_after, &source_path, &policy_path, &pending_path)?;
+        publish_source_snapshot(
+            withhold_racy_stamps(source_after, &racy_sources)?,
+            &source_path,
+            &policy_path,
+            &pending_path,
+        )?;
         if source_published {
             cache::remove_if_exists(&absence_path)?;
         }
@@ -5735,7 +5849,12 @@ fn index_cmd_locked(
     )?;
     lap!("publish-markers");
     let source_published = source_after.is_some();
-    publish_source_snapshot(source_after, &source_path, &policy_path, &pending_path)?;
+    publish_source_snapshot(
+        withhold_racy_stamps(source_after, &racy_sources)?,
+        &source_path,
+        &policy_path,
+        &pending_path,
+    )?;
     if source_published {
         cache::remove_if_exists(&absence_path)?;
     }
@@ -7369,6 +7488,43 @@ mod tests {
         let error = read_optional_bytes(&path, 1024).unwrap_err().to_string();
         assert!(error.contains(&path.display().to_string()));
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// The marker an older build wrote (agent lines only) keeps its meaning, root lines
+    /// round-trip any path, and a corrupt root line is no observation rather than a wildcard.
+    #[test]
+    fn source_absence_marker_reads_agent_lines_and_round_trips_roots() {
+        let dir = std::env::temp_dir().join(format!(
+            "agrep_source_absence_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(super::SOURCE_ABSENCE_FILE);
+        let legacy = format!("{}cursor\nopencode\n", super::SOURCE_ABSENCE_HEADER);
+        std::fs::write(&marker, legacy).unwrap();
+        let read = super::read_source_absence(&marker).unwrap().unwrap();
+        assert_eq!(read.agents, HashSet::from(["cursor".into(), "opencode".into()]));
+        assert!(read.roots.is_empty());
+
+        let root = dir.join("home").join(".pi agent").join("sessions\tx");
+        let written = super::SourceAbsence {
+            agents: HashSet::from(["kimi".to_string()]),
+            roots: HashSet::from([("pi".to_string(), root)]),
+        };
+        super::write_source_absence(&marker, &written).unwrap();
+        let read = super::read_source_absence(&marker).unwrap().unwrap();
+        assert_eq!(read.agents, written.agents);
+        assert_eq!(read.roots, written.roots);
+
+        let corrupt = format!("{}pi\tzz\npi\t\n", super::SOURCE_ABSENCE_HEADER);
+        std::fs::write(&marker, corrupt).unwrap();
+        let read = super::read_source_absence(&marker).unwrap().unwrap();
+        assert!(read.agents.is_empty() && read.roots.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]

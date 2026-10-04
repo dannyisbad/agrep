@@ -529,6 +529,11 @@ pub struct IngestCache {
     /// Agents whose clean ENOENT absence two complete preflights observed; whole-root loss
     /// needs the same absent preflight on two runs, not merely one stable walk.
     repeated_absent_agents: HashSet<String>,
+    /// The same two-observation witness for single store roots of a still-present agent.
+    repeated_absent_roots: Vec<(String, PathBuf)>,
+    /// Epoch nanoseconds before this run's first source stat; stamps not safely older are
+    /// recorded racy. `None` keeps every stamp trusted for callers that never set it.
+    racy_scan_start_ns: Option<i64>,
     /// Recovery started from no last-good rows because the on-disk base was discarded. Absence
     /// of prior material is then a missing witness, never proof, so whole-store deletion still
     /// needs the repeated observation a cached generation would otherwise have supplied.
@@ -658,6 +663,90 @@ fn source_relative(path: &Path, root: &Path) -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn source_relative(path: &Path, root: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+pub(crate) fn epoch_ns(time: std::time::SystemTime) -> Option<i64> {
+    let since = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_nanos()).ok()
+}
+
+/// Racy: a same-size rewrite could still receive this stamp, because it is not safely older
+/// than the scan start. Far-future stamps are not: a later write stamps the present, and
+/// re-verifying a future-dated file would repeat every run. The slack absorbs NFS clock skew.
+#[cfg(not(windows))]
+pub(crate) fn racy_stamp(mtime_ns: i64, scan_start_ns: i64, now_ns: i64) -> bool {
+    const FUTURE_SLACK_NS: i64 = 2_000_000_000;
+    let margin = racy_margin_ns(mtime_ns);
+    mtime_ns > scan_start_ns.saturating_sub(margin)
+        && mtime_ns <= now_ns.saturating_add(margin.max(FUTURE_SLACK_NS))
+}
+
+/// Windows identity is the change journal's USN or a content digest, never a timestamp.
+#[cfg(windows)]
+pub(crate) fn racy_stamp(_mtime_ns: i64, _scan_start_ns: i64, _now_ns: i64) -> bool {
+    false
+}
+
+/// A later write can share a stamp only within one timestamp granule plus however far the
+/// stamping clock lags the scan clock. A stamp ending in k zeros may come from a filesystem
+/// that coarse (10 ms exFAT, 1 s HFS+/ext3); whole seconds may be FAT's 2 s granules.
+#[cfg(not(windows))]
+fn racy_margin_ns(mtime_ns: i64) -> i64 {
+    const SECOND: i64 = 1_000_000_000;
+    let mut granule = 1_i64;
+    while granule < SECOND && mtime_ns % (granule * 10) == 0 {
+        granule *= 10;
+    }
+    if granule == SECOND {
+        granule = 2 * SECOND;
+    }
+    granule.saturating_add(timestamp_clock_lag_ns())
+}
+
+/// Linux stamps files from the coarse clock, which trails CLOCK_REALTIME by under one tick
+/// and never leads it: a write after the scan start stamps later than `start - tick`.
+#[cfg(target_os = "linux")]
+fn timestamp_clock_lag_ns() -> i64 {
+    static TICK: std::sync::LazyLock<i64> =
+        std::sync::LazyLock::new(|| coarse_clock_tick_ns().unwrap_or(10_000_000));
+    *TICK
+}
+
+#[cfg(target_os = "linux")]
+fn coarse_clock_tick_ns() -> Option<i64> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: std::ffi::c_long,
+        tv_nsec: std::ffi::c_long,
+    }
+    unsafe extern "C" {
+        fn clock_getres(clock: std::ffi::c_int, resolution: *mut Timespec) -> std::ffi::c_int;
+    }
+    const CLOCK_REALTIME_COARSE: std::ffi::c_int = 5;
+    let mut resolution = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_getres writes one timespec through a valid, exclusively borrowed pointer.
+    if unsafe { clock_getres(CLOCK_REALTIME_COARSE, &mut resolution) } != 0 {
+        return None;
+    }
+    let tick = i64::from(resolution.tv_sec)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(resolution.tv_nsec));
+    (1..=1_000_000_000).contains(&tick).then_some(tick)
+}
+
+/// Apple filesystems stamp from the precise clock: a later write always gets a later stamp.
+#[cfg(target_vendor = "apple")]
+fn timestamp_clock_lag_ns() -> i64 {
+    0
+}
+
+/// Other kernels: assume a coarse clock with a tick up to 20 ms (HZ=50).
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+fn timestamp_clock_lag_ns() -> i64 {
+    20_000_000
 }
 
 fn normalized_source_entries(entries: HashMap<String, Entry>) -> HashMap<String, Entry> {
@@ -2174,6 +2263,8 @@ impl IngestCache {
             repair_mode: false,
             allow_stable_deletions: false,
             repeated_absent_agents: HashSet::new(),
+            repeated_absent_roots: Vec::new(),
+            racy_scan_start_ns: None,
             discarded_base: false,
             discarded_base_confirmed: false,
             #[cfg(test)]
@@ -2450,6 +2541,28 @@ impl IngestCache {
     pub fn allow_repeated_missing_roots(&mut self, agents: HashSet<String>) {
         debug_assert!(self.repair_mode || !self.warm);
         self.repeated_absent_agents = agents;
+    }
+
+    /// The per-root form of [`Self::allow_repeated_missing_roots`]: `(agent, store root)` pairs
+    /// two consecutive complete, issue-free preflights saw empty. Only that root's rows converge;
+    /// the agent's other roots keep the ordinary guards.
+    pub fn allow_repeated_missing_store_roots(&mut self, roots: HashSet<(String, PathBuf)>) {
+        debug_assert!(self.repair_mode || !self.warm);
+        self.repeated_absent_roots = roots.into_iter().collect();
+    }
+
+    fn repeated_absence_covers(&self, agent: &str, root: &Path) -> bool {
+        self.repeated_absent_agents.contains(agent)
+            || self
+                .repeated_absent_roots
+                .iter()
+                .any(|(owner, absent)| owner == agent && source_path_eq(absent, root))
+    }
+
+    /// Name the instant before this run's first source stat (the preflight, when one feeds the
+    /// cache). Entries whose stamp is not safely older are recorded racy and reparse next run.
+    pub fn set_scan_start(&mut self, start: std::time::SystemTime) {
+        self.racy_scan_start_ns = epoch_ns(start);
     }
 
     /// Whether recovery began with no last-good rows because the on-disk base was discarded.
@@ -3525,6 +3638,108 @@ mod tests {
             file_identity: Some(file_identity),
             content_hashed: false,
         }
+    }
+
+    /// One indexing run against a cache file, with the preflight stamp injected so a test can
+    /// reproduce what Linux's coarse clock does: a same-size rewrite that keeps the stat key.
+    #[cfg(not(windows))]
+    fn racy_run(
+        cache_path: &std::path::Path,
+        source: &std::path::Path,
+        stamp: &crate::ingest::registry::SourceStatStamp,
+        scan_start: std::time::SystemTime,
+    ) -> (Vec<String>, usize) {
+        let root = source.parent().unwrap();
+        let mut cache = IngestCache::load(cache_path);
+        cache
+            .source_stamps
+            .insert(source.to_path_buf(), stamp.clone());
+        cache.set_scan_start(scan_start);
+        let pass = collect_cached(&mut cache, root, &[source.to_path_buf()], |path| {
+            let text = fs::read_to_string(path).unwrap();
+            (vec![test_message(&text)], Vec::<Event>::new())
+        });
+        cache.save(cache_path).unwrap();
+        let texts = pass.messages.iter().map(|m| m.text.to_string()).collect();
+        (texts, pass.parsed)
+    }
+
+    #[cfg(not(windows))]
+    fn racy_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-racy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("store")).unwrap();
+        let source = root.join("store").join("session.jsonl");
+        fs::write(&source, b"first!").unwrap();
+        (root.clone(), root.join("cache.bin"), source)
+    }
+
+    /// A rewrite in the very tick the scan began keeps size, mtime and ctime. The racy entry is
+    /// re-verified on the next run even though its stat key matches, then trusted while quiet.
+    #[cfg(not(windows))]
+    #[test]
+    fn racy_entry_catches_a_same_tick_rewrite_then_is_trusted() {
+        let (root, cache_path, source) = racy_fixture("same-tick");
+        let stamp = source_stamp(&source);
+        let stamped = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos(u64::try_from(stamp.mtime_ns).unwrap());
+        let later = |secs| stamped + std::time::Duration::from_secs(secs);
+
+        assert_eq!(
+            racy_run(&cache_path, &source, &stamp, stamped),
+            (vec!["first!".to_string()], 1)
+        );
+        fs::write(&source, b"second").unwrap();
+        assert_eq!(
+            racy_run(&cache_path, &source, &stamp, later(10)),
+            (vec!["second".to_string()], 1),
+            "a same-tick same-size rewrite was served from the cache"
+        );
+        assert_eq!(
+            racy_run(&cache_path, &source, &stamp, later(20)),
+            (vec!["second".to_string()], 0),
+            "a quiet, re-verified file was not trusted"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Racy protection costs nothing for a file whose stamp predates the scan: it is trusted
+    /// on the very next run, so a quiescent store never re-verifies anything.
+    #[cfg(not(windows))]
+    #[test]
+    fn settled_stamp_is_trusted_on_the_next_run() {
+        let (root, cache_path, source) = racy_fixture("settled");
+        let stamp = source_stamp(&source);
+        let after = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos(u64::try_from(stamp.mtime_ns).unwrap())
+            + std::time::Duration::from_secs(10);
+        assert_eq!(racy_run(&cache_path, &source, &stamp, after).1, 1);
+        assert_eq!(racy_run(&cache_path, &source, &stamp, after).1, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn racy_window_tracks_timestamp_granularity_and_ignores_far_future_stamps() {
+        let second = 1_000_000_000_i64;
+        let start = 1_800_000_000 * second + 123_456_789;
+        let now = start + second;
+        assert!(!super::racy_stamp(start - 60 * second, start, now));
+        assert!(super::racy_stamp(start, start, now));
+        assert!(super::racy_stamp(start + 1_000, start, now));
+        // Whole seconds may be FAT's 2 s granules: a later write can share them for two seconds.
+        assert!(super::racy_stamp(1_800_000_000 * second, start, now));
+        assert!(super::racy_stamp(1_799_999_999 * second, start, now));
+        assert!(!super::racy_stamp(1_799_999_990 * second, start, now));
+        // A fine stamp a whole second before the scan is settled on every clock in use.
+        assert!(!super::racy_stamp(start - second, start, now));
+        assert!(!super::racy_stamp(now + 3_600 * second, start, now));
     }
 
     #[test]
@@ -7638,7 +7853,7 @@ where
         && (cached_material_root || expected_missing_root)
         && (!root.exists()
             || (!cache.stable_deletions_provable() && (cache.warm || expected_missing_root)))
-        && !cache.repeated_absent_agents.contains(agent)
+        && !cache.repeated_absence_covers(agent, root)
     {
         cache.mark_guarded_stale();
         cache.record_source_read_issue(
@@ -8010,6 +8225,10 @@ where
         crate::emit::rows_only(&chunk);
         messages.append(&mut chunk);
     }
+    // A racy entry keeps no identity, so its unchanged stat key still misses and reparses once.
+    let now_ns = epoch_ns(std::time::SystemTime::now()).unwrap_or(i64::MAX);
+    let racy_start = cache.racy_scan_start_ns;
+    let racy = |mtime: i64| racy_start.is_some_and(|start| racy_stamp(mtime, start, now_ns));
     // fresh: changed files (messages + events) + sibling files (messages cached-equal + events)
     for (key, path, mt, sz, identity, m, e, healthy) in miss_parsed {
         // A failed, skipped or partial reparse retains the prior entry instead of publishing
@@ -8102,7 +8321,7 @@ where
             Entry {
                 mtime: mt,
                 size: sz,
-                identity: Some(identity),
+                identity: (!racy(mt)).then_some(identity),
                 msgs: m.iter().map(CMsg::from).collect(),
                 event_keys,
                 legacy_had_events: false,
@@ -8204,10 +8423,10 @@ where
                     .iter()
                     .any(|listed| source_path_eq(listed, path))
         });
-    // Two agreeing clean-absence preflights are the repeated witness a discarded base lacks;
-    // unrelated churn in other stores must not veto them.
+    // Two agreeing clean-absence preflights - of the agent or of this root - are the repeated
+    // witness a discarded base lacks; unrelated churn in other stores must not veto them.
     let repeated_whole_store_absence =
-        file_count == 0 && cache.repeated_absent_agents.contains(agent);
+        file_count == 0 && cache.repeated_absence_covers(agent, root);
     if cache.repair_mode
         && (missing_material_source || missing_expected_source)
         && !cache.stable_deletions_provable()

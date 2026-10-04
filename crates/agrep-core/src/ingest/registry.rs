@@ -1785,6 +1785,75 @@ impl SourceSnapshotView {
             .collect()
     }
 
+    /// Store roots of Stat adapters under which the walk found no source: the per-root form of
+    /// [`Self::cleanly_absent_agents`]. An issue blocks every root it may scope - its own, any
+    /// root beneath it, or all of them when it lies outside each - so a sibling's denial cannot.
+    pub fn cleanly_absent_roots(&self) -> HashSet<(String, PathBuf)> {
+        if self.snapshot.snapshot_version != SOURCE_SNAPSHOT_VERSION {
+            return HashSet::new();
+        }
+        let mut absent = HashSet::new();
+        for adapter in &self.snapshot.adapters {
+            let Some(owner) = ADAPTERS.iter().find(|candidate| {
+                candidate.name() == adapter.agent && candidate.fingerprint() == Fingerprint::Stat
+            }) else {
+                continue;
+            };
+            if !adapter.complete && adapter.issues.is_empty() {
+                continue;
+            }
+            let roots = owner.store_roots();
+            let issue_paths: Vec<PathBuf> = adapter
+                .issues
+                .iter()
+                .map(|issue| PathBuf::from(issue.path()))
+                .collect();
+            let within = |path: &Path, root: &Path| relative_path(path, root).is_some();
+            for root in &roots {
+                let blocked = issue_paths.iter().any(|issue| {
+                    within(issue, root)
+                        || within(root, issue)
+                        || !roots.iter().any(|other| within(issue, other))
+                });
+                if !blocked
+                    && !adapter
+                        .files
+                        .iter()
+                        .any(|source| within(&source.path, root))
+                {
+                    absent.insert((adapter.agent.clone(), root.clone()));
+                }
+            }
+        }
+        absent
+    }
+
+    /// Stat-keyed files whose stamp a same-size rewrite could still reproduce after a preflight
+    /// that began at `scan_start`. Token and Always stores carry content identity instead.
+    pub fn racy_paths(&self, scan_start: std::time::SystemTime) -> HashSet<PathBuf> {
+        let Some(start_ns) = crate::ingest_cache::epoch_ns(scan_start) else {
+            return HashSet::new();
+        };
+        let now_ns =
+            crate::ingest_cache::epoch_ns(std::time::SystemTime::now()).unwrap_or(i64::MAX);
+        self.snapshot
+            .adapters
+            .iter()
+            .filter(|adapter| {
+                ADAPTERS.iter().any(|candidate| {
+                    candidate.name() == adapter.agent
+                        && candidate.fingerprint() == Fingerprint::Stat
+                })
+            })
+            .flat_map(|adapter| &adapter.files)
+            .filter(|source| {
+                source.content_hash.is_none()
+                    && crate::ingest_cache::racy_stamp(source_mtime_ns(source), start_ns, now_ns)
+            })
+            .map(|source| source.path.clone())
+            .collect()
+    }
+
     pub(crate) fn expectations(&self) -> (HashSet<String>, HashSet<PathBuf>) {
         let mut agents = HashSet::new();
         let mut paths = HashSet::new();
@@ -1828,14 +1897,10 @@ impl SourceSnapshotView {
             .iter()
             .flat_map(|adapter| &adapter.files)
             .map(|source| {
-                let mtime_ns = i64::try_from(
-                    u128::from(source.mtime_secs) * 1_000_000_000 + u128::from(source.mtime_nanos),
-                )
-                .unwrap_or(i64::MAX);
                 (
                     source.path.clone(),
                     SourceStatStamp {
-                        mtime_ns,
+                        mtime_ns: source_mtime_ns(source),
                         len: source.len,
                         change_token: source.change_token.clone(),
                         #[cfg(windows)]
@@ -1848,10 +1913,35 @@ impl SourceSnapshotView {
     }
 }
 
+fn source_mtime_ns(source: &SourceFile) -> i64 {
+    i64::try_from(u128::from(source.mtime_secs) * 1_000_000_000 + u128::from(source.mtime_nanos))
+        .unwrap_or(i64::MAX)
+}
+
 pub fn source_snapshot_view(bytes: &[u8]) -> Option<SourceSnapshotView> {
     bincode::deserialize::<SourceSnapshot>(bytes)
         .ok()
         .map(|snapshot| SourceSnapshotView { snapshot })
+}
+
+/// Publication form of a preflight whose `racy` stamps are not yet trustworthy: each gets an
+/// impossible sub-second value, so no later preflight matches it byte-for-byte and skips the
+/// re-verification. Paths, issues and completeness - everything guards read - are unchanged.
+pub fn withhold_racy_stamps(bytes: &[u8], racy: &HashSet<PathBuf>) -> anyhow::Result<Vec<u8>> {
+    if racy.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    let mut snapshot: SourceSnapshot = bincode::deserialize(bytes)
+        .context("decode the source snapshot to withhold racy stamps")?;
+    for source in snapshot
+        .adapters
+        .iter_mut()
+        .flat_map(|adapter| adapter.files.iter_mut())
+        .filter(|source| racy.contains(&source.path))
+    {
+        source.mtime_nanos = u32::MAX;
+    }
+    Ok(bincode::serialize(&snapshot)?)
 }
 
 /// A collision-resistant identifier for the exact opaque snapshot bytes.
