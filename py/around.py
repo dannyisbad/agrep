@@ -361,6 +361,25 @@ def _is_marker(event: dict) -> bool:
     return event.get("kind") == "control" and event.get("name") in _MARKERS
 
 
+# what a disclosure calls each marker kind, in the order it lists them
+_MARKER_NOUNS = (("api_error", "API error"), ("compacted", "compaction"),
+                 ("task_notification", "task notification"))
+
+
+def _marker_counts(events: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        if _is_marker(event):
+            counts[event["name"]] = counts.get(event["name"], 0) + 1
+    return counts
+
+
+def _marker_phrases(counts: dict[str, int]) -> list[str]:
+    """'2 compactions', '1 API error': marker counts named apart from tool calls."""
+    return [f"{counts[name]:,} {noun}{'' if counts[name] == 1 else 's'}"
+            for name, noun in _MARKER_NOUNS if counts.get(name)]
+
+
 def _marker_line(e: dict, color: bool) -> str:
     name = e.get("name")
     raw = " ".join(str(e.get("input") or "").split())
@@ -660,10 +679,15 @@ def _around_scope(
         message_cap_state: str,
         render_truncated_rows: int,
         prose_available: dict[str, int],
-        prose_shown: dict[str, int], events_shown: int,
+        prose_shown: dict[str, int], shown_events: list[dict],
 ) -> dict:
-    """Stable, answer-free disclosure for the rows the renderer did and did not show."""
-    event_total = len(window.get("events") or ())
+    """Stable, answer-free disclosure for the rows the renderer did and did not show. Markers
+    count apart from the tool calls they sit among."""
+    events = list(window.get("events") or ())
+    markers_available = _marker_counts(events)
+    markers_shown = _marker_counts(shown_events)
+    tools_available = len(events) - sum(markers_available.values())
+    tools_shown = len(shown_events) - sum(markers_shown.values())
     return {
         "policy": policy,
         "session": str(window.get("session") or ""),
@@ -682,9 +706,15 @@ def _around_scope(
         "counts_state": "exact",
         "tools": {
             "mode": tool_mode,
-            "available": event_total,
-            "shown": int(events_shown),
-            "hidden": max(0, event_total - int(events_shown)),
+            "available": tools_available,
+            "shown": tools_shown,
+            "hidden": max(0, tools_available - tools_shown),
+        },
+        "markers": {
+            "available_by_name": markers_available,
+            "shown_by_name": markers_shown,
+            "hidden": max(
+                0, sum(markers_available.values()) - sum(markers_shown.values())),
         },
         "prose": {
             "available_by_role": prose_available,
@@ -1082,7 +1112,7 @@ def _main(argv: list[str] | None = None) -> int:
                 prose_shown[who] = prose_shown.get(who, 0) + 1
                 if cap and len(text) > cap:
                     render_truncated_rows += 1
-    events_shown = sum(len(events) for events in events_by_turn.values())
+    shown_events = [event for events in events_by_turn.values() for event in events]
     selected_record_role = (
         "none" if not is_handle else
         "tool" if handle_event_identity is not None else
@@ -1121,7 +1151,7 @@ def _main(argv: list[str] | None = None) -> int:
         render_truncated_rows=render_truncated_rows,
         prose_available=prose_available,
         prose_shown=prose_shown,
-        events_shown=events_shown,
+        shown_events=shown_events,
     )
 
     if args.json:
@@ -1185,22 +1215,29 @@ def _main(argv: list[str] | None = None) -> int:
 
     hidden_tools = int(scope["tools"]["hidden"])
     hidden_prose = int(scope["prose"]["hidden"])
+    markers = scope["markers"]
+    hidden_markers = _marker_phrases({
+        name: count - int(markers["shown_by_name"].get(name, 0))
+        for name, count in markers["available_by_name"].items()})
+    hidden = bool(hidden_tools or hidden_prose or hidden_markers)
     parts = []
     if session_role == "delegated":
         parts.append("subagent conversation")
     elif session_role == "unknown":
         parts.append("conversation role unverified")
-    if hidden_tools or hidden_prose or parts:
+    if hidden or parts:
         if hidden_tools:
             parts.append(f"{hidden_tools:,} tool events omitted")
+        if hidden_markers:
+            parts.append(f"{', '.join(hidden_markers)} omitted")
         if hidden_prose:
             parts.append(f"{hidden_prose:,} messages omitted")
         span_args = ("--whole",) if whole else ("-C", args.context)
-        if args.who is not None and (hidden_tools or hidden_prose):
+        if args.who is not None and hidden:
             parts.append(console.shell_command(
                 "agrep", "around", target, int(w["center"]), *span_args,
                 fallback="agrep around <session> <turn> -C <N>"))
-        elif hidden_tools or hidden_prose:
+        elif hidden:
             parts.append(console.shell_command(
                 "agrep", "around", target, int(w["center"]), *span_args,
                 "--full", fallback="agrep around <session> <turn> -C <N> --full"))

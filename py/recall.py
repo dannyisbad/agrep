@@ -41,8 +41,11 @@ import indexd_runtime
 import search
 import surface_policy as surface
 from around import (
+    _MARKER_NOUNS,
     _cap,
     _expand_command,
+    _marker_counts,
+    _marker_phrases,
     _reply_loss_marker,
     _resolve_handle_claims,
     _selected_tool_match,
@@ -296,9 +299,11 @@ def _fit_json_payload(
 
 
 # every in-payload truncation marker recall/around emit: message caps, omitted
-# tool calls, over-budget hit tails. The final cap must never slice one open.
+# tool calls and markers, over-budget hit tails. The final cap must never slice one open.
+_MARKER_NOUNS_RE = "|".join(re.escape(noun) + "s?" for _name, noun in _MARKER_NOUNS)
 _TRUNC_MARKER_RE = re.compile(
-    r"\[(?:\+[\d,]+ (?:chars|tool calls|hit\(s\) over budget) - [^\]]*"
+    rf"\[(?:\+[\d,]+ (?:chars|hit\(s\) over budget|(?:tool calls|{_MARKER_NOUNS_RE})"
+    rf"(?:, [\d,]+ (?:{_MARKER_NOUNS_RE}))*) - [^\]]*"
     r"|[\d,]+ chars|snippet - open: [^\]]*)\]")
 
 # the over-budget trailer recall builds; parsed back when it must be degraded
@@ -1157,13 +1162,20 @@ def _cap_required_lines(head: str, records: list[dict], indexes: list[int],
     return values[0]
 
 
+def _omitted_events_tail(tools: int, markers: dict[str, int], expand: str) -> str:
+    parts = ([f"{tools} tool calls"] if tools else []) + _marker_phrases(markers)
+    return f"       [+{', '.join(parts)} - {expand}]" if parts else ""
+
+
 def _fit_recall_records(head: str, records: list[dict], limit: int,
-                        expand: str, *, hidden_tools: int = 0) -> tuple[str, int]:
+                        expand: str, *, hidden_tools: int = 0,
+                        hidden_markers: dict[str, int] | None = None) -> tuple[str, int]:
     """Keep required hit rows, then spend any remaining block budget on context."""
+    hidden_markers = hidden_markers or {}
     if not limit:
         lines = [head, *(record["line"] for record in records)]
-        if hidden_tools:
-            lines.append(f"       [+{hidden_tools} tool calls - {expand}]")
+        if tail := _omitted_events_tail(hidden_tools, hidden_markers, expand):
+            lines.append(tail)
         return "\n".join(lines), hidden_tools
 
     keep = set(range(len(records)))
@@ -1175,9 +1187,7 @@ def _fit_recall_records(head: str, records: list[dict], limit: int,
     def marker() -> str:
         if dropped_context:
             return f"     [output truncated to --budget - rest at {expand}]"
-        if dropped_tools:
-            return f"       [+{dropped_tools} tool calls - {expand}]"
-        return ""
+        return _omitted_events_tail(dropped_tools, hidden_markers, expand)
 
     def render() -> str:
         lines = [head, *(record["line"] for i, record in enumerate(records)
@@ -1217,9 +1227,9 @@ def _fit_recall_records(head: str, records: list[dict], limit: int,
     if size() > limit:
         tail = marker()
         if tail:
-            compact_tail = ("     … surrounding context omitted"
-                            if dropped_context else
-                            "       … surrounding tool calls omitted")
+            compact_tail = ("     … surrounding context omitted" if dropped_context else
+                            "       … surrounding tool calls omitted" if dropped_tools else
+                            "       … surrounding events omitted")
             if _utf8_size(compact_tail) < _utf8_size(tail):
                 tail = compact_tail
             head = _cap_required_lines(
@@ -2700,7 +2710,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             center_cap = max(80, min(2400, center_room // center_rows - 80))
         records: list[dict] = []
         order = 0
-        hidden_tools = 0
+        hidden_events: list[dict] = []
         for t in w["turns"]:
             tcap = center_cap if t["turn"] == w["center"] else cap
             # every capped text row keeps its own match window, not just the
@@ -2722,7 +2732,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             for e, selected_event, output_span, match_preview in ev.get(
                     t["turn"], []):
                 if not selected_event:
-                    hidden_tools += 1
+                    hidden_events.append(e)
                     continue
                 line = "     " + _tool_line(
                     e, False, 0, match_span=output_span,
@@ -2748,11 +2758,13 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     "drop_key": (2, -abs(t["turn"] - w["center"]), order),
                 })
                 order += 1
+        hidden_markers = _marker_counts(hidden_events)
         block, _ = _fit_recall_records(
             head_line, records,
             max(80, block_share - 4) if block_share and not fits else 0,
             _window_expand_command(w, target),
-            hidden_tools=hidden_tools)
+            hidden_tools=len(hidden_events) - sum(hidden_markers.values()),
+            hidden_markers=hidden_markers)
         blocks.append(block)
         block_cmds.append(result_handle)
         used += _utf8_size(block) + 1

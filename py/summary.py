@@ -92,6 +92,8 @@ _SIGN_OFF_RE = re.compile(
     r"ping me)\b", re.IGNORECASE)
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=\S)")
 _ENDS_SENTENCE_RE = re.compile(r"[.!?][)\]\"'”’]*$")
+# how a punctuated list closes an item before its last: a sentence end, a semicolon or a comma
+_ITEM_PUNCT_RE = re.compile(r"[.!?;,][)\]\"'”’]*$")
 # a lowercase word, then a capitalized word opening a run of at least three words
 _CAPITAL_BREAK_RE = re.compile(r"\b[a-z][a-z'’]*\s+[A-Z][a-z][\w'’-]*(?:\s+\S+){2,}$")
 _GLUED_BULLET_CAVEAT = "the last bullet may include a later reply block the index joined to it"
@@ -551,15 +553,18 @@ def _open_section_items(reply: str) -> tuple[str, list[str], int, bool] | None:
 
 def _glued_last_bullet(bullets: list[str], *, split: bool) -> bool:
     """Signs that the last bullet ends in a later block: it closes a sentence while the earlier
-    bullets do not, or a lowercase word runs into a capitalized sentence. A single bullet has no
-    list style to contradict and its mid-sentence capitals are usually names, so it never is."""
+    bullets carry no closing punctuation, and a lowercase word runs into a capitalized sentence
+    or nothing else explains it. A lone bullet has no list style to contradict, so it never is."""
     *earlier, last = [_MARKUP_RE.sub(" ", item).strip() for item in bullets]
     if not earlier or not _ENDS_SENTENCE_RE.search(last):
+        return False
+    # a punctuated list closes its last bullet the same way; capitals there are names
+    if any(_ITEM_PUNCT_RE.search(item) for item in earlier):
         return False
     if _CAPITAL_BREAK_RE.search(last):
         return True
     # a sign-off split off at a sentence end leaves the bullet's own punctuation behind
-    return not split and not any(_ENDS_SENTENCE_RE.search(item) for item in earlier)
+    return not split
 
 
 def _input_capped(event: dict) -> bool:
@@ -973,6 +978,8 @@ def _classify_root(chat: _Chat) -> dict | None:
     if caveats:
         record.update(status="unknown", signals=list(caveats), evidence=common.one_line(last.text))
         return record
+    # reply text keeps no timestamp or place among its turn's events, so tool calls after the last
+    # text block (a codex turn cut off mid-work) cannot be told from tools before a final reply
     return None
 
 

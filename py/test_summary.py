@@ -822,6 +822,13 @@ class SummaryTests(unittest.TestCase):
                                "before the Friday freeze."))
         # a closed or empty last bullet carries no open item to doubt
         self.assertFalse(glued("- update the callers\n- [x] run the full suite Updated it all."))
+        # a punctuated list ends its last bullet the same way; a capital there names something
+        self.assertFalse(glued("- Backfill the epsilon table.\n"
+                               "- Point the Reporting service at the new table."))
+        self.assertFalse(glued("- Pin the toolchain.\n- Update the docs for Python 3.12 support."))
+        self.assertFalse(glued("- Merge the fixture branch.\n"
+                               "- Run the Playwright suite against staging."))
+        self.assertFalse(glued("- add tests;\n- update the docs;\n- release it."))
 
     def test_capped_question_input_shows_the_question_never_raw_json(self) -> None:
         import summary

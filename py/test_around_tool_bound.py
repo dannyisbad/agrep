@@ -50,6 +50,16 @@ def _window(events: list[dict]) -> dict:
     }
 
 
+def _marker(ts: int, name: str, input_text: str = "") -> dict:
+    return {
+        "kind": "control", "turn": TURN, "ts": ts, "name": name,
+        "input": input_text, "output": "", "ok": None,
+        "input_chars": len(input_text), "output_chars": 0,
+        "output_bytes": 0, "input_truncated": False,
+        "output_truncated": False, "call_id": f"m{ts}", "child": "",
+    }
+
+
 def _handle(event: dict, needle: str) -> str:
     searchable = common.tool_search_text(event)
     start = searchable.index(needle)
@@ -226,21 +236,13 @@ class AroundToolBoundTests(unittest.TestCase):
                 self.assertNotIn("collapsed", out)
 
     def test_markers_are_their_own_lines_and_never_tool_calls(self) -> None:
-        def marker(ts: int, name: str, input_text: str = "") -> dict:
-            return {
-                "kind": "control", "turn": TURN, "ts": ts, "name": name,
-                "input": input_text, "output": "", "ok": None,
-                "input_chars": len(input_text), "output_chars": 0,
-                "output_bytes": 0, "input_truncated": False,
-                "output_truncated": False, "call_id": f"m{ts}", "child": "",
-            }
         tools = [_event(index, input_text=f"request {index}", output="fine", ok=True)
                  for index in range(1, 7)]
         markers = [
-            marker(0, "compacted"),
-            marker(3, "task_notification",
-                   "status=completed task_id=a0123456789abcdef tool_use_id=toolu_1"),
-            marker(9, "api_error", "API Error: Repeated 529 Overloaded errors"),
+            _marker(0, "compacted"),
+            _marker(3, "task_notification",
+                    "status=completed task_id=a0123456789abcdef tool_use_id=toolu_1"),
+            _marker(9, "api_error", "API Error: Repeated 529 Overloaded errors"),
         ]
         self.events = sorted(tools + markers, key=lambda event: event["ts"])
         rc, out, err = self._run([
@@ -269,6 +271,43 @@ class AroundToolBoundTests(unittest.TestCase):
              if row["kind"] == "control"],
             [(event["kind"], event["name"], event["input"]) for event in markers])
         self.assertEqual(sum(row["kind"] in ("tool", "control") for row in rows), 9)
+
+    def test_default_view_counts_markers_apart_from_tool_events(self) -> None:
+        markers = [_marker(2, "compacted"), _marker(5, "compacted"),
+                   _marker(8, "api_error", "API Error: 529 Overloaded")]
+        cases = (
+            ([], "1 API error, 2 compactions omitted", 0),
+            ([_event(4, ok=True)],
+             "1 tool events omitted · 1 API error, 2 compactions omitted", 1),
+        )
+        for tools, disclosed, tool_count in cases:
+            with self.subTest(tools=len(tools)):
+                self.events = sorted(tools + markers, key=lambda event: event["ts"])
+                rc, out, err = self._run([SESSION, str(TURN), "--no-auto", "--color", "never"])
+                self.assertEqual((rc, err), (0, ""))
+                notice = out.splitlines()[1]
+                self.assertIn(f"{disclosed} · agrep around ", notice)
+                self.assertTrue(notice.endswith(" --full"), notice)
+                if not tools:
+                    self.assertNotIn("tool", notice)
+                rc, out, err = self._run([SESSION, str(TURN), "--json", "--no-auto"])
+                self.assertEqual((rc, err), (0, ""))
+                scope = json.loads(out.splitlines()[0])["scope"]
+                self.assertEqual(
+                    scope["tools"],
+                    {"mode": "excluded", "available": tool_count, "shown": 0,
+                     "hidden": tool_count})
+                self.assertEqual(
+                    scope["markers"],
+                    {"available_by_name": {"compacted": 2, "api_error": 1},
+                     "shown_by_name": {}, "hidden": 3})
+                rc, out, err = self._run([SESSION, str(TURN), "--full", "--json", "--no-auto"])
+                self.assertEqual((rc, err), (0, ""))
+                scope = json.loads(out.splitlines()[0])["scope"]
+                self.assertEqual((scope["tools"]["shown"], scope["tools"]["hidden"]),
+                                 (tool_count, 0))
+                self.assertEqual((scope["markers"]["shown_by_name"], scope["markers"]["hidden"]),
+                                 ({"compacted": 2, "api_error": 1}, 0))
 
 
 if __name__ == "__main__":

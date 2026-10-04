@@ -345,6 +345,73 @@ class RecallBudgetPriorityTests(unittest.TestCase):
         self.assertIn("user: Q", rendered)
         self.assertIn("agent: A", rendered)
 
+    def test_hidden_markers_are_named_apart_from_tool_calls(self) -> None:
+        session = self.SESSIONS[0]
+        prompt = "needle tidy the module"
+        hit = {
+            "session": session, "turn": 1, "ts": 1, "who": "user",
+            "agent": "codex", "project": "agrep", "score": 10.0,
+            "matched": "phrase", "snippet": "needle",
+            "content_digest": recall.compact.content_digest(prompt),
+        }
+        result = {
+            "hits": [hit], "total": 1, "chats": 1, "tool_hits": 0,
+            "engine": "corpusdb", "mode": "keyword",
+        }
+
+        def event(ts: int, kind: str, name: str, text: str = "") -> dict:
+            return {
+                "kind": kind, "turn": 1, "ts": ts, "name": name, "input": text,
+                "output": "", "ok": True if kind == "tool" else None,
+                "input_chars": len(text), "output_chars": 0, "output_bytes": 0,
+                "input_truncated": False, "output_truncated": False,
+            }
+
+        compacted = [event(2, "control", "compacted"), event(5, "control", "compacted")]
+        cases = (
+            (compacted, "[+2 compactions - "),
+            ([event(3, "tool", "exec_command", "ls"), event(4, "control", "api_error",
+                                                           "API Error: 529")],
+             "[+1 tool calls, 1 API error - "),
+        )
+        for events, tail in cases:
+            with self.subTest(tail=tail):
+                window = {
+                    "session": session, "center": 1, "first_turn": 1, "last_turn": 1,
+                    "agent": "codex", "project": "agrep", "events": events,
+                    "turns": [{"turn": 1, "who": "user", "ts": 1,
+                               "text": prompt, "reply": "tidied"}],
+                }
+                rc, rendered, error = self._run_hit(
+                    result, window,
+                    ["needle", "--hits", "1", "--budget", "0",
+                     "--no-auto", "--lexical", "--color", "never"])
+                self.assertEqual(rc, 0, error)
+                line, = [line.strip() for line in rendered.splitlines() if "[+" in line]
+                self.assertTrue(line.startswith(tail), line)
+                self.assertTrue(line.endswith("--tool-output 200]"), line)
+                # the final page cap keeps it whole, like every recovery pointer
+                self.assertIsNotNone(recall._TRUNC_MARKER_RE.fullmatch(line))
+
+        records = [
+            {"line": "     ⚙ exec " + "noise" * 20, "required": False,
+             "kind": "tool", "drop_key": (0, 0, 0)},
+            {"line": "  1 user: Q", "required": True,
+             "kind": "context", "drop_key": (2, 0, 1)},
+        ]
+        markers = {"compacted": 2}
+        rendered, dropped = recall._fit_recall_records(
+            "── @a:1", [dict(r) for r in records], 80, "agrep around a 1",
+            hidden_markers=markers)
+        self.assertEqual(
+            (rendered.splitlines()[-1], dropped),
+            ("       [+1 tool calls, 2 compactions - agrep around a 1]", 1))
+        rendered, dropped = recall._fit_recall_records(
+            "── @a:1", [dict(records[1])], 30, "agrep around a 1",
+            hidden_markers=markers)
+        self.assertEqual((rendered.splitlines()[-1], dropped),
+                         ("       … surrounding events omitted", 0))
+
     def test_selected_tool_event_survives_before_optional_events(self) -> None:
         session = self.SESSIONS[0]
         events = []
