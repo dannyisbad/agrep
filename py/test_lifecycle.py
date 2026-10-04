@@ -859,6 +859,35 @@ class LifecycleTests(unittest.TestCase):
             self.assertIs(indexd_runtime.refresh_search_index(), False)
         stale.close.assert_called_once_with()
 
+    def test_refresh_names_why_it_did_not_publish(self) -> None:
+        def stale_db(stamp: str) -> mock.Mock:
+            db = mock.Mock()
+            db.execute.return_value = (
+                ("stamp", stamp), ("schema", corpusdb._SCHEMA),
+                ("fts_triggers", corpusdb._TRIGGER_SCHEMA), ("build_id", "current-build"))
+            return db
+        cases = (
+            (None, False, "the search database could not be opened"),
+            (stale_db("old"), False, "stamp in its meta table did not match this build"),
+            (stale_db("current"), True, "a query failure still marks it for rebuild"),
+        )
+        for db, rebuild_marked, reason in cases:
+            with self.subTest(reason=reason), \
+                    mock.patch.object(corpusdb, "_trigram_ok", return_value=True), \
+                    mock.patch.object(corpusdb, "connect", return_value=db), \
+                    mock.patch.object(corpusdb, "_stamp", return_value="current"), \
+                    mock.patch.object(corpusdb, "query_rebuild_required",
+                                      return_value=rebuild_marked), \
+                    mock.patch.object(indexd_runtime, "derived_writer_build_id",
+                                      return_value="current-build"), \
+                    mock.patch.object(
+                        corpusdb, "_derived_write_ownership",
+                        return_value=corpusdb._DerivedWriteOwnership("current")), \
+                    mock.patch.object(indexd_runtime.common, "log") as log:
+                self.assertIs(indexd_runtime.refresh_search_index(), False)
+            log.assert_called_once_with(
+                f"search-index refresh did not publish a current database: {reason}")
+
     def test_auto_indexer_stops_child_after_post_launch_lifetime_loss(
             self) -> None:
         watcher = mock.Mock()

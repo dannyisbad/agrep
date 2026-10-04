@@ -863,27 +863,31 @@ def refresh_search_index(quiet: bool = True) -> bool | None:
                 "on a large history) …" if not db_path.exists() else
                 "refreshing the search db …")
         db = corpusdb.connect(quiet=True)
+        reason = "the search database could not be opened"
         if db:
             try:
                 meta = dict(db.execute(
                     "SELECT key, value FROM meta WHERE key IN "
                     "('stamp', 'schema', 'fts_triggers', 'build_id')"))
-                current = (
-                    meta.get("stamp") == corpusdb._stamp()
-                    and meta.get("schema") == corpusdb._SCHEMA
-                    and meta.get("fts_triggers") == corpusdb._TRIGGER_SCHEMA
-                    and meta.get("build_id") == derived_writer_build_id(
-                        require_binary=True)
-                )
+                expected = {
+                    "stamp": corpusdb._stamp(),
+                    "schema": corpusdb._SCHEMA,
+                    "fts_triggers": corpusdb._TRIGGER_SCHEMA,
+                    "build_id": derived_writer_build_id(require_binary=True),
+                }
             finally:
                 db.close()
-            if current and not corpusdb.query_rebuild_required():
+            stale = [key for key, value in expected.items() if meta.get(key) != value]
+            if not stale and not corpusdb.query_rebuild_required():
                 return True
+            reason = (f"{', '.join(stale)} in its meta table did not match this build" if stale
+                      else "a query failure still marks it for rebuild")
         # A foreign owner is a deliberate read-only outcome, not a failed
         # refresh. AutoIndexer must clear its retry streak instead of escalating
         # a correctly fenced build to --full.
         if not corpusdb._derived_write_ownership(for_write=True).writable:
             return True
+        common.log(f"search-index refresh did not publish a current database: {reason}")
         return False
     except Exception as exc:  # noqa: BLE001
         common.log(f"search-index refresh failed: {type(exc).__name__}: {exc}")
