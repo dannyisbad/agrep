@@ -139,6 +139,8 @@ MX_CLAUDE_NOTIFIED_UNLINKED = "ca000032-0532-4000-8000-000000000532"
 MX_CLAUDE_NOTIFIED_UNLINKED_SIDE = "agent-ca32side01"
 # a next-steps list whose last bullet swallowed a later one-sentence reply block
 MX_CLAUDE_GLUED_BULLET = "ca000033-0533-4000-8000-000000000533"
+# the agent finished while the root was still editing: its notification is a queued attachment row
+MX_CLAUDE_NOTIFIED_QUEUED = "ca000034-0534-4000-8000-000000000534"
 # codex: 09:00 prompt, 09:05 shell, 09:07 text, 09:15 compaction, shells 09:20/09:30/09:38, no reply
 MX_CODEX_COMPACTED_NO_REPLY = "cx000013-0553-4000-8000-000000000553"
 # parked on a question tool: ExitPlanMode, AskUserQuestion (and one answered), omp ask
@@ -754,6 +756,17 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual((item["status"], item["source"], item["evidence_session"], item["items"]),
                          ("todo_open", "side-chat", MX_CLAUDE_NOTIFIED_UNLINKED_SIDE,
                           ["rebuild the xray index", "report the xray rebuild"]))
+
+    def test_notification_queued_while_the_root_works_hands_the_subagent_back(self) -> None:
+        # the side chat ran past the root's last tool and kept open todos; Claude delivered the
+        # completion mid-turn as a queued_command attachment, not as an origin-tagged user row
+        day = ("--since", "2026-06-14", "--until", "2026-06-15")
+        handed_back = self.sandbox.summary("pending", *day, "--project", "mx-claude", "--json")
+        meta, items = _rows(handed_back)
+        self.assertEqual((items, meta["chats"], meta["side_chats"]), ([], 1, 1))
+        self.assertNotEqual(handed_back.returncode, 0)
+        pending = self._pending_by_session("--project", "mx-claude")
+        self.assertNotIn(MX_CLAUDE_NOTIFIED_QUEUED, pending)
 
     def test_task_notification_links_only_by_child_or_launch_agent_id(self) -> None:
         import summary
