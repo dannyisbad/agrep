@@ -103,7 +103,7 @@ agrep's data dir, and a tool shell must find it from process ancestry alone
 | `.agrep.search.v{P}` | `py/indexd_runtime.py` (touch), `py/indexd.py` (read) | content ignored; mtime only | none - stat-only demand beat for daemon idle-exit | signal (search demand) |
 | `.ingest.sig` | Rust ingest writes under `.index.lock`; read by the Python freshness surfaces | generation signature text | rewritten (mtime refreshed) by every ingest run; readers independently disclose an unreadable, future-dated, or over-bound mtime even when the writable health ledger failed | signal (generation / freshness clock) |
 | `.semantic-use.beat` | `py/semantic.py` | content ignored; mtime only | none - demand signal for background refs prewarming | signal (semantic demand) |
-| `.<name>.owner-reap-<pid>-<hex>` | `py/ownerfile.py` | byte copy of the record being removed | transient inside `remove_exact`'s two-phase reap; restored on mismatch, else unlinked | transient (reap tombstone) |
+| `.<name>.owner-reap-<pid>-<hex>` | `py/ownerfile.py`; `crates/agrep-cli/src/index_lock.rs` | byte copy of the record being removed | transient inside `remove_exact`'s two-phase reap; restored on mismatch, else unlinked; a freshness-daemon owner's tomb (`..indexd[.v{P}].lock.owner-reap-*`), which nothing reads back, is swept with the ingest staging temps once its reaper pid is dead | transient (reap tombstone) |
 
 Not coordination, deliberately excluded: uniquely-named staging temps that are
 atomically renamed into place (`crates/agrep-core/src/ingest_cache.rs` staged

@@ -157,6 +157,37 @@ class OrphanCleanupTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIsNone(doctor._rust_staging_owner(name))
 
+    def test_doctor_inventories_event_proof_temps_and_owner_tombs_as_rust_sweeps_them(self):
+        # The names and verdicts of the Rust sweep test of the same litter.
+        swept = (
+            ".events_complete.claude.json.tmp.41.9",
+            "..indexd.lock.owner-reap-41-0123abcd",
+            "..indexd.v2.lock.owner-reap-41-0123456789abcdef",
+        )
+        kept = (
+            ".events_complete.claude.json.tmp.42.9",
+            "..indexd.v2.lock.owner-reap-42-0123abcd",
+            "..index.lock.owner-reap-41-0123abcd",
+            ".events_complete.json.tmp.41.9",
+            "..indexd.lock.owner-reap-41-not-hex",
+            ".indexd.lock",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in swept + kept:
+                (root / name).write_bytes(b"x")
+            with (
+                mock.patch.object(doctor.common, "DATA_DIR", root),
+                mock.patch.object(
+                    doctor.common, "pid_alive", side_effect=lambda pid: pid == 42),
+            ):
+                inventory = doctor._rust_staging_orphans()
+
+            self.assertEqual(
+                set(inventory["paths"]), {root / name for name in swept})
+        self.assertIsNone(
+            doctor._rust_owner_tomb_reaper("..indexd.lock.owner-reap-4294967296-ab"))
+
     def test_doctor_orphan_totals_preserve_each_artifact_class(self):
         group = lambda count, size: {
             "count": count, "bytes": size, "paths": (),

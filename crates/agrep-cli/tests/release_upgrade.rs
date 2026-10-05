@@ -534,6 +534,64 @@ fn upgrade_keeps_uncached_rows_of_one_opencode_channel_beside_a_cached_one() {
     }
 }
 
+/// opencode's channel database is a symlink no pass follows, a durable issue in its store. A
+/// session deleted from the readable database since the release indexed it is a change the pass
+/// observes, not a row lost behind that link: every pass publishes it, as the churn beside it.
+#[cfg(unix)]
+#[test]
+fn upgrade_publishes_an_opencode_deletion_beside_a_symlinked_channel_database() {
+    const CHILD_TEXT: &str = "check the generated yaml schema";
+    for snapshot in [Snapshot::Published, Snapshot::Withheld, Snapshot::Pending] {
+        let home = opencode_home();
+        copy_dir(&fixture_home("claude"), &home);
+        let store = home.join(".local/share/opencode");
+        let target = home.join("nightly-copy.db");
+        let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql"))
+            .unwrap()
+            .replace("sess-oc", "nightly-oc");
+        rusqlite::Connection::open(&target)
+            .unwrap()
+            .execute_batch(&seed)
+            .unwrap();
+        std::os::unix::fs::symlink(&target, store.join("opencode-nightly.db")).unwrap();
+        let chat = plant_chat(&home);
+        let data = temp_dir("release-upgrade-oc-link-data");
+        assert_published(&ingest_output("all", &home, &data, false), "first index");
+        let released = normalize(&data);
+        assert!(released.contains(OPENCODE_TEXT) && released.contains(CHILD_TEXT));
+        age_to_release_0_3_2(&data, snapshot);
+        rusqlite::Connection::open(store.join("opencode.db"))
+            .unwrap()
+            .execute_batch(
+                "DELETE FROM part WHERE session_id = 'sess-oc-child';
+                 DELETE FROM message WHERE session_id = 'sess-oc-child';
+                 DELETE FROM session WHERE id = 'sess-oc-child';",
+            )
+            .unwrap();
+        for minute in [1, 2, 3] {
+            let churn = format!("upgrade churn {minute}");
+            append_line(&chat, minute, &churn);
+            let context = format!("{snapshot:?} snapshot, pass {minute} after the upgrade");
+            assert_published(&ingest_output("all", &home, &data, false), &context);
+            let published = normalize(&data);
+            assert!(
+                published.contains(&churn),
+                "{context}: churn was not published"
+            );
+            assert!(
+                published.contains(OPENCODE_TEXT),
+                "{context}: opencode rows dropped"
+            );
+            assert!(
+                !published.contains(CHILD_TEXT),
+                "{context}: the deletion was not published"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
 const EMPTY_CHAT: &str = "44444444-4444-4444-8444-444444444444";
 
 /// A transcript the release read whole and found nothing to publish in leaves a cached entry with
@@ -584,19 +642,34 @@ fn upgrade_publishes_beside_an_unlistable_directory_whose_files_published_nothin
     }
 }
 
-/// A transcript unreadable since the first index has no cache entry and published nothing,
-/// though the inventory lists it. Its directory turning unlistable must not hold the upgrade back:
-/// the published generation shows the cache holds every row it does.
+/// How the passes beside a locked directory listing a never-read file begin.
 #[cfg(unix)]
-#[test]
-fn upgrade_publishes_beside_an_unlistable_directory_listing_a_file_never_read() {
+#[derive(Clone, Copy, Debug)]
+enum NeverReadStart {
+    /// The first pass after an upgrade from release 0.3.2, which published the snapshot.
+    Upgrade,
+    /// A current data dir whose event proofs a crash revoked.
+    CrashRepair,
+}
+
+const GONE_TEXT: &str = "a chat deleted before the passes";
+
+/// A transcript unreadable since the first index is listed though never cached. Its directory
+/// turning unlistable must not hold `start`'s passes back, nor may a transcript deleted elsewhere
+/// (`delete_elsewhere`), whose rows the pass saw go, count as lost behind the locked directory.
+#[cfg(unix)]
+fn publishes_beside_an_unlistable_directory_listing_a_file_never_read(
+    start: NeverReadStart,
+    delete_elsewhere: bool,
+) {
     use std::os::unix::fs::PermissionsExt;
 
     let home = temp_dir("release-upgrade-never-read-home");
     copy_dir(&fixture_home("claude"), &home);
-    let project = home.join(".claude/projects/proj-mixed");
-    fs::create_dir_all(&project).unwrap();
-    let transcript = |session: &str, text: &str| {
+    let projects = home.join(".claude/projects");
+    let project = projects.join("proj-mixed");
+    let transcript = |project: &Path, session: &str, text: &str| {
+        fs::create_dir_all(project).unwrap();
         let row = serde_json::json!({
             "type": "user", "userType": "external", "sessionId": session,
             "timestamp": "2026-01-03T09:00:00.000Z", "cwd": "/work/mixed",
@@ -607,28 +680,38 @@ fn upgrade_publishes_beside_an_unlistable_directory_listing_a_file_never_read() 
         path
     };
     transcript(
+        &project,
         "55555555-5555-4555-8555-555555555555",
         "a row beside a chat never read",
     );
-    let never = transcript(EMPTY_CHAT, "a row no pass could read");
+    let never = transcript(&project, EMPTY_CHAT, "a row no pass could read");
     fs::set_permissions(&never, fs::Permissions::from_mode(0o000)).unwrap();
+    let gone = projects.join("proj-gone");
+    transcript(&gone, "66666666-6666-4666-8666-666666666666", GONE_TEXT);
     let chat = plant_chat(&home);
     let data = temp_dir("release-upgrade-never-read-data");
     let first = ingest_output("all", &home, &data, false);
+    let released = normalize(&data).contains(GONE_TEXT);
     let release_listed = fs::read(&never).is_err() && data.join(".source_snapshot.bin").exists();
     let locked = release_listed.then(|| lock_dir(&project)).flatten();
+    if locked.is_some() {
+        match start {
+            NeverReadStart::Upgrade => age_to_release_0_3_2(&data, Snapshot::Published),
+            NeverReadStart::CrashRepair => strip_event_proofs(&data),
+        }
+        if delete_elsewhere {
+            fs::remove_dir_all(&gone).unwrap();
+        }
+    }
     let passes: Vec<_> = (1..=3)
         .filter(|_| locked.is_some())
         .map(|minute| {
-            if minute == 1 {
-                age_to_release_0_3_2(&data, Snapshot::Published);
-            }
             let churn = format!("upgrade churn {minute}");
             append_line(&chat, minute, &churn);
             let output = ingest_output("all", &home, &data, false);
             let published = normalize(&data);
             let kept = published.contains(&churn) && published.contains("a chat never read");
-            (output, kept)
+            (output, kept, published.contains(GONE_TEXT))
         })
         .collect();
     if let Some(locked) = &locked {
@@ -636,13 +719,45 @@ fn upgrade_publishes_beside_an_unlistable_directory_listing_a_file_never_read() 
     }
     fs::set_permissions(&never, fs::Permissions::from_mode(0o644)).unwrap();
     assert_published(&first, "first index");
-    for (minute, (output, kept)) in (1..).zip(passes) {
-        let context = format!("pass {minute} after the upgrade");
+    assert!(released, "the first index did not publish {GONE_TEXT:?}");
+    for (minute, (output, kept, gone_published)) in (1..).zip(passes) {
+        let context = format!("{start:?}, pass {minute}");
         assert_published(&output, &context);
         assert!(kept, "{context}: churn or published rows missing");
+        assert_eq!(
+            gone_published, !delete_elsewhere,
+            "{context}: {GONE_TEXT:?}"
+        );
     }
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_publishes_beside_an_unlistable_directory_listing_a_file_never_read() {
+    publishes_beside_an_unlistable_directory_listing_a_file_never_read(
+        NeverReadStart::Upgrade,
+        false,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_publishes_a_deletion_beside_an_unlistable_directory_listing_a_file_never_read() {
+    publishes_beside_an_unlistable_directory_listing_a_file_never_read(
+        NeverReadStart::Upgrade,
+        true,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn crash_repair_publishes_a_deletion_beside_an_unlistable_directory_listing_a_file_never_read() {
+    publishes_beside_an_unlistable_directory_listing_a_file_never_read(
+        NeverReadStart::CrashRepair,
+        true,
+    );
 }
 
 /// An upgrade held back by one scope past others it could publish past names that scope: here

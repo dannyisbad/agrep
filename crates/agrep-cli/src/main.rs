@@ -2369,7 +2369,7 @@ fn consume_retained_corpus_owner(data: &Path) -> anyhow::Result<()> {
 
 fn staging_temp_owner(name: &str) -> Option<u32> {
     let (base, raw_suffix) = name.rsplit_once(".tmp.")?;
-    if !ROOT_STAGING_ARTIFACTS.contains(&base) {
+    if !ROOT_STAGING_ARTIFACTS.contains(&base) && !event_proof_name(base) {
         return None;
     }
     let suffix = if base == "corpus.db" {
@@ -2392,6 +2392,30 @@ fn staging_temp_owner(name: &str) -> Option<u32> {
     Some(pid)
 }
 
+/// `.events_complete.<agent>.json`, the event proof each agent's publication stages.
+fn event_proof_name(name: &str) -> bool {
+    name.strip_prefix(".events_complete.")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|agent| {
+            !agent.is_empty()
+                && agent.len() <= 64
+                && agent
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+}
+
+/// The reaper pid of `.<owner>.owner-reap-<pid>-<hex>`, a tomb a reclaim of a freshness-daemon
+/// owner record moves it to. Nothing reads such a tomb back, so one whose reaper died is litter.
+fn owner_tomb_reaper(name: &str) -> Option<u32> {
+    let (owner, rest) = name.strip_prefix('.')?.split_once(".owner-reap-")?;
+    let (pid, token) = rest.split_once('-')?;
+    let hex = !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    (daemon_owner_name(owner) && hex && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| pid.parse().ok())
+        .flatten()
+}
+
 fn sweep_staging_temps_with<F>(data: &Path, mut pid_alive: F) -> std::io::Result<(u64, u64)>
 where
     F: FnMut(u32) -> Option<bool>,
@@ -2411,7 +2435,10 @@ where
             Err(_) => continue,
         };
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(staging_temp_owner) else {
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| staging_temp_owner(name).or_else(|| owner_tomb_reaper(name)))
+        else {
             continue;
         };
         let metadata = match fs::symlink_metadata(entry.path()) {
@@ -5628,6 +5655,14 @@ fn index_cmd_locked(
         .filter(|issue| durable_source_issue(issue.kind()))
         .flat_map(|issue| pcache.sessions_under(Path::new(issue.path())))
         .collect();
+    if published_legible {
+        pcache.census_base_rows(
+            source_issues
+                .iter()
+                .map(|issue| (issue.agent(), Path::new(issue.path()))),
+            repair_events,
+        );
+    }
     lap!("load-cache");
     // a complete parse (cold cache or --full) yields the full event set; a warm run only
     // carries touched sessions' events, so the pulse rollup waits for the next complete run.
@@ -6586,6 +6621,50 @@ mod tests {
         assert!(unknown.exists());
         assert!(malformed.exists());
         assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dead_writers_event_proof_temps_and_dead_reapers_owner_tombs_are_swept() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-litter-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let swept = [
+            ".events_complete.claude.json.tmp.41.9",
+            "..indexd.lock.owner-reap-41-0123abcd",
+            "..indexd.v2.lock.owner-reap-41-0123456789abcdef",
+        ];
+        let kept = [
+            ".events_complete.claude.json.tmp.42.9",
+            "..indexd.v2.lock.owner-reap-42-0123abcd",
+            "..indexd.v2.lock.owner-reap-43-0123abcd",
+            "..index.lock.owner-reap-41-0123abcd",
+            ".events_complete.json.tmp.41.9",
+            "..indexd.lock.owner-reap-41-not-hex",
+            ".indexd.lock",
+        ];
+        for name in swept.iter().chain(&kept) {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        let result = sweep_staging_temps_with(&root, |pid| match pid {
+            41 => Some(false),
+            42 => Some(true),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(result, (3, 3));
+        for name in swept {
+            assert!(!root.join(name).exists(), "{name} survived");
+        }
+        for name in kept {
+            assert!(root.join(name).exists(), "{name} was swept");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

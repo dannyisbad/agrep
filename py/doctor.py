@@ -185,10 +185,16 @@ _RUST_STAGING_ARTIFACTS = frozenset({
     "sessions.jsonl",
 })
 
+# Mirrors `event_proof_name` and `owner_tomb_reaper` in crates/agrep-cli/src/main.rs.
+_RUST_EVENT_PROOF_RE = re.compile(r"\.events_complete\.[A-Za-z0-9_.-]{1,64}\.json")
+_RUST_OWNER_TOMB_RE = re.compile(
+    r"\.\.indexd(?:\.v[0-9]+)?\.lock\.owner-reap-([0-9]+)-[0-9A-Fa-f]+")
+
 
 def _rust_staging_owner(name: str) -> int | None:
     base, separator, suffix = name.rpartition(".tmp.")
-    if not separator or base not in _RUST_STAGING_ARTIFACTS:
+    if not separator or (base not in _RUST_STAGING_ARTIFACTS
+                         and _RUST_EVENT_PROOF_RE.fullmatch(base) is None):
         return None
     if base == "corpus.db":
         for ending in ("-journal", "-wal", "-shm"):
@@ -210,6 +216,14 @@ def _rust_staging_owner(name: str) -> int | None:
     return values[0]
 
 
+def _rust_owner_tomb_reaper(name: str) -> int | None:
+    """The reaper pid of a freshness-daemon owner tomb the Rust sweep reaps once it dies."""
+    match = _RUST_OWNER_TOMB_RE.fullmatch(name)
+    if match is None or int(match.group(1)) > 2**32 - 1:
+        return None
+    return int(match.group(1))
+
+
 def _rust_staging_orphans() -> dict:
     paths = []
     size = 0
@@ -225,6 +239,8 @@ def _rust_staging_orphans() -> dict:
     with entries:
         for entry in entries:
             pid = _rust_staging_owner(entry.name)
+            if pid is None:
+                pid = _rust_owner_tomb_reaper(entry.name)
             if pid is None:
                 continue
             try:

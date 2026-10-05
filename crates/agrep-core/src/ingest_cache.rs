@@ -489,6 +489,59 @@ impl CMsg {
     }
 }
 
+/// The message turns, by session, and the event sessions cache entries hold of one agent.
+#[derive(Default)]
+struct HeldRows {
+    turns: HashMap<std::sync::Arc<str>, HashSet<u32>>,
+    event_sessions: HashSet<std::sync::Arc<str>>,
+}
+
+impl HeldRows {
+    /// The rows `entries` hold of each agent `wanted` accepts.
+    fn census<'a>(
+        entries: impl Iterator<Item = &'a Entry>,
+        wanted: impl Fn(&str) -> bool,
+    ) -> HashMap<String, Self> {
+        fn rows_of<'m>(
+            held: &'m mut HashMap<String, Option<HeldRows>>,
+            agent: &str,
+            wanted: &impl Fn(&str) -> bool,
+        ) -> Option<&'m mut HeldRows> {
+            if !held.contains_key(agent) {
+                held.insert(agent.to_owned(), wanted(agent).then(HeldRows::default));
+            }
+            held.get_mut(agent).and_then(Option::as_mut)
+        }
+        let mut held: HashMap<String, Option<Self>> = HashMap::new();
+        for entry in entries {
+            for message in &entry.msgs {
+                if let Some(rows) = rows_of(&mut held, &message.agent, &wanted) {
+                    let session = message.session.clone();
+                    rows.turns.entry(session).or_default().insert(message.turn);
+                }
+            }
+            for key in &entry.event_keys {
+                if let Some(rows) = rows_of(&mut held, &key.agent, &wanted) {
+                    rows.event_sessions.insert(key.session.as_str().into());
+                }
+            }
+        }
+        held.into_iter()
+            .filter_map(|(agent, rows)| Some((agent, rows?)))
+            .collect()
+    }
+
+    fn holds_turn(&self, session: &str, turn: u32) -> bool {
+        self.turns
+            .get(session)
+            .is_some_and(|turns| turns.contains(&turn))
+    }
+
+    fn holds_session(&self, session: &str) -> bool {
+        self.turns.contains_key(session) || self.event_sessions.contains(session)
+    }
+}
+
 pub struct IngestCache {
     entries: HashMap<String, Entry>,
     dirty: HashSet<String>,
@@ -566,6 +619,9 @@ pub struct IngestCache {
     /// What the published generation holds of each per-file agent whose failed read this cache
     /// cannot answer for alone; None where that generation could not be read.
     published_rows: HashMap<String, Option<crate::cache::PublishedAgentRows>>,
+    /// What the decoded base held of each per-file agent `published_rows` may be compared for,
+    /// taken before ingest: a row this pass then drops went with a change it observed.
+    base_rows: HashMap<String, HeldRows>,
     /// `(agent, database namespace)` of every token conversation the published generation may
     /// hold rows or events of. `None` is unknown: every token database counts as material.
     published_token_namespaces: Option<HashSet<(String, String)>>,
@@ -2328,6 +2384,7 @@ impl IngestCache {
             seeded_snapshots: HashSet::new(),
             unvouched_reads: HashSet::new(),
             published_rows: HashMap::new(),
+            base_rows: HashMap::new(),
             published_token_namespaces: None,
             last_good_base: false,
             legacy_generation: false,
@@ -2852,10 +2909,40 @@ impl IngestCache {
         }
     }
 
+    /// Before ingest mutates this decoded base, census what it holds of each per-file agent a
+    /// failed preflight scope may compare with the published generation; of every per-file agent
+    /// with `every_agent`, for read failures this pass has yet to meet.
+    pub fn census_base_rows<'a>(
+        &mut self,
+        preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        every_agent: bool,
+    ) {
+        if !self.last_good_base {
+            return;
+        }
+        let agents: HashSet<&str> = preflight_issues
+            .into_iter()
+            .filter(|(agent, scope)| self.may_compare_published_rows(agent, scope))
+            .map(|(agent, _)| agent)
+            .collect();
+        let wanted =
+            |agent: &str| agents.contains(agent) || (every_agent && Self::per_file_agent(agent));
+        self.base_rows = HeldRows::census(self.entries.values(), wanted);
+    }
+
+    fn per_file_agent(agent: &str) -> bool {
+        !crate::ingest::registry::whole_store_agent(agent)
+            && !crate::ingest::registry::token_store_agent(agent)
+    }
+
+    fn may_compare_published_rows(&self, agent: &str, scope: &Path) -> bool {
+        Self::per_file_agent(agent)
+            && ((self.legacy_generation && crate::ingest::registry::partial_read_agent(agent))
+                || self.listed_files_cached(scope).is_some())
+    }
+
     fn cache_cannot_answer_for(&self, agent: &str, scope: &Path) -> bool {
-        let per_file = !crate::ingest::registry::whole_store_agent(agent)
-            && !crate::ingest::registry::token_store_agent(agent);
-        per_file
+        Self::per_file_agent(agent)
             && !self.published_rows.contains_key(agent)
             && ((self.legacy_generation && crate::ingest::registry::partial_read_agent(agent))
                 || self.listed_files_cached(scope) == Some(false))
@@ -2884,29 +2971,31 @@ impl IngestCache {
     }
 
     /// Whether this cache holds every row and session of `agent` the published generation does,
-    /// as [`Self::record_published_rows`] read it; None when it was not read.
+    /// as [`Self::record_published_rows`] read it, or held it before this pass; None when it was
+    /// not read. A row only the published generation holds is one this cache cannot serve.
     fn cache_holds_published_rows(&self, agent: &str) -> Option<bool> {
         let rows = self.published_rows.get(agent)?.as_ref()?;
-        let mut turns = HashSet::new();
-        let mut sessions = HashSet::new();
-        for entry in self.entries.values() {
-            for message in entry.msgs.iter().filter(|message| message.agent == agent) {
-                turns.insert((message.session.as_ref(), message.turn));
-                sessions.insert(message.session.as_ref());
-            }
-            for key in entry.event_keys.iter().filter(|key| key.agent == agent) {
-                sessions.insert(key.session.as_str());
-            }
-        }
+        let after = HeldRows::census(self.entries.values(), |owner| owner == agent);
+        let held = [after.get(agent), self.base_rows.get(agent)];
+        let holds_turn = |session: &str, turn: u32| {
+            held.iter()
+                .flatten()
+                .any(|rows| rows.holds_turn(session, turn))
+        };
+        let holds_session = |session: &str| {
+            held.iter()
+                .flatten()
+                .any(|rows| rows.holds_session(session))
+        };
         Some(
             rows.turns
                 .keys()
-                .all(|(session, turn)| turns.contains(&(session.as_str(), *turn)))
+                .all(|(session, turn)| holds_turn(session, *turn))
                 && rows
                     .sessions
                     .iter()
                     .chain(&rows.event_sessions)
-                    .all(|session| sessions.contains(session.as_str())),
+                    .all(|session| holds_session(session)),
         )
     }
 
@@ -6137,6 +6226,41 @@ mod tests {
                 .collect(),
             event_sessions: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn a_row_the_base_held_and_this_pass_dropped_is_not_lost_behind_a_failed_scope() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let deleted = Path::new("/fixture/.claude/projects/gone/chat.jsonl");
+        let mut row = test_message("a row this pass deletes");
+        row.session = "gone".into();
+        // Whether the base census runs, and the sessions the published generation holds.
+        let verdict = |census: bool, sessions: &[&str]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), deleted.into()]));
+            let key = deleted.to_string_lossy().into_owned();
+            cache.put_entry(key.clone(), cached_entry(std::slice::from_ref(&row)));
+            if census {
+                cache.census_base_rows([("claude", scope)], false);
+            }
+            cache.remove_entry(&key);
+            let mut once = Some(published_rows(sessions));
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+
+        assert_eq!(verdict(true, &["gone"]), MaterialVerdict::Retained);
+        assert_eq!(verdict(false, &["gone"]), MaterialVerdict::Drops);
+        // A row the base never held is one only the published generation can still serve.
+        assert_eq!(
+            verdict(true, &["gone", "never-read"]),
+            MaterialVerdict::Drops
+        );
     }
 
     #[test]
