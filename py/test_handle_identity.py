@@ -10,6 +10,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -746,6 +751,151 @@ class PrintedHandleReopens(unittest.TestCase):
         rc, rows, _stderr = self._around(f"{self.SESSION}:2", window, roots)
         self.assertNotEqual(rc, 0)
         self.assertEqual(rows[0].get("miss", {}).get("code"), "no-speaker-match")
+
+
+FIXTURE_STORE = Path(__file__).resolve().parent / "fixtures" / "handle_identity" / "store"
+COMPACTED_CODEX = "7a7a7a7a-0510-4000-8000-000000000510"
+FIRST_PROMPT = "Port the kilo parser to the new grammar."
+MID_REPLY = "The kilo parser passes every zephyrine grammar rule after compaction."
+LAST_REPLY = "The kilo grammar notes are published with quillwort examples."
+
+
+class ReplyOnlyTurnWindow(unittest.TestCase):
+    """codex writes a compaction as an empty recap row. The search db stores no
+    empty text, so the reply after it is the turn's only row there; the window
+    still has to open that turn the way the published transcript does."""
+
+    def test_reply_only_turn_is_on_the_timeline_as_its_recap(self) -> None:
+        import corpusdb
+        import explore
+
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE msgs(id INTEGER PRIMARY KEY, session TEXT, turn INTEGER, "
+                   "ts INTEGER, agent TEXT, project TEXT, concept TEXT, model TEXT, "
+                   "model_source TEXT, who TEXT, text TEXT)")
+        rows = [(0, 100, "gpt-5", "explicit", "user", FIRST_PROMPT),
+                (0, 100, "gpt-5", "explicit", "agent", "three rules still fail"),
+                (0, 150, "", "tool", "tool", "shell_command: make kilo-parse"),
+                (1, 200, "<recap>", "recap", "agent", MID_REPLY),
+                (1, 250, "", "tool", "tool", "shell_command: make kilo-parse"),
+                (2, 300, "gpt-5", "explicit", "user", "Document the kilo grammar."),
+                (2, 300, "gpt-5", "explicit", "agent", "drafted"),
+                (3, 400, "<recap>", "recap", "agent", LAST_REPLY)]
+        db.executemany(
+            "INSERT INTO msgs(session, turn, ts, agent, project, concept, model, "
+            "model_source, who, text) VALUES(?, ?, ?, 'codex', 'kilo', '', ?, ?, ?, ?)",
+            [(COMPACTED_CODEX, *row) for row in rows])
+
+        context = corpusdb.session_context(db, COMPACTED_CODEX)
+        self.assertEqual(context["timeline"], [{"turn": turn, "ts": ts} for turn, ts in
+                                               ((0, 100), (1, 200), (2, 300), (3, 400))])
+        self.assertEqual((context["first_turn"], context["last_turn"], context["n_turns"]),
+                         (0, 3, 4))
+        merged = explore._merge_transcript_rows(
+            corpusdb.session_rows(db, COMPACTED_CODEX, lo=1, hi=1))
+        self.assertEqual(merged, [{"turn": 1, "ts": 200, "agent": "codex", "project": "kilo",
+                                   "who": "recap", "text": "", "reply": MID_REPLY}])
+
+
+class CompactedCodexHandlesReopen(unittest.TestCase):
+    """Black-box: the real ingest indexes a codex rollout whose compactions are each
+    followed by a reply. The handles search and chats print for those replies open
+    in around, on the search db and on the published transcript alike."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        binary = Path(os.environ.get("AGREP_RS_BIN") or repo / "target" / "release" / (
+            "agrep-rs.exe" if os.name == "nt" else "agrep-rs"))
+        if not binary.is_file():
+            raise unittest.SkipTest("release ingest binary is required")
+        temp = tempfile.TemporaryDirectory(prefix="agrep-reply-only-")
+        cls.addClassCleanup(temp.cleanup)
+        cls.root = Path(temp.name)
+        home, cls.data = cls.root / "home", cls.root / "data"
+        for source in FIXTURE_STORE.rglob("*.jsonl"):
+            relative = source.relative_to(FIXTURE_STORE)
+            target = home / ("." + relative.parts[0]) / Path(*relative.parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        cls.data.mkdir()
+        (cls.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
+        cls.env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("AGREP_") and key != "PYTHONPATH"}
+        cls.env.update({
+            "HOME": str(home), "USERPROFILE": str(home), "AGREP_HOME": str(home),
+            "AGREP_DATA_DIR": str(cls.data), "AGREP_RS_BIN": str(binary),
+            "AGREP_MODEL_DIR": str(cls.root / "models"), "AGREP_NO_FETCH": "1",
+            "AGREP_NO_DAEMON": "1", "AGREP_NO_SEM_WORKER": "1", "AGREP_NO_RESIDENT": "1",
+            "AGREP_CALLER_PUBLICATION_DIR": str(cls.root / "callers"),
+            "APPDATA": str(cls.root / "appdata"),
+            "LOCALAPPDATA": str(cls.root / "localappdata"),
+            "XDG_CONFIG_HOME": str(cls.root / "config"),
+            "XDG_DATA_HOME": str(cls.root / "share"),
+            "CODEX_HOME": str(home / ".codex"), "CLINE_DIR": str(cls.root / "cline"),
+            "CRUSH_GLOBAL_DATA": str(cls.root / "crush"), "OPENCODE_DB": "",
+        })
+        cls.cli = [sys.executable, str(repo / "cli.py")]
+        indexed = cls._run(["index"])
+        if indexed.returncode or not (cls.data / "corpus.db").is_file():
+            raise AssertionError(f"fixture indexing failed:\n{indexed.stdout}{indexed.stderr}")
+
+    @classmethod
+    def _run(cls, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*cls.cli, *argv], cwd=cls.root, env=cls.env, capture_output=True,
+            text=True, encoding="utf-8", timeout=120, check=False)
+
+    def _rows(self, argv: list[str]) -> list[dict]:
+        result = self._run([*argv, "--json", "--no-auto"])
+        self.assertEqual(result.returncode, 0, f"{argv}\n{result.stdout}{result.stderr}")
+        return [row for row in map(json.loads, result.stdout.splitlines())
+                if row.get("kind") != "agrep-meta"]
+
+    @staticmethod
+    def _shape(row: dict) -> tuple:
+        return (row["kind"], row["turn"], row.get("who", row.get("name")),
+                row.get("text", row.get("input")))
+
+    def _printed_handles(self) -> list[tuple[str, tuple]]:
+        """Each handle a search or chats printed, with the row it cites."""
+        agent_hit, = self._rows(["zephyrine"])
+        tool_hit, = self._rows(["all rules pass"])
+        first_hit, = [row for row in self._rows(["Port the kilo parser"])
+                      if (row["turn"], row["who"]) == (0, "user")]
+        chat, = [row for row in self._rows(["chats"]) if row["session"] == COMPACTED_CODEX]
+        self.assertEqual((agent_hit["turn"], agent_hit["who"]), (1, "agent"))
+        self.assertEqual((tool_hit["turn"], tool_hit["who"]), (1, "tool"))
+        self.assertEqual(chat["last_turn"], 3)
+        return [(agent_hit["handle"], ("msg", 1, "agent", MID_REPLY)),
+                (tool_hit["handle"], ("tool", 1, "shell_command", "make kilo-parse")),
+                (chat["latest_handle"], ("msg", 3, "agent", LAST_REPLY)),
+                (first_hit["handle"], ("msg", 0, "user", FIRST_PROMPT))]
+
+    def _opened(self, handle: str, cited: tuple) -> list[dict]:
+        rows = self._rows(["around", handle])
+        self.assertIn(cited, [self._shape(row) for row in rows], handle)
+        self.assertEqual({row["turn"] for row in rows}, {cited[1]}, handle)
+        return self._rows(["around", handle, "--full"])
+
+    def test_printed_handles_open_their_turn_on_both_read_paths(self) -> None:
+        handles = self._printed_handles()
+        indexed = {handle: self._opened(handle, cited) for handle, cited in handles}
+        mid = [(row["kind"], row["turn"], row.get("name")) for row in indexed[handles[0][0]]]
+        self.assertIn(("control", 1, "compacted"), mid)
+        self.assertIn(("tool", 1, "shell_command"), mid)
+        first = [(row["kind"], row["turn"]) for row in indexed[handles[-1][0]]]
+        self.assertEqual(first, [("msg", 0), ("msg", 0), ("tool", 0)],
+                         "a later compaction's events stay off the earlier turn")
+
+        corpus = self.data / "corpus.db"
+        aside = self.data / "corpus.db.aside"
+        corpus.rename(aside)
+        self.addCleanup(aside.rename, corpus)
+        published = {handle: self._opened(handle, cited) for handle, cited in handles}
+        self.assertFalse(corpus.exists(), "the transcript path rebuilt the search db")
+        self.assertEqual(published, indexed)
 
 
 if __name__ == "__main__":

@@ -2183,6 +2183,10 @@ def _merge_transcript_rows(rows: list[dict]) -> list[dict]:
         if who == "agent":
             if not item["reply"]:
                 item["reply"] = o.get("text", "") or ""
+                if not item["text"] and o.get("model_source") == "recap":
+                    # A reply carries its prompt row's model_source: this one answers a codex
+                    # compaction recap whose empty row the corpus omits and the transcript keeps.
+                    item["who"] = "recap"
             continue
         # There is canonically one initiating row per turn. First-wins is deliberate:
         # a malformed duplicate must not silently replace the real prompt either.

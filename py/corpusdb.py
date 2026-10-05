@@ -5022,25 +5022,30 @@ def session_term_turns(
 def session_context(db: sqlite3.Connection, session: str) -> dict | None:
     """Small structural metadata needed to build any window in ``session``.
 
-    The timeline contains one ``(turn, ts)`` pair per prompt/control/recap row and
-    deliberately carries no message or tool text. Keeping it separate means a
-    bounded window can clamp sparse turn numbers and attribute timestamped events
-    correctly without loading the full transcript. ``explore`` caches this compact
-    result across expansion windows.
+    The timeline contains one ``(turn, ts)`` pair per prompt/control/recap row, plus
+    one per reply-only turn at its reply's timestamp, and deliberately carries no
+    message or tool text. Keeping it separate means a bounded window can clamp
+    sparse turn numbers and attribute timestamped events correctly without loading
+    the full transcript. ``explore`` caches this compact result across expansion
+    windows.
     """
     rows = list(db.execute(
-        "SELECT turn, ts, agent, project FROM msgs "
-        "WHERE session = ? AND who <> 'tool' AND who <> 'agent' "
-        "ORDER BY turn, id", (session,)))
-    if not rows:
-        # Defensive support for an old/partial corpus containing reply-only turns.
-        rows = list(db.execute(
-            "SELECT turn, ts, agent, project FROM msgs "
-            "WHERE session = ? AND who = 'agent' ORDER BY turn, id", (session,)))
+        "SELECT turn, ts, agent, project, who = 'agent' FROM msgs "
+        "WHERE session = ? AND who <> 'tool' ORDER BY turn, id", (session,)))
     if not rows:
         return None
 
-    timeline = [{"turn": int(r[0]), "ts": int(r[1] or 0)} for r in rows]
+    opened = {int(r[0]) for r in rows if not r[4]}
+    timeline = []
+    for turn, ts, _agent, _project, reply in rows:
+        turn = int(turn)
+        if reply:
+            # _scan stores no row for empty text (codex's compaction recap), but the
+            # reply keeps that row's turn and ts, so the turn still opens and owns its events.
+            if turn in opened:
+                continue
+            opened.add(turn)
+        timeline.append({"turn": turn, "ts": int(ts or 0)})
     turns = [r["turn"] for r in timeline]
     agent = next((r[2] for r in rows if r[2]), "")
     project = next((r[3] for r in rows if r[3]), "")

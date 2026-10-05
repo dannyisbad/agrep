@@ -171,6 +171,25 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(error["requested_turn"], 999999)
         self.assertEqual(err, "")
 
+    def test_a_gap_inside_the_range_is_missing_not_out_of_range(self) -> None:
+        """Only a turn past either end is out of range; one between indexed turns
+        that the index does not hold is a gap, and the message says so."""
+        def gapped(session: str, center: int, radius: int) -> dict:
+            return _window(session, 299 if int(center) == 300 else center, radius)
+
+        with mock.patch.object(explore, "get_window", gapped):
+            rc, out, err = self._run([f"@{TWINS[0]}:300"])
+            self.assertEqual((rc, out), (2, ""))
+            self.assertEqual(
+                err, f"result handle is stale: turn 300 is missing from the index "
+                     f"(chat has turns 0-{LAST}); "
+                     "rerun the search for a current handle\n")
+            rc, out, err = self._run([TWINS[0], "300", "-C", "0"])
+        self.assertEqual(rc, 0)
+        self.assertIn(f"turn 300 is missing from the index - centered on 299 "
+                      f"(session has turns 0-{LAST}).", err.splitlines())
+        self.assertNotIn("out of range", err)
+
     def test_every_divergence_renders_one_decision(self) -> None:
         """The stderr sentence and the JSON field are the same string, so a
         rewording cannot leave the two surfaces disagreeing."""

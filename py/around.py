@@ -918,7 +918,7 @@ def _main(argv: list[str] | None = None) -> int:
             return _fail(
                 args.json, "stale-handle",
                 _stale_handle_reason(
-                    f"turn {center} is out of range "
+                    f"{surface.turn_not_served(center, w['first_turn'], w['last_turn'])} "
                     f"(chat has turns {w['first_turn']}-{w['last_turn']})"),
                 requested_turn=center,
                 first_turn=w["first_turn"], last_turn=w["last_turn"])

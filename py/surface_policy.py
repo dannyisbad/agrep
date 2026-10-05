@@ -2309,9 +2309,17 @@ def handle_filter_override(flags: Sequence[str],
     return line
 
 
+def turn_not_served(requested: int, first: int, last: int) -> str:
+    """Why a chat did not serve a turn: past either end, or a gap between indexed turns."""
+    if int(first) <= int(requested) <= int(last):
+        return f"turn {requested} is missing from the index"
+    return f"turn {requested} is out of range"
+
+
 AROUND_SERVICE_LINES: Mapping[str, Callable[[Mapping], str]] = MappingProxyType({
     "turn_clamped": lambda n: (
-        f"turn {n['requested']} is out of range - centered on {n['served']} "
+        f"{turn_not_served(n['requested'], n['first_turn'], n['last_turn'])} - "
+        f"centered on {n['served']} "
         f"(session has turns {n['first_turn']}-{n['last_turn']})."),
     "handle_unverified": lambda n: legacy_handle_unverified(),
     "handle_disambiguated": lambda n: (
