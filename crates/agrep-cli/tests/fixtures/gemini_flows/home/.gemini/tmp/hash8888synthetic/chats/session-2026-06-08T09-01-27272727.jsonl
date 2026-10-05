@@ -12,9 +12,11 @@
 {"id":"27272727-0000-4000-8000-000000000004","timestamp":"2026-06-08T09:05:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"shell-bison","name":"run_shell_command","args":{"command":"rm -r bison"},"result":[{"functionResponse":{"id":"shell-bison","name":"run_shell_command","response":{"output":"removed"}}}],"status":"success","timestamp":"2026-06-08T09:05:00.000Z","displayName":"run_shell_command","description":"run_shell_command tool","renderOutputAsMarkdown":false}]}
 {"id":"27272727-0000-4000-8000-000000000005","timestamp":"2026-06-08T09:05:00.000Z","type":"user","content":[{"functionResponse":{"id":"shell-bison","name":"run_shell_command","response":{"output":"removed"}}}]}
 {"$set":{"lastUpdated":"2026-06-08T09:05:00.000Z"}}
-{"$patch":{"updates":[{"id":"27272727-0000-4000-8000-000000000002","content":[{"text":"ok alpaca"}]}],"removeIds":["27272727-0000-4000-8000-000000000003","27272727-0000-4000-8000-000000000004","27272727-0000-4000-8000-000000000005"]}}
+{"id":"27272727-0000-4000-8000-000000000006","timestamp":"2026-06-08T09:05:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-06-08T09:05:00.000Z"}}
+{"$patch":{"updates":[{"id":"27272727-0000-4000-8000-000000000002","content":[{"text":"ok alpaca"}]}],"removeIds":["27272727-0000-4000-8000-000000000003","27272727-0000-4000-8000-000000000004","27272727-0000-4000-8000-000000000005","27272727-0000-4000-8000-000000000006"]}}
 {"$set":{"lastUpdated":"2026-06-08T09:06:00.000Z"}}
-{"id":"27272727-0000-4000-8000-000000000006","timestamp":"2026-06-08T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"27272727-0000-4000-8000-000000000007","timestamp":"2026-06-08T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
 {"$set":{"lastUpdated":"2026-06-08T09:07:00.000Z"}}
-{"id":"27272727-0000-4000-8000-000000000007","timestamp":"2026-06-08T09:08:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"27272727-0000-4000-8000-000000000008","timestamp":"2026-06-08T09:08:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-08T09:08:00.000Z"}}

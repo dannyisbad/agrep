@@ -10,18 +10,20 @@
 {"$set":{"lastUpdated":"2026-06-28T09:03:00.000Z"}}
 {"id":"6b6b6b6b-0000-4000-8000-000000000004","timestamp":"2026-06-28T09:04:00.000Z","type":"gemini","content":"ok alpaca","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-28T09:04:00.000Z"}}
+{"id":"6b6b6b6b-0000-4000-8000-000000000005","timestamp":"2026-06-28T09:04:00.000Z","type":"info","content":"Conversation checkpoint saved with tag: s6."}
+{"$set":{"lastUpdated":"2026-06-28T09:04:00.000Z"}}
 {"$rewindTo":"6b6b6b6b-0000-4000-8000-000000000001"}
 {"$rewindTo":"d04923d38bb0f6017037e74183378ef4"}
 {"$set":{"lastUpdated":"2026-06-28T09:05:00.000Z"}}
-{"id":"6b6b6b6b-0000-4000-8000-000000000005","timestamp":"2026-06-28T09:06:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
+{"id":"6b6b6b6b-0000-4000-8000-000000000006","timestamp":"2026-06-28T09:06:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
 {"$set":{"lastUpdated":"2026-06-28T09:06:00.000Z"}}
-{"id":"6b6b6b6b-0000-4000-8000-000000000006","timestamp":"2026-06-28T09:06:00.000Z","type":"gemini","content":[{"functionCall":{"id":"read-alpaca","name":"read_file","args":{"file_path":"alpaca.ts"}}}],"thoughts":[],"tokens":null}
+{"id":"6b6b6b6b-0000-4000-8000-000000000007","timestamp":"2026-06-28T09:06:00.000Z","type":"gemini","content":[{"functionCall":{"id":"read-alpaca","name":"read_file","args":{"file_path":"alpaca.ts"}}}],"thoughts":[],"tokens":null}
 {"$set":{"lastUpdated":"2026-06-28T09:06:00.000Z"}}
-{"id":"6b6b6b6b-0000-4000-8000-000000000007","timestamp":"2026-06-28T09:06:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-alpaca","name":"read_file","response":{"output":"export const alpaca = 1;"}}}]}
+{"id":"6b6b6b6b-0000-4000-8000-000000000008","timestamp":"2026-06-28T09:06:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-alpaca","name":"read_file","response":{"output":"export const alpaca = 1;"}}}]}
 {"$set":{"lastUpdated":"2026-06-28T09:06:00.000Z"}}
-{"id":"6b6b6b6b-0000-4000-8000-000000000008","timestamp":"2026-06-28T09:06:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
+{"id":"6b6b6b6b-0000-4000-8000-000000000009","timestamp":"2026-06-28T09:06:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
 {"$set":{"lastUpdated":"2026-06-28T09:06:00.000Z"}}
-{"id":"6b6b6b6b-0000-4000-8000-000000000009","timestamp":"2026-06-28T09:07:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"id":"6b6b6b6b-0000-4000-8000-000000000010","timestamp":"2026-06-28T09:07:00.000Z","type":"user","content":[{"text":"bison"}]}
 {"$set":{"lastUpdated":"2026-06-28T09:07:00.000Z"}}
-{"id":"6b6b6b6b-0000-4000-8000-000000000010","timestamp":"2026-06-28T09:08:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"6b6b6b6b-0000-4000-8000-000000000011","timestamp":"2026-06-28T09:08:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-28T09:08:00.000Z"}}

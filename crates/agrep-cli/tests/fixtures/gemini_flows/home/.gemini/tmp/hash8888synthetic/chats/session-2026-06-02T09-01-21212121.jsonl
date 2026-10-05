@@ -16,18 +16,22 @@
 {"id":"21212121-0000-4000-8000-000000000008","timestamp":"2026-06-02T09:06:00.000Z","type":"gemini","content":[{"text":"ok bison"}]}
 {"$patch":{"removeIds":["21212121-0000-4000-8000-000000000001","21212121-0000-4000-8000-000000000002","21212121-0000-4000-8000-000000000003","21212121-0000-4000-8000-000000000004"]}}
 {"$set":{"lastUpdated":"2026-06-02T09:06:00.000Z"}}
-{"id":"21212121-0000-4000-8000-000000000009","timestamp":"2026-06-02T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"21212121-0000-4000-8000-000000000009","timestamp":"2026-06-02T09:06:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
+{"$set":{"lastUpdated":"2026-06-02T09:06:00.000Z"}}
+{"id":"21212121-0000-4000-8000-000000000010","timestamp":"2026-06-02T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
 {"$set":{"lastUpdated":"2026-06-02T09:07:00.000Z"}}
-{"id":"21212121-0000-4000-8000-000000000010","timestamp":"2026-06-02T09:08:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"21212121-0000-4000-8000-000000000011","timestamp":"2026-06-02T09:08:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-02T09:08:00.000Z"}}
 {"$set":{"sessionId":"21212121-2001-4000-8000-212121212121"}}
-{"id":"21212121-0000-4000-8000-000000000011","timestamp":"2026-06-02T09:09:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>bison and cheetah</overall_goal>\n</state_snapshot>"}]}
-{"id":"21212121-0000-4000-8000-000000000012","timestamp":"2026-06-02T09:09:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}
-{"id":"21212121-0000-4000-8000-000000000013","timestamp":"2026-06-02T09:09:00.000Z","type":"user","content":[{"text":"cheetah"}]}
-{"id":"21212121-0000-4000-8000-000000000014","timestamp":"2026-06-02T09:09:00.000Z","type":"gemini","content":[{"text":"ok cheetah"}]}
-{"$patch":{"removeIds":["21212121-0000-4000-8000-000000000005","21212121-0000-4000-8000-000000000006","21212121-0000-4000-8000-000000000007","21212121-0000-4000-8000-000000000008","21212121-0000-4000-8000-000000000009","21212121-0000-4000-8000-000000000010"]}}
+{"id":"21212121-0000-4000-8000-000000000012","timestamp":"2026-06-02T09:09:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>bison and cheetah</overall_goal>\n</state_snapshot>"}]}
+{"id":"21212121-0000-4000-8000-000000000013","timestamp":"2026-06-02T09:09:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}
+{"id":"21212121-0000-4000-8000-000000000014","timestamp":"2026-06-02T09:09:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"21212121-0000-4000-8000-000000000015","timestamp":"2026-06-02T09:09:00.000Z","type":"gemini","content":[{"text":"ok cheetah"}]}
+{"$patch":{"removeIds":["21212121-0000-4000-8000-000000000005","21212121-0000-4000-8000-000000000006","21212121-0000-4000-8000-000000000007","21212121-0000-4000-8000-000000000008","21212121-0000-4000-8000-000000000009","21212121-0000-4000-8000-000000000010","21212121-0000-4000-8000-000000000011"]}}
 {"$set":{"lastUpdated":"2026-06-02T09:09:00.000Z"}}
-{"id":"21212121-0000-4000-8000-000000000015","timestamp":"2026-06-02T09:10:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"id":"21212121-0000-4000-8000-000000000016","timestamp":"2026-06-02T09:09:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
+{"$set":{"lastUpdated":"2026-06-02T09:09:00.000Z"}}
+{"id":"21212121-0000-4000-8000-000000000017","timestamp":"2026-06-02T09:10:00.000Z","type":"user","content":[{"text":"dingo"}]}
 {"$set":{"lastUpdated":"2026-06-02T09:10:00.000Z"}}
-{"id":"21212121-0000-4000-8000-000000000016","timestamp":"2026-06-02T09:11:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"21212121-0000-4000-8000-000000000018","timestamp":"2026-06-02T09:11:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-02T09:11:00.000Z"}}

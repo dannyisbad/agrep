@@ -17,11 +17,13 @@
 {"id":"63636363-0000-4000-8000-000000000008","timestamp":"2026-06-20T09:06:00.000Z","type":"gemini","content":[{"functionCall":{"id":"read-bison","name":"read_file","args":{"file_path":"bison.ts"}}}]}
 {"$patch":{"removeIds":["63636363-0000-4000-8000-000000000001","63636363-0000-4000-8000-000000000002","63636363-0000-4000-8000-000000000003","63636363-0000-4000-8000-000000000004"]}}
 {"$set":{"lastUpdated":"2026-06-20T09:06:00.000Z"}}
-{"id":"63636363-0000-4000-8000-000000000009","timestamp":"2026-06-20T09:06:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-bison","name":"read_file","response":{"output":"export const bison = 1;"}}}]}
+{"id":"63636363-0000-4000-8000-000000000009","timestamp":"2026-06-20T09:06:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
 {"$set":{"lastUpdated":"2026-06-20T09:06:00.000Z"}}
-{"id":"63636363-0000-4000-8000-000000000010","timestamp":"2026-06-20T09:07:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"63636363-0000-4000-8000-000000000010","timestamp":"2026-06-20T09:06:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-bison","name":"read_file","response":{"output":"export const bison = 1;"}}}]}
+{"$set":{"lastUpdated":"2026-06-20T09:06:00.000Z"}}
+{"id":"63636363-0000-4000-8000-000000000011","timestamp":"2026-06-20T09:07:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-20T09:07:00.000Z"}}
-{"id":"63636363-0000-4000-8000-000000000011","timestamp":"2026-06-20T09:08:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"63636363-0000-4000-8000-000000000012","timestamp":"2026-06-20T09:08:00.000Z","type":"user","content":[{"text":"cheetah"}]}
 {"$set":{"lastUpdated":"2026-06-20T09:08:00.000Z"}}
-{"id":"63636363-0000-4000-8000-000000000012","timestamp":"2026-06-20T09:09:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"63636363-0000-4000-8000-000000000013","timestamp":"2026-06-20T09:09:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-20T09:09:00.000Z"}}

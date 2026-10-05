@@ -16,12 +16,14 @@
 {"id":"29292929-0000-4000-8000-000000000008","timestamp":"2026-06-10T09:06:00.000Z","type":"gemini","content":[{"text":"ok bison"}]}
 {"$patch":{"removeIds":["29292929-0000-4000-8000-000000000001","29292929-0000-4000-8000-000000000002","29292929-0000-4000-8000-000000000003","29292929-0000-4000-8000-000000000004"]}}
 {"$set":{"lastUpdated":"2026-06-10T09:06:00.000Z"}}
-{"id":"29292929-0000-4000-8000-000000000009","timestamp":"2026-06-10T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"29292929-0000-4000-8000-000000000009","timestamp":"2026-06-10T09:06:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
+{"$set":{"lastUpdated":"2026-06-10T09:06:00.000Z"}}
+{"id":"29292929-0000-4000-8000-000000000010","timestamp":"2026-06-10T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
 {"$set":{"lastUpdated":"2026-06-10T09:07:00.000Z"}}
-{"id":"29292929-0000-4000-8000-000000000010","timestamp":"2026-06-10T09:08:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"29292929-0000-4000-8000-000000000011","timestamp":"2026-06-10T09:08:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-10T09:08:00.000Z"}}
 {"$rewindTo":"d04923d38bb0f6017037e74183378ef4"}
-{"id":"29292929-0000-4000-8000-000000000011","timestamp":"2026-06-10T09:10:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"id":"29292929-0000-4000-8000-000000000012","timestamp":"2026-06-10T09:10:00.000Z","type":"user","content":[{"text":"dingo"}]}
 {"$set":{"lastUpdated":"2026-06-10T09:10:00.000Z"}}
-{"id":"29292929-0000-4000-8000-000000000012","timestamp":"2026-06-10T09:11:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"29292929-0000-4000-8000-000000000013","timestamp":"2026-06-10T09:11:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-10T09:11:00.000Z"}}

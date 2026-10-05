@@ -20,14 +20,16 @@
 {"id":"2a2a2a2a-0000-4000-8000-000000000010","timestamp":"2026-06-11T09:08:00.000Z","type":"gemini","content":[{"text":"ok cheetah"}]}
 {"$patch":{"removeIds":["2a2a2a2a-0000-4000-8000-000000000001","2a2a2a2a-0000-4000-8000-000000000002","2a2a2a2a-0000-4000-8000-000000000003","2a2a2a2a-0000-4000-8000-000000000004","2a2a2a2a-0000-4000-8000-000000000005","2a2a2a2a-0000-4000-8000-000000000006"]}}
 {"$set":{"lastUpdated":"2026-06-11T09:08:00.000Z"}}
-{"id":"2a2a2a2a-0000-4000-8000-000000000011","timestamp":"2026-06-11T09:09:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"id":"2a2a2a2a-0000-4000-8000-000000000011","timestamp":"2026-06-11T09:08:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
+{"$set":{"lastUpdated":"2026-06-11T09:08:00.000Z"}}
+{"id":"2a2a2a2a-0000-4000-8000-000000000012","timestamp":"2026-06-11T09:09:00.000Z","type":"user","content":[{"text":"dingo"}]}
 {"$set":{"lastUpdated":"2026-06-11T09:09:00.000Z"}}
-{"id":"2a2a2a2a-0000-4000-8000-000000000012","timestamp":"2026-06-11T09:10:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"2a2a2a2a-0000-4000-8000-000000000013","timestamp":"2026-06-11T09:10:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-11T09:10:00.000Z"}}
 {"$rewindTo":"2a2a2a2a-0000-4000-8000-000000000007"}
 {"$rewindTo":"d04923d38bb0f6017037e74183378ef4"}
 {"$set":{"lastUpdated":"2026-06-11T09:11:00.000Z"}}
-{"id":"2a2a2a2a-0000-4000-8000-000000000013","timestamp":"2026-06-11T09:12:00.000Z","type":"user","content":[{"text":"elephant"}]}
+{"id":"2a2a2a2a-0000-4000-8000-000000000014","timestamp":"2026-06-11T09:12:00.000Z","type":"user","content":[{"text":"elephant"}]}
 {"$set":{"lastUpdated":"2026-06-11T09:12:00.000Z"}}
-{"id":"2a2a2a2a-0000-4000-8000-000000000014","timestamp":"2026-06-11T09:13:00.000Z","type":"gemini","content":"ok elephant","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"2a2a2a2a-0000-4000-8000-000000000015","timestamp":"2026-06-11T09:13:00.000Z","type":"gemini","content":"ok elephant","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-11T09:13:00.000Z"}}

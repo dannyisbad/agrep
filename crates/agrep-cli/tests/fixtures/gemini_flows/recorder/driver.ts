@@ -185,15 +185,40 @@ class Session {
   }
 
   /**
-   * A prompt whose tool call the person declines. useGeminiStream notes getHistory().length before
-   * sending (1742-1745 at fb972b2) and, with every tool cancelled, sets the history back to that
-   * length (2119-2140); coalesced, the first prompt is merged into the environment turn and stays.
+   * useHistory().addItem: every info, warning and error item the UI shows is recorded as a session
+   * message too (useHistoryManager.ts 91-124 at fb972b2), never part of the model's history.
    */
-  declined(text: string, callId: string, name: string, args: Record<string, unknown>): void {
+  notice(type: 'info' | 'warning' | 'error', text: string): void {
+    this.recorder.recordMessage({ model: undefined, type, content: text });
+  }
+
+  /** Esc while a tool runs: cancelOngoingRequest's notice (915-923), then the cancelled result. */
+  escTool(callId: string, name: string, args: Record<string, unknown>): void {
+    this.call(callId, name, args, CANCELLED, 'cancelled');
+    this.notice('info', 'Request cancelled.');
+    this.respond(callId, name, CANCELLED);
+  }
+
+  /**
+   * A prompt whose tool call the person declines. useGeminiStream notes getHistory().length before
+   * sending (1742-1745 at fb972b2) and, with every tool cancelled, records 'Request cancelled.'
+   * and sets the history back to that length when it is longer (2105-2147); coalesced, the first
+   * prompt is merged into the environment turn and stays. Auto-compression in the same turn
+   * (processTurn, client.ts 703) leaves it shorter, so nothing is rolled back.
+   */
+  async declined(
+    text: string,
+    callId: string,
+    name: string,
+    args: Record<string, unknown>,
+    compressed?: { goal: string; keep: number },
+  ): Promise<void> {
     const before = this.contents().length;
+    if (compressed) await this.compress(compressed.goal, compressed.keep);
     this.prompt(text);
     this.call(callId, name, args, DENIED, 'cancelled');
-    this.setHistory(this.contents().slice(0, before));
+    this.notice('info', 'Request cancelled.');
+    if (this.contents().length > before) this.setHistory(this.contents().slice(0, before));
   }
 
   /** sendMessageStream in IDE mode: the editor context goes in as its own turn (addHistory). */
@@ -203,10 +228,22 @@ class Session {
     this.history.push({ id, content: { role: 'user', parts } });
   }
 
-  /** The `finally` of sendMessageStream: abort or failure rolls back to before the prompt. */
+  /** Esc while a reply streams: the notice (915-923), then sendMessageStream's rollback. */
   abort(): void {
+    this.notice('info', 'Request cancelled.');
+    this.rollBack();
+  }
+
+  /** A failed request: the rollback, then handleErrorEvent's error item (1217-1238). */
+  fail(): void {
+    this.rollBack();
+    this.notice('error', '[API Error: The model is overloaded. Please try again later.]');
+  }
+
+  /** The `finally` of sendMessageStream: abort or failure rolls back to before the prompt. */
+  rollBack(): void {
     this.tick();
-    if (this.promptStart === undefined) throw new Error('no prompt to abort');
+    if (this.promptStart === undefined) throw new Error('no prompt to roll back');
     this.history = this.history.slice(0, this.promptStart);
     this.recorder.updateMessagesFromHistory(this.history);
     this.promptStart = undefined;
@@ -230,6 +267,12 @@ class Session {
       parts: structuredClone(turn.content.parts).map(rewrite),
     }));
     return this.coalesced ? coalesce(contents) : contents;
+  }
+
+  /** /chat save: the checkpoint, and the info item its result shows (chatCommand.ts 139-149). */
+  save(tag: string): Content[] {
+    this.notice('info', `Conversation checkpoint saved with tag: ${tag}.`);
+    return this.contents();
   }
 
   /** client.tryMaskToolOutputs and CONTENT_TRUNCATED: tool outputs replaced, then setHistory. */
@@ -258,6 +301,8 @@ class Session {
       ],
       { conversation, filePath },
     );
+    // handleChatCompressionEvent's item (1370-1398), recorded by the new chat's recorder
+    this.notice('info', 'Context compressed from 74% to 21%.');
   }
 
   /** rewindCommand: recorder.rewindTo, then client.setHistory(convertSessionToClientHistory). */
@@ -375,7 +420,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       plainTurn(s, 'bison');
-      const saved = s.contents();
+      const saved = s.save('s1');
       plainTurn(s, 'cheetah');
       plainTurn(s, 'dingo');
       s.setHistory(saved);
@@ -409,7 +454,7 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'alpaca');
       s.prompt('bison');
       // a failed typed send rolls back to its own start, which is where the prompt began
-      s.abort();
+      s.fail();
       plainTurn(s, 'cheetah');
     },
   },
@@ -494,8 +539,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       s.prompt('bison');
-      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
-      s.respond('read-bison', 'read_file', CANCELLED);
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
       plainTurn(s, 'cheetah');
       s.prompt('dingo');
       s.tool('todo-dingo', 'write_todos', { todos: [{ description: 'Drop the prod table', status: 'pending' }] }, 'Updated.');
@@ -509,8 +553,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       s.prompt('bison');
-      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
-      s.respond('read-bison', 'read_file', CANCELLED);
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
       plainTurn(s, 'cheetah');
       s.prompt('dingo');
       s.abort();
@@ -524,8 +567,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       s.prompt('bison');
-      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
-      s.respond('read-bison', 'read_file', CANCELLED);
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
       plainTurn(s, 'cheetah');
       s.mask(MASKED);
       plainTurn(s, 'dingo');
@@ -539,7 +581,7 @@ const SCENARIOS: Scenario[] = [
       s.prompt('fix a');
       s.tool('read-a', 'read_file', { file_path: 'a.ts' }, 'export const a = 1;');
       s.reply('Done.');
-      const saved = s.contents();
+      const saved = s.save('s2');
       s.prompt('fix b');
       s.tool('read-b', 'read_file', { file_path: 'b.ts' }, 'export const b = 1;');
       s.reply('Done.');
@@ -570,7 +612,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       toolTurn(s, 'bison');
-      const saved = s.contents();
+      const saved = s.save('s3');
       plainTurn(s, 'cheetah');
       await s.compress('cheetah only', 2);
       s.setHistory(saved);
@@ -585,7 +627,7 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'alpaca');
       plainTurn(s, 'bison');
       s.rewind(s.idOf('bison'));
-      const saved = s.contents();
+      const saved = s.save('s4');
       plainTurn(s, 'cheetah');
       await s.compress('cheetah only', 2);
       s.setHistory(saved);
@@ -612,8 +654,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       s.prompt('bison');
-      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
-      s.respond('read-bison', 'read_file', CANCELLED);
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
       plainTurn(s, 'cheetah');
       await s.resume();
       s.mask(MASKED);
@@ -644,8 +685,7 @@ const SCENARIOS: Scenario[] = [
     run: async (s) => {
       plainTurn(s, 'alpaca');
       s.prompt('bison');
-      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
-      s.respond('read-bison', 'read_file', CANCELLED);
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
       await s.resume();
       plainTurn(s, 'cheetah');
       await s.resume();
@@ -661,7 +701,7 @@ const SCENARIOS: Scenario[] = [
     expect: [user('bison'), recap('bison only'), user('cheetah'), user('alpaca'), user('dingo')],
     run: async (s) => {
       plainTurn(s, 'alpaca');
-      const saved = s.contents();
+      const saved = s.save('s5');
       s.mask(MASKED);
       plainTurn(s, 'bison');
       await s.compress('bison only', 2);
@@ -678,7 +718,7 @@ const SCENARIOS: Scenario[] = [
     expect: [user('alpaca'), user('bison')],
     run: async (s) => {
       toolTurn(s, 'alpaca');
-      const saved = s.contents();
+      const saved = s.save('s6');
       s.rewind(s.idOf('alpaca'));
       s.setHistory(saved);
       plainTurn(s, 'bison');
@@ -690,7 +730,7 @@ const SCENARIOS: Scenario[] = [
     name: 'decline_rewind',
     expect: [user('alpaca', ''), user('cheetah')],
     run: async (s) => {
-      s.declined('alpaca', 'shell-alpaca', 'run_shell_command', { command: 'rm -r alpaca' });
+      await s.declined('alpaca', 'shell-alpaca', 'run_shell_command', { command: 'rm -r alpaca' });
       plainTurn(s, 'bison');
       s.rewind(s.idOf('bison'));
       plainTurn(s, 'cheetah');
@@ -700,8 +740,8 @@ const SCENARIOS: Scenario[] = [
     name: 'decline_twice_rewind',
     expect: [user('alpaca', ''), user('bison', ''), user('dingo')],
     run: async (s) => {
-      s.declined('alpaca', 'shell-alpaca', 'run_shell_command', { command: 'rm -r alpaca' });
-      s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
+      await s.declined('alpaca', 'shell-alpaca', 'run_shell_command', { command: 'rm -r alpaca' });
+      await s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
       plainTurn(s, 'cheetah');
       s.rewind(s.idOf('cheetah'));
       plainTurn(s, 'dingo');
@@ -712,11 +752,42 @@ const SCENARIOS: Scenario[] = [
     expect: [user('alpaca'), user('bison', ''), user('dingo')],
     run: async (s) => {
       plainTurn(s, 'alpaca');
-      s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
+      await s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
       await s.resume();
       plainTurn(s, 'cheetah');
       s.rewind(s.idOf('cheetah'));
       plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // /rewind to the first prompt empties the context, so the decline's own rollback is a pure one
+    // that also removes the 'Request cancelled.' notice recorded after the declined turn
+    name: 'decline_after_rewind_first',
+    expect: [user('bison', ''), user('cheetah')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.rewind(s.idOf('alpaca'));
+      await s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // compression in the declined turn leaves it unrolled; an Esc'd prompt's rollback then takes
+    // the notice, and the person's /rewind ends on the declined turn yet undoes it
+    name: 'decline_compressed_esc_rewind',
+    expect: [user('alpaca'), user('bison'), user('cheetah'), recap('alpaca to cheetah'), user('fox')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      plainTurn(s, 'bison');
+      plainTurn(s, 'cheetah');
+      await s.declined('dingo', 'shell-dingo', 'run_shell_command', { command: 'rm -r dingo' }, {
+        goal: 'alpaca to cheetah',
+        keep: 2,
+      });
+      s.prompt('elephant');
+      s.abort();
+      s.rewind(s.idOf('dingo'));
+      plainTurn(s, 'fox');
     },
   },
 ];
@@ -726,12 +797,15 @@ for (const coalesced of [false, true]) {
   for (const [r, version] of VERSIONS.entries()) {
     const v = (coalesced ? VERSIONS.length : 0) + r;
     for (const [n, scenario] of SCENARIOS.entries()) {
-      // the first sixteen flows keep the ids their fixtures were recorded with
-      const code = n < 16 ? v * 16 + n : 0x40 + v * 16 + (n - 16);
+      // the first sixteen flows keep the ids their fixtures were recorded with; each block of
+      // sixteen after them has its own codes, and flows past the 31st day their own months
+      const block = Math.floor(n / 16);
+      const code = block === 0 ? v * 16 + n : 0x40 * block + v * 16 + (n % 16);
       const tag = `${code.toString(16).padStart(2, '0')}`.repeat(4);
       setIdPrefix(tag);
       const sessionId = `${tag}-${v}${n.toString(16).padStart(3, '0')}-4000-8000-${tag}${tag.slice(0, 4)}`;
-      const day = `2026-0${v + 4}-${String(n + 1).padStart(2, '0')}`;
+      const month = String(n < 31 ? v + 4 : v + 8).padStart(2, '0');
+      const day = `2026-${month}-${String(n < 31 ? n + 1 : n - 30).padStart(2, '0')}`;
       const ctx: Context = {
         promptId: sessionId,
         config: {

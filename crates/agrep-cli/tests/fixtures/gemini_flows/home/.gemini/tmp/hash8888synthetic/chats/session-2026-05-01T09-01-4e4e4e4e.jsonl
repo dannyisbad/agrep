@@ -10,26 +10,28 @@
 {"id":"4e4e4e4e-0000-4000-8000-000000000004","timestamp":"2026-05-01T09:05:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-05-01T09:05:00.000Z"}}
 {"id":"4e4e4e4e-0000-4000-8000-000000000004","timestamp":"2026-05-01T09:05:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"shell-bison","name":"run_shell_command","args":{"command":"rm -r bison"},"result":[{"functionResponse":{"id":"shell-bison","name":"run_shell_command","response":{"output":"[Operation Cancelled] Reason: User denied execution."}}}],"status":"cancelled","timestamp":"2026-05-01T09:05:00.000Z","displayName":"run_shell_command","description":"run_shell_command tool","renderOutputAsMarkdown":false}]}
-{"id":"4e4e4e4e-0000-4000-8000-000000000005","timestamp":"2026-05-01T09:06:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"id":"4e4e4e4e-0000-4000-8000-000000000005","timestamp":"2026-05-01T09:05:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-05-01T09:05:00.000Z"}}
+{"id":"4e4e4e4e-0000-4000-8000-000000000006","timestamp":"2026-05-01T09:06:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
 {"$set":{"lastUpdated":"2026-05-01T09:06:00.000Z"}}
-{"id":"4e4e4e4e-0000-4000-8000-000000000006","timestamp":"2026-05-01T09:06:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"id":"4e4e4e4e-0000-4000-8000-000000000007","timestamp":"2026-05-01T09:06:00.000Z","type":"user","content":[{"text":"alpaca"}]}
 {"$set":{"lastUpdated":"2026-05-01T09:06:00.000Z"}}
-{"id":"4e4e4e4e-0000-4000-8000-000000000007","timestamp":"2026-05-01T09:06:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
+{"id":"4e4e4e4e-0000-4000-8000-000000000008","timestamp":"2026-05-01T09:06:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
 {"$set":{"lastUpdated":"2026-05-01T09:06:00.000Z"}}
-{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4","4e4e4e4e-0000-4000-8000-000000000001","4e4e4e4e-0000-4000-8000-000000000002","4e4e4e4e-0000-4000-8000-000000000003","4e4e4e4e-0000-4000-8000-000000000004"]}}
+{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4","4e4e4e4e-0000-4000-8000-000000000001","4e4e4e4e-0000-4000-8000-000000000002","4e4e4e4e-0000-4000-8000-000000000003","4e4e4e4e-0000-4000-8000-000000000004","4e4e4e4e-0000-4000-8000-000000000005"]}}
 {"$set":{"lastUpdated":"2026-05-01T09:06:00.000Z"}}
 {"$set":{"sessionId":"4e4e4e4e-001e-4000-8000-4e4e4e4e4e4e"}}
 {"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-05-01T09:07:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
-{"$patch":{"removeIds":["4e4e4e4e-0000-4000-8000-000000000005"],"orderIds":["d04923d38bb0f6017037e74183378ef4","4e4e4e4e-0000-4000-8000-000000000006","4e4e4e4e-0000-4000-8000-000000000007"]}}
+{"$patch":{"removeIds":["4e4e4e4e-0000-4000-8000-000000000006"],"orderIds":["d04923d38bb0f6017037e74183378ef4","4e4e4e4e-0000-4000-8000-000000000007","4e4e4e4e-0000-4000-8000-000000000008"]}}
 {"$set":{"lastUpdated":"2026-05-01T09:07:00.000Z"}}
-{"id":"4e4e4e4e-0000-4000-8000-000000000008","timestamp":"2026-05-01T09:08:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"4e4e4e4e-0000-4000-8000-000000000009","timestamp":"2026-05-01T09:08:00.000Z","type":"user","content":[{"text":"cheetah"}]}
 {"$set":{"lastUpdated":"2026-05-01T09:08:00.000Z"}}
-{"id":"4e4e4e4e-0000-4000-8000-000000000009","timestamp":"2026-05-01T09:09:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"4e4e4e4e-0000-4000-8000-000000000010","timestamp":"2026-05-01T09:09:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-05-01T09:09:00.000Z"}}
-{"$rewindTo":"4e4e4e4e-0000-4000-8000-000000000008"}
+{"$rewindTo":"4e4e4e4e-0000-4000-8000-000000000009"}
 {"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4"]}}
 {"$set":{"lastUpdated":"2026-05-01T09:10:00.000Z"}}
-{"id":"4e4e4e4e-0000-4000-8000-000000000010","timestamp":"2026-05-01T09:11:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"id":"4e4e4e4e-0000-4000-8000-000000000011","timestamp":"2026-05-01T09:11:00.000Z","type":"user","content":[{"text":"dingo"}]}
 {"$set":{"lastUpdated":"2026-05-01T09:11:00.000Z"}}
-{"id":"4e4e4e4e-0000-4000-8000-000000000011","timestamp":"2026-05-01T09:12:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"4e4e4e4e-0000-4000-8000-000000000012","timestamp":"2026-05-01T09:12:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-05-01T09:12:00.000Z"}}

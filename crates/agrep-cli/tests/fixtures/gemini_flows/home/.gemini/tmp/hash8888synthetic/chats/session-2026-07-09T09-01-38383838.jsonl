@@ -7,7 +7,9 @@
 {"id":"38383838-0000-4000-8000-000000000003","timestamp":"2026-07-09T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
 {"$set":{"lastUpdated":"2026-07-09T09:04:00.000Z"}}
 {"$set":{"messages":[{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-07-09T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]},{"id":"38383838-0000-4000-8000-000000000001","timestamp":"2026-07-09T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]},{"id":"38383838-0000-4000-8000-000000000002","timestamp":"2026-07-09T09:03:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}],"lastUpdated":"2026-07-09T09:05:00.000Z"}}
-{"id":"38383838-0000-4000-8000-000000000004","timestamp":"2026-07-09T09:06:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"38383838-0000-4000-8000-000000000004","timestamp":"2026-07-09T09:05:00.000Z","type":"error","content":"[API Error: The model is overloaded. Please try again later.]"}
+{"$set":{"lastUpdated":"2026-07-09T09:05:00.000Z"}}
+{"id":"38383838-0000-4000-8000-000000000005","timestamp":"2026-07-09T09:06:00.000Z","type":"user","content":[{"text":"cheetah"}]}
 {"$set":{"lastUpdated":"2026-07-09T09:06:00.000Z"}}
-{"id":"38383838-0000-4000-8000-000000000005","timestamp":"2026-07-09T09:07:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"38383838-0000-4000-8000-000000000006","timestamp":"2026-07-09T09:07:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-07-09T09:07:00.000Z"}}

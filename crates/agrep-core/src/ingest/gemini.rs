@@ -141,15 +141,26 @@ fn past_injected(mut parts: &[Value]) -> &[Value] {
     parts
 }
 
+/// An info, warning or error item of the CLI's own: `useHistory().addItem` records every one as a
+/// session message (useHistoryManager.ts 91-124 at fb972b2), outside the model's history, so the
+/// next re-sync removes it.
+fn is_notice(message: &Value) -> bool {
+    matches!(
+        message.get("type").and_then(Value::as_str),
+        Some("info" | "error" | "warning")
+    )
+}
+
 /// A message upstream's `convertSessionToClientHistory` (sessionUtils.ts 110-228 at fb972b2) leaves
-/// out of the history it rebuilds on `/rewind` and `--resume`: info, error and warning notices, and
-/// user turns `isIgnoredUserContent` (97-105) rejects. That tests the trimmed
+/// out of the history it rebuilds on `/rewind` and `--resume`: notices, and user turns
+/// `isIgnoredUserContent` (97-105) rejects. That tests the trimmed
 /// `partListUnionToString`: `partToString` verbose (partUtils.ts 18-82), parts joined.
 fn conversion_skips(message: &Value) -> bool {
-    match message.get("type").and_then(Value::as_str) {
-        Some("info" | "error" | "warning") => return true,
-        Some("user") => {}
-        _ => return false,
+    if is_notice(message) {
+        return true;
+    }
+    if message.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
     }
     let mut text = String::new();
     for part in parts_of(message.get("content").unwrap_or(&Value::Null)) {
@@ -476,7 +487,7 @@ fn key_hash(key: &CopyKey) -> u64 {
 ///
 /// Two removals are neither, and their messages stay, as dropped: the re-sync right after a
 /// `/rewind`, which removes only what upstream's conversion of the rewound history skips (see
-/// `converting`), and a declined tool's rollback (see `declined`).
+/// `converting`), and a declined tool's rollback (see `declines`).
 ///
 /// Work stays linear in the file: each entry is keyed at most once as removed and once as a
 /// copy, and the map is a slot list compacted as removals accumulate and wherever the rollback
@@ -491,6 +502,8 @@ struct Fold {
     /// Upstream's context map: entry indices in its insertion order, `None` where one left.
     order: Vec<Option<usize>>,
     in_map: usize,
+    /// Map entries that are not notices (see `is_notice`).
+    turns_in_map: usize,
     /// Each id's newest entry.
     by_id: HashMap<String, usize>,
     /// Bumped by every record that is not a message: entries entering the map in the current
@@ -501,6 +514,10 @@ struct Fold {
     /// Map entries recorded before `mark`: none left after a re-sync means it re-recorded the
     /// whole context (`setHistory` with fresh ids: masking, truncation, `/chat resume`).
     before_mark: usize,
+    /// The epoch of the previous re-sync or `$rewindTo` that removed a message other than a notice
+    /// (see `declines`). A re-sync that only adds, as the `$set.messages` recorder writes on
+    /// compressing an empty context, leaves it, and the environment's stable id can re-enter after.
+    removal_epoch: Option<u64>,
     /// Set by a `$rewindTo` until the next record that is not a message. `/rewind` writes it, then
     /// re-syncs to `convertSessionToClientHistory` of what is left (rewindCommand.tsx 47-60 at
     /// fb972b2), so a re-sync then that removes only what the conversion skips is that one.
@@ -599,12 +616,20 @@ impl Fold {
                 .get_mut(index)
                 .filter(|entry| entry.state != State::Deleted)
             {
+                let was_turn = !is_notice(&entry.message);
                 entry.message = message;
+                let turn = !is_notice(&entry.message);
                 let revived = entry.state == State::Dropped;
                 if revived {
                     entry.state = State::Live;
                     entry.entered = epoch;
                     self.enter(index);
+                } else if was_turn != turn {
+                    self.turns_in_map = if turn {
+                        self.turns_in_map + 1
+                    } else {
+                        self.turns_in_map.saturating_sub(1)
+                    };
                 }
                 self.replay += 1;
                 return;
@@ -627,6 +652,9 @@ impl Fold {
             entry.slot = Some(self.order.len());
             self.order.push(Some(index));
             self.in_map += 1;
+            if !is_notice(&entry.message) {
+                self.turns_in_map += 1;
+            }
             if index < self.mark {
                 self.before_mark += 1;
             }
@@ -634,13 +662,17 @@ impl Fold {
     }
 
     fn leave(&mut self, index: usize) {
-        let slot = self
-            .entries
-            .get_mut(index)
-            .and_then(|entry| entry.slot.take());
+        let Some(entry) = self.entries.get_mut(index) else {
+            return;
+        };
+        let slot = entry.slot.take();
+        let turn = !is_notice(&entry.message);
         if let Some(cell) = slot.and_then(|slot| self.order.get_mut(slot)) {
             *cell = None;
             self.in_map = self.in_map.saturating_sub(1);
+            if turn {
+                self.turns_in_map = self.turns_in_map.saturating_sub(1);
+            }
             if index < self.mark {
                 self.before_mark = self.before_mark.saturating_sub(1);
             }
@@ -706,8 +738,10 @@ impl Fold {
             .flatten()
             .copied()
             .collect();
-        let kept = (converting && self.only_conversion_skips(&undone))
-            || undone.last().is_some_and(|index| self.declined(*index));
+        let kept = (converting && self.only_conversion_skips(&undone)) || self.declines(&undone);
+        if undone.iter().any(|index| self.is_turn(*index)) {
+            self.removal_epoch = Some(self.epoch);
+        }
         if kept {
             for index in &undone {
                 self.leave(*index);
@@ -734,10 +768,39 @@ impl Fold {
             })
     }
 
-    /// A model turn whose tool calls the person declined. With every declinable call cancelled,
-    /// useGeminiStream sets the history back to its length before the prompt (2105-2140 at
-    /// fb972b2): that leaves this turn last in the map only when it rolls back everything since,
-    /// as an abort would when nothing came before the prompt. A declined turn stays, as dropped.
+    /// A pure rollback that is a declined tool's, not a person's `/rewind` or an abort: with every
+    /// declinable call cancelled, useGeminiStream records 'Request cancelled.' and then sets the
+    /// history back to its length before the prompt (2105-2147 at fb972b2). Only an empty context
+    /// makes that a rollback rather than a rewrite. So past notices it ends on the declined turn,
+    /// removes only messages that entered the map since the previous removal, and leaves nothing
+    /// but notices. When compression shortened the history in the same turn upstream skips it
+    /// (2135), and the declined turn can later end a person's `/rewind`: the last two conditions
+    /// tell that apart.
+    fn declines(&self, removed: &[usize]) -> bool {
+        let turns: Vec<usize> = removed
+            .iter()
+            .copied()
+            .filter(|index| self.is_turn(*index))
+            .collect();
+        let since = |index: &usize| {
+            let entered = self.entries.get(*index).map(|entry| entry.entered);
+            self.removal_epoch
+                .is_none_or(|epoch| entered.is_some_and(|entered| entered > epoch))
+        };
+        turns.last().is_some_and(|index| self.declined(*index))
+            && turns.iter().all(since)
+            && self.turns_in_map == turns.len()
+    }
+
+    /// Any message but a notice.
+    fn is_turn(&self, index: usize) -> bool {
+        self.entries
+            .get(index)
+            .is_some_and(|entry| !is_notice(&entry.message))
+    }
+
+    /// A model turn whose tool calls the person declined: every declinable one cancelled, or
+    /// every one. `isTopicTool` (125-126): the person never gets to decline that one.
     fn declined(&self, index: usize) -> bool {
         let Some(message) = self.entries.get(index).map(|entry| &entry.message) else {
             return false;
@@ -748,7 +811,6 @@ impl Fold {
         };
         let cancelled =
             |call: &&Value| call.get("status").and_then(Value::as_str) == Some("cancelled");
-        // `isTopicTool` (125-126): the person never gets to decline it
         let topic = |call: &&Value| {
             let name = call.get("name").and_then(Value::as_str);
             matches!(name, Some("update_topic" | "Update Topic Context"))
@@ -841,7 +903,6 @@ impl Fold {
         let removed: Vec<usize> = removed.into_iter().map(|(_, index)| index).collect();
         let gone: HashSet<usize> = removed.iter().copied().collect();
         let mut tail: HashSet<usize> = HashSet::new();
-        let mut tail_end = None;
         let converted = converting && self.only_conversion_skips(&removed);
         let mut copies: Vec<(usize, usize)> = Vec::new();
         if !removed.is_empty() && !converted {
@@ -856,7 +917,6 @@ impl Fold {
                     None => gaps = true,
                     Some(index) if self.entered_now(index) => {}
                     Some(index) if gone.contains(&index) => {
-                        tail_end.get_or_insert(index);
                         tail.insert(index);
                     }
                     Some(_) => break,
@@ -867,7 +927,7 @@ impl Fold {
             if gaps {
                 self.compact_from(from);
             }
-            if tail_end.is_some_and(|index| self.declined(index)) {
+            if self.declines(&removed) {
                 tail.clear();
             }
         }
@@ -896,6 +956,9 @@ impl Fold {
         }
         self.tidy();
         if !removed.is_empty() {
+            if removed.iter().any(|index| self.is_turn(*index)) {
+                self.removal_epoch = Some(self.epoch);
+            }
             let last = self.order.iter().rev().flatten().next().copied();
             let mut dropped = removed;
             if !tail.is_empty() && !last.is_some_and(|index| self.entered_now(index)) {
@@ -903,23 +966,28 @@ impl Fold {
                 self.undo(tail.into_iter().collect());
             }
             let copies: Vec<usize> = copies.into_iter().map(|(_, index)| index).collect();
+            // a copy never repeats a notice, and one between two user turns would split their run
+            let (turns, notices): (Vec<usize>, Vec<usize>) =
+                dropped.into_iter().partition(|index| self.is_turn(*index));
             let keys: Vec<Option<CopyKey>> =
-                dropped.iter().map(|index| self.copy_key(*index)).collect();
+                turns.iter().map(|index| self.copy_key(*index)).collect();
             let whole = self.before_mark == 0;
-            self.pair(&dropped, &keys, &copies, whole);
-            self.mark_dropped(&dropped, &keys);
+            self.pair(&turns, &keys, &copies, whole);
+            self.mark_dropped(&turns, &keys);
+            self.mark_dropped(&notices, &[]);
             self.tidy();
         }
         self.set_mark();
     }
 
-    /// Mark messages already out of the map dropped, and pool them for later whole rewrites.
+    /// Mark messages already out of the map dropped, and pool them, by `keys` where given, for
+    /// later whole rewrites.
     fn mark_dropped(&mut self, dropped: &[usize], keys: &[Option<CopyKey>]) {
-        for (index, key) in dropped.iter().zip(keys) {
+        for (position, index) in dropped.iter().enumerate() {
             if let Some(entry) = self.entries.get_mut(*index) {
                 entry.state = State::Dropped;
             }
-            if let Some(key) = key {
+            if let Some(Some(key)) = keys.get(position) {
                 self.dropped
                     .entry(key_hash(key))
                     .or_default()
@@ -1859,7 +1927,7 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
-        assert_eq!(files.len(), 124);
+        assert_eq!(files.len(), 132);
         let mut failures = Vec::new();
         for path in files {
             let (messages, _, tally) = parse(&path);
@@ -2012,16 +2080,19 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
     }
 
-    /// A declined tool sets the history back to before its prompt. Coalesced, the first prompt
-    /// stays in the environment's copy, which `/rewind`'s conversion then leaves out of the map
-    /// with a `$rewindTo` of its own; and with nothing before the prompt the decline itself rolls
-    /// everything back. Neither is the person undoing the prompt. A second `/rewind` still is.
+    /// A declined tool sets the history back to before its prompt, after the UI records
+    /// 'Request cancelled.'. Coalesced, the first prompt stays in the environment's copy, which
+    /// `/rewind`'s conversion then leaves out with a `$rewindTo` of its own; with nothing before
+    /// the prompt the decline itself rolls everything back. Neither is the person undoing it. A
+    /// person's `/rewind`, also one ending on a declined turn the CLI never rolled back, still is.
     #[test]
     fn declined_prompts_survive_the_rollbacks_around_them() {
         let root = temp_root("declined");
         let env = r#"{"text":"<session_context>\nx\n</session_context>"}"#;
         let declined =
             r#""toolCalls":[{"id":"t1","name":"run_shell_command","status":"cancelled"}]"#;
+        let notice =
+            |id: &str| format!(r#"{{"id":"{id}","type":"info","content":"Request cancelled."}}"#);
         let flows = [
             (
                 vec![
@@ -2030,9 +2101,10 @@ mod tests {
                     r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
                     r#"{"$set":{"lastUpdated":"2026-04-28T09:01:00.000Z"}}"#.to_string(),
                     format!(r#"{{"id":"g1","type":"gemini","content":"",{declined}}}"#),
+                    notice("n1"),
                     format!(r#"{{"id":"c1","type":"user","content":[{env},{{"text":"alpaca"}}]}}"#),
                     r#"{"$set":{"lastUpdated":"2026-04-28T09:02:00.000Z"}}"#.to_string(),
-                    r#"{"$patch":{"removeIds":["env","u1","g1"]}}"#.to_string(),
+                    r#"{"$patch":{"removeIds":["env","u1","g1","n1"]}}"#.to_string(),
                     r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
                     r#"{"$set":{"lastUpdated":"2026-04-28T09:03:00.000Z"}}"#.to_string(),
                     r#"{"$rewindTo":"u2"}"#.to_string(),
@@ -2043,10 +2115,13 @@ mod tests {
             ),
             (
                 vec![
+                    r#"{"id":"n0","type":"info","content":"No conversation found to save."}"#
+                        .to_string(),
                     r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
                     r#"{"$set":{"lastUpdated":"2026-04-28T09:01:00.000Z"}}"#.to_string(),
                     format!(r#"{{"id":"g1","type":"gemini","content":"",{declined}}}"#),
-                    r#"{"$rewindTo":"u1"}"#.to_string(),
+                    notice("n1"),
+                    r#"{"$rewindTo":"n0"}"#.to_string(),
                     r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
                 ],
                 vec!["alpaca", "bison"],
@@ -2061,6 +2136,34 @@ mod tests {
                     r#"{"$rewindTo":"u2"}"#.to_string(),
                 ],
                 vec!["alpaca"],
+            ),
+            (
+                vec![
+                    r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                    r#"{"id":"a1","type":"gemini","content":"ok alpaca"}"#.to_string(),
+                    r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+                    format!(r#"{{"id":"g2","type":"gemini","content":"",{declined}}}"#),
+                    notice("n2"),
+                    r#"{"$rewindTo":"u2"}"#.to_string(),
+                    r#"{"id":"u3","type":"user","content":[{"text":"cheetah"}]}"#.to_string(),
+                ],
+                vec!["alpaca", "cheetah"],
+            ),
+            (
+                vec![
+                    r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                    r#"{"id":"a1","type":"gemini","content":"ok alpaca"}"#.to_string(),
+                    r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+                    format!(r#"{{"id":"g2","type":"gemini","content":"",{declined}}}"#),
+                    notice("n2"),
+                    r#"{"id":"u3","type":"user","content":[{"text":"cheetah"}]}"#.to_string(),
+                    notice("n3"),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:05:00.000Z"}}"#.to_string(),
+                    r#"{"$patch":{"removeIds":["n2","u3","n3"]}}"#.to_string(),
+                    r#"{"$rewindTo":"u2"}"#.to_string(),
+                    r#"{"id":"u4","type":"user","content":[{"text":"dingo"}]}"#.to_string(),
+                ],
+                vec!["alpaca", "dingo"],
             ),
         ];
         for (n, (lines, want)) in flows.into_iter().enumerate() {

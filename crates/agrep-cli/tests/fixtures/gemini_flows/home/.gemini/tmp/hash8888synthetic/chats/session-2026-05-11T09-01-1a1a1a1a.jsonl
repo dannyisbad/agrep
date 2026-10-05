@@ -14,13 +14,15 @@
 {"$set":{"lastUpdated":"2026-05-11T09:07:00.000Z"}}
 {"$set":{"sessionId":"1a1a1a1a-100a-4000-8000-1a1a1a1a1a1a"}}
 {"$set":{"messages":[{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-05-11T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]},{"id":"1a1a1a1a-0000-4000-8000-000000000007","timestamp":"2026-05-11T09:08:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca to cheetah</overall_goal>\n</state_snapshot>"}]},{"id":"1a1a1a1a-0000-4000-8000-000000000008","timestamp":"2026-05-11T09:08:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]},{"id":"1a1a1a1a-0000-4000-8000-000000000009","timestamp":"2026-05-11T09:08:00.000Z","type":"user","content":[{"text":"cheetah"}]},{"id":"1a1a1a1a-0000-4000-8000-000000000010","timestamp":"2026-05-11T09:08:00.000Z","type":"gemini","content":[{"text":"ok cheetah"}]}],"lastUpdated":"2026-05-11T09:08:00.000Z"}}
-{"id":"1a1a1a1a-0000-4000-8000-000000000011","timestamp":"2026-05-11T09:09:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"id":"1a1a1a1a-0000-4000-8000-000000000011","timestamp":"2026-05-11T09:08:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
+{"$set":{"lastUpdated":"2026-05-11T09:08:00.000Z"}}
+{"id":"1a1a1a1a-0000-4000-8000-000000000012","timestamp":"2026-05-11T09:09:00.000Z","type":"user","content":[{"text":"dingo"}]}
 {"$set":{"lastUpdated":"2026-05-11T09:09:00.000Z"}}
-{"id":"1a1a1a1a-0000-4000-8000-000000000012","timestamp":"2026-05-11T09:10:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"1a1a1a1a-0000-4000-8000-000000000013","timestamp":"2026-05-11T09:10:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-05-11T09:10:00.000Z"}}
 {"$rewindTo":"1a1a1a1a-0000-4000-8000-000000000007"}
 {"$set":{"messages":[],"lastUpdated":"2026-05-11T09:11:00.000Z"}}
-{"id":"1a1a1a1a-0000-4000-8000-000000000013","timestamp":"2026-05-11T09:12:00.000Z","type":"user","content":[{"text":"elephant"}]}
+{"id":"1a1a1a1a-0000-4000-8000-000000000014","timestamp":"2026-05-11T09:12:00.000Z","type":"user","content":[{"text":"elephant"}]}
 {"$set":{"lastUpdated":"2026-05-11T09:12:00.000Z"}}
-{"id":"1a1a1a1a-0000-4000-8000-000000000014","timestamp":"2026-05-11T09:13:00.000Z","type":"gemini","content":"ok elephant","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"1a1a1a1a-0000-4000-8000-000000000015","timestamp":"2026-05-11T09:13:00.000Z","type":"gemini","content":"ok elephant","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-05-11T09:13:00.000Z"}}

@@ -3,9 +3,11 @@
 {"$set":{"lastUpdated":"2026-06-07T09:01:00.000Z"}}
 {"id":"26262626-0000-4000-8000-000000000001","timestamp":"2026-06-07T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
 {"$set":{"lastUpdated":"2026-06-07T09:02:00.000Z"}}
+{"id":"26262626-0000-4000-8000-000000000002","timestamp":"2026-06-07T09:02:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-06-07T09:02:00.000Z"}}
 {"$rewindTo":"26262626-0000-4000-8000-000000000001"}
 {"$set":{"lastUpdated":"2026-06-07T09:03:00.000Z"}}
-{"id":"26262626-0000-4000-8000-000000000002","timestamp":"2026-06-07T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"id":"26262626-0000-4000-8000-000000000003","timestamp":"2026-06-07T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
 {"$set":{"lastUpdated":"2026-06-07T09:04:00.000Z"}}
-{"id":"26262626-0000-4000-8000-000000000003","timestamp":"2026-06-07T09:05:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"id":"26262626-0000-4000-8000-000000000004","timestamp":"2026-06-07T09:05:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
 {"$set":{"lastUpdated":"2026-06-07T09:05:00.000Z"}}
