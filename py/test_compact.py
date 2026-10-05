@@ -2660,6 +2660,55 @@ class RecallTests(unittest.TestCase):
         hits = json.loads(out)["hits"]
         self.assertEqual([h["turn"] for h in hits], [150])
 
+    def _recall_handle(self, handle: str, centers) -> tuple[int, str, str]:
+        """Run recall on one result handle; ``centers`` maps (call, turn) to the served turn."""
+        full = "0199bbbb-0000-7000-8000-000000000003"
+        calls = []
+
+        def get_windows(reqs):
+            calls.append(None)
+            out = []
+            for _, turn, _ in reqs:
+                served = centers(len(calls), turn)
+                out.append({"session": full, "center": served, "first_turn": 0,
+                            "last_turn": 209, "agent": "claude", "project": "p",
+                            "events": [],
+                            "turns": [{"turn": served, "who": "user", "ts": 1,
+                                       "text": "body", "reply": ""}]})
+            return out
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(recall.indexd_runtime, "ensure_index",
+                               lambda auto=True, **_kw: True), \
+                mock.patch.object(recall.explore, "resolve_session", lambda q: [full]), \
+                mock.patch.object(recall.explore, "get_windows", get_windows), \
+                mock.patch.object(recall.corpusdb, "connect", lambda **kw: None), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = recall.main([handle, "--json"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_stale_handle_between_indexed_turns_is_missing_not_out_of_range(self) -> None:
+        # turn 150 sits inside 0-209 but the index no longer holds it: the window
+        # recenters on 149, and the refusal names a gap rather than a range miss
+        rc, out, err = self._recall_handle(
+            "@0199bbbb:150", lambda _call, turn: 149 if turn == 150 else turn)
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error"]["code"], "stale-result-handle")
+        self.assertIn("result handle turn 150 is missing from the index "
+                      "(session has turns 0-209) - the handle is stale", err)
+        self.assertNotIn("out of range", err)
+
+    def test_handle_window_moving_to_a_gap_after_resolution_is_missing(self) -> None:
+        # the handle resolves, then the recall window read recenters it: the
+        # second refusal names the in-range gap the same way
+        rc, out, err = self._recall_handle(
+            "@0199bbbb:150", lambda call, turn: turn if call == 1 else 151)
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error"]["code"], "stale-result-handle")
+        self.assertIn("result handle turn 150 is missing from the index "
+                      "(session has turns 0-209) - the handle is stale", err)
+        self.assertNotIn("out of range", err)
+
     def test_fit_json_shrink_keeps_around_marker(self) -> None:
         sess = "abcdef01-2345-6789-abcd-ef0123456789"
         row = {"kind": "msg", "session": sess, "project": "p", "turn": 7,

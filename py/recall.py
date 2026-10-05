@@ -1590,7 +1590,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                             reason=reason)
                 return 2
             if int(window.get("center", -1)) != turn:
-                reason = (f"result handle turn {turn} is out of range "
+                unserved = surface.turn_not_served(
+                    turn, window["first_turn"], window["last_turn"])
+                reason = (f"result handle {unserved} "
                           f"(session has turns {window['first_turn']}-"
                           f"{window['last_turn']}) - "
                           f"{surface.stale_handle_recovery(common.cli_name())}")
@@ -2390,7 +2392,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         # @handles are stored references agents replay: serving the nearest real
         # turn as if it matched would silently rewrite saved content (around's rule)
         w = pairs[0][1]
-        common.log(f"result handle turn {direct_hit['turn']} is out of range "
+        unserved = surface.turn_not_served(
+            direct_hit["turn"], w["first_turn"], w["last_turn"])
+        common.log(f"result handle {unserved} "
                    f"(session has turns {w['first_turn']}-{w['last_turn']}) - "
                    f"{surface.stale_handle_recovery(common.cli_name())}")
         _json_error(

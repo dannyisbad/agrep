@@ -1014,6 +1014,76 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                         {"a"},
                     )
 
+    def test_database_without_recap_rows_converges_on_its_next_refresh(self) -> None:
+        import why
+
+        def message(session: str, turn: int, text: str, who: str = "user") -> str:
+            return json.dumps({"id": f"codex:{session}:{turn}", "session": session,
+                               "agent": "codex", "turn": turn, "ts": turn + 1,
+                               "who": who, "text": text}) + "\n"
+
+        def why_facts() -> tuple[dict, str]:
+            """What `why` compares: stored rows against the rows the sources publish."""
+            with closing(sqlite3.connect(corpusdb.DB_PATH)) as db:
+                stored = why._stored_rows(db, "old", {})
+                first = why._stored_candidate(db, "old")["first_text"]
+            diff = why._row_diff(stored, corpusdb._scan(only={"old"})["old"])
+            return {key: diff[key] for key in ("current", "missing", "extra")}, first
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            messages = root / "messages.jsonl"
+            # "old" opens on a compaction recap, the way a resumed codex rollout does
+            messages.write_text(
+                message("old", 0, "", "recap") + message("old", 1, "needle old")
+                + message("live", 0, "needle live"), encoding="utf-8")
+            self._publish_families(root, [{"session": "old"}, {"session": "live"}])
+            patches = self._paths(root)
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4], patches[5], patches[6]:
+                corpusdb._build(corpusdb.DB_PATH, corpusdb._stamp())
+                # what a build from before the recap row shape published: no empty row, the
+                # signature of the rows it did store, no row_shape
+                stored = [row for row in corpusdb._scan()["old"] if row[9]]
+                with closing(sqlite3.connect(corpusdb.DB_PATH)) as db:
+                    db.execute("DELETE FROM msgs WHERE who='recap'")
+                    db.execute("UPDATE session_sig SET sig=? WHERE session='old'",
+                               (corpusdb._session_sig(stored),))
+                    db.execute("DELETE FROM meta WHERE key='row_shape'")
+                    db.commit()
+                none, one = {"text": 0, "tool": 0}, {"text": 1, "tool": 0}
+                self.assertEqual(why_facts(), (
+                    {"current": False, "missing": one, "extra": none}, "needle old"))
+
+                def refresh_after_live_moves(turn: int) -> list:
+                    with messages.open("a", encoding="utf-8") as stream:
+                        stream.write(message("live", turn, f"needle live {turn}"))
+                    self._publish_families(
+                        root, [{"session": "old"}, {"session": "live"}], f"{3 + turn}:moved")
+                    corpusdb.CHANGED_PATH.write_text("live\n", encoding="utf-8")
+                    with mock.patch.object(corpusdb, "_scan", wraps=corpusdb._scan) as scan:
+                        refreshed = corpusdb._incremental(corpusdb._stamp())
+                    self.assertIsNotNone(refreshed)
+                    refreshed.close()
+                    return [call.kwargs.get("only") for call in scan.call_args_list]
+
+                # only another session moved, yet the untouched one gains its recap row
+                self.assertEqual(refresh_after_live_moves(1), [None])
+                with closing(sqlite3.connect(corpusdb.DB_PATH)) as db:
+                    recaps = db.execute(
+                        "SELECT session, turn, text FROM msgs WHERE who='recap'").fetchall()
+                    shape = db.execute(
+                        "SELECT value FROM meta WHERE key='row_shape'").fetchone()
+                    sig = db.execute(
+                        "SELECT sig FROM session_sig WHERE session='old'").fetchone()
+                self.assertEqual(recaps, [("old", 0, "")])
+                self.assertEqual(shape, (corpusdb._ROW_SHAPE,))
+                self.assertEqual(sig, (corpusdb._session_sig(corpusdb._scan()["old"]),))
+                self.assertEqual(why_facts(), (
+                    {"current": True, "missing": none, "extra": none}, "needle old"))
+                # converged once: the next named delta parses only the session it names
+                self.assertEqual(refresh_after_live_moves(2), [{"live"}])
+
     def test_non_family_rewrite_preserves_the_logical_family_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

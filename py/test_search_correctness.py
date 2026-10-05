@@ -139,6 +139,68 @@ class SearchCorrectnessTests(unittest.TestCase):
                 rows = corpusdb._scan()["s"]
         self.assertEqual([row[8] for row in rows], ["user", "recap"])
 
+    def test_empty_recap_row_is_indexed_but_never_a_search_document(self) -> None:
+        # codex writes each compaction as a recap row with no text: the search db keeps
+        # that row as the boundary, yet every engine must still see the same documents
+        def message(turn: int, who: str, text: str, model: str = "gpt-5") -> dict:
+            return {"id": f"codex:s:{turn}", "session": "s", "agent": "codex",
+                    "project": "p", "turn": turn, "ts": 10 * (turn + 1), "who": who,
+                    "text": text, "model": model,
+                    "model_source": "recap" if who == "recap" else "explicit"}
+
+        messages = [message(0, "user", "tune the heron cache eviction"),
+                    message(1, "recap", "", "<recap>"),
+                    message(2, "user", ""),
+                    message(3, "user", "heron cache sizing numbers")]
+        replies = {"codex:s:1": "heron eviction now uses a clock hand",
+                   "codex:s:2": "heron answered from an empty prompt"}
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary)
+            (data / "messages.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
+            (data / "replies.jsonl").write_text(
+                "".join(json.dumps({"id": key, "reply": value}) + "\n"
+                        for key, value in replies.items()), encoding="utf-8")
+            with mock.patch.object(common, "DATA_DIR", data), \
+                    mock.patch.object(common, "MESSAGES_PATH", data / "messages.jsonl"), \
+                    mock.patch.object(common, "setting", return_value="off"):
+                rows = corpusdb._scan()["s"]
+        self.assertEqual([(row[1], row[8], row[9]) for row in rows if not row[9]],
+                         [(1, "recap", "")])
+        self.assertEqual([(row[1], row[8]) for row in rows],
+                         [(0, "user"), (1, "recap"), (1, "agent"), (2, "agent"), (3, "user")])
+
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.executescript(corpusdb._SCHEMA_SQL)
+        corpusdb._insert_index_rows(db, rows)
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        db.execute("INSERT INTO msgs_prose_fts(rowid,text) "
+                   "SELECT id,text FROM msgs WHERE who <> 'tool'")
+        published = {
+            key: {"reply": value, "content_digest": compact.content_digest(value)}
+            for key, value in replies.items()}
+
+        def shape(hits: list[dict], *extra: str) -> list[tuple]:
+            return sorted((hit["turn"], hit["who"], *(hit[key] for key in extra))
+                          for hit in hits)
+
+        with mock.patch.object(explore, "_messages_by_session", return_value={"s": messages}), \
+                mock.patch.object(explore, "_reply_records_by_id", return_value=published), \
+                mock.patch.object(explore, "_session_concept", return_value={}), \
+                mock.patch.object(common, "setting", return_value="off"):
+            for pattern in ("^", "z*", "heron"):
+                with self.subTest(pattern=pattern):
+                    indexed = shape(corpusdb.regex(db, pattern, 99)["hits"])
+                    self.assertEqual(indexed, shape(search._regex_scan(pattern, 99)["hits"]))
+                    self.assertEqual(len(indexed), 4)
+                    self.assertNotIn("recap", {who for _turn, who in indexed})
+            terms = ["heron", "cache", "sizing"]
+            indexed = shape(corpusdb.content(db, " ".join(terms), 99)["hits"], "coverage")
+            self.assertEqual(indexed,
+                             shape(search._content_scan(terms, 99)["hits"], "coverage"))
+            self.assertEqual(len(indexed), 4)
+
     def test_stream_row_who_reads_the_streamed_field_fail_closed(self) -> None:
         # No prose mirror: the streamed row's own
         # normalize-pass `who` decides, and anything else stays unknown.

@@ -1138,5 +1138,185 @@ class PublishedAbsenceProofTests(unittest.TestCase):
             "publication-covered")
 
 
+CODEX_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "codex_compaction"
+CODEX_COMPACTED = "7b7b7b7b-0611-4000-8000-000000000611"
+CODEX_TAIL = [
+    (0, "user", "Migrate the walrus importer to the streaming parser."),
+    (0, "agent", "Two walrus fixtures still fail on the streaming parser; the rest import."),
+    (1, "user", "Benchmark the walrus importer against the old parser."),
+]
+
+
+class _IndexedCodexCompaction:
+    """Black-box: the real ingest indexes a codex rollout that compacted mid-turn, and the
+    search db is built from that publication, never from hand-inserted rows. codex writes
+    the compaction as an empty recap row; every read path must find the boundary there."""
+
+    REPLIED = False
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        binary = Path(os.environ.get("AGREP_RS_BIN") or repo / "target" / "release" / (
+            "agrep-rs.exe" if os.name == "nt" else "agrep-rs"))
+        if not binary.is_file():
+            raise unittest.SkipTest("release ingest binary is required")
+        temp = tempfile.TemporaryDirectory(prefix="agrep-codex-compaction-")
+        cls.addClassCleanup(temp.cleanup)
+        root = Path(temp.name)
+        home, cls.data = root / "home", root / "data"
+        source = next(CODEX_FIXTURE.glob("rollout-*.jsonl"))
+        rollout = home / ".codex" / "sessions" / "2026" / "06" / "11" / source.name
+        rollout.parent.mkdir(parents=True)
+        rollout.write_bytes(source.read_bytes())
+        cls.data.mkdir()
+        (cls.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
+        cls.env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGREP_", "CODEX_", "CLAUDE_"))
+                   and key != "PYTHONPATH"}
+        cls.env.update({
+            "HOME": str(home), "USERPROFILE": str(home), "AGREP_HOME": str(home),
+            "AGREP_DATA_DIR": str(cls.data), "AGREP_RS_BIN": str(binary),
+            "AGREP_MODEL_DIR": str(root / "models"), "AGREP_NO_FETCH": "1",
+            "AGREP_NO_DAEMON": "1", "AGREP_NO_SEM_WORKER": "1", "AGREP_NO_RESIDENT": "1",
+            "AGREP_CALLER_PUBLICATION_DIR": str(root / "callers"),
+            "APPDATA": str(root / "appdata"), "LOCALAPPDATA": str(root / "localappdata"),
+            "XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "share"),
+            "CODEX_HOME": str(home / ".codex"), "CLINE_DIR": str(root / "cline"),
+            "CRUSH_GLOBAL_DATA": str(root / "crush"), "OPENCODE_DB": "",
+        })
+        cls.cli = [sys.executable, str(repo / "cli.py")]
+        cls._index()
+        if cls.REPLIED:
+            # the reply lands later and reaches the search db through the incremental refresh
+            with rollout.open("ab") as stream:
+                stream.write((CODEX_FIXTURE / "reply_after_compaction.jsonl").read_bytes())
+            cls._index()
+
+    @classmethod
+    def _index(cls) -> None:
+        indexed = cls._run(["index"])
+        if indexed.returncode or not (cls.data / "corpus.db").is_file():
+            raise AssertionError(f"fixture indexing failed:\n{indexed.stdout}{indexed.stderr}")
+
+    @classmethod
+    def _run(cls, argv: list[str], **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*cls.cli, *argv], cwd=cls.data.parent, env={**cls.env, **env},
+            capture_output=True, text=True, encoding="utf-8", timeout=120, check=False)
+
+    def _rows(self, argv: list[str]) -> list[dict]:
+        result = self._run([*argv, "--json", "--no-auto"])
+        self.assertIn(result.returncode, (0, 2), f"{argv}\n{result.stdout}{result.stderr}")
+        return [row for row in map(json.loads, result.stdout.splitlines())
+                if row.get("kind") != "agrep-meta"]
+
+    def _hits(self, query: str) -> list[tuple]:
+        return [(row["turn"], row["who"], row["handle"]) for row in self._rows([query])]
+
+    def _on_the_transcript_path(self, probe):
+        """``probe()`` with the search db set aside, so reads scan the published transcript."""
+        corpus = self.data / "corpus.db"
+        aside = self.data / "corpus.db.aside"
+        corpus.rename(aside)
+        try:
+            result = probe()
+        finally:
+            rebuilt = corpus.exists()
+            aside.replace(corpus)
+        self.assertFalse(rebuilt, "the transcript path rebuilt the search db")
+        return result
+
+    def test_search_db_holds_the_recap_row_messages_jsonl_publishes(self) -> None:
+        published = [json.loads(line) for line in (self.data / "messages.jsonl").read_text(
+            encoding="utf-8").splitlines() if line.strip()]
+        recap, = [row for row in published if row.get("who") == "recap"]
+        with contextlib.closing(sqlite3.connect(self.data / "corpus.db")) as db:
+            stored = db.execute(
+                "SELECT session, turn, ts, who, text, model, model_source FROM msgs "
+                "WHERE who='recap'").fetchall()
+            other_empty = db.execute(
+                "SELECT count(*) FROM msgs WHERE text='' AND who<>'recap'").fetchone()[0]
+        model = recap.get("model", "")
+        self.assertEqual(stored, [(
+            CODEX_COMPACTED, 2, recap["ts"], "recap", "", model,
+            recap.get("model_source", "explicit" if model else "unknown"))])
+        self.assertEqual((recap["turn"], recap["text"]), (2, ""))
+        self.assertEqual(other_empty, 0)
+
+    def test_postcompact_finds_the_boundary_and_replays_the_tail(self) -> None:
+        compacted_ms = int(datetime.fromisoformat("2026-06-11T10:20:00+00:00").timestamp() * 1000)
+        for extra in ([], ["--boundary-ms", str(compacted_ms)]):
+            with self.subTest(argv=extra):
+                result = self._run(["postcompact", "--session", CODEX_COMPACTED, "--json", *extra])
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                packet = json.loads(result.stdout)
+                self.assertEqual(packet["status"], "recovered")
+                self.assertEqual(packet["selection"]["boundary_turn"], 2)
+                self.assertIsNone(packet["selection"]["previous_boundary_turn"])
+                self.assertEqual(
+                    [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
+                    CODEX_TAIL)
+
+    def test_search_hits_on_both_sides_of_the_compaction_are_unchanged(self) -> None:
+        self.assertEqual(self._hits("walrus fixtures still fail"),
+                         [(0, "agent", "@7b7b7b7b:0.2b55")])
+        self.assertEqual(self._hits("Benchmark the walrus importer"),
+                         [(1, "user", "@7b7b7b7b:1.0175")])
+        self.assertEqual(self._hits("ocelot"),
+                         [(1, "tool", "@7b7b7b7b:1.b2cd~6dee0a3d5a873dce35ba2de7:47-53")])
+        self.assertEqual(self._hits("quokka"),
+                         [(2, "agent", "@7b7b7b7b:2.450b")] if self.REPLIED else [])
+        # A tool call after the compaction belongs to the recap's turn whether or not
+        # the reply has landed yet, so its handle never moves when the reply arrives.
+        self.assertEqual(self._hits("pangolin"),
+                         [(2, "tool", "@7b7b7b7b:2.5125~5129c1f179356771a1590a93:59-67")])
+
+    def test_regex_matching_the_empty_string_never_hits_the_recap_row(self) -> None:
+        for pattern in ("^", "z*"):
+            with self.subTest(pattern=pattern):
+                rows = self._rows(["-E", pattern, "-n", "100"])
+                self.assertEqual(len(rows), 7 if self.REPLIED else 6)
+                self.assertNotIn("recap", {row["who"] for row in rows})
+                self.assertTrue(all(row["snippet"] for row in rows))
+
+    def test_search_db_and_transcript_paths_agree(self) -> None:
+        def shapes():
+            hits = [sorted((row["turn"], row["who"]) for row in self._rows(argv))
+                    for argv in (["walrus", "-n", "50"], ["-E", "^", "-n", "50"])]
+            window = [(row["kind"], row["turn"], row.get("who", row.get("name")),
+                       row.get("text", row.get("input")))
+                      for row in self._rows(["around", CODEX_COMPACTED[:8], "--full"])]
+            return hits, window
+        indexed = shapes()
+        self.assertEqual(indexed, self._on_the_transcript_path(shapes))
+        self.assertIn(("control", 2, "compacted", ""), indexed[1])
+        self.assertIn(("tool", 2, "shell_command", "make walrus-bench FULL=1"), indexed[1])
+
+    def test_chats_latest_claim_does_not_move_when_the_reply_lands(self) -> None:
+        chat, = [row for row in self._rows(["chats"]) if row["session"] == CODEX_COMPACTED]
+        self.assertEqual((chat["last_turn"], chat["latest_handle"]), (2, "@7b7b7b7b:2.5125"))
+
+    def test_codex_caller_live_window_starts_at_its_compaction(self) -> None:
+        result = self._run(["recall", "walrus fixtures still fail", "--json", "--no-auto"],
+                           CODEX_THREAD_ID=CODEX_COMPACTED)
+        payload = json.loads(result.stdout)
+        exclusion = payload["self_exclusion"]
+        self.assertEqual((exclusion["reason"], exclusion["identity"], exclusion["from_turn"]),
+                         ("window", "codex", 2))
+        self.assertEqual([(hit["session"], hit["turn"]) for hit in payload["hits"]],
+                         [(CODEX_COMPACTED, 0)])
+
+
+class CodexCompactionAwaitingReply(_IndexedCodexCompaction, unittest.TestCase):
+    """postcompact runs right after the compaction, before any reply exists."""
+
+
+class CodexCompactionAfterReply(_IndexedCodexCompaction, unittest.TestCase):
+    """A reply written after the compaction files under the recap's turn."""
+
+    REPLIED = True
+
+
 if __name__ == "__main__":
     unittest.main()

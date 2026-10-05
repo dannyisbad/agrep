@@ -8,11 +8,13 @@ chat templated relative to now, which proves the default 7d window.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -108,7 +110,7 @@ MX_CODEX_SHORT_HAND_BACK = "cx000009-0549-4000-8000-000000000549"  # completed t
 # self-mx, timed relative to now: the caller's own chat auto-compacted mid-turn at t-90m
 SELF_TOOLS_ONLY = "db000001-0601-4000-8000-000000000601"  # only a tool call after the recap
 SELF_LIVE_PROMPT = "db000002-0602-4000-8000-000000000602"  # a live-window prompt at t-70m
-# codex compacted mid-turn: the search db keeps no empty-text recap row
+# codex compacted mid-turn: each compaction is an empty-text recap row
 MX_CODEX_COMPACTED_FINISHED = "cx000010-0550-4000-8000-000000000550"
 MX_CODEX_COMPACTED_NEXT_STEPS = "cx000011-0551-4000-8000-000000000551"
 MX_CODEX_COMPACTED_BETWEEN = "cx000012-0552-4000-8000-000000000552"  # 09:00, 09:30, 10:00
@@ -686,9 +688,28 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn(MX_CODEX_SHORT_HAND_BACK, pending)
         self.assertIn(MX_CODEX_WAIT_TIMED_OUT, pending)
 
+    def _on_every_read_path(self, probe) -> list:
+        """``probe()`` on the search db, on that db without codex's empty recap rows (what a
+        build from before they were indexed left), and on the transcript with no db at all."""
+        database = self.sandbox.data / "corpus.db"
+        kept = database.with_name("corpus.db.kept")
+        shutil.copy2(database, kept)
+        try:
+            observed = [probe()]
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                dropped = db.execute("DELETE FROM msgs WHERE who='recap' AND text=''").rowcount
+                db.commit()
+            self.assertGreater(dropped, 0)
+            observed.append(probe())
+            database.unlink()
+            observed.append(probe())
+        finally:
+            kept.replace(database)
+        return observed
+
     def test_codex_compaction_survives_the_search_db(self) -> None:
-        # corpus.db drops empty-text rows, so a codex `compacted` recap reaches summary only as
-        # the reply filed under its turn; both the db path and the JSONL fallback must agree
+        # a codex `compacted` recap is an empty-text row with the reply filed under its turn;
+        # the search db, an older db that kept only that reply, and the JSONL fallback agree
         def verdicts():
             pending = self._pending_by_session("--agent", "codex")
             table = _time_table(self._ok("time", "--since", "2026-06-03",
@@ -701,31 +722,17 @@ class SummaryTests(unittest.TestCase):
                     table[("2026-06-03", "mx-codex")]["estimated_active_ms"])
         expected = (None, "open_next_steps", ["port the oscar writer", "update the oscar docs"],
                     False, 40 * MINUTE)
-        self.assertEqual(verdicts(), expected)
-        database = self.sandbox.data / "corpus.db"
-        parked = database.with_name("corpus.db.parked")
-        database.rename(parked)
-        try:
-            self.assertEqual(verdicts(), expected)
-        finally:
-            parked.rename(database)
+        self.assertEqual(self._on_every_read_path(verdicts), [expected] * 3)
 
     def test_codex_compaction_marker_counts_on_both_paths(self) -> None:
-        # no reply follows the 09:15 compaction, so its recap row never reaches the search db;
-        # the compaction marker gives that moment on both paths: 15m + the capped 20m tail
+        # no reply follows the 09:15 compaction: the recap row and the compaction marker give
+        # that moment once on every read path: 15m + the capped 20m tail
         def minutes():
             table = _time_table(self._ok("time", "--since", "2026-06-04",
                                          "--until", "2026-06-04 23:59", "--project", "mx-codex",
                                          "--json"))
             return table[("2026-06-04", "mx-codex")]["estimated_active_ms"]
-        self.assertEqual(minutes(), 35 * MINUTE)
-        database = self.sandbox.data / "corpus.db"
-        parked = database.with_name("corpus.db.parked")
-        database.rename(parked)
-        try:
-            self.assertEqual(minutes(), 35 * MINUTE)
-        finally:
-            parked.rename(database)
+        self.assertEqual(self._on_every_read_path(minutes), [35 * MINUTE] * 3)
 
     def test_compaction_markers_dedupe_against_recap_moments(self) -> None:
         import summary

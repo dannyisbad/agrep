@@ -292,8 +292,8 @@ def _load_transcripts(chats: dict[str, _Chat], excludes=None) -> bool:
                     seen[session].add(turn)
                     chat.turns.append(_Turn(turn, int(ts or 0), str(who or "user"),
                                             str(text or ""), digest))
-            # the db keeps no empty-text row: a codex recap reaches it only as the reply filed
-            # under its turn, and the compaction marker carries the moment either way
+            # a database built before _scan kept codex's empty recap row files that recap only
+            # as the reply under its turn; the compaction marker carries the moment either way
             for (session, turn), ts in orphan_ts.items():
                 if turn not in seen[session]:
                     seen[session].add(turn)

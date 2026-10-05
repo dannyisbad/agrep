@@ -52,6 +52,9 @@ BOUNDARY_STATS_PATH = common.DATA_DIR / "boundary_stats.json"
 INGEST_SIG_PATH = common.DATA_DIR / ".ingest.sig"
 _SCHEMA = "15"  # 15: structural side-session provenance in family relations
 _TRIGGER_SCHEMA = "4"  # 4: FTS triggers consume the normalized text sidecar
+# 1: codex's empty-text recap rows are indexed. A database lacking this meta value predates
+# the shape and converges through one full parse and signature diff on its next refresh.
+_ROW_SHAPE = "1"
 # The compact event generation moves only after its DB transaction commits.
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json",
             "concept_pair.manifest.json", "events/.generation", "settings.json",
@@ -1992,10 +1995,11 @@ def _open(path, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
 
 def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
     """Parse the materialized corpus into per-session row lists - the exact rows the msgs
-    table holds (one per user turn, one per agent reply), mirroring explore's fallback so
-    every engine reports identical hits. Shared by the full build and the incremental update
-    so both index byte-identical content. The session concept rides in each row, so a concept
-    relabel changes that session's fingerprint and re-indexes it like any other content move.
+    table holds (one per user turn, one per agent reply, plus codex's empty-text compaction
+    recaps), mirroring explore's fallback so every engine reports identical hits. Shared by
+    the full build and the incremental update so both index byte-identical content. The
+    session concept rides in each row, so a concept relabel changes that session's
+    fingerprint and re-indexes it like any other content move.
 
     `only` restricts the (expensive) JSON parse to a small set of session ids: each line's
     session is pulled out with one cheap `find` (the Rust writer emits compact JSON, so the
@@ -2091,8 +2095,10 @@ def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
                     o.get("project", ""), concept.get(s, ""), model, model_source)
             rows = by.setdefault(s, [])
             t = o.get("text", "") or ""
-            if t:
-                who = o.get("who", "user")
+            who = o.get("who", "user")
+            # codex writes each compaction as an empty recap row; postcompact and the caller's
+            # live window resolve the boundary by it. No other empty-text row is a document.
+            if t or who == "recap":
                 rows.append((*base, who, t, _digest(o, t, "messages.jsonl")))
             r, r_digest = reps.get(o.get("id", ""), ("", ""))
             if r:
@@ -2227,6 +2233,7 @@ def _build(dst, expected_stamp: str | None = None) -> None:
         db.execute("INSERT INTO meta VALUES('stamp', ?)", (expected_stamp,))
         db.execute("INSERT INTO meta VALUES('schema', ?)", (_SCHEMA,))
         db.execute("INSERT INTO meta VALUES('fts_triggers', ?)", (_TRIGGER_SCHEMA,))
+        db.execute("INSERT INTO meta VALUES('row_shape', ?)", (_ROW_SHAPE,))
         db.execute(
             "INSERT INTO meta VALUES('build_id', ?)",
             (indexd_runtime.derived_writer_build_id(
@@ -2490,9 +2497,10 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
     Changed sessions are reparsed, but their stored rows are reconciled as multisets:
     unchanged rows keep their rowids and never fire FTS triggers. A ``*`` or oversized
     named delta performs one full corpus parse, then uses the same signature/row diff.
-    Concept-source moves full-scan and signature-diff all sessions because the Rust
-    delta does not name relabels. Returns None only when a clean bulk rebuild is
-    required (cold/schema/tools-setting/invalid).
+    Concept-source moves, and a database whose ``row_shape`` predates ``_ROW_SHAPE``,
+    full-scan and signature-diff all sessions because the Rust delta names neither.
+    Returns None only when a clean bulk rebuild is required
+    (cold/schema/tools-setting/invalid).
     """
     if _protected_derived_target(DB_PATH):
         return None
@@ -2507,8 +2515,8 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         db.execute("PRAGMA synchronous=NORMAL")
         db.execute("PRAGMA cache_size=-65536")
         meta = dict(db.execute(
-            "SELECT key, value FROM meta "
-            "WHERE key IN ('schema', 'stamp', 'family_stamp', 'build_id')"))
+            "SELECT key, value FROM meta WHERE key IN "
+            "('schema', 'stamp', 'family_stamp', 'build_id', 'row_shape')"))
         current_build = indexd_runtime.derived_writer_build_id(
             require_binary=True)
         if (meta.get("schema") != _SCHEMA
@@ -2536,16 +2544,17 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
                 "corpusdb incremental unavailable: sessions.jsonl missing")
             return None
         concept_scan = _concepts_moved(old_stamp, stamp)
+        row_shape_moved = meta.get("row_shape") != _ROW_SHAPE
         changed = _read_changed()
-        if concept_scan:
-            # A manifest/name/assignment publication can relabel any session and has
-            # no changed-session marker. One parse plus signatures is still far cheaper
-            # than rebuilding both FTS tables, and unchanged rows never fire triggers.
+        if concept_scan or row_shape_moved:
+            # A manifest/name/assignment publication can relabel any session, an older row shape
+            # can differ in any session, and neither names one. One parse plus signatures is still
+            # far cheaper than rebuilding both FTS tables, and unchanged rows never fire triggers.
             by = _scan()
             current = set(by)
             targets = set(by) | set(old)
             full_scan = True
-            mode = "concept"
+            mode = "concept" if concept_scan else "row-shape"
         else:
             current = set(family_snapshot.sessions)
             if changed != "*" and not isinstance(changed, set):
@@ -2593,10 +2602,10 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         if _stamp() != stamp:
             raise _SourceMoved("corpus sources moved during incremental scan")
         db.execute("UPDATE meta SET value = ? WHERE key = 'stamp'", (stamp,))
-        db.execute(
-            "INSERT INTO meta(key, value) VALUES('build_id', ?) "
+        db.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (current_build,))
+            (("build_id", current_build), ("row_shape", _ROW_SHAPE)))
         db.commit()
         _consume_changed()  # applied -> clear the delta
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -4647,6 +4656,19 @@ def keyword(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None, *,
     return _pack(hits, k, position_order)
 
 
+def _document_count(db: sqlite3.Connection, *, prose_only: bool = False) -> int:
+    """Rows a text lane can match, the idf population the JSONL scan counts too.
+
+    An empty recap row marks a compaction and holds no text, so it is no document. The
+    subtraction walks only recap rows, through the speaker index.
+    """
+    total = db.execute("SELECT count(*) FROM msgs" +
+                       (" WHERE who <> 'tool'" if prose_only else "")).fetchone()[0]
+    empty = db.execute(
+        "SELECT count(*) FROM msgs WHERE who = 'recap' AND text = ''").fetchone()[0]
+    return int(total or 0) - int(empty or 0)
+
+
 def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> dict:
     """Scored-OR over content terms - the last-resort tier for natural-language
     queries where even bag-of-words AND finds nothing (evidence rarely holds every
@@ -4660,8 +4682,7 @@ def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> 
         return {"hits": [], "total": 0, "chats": 0}
     fts_table = _fts_table(flt)
     prose_only = fts_table == "msgs_prose_fts"
-    n_docs = db.execute("SELECT count(*) FROM msgs" +
-                        (" WHERE who <> 'tool'" if prose_only else "")).fetchone()[0] or 1
+    n_docs = _document_count(db, prose_only=prose_only) or 1
     idf: dict[str, float] = {}
     for t in toks:
         if len(t) >= 3:
@@ -4742,7 +4763,7 @@ def coverage_rank(db: sqlite3.Connection, q: str, k: int,
         return []
     echo_pat = re.compile(r"[\W_]*".join(re.escape(t) for t in raw), re.I)
     fts_table = _fts_table(flt)
-    n_docs = db.execute("SELECT count(*) FROM msgs").fetchone()[0] or 1
+    n_docs = _document_count(db) or 1
     idf: dict[str, float] = {}
     for t in toks:
         if len(t) >= 3:
@@ -4907,10 +4928,12 @@ def regex(db: sqlite3.Connection, pattern: str, k: int, flt: dict | None = None,
     else:
         _register_functions(db)
         fw, fp = _filter_sql(flt)
+        # An empty recap row is a compaction boundary, not a document: a pattern that
+        # matches the empty string must not turn it into a hit (the JSONL scan skips it too).
         cur = db.execute(
             "SELECT session, agent, project, concept, model, model_source, "
-            "turn, ts, who, text, content_digest FROM msgs"
-            + (" WHERE " + " AND ".join(fw) if fw else ""), fp)
+            "turn, ts, who, text, content_digest FROM msgs WHERE "
+            + " AND ".join(["text <> ''", *fw]), fp)
     for row in cur:
         m = search(row[_TEXT])
         if m:
@@ -5040,8 +5063,8 @@ def session_context(db: sqlite3.Connection, session: str) -> dict | None:
     for turn, ts, _agent, _project, reply in rows:
         turn = int(turn)
         if reply:
-            # _scan stores no row for empty text (codex's compaction recap), but the
-            # reply keeps that row's turn and ts, so the turn still opens and owns its events.
+            # A database built before _scan kept codex's empty recap row lacks that row, but
+            # the reply keeps its turn and ts, so the turn still opens and owns its events.
             if turn in opened:
                 continue
             opened.add(turn)
