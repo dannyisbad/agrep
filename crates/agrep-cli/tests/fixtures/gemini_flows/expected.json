@@ -77,6 +77,47 @@
   ["user","bison","ok bison"],
   ["user","cheetah","ok cheetah"]
  ]},
+ "0f0f0f0f-000f-4000-8000-0f0f0f0f0f0f": {"flow": "current/esc_tool", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "40404040-0010-4000-8000-404040404040": {"flow": "current/esc_tool_mask", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "41414141-0011-4000-8000-414141414141": {"flow": "current/esc_tool_mask_only", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","cheetah","ok cheetah"],
+  ["user","dingo","ok dingo"]
+ ]},
+ "42424242-0012-4000-8000-424242424242": {"flow": "current/chat_resume_rewind", "rows": [
+  ["user","fix b","Done."],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "43434343-0013-4000-8000-434343434343": {"flow": "current/compress_mid_tool", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "44444444-0014-4000-8000-444444444444": {"flow": "current/chat_resume_after_compress", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>cheetah only</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "45454545-0015-4000-8000-454545454545": {"flow": "current/chat_resume_after_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>cheetah only</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
  "10101010-1000-4000-8000-101010101010": {"flow": "checkpoint/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"],
@@ -154,5 +195,46 @@
   ["user","bison","ok bison"],
   ["user","bison","ok bison"],
   ["user","cheetah","ok cheetah"]
+ ]},
+ "1f1f1f1f-100f-4000-8000-1f1f1f1f1f1f": {"flow": "checkpoint/esc_tool", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "50505050-1010-4000-8000-505050505050": {"flow": "checkpoint/esc_tool_mask", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "51515151-1011-4000-8000-515151515151": {"flow": "checkpoint/esc_tool_mask_only", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","cheetah","ok cheetah"],
+  ["user","dingo","ok dingo"]
+ ]},
+ "52525252-1012-4000-8000-525252525252": {"flow": "checkpoint/chat_resume_rewind", "rows": [
+  ["user","fix b","Done."],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "53535353-1013-4000-8000-535353535353": {"flow": "checkpoint/compress_mid_tool", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "54545454-1014-4000-8000-545454545454": {"flow": "checkpoint/chat_resume_after_compress", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>cheetah only</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "55555555-1015-4000-8000-555555555555": {"flow": "checkpoint/chat_resume_after_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>cheetah only</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
  ]}
 }

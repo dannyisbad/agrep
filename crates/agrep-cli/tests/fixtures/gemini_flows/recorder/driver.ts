@@ -70,6 +70,8 @@ const MODEL = 'gemini-2.5-pro';
 const ENV_ID = deriveStableId(['environment-context']);
 const ENV_TEXT = '<session_context>\nThis is the Gemini CLI.\n</session_context>';
 const ACK = 'Got it. Thanks for the additional context!';
+const INTERRUPTED = '[The previous response was interrupted before it completed.]';
+const CANCELLED = '[Operation Cancelled] Reason: User cancelled the operation.';
 const MASKED = '<tool_output_masked>\noutput hidden to save context\n</tool_output_masked>';
 
 // Both classes expose the Recorder surface; their declared private fields differ by version.
@@ -125,6 +127,11 @@ class Session {
   prompt(text: string): void {
     this.tick();
     this.promptStart = this.history.length;
+    // closeUnansweredToolResponseTurn: a cancelled tool's response gets an unrecorded closer
+    const last = this.history.at(-1);
+    if (last?.content.role === 'user' && last.content.parts.some((part) => 'functionResponse' in part)) {
+      this.history.push({ id: randomUUID(), content: { role: 'model', parts: [{ text: INTERRUPTED }] } });
+    }
     const parts = [{ text }];
     const id = this.recorder.recordMessage({ model: MODEL, type: 'user', content: parts });
     this.history.push({ id, content: { role: 'user', parts } });
@@ -138,17 +145,27 @@ class Session {
     this.history.push({ id, content: { role: 'model', parts: [{ text: raw }] } });
   }
 
-  /** A model function call, its completion record, and the function response sent back. */
-  tool(callId: string, name: string, args: Record<string, unknown>, output: string): void {
+  /** A model function call and its completion record (recordCompletedToolCalls). */
+  call(callId: string, name: string, args: Record<string, unknown>, output: string, status = 'success'): void {
     this.tick();
     const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: '' });
     this.history.push({ id, content: { role: 'model', parts: [{ functionCall: { id: callId, name, args } }] } });
     const response = [{ functionResponse: { id: callId, name, response: { output } } }];
     this.recorder.recordToolCalls(MODEL, [
-      { id: callId, name, args, result: response, status: 'success', timestamp: new Date().toISOString() },
+      { id: callId, name, args, result: response, status, timestamp: new Date().toISOString() },
     ]);
+  }
+
+  /** The function response sent back, or after Esc handed to addHistory: both record it. */
+  respond(callId: string, name: string, output: string): void {
+    const response = [{ functionResponse: { id: callId, name, response: { output } } }];
     const rid = this.recorder.recordSyntheticMessage('user', response);
     this.history.push({ id: rid, content: { role: 'user', parts: response } });
+  }
+
+  tool(callId: string, name: string, args: Record<string, unknown>, output: string): void {
+    this.call(callId, name, args, output);
+    this.respond(callId, name, output);
   }
 
   /** The `finally` of sendMessageStream: abort or failure rolls back to before the prompt. */
@@ -432,12 +449,120 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'cheetah');
     },
   },
+  {
+    // Esc while a tool runs, a later prompt, then Esc while a prompt streams: the abort records
+    // the unrecorded interrupted-turn closer before removing the aborted turn
+    name: 'esc_tool',
+    expect: [user('alpaca'), user('bison', ''), user('cheetah'), user('elephant')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
+      s.respond('read-bison', 'read_file', CANCELLED);
+      plainTurn(s, 'cheetah');
+      s.prompt('dingo');
+      s.tool('todo-dingo', 'write_todos', { todos: [{ description: 'Drop the prod table', status: 'pending' }] }, 'Updated.');
+      s.abort();
+      plainTurn(s, 'elephant');
+    },
+  },
+  {
+    name: 'esc_tool_mask',
+    expect: [user('alpaca'), user('bison', ''), user('cheetah'), user('elephant')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
+      s.respond('read-bison', 'read_file', CANCELLED);
+      plainTurn(s, 'cheetah');
+      s.prompt('dingo');
+      s.abort();
+      s.mask(MASKED);
+      plainTurn(s, 'elephant');
+    },
+  },
+  {
+    name: 'esc_tool_mask_only',
+    expect: [user('alpaca'), user('bison', ''), user('cheetah'), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
+      s.respond('read-bison', 'read_file', CANCELLED);
+      plainTurn(s, 'cheetah');
+      s.mask(MASKED);
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // /chat save, more work, /chat resume, then /rewind to the resumed prompt
+    name: 'chat_resume_rewind',
+    expect: [user('fix b', 'Done.'), user('cheetah')],
+    run: async (s) => {
+      s.prompt('fix a');
+      s.tool('read-a', 'read_file', { file_path: 'a.ts' }, 'export const a = 1;');
+      s.reply('Done.');
+      const saved = s.contents();
+      s.prompt('fix b');
+      s.tool('read-b', 'read_file', { file_path: 'b.ts' }, 'export const b = 1;');
+      s.reply('Done.');
+      s.setHistory(saved);
+      s.rewind(s.idOf('fix a'));
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // auto-compression between a tool call and its response; the reply after it files under the
+    // recap, as claude's and codex's post-compaction replies do (postcompact replays it there)
+    name: 'compress_mid_tool',
+    expect: [user('alpaca'), user('bison', ''), [...recap('alpaca and bison').slice(0, 2), 'ok bison'] as Row, user('cheetah')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, 'export const bison = 1;');
+      await s.compress('alpaca and bison', 2);
+      s.respond('read-bison', 'read_file', 'export const bison = 1;');
+      s.reply('ok bison');
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // /chat resume of a save from before a compression copies turns that left the context
+    name: 'chat_resume_after_compress',
+    expect: [user('alpaca'), user('bison'), user('cheetah'), recap('cheetah only'), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      toolTurn(s, 'bison');
+      const saved = s.contents();
+      plainTurn(s, 'cheetah');
+      await s.compress('cheetah only', 2);
+      s.setHistory(saved);
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // a save made after /rewind lacks the environment message that compression puts back
+    name: 'chat_resume_after_rewind',
+    expect: [user('alpaca'), user('cheetah'), recap('cheetah only'), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      plainTurn(s, 'bison');
+      s.rewind(s.idOf('bison'));
+      const saved = s.contents();
+      plainTurn(s, 'cheetah');
+      await s.compress('cheetah only', 2);
+      s.setHistory(saved);
+      plainTurn(s, 'dingo');
+    },
+  },
 ];
 
 const expected: string[] = [];
 for (const [v, version] of VERSIONS.entries()) {
   for (const [n, scenario] of SCENARIOS.entries()) {
-    const tag = `${(v * 16 + n).toString(16).padStart(2, '0')}`.repeat(4);
+    // the first sixteen flows keep the ids their fixtures were recorded with
+    const code = n < 16 ? v * 16 + n : 0x40 + v * 16 + (n - 16);
+    const tag = `${code.toString(16).padStart(2, '0')}`.repeat(4);
     setIdPrefix(tag);
     const sessionId = `${tag}-${v}${n.toString(16).padStart(3, '0')}-4000-8000-${tag}${tag.slice(0, 4)}`;
     const day = `2026-0${v + 4}-${String(n + 1).padStart(2, '0')}`;

@@ -1,0 +1,37 @@
+{"sessionId":"52525252-1012-4000-8000-525252525252","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-05-19T09:01:00.000Z","lastUpdated":"2026-05-19T09:01:00.000Z","kind":"main"}
+{"$set":{"messages":[{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-05-19T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}],"lastUpdated":"2026-05-19T09:01:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000001","timestamp":"2026-05-19T09:02:00.000Z","type":"user","content":[{"text":"fix a"}]}
+{"$set":{"lastUpdated":"2026-05-19T09:02:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000002","timestamp":"2026-05-19T09:03:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-05-19T09:03:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000002","timestamp":"2026-05-19T09:03:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"read-a","name":"read_file","args":{"file_path":"a.ts"},"result":[{"functionResponse":{"id":"read-a","name":"read_file","response":{"output":"export const a = 1;"}}}],"status":"success","timestamp":"2026-05-19T09:03:00.000Z","displayName":"read_file","description":"read_file tool","renderOutputAsMarkdown":false}]}
+{"id":"52525252-0000-4000-8000-000000000003","timestamp":"2026-05-19T09:03:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-a","name":"read_file","response":{"output":"export const a = 1;"}}}]}
+{"$set":{"lastUpdated":"2026-05-19T09:03:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000004","timestamp":"2026-05-19T09:04:00.000Z","type":"gemini","content":"Done.","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-05-19T09:04:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000005","timestamp":"2026-05-19T09:05:00.000Z","type":"user","content":[{"text":"fix b"}]}
+{"$set":{"lastUpdated":"2026-05-19T09:05:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000006","timestamp":"2026-05-19T09:06:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-05-19T09:06:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000006","timestamp":"2026-05-19T09:06:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"read-b","name":"read_file","args":{"file_path":"b.ts"},"result":[{"functionResponse":{"id":"read-b","name":"read_file","response":{"output":"export const b = 1;"}}}],"status":"success","timestamp":"2026-05-19T09:06:00.000Z","displayName":"read_file","description":"read_file tool","renderOutputAsMarkdown":false}]}
+{"id":"52525252-0000-4000-8000-000000000007","timestamp":"2026-05-19T09:06:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-b","name":"read_file","response":{"output":"export const b = 1;"}}}]}
+{"$set":{"lastUpdated":"2026-05-19T09:06:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000008","timestamp":"2026-05-19T09:07:00.000Z","type":"gemini","content":"Done.","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-05-19T09:07:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000009","timestamp":"2026-05-19T09:08:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-05-19T09:08:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000010","timestamp":"2026-05-19T09:08:00.000Z","type":"user","content":[{"text":"fix a"}]}
+{"$set":{"lastUpdated":"2026-05-19T09:08:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000011","timestamp":"2026-05-19T09:08:00.000Z","type":"gemini","content":[{"functionCall":{"id":"read-a","name":"read_file","args":{"file_path":"a.ts"}}}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-05-19T09:08:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000012","timestamp":"2026-05-19T09:08:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-a","name":"read_file","response":{"output":"export const a = 1;"}}}]}
+{"$set":{"lastUpdated":"2026-05-19T09:08:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000013","timestamp":"2026-05-19T09:08:00.000Z","type":"gemini","content":[{"text":"Done."}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-05-19T09:08:00.000Z"}}
+{"$set":{"messages":[{"id":"52525252-0000-4000-8000-000000000009","timestamp":"2026-05-19T09:08:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]},{"id":"52525252-0000-4000-8000-000000000010","timestamp":"2026-05-19T09:08:00.000Z","type":"user","content":[{"text":"fix a"}]},{"id":"52525252-0000-4000-8000-000000000011","timestamp":"2026-05-19T09:08:00.000Z","type":"gemini","content":[{"functionCall":{"id":"read-a","name":"read_file","args":{"file_path":"a.ts"}}}],"thoughts":[],"tokens":null},{"id":"52525252-0000-4000-8000-000000000012","timestamp":"2026-05-19T09:08:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-a","name":"read_file","response":{"output":"export const a = 1;"}}}]},{"id":"52525252-0000-4000-8000-000000000013","timestamp":"2026-05-19T09:08:00.000Z","type":"gemini","content":[{"text":"Done."}],"thoughts":[],"tokens":null}],"lastUpdated":"2026-05-19T09:08:00.000Z"}}
+{"$rewindTo":"52525252-0000-4000-8000-000000000010"}
+{"$set":{"messages":[],"lastUpdated":"2026-05-19T09:09:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000014","timestamp":"2026-05-19T09:10:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-05-19T09:10:00.000Z"}}
+{"id":"52525252-0000-4000-8000-000000000015","timestamp":"2026-05-19T09:11:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-05-19T09:11:00.000Z"}}
