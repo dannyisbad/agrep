@@ -385,6 +385,10 @@ impl Unenumerable {
             reason: format!("not a crush database: {error}"),
         }
     }
+
+    fn durable(&self) -> bool {
+        matches!(self.kind, "permission-denied" | "unsupported-file-type")
+    }
 }
 
 /// The primary result code, including the input errors SQLite reports with a token offset.
@@ -809,10 +813,26 @@ fn collect_discovered(
         .as_ref()
         .map(|opened| opened.databases.is_empty())
         .unwrap_or(true);
-    let tokens = opened
-        .as_ref()
-        .filter(|_| !all_failed && !(incomplete_discovery && no_healthy_database))
-        .map(|opened| opened.tokens.clone());
+    // Every database failed with a defect no retry heals and the published generation held nothing
+    // there: an empty listing that keeps every cached conversation, as for an incomplete discovery,
+    // instead of failing closed and taking every other agent's retry lane down with it.
+    let durably_blind = all_failed
+        && !incomplete_discovery
+        && opened.as_ref().is_some_and(|opened| {
+            opened.unavailable.iter().all(|(_, path, failure)| {
+                failure.durable()
+                    && cache.published_material_under("crush", path)
+                        == crate::ingest_cache::MaterialVerdict::Retained
+            })
+        });
+    let tokens = if durably_blind {
+        Some(Vec::new())
+    } else {
+        opened
+            .as_ref()
+            .filter(|_| !all_failed && !(incomplete_discovery && no_healthy_database))
+            .map(|opened| opened.tokens.clone())
+    };
     let unavailable = opened
         .as_ref()
         .filter(|_| !all_failed)
@@ -824,7 +844,7 @@ fn collect_discovered(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let preserve_unlisted = incomplete_discovery;
+    let preserve_unlisted = incomplete_discovery || durably_blind;
     let has_readable_source = opened
         .as_ref()
         .is_some_and(|opened| !opened.databases.is_empty());
@@ -1492,6 +1512,57 @@ mod tests {
         assert!(pass.0.is_empty());
         assert!(!cache.output_complete());
         assert!(!cache.source_snapshot_safe());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn durably_foreign_store_fails_closed_only_where_published_material_is_at_stake() {
+        use crate::ingest_cache::IngestCache;
+        use std::collections::HashSet;
+
+        let base = temp_dir("foreign-only");
+        let root = base.join("global");
+        let home = base.join("home");
+        let db = root.join("crush.db");
+        write_db(&db, "cached before the store turned foreign");
+        let cache_path = base.join("cache.bin");
+        let mut initial = IngestCache::cold();
+        assert_eq!(
+            collect_discovered(&mut initial, discover_at(vec![root.clone()], &home))
+                .0
+                .len(),
+            1
+        );
+        initial.save(&cache_path).unwrap();
+        fs::write(&db, b"not a sqlite database").unwrap();
+
+        let mut first_index = IngestCache::cold();
+        first_index.set_published_material(HashSet::new());
+        let pass = collect_discovered(&mut first_index, discover_at(vec![root.clone()], &home));
+        assert!(pass.0.is_empty());
+        assert!(first_index.output_complete());
+        assert!(!first_index.source_snapshot_safe());
+
+        for published in [None, Some(HashSet::from([db.clone()]))] {
+            let mut at_stake = IngestCache::cold();
+            if let Some(published) = published {
+                at_stake.set_published_material(published);
+            }
+            collect_discovered(&mut at_stake, discover_at(vec![root.clone()], &home));
+            assert!(!at_stake.output_complete());
+        }
+
+        // Retained over a warm base: every cached conversation is served and none is deleted.
+        for _pass in 0..2 {
+            let mut warm = IngestCache::load(&cache_path);
+            warm.set_published_material(HashSet::new());
+            let pass = collect_discovered(&mut warm, discover_at(vec![root.clone()], &home));
+            assert_eq!(pass.0.len(), 1);
+            assert!(warm.output_complete());
+            assert!(!warm.source_snapshot_safe());
+            warm.save(&cache_path).unwrap();
+        }
 
         let _ = fs::remove_dir_all(base);
     }

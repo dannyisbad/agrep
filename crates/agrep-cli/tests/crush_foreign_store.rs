@@ -97,6 +97,30 @@ fn append_churn(source: &Path, minute: u32) {
     fs::write(source, body).unwrap();
 }
 
+/// A second claude chat in its own project, so it can be made unreadable apart from the churn.
+fn plant_claude_chat(home: &Path, text: &str) -> PathBuf {
+    let project = home.join(".claude").join("projects").join("proj-beta");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join("22222222-2222-4222-8222-222222222222.jsonl");
+    let rows = [
+        serde_json::json!({
+            "type": "user", "userType": "external",
+            "sessionId": "22222222-2222-4222-8222-222222222222",
+            "timestamp": "2026-01-03T10:00:00.000Z", "cwd": "/work/beta",
+            "message": {"role": "user", "content": text},
+        }),
+        serde_json::json!({
+            "type": "assistant", "sessionId": "22222222-2222-4222-8222-222222222222",
+            "timestamp": "2026-01-03T10:00:05.000Z", "cwd": "/work/beta",
+            "message": {"role": "assistant", "model": "claude-fable-5",
+                        "content": [{"type": "text", "text": "noted"}]},
+        }),
+    ];
+    let body: String = rows.iter().map(|row| format!("{row}\n")).collect();
+    fs::write(&path, body).unwrap();
+    path
+}
+
 /// Kinds of the disclosed source-health issues naming `db` for crush.
 fn crush_issue_kinds(data: &Path, db: &Path) -> Vec<String> {
     let Ok(body) = fs::read(data.join(".source-health.json")) else {
@@ -203,6 +227,83 @@ fn foreign_crush_store_appearing_after_a_good_generation_publishes_other_agents(
         assert!(!has_crush_rows(&data));
         assert!(crush_issue_kinds(&data, &db).contains(&"unsupported-file-type".to_string()));
     }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A foreign store with nothing indexed must not turn another agent's retryable issue into a
+/// refusal of every agent: the unreadable chat keeps its cached rows and the churn publishes.
+#[cfg(unix)]
+#[test]
+fn foreign_crush_store_beside_an_unreadable_claude_chat_still_publishes_churn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = claude_home("crush-foreign-sibling-home");
+    let db = crush_db(&home);
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    plant_foreign_tables(&db);
+    let chat = plant_claude_chat(&home, "beta chat that later turns unreadable");
+    let data = temp_dir("crush-foreign-sibling-data");
+    ingest_into("all", &home, &data, false);
+    assert!(normalize(&data).contains("beta chat that later turns unreadable"));
+
+    fs::set_permissions(&chat, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&chat).is_ok() {
+        // Privileged runners ignore the mode bits; there is no denial to observe.
+        fs::set_permissions(&chat, fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    let mut outputs = Vec::new();
+    for minute in [1, 2, 3] {
+        append_churn(&claude_transcript(&home), minute);
+        outputs.push((minute, ingest_output("all", &home, &data, false)));
+    }
+    fs::set_permissions(&chat, fs::Permissions::from_mode(0o600)).unwrap();
+    for (minute, output) in &outputs {
+        assert_published(output, &format!("unreadable claude chat, run {minute}"));
+    }
+    let published = normalize(&data);
+    assert!(
+        published.contains("crush probe churn 3"),
+        "claude churn never published"
+    );
+    assert!(published.contains("beta chat that later turns unreadable"));
+    assert!(!has_crush_rows(&data));
+    assert!(crush_issue_kinds(&data, &db).contains(&"unsupported-file-type".to_string()));
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// One run without claude's store is retried like it is without crush, not refused for crush.
+#[test]
+fn foreign_crush_store_beside_a_vanished_claude_root_retains_and_publishes() {
+    let home = claude_home("crush-foreign-vanished-home");
+    let db = crush_db(&home);
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    plant_foreign_tables(&db);
+    let data = temp_dir("crush-foreign-vanished-data");
+    ingest_into("all", &home, &data, false);
+
+    let projects = home.join(".claude").join("projects");
+    let parked = home.join("parked-projects");
+    fs::rename(&projects, &parked).unwrap();
+    let vanished = ingest_output("all", &home, &data, false);
+    fs::rename(&parked, &projects).unwrap();
+    assert_published(&vanished, "claude root missing for one run");
+    assert!(
+        normalize(&data).contains(CLAUDE_TEXT),
+        "one absence dropped claude rows"
+    );
+    assert!(crush_issue_kinds(&data, &db).contains(&"unsupported-file-type".to_string()));
+
+    append_churn(&claude_transcript(&home), 1);
+    let restored = ingest_output("all", &home, &data, false);
+    assert_published(&restored, "claude root restored");
+    assert!(normalize(&data).contains("crush probe churn 1"));
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
