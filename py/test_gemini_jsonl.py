@@ -5,7 +5,8 @@ same id, and `$set`/`$rewindTo`/`$patch` records) with Part[] prompts such as
 `[{"text": ...}]`. The fixture under py/fixtures/gemini_jsonl holds one such session and one
 legacy `.json` whose prompt is a Part[]; `python cli.py index` ingests them in a sandbox.
 Compression re-syncs the recorded history to the model's shorter context; the sessions under
-crates/agrep-cli/tests/fixtures/gemini_compress were written by upstream's own recorder.
+crates/agrep-cli/tests/fixtures/gemini_compress and gemini_flows were written by upstream's own
+recorders; gemini_flows/expected.json is the conversation each one records.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ FIXTURE = ROOT / "py" / "fixtures" / "gemini_jsonl" / "tmp"
 COMPRESSED = (ROOT / "crates" / "agrep-cli" / "tests" / "fixtures" / "gemini_compress" / "home"
               / ".gemini" / "tmp")
 LEGACY = "hash7777synthetic/chats/session-2026-03-01T10-00-b1b1b1b1.json"
+FLOWS = ROOT / "crates" / "agrep-cli" / "tests" / "fixtures" / "gemini_flows"
 COMPRESSED_SESSION = "c0c0c0c0-0414-4000-8000-000000000414"
 CURRENT = "6e6e0001-0414-4000-8000-000000000414"
 WINDOW = ("--since", "2026-02-01", "--until", "2026-04-30")
@@ -152,6 +154,28 @@ class CompressedResumeTests(_Sandbox):
                                                          "--until", "2026-04-30"))}
         self.assertEqual(pending[COMPRESSED_SESSION]["items"],
                          ["Port the cheetah loader", "Document the cheetah flags"])
+
+
+@unittest.skipUnless(os.name == "posix", "the sandbox relies on POSIX paths")
+class RecordedFlowsTests(_Sandbox):
+    """Compression, masking, truncation, /chat resume, aborts, failures, /rewind and resume."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._sandbox()
+        shutil.copytree(FLOWS / "home" / ".gemini", cls.home / ".gemini")
+        cls._index()
+
+    def test_each_chat_has_the_turns_its_person_had(self) -> None:
+        expected = json.loads((FLOWS / "expected.json").read_text(encoding="utf-8"))
+        result = self._run(ROOT / "cli.py", "chats", "--agent", "gemini", "--json", "-n", "80")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        chats = {row["session"]: row for row in map(json.loads, result.stdout.splitlines())
+                 if row.get("kind") != "agrep-meta"}
+        for session, case in expected.items():
+            with self.subTest(flow=case["flow"]):
+                self.assertEqual(chats[session]["turns"], len(case["rows"]))
+                self.assertEqual(chats[session]["first_text"], case["rows"][0][1])
 
 
 if __name__ == "__main__":

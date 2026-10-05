@@ -7,10 +7,11 @@
 //! `$set` (metadata; until 2026-10 also whole-history `messages` checkpoints), `$rewindTo` (drop
 //! that message and every later one; an unknown id drops them all) and `$patch` (content and
 //! tool-result updates, `removeIds`, `orderIds`). Checkpoints and `removeIds` re-sync the file to
-//! the model's context: compression (`ChatCompressionService`, automatic past a token threshold
-//! or `/compress`) re-records a `<state_snapshot>` user turn, a canned acknowledgement and the
-//! kept tail under new ids, then removes every earlier id. The adapter keeps the transcript (see
-//! `Fold`); the snapshot becomes a recap row. Resuming a legacy session copies `X.json`
+//! the model's context: an aborted or failed request removes its own turns, while compression
+//! (`ChatCompressionService`, automatic past a token threshold or `/compress`), tool-output
+//! masking, truncation and `/chat resume` re-record the context under new ids and remove every
+//! earlier id. The adapter keeps the transcript (see `Fold`); a compression's `<state_snapshot>`
+//! user turn becomes a recap row. Resuming a legacy session copies `X.json`
 //! into `X.jsonl` beside it and leaves the `.json` behind, so a `.json` with a `.jsonl`
 //! sibling is superseded and not a source. The legacy store is one JSON object per session:
 //!   { sessionId, projectHash, startTime, lastUpdated, messages: [ ... ] }
@@ -294,36 +295,78 @@ fn js_truthy(value: &Value) -> bool {
     }
 }
 
-/// Upstream's `createJsonlRecordAccumulator` (full-load mode), reading the transcript rather
-/// than the model context: messages keyed by id in first-insertion order like its JS Map,
-/// record kinds tested in its order, `$rewindTo` honored. A history re-sync (`$patch`
-/// `removeIds`, a `$set.messages` checkpoint) only drops messages from the model's context -
-/// compression drops every earlier turn - so those stay, and the copies it re-records under new
-/// ids are replays. Re-syncs never overwrite a recorded tool result (masking and truncation
-/// shorten them for the model). Every non-blank line and every message inside a `messages`
-/// array is one seen unit, and each leaves through exactly one counter below or survives.
+/// Text as upstream records a reply (`responseText`): zero-width characters and HTML comments
+/// removed, then trimmed. A re-recorded turn keeps the raw parts, so copies compare on this.
+fn visible_text(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200B}'..='\u{200D}' | '\u{FEFF}' | '\u{200E}' | '\u{200F}'
+            )
+        })
+        .collect();
+    while let Some(start) = out.find("<!--") {
+        let Some(end) = out.get(start + 4..).and_then(|rest| rest.find("-->")) else {
+            break;
+        };
+        out.replace_range(start..start + 4 + end + 3, "");
+    }
+    out.trim().to_string()
+}
+
+/// Where one recorded message stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// In upstream's context map.
+    Live,
+    /// Out of the context after a rewrite, still part of the conversation.
+    Dropped,
+    /// Undone: rewound, or rolled back after an aborted or failed request.
+    Deleted,
+}
+
+struct Entry {
+    message: Value,
+    state: State,
+    /// The entry this one re-records under a new id during a context rewrite.
+    original: Option<usize>,
+}
+
+/// What a re-recorded copy shares with the message it repeats.
+type CopyKey = (String, String, Vec<String>);
+
+/// Upstream's `createJsonlRecordAccumulator` (full-load mode) mirrored as `live`, its context map
+/// in insertion order with record kinds tested in its order, beside the transcript (`entries`, in
+/// first-recorded order) that a person read. A context change removing messages is either:
+/// - a tail rollback: `$rewindTo`, or a re-sync adding nothing that removes exactly the live tail
+///   (aborted and failed requests). Its messages, and the originals of copies among them, are
+///   undone; already dropped messages are untouched.
+/// - a context rewrite: any other re-sync (`$patch` `removeIds`, a `$set.messages` checkpoint).
+///   Its messages stay; the copies it re-records after them pair to them as replays, and a
+///   re-sync never overwrites a recorded tool result (masking and truncation shorten them).
+///
+/// Every non-blank line and every message inside a `messages` array is one seen unit, and each
+/// leaves through exactly one counter below or as one transcript entry.
 #[derive(Default)]
 struct Fold {
     session_id: Option<Value>,
     project_hash: Option<Value>,
-    slots: Vec<Option<(String, Value)>>,
-    index: HashMap<String, usize>,
-    /// Ids a re-sync dropped from the model's context; they remain transcript.
-    dropped: HashSet<String>,
-    /// A re-recorded copy's id -> the dropped message it repeats.
-    replays: HashMap<String, String>,
-    /// First slot written since a re-initialization (`$set.sessionId`, written on resume and
-    /// after compression), until the re-sync that follows it.
-    resync_from: Option<usize>,
+    entries: Vec<Entry>,
+    /// Upstream's context map: entry indices in its insertion order.
+    live: Vec<usize>,
+    /// Each id's newest entry.
+    by_id: HashMap<String, usize>,
     seen: u64,
     meta: u64,
     non_message: u64,
     replay: u64,
-    unreferenced: u64,
     errors: u64,
     first_error: Option<String>,
 }
 
+#[deny(clippy::indexing_slicing)]
 impl Fold {
     fn read(data: &str) -> Self {
         let mut fold = Self::default();
@@ -361,8 +404,6 @@ impl Fold {
             if let Some(Value::Array(messages)) = set.get("messages") {
                 self.checkpoint(messages);
             }
-            // a re-sync writes no `$set` before its `$patch`; a later message's does
-            self.resync_from = set.get("sessionId").is_some().then_some(self.slots.len());
             self.merge_metadata(set);
         } else if record.get("sessionId").is_some_and(Value::is_string)
             && record.get("projectHash").is_some_and(Value::is_string)
@@ -370,7 +411,13 @@ impl Fold {
             self.meta += 1;
             self.merge_metadata(&record);
             if let Some(Value::Array(messages)) = record.get("messages") {
-                self.insert_all(messages);
+                for message in messages {
+                    self.seen += 1;
+                    match (message.get("id"), message.get("$patch")) {
+                        (Some(Value::String(id)), None) => self.put(id.clone(), message.clone()),
+                        _ => self.non_message += 1,
+                    }
+                }
             }
         } else {
             self.non_message += 1;
@@ -386,150 +433,68 @@ impl Fold {
         }
     }
 
-    fn insert_all(&mut self, messages: &[Value]) {
-        for message in messages {
-            self.seen += 1;
-            match (message.get("id"), message.get("$patch")) {
-                (Some(Value::String(id)), None) => self.put(id.clone(), message.clone()),
-                _ => self.non_message += 1,
-            }
-        }
-    }
-
+    /// A message record: a rewrite of a message in the map replaces it in place; anything else
+    /// enters the map at its end, a dropped message returning to it.
     fn put(&mut self, id: String, message: Value) {
-        if let Some(&slot) = self.index.get(&id) {
-            if let Some(entry) = self.slots[slot].as_mut() {
-                entry.1 = message;
+        if let Some(index) = self.by_id.get(&id).copied() {
+            if let Some(entry) = self
+                .entries
+                .get_mut(index)
+                .filter(|entry| entry.state != State::Deleted)
+            {
+                entry.message = message;
+                if entry.state == State::Dropped {
+                    entry.state = State::Live;
+                    self.live.push(index);
+                }
+                self.replay += 1;
+                return;
             }
-            self.replay += 1;
-        } else {
-            self.index.insert(id.clone(), self.slots.len());
-            self.slots.push(Some((id, message)));
         }
+        self.by_id.insert(id, self.entries.len());
+        self.live.push(self.entries.len());
+        self.entries.push(Entry {
+            message,
+            state: State::Live,
+            original: None,
+        });
     }
 
-    /// A `$set.messages` history checkpoint (gemini-cli up to 361b0bb; `$patch` replaced it in
-    /// d1cc08a): listed messages already recorded are re-syncs of themselves, new ones are
-    /// inserted, unlisted ones left the model's context.
-    fn checkpoint(&mut self, messages: &[Value]) {
-        let mut listed: Vec<&str> = Vec::new();
-        let first_new = self.slots.len();
-        for message in messages {
-            self.seen += 1;
-            let (Some(Value::String(id)), None) = (message.get("id"), message.get("$patch")) else {
-                self.non_message += 1;
+    fn live_index(&self, id: &str) -> Option<usize> {
+        self.by_id.get(id).copied().filter(|index| {
+            self.entries
+                .get(*index)
+                .is_some_and(|entry| entry.state == State::Live)
+        })
+    }
+
+    /// `$rewindTo`: the message and every later one in the map; an unknown id clears the map.
+    fn rewind(&mut self, target: &str) {
+        let from = self
+            .live_index(target)
+            .and_then(|index| self.live.iter().position(|live| *live == index))
+            .unwrap_or(0);
+        let undone: Vec<usize> = self.live.drain(from.min(self.live.len())..).collect();
+        self.undo(undone);
+    }
+
+    /// Delete entries and, through each copy, the original it re-recorded.
+    fn undo(&mut self, mut pending: Vec<usize>) {
+        while let Some(index) = pending.pop() {
+            let Some(entry) = self.entries.get_mut(index) else {
                 continue;
             };
-            listed.push(id);
-            if self.index.contains_key(id) {
-                self.update(message);
-                self.replay += 1;
-            } else {
-                self.put(id.clone(), message.clone());
+            if entry.state != State::Deleted {
+                entry.state = State::Deleted;
+                pending.extend(entry.original);
             }
         }
-        let listed_ids: HashSet<&str> = listed.iter().copied().collect();
-        let dropped = self.live_slots(0, |id| !listed_ids.contains(id));
-        let inserted = self.live_slots(first_new, |_| true);
-        self.drop_from_context(&dropped, &inserted);
-        self.reorder(listed);
-    }
-
-    /// Live slots from `from` on whose id is not yet dropped and passes `keep`.
-    fn live_slots(&self, from: usize, keep: impl Fn(&str) -> bool) -> Vec<usize> {
-        (from..self.slots.len())
-            .filter(|&slot| {
-                self.slots[slot]
-                    .as_ref()
-                    .is_some_and(|(id, _)| !self.dropped.contains(id) && keep(id))
-            })
-            .collect()
-    }
-
-    /// Mark `dropped` as out of the model's context and pair each re-recorded copy among
-    /// `inserted` with the newest still-unpaired dropped message of the same type and text.
-    fn drop_from_context(&mut self, dropped: &[usize], inserted: &[usize]) {
-        let key = |slot: usize| {
-            self.slots[slot].as_ref().map(|(_, message)| {
-                let ty = message.get("type").and_then(Value::as_str).unwrap_or("");
-                let text = message.get("content").map(part_text).unwrap_or_default();
-                (ty.to_string(), text)
-            })
-        };
-        let dropped_keys: Vec<_> = dropped.iter().map(|&slot| key(slot)).collect();
-        let mut pairs = Vec::new();
-        let mut limit = dropped.len();
-        for &copy in inserted.iter().rev() {
-            let want = key(copy);
-            if let Some(found) = (0..limit).rev().find(|&k| dropped_keys[k] == want) {
-                pairs.push((copy, dropped[found]));
-                limit = found;
-            }
-        }
-        for (copy_slot, original_slot) in pairs {
-            if let (Some((copy, _)), Some((original, _))) =
-                (&self.slots[copy_slot], &self.slots[original_slot])
-            {
-                self.replays.insert(copy.clone(), original.clone());
-            }
-        }
-        for &slot in dropped {
-            if let Some((id, _)) = &self.slots[slot] {
-                self.dropped.insert(id.clone());
-            }
-        }
-    }
-
-    /// Drop the message and every later one; a rewound copy takes the original it repeats.
-    fn rewind(&mut self, id: &str) {
-        let from = self.index.get(id).copied().unwrap_or(0);
-        let mut gone: Vec<String> = Vec::new();
-        for slot in &mut self.slots[from..] {
-            if let Some((id, _)) = slot.take() {
-                gone.push(id);
-            }
-        }
-        self.slots.truncate(from);
-        while let Some(id) = gone.pop() {
-            self.index.remove(&id);
-            self.unreferenced += 1;
-            if let Some(original) = self.replays.remove(&id) {
-                if let Some(slot) = self.index.get(&original).copied() {
-                    if let Some((original, _)) = self.slots[slot].take() {
-                        gone.push(original);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Listed ids move to the end in list order; unlisted messages keep their order ahead.
-    fn reorder<'a>(&mut self, order: impl IntoIterator<Item = &'a str>) {
-        let mut moved = Vec::new();
-        let mut taken = HashSet::new();
-        for id in order {
-            if let Some(&slot) = self.index.get(id) {
-                if taken.insert(slot) {
-                    moved.push(slot);
-                }
-            }
-        }
-        let mut slots = std::mem::take(&mut self.slots);
-        let kept: Vec<usize> = (0..slots.len())
-            .filter(|slot| slots[*slot].is_some() && !taken.contains(slot))
-            .collect();
-        self.slots = kept
-            .into_iter()
-            .chain(moved)
-            .filter_map(|slot| slots[slot].take())
-            .map(Some)
-            .collect();
-        self.index = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, entry)| entry.as_ref().map(|(id, _)| (id.clone(), slot)))
-            .collect();
+        let entries = &self.entries;
+        self.live.retain(|index| {
+            entries
+                .get(*index)
+                .is_some_and(|entry| entry.state == State::Live)
+        });
     }
 
     fn patch(&mut self, patch: &Value) {
@@ -543,33 +508,165 @@ impl Fold {
                 }
             }
         }
-        let resync_from = self.resync_from.take();
         if let Some(Value::Array(ids)) = patch.get("removeIds") {
-            let removed: HashSet<&str> = ids.iter().filter_map(Value::as_str).collect();
-            let dropped = self.live_slots(0, |id| removed.contains(id));
-            // only a re-initialized chat re-records its kept tail as new messages
-            let inserted = match resync_from {
-                Some(from) => self.live_slots(from, |id| !removed.contains(id)),
-                None => Vec::new(),
-            };
-            self.drop_from_context(&dropped, &inserted);
+            let removed: HashSet<usize> = ids
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| self.live_index(id))
+                .collect();
+            self.resync(&removed);
         }
         if let Some(Value::Array(order)) = patch.get("orderIds") {
-            self.reorder(order.iter().filter_map(Value::as_str));
+            let order: Vec<usize> = order
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| self.live_index(id))
+                .collect();
+            // listed messages move to the end in list order; unlisted ones keep theirs ahead
+            let mut taken = HashSet::new();
+            let moved: Vec<usize> = order.into_iter().filter(|i| taken.insert(*i)).collect();
+            self.live.retain(|index| !taken.contains(index));
+            self.live.extend(moved);
         }
     }
 
-    /// Upstream `applySinglePatch`: replace `content`; give gemini tool calls a result by id,
-    /// only where none was recorded.
+    /// A `$set.messages` history checkpoint (gemini-cli up to 361b0bb; `$patch` replaced it in
+    /// d1cc08a): upstream rebuilds its map from the list, so unlisted messages leave it.
+    fn checkpoint(&mut self, messages: &[Value]) {
+        let before: HashSet<usize> = self.live.iter().copied().collect();
+        let mut listed: Vec<usize> = Vec::new();
+        for message in messages {
+            self.seen += 1;
+            let (Some(Value::String(id)), None) = (message.get("id"), message.get("$patch")) else {
+                self.non_message += 1;
+                continue;
+            };
+            match self.live_index(id).filter(|index| before.contains(index)) {
+                Some(index) => {
+                    self.update(message);
+                    self.replay += 1;
+                    listed.push(index);
+                }
+                None => {
+                    self.put(id.clone(), message.clone());
+                    listed.extend(self.by_id.get(id).copied());
+                }
+            }
+        }
+        let kept: HashSet<usize> = listed.iter().copied().collect();
+        let removed: HashSet<usize> = before.difference(&kept).copied().collect();
+        self.resync(&removed);
+        let mut seen = HashSet::new();
+        let entries = &self.entries;
+        self.live = listed
+            .into_iter()
+            .filter(|index| seen.insert(*index))
+            .filter(|index| {
+                entries
+                    .get(*index)
+                    .is_some_and(|entry| entry.state == State::Live)
+            })
+            .collect();
+    }
+
+    /// Remove `removed` (live entries) from the map as a tail rollback or a context rewrite.
+    fn resync(&mut self, removed: &HashSet<usize>) {
+        let first = self.live.iter().position(|index| removed.contains(index));
+        let last = self.live.iter().rposition(|index| removed.contains(index));
+        let (Some(first), Some(last)) = (first, last) else {
+            return;
+        };
+        if self.live.len().saturating_sub(first) == removed.len() {
+            let undone: Vec<usize> = self.live.drain(first..).collect();
+            self.undo(undone);
+            return;
+        }
+        let in_order: Vec<usize> = self
+            .live
+            .iter()
+            .copied()
+            .filter(|index| removed.contains(index))
+            .collect();
+        let after: Vec<usize> = self.live.iter().skip(last + 1).copied().collect();
+        self.pair(&in_order, &after);
+        for index in &in_order {
+            if let Some(entry) = self.entries.get_mut(*index) {
+                entry.state = State::Dropped;
+            }
+        }
+        self.live.retain(|index| !removed.contains(index));
+    }
+
+    /// Pair each copy among `candidates` with the newest unpaired `removed` message it repeats,
+    /// keeping both orders: a rewrite re-records the turns it keeps in their order.
+    fn pair(&mut self, removed: &[usize], candidates: &[usize]) {
+        let keys: Vec<Option<CopyKey>> =
+            removed.iter().map(|index| self.copy_key(*index)).collect();
+        let mut limit = keys.len();
+        for candidate in candidates.iter().rev() {
+            if self
+                .entries
+                .get(*candidate)
+                .is_none_or(|entry| entry.original.is_some())
+            {
+                continue;
+            }
+            let Some(want) = self.copy_key(*candidate) else {
+                continue;
+            };
+            let found = keys
+                .get(..limit)
+                .and_then(|keys| keys.iter().rposition(|key| key.as_ref() == Some(&want)));
+            let Some(found) = found else {
+                continue;
+            };
+            if let (Some(original), Some(entry)) =
+                (removed.get(found), self.entries.get_mut(*candidate))
+            {
+                entry.original = Some(*original);
+            }
+            limit = found;
+        }
+    }
+
+    /// Type, visible text and tool names: a copy keeps the turn's parts, the record may differ.
+    fn copy_key(&self, index: usize) -> Option<CopyKey> {
+        let message = &self.entries.get(index)?.message;
+        let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
+        let content = message.get("content").unwrap_or(&Value::Null);
+        let mut tools: Vec<String> = Vec::new();
+        let calls = message.get("toolCalls").and_then(Value::as_array);
+        for call in calls.into_iter().flatten() {
+            tools.extend(call.get("name").and_then(Value::as_str).map(str::to_string));
+        }
+        let parts = match content {
+            Value::Array(parts) => parts.as_slice(),
+            part => std::slice::from_ref(part),
+        };
+        for part in parts {
+            for field in ["functionCall", "functionResponse"] {
+                let name = part.get(field).and_then(|f| f.get("name"));
+                tools.extend(name.and_then(Value::as_str).map(str::to_string));
+            }
+        }
+        tools.sort_unstable();
+        tools.dedup();
+        let text = visible_text(&part_text(content));
+        Some((kind.to_string(), text, tools))
+    }
+
+    /// Upstream `applySinglePatch` on a message in the map: replace `content`; give gemini tool
+    /// calls a result by id, only where none was recorded.
     fn update(&mut self, patch: &Value) {
-        let Some(&slot) = patch
+        let Some(index) = patch
             .get("id")
             .and_then(Value::as_str)
-            .and_then(|id| self.index.get(id))
+            .and_then(|id| self.live_index(id))
         else {
             return;
         };
-        let Some((_, Value::Object(message))) = self.slots[slot].as_mut() else {
+        let Some(Value::Object(message)) = self.entries.get_mut(index).map(|e| &mut e.message)
+        else {
             return;
         };
         if let Some(content) = patch.get("content") {
@@ -609,23 +706,28 @@ impl Fold {
     }
 
     fn record(&self, tally: &Tally) {
+        let undone = self
+            .entries
+            .iter()
+            .filter(|entry| entry.state == State::Deleted)
+            .count();
         tally.seen_n(self.seen);
         tally.skip_n(Skip::Meta, self.meta);
         tally.skip_n(Skip::NonMessage, self.non_message);
         tally.skip_n(Skip::Replay, self.replay);
-        tally.skip_n(Skip::Unreferenced, self.unreferenced);
+        tally.skip_n(Skip::Unreferenced, undone as u64);
         let sample = self.first_error.as_deref().unwrap_or("");
         for _ in 0..self.errors {
             tally.error(sample);
         }
     }
 
-    /// The transcript in order, each message flagged when it only repeats a dropped one.
+    /// The transcript in order, each message flagged when it only repeats another.
     fn messages(&self) -> impl Iterator<Item = (&Value, bool)> {
-        self.slots
+        self.entries
             .iter()
-            .flatten()
-            .map(|(id, message)| (message, self.replays.contains_key(id)))
+            .filter(|entry| entry.state != State::Deleted)
+            .map(|entry| (&entry.message, entry.original.is_some()))
     }
 }
 
@@ -1147,24 +1249,116 @@ mod tests {
     }
 
     #[test]
-    fn only_the_re_sync_right_after_a_re_initialization_pairs_copies() {
-        let root = temp_root("resync-window");
+    fn a_prompt_retyped_between_two_rewrites_stays_its_own_turn() {
+        let root = temp_root("retyped");
         let path = root.join("session-2026-04-23T09-00-6e6e6e6e.jsonl");
         let lines = [
             r#"{"sessionId":"6e6e6e6e-0000-4000-8000-000000000007","projectHash":"h"}"#,
             r#"{"id":"u1","timestamp":"2026-04-23T09:00:01.000Z","type":"user","content":[{"text":"continue"}]}"#,
-            r#"{"$set":{"sessionId":"6e6e6e6e-0000-4000-8000-000000000007"}}"#,
-            r#"{"id":"u2","timestamp":"2026-04-23T09:05:01.000Z","type":"user","content":[{"text":"continue"}]}"#,
-            r#"{"$set":{"lastUpdated":"2026-04-23T09:05:01.000Z"}}"#,
+            r#"{"id":"c1","timestamp":"2026-04-23T09:01:00.000Z","type":"user","content":[{"text":"continue"}]}"#,
+            r#"{"$set":{"lastUpdated":"2026-04-23T09:01:00.000Z"}}"#,
             r#"{"$patch":{"removeIds":["u1"]}}"#,
+            r#"{"id":"u2","timestamp":"2026-04-23T09:05:01.000Z","type":"user","content":[{"text":"continue"}]}"#,
+            r#"{"id":"c2","timestamp":"2026-04-23T09:06:00.000Z","type":"user","content":[{"text":"continue"}]}"#,
+            r#"{"id":"c3","timestamp":"2026-04-23T09:06:00.000Z","type":"user","content":[{"text":"continue"}]}"#,
+            r#"{"$patch":{"removeIds":["c1","u2"]}}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let (messages, _, _) = parse(&path);
+        let (messages, _, tally) = parse(&path);
         let _ = std::fs::remove_dir_all(&root);
+        let rows: Vec<(u32, i64)> = messages.iter().map(|m| (m.turn, m.ts)).collect();
+        let at = |iso| crate::ingest::parse_timestamp::rfc3339(Some(iso));
         assert_eq!(
-            turns(&messages),
-            vec![(0, "user", "continue"), (1, "user", "continue")]
+            rows,
+            vec![
+                (0, at("2026-04-23T09:00:01.000Z")),
+                (1, at("2026-04-23T09:05:01.000Z"))
+            ]
         );
+        assert_eq!(tally.test_record_counts(Skip::Replay).3, 3);
+    }
+
+    /// Every session upstream's recorders wrote in tests/fixtures/gemini_flows reads as its
+    /// `expected.json` transcript, with each record accounted for.
+    #[test]
+    fn every_recorded_flow_reads_its_expected_transcript() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../agrep-cli/tests/fixtures/gemini_flows");
+        let expected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.join("expected.json")).unwrap()).unwrap();
+        let chats = fixture.join("home/.gemini/tmp/hash8888synthetic/chats");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&chats)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 30);
+        for path in files {
+            let (messages, _, tally) = parse(&path);
+            let session = messages[0].session.to_string();
+            let case = &expected[session.as_str()];
+            let rows: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|m| serde_json::json!([&*m.who, &*m.text, &*m.reply]))
+                .collect();
+            assert_eq!(
+                serde_json::Value::Array(rows),
+                case["rows"],
+                "{}",
+                case["flow"]
+            );
+            let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+            assert_eq!(seen, rows + agent_rows + skips + errors, "{}", case["flow"]);
+        }
+    }
+
+    #[test]
+    fn masking_keeps_the_recorded_tool_output_and_the_turns_own_moment() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agrep-cli/tests/fixtures/gemini_flows/home/.gemini/tmp/hash8888synthetic")
+            .join("chats/session-2026-04-04T09-01-03030303.jsonl");
+        let (messages, events, _) = parse(&path);
+        let outputs: Vec<&str> = events.iter().map(|e| e.output.as_str()).collect();
+        assert_eq!(
+            outputs,
+            vec!["export const alpaca = 1;", "export const bison = 1;"]
+        );
+        let at = |iso| crate::ingest::parse_timestamp::rfc3339(Some(iso));
+        let stamps: Vec<i64> = messages.iter().map(|m| m.ts).collect();
+        assert_eq!(
+            stamps,
+            vec![
+                at("2026-04-04T09:02:00.000Z"),
+                at("2026-04-04T09:06:00.000Z"),
+                at("2026-04-04T09:10:00.000Z")
+            ]
+        );
+    }
+
+    #[test]
+    fn rewinding_past_copies_whose_originals_follow_the_target_never_panics() {
+        // the stable-id environment turn stays first in the map through compression
+        let root = temp_root("rewind-env");
+        let path = root.join("session-2026-04-24T09-00-6d6d6d6d.jsonl");
+        let lines = [
+            r#"{"sessionId":"6d6d6d6d-0000-4000-8000-000000000008","projectHash":"h"}"#,
+            r#"{"id":"env","timestamp":"2026-04-24T09:00:00.000Z","type":"user","content":[{"text":"<session_context>x</session_context>"}]}"#,
+            r#"{"id":"a","timestamp":"2026-04-24T09:00:01.000Z","type":"user","content":[{"text":"alpha"}]}"#,
+            r#"{"id":"b","timestamp":"2026-04-24T09:01:01.000Z","type":"user","content":[{"text":"beta"}]}"#,
+            r#"{"$set":{"sessionId":"6d6d6d6d-0000-4000-8000-000000000008"}}"#,
+            r#"{"id":"s","timestamp":"2026-04-24T09:02:00.000Z","type":"user","content":[{"text":"<state_snapshot>a and b</state_snapshot>"}]}"#,
+            r#"{"id":"b2","timestamp":"2026-04-24T09:02:00.000Z","type":"user","content":[{"text":"beta"}]}"#,
+            r#"{"$patch":{"removeIds":["a","b"]}}"#,
+            r#"{"$rewindTo":"env"}"#,
+            r#"{"$rewindTo":"never-recorded"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (messages, _, tally) = parse(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(turns(&messages), vec![(0, "user", "alpha")]);
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+        assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 4);
     }
 
     #[test]

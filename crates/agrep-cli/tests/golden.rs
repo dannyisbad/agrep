@@ -216,6 +216,57 @@ fn intake_ids(data: &Path) -> Vec<String> {
     book["files"].as_object().unwrap().keys().cloned().collect()
 }
 
+/// Every flow that rewrites a Gemini session file, recorded by upstream's own recorders (current
+/// fb972b2 and the `$set.messages` 361b0bb) in tests/fixtures/gemini_flows. `expected.json` holds
+/// the conversation a person had: what upstream resumes, plus turns a context rewrite (compression,
+/// masking, truncation, `/chat resume`) took out of the model's view. Rewound and rolled-back
+/// turns are gone, and both recorder versions of one flow read the same.
+#[test]
+fn gemini_flows_read_as_the_conversation_a_person_had() {
+    let fixture = fixtures_dir().join("gemini_flows");
+    let expected: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.join("expected.json")).unwrap()).unwrap();
+    let data = temp_dir("gemini-flows");
+    ingest_into("gemini", &fixture.join("home"), &data, true);
+    check_intake_identity(&data);
+    let replies: std::collections::HashMap<String, String> =
+        sorted_lines(&data.join("replies.jsonl"))
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["reply"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+    let mut failures = Vec::new();
+    for (session, case) in expected.as_object().unwrap() {
+        let rows = session_rows(&data, session);
+        let got: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let reply = replies
+                    .get(row["id"].as_str().unwrap())
+                    .cloned()
+                    .unwrap_or_default();
+                serde_json::json!([row["who"], row["text"], reply])
+            })
+            .collect();
+        let turns: Vec<u64> = rows
+            .iter()
+            .map(|row| row["turn"].as_u64().unwrap())
+            .collect();
+        if serde_json::Value::Array(got.clone()) != case["rows"]
+            || turns != (0..rows.len() as u64).collect::<Vec<_>>()
+        {
+            failures.push(format!("{}: got {got:?} turns {turns:?}", case["flow"]));
+        }
+    }
+    let _ = fs::remove_dir_all(&data);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A legacy `.json` indexed before Gemini CLI resumed it (migrating it into a `.jsonl`) and then
 /// compressed the chat: the indexed turns keep their rows and handles, and the retired `.json`
 /// leaves the intake book so audit stops reporting it as an undiscovered source.

@@ -1,0 +1,11 @@
+{"sessionId":"06060606-0006-4000-8000-060606060606","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-04-07T09:01:00.000Z","lastUpdated":"2026-04-07T09:01:00.000Z","kind":"main"}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-04-07T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-04-07T09:01:00.000Z"}}
+{"id":"06060606-0000-4000-8000-000000000001","timestamp":"2026-04-07T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-04-07T09:02:00.000Z"}}
+{"$rewindTo":"06060606-0000-4000-8000-000000000001"}
+{"$set":{"lastUpdated":"2026-04-07T09:03:00.000Z"}}
+{"id":"06060606-0000-4000-8000-000000000002","timestamp":"2026-04-07T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-04-07T09:04:00.000Z"}}
+{"id":"06060606-0000-4000-8000-000000000003","timestamp":"2026-04-07T09:05:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-07T09:05:00.000Z"}}

@@ -1,0 +1,38 @@
+{"sessionId":"00000000-0000-4000-8000-000000000000","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-04-01T09:01:00.000Z","lastUpdated":"2026-04-01T09:01:00.000Z","kind":"main"}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-04-01T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-04-01T09:01:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000001","timestamp":"2026-04-01T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-04-01T09:02:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000002","timestamp":"2026-04-01T09:03:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-01T09:03:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000002","timestamp":"2026-04-01T09:03:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"read-alpaca","name":"read_file","args":{"file_path":"alpaca.ts"},"result":[{"functionResponse":{"id":"read-alpaca","name":"read_file","response":{"output":"export const alpaca = 1;"}}}],"status":"success","timestamp":"2026-04-01T09:03:00.000Z","displayName":"read_file","description":"read_file tool","renderOutputAsMarkdown":false}]}
+{"id":"00000000-0000-4000-8000-000000000003","timestamp":"2026-04-01T09:03:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-alpaca","name":"read_file","response":{"output":"export const alpaca = 1;"}}}]}
+{"$set":{"lastUpdated":"2026-04-01T09:03:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000004","timestamp":"2026-04-01T09:04:00.000Z","type":"gemini","content":"ok alpaca","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-01T09:04:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000005","timestamp":"2026-04-01T09:05:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-04-01T09:05:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000006","timestamp":"2026-04-01T09:06:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-01T09:06:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000007","timestamp":"2026-04-01T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-04-01T09:07:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000008","timestamp":"2026-04-01T09:08:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-01T09:08:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000008","timestamp":"2026-04-01T09:08:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"todo-cheetah","name":"write_todos","args":{"todos":[{"description":"Port the cheetah loader","status":"pending"}]},"result":[{"functionResponse":{"id":"todo-cheetah","name":"write_todos","response":{"output":"Updated."}}}],"status":"success","timestamp":"2026-04-01T09:08:00.000Z","displayName":"write_todos","description":"write_todos tool","renderOutputAsMarkdown":false}]}
+{"id":"00000000-0000-4000-8000-000000000009","timestamp":"2026-04-01T09:08:00.000Z","type":"user","content":[{"functionResponse":{"id":"todo-cheetah","name":"write_todos","response":{"output":"Updated."}}}]}
+{"$set":{"lastUpdated":"2026-04-01T09:08:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000010","timestamp":"2026-04-01T09:09:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-01T09:09:00.000Z"}}
+{"$set":{"sessionId":"00000000-0000-4000-8000-000000000000"}}
+{"id":"00000000-0000-4000-8000-000000000011","timestamp":"2026-04-01T09:10:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca to cheetah</overall_goal>\n</state_snapshot>"}]}
+{"id":"00000000-0000-4000-8000-000000000012","timestamp":"2026-04-01T09:10:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}
+{"id":"00000000-0000-4000-8000-000000000013","timestamp":"2026-04-01T09:10:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"id":"00000000-0000-4000-8000-000000000014","timestamp":"2026-04-01T09:10:00.000Z","type":"gemini","content":[{"functionCall":{"id":"todo-cheetah","name":"write_todos","args":{"todos":[{"description":"Port the cheetah loader","status":"pending"}]}}}]}
+{"id":"00000000-0000-4000-8000-000000000015","timestamp":"2026-04-01T09:10:00.000Z","type":"user","content":[{"functionResponse":{"id":"todo-cheetah","name":"write_todos","response":{"output":"Updated."}}}]}
+{"id":"00000000-0000-4000-8000-000000000016","timestamp":"2026-04-01T09:10:00.000Z","type":"gemini","content":[{"text":"ok​ cheetah\n"}]}
+{"$patch":{"removeIds":["00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003","00000000-0000-4000-8000-000000000004","00000000-0000-4000-8000-000000000005","00000000-0000-4000-8000-000000000006","00000000-0000-4000-8000-000000000007","00000000-0000-4000-8000-000000000008","00000000-0000-4000-8000-000000000009","00000000-0000-4000-8000-000000000010"]}}
+{"$set":{"lastUpdated":"2026-04-01T09:10:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000017","timestamp":"2026-04-01T09:11:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"$set":{"lastUpdated":"2026-04-01T09:11:00.000Z"}}
+{"id":"00000000-0000-4000-8000-000000000018","timestamp":"2026-04-01T09:12:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-01T09:12:00.000Z"}}

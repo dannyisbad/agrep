@@ -1,0 +1,158 @@
+{
+ "00000000-0000-4000-8000-000000000000": {"flow": "current/compress1", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca to cheetah</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "01010101-0001-4000-8000-010101010101": {"flow": "current/compress2", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>",""],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>bison and cheetah</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "02020202-0002-4000-8000-020202020202": {"flow": "current/mask1", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "03030303-0003-4000-8000-030303030303": {"flow": "current/mask2", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "04040404-0004-4000-8000-040404040404": {"flow": "current/truncate", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "05050505-0005-4000-8000-050505050505": {"flow": "current/load_history", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"],
+  ["user","dingo","ok dingo"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "06060606-0006-4000-8000-060606060606": {"flow": "current/abort_first", "rows": [
+  ["user","bison","ok bison"]
+ ]},
+ "07070707-0007-4000-8000-070707070707": {"flow": "current/abort_later", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "08080808-0008-4000-8000-080808080808": {"flow": "current/fail", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "09090909-0009-4000-8000-090909090909": {"flow": "current/rewind_env", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","dingo","ok dingo"]
+ ]},
+ "0a0a0a0a-000a-4000-8000-0a0a0a0a0a0a": {"flow": "current/rewind_snapshot", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "0b0b0b0b-000b-4000-8000-0b0b0b0b0b0b": {"flow": "current/rewind_snapshot2", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>",""],
+  ["user","elephant","ok elephant"]
+ ]},
+ "0c0c0c0c-000c-4000-8000-0c0c0c0c0c0c": {"flow": "current/rewind_copy", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "0d0d0d0d-000d-4000-8000-0d0d0d0d0d0d": {"flow": "current/rewind_prompt", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","dingo","ok dingo"]
+ ]},
+ "0e0e0e0e-000e-4000-8000-0e0e0e0e0e0e": {"flow": "current/resume_retype", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "10101010-1000-4000-8000-101010101010": {"flow": "checkpoint/compress1", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca to cheetah</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "11111111-1001-4000-8000-111111111111": {"flow": "checkpoint/compress2", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>",""],
+  ["user","cheetah","ok cheetah"],
+  ["recap","<state_snapshot>\n<overall_goal>bison and cheetah</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "12121212-1002-4000-8000-121212121212": {"flow": "checkpoint/mask1", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "13131313-1003-4000-8000-131313131313": {"flow": "checkpoint/mask2", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "14141414-1004-4000-8000-141414141414": {"flow": "checkpoint/truncate", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "15151515-1005-4000-8000-151515151515": {"flow": "checkpoint/load_history", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"],
+  ["user","dingo","ok dingo"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "16161616-1006-4000-8000-161616161616": {"flow": "checkpoint/abort_first", "rows": [
+  ["user","bison","ok bison"]
+ ]},
+ "17171717-1007-4000-8000-171717171717": {"flow": "checkpoint/abort_later", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "18181818-1008-4000-8000-181818181818": {"flow": "checkpoint/fail", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "19191919-1009-4000-8000-191919191919": {"flow": "checkpoint/rewind_env", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","dingo","ok dingo"]
+ ]},
+ "1a1a1a1a-100a-4000-8000-1a1a1a1a1a1a": {"flow": "checkpoint/rewind_snapshot", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "1b1b1b1b-100b-4000-8000-1b1b1b1b1b1b": {"flow": "checkpoint/rewind_snapshot2", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>",""],
+  ["user","elephant","ok elephant"]
+ ]},
+ "1c1c1c1c-100c-4000-8000-1c1c1c1c1c1c": {"flow": "checkpoint/rewind_copy", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["recap","<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "1d1d1d1d-100d-4000-8000-1d1d1d1d1d1d": {"flow": "checkpoint/rewind_prompt", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","dingo","ok dingo"]
+ ]},
+ "1e1e1e1e-100e-4000-8000-1e1e1e1e1e1e": {"flow": "checkpoint/resume_retype", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","ok bison"],
+  ["user","bison","ok bison"],
+  ["user","cheetah","ok cheetah"]
+ ]}
+}
