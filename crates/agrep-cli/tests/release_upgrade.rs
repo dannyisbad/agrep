@@ -223,12 +223,25 @@ fn upgrade_publishes_beside_a_foreign_crush_database_that_release_never_read() {
     }
 }
 
-/// The release held its snapshot back beside a foreign crush database and a claude project no
-/// pass could ever read. It published partial reads uncached, so its cache proves nothing about
-/// a directory it holds no rows of: the first pass publishes, the second (current cache) settles.
+/// How the first pass after an upgrade beside a never-readable claude project begins.
 #[cfg(unix)]
-#[test]
-fn upgrade_settles_beside_a_project_directory_release_never_read() {
+#[derive(Clone, Copy, Debug)]
+enum UpgradeStart {
+    /// As the release left the data dir.
+    AsReleased,
+    /// The release's data dir had already lost its event-completeness proofs.
+    ProofsLost,
+    /// The first pass was killed inside its cache commit: it had taken the stores over (its
+    /// cache is the release's, re-encoded with every entry awaiting reparse) and revoked the
+    /// event proofs, but never renamed its own cache into place.
+    KilledInCommit,
+}
+
+/// The release held its snapshot back beside a foreign crush database and a claude project no
+/// pass could ever read. Only an opencode read could publish uncached under the release, so its
+/// cache proves that directory held nothing and the first pass settles, event repair included.
+#[cfg(unix)]
+fn upgrade_settles_beside_a_project_directory_release_never_read(start: UpgradeStart) {
     let (home, foreign) = crush_upgrade_home();
     fs::write(&foreign, b"plain text where crush keeps its database\n").unwrap();
     let Some(locked) = lock_claude_project(&home) else {
@@ -239,15 +252,59 @@ fn upgrade_settles_beside_a_project_directory_release_never_read() {
     let data = temp_dir("release-upgrade-locked-data");
     assert_published(&ingest_output("all", &home, &data, false), "first index");
     age_to_release_0_3_2(&data, Snapshot::Withheld);
-    assert_settles_beside_a_never_read_dir(&home, &data, &locked, 2, |minute| {
+    if let UpgradeStart::KilledInCommit = start {
+        // A harness policy no pass can read stops the pass right after its takeover.
+        let policy = data.join("harness_prefixes.txt");
+        fs::write(&policy, b"\xff\xfe").unwrap();
+        assert!(!ingest_output("all", &home, &data, false).status.success());
+        fs::remove_file(&policy).unwrap();
+        let owner = fs::read_to_string(data.join(".derived-owner.json")).unwrap();
+        assert!(
+            !owner.contains("03020302030203020302"),
+            "no takeover: {owner}"
+        );
+        let cache = fs::read(data.join(".ingest_cache.bin")).unwrap();
+        assert_eq!(&cache[12..20], b"AGRPCB01", "the cache was not re-encoded");
+    }
+    if !matches!(start, UpgradeStart::AsReleased) {
+        for proof in fs::read_dir(&data).unwrap().flatten() {
+            if proof
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".events_complete")
+            {
+                fs::remove_file(proof.path()).unwrap();
+            }
+        }
+    }
+    assert!(!data.join(".source_snapshot.bin").exists(), "{start:?}");
+    assert_settles_beside_a_never_read_dir(&home, &data, &locked, 1, |minute| {
         let text = format!("upgrade churn {minute}");
         append_line(&chat, minute, &text);
         text
     });
-    assert!(normalize(&data).contains(CRUSH_TEXT));
+    assert!(normalize(&data).contains(CRUSH_TEXT), "{start:?}");
     unlock_dir(&locked);
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_settles_on_its_first_pass_beside_a_project_directory_release_never_read() {
+    upgrade_settles_beside_a_project_directory_release_never_read(UpgradeStart::AsReleased);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_that_must_rebuild_events_settles_beside_a_project_directory_release_never_read() {
+    upgrade_settles_beside_a_project_directory_release_never_read(UpgradeStart::ProofsLost);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_killed_inside_its_first_commit_settles_beside_a_project_directory_release_never_read() {
+    upgrade_settles_beside_a_project_directory_release_never_read(UpgradeStart::KilledInCommit);
 }
 
 /// The release published a partial opencode read without caching it, and held its snapshot back

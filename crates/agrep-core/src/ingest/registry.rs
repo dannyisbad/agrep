@@ -133,6 +133,11 @@ pub trait Adapter: Sync {
             Vec::new(),
         )
     }
+    /// Whether a read of one of this adapter's sources can come back `ReadOutcome::Partial`.
+    /// Cache generations older than the current one published such reads without caching them.
+    fn may_read_partially(&self) -> bool {
+        false
+    }
     /// Where this adapter's store lives (dirs or files; absent candidates are fine).
     /// The doctor freshness canary stats these: store activity the parser never turns
     /// into messages is adapter drift, and this is what makes it visible.
@@ -2032,6 +2037,14 @@ pub fn whole_store_agent(agent: &str) -> bool {
         .any(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Always)
 }
 
+/// Whether `agent` names a registered adapter whose reads may come back partial; see
+/// [`Adapter::may_read_partially`].
+pub fn partial_read_agent(agent: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.may_read_partially())
+}
+
 /// Exact current preflight coverage consumed by the ingest collectors. Stat paths let the cache
 /// recover a new file omitted by a transient `read_dir` entry error; Token identities detect a
 /// partial DB enumeration even when the outer source snapshot itself succeeds.
@@ -3424,6 +3437,39 @@ mod tests {
     #[test]
     fn hookless_registry_matches_registered_adapters() {
         assert_registry_contract(&registry_contract());
+    }
+
+    /// An adapter whose parser can return `ReadOutcome::Partial` must say so: the inventory an
+    /// older cache stands in for proves its sources empty otherwise, and rows could drop.
+    #[test]
+    fn every_adapter_that_can_read_partially_declares_it() {
+        let sources = [
+            ("antigravity", include_str!("antigravity.rs")),
+            ("claude", include_str!("claude.rs")),
+            ("cline", include_str!("cline.rs")),
+            ("codex", include_str!("codex.rs")),
+            ("crush", include_str!("crush.rs")),
+            ("cursor", include_str!("cursor.rs")),
+            ("gemini", include_str!("gemini.rs")),
+            ("kimi", include_str!("kimi.rs")),
+            ("opencode", include_str!("opencode.rs")),
+            ("pi", include_str!("pi.rs")),
+        ];
+        for adapter in ADAPTERS {
+            let (_, source) = sources
+                .iter()
+                .find(|(name, _)| *name == adapter.name())
+                .unwrap_or_else(|| panic!("no source listed for adapter {}", adapter.name()));
+            if source.contains("ReadOutcome::Partial") {
+                assert!(
+                    adapter.may_read_partially(),
+                    "{} can read partially but does not declare it",
+                    adapter.name()
+                );
+            }
+        }
+        assert!(partial_read_agent("opencode"));
+        assert!(!partial_read_agent("claude"));
     }
 
     fn assert_invalid_registry_value(value: serde_json::Value) {

@@ -2781,11 +2781,13 @@ impl IngestCache {
     }
 
     /// Whether a cache-derived inventory is silent on `scope`: a whole store, which admission
-    /// decides, or any non-token scope when an older build may have published it uncached.
+    /// decides, or, in an older generation, a source whose partial read published uncached.
+    /// Older generations cached every other Stat read they published; a failed read published none.
     fn cache_inventory_silent_on(&self, agent: &str, scope: &Path) -> bool {
         self.published_from_cache
             && crate::ingest::registry::token_prefix(agent, scope).is_none()
-            && (self.legacy_generation || crate::ingest::registry::whole_store_agent(agent))
+            && (crate::ingest::registry::whole_store_agent(agent)
+                || (self.legacy_generation && crate::ingest::registry::partial_read_agent(agent)))
     }
 
     /// Whether this cache holds conversations with rows or events of the token store database

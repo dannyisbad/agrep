@@ -760,6 +760,9 @@ impl crate::ingest::registry::Adapter for Opencode {
     fn collect(&self, cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
         collect(cache)
     }
+    fn may_read_partially(&self) -> bool {
+        true
+    }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
         let dirs = data_dirs_at(&crate::ingest::home());
         let mut roots = dirs.clone();
