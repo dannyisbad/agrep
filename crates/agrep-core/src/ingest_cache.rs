@@ -900,10 +900,14 @@ fn decode_cache_payload(
             }) {
                 return Err(CacheDecodeRefusal::PayloadShape);
             }
-            let generation = if cache
-                .entries
-                .values()
-                .any(|entry| entry.legacy_needs_reparse)
+            // Takeover re-encodes an older generation at this version with every entry flagged:
+            // it reparses whole. Once a pass has made any entry current, the entries it could not
+            // reparse keep their flag and rows and reparse one by one on warm passes.
+            let generation = if !cache.entries.is_empty()
+                && cache
+                    .entries
+                    .values()
+                    .all(|entry| entry.legacy_needs_reparse)
             {
                 CacheGeneration::LegacyReparse
             } else {
@@ -2585,6 +2589,17 @@ impl IngestCache {
     /// Whether this cache decoded an on-disk generation rather than starting empty.
     pub fn decoded_last_good_base(&self) -> bool {
         self.last_good_base
+    }
+
+    /// Source paths of every cached entry holding rows or events.
+    pub fn material_source_paths(&self) -> HashSet<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
+            })
+            .filter_map(|(key, _)| source_path_from_key(key))
+            .collect()
     }
 
     /// Supply the second stable source observation (a byte-identical preflight pair) that
@@ -7503,6 +7518,91 @@ mod tests {
         );
         assert_eq!(pass.parsed, 0);
         assert_eq!(pass.messages.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leftover_flagged_entries_reparse_one_by_one_on_a_warm_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "agrep-leftover-reparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join(".ingest_cache.bin");
+        let current = dir.join("current.jsonl");
+        let leftover = dir.join("leftover.jsonl");
+        fs::write(&current, b"current").unwrap();
+        fs::write(&leftover, b"leftover").unwrap();
+        let sources = [current.clone(), leftover.clone()];
+        // One session per source, so no reparse re-reads the other as a sibling.
+        let row = |path: &std::path::Path, text: &str| {
+            crate::model::RawMessage {
+                agent: "claude",
+                project: "project".into(),
+                session: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                ts: 1,
+                turn: 0,
+                text: text.into(),
+                model: String::new(),
+                reply: String::new(),
+                reply_chars: 0,
+                side: false,
+                parent: String::new(),
+            }
+            .freeze()
+        };
+        let mut cold = IngestCache::cold();
+        collect_cached(&mut cold, &dir, &sources, |path| {
+            let text = format!("{} row", path.file_stem().unwrap().to_string_lossy());
+            (vec![row(path, &text)], Vec::new(), ReadOutcome::Complete)
+        });
+        let flagged = |keys: &[&std::path::Path]| {
+            let mut entries = cold.entries.clone();
+            for key in keys {
+                entries
+                    .get_mut(&source_key(key))
+                    .unwrap()
+                    .legacy_needs_reparse = true;
+            }
+            IngestCache::base(entries, super::CacheBacking::Rewrite)
+                .save(&cache_path)
+                .unwrap();
+        };
+
+        // Every entry flagged is an older generation takeover re-encoded: it reparses whole.
+        flagged(&[&current, &leftover]);
+        let adopted = IngestCache::load(&cache_path);
+        assert!(!adopted.warm && adopted.force_reparse);
+
+        flagged(&[&leftover]);
+        let mut warm = IngestCache::load(&cache_path);
+        assert!(warm.warm && !warm.force_reparse);
+        let pass = collect_cached(&mut warm, &dir, &sources, |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+        });
+        assert_eq!(pass.parsed, 1, "only the flagged entry reparses");
+        let mut texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["current row", "leftover row"]);
+        assert!(warm.entries[&source_key(&leftover)].legacy_needs_reparse);
+        assert!(!warm.entries[&source_key(&current)].legacy_needs_reparse);
+
+        let pass = collect_cached(&mut warm, &dir, &sources, |path| {
+            (
+                vec![row(path, "leftover reparsed")],
+                Vec::new(),
+                ReadOutcome::Complete,
+            )
+        });
+        assert_eq!(pass.parsed, 1);
+        let mut texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["current row", "leftover reparsed"]);
+        assert!(!warm.entries[&source_key(&leftover)].legacy_needs_reparse);
         fs::remove_dir_all(&dir).ok();
     }
 

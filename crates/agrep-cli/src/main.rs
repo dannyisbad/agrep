@@ -5511,6 +5511,11 @@ fn index_cmd_locked(
         );
     } else if !prior_generation {
         pcache.set_published_material(HashSet::new());
+    } else if pcache.decoded_last_good_base() {
+        // Publication withheld every snapshot (0.3.2 held it beside any source issue), yet every
+        // row it published came through this cache first, as `published_token_inventory` relies
+        // on: the decoded cache's sources cover that generation.
+        pcache.set_published_material(pcache.material_source_paths());
     }
     let published_token_material =
         published_token_inventory(&data, prior_generation, previous_sig.as_deref(), &pcache);
@@ -5645,10 +5650,18 @@ fn index_cmd_locked(
             "complete ingest could not capture a preflight source snapshot; no generation was published"
         );
     }
+    // A pass complete only because a decoded base awaits reparse serves that base's rows as a
+    // warm pass does, so it publishes as one: an unreparsable entry would otherwise pin it.
+    let reparse_upgrade = !full && !repair_events && pcache.decoded_last_good_base();
     // Incremental retries may publish cache-merged healthy sessions while the pending marker
     // forces another attempt; a complete pass has no safe partial fallback. A stably
     // unreadable source is a disclosed fact, not a retryable condition, so it may publish.
-    if prior_generation && complete && !source_snapshot_safe && !stable_unreadable {
+    if prior_generation
+        && complete
+        && !reparse_upgrade
+        && !source_snapshot_safe
+        && !stable_unreadable
+    {
         let detail = source_detail_suffix(
             first_source_issue_label(&source_issues, pcache.source_read_issues())
                 .or_else(|| source_preflight_error.clone())

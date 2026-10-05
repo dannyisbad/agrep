@@ -685,15 +685,19 @@ fn takeover_migrates_legacy_cache_without_losing_unreadable_source_material() {
     let original = fs::read_to_string(&source).unwrap();
     fs::write(&source, b"\xff\xfe").unwrap();
 
+    // The legacy base serves the unreadable source's rows, as a warm cache would: publish
+    // them unchanged beside the disclosure rather than pin every later pass on the reparse.
     let successor = run(&home, &data, owner_b, false);
     assert!(
-        !successor.status.success(),
+        successor.status.success(),
         "{}",
         String::from_utf8_lossy(&successor.stderr)
     );
     for (name, bytes) in published {
         assert_eq!(fs::read(data.join(name)).unwrap(), bytes, "{name}");
     }
+    let health = fs::read_to_string(data.join(".source-health.json")).unwrap();
+    assert!(health.contains("source-read-failed"), "{health}");
     assert_owned_by(&data, owner_b);
     assert_eq!(owner_at(&data.join("corpus.db")), owner_b);
 
