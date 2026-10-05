@@ -130,6 +130,16 @@ def _crush_store(path: Path, turns: list[tuple[str, int, str]]) -> None:
         _crush_add(path, session, at, text)
 
 
+def _crush_exec(path: Path, *statements: str) -> None:
+    db = sqlite3.connect(str(path))
+    try:
+        with db:
+            for statement in statements:
+                db.execute(statement)
+    finally:
+        db.close()
+
+
 def _opencode_add(path: Path, home: Path, session: str, at: int, text: str, *,
                   new_session: bool = True) -> None:
     db = sqlite3.connect(str(path))
@@ -1672,6 +1682,40 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
             self.assertEqual(self.assert_verdict("indexed", kimi)["evidence"]["sources"], [str(path)])
             self.assert_verdict("indexed-as-side-chat", str(child))
 
+    def test_claude_file_its_store_walk_never_lists_is_not_parsed(self) -> None:
+        """claude walks only transcripts 2 to 7 levels below ~/.claude/projects; a `.jsonl` the census
+        finds above or below that range is never parsed, however new it is or often the index runs."""
+        projects = self.sandbox.home / ".claude" / "projects"
+        nested = projects.joinpath("-p", "a", "b", "c", "d", "e")
+        shallow = projects / "eeeeeeee-1111-4111-8111-111111111111.jsonl"
+        deep = nested / "f" / "ffffffff-1111-4111-8111-111111111111.jsonl"
+        deepest = nested / "dddddddd-1111-4111-8111-111111111111.jsonl"
+        deep.parent.mkdir(parents=True)
+
+        def write(path: Path) -> None:
+            _append_claude_turn(path, self.sandbox.home, "quokka depth question",
+                                "2000-01-01T00:00:00.000Z", session=path.stem)
+
+        for path in (shallow, deep, deepest):
+            write(path)
+            os.utime(path, (time.time() - 86400,) * 2)
+        late = deep.with_name("cccccccc-1111-4111-8111-111111111111.jsonl")
+        for round_ in range(2):
+            self.sandbox.index()
+            if round_:
+                write(late)
+            for path in (shallow, deep) + ((late,) if round_ else ()):
+                with self.subTest(path=path, round=round_):
+                    payload = self.assert_verdict("discovered-no-rows", str(path))
+                    self.assertEqual(payload["summary"],
+                                     f"discovered but not parsed: {self.sandbox.display(path)} "
+                                     "is not a file claude parses, so none of it is searchable")
+                    self.assertEqual(payload["evidence"]["intake"], [])
+            self.assert_verdict("indexed", str(deepest))
+            search = self.sandbox.cli("search", "quokka", "--json")
+            self.assertEqual({r["session"] for r in map(json.loads, search.stdout.splitlines())
+                              if "session" in r}, {deepest.stem})
+
     def test_token_store_path_with_a_new_conversation_is_not_indexed(self) -> None:
         """A conversation created after the index is in the census token list but in no intake
         record, so the database path is not indexed, whatever its indexed chats would say."""
@@ -1873,6 +1917,95 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
         crush.chmod(0o600)
         self.sandbox.index()
         self.assert_verdict("indexed", "crushchat-one")
+
+    def test_a_conversations_bad_row_leaves_its_siblings_indexed(self) -> None:
+        """crush files one conversation's unreadable row as an issue on its whole database; only the
+        conversation whose own tally shows that failed parse serves its last good parse."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question"),
+                             ("crushchat-two", 2000, "hazel invoice question"),
+                             ("crushchat-three", 3000, "maple budget question")])
+        self.sandbox.index()
+        _crush_exec(crush, "INSERT INTO messages VALUES "
+                           "('bad', 'crushchat-two', 'user', '{not json', '', 4000, 4000)",
+                    "UPDATE sessions SET updated_at = 4000 WHERE id = 'crushchat-two'")
+        self.sandbox.index()
+        unreadable = "make the file readable, then agrep index"
+        payload = self.assert_verdict("source-unreadable", "crushchat-two", next_action=unreadable)
+        self.assertEqual(payload["evidence"]["issue"]["path"], str(crush))
+        for session in ("crushchat-one", "crushchat-three"):
+            with self.subTest(session=session):
+                self.assertIsNone(self.assert_verdict("indexed", session)["evidence"]["issue"])
+        _crush_add(crush, "crushchat-one", 5000, "oak follow-up question", new_session=False)
+        _crush_exec(crush, "DELETE FROM messages WHERE session_id = 'crushchat-three'",
+                    "DELETE FROM sessions WHERE id = 'crushchat-three'")
+        self.assert_verdict("written-after-last-index", "crushchat-one", next_action="agrep index")
+        self.assert_verdict("indexed", "crushchat-three")
+        self.sandbox.index()
+        self.assert_no_hits("maple")
+        payload = self.assert_verdict("source-not-discovered", "crushchat-three")
+        self.assertEqual(payload["summary"], "not indexed: crush conversation crushchat-three was deleted "
+                                             f"from {self.sandbox.display(crush)} after an index parsed it")
+        self.assert_verdict("indexed", "crushchat-one")
+        self.assert_verdict("source-unreadable", "crushchat-two", next_action=unreadable)
+
+    def test_an_emptied_sibling_leaves_the_other_conversation_indexed(self) -> None:
+        """A conversation whose rows are gone while its session stays parses to nothing, so crush keeps
+        its last good parse and flags the database; that says nothing about the other chat."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question"),
+                             ("crushchat-two", 2000, "hazel invoice question")])
+        self.sandbox.index()
+        _crush_exec(crush, "DELETE FROM messages WHERE session_id = 'crushchat-two'",
+                    "UPDATE sessions SET updated_at = 4000 WHERE id = 'crushchat-two'")
+        self.sandbox.index()
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["issue"])
+        payload = self.assert_verdict("source-unreadable", "crushchat-two",
+                                      next_action="make the file readable, then agrep index")
+        self.assertEqual(payload["evidence"]["issue"]["path"], str(crush))
+
+    def test_store_the_census_no_longer_discovers_is_not_called_deleted(self) -> None:
+        """crush reads only the databases projects.json registers. One dropped from it still holds its
+        chats, so a census that never opened it proves no deletion."""
+        project = self.sandbox.home / "projects" / "oak"
+        store = project / ".crush" / "crush.db"
+        _crush_store(store, [("projchat-one", 1000, "marzipan ledger question")])
+        registry = self.crush_path().with_name("projects.json")
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"projects": [{"path": str(project), "data_dir": str(store.parent)}]}),
+                            encoding="utf-8")
+        self.sandbox.index()
+        self.assert_verdict("indexed", "projchat-one")
+        registry.write_text(json.dumps({"projects": []}), encoding="utf-8")
+        self.sandbox.index()
+        self.sandbox.index()
+        self.assert_no_hits("marzipan")
+        for reference in ("projchat-one", str(store)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("not-provable", reference)
+                self.assertEqual(payload["evidence"]["lines"][0],
+                                 f"store census: discovers no crush store at {self.sandbox.display(store)}")
+
+    def test_emptied_live_token_store_is_deleted_not_ambiguous(self) -> None:
+        """A live database the census reads whole that holds none of the conversations an index parsed
+        from it lost them all: deleted, never ambiguous between chats it no longer holds."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question"),
+                             ("crushchat-two", 2000, "hazel invoice question")])
+        self.sandbox.index()
+        _crush_exec(crush, "DELETE FROM messages", "DELETE FROM sessions")
+        # The first index after the store empties keeps its last good parse; the next drops it.
+        self.sandbox.index()
+        self.sandbox.index()
+        self.assert_no_hits("walnut")
+        shown = self.sandbox.display(crush)
+        payload = self.assert_verdict("source-not-discovered", str(crush))
+        self.assertEqual(payload["summary"], f"not indexed: every conversation an index parsed from crush "
+                                             f"file {shown} was deleted from it")
+        self.assertEqual(payload["evidence"]["lines"][:2], [
+            f"store census: {shown} holds 0 conversations, none of the 2 an index parsed",
+            "intake_stats.json: 2 conversations parsed from it: crushchat-one, crushchat-two"])
+        self.assertEqual(payload["candidates"], [])
 
 
 if __name__ == "__main__":

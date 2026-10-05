@@ -720,7 +720,7 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
         entries += [e for e in ctx.intake_files if e.get("session") == session]
     moved = {id(e): _store_wide_move(ctx, e, session) for e in entries if e.get("fresh") is False}
     stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
-    stores = [e["path"] for e in entries if e.get("session") and e.get("path")]
+    stores = [e["path"] for e in entries if e.get("session") and e.get("path") and _token_trouble(ctx, e)]
     issue = next((i for i in (_issue_covering(ctx, p) for p in paths + stores) if i), None)
     store_issue = next((i for i in ctx.issues if i.get("agent") == agent), None) if whole_store else None
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
@@ -958,18 +958,62 @@ def _unparsed_conversations(ctx: _Context, path: str, entries: list[dict]) -> li
                    and t["session"] not in _RESERVED_SESSIONS} - tallied)
 
 
+def _census_blind(ctx: _Context, agent: object) -> bool:
+    """The census could not read `agent`'s token lists, so a conversation missing from them proves nothing."""
+    return any(i.get("kind") == "token-census-unreadable" and i.get("agent") == agent for i in ctx.issues)
+
+
+def _token_trouble(ctx: _Context, entry: dict) -> bool:
+    """Whether a token conversation's own tally ties an issue on its database to it: its last parse
+    failed or yielded no row, or the census could not list its token. A sibling's bad row alone
+    records that same database-wide issue."""
+    if entry.get("errors") or not (entry.get("rows") or entry.get("agent_rows")):
+        return True
+    return entry.get("fresh") is None and _census_blind(ctx, entry.get("agent"))
+
+
+def _parsed_line(conversations: list[dict]) -> str:
+    held = sorted(str(e.get("session")) for e in conversations)
+    shown = ", ".join(held[:_CANDIDATE_LINES]) + (" …" if len(held) > _CANDIDATE_LINES else "")
+    return f"intake_stats.json: {_plural(len(held), 'conversation')} parsed from it: {shown}"
+
+
+def _claude_depth(ctx: _Context, path: str) -> tuple[int, str] | None:
+    """(depth, root) of `path` as claude.rs `is_discovered_transcript` counts it: components below
+    ~/.claude/projects, or all of them outside it. None without the census home."""
+    home = (ctx.payload or {}).get("home")
+    if not home:
+        return None
+    target, root = Path(path), Path(str(home), ".claude", "projects")
+    try:
+        return len(target.relative_to(root).parts), str(root)
+    except ValueError:
+        # Rust counts a Windows prefix and its root as two components; pathlib joins them in one part.
+        return len(target.parts) + bool(target.drive and target.root), str(root)
+
+
 def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
                conversation: str | None, facts: dict) -> dict:
     """A discovered file, or token-store conversation, that no intake record tallies. Only a file
     the last index's store walk listed went unparsed by it: no index tallies what its agent skips."""
+    source = next((s for s in ctx.sources if s.get("path") == path), None) or {}
+    modified = f"store census: file modified {_when(_key_mtime_ms(source.get('stat_key')))}"
+    unparsed = "intake_stats.json: no record of this file, so no index has parsed it"
+    depth = _claude_depth(ctx, path) if agent == "claude" else None
+    if depth and not 2 <= depth[0] <= 7:
+        return _report(
+            ctx, "discovered-no-rows",
+            f"discovered but not parsed: {ctx.display(path)} is not a file claude parses, so none of "
+            "it is searchable",
+            [f"claude: the store walk lists only transcripts 2 to 7 levels below "
+             f"{ctx.display(depth[1])}; this file is {depth[0]} deep", unparsed, modified,
+             ctx.sig_line()],
+            facts=facts)
     if not ctx.sig.get("present"):
         return _report(
             ctx, "not-provable",
             f"unprovable: {label} was discovered but nothing has been indexed yet",
             [ctx.census_line(), ctx.sig_line()], facts=facts, next_action="agrep index")
-    source = next((s for s in ctx.sources if s.get("path") == path), None) or {}
-    modified = f"store census: file modified {_when(_key_mtime_ms(source.get('stat_key')))}"
-    unparsed = "intake_stats.json: no record of this file, so no index has parsed it"
     # The census token list alone shows a conversation is new: sqlite WAL writes can leave the
     # database file's mtime older than the index that never saw the conversation.
     if conversation or ctx.changed_since_index(source):
@@ -1014,12 +1058,14 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
     a token-store conversation, or the chat directory a whole-store file was found under."""
     whole_store = ctx.fingerprint(agent or "") == "always"
     conversation = None if whole_store else session
-    issue = _issue_covering(ctx, path)
     claims = [c for c in ctx.cache_sessions if c.get("path") == path
               and (conversation is None or c.get("session") == conversation)]
     entries = [e for e in ctx.intake_files if e.get("path") == path
                and (conversation is None or e.get("session") == conversation)]
     conversations = [e for e in entries if e.get("session") not in _RESERVED_SESSIONS]
+    issue = _issue_covering(ctx, path)
+    if issue and conversation and not any(_token_trouble(ctx, e) for e in entries):
+        issue = None
     unparsed = [] if session else _unparsed_conversations(ctx, path, entries)
     indexed = [r for r in (ctx.row_for(c["session"]) for c in claims) if r]
     if not claims:
@@ -1063,14 +1109,23 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
     tallies = conversations or entries
     if tallies and not os.path.lexists(path):
         # intake_stats.json keeps a vanished source's record until an audit drops it.
-        held = sorted(str(e.get("session")) for e in conversations)
-        shown = ", ".join(held[:_CANDIDATE_LINES]) + (" …" if len(held) > _CANDIDATE_LINES else "")
-        tally = (f"intake_stats.json: {_plural(len(conversations), 'conversation')} parsed from it: "
-                 f"{shown}" if len(conversations) > 1 else _intake_line(tallies[0]))
+        tally = _parsed_line(conversations) if len(conversations) > 1 else _intake_line(tallies[0])
         return _report(
             ctx, "source-not-discovered",
             f"not indexed: {label} was deleted after an index parsed it",
             [f"filesystem: no file at {ctx.display(path)}", tally, ctx.sig_line()], facts=facts)
+    discovered = any(s.get("path") == path for s in ctx.sources)
+    # Only a token store the census discovered and read lists every conversation it still holds.
+    listed_whole = discovered and not _census_blind(ctx, agent)
+    if (session is None and len(conversations) > 1 and listed_whole
+            and all(e.get("session") and e.get("fresh") is None for e in conversations)):
+        listed = {t["session"] for t in ctx.token_conversations if t["path"] == path} - _RESERVED_SESSIONS
+        return _report(
+            ctx, "source-not-discovered",
+            f"not indexed: every conversation an index parsed from {label} was deleted from it",
+            [f"store census: {ctx.display(path)} holds {_plural(len(listed), 'conversation')}, none of "
+             f"the {len(conversations)} an index parsed", _parsed_line(conversations), ctx.sig_line()],
+            facts=facts)
     if session is None and len(conversations) > 1:
         candidates = [{"agent": e.get("agent"), "path": path, "session": e.get("session"),
                        "rows": e.get("rows")} for e in conversations[:_CANDIDATE_LINES]]
@@ -1087,10 +1142,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
              f"now {_when(_key_mtime_ms(now))} ({now})", _intake_line(entry), ctx.sig_line()],
             facts=facts, next_action="agrep index")
     token = entry.get("session")
-    if entry.get("fresh") is None and token and token not in _RESERVED_SESSIONS and not any(
-            i.get("kind") == "token-census-unreadable" and i.get("agent") == entry.get("agent")
-            for i in ctx.issues):
-        # The census read this store's token list whole, and the conversation is not in it.
+    if entry.get("fresh") is None and token and token not in _RESERVED_SESSIONS and listed_whole:
         listed = {t["session"] for t in ctx.token_conversations if t["path"] == path} - _RESERVED_SESSIONS
         return _report(
             ctx, "source-not-discovered",
@@ -1099,10 +1151,13 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             [f"store census: {ctx.display(path)} holds {_plural(len(listed), 'conversation')}, "
              f"none of them {token}", _intake_line(entry), ctx.sig_line()], facts=facts)
     if entry.get("fresh") is None:
+        lines = [_intake_line(entry), ctx.sig_line()]
+        if token and not discovered:
+            lines.insert(0, f"store census: discovers no {agent or 'token'} store at {ctx.display(path)}")
         return _report(
             ctx, "not-provable",
             f"unprovable: {label} has an intake record but its current state cannot be read",
-            [_intake_line(entry), ctx.sig_line()], facts=facts)
+            lines, facts=facts)
     if not entry.get("rows"):
         return _report(
             ctx, "discovered-no-rows",
