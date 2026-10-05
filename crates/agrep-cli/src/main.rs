@@ -226,6 +226,7 @@ const ROOT_STAGING_ARTIFACTS: &[&str] = &[
     ".source_absence_pending",
     ".source-health.json",
     ".source_snapshot.bin",
+    ".token_material.json",
     "boundary_stats.json",
     "corpus.db",
     "event_stats.json",
@@ -4096,10 +4097,68 @@ fn session_aliases(parse_cache: &IngestCache, msgs: &[Message]) -> Vec<cache::Se
     cache::resolve_session_aliases(msgs, claims)
 }
 
+/// `(agent, namespace)` of the token databases a published generation may hold material of,
+/// bound to that generation's `.ingest.sig`. Only an exact signature match is believed.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct TokenMaterialRecord {
+    version: u32,
+    signature: Option<String>,
+    namespaces: Vec<(String, String)>,
+}
+
+fn read_token_material(data: &Path, signature: Option<&str>) -> Option<HashSet<(String, String)>> {
+    let bytes =
+        read_optional_bytes(&data.join(TOKEN_MATERIAL_FILE), TOKEN_MATERIAL_MAX_BYTES).ok()??;
+    let record: TokenMaterialRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.version == TOKEN_MATERIAL_VERSION
+        && record.signature.as_deref().map(str::trim) == signature.map(str::trim))
+    .then(|| record.namespaces.into_iter().collect())
+}
+
+fn write_token_material(
+    data: &Path,
+    signature: Option<&str>,
+    namespaces: &HashSet<(String, String)>,
+) -> anyhow::Result<()> {
+    let mut namespaces: Vec<_> = namespaces.iter().cloned().collect();
+    namespaces.sort();
+    let record = TokenMaterialRecord {
+        version: TOKEN_MATERIAL_VERSION,
+        signature: signature.map(|signature| signature.trim().to_owned()),
+        namespaces,
+    };
+    cache::write_bytes_atomic(
+        &data.join(TOKEN_MATERIAL_FILE),
+        &serde_json::to_vec(&record)?,
+    )
+}
+
+/// Runs after the cache commit and before any derived write. The record keeps the published
+/// signature and gains the next generation's databases, so a crash anywhere up to the post-
+/// marker rewrite leaves a superset of both; an unknown record is removed, never guessed.
+fn stage_token_material(
+    data: &Path,
+    published_signature: Option<&str>,
+    published: Option<&HashSet<(String, String)>>,
+    next: &HashSet<(String, String)>,
+) -> anyhow::Result<()> {
+    match published {
+        Some(published) => write_token_material(
+            data,
+            published_signature,
+            &published.union(next).cloned().collect(),
+        ),
+        None => cache::remove_if_exists(&data.join(TOKEN_MATERIAL_FILE)),
+    }
+}
+
 const SOURCE_SNAPSHOT_FILE: &str = ".source_snapshot.bin";
 const INGEST_PENDING_FILE: &str = ".ingest_pending.bin";
 const SOURCE_ABSENCE_FILE: &str = ".source_absence_pending";
 const HARNESS_POLICY_SNAPSHOT_FILE: &str = ".harness_prefixes.snapshot";
+const TOKEN_MATERIAL_FILE: &str = ".token_material.json";
+const TOKEN_MATERIAL_VERSION: u32 = 1;
+const TOKEN_MATERIAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DERIVED_PROOF_FILE: &str = ".derived_generation.json";
 const DERIVED_PROOF_VERSION: u32 = 6;
 const LEGACY_DERIVED_PROOF_VERSION: u32 = 4;
@@ -5417,10 +5476,8 @@ fn index_cmd_locked(
     // --full still converges real deletions: what the last published generation contained,
     // or a proven-empty set when nothing was ever published.
     if let Some(published) = published_source.as_deref() {
-        pcache.set_published_material(ingest::registry::source_snapshot_published_material(
-            published,
-            pending_source.as_deref(),
-        ));
+        let (_, paths) = ingest::registry::source_snapshot_expectations(published);
+        pcache.set_published_material(paths);
         // That inventory lists only what it could read. Name the scopes it could not, so a
         // scope it published as an issue record cannot be mistaken for one it proved empty.
         pcache.set_published_blind_scopes(
@@ -5432,6 +5489,12 @@ fn index_cmd_locked(
     } else if !prior_generation {
         pcache.set_published_material(HashSet::new());
     }
+    let published_token_material = if prior_generation {
+        read_token_material(&data, previous_sig.as_deref())
+    } else {
+        Some(HashSet::new())
+    };
+    pcache.set_published_token_namespaces(published_token_material.clone());
     // A token store the preflight could not fully read is the only kind whose verdicts can turn
     // on what the published generation holds, so only then is that generation read for it.
     if prior_generation && derived_valid {
@@ -5695,6 +5758,13 @@ fn index_cmd_locked(
             staged_cache,
             proven_event_delta.is_none(),
         )?;
+        let committed_token_material = pcache.token_namespaces();
+        stage_token_material(
+            &data,
+            previous_sig.as_deref(),
+            published_token_material.as_ref(),
+            &committed_token_material,
+        )?;
         let (event_result, proof_complete) = refresh_events()?;
         let (_n_files, n_events, n_rewritten) = event_result;
         anyhow::ensure!(
@@ -5717,6 +5787,7 @@ fn index_cmd_locked(
             previous_sig_mtime,
             !(source_snapshot_safe || generation_publishes) && signal_written,
         )?;
+        write_token_material(&data, Some(&sig_line), &committed_token_material)?;
         lap!("write-events");
         let source_published = source_after.is_some();
         publish_source_snapshot(
@@ -5781,6 +5852,13 @@ fn index_cmd_locked(
         &run_agents,
         staged_cache,
         proven_event_delta.is_none(),
+    )?;
+    let committed_token_material = pcache.token_namespaces();
+    stage_token_material(
+        &data,
+        previous_sig.as_deref(),
+        published_token_material.as_ref(),
+        &committed_token_material,
     )?;
 
     // The final signature remains the cross-file permission slip.
@@ -5863,6 +5941,7 @@ fn index_cmd_locked(
         previous_sig_mtime,
         !(source_snapshot_safe || generation_publishes) && signal_written,
     )?;
+    write_token_material(&data, Some(&sig_line), &committed_token_material)?;
     lap!("publish-markers");
     let source_published = source_after.is_some();
     publish_source_snapshot(
@@ -6166,6 +6245,50 @@ mod tests {
         )
         .unwrap();
         assert!(!unlocked_owner_has_no_retained_corpus(&data));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn token_material_record_is_believed_only_for_its_own_signature() {
+        use super::{read_token_material, stage_token_material, write_token_material};
+
+        let data = std::env::temp_dir().join(format!(
+            "agrep-token-material-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let entry = |agent: &str, namespace: &str| (agent.to_string(), namespace.to_string());
+        let published = HashSet::from([entry("crush", "61\0")]);
+        let next = HashSet::from([entry("cursor", "")]);
+        assert_eq!(read_token_material(&data, Some("3:g\n")), None);
+
+        write_token_material(&data, Some("3:g\n"), &published).unwrap();
+        assert_eq!(
+            read_token_material(&data, Some("3:g")),
+            Some(published.clone())
+        );
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        assert_eq!(read_token_material(&data, None), None);
+
+        // Staged before the derived writes: still the published signature, both generations.
+        stage_token_material(&data, Some("3:g"), Some(&published), &next).unwrap();
+        let both: HashSet<_> = published.union(&next).cloned().collect();
+        assert_eq!(read_token_material(&data, Some("3:g")), Some(both));
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        write_token_material(&data, Some("4:h\n"), &next).unwrap();
+        assert_eq!(read_token_material(&data, Some("4:h")), Some(next.clone()));
+
+        // An unknown record is removed rather than extended into a claim.
+        stage_token_material(&data, Some("4:h"), None, &next).unwrap();
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        assert!(!data.join(super::TOKEN_MATERIAL_FILE).exists());
+
+        std::fs::write(data.join(super::TOKEN_MATERIAL_FILE), b"{not json").unwrap();
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
         let _ = std::fs::remove_dir_all(data);
     }
 

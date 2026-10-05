@@ -489,6 +489,45 @@ fn foreign_crush_store_retains_previously_indexed_crush_rows() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// A complete pass (--full, or the first pass over an upgraded parse cache) serves a durably
+/// unreadable database's cached conversations exactly as a warm pass does, so it publishes the
+/// other agents' changes instead of refusing every run until the database is readable.
+#[test]
+fn complete_pass_beside_a_foreign_crush_store_keeps_its_rows_and_publishes_churn() {
+    let home = crush_home();
+    copy_dir(&fixture_home("claude"), &home);
+    let db = crush_db(&home);
+    let data = temp_dir("crush-complete-foreign-data");
+    ingest_into("all", &home, &data, false);
+    remove_database(&db);
+    plant_foreign_tables(&db);
+    append_churn(&claude_transcript(&home), 1);
+    ingest_into("all", &home, &data, false);
+
+    append_churn(&claude_transcript(&home), 2);
+    let complete = ingest_output("all", &home, &data, true);
+    assert_published(&complete, "complete pass beside a foreign crush store");
+    let published = normalize(&data);
+    assert!(published.contains("crush probe churn 2"));
+    assert!(
+        published.contains(CRUSH_TEXT),
+        "indexed crush rows were dropped"
+    );
+    assert!(crush_issue_kinds(&data, &db).contains(&"unsupported-file-type".to_string()));
+
+    append_churn(&claude_transcript(&home), 3);
+    ingest_into("all", &home, &data, false);
+    let published = normalize(&data);
+    assert!(published.contains("crush probe churn 3"));
+    assert!(
+        published.contains(CRUSH_TEXT),
+        "indexed crush rows were dropped"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_crush_store_is_disclosed_and_does_not_block_other_agents() {
@@ -557,16 +596,43 @@ fn add_crush_conversation(db: &Path, session: &str, text: &str) {
 }
 
 #[cfg(unix)]
-fn crush_rows(data: &Path) -> usize {
+fn agent_rows(data: &Path, agent: &str) -> usize {
+    let field = format!("\"agent\":\"{agent}\"");
     sorted_lines(&data.join("messages.jsonl"))
         .iter()
-        .filter(|line| line.contains("\"agent\":\"crush\""))
+        .filter(|line| line.contains(&field))
         .count()
+}
+
+#[cfg(unix)]
+fn crush_rows(data: &Path) -> usize {
+    agent_rows(data, "crush")
+}
+
+/// Adds the Cursor fixture's store to an existing home.
+#[cfg(unix)]
+fn plant_cursor_fixture(home: &Path) {
+    let fixture = cursor_home();
+    copy_dir(&fixture, home);
+    let _ = fs::remove_dir_all(&fixture);
 }
 
 fn remove_parse_cache(data: &Path) {
     fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
     let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+}
+
+/// Loses the parse cache, then changes another agent's source: an unchanged preflight would
+/// take the shortcut that publishes nothing, so this pass must decide publication without it.
+#[cfg(unix)]
+fn index_after_losing_cache(home: &Path, data: &Path) -> std::process::Output {
+    remove_parse_cache(data);
+    let transcript = claude_transcript(home);
+    if !transcript.exists() {
+        copy_dir(&fixture_home("claude"), home);
+    }
+    append_churn(&transcript, 59);
+    ingest_output("all", home, data, false)
 }
 
 /// Makes `path` unreadable; false when this runner ignores mode bits, so there is no denial.
@@ -626,8 +692,7 @@ fn sibling_census_failure_cannot_unpublish_another_databases_rows() {
         let _ = fs::remove_dir_all(&data);
         return;
     }
-    remove_parse_cache(&data);
-    let lost = ingest_output("all", &home, &data, false);
+    let lost = index_after_losing_cache(&home, &data);
     allow(&indexed);
     assert_refused(
         &lost,
@@ -680,8 +745,7 @@ fn conversations_published_past_a_held_snapshot_survive_a_lost_cache() {
         assert_published(&served, &format!("unreadable crush store, run {pass}"));
         assert!(normalize(&data).contains(HELD_TEXT));
     }
-    remove_parse_cache(&data);
-    let lost = ingest_output("all", &home, &data, false);
+    let lost = index_after_losing_cache(&home, &data);
     allow(&crush);
     assert_refused(&lost, "rows published past a held snapshot");
     assert!(
@@ -716,8 +780,7 @@ fn one_observed_deletion_cannot_unpublish_rows_once_the_cache_is_lost() {
         let _ = fs::remove_dir_all(&data);
         return;
     }
-    remove_parse_cache(&data);
-    let lost = ingest_output("all", &home, &data, false);
+    let lost = index_after_losing_cache(&home, &data);
     allow(&crush);
     assert_refused(&lost, "rows seen deleted once, then a lost cache");
     assert!(
@@ -758,12 +821,127 @@ fn new_database_published_past_a_held_snapshot_survives_a_lost_cache() {
     let served = ingest_output("all", &home, &data, false);
     assert_published(&served, "unreadable new crush store");
     assert_eq!(crush_rows(&data), 3);
-    remove_parse_cache(&data);
-    let lost = ingest_output("all", &home, &data, false);
+    let lost = index_after_losing_cache(&home, &data);
     allow(&crush);
     assert_refused(&lost, "new database's rows after a lost cache");
     assert_eq!(crush_rows(&data), 3, "published crush rows were dropped");
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
+}
+
+/// A store first read by a later pass while every pass holds its snapshot back is in neither
+/// snapshot; its published conversations survive it turning unreadable with the cache gone.
+#[cfg(unix)]
+#[test]
+fn store_first_read_by_a_later_held_pass_survives_a_lost_cache() {
+    let home = crush_home();
+    let sibling = home.join(".crush").join("crush.db");
+    plant_empty_crush(&sibling);
+    let data = temp_dir("crush-later-held-data");
+    for _pass in 0..2 {
+        ingest_into("all", &home, &data, false);
+    }
+    assert_eq!(crush_rows(&data), 3);
+
+    remove_database(&sibling);
+    plant_not_sqlite(&sibling);
+    let held = ingest_output("all", &home, &data, false);
+    assert_published(&held, "foreign empty sibling holds the snapshot back");
+    plant_cursor_fixture(&home);
+    for pass in [1, 2] {
+        let output = ingest_output("all", &home, &data, false);
+        assert_published(
+            &output,
+            &format!("cursor under a held snapshot, run {pass}"),
+        );
+    }
+    let cursor_rows = agent_rows(&data, "cursor");
+    assert!(cursor_rows > 0, "cursor fixture was not published");
+
+    plant_empty_crush(&sibling);
+    let cursor = cursor_db(&home);
+    if !deny(&cursor) {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    let lost = index_after_losing_cache(&home, &data);
+    allow(&cursor);
+    assert_refused(&lost, "store first read by a later held pass");
+    assert_eq!(
+        agent_rows(&data, "cursor"),
+        cursor_rows,
+        "published cursor rows were dropped"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A database added after the pending marker was written is in neither snapshot. Its published
+/// conversations survive it turning unreadable with the cache gone, with the snapshot held or not
+/// while it is served, and whether the record is kept, removed, or names another generation.
+#[cfg(unix)]
+#[test]
+fn database_added_under_a_held_snapshot_survives_a_lost_cache_and_record() {
+    const ADDED_TEXT: &str = "crush conversation in a database added under a held snapshot";
+    let cases = [false, true].into_iter().flat_map(|held_while_served| {
+        ["kept", "removed", "stale"].map(|record| (held_while_served, record))
+    });
+    for (held_while_served, record) in cases {
+        let context = format!("{record} record, held while served: {held_while_served}");
+        let home = cursor_home();
+        let crush = crush_db(&home);
+        fs::create_dir_all(crush.parent().unwrap()).unwrap();
+        plant_crush_seed(&crush);
+        let data = temp_dir("crush-added-held-data");
+        ingest_into("all", &home, &data, false);
+
+        let journal = cursor_db(&home).with_file_name("state.vscdb-journal");
+        fs::write(&journal, b"hot").unwrap();
+        let marked = ingest_output("all", &home, &data, false);
+        assert_published(&marked, "cursor journal writes the pending marker");
+        assert!(data.join(".ingest_pending.bin").exists());
+        let added = home.join(".crush").join("crush.db");
+        plant_empty_crush(&added);
+        add_crush_conversation(&added, "added-session", ADDED_TEXT);
+        let held = ingest_output("all", &home, &data, false);
+        if !held_while_served {
+            fs::remove_file(&journal).unwrap();
+        }
+        assert_published(&held, "database added under a held snapshot");
+        assert!(normalize(&data).contains(ADDED_TEXT));
+
+        if !deny(&added) {
+            let _ = fs::remove_dir_all(&home);
+            let _ = fs::remove_dir_all(&data);
+            return;
+        }
+        let served = ingest_output("all", &home, &data, false);
+        let _ = fs::remove_file(&journal);
+        assert_published(&served, &context);
+        assert!(normalize(&data).contains(ADDED_TEXT));
+        let record_path = data.join(".token_material.json");
+        match record {
+            "removed" => fs::remove_file(&record_path).unwrap(),
+            "stale" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+                value["signature"] = serde_json::json!("0:another-generation");
+                fs::write(&record_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            _ => {}
+        }
+        let lost = index_after_losing_cache(&home, &data);
+        allow(&added);
+        assert_refused(&lost, &context);
+        assert!(
+            normalize(&data).contains(ADDED_TEXT),
+            "{context}: published crush rows were dropped"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
 }

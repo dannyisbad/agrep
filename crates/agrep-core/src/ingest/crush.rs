@@ -979,6 +979,10 @@ impl crate::ingest::registry::Adapter for Crush {
         self.store_content(database)
             .then(|| cache_namespace(database))
     }
+    fn token_namespace<'a>(&self, cache_id: &'a str) -> &'a str {
+        // cache_namespace is hex digits closed by the first NUL.
+        cache_id.find('\0').map_or("", |end| &cache_id[..=end])
+    }
     fn freshness_tokens(&self) -> crate::ingest::registry::TokenAvailability {
         live_tokens(false)
     }
@@ -1531,16 +1535,25 @@ mod tests {
 
         let mut first_index = IngestCache::cold();
         first_index.set_published_material(HashSet::new());
+        first_index.set_published_token_namespaces(Some(HashSet::new()));
         let pass = collect_discovered(&mut first_index, discover_at(vec![root.clone()], &home));
         assert!(pass.0.is_empty());
         assert!(first_index.output_complete());
         assert!(!first_index.source_snapshot_safe());
 
-        for published in [None, Some(HashSet::from([db.clone()]))] {
+        let recorded = ("crush".to_string(), cache_namespace(&db));
+        let at_stake_inventories = [
+            (None, Some(HashSet::new())),
+            (Some(HashSet::from([db.clone()])), Some(HashSet::new())),
+            (Some(HashSet::new()), None),
+            (Some(HashSet::new()), Some(HashSet::from([recorded]))),
+        ];
+        for (published, namespaces) in at_stake_inventories {
             let mut at_stake = IngestCache::cold();
             if let Some(published) = published {
                 at_stake.set_published_material(published);
             }
+            at_stake.set_published_token_namespaces(namespaces);
             collect_discovered(&mut at_stake, discover_at(vec![root.clone()], &home));
             assert!(!at_stake.output_complete());
         }
@@ -1549,6 +1562,7 @@ mod tests {
         for _pass in 0..2 {
             let mut warm = IngestCache::load(&cache_path);
             warm.set_published_material(HashSet::new());
+            warm.set_published_token_namespaces(Some(HashSet::new()));
             let pass = collect_discovered(&mut warm, discover_at(vec![root.clone()], &home));
             assert_eq!(pass.0.len(), 1);
             assert!(warm.output_complete());

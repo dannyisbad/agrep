@@ -551,6 +551,9 @@ pub struct IngestCache {
     published_blind_scopes: HashSet<(String, PathBuf)>,
     /// Token-store agents the verified published generation holds no row or event of.
     unpublished_token_agents: HashSet<String>,
+    /// `(agent, database namespace)` of every token conversation the published generation may
+    /// hold rows or events of. `None` is unknown: every token database counts as material.
+    published_token_namespaces: Option<HashSet<(String, String)>>,
     /// This cache decoded a last-good generation, so "no entry under X" is a positive fact
     /// about what was published rather than a missing witness.
     last_good_base: bool,
@@ -2274,6 +2277,7 @@ impl IngestCache {
             published_material: None,
             published_blind_scopes: HashSet::new(),
             unpublished_token_agents: HashSet::new(),
+            published_token_namespaces: None,
             last_good_base: false,
             repair_expected_agents: HashSet::new(),
             repair_expected_paths: HashSet::new(),
@@ -2620,6 +2624,32 @@ impl IngestCache {
         self.unpublished_token_agents = agents;
     }
 
+    /// The token databases the published generation may hold material of; see
+    /// [`Self::token_namespaces`]. `None` when that record is missing or describes another one.
+    pub fn set_published_token_namespaces(
+        &mut self,
+        namespaces: Option<HashSet<(String, String)>>,
+    ) {
+        self.published_token_namespaces = namespaces;
+    }
+
+    /// `(agent, database namespace)` of every cached token conversation with rows or events.
+    /// Every token row a pass publishes is served from such an entry, so recorded before the
+    /// derived writes this names each database the publication can hold material of.
+    pub fn token_namespaces(&self) -> HashSet<(String, String)> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
+            })
+            .filter_map(|(key, _)| key.strip_prefix("\0tok\0")?.split_once('\0'))
+            .map(|(agent, cache_id)| {
+                let namespace = crate::ingest::registry::token_namespace(agent, cache_id);
+                (agent.to_owned(), namespace)
+            })
+            .collect()
+    }
+
     /// Sessions the last-good rows attribute to `scope`. Read before ingest, this is the
     /// per-scope row census a publication may not silently shrink while `scope` is unreadable.
     pub fn sessions_under(&self, scope: &Path) -> HashSet<String> {
@@ -2662,6 +2692,22 @@ impl IngestCache {
         })
     }
 
+    /// Whether the token store database at `scope` may hold published or cached material: its
+    /// namespace is recorded as published, that record is unknown, or this cache holds it.
+    fn token_scope_material(&self, agent: &str, scope: &Path) -> bool {
+        let Some(prefix) = crate::ingest::registry::token_prefix(agent, scope) else {
+            return false;
+        };
+        let recorded = |(owner, namespace): &(String, String)| {
+            owner == agent && (prefix.starts_with(namespace) || namespace.starts_with(&prefix))
+        };
+        self.holds_token_entries(agent, scope)
+            || self
+                .published_token_namespaces
+                .as_ref()
+                .is_none_or(|published| published.iter().any(recorded))
+    }
+
     /// A token store database with nothing at stake: its agent has nothing published and this
     /// cache holds none of its conversations, so no publication without it can drop a row.
     fn unpublished_token_scope(&self, agent: &str, scope: &Path) -> bool {
@@ -2687,9 +2733,11 @@ impl IngestCache {
         let has_material = |entry: &Entry| {
             !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
         };
-        // An Always adapter's last-good snapshot carries its whole store, path keys and all.
+        // An Always adapter's last-good snapshot carries its whole store, path keys and all;
+        // a token collect serves every cached conversation of a database it cannot read.
         let snapshot_key = format!("\x00snapshot\x00{agent}");
         let retained_here = self.entries.get(&snapshot_key).is_some_and(has_material)
+            || self.holds_token_entries(agent, scope)
             || self.entries.iter().any(|(key, entry)| {
                 source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
                     && has_material(entry)
@@ -2698,7 +2746,7 @@ impl IngestCache {
             return MaterialVerdict::Retained;
         }
         if published.iter().any(|path| source_path_within(path, scope))
-            || self.holds_token_entries(agent, scope)
+            || self.token_scope_material(agent, scope)
         {
             return MaterialVerdict::Drops;
         }
@@ -2737,7 +2785,7 @@ impl IngestCache {
         match self.published_material.as_ref() {
             Some(paths) => {
                 !paths.iter().any(|path| source_path_within(path, scope))
-                    && !self.holds_token_entries(agent, scope)
+                    && !self.token_scope_material(agent, scope)
                     && !self.published_inventory_blind_to(agent, scope)
             }
             None => false,
@@ -5260,7 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_token_conversations_keep_their_database_published_material() {
+    fn cached_token_conversations_are_served_but_never_prove_their_database_empty() {
         use super::MaterialVerdict;
         use std::path::Path;
 
@@ -5281,9 +5329,16 @@ mod tests {
             |_, _| (vec![test_message("cached chat")], Vec::new()),
         );
         cache.set_published_material(HashSet::new());
+        cache.set_published_token_namespaces(Some(HashSet::new()));
+        assert_eq!(
+            cache.token_namespaces(),
+            HashSet::from([("crush".to_string(), prefix.clone())])
+        );
+        // Cached conversations are served, so publishing past the database drops none of them;
+        // they never prove it held nothing.
         assert_eq!(
             cache.published_material_under("crush", chats),
-            MaterialVerdict::Drops
+            MaterialVerdict::Retained
         );
         assert!(!cache.unreadable_scope_covered("crush", chats));
         assert_eq!(
@@ -5296,6 +5351,20 @@ mod tests {
             cache.published_material_under("claude", chats),
             MaterialVerdict::Retained
         );
+        // A recorded or unknown published namespace keeps a database without cached rows.
+        let empty_prefix = crate::ingest::registry::token_prefix("crush", empty).unwrap();
+        for namespaces in [Some(HashSet::from([("crush".into(), empty_prefix)])), None] {
+            cache.set_published_token_namespaces(namespaces);
+            assert_eq!(
+                cache.published_material_under("crush", empty),
+                MaterialVerdict::Drops
+            );
+            assert!(!cache.unreadable_scope_covered("crush", empty));
+            assert_eq!(
+                cache.published_material_under("claude", empty),
+                MaterialVerdict::Retained
+            );
+        }
     }
 
     #[test]
@@ -5338,8 +5407,9 @@ mod tests {
         );
         assert_eq!(
             cache.published_material_under("crush", chats),
-            MaterialVerdict::Drops
+            MaterialVerdict::Retained
         );
+        assert!(!cache.unreadable_scope_covered("crush", chats));
         // Stat scopes and other token agents keep the listed inventory.
         cache.set_unpublished_token_agents(HashSet::from(["claude".to_string()]));
         assert_eq!(

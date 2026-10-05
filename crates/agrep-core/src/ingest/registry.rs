@@ -173,6 +173,11 @@ pub trait Adapter: Sync {
     fn token_prefix(&self, _database: &Path) -> Option<String> {
         None
     }
+    /// The inverse of [`Self::token_prefix`]: the database part of a parse-cache id, equal to
+    /// `token_prefix` of the database that conversation came from. "" spans every database.
+    fn token_namespace<'a>(&self, _cache_id: &'a str) -> &'a str {
+        ""
+    }
     /// Actionable adapter root used only when a guarded collector cannot name a finer path.
     fn runtime_issue_root(&self) -> PathBuf {
         self.freshness_roots()
@@ -211,6 +216,16 @@ pub fn token_prefix(agent: &str, database: &Path) -> Option<String> {
         .iter()
         .find(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
         .and_then(|adapter| adapter.token_prefix(database))
+}
+
+/// [`Adapter::token_namespace`] of a cache id of `agent`; "" (every database) when no token
+/// adapter claims the agent.
+pub fn token_namespace(agent: &str, cache_id: &str) -> String {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
+        .map(|adapter| adapter.token_namespace(cache_id).to_owned())
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1891,16 +1906,6 @@ impl SourceSnapshotView {
         (agents, paths)
     }
 
-    /// The token store databases this snapshot listed.
-    fn listed_token_databases(&self) -> impl Iterator<Item = &Path> + '_ {
-        self.snapshot
-            .adapters
-            .iter()
-            .filter(|adapter| token_store_agent(&adapter.agent))
-            .flat_map(listed_sources)
-            .map(|source| source.path.as_path())
-    }
-
     pub(crate) fn coverage(&self) -> SourceCoverage {
         let mut paths = HashSet::new();
         let mut tokens = HashMap::new();
@@ -2010,20 +2015,6 @@ pub fn source_snapshot_expectations(bytes: &[u8]) -> (HashSet<String>, HashSet<P
         return (HashSet::new(), HashSet::new());
     };
     snapshot.expectations()
-}
-
-/// The publication guard's inventory: every path the published snapshot listed, plus the token
-/// store databases the pending one did. A pass that held its snapshot back may have published
-/// their conversations, and a token cache entry names no path the guard could find instead.
-pub fn source_snapshot_published_material(
-    published: &[u8],
-    pending: Option<&[u8]>,
-) -> HashSet<PathBuf> {
-    let (_, mut paths) = source_snapshot_expectations(published);
-    if let Some(pending) = pending.and_then(source_snapshot_view) {
-        paths.extend(pending.listed_token_databases().map(Path::to_path_buf));
-    }
-    paths
 }
 
 /// Whether `agent` names a registered `Fingerprint::Token` adapter.
@@ -5107,70 +5098,24 @@ mod tests {
     }
 
     #[test]
-    fn published_material_adds_only_the_pending_snapshots_token_databases() {
-        let file = |agent: &str, path: &Path| SourceFile {
-            agent: agent.into(),
-            path: path.to_path_buf(),
-            len: 4096,
-            mtime_secs: 1,
-            mtime_nanos: 0,
-            change_token: ChangeToken::Metadata(1),
-            #[cfg(windows)]
-            file_identity: None,
-            content_hash: None,
-        };
-        let adapter = |agent: &str, files: Vec<SourceFile>, issues| AdapterSource {
-            agent: agent.into(),
-            files,
-            tokens: Vec::new(),
-            issues,
-            complete: true,
-        };
-        let snapshot = |adapters| {
-            bincode::serialize(&SourceSnapshot {
-                snapshot_version: SOURCE_SNAPSHOT_VERSION,
-                cache_version: crate::ingest_cache::CACHE_VERSION,
-                selection: "all".into(),
-                adapters,
-                complete: true,
-            })
-            .unwrap()
-        };
-        let transcript = PathBuf::from("/fixture/claude/chat.jsonl");
-        let new_transcript = PathBuf::from("/fixture/claude/new.jsonl");
-        let empty_db = PathBuf::from("/fixture/empty/crush.db");
-        let new_db = PathBuf::from("/fixture/new/crush.db");
-        let foreign_db = PathBuf::from("/fixture/foreign/crush.db");
-        let cursor_db = PathBuf::from("/fixture/User/globalStorage/state.vscdb");
+    fn token_namespace_inverts_token_prefix_per_database() {
+        let first = PathBuf::from("/fixture/first/crush.db");
+        let second = PathBuf::from("/fixture/second/crush.db");
+        let first_prefix = token_prefix("crush", &first).unwrap();
+        let second_prefix = token_prefix("crush", &second).unwrap();
+        for session in ["sc1", "id\0with-nul", ""] {
+            let id = format!("{first_prefix}{session}");
+            assert_eq!(token_namespace("crush", &id), first_prefix);
+            assert!(!token_namespace("crush", &id).starts_with(&second_prefix));
+            assert!(!second_prefix.starts_with(&token_namespace("crush", &id)));
+        }
+        // An id without a namespace spans every database rather than none.
+        assert_eq!(token_namespace("crush", "bare-session"), "");
+        let cursor = PathBuf::from("/fixture/User/globalStorage/state.vscdb");
+        assert_eq!(token_prefix("cursor", &cursor).as_deref(), Some(""));
+        assert_eq!(token_namespace("cursor", "composer-id"), "");
+        assert_eq!(token_namespace("claude", "anything"), "");
         assert!(token_store_agent("crush") && token_store_agent("cursor"));
         assert!(!token_store_agent("claude"));
-        let published = snapshot(vec![
-            adapter("claude", vec![file("claude", &transcript)], Vec::new()),
-            adapter("crush", vec![file("crush", &empty_db)], Vec::new()),
-        ]);
-        let pending = snapshot(vec![
-            adapter("claude", vec![file("claude", &new_transcript)], Vec::new()),
-            adapter(
-                "crush",
-                vec![file("crush", &new_db), file("crush", &foreign_db)],
-                vec![SourceIssue::new(
-                    "crush",
-                    &foreign_db,
-                    "unsupported-file-type",
-                    "not a crush database",
-                )],
-            ),
-            adapter("cursor", vec![file("cursor", &cursor_db)], Vec::new()),
-        ]);
-        assert_eq!(
-            source_snapshot_published_material(&published, None),
-            HashSet::from([transcript.clone(), empty_db.clone()])
-        );
-        // Stat paths keep their published-only inventory; a database the census could not
-        // read proves no conversation either way.
-        assert_eq!(
-            source_snapshot_published_material(&published, Some(&pending)),
-            HashSet::from([transcript, empty_db, new_db, cursor_db])
-        );
     }
 }
