@@ -4,9 +4,13 @@
 //! (fb972b2). Since #23749 a session is JSONL: a metadata line `{ sessionId, projectHash,
 //! startTime, ... }`, then whole message records - re-recording a message (tool calls, tokens)
 //! appends it again under the same `id`; the last write wins at its first position - plus
-//! `$set` (metadata; a `messages` array there replaces the history), `$rewindTo` (drop that
-//! message and every later one; an unknown id drops them all) and `$patch` (content and
-//! tool-result updates, `removeIds`, `orderIds`). Resuming a legacy session copies `X.json`
+//! `$set` (metadata; until 2026-10 also whole-history `messages` checkpoints), `$rewindTo` (drop
+//! that message and every later one; an unknown id drops them all) and `$patch` (content and
+//! tool-result updates, `removeIds`, `orderIds`). Checkpoints and `removeIds` re-sync the file to
+//! the model's context: compression (`ChatCompressionService`, automatic past a token threshold
+//! or `/compress`) re-records a `<state_snapshot>` user turn, a canned acknowledgement and the
+//! kept tail under new ids, then removes every earlier id. The adapter keeps the transcript (see
+//! `Fold`); the snapshot becomes a recap row. Resuming a legacy session copies `X.json`
 //! into `X.jsonl` beside it and leaves the `.json` behind, so a `.json` with a `.jsonl`
 //! sibling is superseded and not a source. The legacy store is one JSON object per session:
 //!   { sessionId, projectHash, startTime, lastUpdated, messages: [ ... ] }
@@ -105,23 +109,39 @@ fn is_injected_context(text: &str) -> bool {
     text.starts_with("<session_context>") || text.starts_with("<hook_context>")
 }
 
+/// Compression (upstream `ChatCompressionService`) records the model-written `<state_snapshot>`
+/// as a user turn, then this canned model acknowledgement, before the kept tail.
+const COMPRESSION_ACK: &str = "Got it. Thanks for the additional context!";
+
+fn is_state_snapshot(text: &str) -> bool {
+    text.contains("<state_snapshot>") && text.contains("</state_snapshot>")
+}
+
 fn file_stem(path: &Path) -> String {
     path.file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_default()
 }
 
-/// One session's messages as rows and events. Callers have already counted every message
-/// as seen; each one here lands in exactly one row, agent row or named skip.
+/// One session's messages as rows and events; a message flagged `true` only repeats an earlier
+/// one. Callers have already counted every message as seen; each one here lands in exactly one
+/// row, agent row or named skip.
 fn emit_messages<'a>(
     session: &str,
-    messages: impl IntoIterator<Item = &'a Value>,
+    messages: impl IntoIterator<Item = (&'a Value, bool)>,
     tally: &Tally,
 ) -> (Vec<Message>, Vec<Event>) {
     let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    let mut recap_turns: Vec<u32> = Vec::new();
+    let mut after_recap = false;
     let mut turn = 0u32;
-    for (message_ordinal, m) in messages.into_iter().enumerate() {
+    for (message_ordinal, (m, replay)) in messages.into_iter().enumerate() {
+        if replay {
+            tally.skip(Skip::Replay);
+            continue;
+        }
+        let follows_recap = std::mem::take(&mut after_recap);
         let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let ts = parse_timestamp::rfc3339(m.get("timestamp").and_then(|t| t.as_str()));
         match ty {
@@ -145,6 +165,10 @@ fn emit_messages<'a>(
                     continue;
                 }
                 tally.row();
+                if is_state_snapshot(&text) {
+                    recap_turns.push(turn);
+                    after_recap = true;
+                }
                 out.push(crate::model::RawMessage {
                     agent: "gemini",
                     project: "gemini".to_string(),
@@ -163,6 +187,10 @@ fn emit_messages<'a>(
             "gemini" => {
                 // prose reply -> the user turn it answers (thoughts are reasoning, excluded)
                 let txt = m.get("content").map(part_text).unwrap_or_default();
+                if follows_recap && txt.trim() == COMPRESSION_ACK {
+                    tally.skip(Skip::Meta);
+                    continue;
+                }
                 if !txt.trim().is_empty() {
                     if let Some(last) = out.last_mut() {
                         let chars = crate::ingest::append_capped(
@@ -174,7 +202,8 @@ fn emit_messages<'a>(
                     }
                 }
                 if let Some(last) = out.last_mut() {
-                    if last.model.is_empty() {
+                    let recap = recap_turns.last() == Some(&last.turn);
+                    if last.model.is_empty() && !recap {
                         if let Some(md) = m.get("model").and_then(|v| v.as_str()) {
                             if !md.is_empty() {
                                 last.model = md.to_string();
@@ -221,12 +250,19 @@ fn emit_messages<'a>(
             _ => tally.skip(Skip::NonHuman),
         }
     }
-    (
-        out.into_iter()
-            .map(crate::model::RawMessage::freeze)
-            .collect(),
-        events,
-    )
+    let messages = out
+        .into_iter()
+        .map(|raw| {
+            let recap = recap_turns.binary_search(&raw.turn).is_ok();
+            let mut message = raw.freeze();
+            if recap {
+                message.who = "recap".into();
+                message.model_source = "recap".into();
+            }
+            message
+        })
+        .collect();
+    (messages, events)
 }
 
 /// A legacy whole-session document; seen = elements of its messages array.
@@ -240,7 +276,7 @@ fn parse_document(root: &Value, path: &Path, tally: &Tally) -> (Vec<Message>, Ve
         return (Vec::new(), Vec::new());
     };
     tally.seen_n(messages.len() as u64);
-    emit_messages(&session, messages, tally)
+    emit_messages(&session, messages.iter().map(|m| (m, false)), tally)
 }
 
 /// JS `typeof value === 'object' && value !== null`, the test upstream applies to `$set`/`$patch`.
@@ -258,16 +294,27 @@ fn js_truthy(value: &Value) -> bool {
     }
 }
 
-/// Upstream's `createJsonlRecordAccumulator` (full-load mode): messages keyed by id in
-/// first-insertion order like its JS Map, record kinds tested in its order. Every non-blank
-/// line and every message inside a `messages` array is one seen unit, and each unit leaves
-/// through exactly one counter below or survives into the final history.
+/// Upstream's `createJsonlRecordAccumulator` (full-load mode), reading the transcript rather
+/// than the model context: messages keyed by id in first-insertion order like its JS Map,
+/// record kinds tested in its order, `$rewindTo` honored. A history re-sync (`$patch`
+/// `removeIds`, a `$set.messages` checkpoint) only drops messages from the model's context -
+/// compression drops every earlier turn - so those stay, and the copies it re-records under new
+/// ids are replays. Re-syncs never overwrite a recorded tool result (masking and truncation
+/// shorten them for the model). Every non-blank line and every message inside a `messages`
+/// array is one seen unit, and each leaves through exactly one counter below or survives.
 #[derive(Default)]
 struct Fold {
     session_id: Option<Value>,
     project_hash: Option<Value>,
     slots: Vec<Option<(String, Value)>>,
     index: HashMap<String, usize>,
+    /// Ids a re-sync dropped from the model's context; they remain transcript.
+    dropped: HashSet<String>,
+    /// A re-recorded copy's id -> the dropped message it repeats.
+    replays: HashMap<String, String>,
+    /// First slot written since a re-initialization (`$set.sessionId`, written on resume and
+    /// after compression), until the re-sync that follows it.
+    resync_from: Option<usize>,
     seen: u64,
     meta: u64,
     non_message: u64,
@@ -312,11 +359,10 @@ impl Fold {
         } else if let Some(set) = record.get("$set").filter(|set| is_js_object(set)) {
             self.meta += 1;
             if let Some(Value::Array(messages)) = set.get("messages") {
-                self.replay += self.index.len() as u64;
-                self.slots.clear();
-                self.index.clear();
-                self.insert_all(messages);
+                self.checkpoint(messages);
             }
+            // a re-sync writes no `$set` before its `$patch`; a later message's does
+            self.resync_from = set.get("sessionId").is_some().then_some(self.slots.len());
             self.merge_metadata(set);
         } else if record.get("sessionId").is_some_and(Value::is_string)
             && record.get("projectHash").is_some_and(Value::is_string)
@@ -362,29 +408,106 @@ impl Fold {
         }
     }
 
-    fn remove(&mut self, id: &str) {
-        if let Some(slot) = self.index.remove(id) {
-            self.slots[slot] = None;
-            self.unreferenced += 1;
+    /// A `$set.messages` history checkpoint (gemini-cli up to 361b0bb; `$patch` replaced it in
+    /// d1cc08a): listed messages already recorded are re-syncs of themselves, new ones are
+    /// inserted, unlisted ones left the model's context.
+    fn checkpoint(&mut self, messages: &[Value]) {
+        let mut listed: Vec<&str> = Vec::new();
+        let first_new = self.slots.len();
+        for message in messages {
+            self.seen += 1;
+            let (Some(Value::String(id)), None) = (message.get("id"), message.get("$patch")) else {
+                self.non_message += 1;
+                continue;
+            };
+            listed.push(id);
+            if self.index.contains_key(id) {
+                self.update(message);
+                self.replay += 1;
+            } else {
+                self.put(id.clone(), message.clone());
+            }
+        }
+        let listed_ids: HashSet<&str> = listed.iter().copied().collect();
+        let dropped = self.live_slots(0, |id| !listed_ids.contains(id));
+        let inserted = self.live_slots(first_new, |_| true);
+        self.drop_from_context(&dropped, &inserted);
+        self.reorder(listed);
+    }
+
+    /// Live slots from `from` on whose id is not yet dropped and passes `keep`.
+    fn live_slots(&self, from: usize, keep: impl Fn(&str) -> bool) -> Vec<usize> {
+        (from..self.slots.len())
+            .filter(|&slot| {
+                self.slots[slot]
+                    .as_ref()
+                    .is_some_and(|(id, _)| !self.dropped.contains(id) && keep(id))
+            })
+            .collect()
+    }
+
+    /// Mark `dropped` as out of the model's context and pair each re-recorded copy among
+    /// `inserted` with the newest still-unpaired dropped message of the same type and text.
+    fn drop_from_context(&mut self, dropped: &[usize], inserted: &[usize]) {
+        let key = |slot: usize| {
+            self.slots[slot].as_ref().map(|(_, message)| {
+                let ty = message.get("type").and_then(Value::as_str).unwrap_or("");
+                let text = message.get("content").map(part_text).unwrap_or_default();
+                (ty.to_string(), text)
+            })
+        };
+        let dropped_keys: Vec<_> = dropped.iter().map(|&slot| key(slot)).collect();
+        let mut pairs = Vec::new();
+        let mut limit = dropped.len();
+        for &copy in inserted.iter().rev() {
+            let want = key(copy);
+            if let Some(found) = (0..limit).rev().find(|&k| dropped_keys[k] == want) {
+                pairs.push((copy, dropped[found]));
+                limit = found;
+            }
+        }
+        for (copy_slot, original_slot) in pairs {
+            if let (Some((copy, _)), Some((original, _))) =
+                (&self.slots[copy_slot], &self.slots[original_slot])
+            {
+                self.replays.insert(copy.clone(), original.clone());
+            }
+        }
+        for &slot in dropped {
+            if let Some((id, _)) = &self.slots[slot] {
+                self.dropped.insert(id.clone());
+            }
         }
     }
 
+    /// Drop the message and every later one; a rewound copy takes the original it repeats.
     fn rewind(&mut self, id: &str) {
         let from = self.index.get(id).copied().unwrap_or(0);
+        let mut gone: Vec<String> = Vec::new();
         for slot in &mut self.slots[from..] {
             if let Some((id, _)) = slot.take() {
-                self.index.remove(&id);
-                self.unreferenced += 1;
+                gone.push(id);
             }
         }
         self.slots.truncate(from);
+        while let Some(id) = gone.pop() {
+            self.index.remove(&id);
+            self.unreferenced += 1;
+            if let Some(original) = self.replays.remove(&id) {
+                if let Some(slot) = self.index.get(&original).copied() {
+                    if let Some((original, _)) = self.slots[slot].take() {
+                        gone.push(original);
+                    }
+                }
+            }
+        }
     }
 
     /// Listed ids move to the end in list order; unlisted messages keep their order ahead.
-    fn reorder(&mut self, order: &[Value]) {
+    fn reorder<'a>(&mut self, order: impl IntoIterator<Item = &'a str>) {
         let mut moved = Vec::new();
         let mut taken = HashSet::new();
-        for id in order.iter().filter_map(Value::as_str) {
+        for id in order {
             if let Some(&slot) = self.index.get(id) {
                 if taken.insert(slot) {
                     moved.push(slot);
@@ -420,17 +543,24 @@ impl Fold {
                 }
             }
         }
+        let resync_from = self.resync_from.take();
         if let Some(Value::Array(ids)) = patch.get("removeIds") {
-            for id in ids.iter().filter_map(Value::as_str) {
-                self.remove(id);
-            }
+            let removed: HashSet<&str> = ids.iter().filter_map(Value::as_str).collect();
+            let dropped = self.live_slots(0, |id| removed.contains(id));
+            // only a re-initialized chat re-records its kept tail as new messages
+            let inserted = match resync_from {
+                Some(from) => self.live_slots(from, |id| !removed.contains(id)),
+                None => Vec::new(),
+            };
+            self.drop_from_context(&dropped, &inserted);
         }
         if let Some(Value::Array(order)) = patch.get("orderIds") {
-            self.reorder(order);
+            self.reorder(order.iter().filter_map(Value::as_str));
         }
     }
 
-    /// Upstream `applySinglePatch`: replace `content`; set `result` on gemini tool calls by id.
+    /// Upstream `applySinglePatch`: replace `content`; give gemini tool calls a result by id,
+    /// only where none was recorded.
     fn update(&mut self, patch: &Value) {
         let Some(&slot) = patch
             .get("id")
@@ -458,7 +588,9 @@ impl Fold {
             let id = call.get("id");
             let target = existing.iter_mut().find(|tc| tc.get("id") == id);
             if let (Some(result), Some(Value::Object(target))) = (call.get("result"), target) {
-                target.insert("result".to_string(), result.clone());
+                if target.get("result").is_none_or(Value::is_null) {
+                    target.insert("result".to_string(), result.clone());
+                }
             }
         }
     }
@@ -488,8 +620,12 @@ impl Fold {
         }
     }
 
-    fn messages(&self) -> impl Iterator<Item = &Value> {
-        self.slots.iter().flatten().map(|(_, message)| message)
+    /// The transcript in order, each message flagged when it only repeats a dropped one.
+    fn messages(&self) -> impl Iterator<Item = (&Value, bool)> {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|(id, message)| (message, self.replays.contains_key(id)))
     }
 }
 
@@ -755,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_folds_last_writes_rewinds_and_patches_like_upstream() {
+    fn jsonl_folds_last_writes_rewinds_and_patches_without_dropping_turns() {
         let root = temp_root("fold");
         let path = root.join("session-2026-04-20T09-00-6a6a6a6a.jsonl");
         let lines = [
@@ -805,19 +941,20 @@ mod tests {
         assert_eq!(events[0].output, "Updated 1 todo");
         assert!(events[0].input.contains("Port the yaml loader"));
         // 16 lines: metadata, $set, $rewindTo, two $patch lines and the info notice are meta;
-        // g1's first write is replayed; u2, g3 (rewind) and r1 (removeIds) are unreferenced;
-        // the preamble is a wrapper and the torn last line errs.
+        // g1's first write is replayed; u2 and g3 (rewind) are unreferenced; r1 survives its
+        // removeIds as a tool result; the preamble is a wrapper and the torn last line errs.
         let (seen, rows, agent_rows, skips, errors) = identity(&tally);
         assert_eq!((seen, rows, agent_rows, errors), (16, 2, 2, 1));
         assert_eq!(seen, rows + agent_rows + skips + errors);
         assert_eq!(tally.test_record_counts(Skip::Meta).3, 6);
         assert_eq!(tally.test_record_counts(Skip::Replay).3, 1);
-        assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 3);
+        assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 2);
+        assert_eq!(tally.test_record_counts(Skip::NonHuman).3, 1);
         assert_eq!(tally.test_record_counts(Skip::Wrapper).3, 1);
     }
 
     #[test]
-    fn rewind_to_an_unknown_id_and_a_set_checkpoint_replace_the_history() {
+    fn rewind_to_an_unknown_id_clears_and_a_set_checkpoint_keeps_earlier_turns() {
         let root = temp_root("checkpoint");
         let path = root.join("session-2026-04-21T09-00-6b6b6b6b.jsonl");
         let lines = [
@@ -830,16 +967,21 @@ mod tests {
         std::fs::write(&path, lines.join("\r\n")).unwrap();
         let (messages, _, tally) = parse(&path);
         let _ = std::fs::remove_dir_all(&root);
-        let rows: Vec<(&str, &str)> = messages.iter().map(|m| (&*m.session, &*m.text)).collect();
+        let rows: Vec<(&str, &str, u32)> = messages
+            .iter()
+            .map(|m| (&*m.session, &*m.text, m.turn))
+            .collect();
+        let session = "6b6b6b6b-0000-4000-8000-00000000000b";
         assert_eq!(
             rows,
-            vec![(
-                "6b6b6b6b-0000-4000-8000-00000000000b",
-                "checkpointed prompt"
-            )]
+            vec![
+                (session, "second draft", 0),
+                (session, "checkpointed prompt", 1)
+            ]
         );
         let (seen, rows, agent_rows, skips, errors) = identity(&tally);
-        assert_eq!((seen, rows, errors), (7, 1, 0));
+        assert_eq!((seen, rows, errors), (7, 2, 0));
+        assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 1);
         assert_eq!(seen, rows + agent_rows + skips + errors);
     }
 
@@ -867,6 +1009,162 @@ mod tests {
         assert_eq!(tally.test_record_counts(Skip::NonHuman).3, 1);
         assert_eq!(tally.test_record_counts(Skip::EmptyText).3, 1);
         assert_eq!(seen, rows + agent_rows + skips + errors);
+    }
+
+    /// Sessions written by upstream's own recorder (crates/agrep-cli/tests/fixtures/gemini_compress).
+    fn recorded(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agrep-cli/tests/fixtures/gemini_compress/home/.gemini/tmp")
+            .join("hash7777synthetic/chats")
+            .join(name)
+    }
+
+    fn turns(messages: &[crate::model::Message]) -> Vec<(u32, &str, &str)> {
+        messages
+            .iter()
+            .map(|m| (m.turn, &*m.who, m.text.lines().next().unwrap_or("")))
+            .collect()
+    }
+
+    #[test]
+    fn compression_keeps_compressed_turns_and_files_the_snapshot_as_a_recap() {
+        let path = recorded("session-2026-04-14T09-00-c0c0c0c0.jsonl");
+        let (messages, events, tally) = parse(&path);
+        assert_eq!(
+            turns(&messages),
+            vec![
+                (0, "user", "investigate the alpaca module"),
+                (1, "user", "investigate the bison module"),
+                (2, "user", "investigate the cheetah module"),
+                (3, "user", "investigate the dingo module"),
+                (4, "recap", "<state_snapshot>"),
+                (5, "user", "now investigate the elephant module"),
+            ]
+        );
+        // the dingo turn keeps its own moment, not the re-recorded copy's
+        let dingo = crate::ingest::parse_timestamp::rfc3339(Some("2026-04-14T09:03:00.000Z"));
+        assert_eq!(messages[3].ts, dingo);
+        assert_eq!(&*messages[3].reply, "The dingo module has 412 lines.");
+        let recap = &messages[4];
+        assert!(recap.reply.is_empty() && recap.model.is_empty());
+        assert_eq!(&*recap.model_source, "recap");
+        let outputs: Vec<(&str, &str)> = events
+            .iter()
+            .map(|e| (e.call_id.as_str(), e.output.as_str()))
+            .collect();
+        assert_eq!(
+            outputs,
+            vec![
+                ("read_file-1", "export const alpaca = 1;"),
+                ("write_todos-1", "Successfully updated the todo list."),
+                ("run_shell_command-1", "412 src/dingo.ts"),
+            ]
+        );
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+        // three tool-call rewrites plus the four re-recorded tail messages
+        assert_eq!(tally.test_record_counts(Skip::Replay).3, 7);
+        assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 0);
+    }
+
+    #[test]
+    fn checkpoint_compression_from_the_august_recorder_keeps_its_turns() {
+        let path = recorded("session-2026-08-20T09-00-a2a2a2a2.jsonl");
+        let (messages, events, tally) = parse(&path);
+        assert_eq!(
+            turns(&messages),
+            vec![
+                (0, "user", "profile the kestrel cache"),
+                (1, "user", "profile the lemur queue"),
+                (2, "recap", "<state_snapshot>"),
+                (3, "user", "profile the marmot scheduler"),
+            ]
+        );
+        assert_eq!(&*messages[1].reply, "The lemur queue is unbounded.");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].output, "export class Lemur {}");
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+    }
+
+    #[test]
+    fn a_resumed_then_compressed_legacy_session_keeps_its_turns() {
+        let (legacy, _, _) = parse(&recorded("session-2026-03-01T10-00-b1b1b1b1.json"));
+        let (current, _, tally) = parse(&recorded("session-2026-03-01T10-00-b1b1b1b1.jsonl"));
+        assert_eq!(
+            turns(&current),
+            vec![
+                (0, "user", "audit the falcon parser"),
+                (1, "user", "audit the gecko lexer"),
+                (2, "user", "audit the heron emitter"),
+                (3, "user", "audit the ibis printer"),
+                (4, "recap", "<state_snapshot>"),
+                (5, "user", "audit the jackal linker"),
+            ]
+        );
+        let identity_of =
+            |m: &crate::model::Message| (m.session.to_string(), m.turn, m.ts, m.text.to_string());
+        let before: Vec<_> = legacy.iter().map(identity_of).collect();
+        let after: Vec<_> = current.iter().take(3).map(identity_of).collect();
+        assert_eq!(before, after);
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+    }
+
+    #[test]
+    fn rewinding_a_re_recorded_copy_takes_its_original() {
+        let root = temp_root("rewind-copy");
+        let path = root.join("session-2026-04-22T09-00-6f6f6f6f.jsonl");
+        let lines = [
+            r#"{"sessionId":"6f6f6f6f-0000-4000-8000-000000000006","projectHash":"h"}"#,
+            r#"{"id":"a","timestamp":"2026-04-22T09:00:01.000Z","type":"user","content":[{"text":"alpha"}]}"#,
+            r#"{"id":"ga","timestamp":"2026-04-22T09:00:02.000Z","type":"gemini","content":"A1"}"#,
+            r#"{"id":"b","timestamp":"2026-04-22T09:01:01.000Z","type":"user","content":[{"text":"beta"}]}"#,
+            r#"{"id":"gb","timestamp":"2026-04-22T09:01:02.000Z","type":"gemini","content":"B1"}"#,
+            r#"{"$set":{"sessionId":"6f6f6f6f-0000-4000-8000-000000000006"}}"#,
+            r#"{"id":"s","timestamp":"2026-04-22T09:02:00.000Z","type":"user","content":[{"text":"<state_snapshot>a and b</state_snapshot>"}]}"#,
+            r#"{"id":"k","timestamp":"2026-04-22T09:02:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}"#,
+            r#"{"id":"b2","timestamp":"2026-04-22T09:02:00.000Z","type":"user","content":[{"text":"beta"}]}"#,
+            r#"{"id":"gb2","timestamp":"2026-04-22T09:02:00.000Z","type":"gemini","content":[{"text":"B1"}]}"#,
+            r#"{"$patch":{"removeIds":["a","ga","b","gb"]}}"#,
+            r#"{"$set":{"lastUpdated":"2026-04-22T09:02:00.000Z"}}"#,
+            r#"{"$rewindTo":"b2"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (messages, _, tally) = parse(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            turns(&messages),
+            vec![
+                (0, "user", "alpha"),
+                (1, "recap", "<state_snapshot>a and b</state_snapshot>")
+            ]
+        );
+        assert_eq!(&*messages[0].reply, "A1");
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+        assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 4);
+    }
+
+    #[test]
+    fn only_the_re_sync_right_after_a_re_initialization_pairs_copies() {
+        let root = temp_root("resync-window");
+        let path = root.join("session-2026-04-23T09-00-6e6e6e6e.jsonl");
+        let lines = [
+            r#"{"sessionId":"6e6e6e6e-0000-4000-8000-000000000007","projectHash":"h"}"#,
+            r#"{"id":"u1","timestamp":"2026-04-23T09:00:01.000Z","type":"user","content":[{"text":"continue"}]}"#,
+            r#"{"$set":{"sessionId":"6e6e6e6e-0000-4000-8000-000000000007"}}"#,
+            r#"{"id":"u2","timestamp":"2026-04-23T09:05:01.000Z","type":"user","content":[{"text":"continue"}]}"#,
+            r#"{"$set":{"lastUpdated":"2026-04-23T09:05:01.000Z"}}"#,
+            r#"{"$patch":{"removeIds":["u1"]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (messages, _, _) = parse(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            turns(&messages),
+            vec![(0, "user", "continue"), (1, "user", "continue")]
+        );
     }
 
     #[test]

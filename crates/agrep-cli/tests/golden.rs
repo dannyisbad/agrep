@@ -189,6 +189,93 @@ fn gemini_resume_migration_retires_the_legacy_json_warm() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// Sessions written by upstream's own recorder (fb972b2 and the August 361b0bb), compressed
+/// mid-way: every compressed-away turn stays at its turn and the `<state_snapshot>` is a recap.
+#[test]
+fn golden_gemini_compress() {
+    check_fixture(
+        "gemini",
+        "gemini_compress",
+        &fixture_home("gemini_compress"),
+    );
+}
+
+fn session_rows(data: &Path, session: &str) -> Vec<serde_json::Value> {
+    let mut rows: Vec<serde_json::Value> = sorted_lines(&data.join("messages.jsonl"))
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["session"] == session)
+        .collect();
+    rows.sort_by_key(|row| row["turn"].as_u64());
+    rows
+}
+
+fn intake_ids(data: &Path) -> Vec<String> {
+    let book: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join("intake_stats.json")).unwrap()).unwrap();
+    book["files"].as_object().unwrap().keys().cloned().collect()
+}
+
+/// A legacy `.json` indexed before Gemini CLI resumed it (migrating it into a `.jsonl`) and then
+/// compressed the chat: the indexed turns keep their rows and handles, and the retired `.json`
+/// leaves the intake book so audit stops reporting it as an undiscovered source.
+#[test]
+fn gemini_resume_then_compress_keeps_indexed_turns_and_forgets_the_retired_json() {
+    let session = "b1b1b1b1-0301-4000-8000-000000000301";
+    let home = temp_dir("gemini-compress-home");
+    copy_dir(&fixture_home("gemini_compress"), &home);
+    let chats = home.join(".gemini/tmp/hash7777synthetic/chats");
+    let legacy = chats.join("session-2026-03-01T10-00-b1b1b1b1.json");
+    let jsonl = chats.join("session-2026-03-01T10-00-b1b1b1b1.jsonl");
+    let parked = home.join("parked.jsonl");
+    fs::rename(&jsonl, &parked).unwrap();
+    let data = temp_dir("gemini-compress-data");
+
+    ingest_into("gemini", &home, &data, false);
+    let before = session_rows(&data, session);
+    assert_eq!(before.len(), 3);
+    let legacy_id = legacy.to_string_lossy().to_string();
+    assert!(intake_ids(&data).contains(&legacy_id));
+
+    fs::rename(&parked, &jsonl).unwrap();
+    for full in [false, true] {
+        ingest_into("gemini", &home, &data, full);
+        let book = intake_ids(&data);
+        assert!(
+            !book.contains(&legacy_id),
+            "retired .json still tallied (full={full})"
+        );
+        assert!(book.contains(&jsonl.to_string_lossy().to_string()));
+        let after = session_rows(&data, session);
+        assert_eq!(after[..3], before[..], "indexed turns moved (full={full})");
+        let shape: Vec<(u64, &str, &str)> = after
+            .iter()
+            .map(|row| {
+                let text = row["text"].as_str().unwrap().lines().next().unwrap_or("");
+                (
+                    row["turn"].as_u64().unwrap(),
+                    row["who"].as_str().unwrap(),
+                    text,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, "user", "audit the falcon parser"),
+                (1, "user", "audit the gecko lexer"),
+                (2, "user", "audit the heron emitter"),
+                (3, "user", "audit the ibis printer"),
+                (4, "recap", "<state_snapshot>"),
+                (5, "user", "audit the jackal linker"),
+            ]
+        );
+    }
+    check_intake_identity(&data);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 #[test]
 fn golden_crush() {
     let home = crush_home();

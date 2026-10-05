@@ -1,0 +1,61 @@
+{
+  "sessionId": "b1b1b1b1-0301-4000-8000-000000000301",
+  "projectHash": "legacyhash",
+  "startTime": "2026-03-01T10:00:00.000Z",
+  "lastUpdated": "2026-03-01T10:03:05.000Z",
+  "messages": [
+    {
+      "id": "i1",
+      "timestamp": "2026-03-01T10:00:00.000Z",
+      "type": "info",
+      "content": "Authentication succeeded"
+    },
+    {
+      "id": "m1",
+      "timestamp": "2026-03-01T10:01:00.000Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "audit the falcon parser"
+        }
+      ]
+    },
+    {
+      "id": "m2",
+      "timestamp": "2026-03-01T10:01:05.000Z",
+      "type": "gemini",
+      "content": "The falcon parser looks sound.",
+      "model": "gemini-2.5-pro"
+    },
+    {
+      "id": "m3",
+      "timestamp": "2026-03-01T10:02:00.000Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "audit the gecko lexer"
+        }
+      ]
+    },
+    {
+      "id": "m4",
+      "timestamp": "2026-03-01T10:02:05.000Z",
+      "type": "gemini",
+      "content": "The gecko lexer drops BOMs.",
+      "model": "gemini-2.5-pro"
+    },
+    {
+      "id": "m5",
+      "timestamp": "2026-03-01T10:03:00.000Z",
+      "type": "user",
+      "content": "audit the heron emitter"
+    },
+    {
+      "id": "m6",
+      "timestamp": "2026-03-01T10:03:05.000Z",
+      "type": "gemini",
+      "content": "The heron emitter is fine.",
+      "model": "gemini-2.5-pro"
+    }
+  ]
+}

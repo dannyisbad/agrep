@@ -29,7 +29,7 @@ use crate::model::{Event, Message};
 
 /// Increment when entry layout or parse semantics change.
 /// Supported prior generations retain last-good entries until their source reparse completes.
-pub const CACHE_VERSION: u32 = 26;
+pub const CACHE_VERSION: u32 = 27;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -879,7 +879,7 @@ impl std::fmt::Display for CacheDecodeRefusal {
 
 /// These generations share the current entry layout but require current parser semantics.
 fn reparse_compatible_cache_version(version: u32) -> bool {
-    matches!(version, 18..=19 | 21..=25)
+    matches!(version, 18..=19 | 21..=26)
 }
 
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
@@ -7316,7 +7316,9 @@ mod tests {
     #[test]
     fn takeover_adopts_released_cache_versions_with_last_good_rows() {
         for (version, journaled) in [
-            (25_u32, false),
+            (26_u32, false),
+            (26, true),
+            (25, false),
             (25, true),
             (24, false),
             (24, true),
@@ -8055,7 +8057,7 @@ where
 
 /// [`collect_cached_for`] for a store where a file that still exists can stop being a source
 /// because a newer sibling supersedes it: `retired` paths are forgotten exactly like deletions
-/// instead of being re-added from the cache or the coverage snapshot.
+/// instead of being re-added from the cache or the coverage snapshot, and so is their tally.
 pub fn collect_cached_retiring_for<F, R>(
     cache: &mut IngestCache,
     agent: &'static str,
@@ -8085,6 +8087,9 @@ where
     F: Fn(&Path, i64, u64) -> R + Sync,
     R: IntoParsed,
 {
+    for path in retired {
+        crate::intake::forget(path);
+    }
     // Windows walkers transiently omit entries (`read_dir` errors under live writers/AV), so
     // re-add cached paths: only metadata NotFound confirms deletion; other stat errors guard.
     let mut cached_paths: HashMap<String, PathBuf> = cache

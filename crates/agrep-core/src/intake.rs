@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -213,14 +213,23 @@ type OpenTally = (String, Option<String>, &'static str, String, Arc<Tally>);
 struct Run {
     /// Tallies opened this run, with the fingerprint captured at open time.
     open: Mutex<Vec<OpenTally>>,
+    /// Book ids whose source an adapter stopped reading while the file stays on disk.
+    forgotten: Mutex<Vec<String>>,
 }
 
-static RUN: OnceLock<Run> = OnceLock::new();
+static RUN: LazyLock<Run> = LazyLock::new(|| Run {
+    open: Mutex::new(Vec::new()),
+    forgotten: Mutex::new(Vec::new()),
+});
 
-fn run() -> &'static Run {
-    RUN.get_or_init(|| Run {
-        open: Mutex::new(Vec::new()),
-    })
+/// Drop `path`'s entry at the next [`commit`]. For a file that still exists but is no longer a
+/// source (a newer sibling supersedes it): commit keeps every unparsed entry, and audit reads a
+/// present, undiscovered, tallied path as a coverage gap.
+pub fn forget(path: &Path) {
+    RUN.forgotten
+        .lock()
+        .unwrap()
+        .push(path.to_string_lossy().to_string());
 }
 
 /// Stat-file fingerprint. Deliberately weaker than the ingest cache's staleness key: the
@@ -264,8 +273,7 @@ pub fn file_stamped(agent: &'static str, path: &Path, mtime_ns: i64, size: u64) 
 /// Open the tally for one caller-defined keyed unit.
 pub fn keyed(agent: &'static str, id: &str, fingerprint: String) -> Arc<Tally> {
     let t = Arc::new(Tally::default());
-    run()
-        .open
+    RUN.open
         .lock()
         .unwrap()
         .push((id.to_string(), None, agent, fingerprint, Arc::clone(&t)));
@@ -299,8 +307,7 @@ pub fn keyed_token(
     let id = token_id(path, session);
     let legacy = legacy_token_id(path, session);
     let tally = Arc::new(Tally::default());
-    run()
-        .open
+    RUN.open
         .lock()
         .unwrap()
         .push((id, Some(legacy), agent, fingerprint, Arc::clone(&tally)));
@@ -349,9 +356,9 @@ pub fn read_book(path: &Path) -> anyhow::Result<Option<BTreeMap<String, FileEntr
 }
 
 /// Fold this run's tallies into the persisted book at `path`: parsed units replace
-/// their old entries, unparsed-but-still-present entries survive (their source was
-/// served from the parse cache), entries whose source vanished are dropped by the
-/// audit rather than here (path existence is adapter-specific). Returns per-agent
+/// their old entries, ids passed to [`forget`] leave, unparsed-but-still-present entries survive
+/// (their source was served from the parse cache), entries whose source vanished are dropped
+/// by the audit rather than here (path existence is adapter-specific). Returns per-agent
 /// rollups of THIS run for the stdout summary.
 pub fn commit(path: &Path) -> anyhow::Result<BTreeMap<&'static str, AgentSummary>> {
     let mut book: Book = std::fs::read_to_string(path)
@@ -362,7 +369,10 @@ pub fn commit(path: &Path) -> anyhow::Result<BTreeMap<&'static str, AgentSummary
     book.version = BOOK_VERSION;
 
     let mut summaries: BTreeMap<&'static str, AgentSummary> = BTreeMap::new();
-    let opened = std::mem::take(&mut *run().open.lock().unwrap());
+    let opened = std::mem::take(&mut *RUN.open.lock().unwrap());
+    for id in std::mem::take(&mut *RUN.forgotten.lock().unwrap()) {
+        book.files.remove(&id);
+    }
     for (id, legacy_id, agent, fingerprint, t) in opened {
         let mut skips = BTreeMap::new();
         let mut skip_total = 0u64;
@@ -501,6 +511,17 @@ mod tests {
         let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(book.files["x.jsonl"].seen, 1);
         assert_eq!(book.files["x.jsonl"].rows, 1);
+
+        // a forgotten source leaves the book; one re-tallied in the same run stays
+        keyed("testagent", "y.jsonl", "s:3:3".into()).seen();
+        commit(&p).unwrap();
+        forget(Path::new("x.jsonl"));
+        forget(Path::new("y.jsonl"));
+        keyed("testagent", "y.jsonl", "s:4:4".into()).seen();
+        commit(&p).unwrap();
+        let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(!book.files.contains_key("x.jsonl"));
+        assert_eq!(book.files["y.jsonl"].key, "s:4:4");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
