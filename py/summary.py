@@ -137,6 +137,16 @@ _AGENT_SESSION_PREFIX = "agent-"
 # the line Claude Code (2.0.69 on) adds to a finished foreground agent's result; an async launch
 # names the agent with an `(internal ID` note instead; recent Explore/Plan results carry none
 _AGENT_RETURNED_RE = re.compile(r"(?<![\w-])agentId: (\S+) \((?:use SendMessage|for resuming)\b")
+# the run time that result's usage block reports, measured from before the run wrote its prompt;
+# the closing tag proves the cap left the number whole
+_AGENT_DURATION_RE = re.compile(r"<usage>[^<]*?\bduration_ms: (\d+)</usage>")
+# a SendMessage that resumed a stopped agent and waited returns its result inline: 2.1.199 says
+# `ran to completion. Result:`, 2.1.289 `Resumed agent <first 7 of the id, or its name>. Result:`
+_INLINE_HANDBACK_RE = re.compile(r"\bResumed agent(?: (\S+?))?\. (?:Result:|Its final report "
+                                 r"follows)|\bran to completion\. Result:")
+_PLAIN_AGENT_ID_RE = re.compile(r"a[0-9a-f]{16}")
+# the recipient in the compact JSON the ingest keeps as a SendMessage's input
+_SEND_TO_RE = re.compile(r'"to"\s*:\s*"((?:[^"\\]|\\.)*)"')
 # tools that stop the turn until the human answers: claude AskUserQuestion/ExitPlanMode, omp ask,
 # codex request_user_input, opencode question
 _QUESTION_TOOL_RE = re.compile(
@@ -1302,30 +1312,100 @@ def _notified(root: _Chat, side: _Chat) -> bool:
     return False
 
 
+def _claude_agent_id(side: _Chat) -> str:
+    """The agent id a Claude side chat's transcript is named after; "" for any other side chat."""
+    if side.agent != "claude" or not side.session.startswith(_AGENT_SESSION_PREFIX):
+        return ""
+    return side.session[len(_AGENT_SESSION_PREFIX):]
+
+
+def _names_agent(text: str, agent_id: str) -> bool:
+    return re.search(rf"(?<![\w-]){re.escape(agent_id)}(?![\w-])", text) is not None
+
+
+def _addresses(event: dict, agent_id: str) -> bool:
+    """Does a root SendMessage address the agent? Its input's `to` names the recipient; a resume
+    result may name it (`resumedAgentId`, the output path) or show the id's first 7."""
+    recipient = _SEND_TO_RE.search(str(event.get("input") or ""))
+    output = str(event.get("output") or "")
+    if _names_agent(f"{recipient.group(1) if recipient else ''}\n{output}", agent_id):
+        return True
+    inline = _INLINE_HANDBACK_RE.search(output)
+    return (inline is not None and _PLAIN_AGENT_ID_RE.fullmatch(agent_id) is not None
+            and inline.group(1) == agent_id[:7])
+
+
+def _engagements(root: _Chat, agent_id: str) -> list[dict]:
+    """The root's calls that ran or messaged the agent: an agent call whose result names it, or a
+    SendMessage addressed to it. Each starts or steers a run of that agent."""
+    return [event for event in root.events
+            if (event.get("kind") == "subagent_start"
+                and _names_agent(str(event.get("output") or ""), agent_id))
+            or (event.get("kind") == "tool" and event.get("name") == "SendMessage"
+                and _addresses(event, agent_id))]
+
+
+def _side_moments(side: _Chat) -> list[int]:
+    return [moment for moment in (*(row.ts for row in side.turns),
+                                  *(int(event.get("ts") or 0) for event in _activity(side)))
+            if moment > 0]
+
+
+def _run_end(root: _Chat, side: _Chat, event: dict, agent_id: str) -> int | None:
+    """A moment by which the run the root's call at `event` waited on had ended: the root's next
+    prompt, or the run's first moment plus the duration its result reports. None when unknown."""
+    called = int(event.get("ts") or 0)
+    bounds = [min((row.ts for row in root.turns if row.ts > called), default=None)]
+    output = str(event.get("output") or "")
+    trailer = next((match for match in _AGENT_RETURNED_RE.finditer(output)
+                    if match.group(1) == agent_id), None)
+    duration = _AGENT_DURATION_RE.search(output, trailer.end()) if trailer is not None else None
+    started = min((moment for moment in _side_moments(side) if moment >= called), default=None)
+    if duration is not None and started is not None:
+        bounds.append(started + int(duration.group(1)))
+    return min((bound for bound in bounds if bound is not None), default=None)
+
+
+def _superseded(root: _Chat, side: _Chat, agent_id: str, event: dict) -> bool:
+    """Did the agent run again after the root's call at `event`, so its result says nothing of the
+    latest run? A resume keeps the agent's id and may record no prompt, so any of these counts: a
+    later root call that runs or messages it, a later prompt, or activity after that run ended."""
+    called = int(event.get("ts") or 0)
+    if any(other is not event and int(other.get("ts") or 0) > called
+           for other in _engagements(root, agent_id)):
+        return True
+    if sum(1 for row in side.turns if row.ts >= called) > 1:
+        return True
+    ended = _run_end(root, side, event, agent_id)
+    return ended is not None and any(moment > ended for moment in _side_moments(side))
+
+
 def _agent_returned(root: _Chat, side: _Chat) -> bool:
-    """Did a Claude agent call in the root return the side chat's latest run? Claude Code ends a
-    finished agent's result with a line naming it, which narration or a short reply can't hide. A
-    resumed agent keeps its id, so that call proves only the run it launched: the side chat's first
-    turn at or after the call."""
-    last = side.last_turn()
-    if last is None or not side.session.startswith(_AGENT_SESSION_PREFIX):
+    """Did a root call return the Claude side chat's latest run? An agent call's result ends in a
+    line naming the agent, which narration or a short reply can't hide; a SendMessage that resumed
+    it may wait and return its result inline. Either proves only the run it closed."""
+    agent_id = _claude_agent_id(side)
+    if not agent_id:
         return False
-    agent_id = side.session[len(_AGENT_SESSION_PREFIX):]
     for event in root.events:
-        if (event.get("kind") != "subagent_start" or event.get("ok") is not True
-                or agent_id not in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))):
+        if event.get("ok") is not True:
             continue
-        called = int(event.get("ts") or 0)
-        if min((row.ts for row in side.turns if row.ts >= called), default=None) == last.ts:
+        if event.get("kind") == "subagent_start":
+            proof = agent_id in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))
+        else:
+            proof = (event.get("kind") == "tool" and event.get("name") == "SendMessage"
+                     and _INLINE_HANDBACK_RE.search(str(event.get("output") or "")) is not None
+                     and _addresses(event, agent_id))
+        if proof and not _superseded(root, side, agent_id, event):
             return True
     return False
 
 
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
     """Did the side chat hand its result back? A terminal `yield`, a linked task notification or
-    a Claude agent result that names it is the hand-back itself; else the root's delegation
+    a Claude result that names the agent is the hand-back itself; else the root's delegation
     result must carry the side chat's final reply, the only indexed proof the root went on after
-    it. None when a capped reply can't say."""
+    it, and for a Claude agent belong to its latest run. None when a capped reply can't say."""
     if _side_yielded(side) or _notified(root, side) or _agent_returned(root, side):
         return True
     last = side.last_turn()
@@ -1335,12 +1415,15 @@ def _result_received(root: _Chat, side: _Chat) -> bool | None:
     if len(reply) >= _REPLY_CAP_CHARS:
         return None
     final = " ".join(reply.split())
+    agent_id = _claude_agent_id(side)
     for event in root.events:
         if event.get("kind") != "subagent_start" and not (
                 event.get("kind") == "tool"
                 and _DELEGATION_TOOL_RE.match(str(event.get("name") or ""))):
             continue
-        if _delivers(str(event.get("output") or ""), final):
+        # a resumed run's text joins the earlier run's reply, which an earlier result also carries
+        if (_delivers(str(event.get("output") or ""), final)
+                and not (agent_id and _superseded(root, side, agent_id, event))):
             return True
     return False
 

@@ -179,6 +179,16 @@ TASKS_RESUMED_BACKGROUND = "ct000014-0714-4000-8000-000000000714"
 TASKS_RESUMED_UNRETURNED = "ct000015-0715-4000-8000-000000000715"
 TASKS_RESUMED_RETURNED = "ct000016-0716-4000-8000-000000000716"
 TASKS_BATCH_OUT = "ct000017-0717-4000-8000-000000000717"  # A returned, its batch-mate C did not
+# 2.1.289 SendMessage resumes keep the id and write an isMeta prompt the index skips: by id with
+# resumedAgentId, by name without it (shown only by the run's duration, or by a later prompt when
+# the cap cut the usage block), and a resume that waited and handed its result back inline
+TASKS_RESUMED_META = "ct000018-0718-4000-8000-000000000718"
+TASKS_RESUMED_BY_NAME = "ct000019-0719-4000-8000-000000000719"
+TASKS_RESUMED_AFTER_PROMPT = "ct000020-0720-4000-8000-000000000720"
+TASKS_RESUMED_INLINE = "ct000021-0721-4000-8000-000000000721"
+# an older agentId line with no usage block, then an unreturned Task(resume=) in the same turn
+TASKS_RESUMED_OLD_LINE = "ct000022-0722-4000-8000-000000000722"
+TASKS_USAGE_CUT_IN_DIGITS = "ct000023-0723-4000-8000-000000000723"  # one run, handed back
 # cursor todo_write merge=true: statuses by id, content plus a new id, a new id without content
 CURSOR_MERGE_STATUS = "k1000001-0715-4000-8000-000000000715"
 CURSOR_MERGE_CONTENT = "k2000002-0716-4000-8000-000000000716"
@@ -704,7 +714,8 @@ class SummaryTests(unittest.TestCase):
         # the first run's agentId line proves only that run; the resumed one is still working
         pending = self._tasks_pending("--project", "mx-tasks")
         for session, side in ((TASKS_RESUMED_BACKGROUND, "agent-ct14side01"),
-                              (TASKS_RESUMED_UNRETURNED, "agent-ct15side01")):
+                              (TASKS_RESUMED_UNRETURNED, "agent-ct15side01"),
+                              (TASKS_RESUMED_OLD_LINE, "agent-a22c0ffee0000beef")):
             with self.subTest(session=session):
                 item = pending.get(session, {})
                 self.assertEqual(
@@ -721,6 +732,28 @@ class SummaryTests(unittest.TestCase):
         item = self._tasks_pending("--project", "mx-tasks").get(TASKS_BATCH_OUT, {})
         self.assertEqual((item.get("status"), item.get("source"), item.get("items")),
                          ("todo_open", "root", ["Port the yaml reader"]))
+
+    def test_a_resume_with_an_unrecorded_prompt_supersedes_the_earlier_result(self) -> None:
+        # the resumed agent closed #1 after the root's last moment and is still working; the
+        # first run's agentId line and its reply text speak only for that run
+        item = self._tasks_pending("--project", "mx-tasks").get(TASKS_RESUMED_META, {})
+        self.assertEqual((item.get("status"), item.get("source"), item.get("items")),
+                         ("todo_open", "root", ["Update the csv writer docs"]))
+
+    def test_side_activity_after_the_returned_run_ended_supersedes_its_result(self) -> None:
+        # nothing in the root names the agent again: its activity past the run's reported
+        # duration, or past the root's next prompt, is a later run
+        pending = self._tasks_pending("--project", "mx-tasks")
+        for session, task in ((TASKS_RESUMED_BY_NAME, "Update the json writer docs"),
+                              (TASKS_RESUMED_AFTER_PROMPT, "Update the yaml writer docs")):
+            with self.subTest(session=session):
+                item = pending.get(session, {})
+                self.assertEqual((item.get("status"), item.get("source"), item.get("items")),
+                                 ("todo_open", "root", [task]))
+        # a resume that waited returns the run's result inline, which hands that run back
+        self.assertNotIn(TASKS_RESUMED_INLINE, pending)
+        # a duration the cap cut inside its digits bounds nothing: this run closed #1 and returned
+        self.assertNotIn(TASKS_USAGE_CUT_IN_DIGITS, pending)
 
     def test_capped_cursor_merge_leaves_the_list_unknown(self) -> None:
         # the merge closing items 9 and 10 was cut by the event cap: they are neither open nor done
