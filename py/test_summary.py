@@ -161,6 +161,20 @@ TASKS_AFTER_TODOWRITE = "ct000005-0705-4000-8000-000000000705"  # resumed with t
 TODOWRITE_AFTER_TASKS = "ct000006-0706-4000-8000-000000000706"  # resumed with task tools off
 GEMINI_TODOS_OPEN = "9e000001-0713-4000-8000-000000000713"
 GEMINI_TODOS_DONE = "9e000002-0714-4000-8000-000000000714"
+# one task list per Claude session, shared with its subagents: a subagent closes the root's tasks
+# (the root's TaskList confirms), creates tasks the root closes, or closes them as the root's last
+# step; a TaskList also restores a list an unresolved id made unknown
+TASKS_KIN_CLOSES = "ct000007-0707-4000-8000-000000000707"
+TASKS_KIN_CREATES = "ct000008-0708-4000-8000-000000000708"
+TASKS_KIN_LAST_STEP = "ct000009-0709-4000-8000-000000000709"
+TASKS_LISTED = "ct000010-0710-4000-8000-000000000710"
+# cursor todo_write merge=true: statuses by id, content plus a new id, a new id without content
+CURSOR_MERGE_STATUS = "k1000001-0715-4000-8000-000000000715"
+CURSOR_MERGE_CONTENT = "k2000002-0716-4000-8000-000000000716"
+CURSOR_MERGE_UNMATCHED = "k3000003-0717-4000-8000-000000000717"
+# kimi's SetTodoList before 2025-12 wrote Pending / In Progress / Done
+KIMI_TITLE_CASE = "4b000001-1120-4000-8000-000000001120"
+KIMI_WINDOW = ("--since", "2025-11-01", "--until", "2025-11-30")
 
 
 class SummarySandbox:
@@ -214,16 +228,20 @@ class SummarySandbox:
             if "{{" in content:
                 raise AssertionError(f"unexpanded fixture template: {source}")
             destination.write_text(content, encoding="utf-8")
-        # opencode keeps its chats in SQLite; the seed carries the same synthetic matrix
-        seed = FIXTURES / "store" / "opencode" / "seed.sql"
-        database = self.home / ".local" / "share" / "opencode" / "opencode.db"
-        database.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database)
-        try:
-            connection.executescript(
-                seed.read_text(encoding="utf-8").replace("{{home}}", str(self.home)))
-        finally:
-            connection.close()
+        # opencode and cursor keep their chats in SQLite; the cursor path is the Linux one, which
+        # the ingest also checks on macOS
+        for seed, database in (
+                (FIXTURES / "store" / "opencode" / "seed.sql",
+                 self.home / ".local" / "share" / "opencode" / "opencode.db"),
+                (FIXTURES / "store" / "cursor" / "seed.sql",
+                 self.home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb")):
+            database.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    seed.read_text(encoding="utf-8").replace("{{home}}", str(self.home)))
+            finally:
+                connection.close()
 
     def spawn(self, command, *, env_overrides=None, executable=None):
         env = dict(self.env)
@@ -619,6 +637,51 @@ class SummaryTests(unittest.TestCase):
                           ["Port the yaml loader", "Update the loader docs"]))
         self.assertNotIn("caveats", item)
         self.assertNotIn(GEMINI_TODOS_DONE, pending)
+
+    def test_claude_family_replays_one_shared_task_list(self) -> None:
+        # Claude keys the task list by session id and foreground subagents run under the root's,
+        # so an update in either chat changes the list the other one sees
+        pending = self._tasks_pending("--project", "mx-tasks")
+        for session in (TASKS_KIN_CLOSES, TASKS_KIN_CREATES, TASKS_KIN_LAST_STEP):
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
+        # a background subagent's tasks, all made after the root's reply, stay with the side chat
+        self.assertEqual(pending[TASKS_SIDE]["source"], "side-chat")
+
+    def test_claude_task_list_result_resets_the_replay(self) -> None:
+        # TaskList prints the whole list: the unresolved #2 is known again, #4 keeps the subject
+        # the replay knows without its owner, and the blocked-by suffix is no part of a subject
+        item = self._tasks_pending("--project", "mx-tasks")[TASKS_LISTED]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("todo_open", "medium",
+                          ["Publish the oscar notes", "Announce the oscar release"]))
+        self.assertNotIn("caveats", item)
+
+    def test_cursor_todo_merge_updates_items_by_id(self) -> None:
+        # Cursor's todo_write merges by id when `merge` is true, leaving unsent fields as they were
+        pending = self._tasks_pending("--agent", "cursor")
+        expected = {
+            CURSOR_MERGE_STATUS: ["Document the retry policy", "Add a changelog entry for retries"],
+            CURSOR_MERGE_CONTENT: ["Document the grpc retry policy",
+                                   "Add a changelog entry for grpc retries",
+                                   "Benchmark the grpc retries"],
+        }
+        for session, items in expected.items():
+            with self.subTest(session=session):
+                item = pending[session]
+                self.assertEqual((item["status"], item["agent"], item["items"]),
+                                 ("todo_open", "cursor", items))
+        unmatched = pending[CURSOR_MERGE_UNMATCHED]
+        self.assertEqual(
+            (unmatched["status"], unmatched["items"], unmatched["caveats"]),
+            ("unknown", [], ["todo list merges an item whose id could not be resolved"]))
+
+    def test_kimi_in_progress_with_a_space_is_open(self) -> None:
+        _meta, items = _rows(self.sandbox.summary("pending", *KIMI_WINDOW, "--agent", "kimi",
+                                                  "--json"))
+        item = {row["session"]: row for row in items}[KIMI_TITLE_CASE]
+        self.assertEqual((item["status"], item["agent"], item["items"]),
+                         ("todo_open", "kimi", ["Port the yaml loader"]))
 
     def test_trailing_compaction_recap_does_not_reopen_a_finished_chat(self) -> None:
         # claude: manual /compact after the final reply; omp: auto-compaction after it; codex: a

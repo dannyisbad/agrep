@@ -11,17 +11,19 @@ and unioned across a chat and its side chats so a subagent minute never counts
 twice. It is never elapsed session span and never billable time.
 
 Pending status reads each root chat's final reply, its latest tool events and
-its todo list (whole-list writes, omp's ops and Claude's task tools replayed,
-codex plans), and reports a status with a stated confidence. Explicit completion
-always wins over an open-looking bullet. A compaction recap is never a turn of
-its own, and a side chat that handed its result back (a terminal yield, or a
-delegation result that carries its reply) never reopens a finished family.
+its todo list (whole-list writes, Cursor's merges by id, omp's ops and the Claude
+task list a family shares replayed, codex plans), and reports a status with a
+stated confidence. Explicit completion always wins over an open-looking bullet.
+A compaction recap is never a turn of its own, and a side chat that handed its
+result back (a terminal yield, or a delegation result that carries its reply)
+never reopens a finished family.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import heapq
 import json
 import re
 import sqlite3
@@ -100,11 +102,15 @@ _GLUED_BULLET_CAVEAT = "the last bullet may include a later reply block the inde
 # claude TodoWrite/TodoRead, opencode todowrite/todoread, omp todo, codex update_plan,
 # gemini write_todos
 _TODO_TOOL_RE = re.compile(r"todo|update_plan", re.IGNORECASE)
-# Claude Code's task tools; TaskList and TaskGet only read. The ingest keeps TaskCreate's
-# description as its input, so a task's id and subject come from the result Claude printed
-_TASK_TOOL_RE = re.compile(r"^Task(?:Create|Update)$")
+# Claude Code's task tools. The ingest keeps TaskCreate's description as its input, so a task's id
+# and subject come from the result Claude printed; TaskList prints the whole list, TaskGet one task
+_TASK_TOOL_RE = re.compile(r"^Task(?:Create|Update|List)$")
 _TASK_CREATED_RE = re.compile(r"Task #(\S+) created successfully: (.*)", re.DOTALL)
 _TASK_UPDATED_RE = re.compile(r"Updated task #(\S+) ?([^\n]*)")
+# one TaskList line: `#id [status] subject`, then ` (owner)` and ` [blocked by #a, #b]` when set
+_TASK_LISTED_RE = re.compile(r"#(\S+) \[([a-z_]+)\](?: (.*))?")
+_TASK_BLOCKED_RE = re.compile(r" \[blocked by #[^\]]*\]$")
+_NO_TASKS = "No tasks found"
 _TODO_OPEN_STATUSES = frozenset({
     "pending", "in_progress", "in-progress", "not_started", "not-started", "open",
     "todo", "active", "blocked", "queued"})
@@ -164,6 +170,9 @@ class _Chat:
     withheld_from: int | None = None
     # the unindexed parent of a side chat promoted to a family root of its own
     parent: str = ""
+    # the family's other Claude chats: Claude keys its task list by session id, and subagents
+    # run under the root's session, so they all edit one list
+    task_kin: list[_Chat] = field(default_factory=list, repr=False, compare=False)
 
     def last_turn(self) -> _Turn | None:
         return max(self.turns, key=lambda row: (row.turn, row.ts)) if self.turns else None
@@ -604,23 +613,40 @@ def _capped_list_items(raw: str, key: str) -> list:
         out.append(item)
 
 
+def _todo_name(item: dict) -> str:
+    # gemini's write_todos names an item only by `description`; last, so others keep their names
+    return next((common.one_line(item[key]) for key in ("content", "title", "task", "step", "text",
+                                                       "name", "description")
+                 if isinstance(item.get(key), str) and item[key].strip()), "")
+
+
+def _todo_status(item: dict) -> str:
+    """The element's status, lowercased with spaces as underscores: kimi's SetTodoList said
+    `In Progress` before it said `in_progress`."""
+    return "_".join(str(item.get("status") or item.get("state") or "").lower().split())
+
+
+def _todo_id(item: object) -> str:
+    """The id a todo element carries; Cursor's merges address rows by it."""
+    value = item.get("id") if isinstance(item, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return ""
+    return str(value).strip()
+
+
 def _todo_entry(item: object) -> tuple[str, str] | None:
     """(content, status) of one todo/plan element: a string, or a dict naming the item."""
     if isinstance(item, str):
         return (common.one_line(item), "open") if item.strip() else None
     if not isinstance(item, dict):
         return None
-    # gemini's write_todos names an item only by `description`; last, so others keep their names
-    name = next((str(item[key]) for key in ("content", "title", "task", "step", "text", "name",
-                                            "description")
-                 if isinstance(item.get(key), str) and item[key].strip()), "")
-    status = str(item.get("status") or item.get("state") or "").strip().lower()
-    return (common.one_line(name), status) if name else None
+    name = _todo_name(item)
+    return (name, _todo_status(item)) if name else None
 
 
-def _snapshot_tasks(payload: object, raw: str, capped: bool) -> list[list[str]] | None:
-    """[phase, content, status] rows from a whole-list todo write: claude/opencode/gemini `todos`,
-    codex `plan`, or a bare list. None when the payload is not that shape."""
+def _todo_items(payload: object, raw: str, capped: bool) -> list | None:
+    """The elements of a todo list write: claude/opencode/gemini/cursor `todos`, codex `plan`, or
+    a bare list. None when the payload is not that shape."""
     key = next((k for k in ("todos", "plan") if isinstance(payload, dict) and k in payload), None)
     if capped:
         key = next((k for k in ("todos", "plan") if f'"{k}"' in raw), None)
@@ -633,14 +659,46 @@ def _snapshot_tasks(payload: object, raw: str, capped: bool) -> list[list[str]] 
         items = payload
     else:
         return None
-    if not isinstance(items, list):
-        return None
-    rows = []
+    return items if isinstance(items, list) else None
+
+
+def _todo_rows(items: list) -> list[list[str]]:
+    """[phase, content, status, id] rows from the elements of a whole-list write."""
+    return [["", entry[0], entry[1], _todo_id(item)]
+            for item in items for entry in [_todo_entry(item)] if entry is not None]
+
+
+_TODO_MERGE_RE = re.compile(r'"merge"\s*:\s*true\b')
+
+
+def _todo_merges(payload: object, raw: str, capped: bool) -> bool:
+    """Is this Cursor's todo_write with `merge: true`? A capped input still shows it, since the
+    ingest writes the keys sorted and `merge` precedes `todos`."""
+    if capped:
+        return _TODO_MERGE_RE.search(raw.split('"todos"', 1)[0]) is not None
+    return isinstance(payload, dict) and payload.get("merge") is True
+
+
+def _merged_todos(tasks: list[list[str]], items: list) -> list[list[str]] | None:
+    """Cursor's `merge: true` replayed over the rows: an element updates the row with its id, the
+    fields it leaves out keeping their values, and an id the list lacks appends a row. None when
+    such a new row would have no content."""
+    out = [list(row) for row in tasks]
     for item in items:
-        entry = _todo_entry(item)
-        if entry is not None:
-            rows.append(["", entry[0], entry[1]])
-    return rows
+        item_id = _todo_id(item)
+        row = next((row for row in out if item_id and row[3:4] == [item_id]), None)
+        if row is None:
+            fresh = _todo_rows([item])
+            if not fresh:
+                return None
+            out += fresh
+            continue
+        name, status = _todo_name(item), _todo_status(item)
+        if name:
+            row[1] = name
+        if status:
+            row[2] = status
+    return out
 
 
 def _todo_targets(tasks: list[list[str]], payload: dict) -> list[list[str]] | None:
@@ -764,6 +822,7 @@ def _apply_capped_todo_op(tasks: list[list[str]], raw: str,
 _TODO_UNKNOWN_SHAPE = "todo list captured in an unknown shape"
 _TODO_UNREPLAYABLE = "todo list uses an op this build cannot replay"
 _TODO_CAP_DRIFT = "todo list capped at index time; its later changes could not be replayed"
+_TODO_UNMATCHED = "todo list merges an item whose id could not be resolved"
 _TASK_UNRESOLVED = "task list changes a task whose id could not be resolved"
 
 
@@ -808,15 +867,65 @@ def _apply_task_tool(tasks: dict[str, list[str]], event: dict) -> bool:
     return True
 
 
+def _listed_tasks(event: dict, known: dict[str, list[str]]) -> dict[str, list[str]] | None:
+    """The whole list a TaskList result printed, as {id: [subject, status]}. A subject the replay
+    knows is kept, since the line may append the task's owner. None when the result was cut short
+    or is not that listing."""
+    output = str(event.get("output") or "").strip()
+    # a cut output ends in `…`; skipping a whole listing that just ends in one forgoes a reset
+    if not output or event.get("output_truncated") is True or output.endswith("…"):
+        return None
+    if output == _NO_TASKS:
+        return {}
+    listed: dict[str, list[str]] = {}
+    for line in output.splitlines():
+        match = _TASK_LISTED_RE.fullmatch(line.strip())
+        if match is None:
+            return None
+        task_id, status, rest = match.groups()
+        rest = _TASK_BLOCKED_RE.sub("", rest or "")
+        subject = known.get(task_id, [""])[0]
+        if not subject or not rest.startswith(subject):
+            subject = common.one_line(rest)
+        listed[task_id] = [subject or f"Task #{task_id}", status]
+    return listed
+
+
+def _task_events(chat: _Chat) -> list[dict]:
+    """The chat's events with its kin's Claude task tool calls merged in by time. A side chat sees
+    the family's calls up to its latest moment; the root sees them up to its own, and all of a
+    side chat's once it received that chat's result. A caller's live window is never history."""
+    if not chat.task_kin:
+        return chat.events
+    latest = _latest_ts(chat)
+    root = chat.root == chat.session
+    foreign = []
+    for kin in chat.task_kin:
+        calls = [event for event in kin.events if event.get("kind") == "tool"
+                 and _TASK_TOOL_RE.match(str(event.get("name") or ""))]
+        if not calls:
+            continue
+        until = float("inf") if root and _result_received(chat, kin) is True else latest
+        if kin.withheld_from is not None:
+            until = min(until, kin.withheld_from - 1)
+        foreign += [event for event in calls if int(event.get("ts") or 0) <= until]
+    if not foreign:
+        return chat.events
+    foreign.sort(key=lambda event: (int(event.get("ts") or 0), int(event.get("i") or 0)))
+    return list(heapq.merge(chat.events, foreign, key=lambda event: int(event.get("ts") or 0)))
+
+
 def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, str]:
     """(items after the last todo write, present, capped, why unknowable). Whole-list writes
-    replace the state; omp ops and Claude's task tools replay in order. An op omp rejected (`ok`
-    false) left its state alone; any other op the replay can't apply makes it unknown from there."""
+    replace the state and Cursor's merges update it by id; omp ops and Claude's task tools replay in
+    order, the latter over the family's shared list, which a TaskList result resets. An op omp
+    rejected (`ok` false) left its state alone; any other op the replay can't apply makes it
+    unknown from there."""
     tasks: list[list[str]] = []
     claude_tasks: dict[str, list[str]] = {}
     present = capped = tasks_last = False
     unknown = task_unknown = ""
-    for event in chat.events:
+    for event in _task_events(chat):
         name = str(event.get("name") or "")
         claude_task = _TASK_TOOL_RE.match(name) is not None
         if event.get("kind") != "tool" or not (claude_task or _TODO_TOOL_RE.search(name)):
@@ -826,7 +935,11 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, 
             continue
         if claude_task:
             tasks_last = True
-            if not task_unknown and not _apply_task_tool(claude_tasks, event):
+            if name == "TaskList":
+                listed = _listed_tasks(event, claude_tasks)
+                if listed is not None:
+                    claude_tasks, task_unknown = listed, ""
+            elif not task_unknown and not _apply_task_tool(claude_tasks, event):
                 task_unknown = _TASK_UNRESOLVED
             continue
         raw = str(event.get("input") or "")
@@ -841,9 +954,16 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, 
         if payload == {}:
             continue
         tasks_last = False
-        snapshot = _snapshot_tasks(payload, raw, cut)
-        if snapshot is not None:
-            tasks, capped, unknown = snapshot, cut, ""
+        items = _todo_items(payload, raw, cut)
+        if items is not None and _todo_merges(payload, raw, cut):
+            merged = _merged_todos(tasks, items)
+            if merged is None:
+                unknown = _TODO_UNMATCHED
+                continue
+            tasks, capped = merged, capped or cut
+            continue
+        if items is not None:
+            tasks, capped, unknown = _todo_rows(items), cut, ""
             continue
         if payload is None:
             op = _capped_todo_op(raw, tasks)
@@ -875,7 +995,7 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, 
         return [(content, status) for content, status in claude_tasks.values()], present, False, ""
     if unknown:
         return None, present, capped, unknown
-    return [(content, status) for _phase, content, status in tasks], present, capped, ""
+    return [(row[1], row[2]) for row in tasks], present, capped, ""
 
 
 def _open_todos(chat: _Chat) -> tuple[list[str], list[str]]:
@@ -1410,6 +1530,10 @@ def main(argv: list[str] | None = None) -> int:
             self_dropped += 1
     for chat in chats.values():
         _load_events(chat)
+    for root, chat in roots.items():
+        claude = [member for member in (chat, *sides.get(root, ())) if member.agent == "claude"]
+        for member in claude:
+            member.task_kin = [other for other in claude if other is not member]
     common.lap("transcripts", f"{len(chats)} chats")
 
     # --- time per family, split per local day ---
