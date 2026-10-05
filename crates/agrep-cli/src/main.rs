@@ -5656,11 +5656,11 @@ fn index_cmd_locked(
         .flat_map(|issue| pcache.sessions_under(Path::new(issue.path())))
         .collect();
     if published_legible {
-        pcache.census_base_rows(
+        pcache.mark_base_rows(
             source_issues
                 .iter()
                 .map(|issue| (issue.agent(), Path::new(issue.path()))),
-            repair_events,
+            cache::published_generation_seal(&data),
         );
     }
     lap!("load-cache");
@@ -5839,6 +5839,7 @@ fn index_cmd_locked(
             "complete ingest observed an unavailable/incomplete source{detail}; retained the old generation{recovery}"
         );
     }
+    pcache.record_released_rows();
     // Cache serialization and the corpus fingerprint are independent, CPU-heavy walks over
     // different data. Do them together; on the one-file-changed path this hides the complete
     // bincode cache rewrite behind the message hash instead of paying both serially.

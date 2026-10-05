@@ -67,7 +67,7 @@ const STAGED_WRITE_CHUNK: usize = 256 * 1024;
 const PYTHON_RUNTIME_BUILD_ID_ENV: &str = "AGREP_PYTHON_RUNTIME_BUILD_ID";
 static CACHE_COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 struct CMsg {
     agent: String,
     project: std::sync::Arc<str>,
@@ -489,85 +489,222 @@ impl CMsg {
     }
 }
 
-/// The rows and the event sessions cache entries hold of one agent.
-#[derive(Default)]
-struct HeldRows {
-    rows: Vec<CMsg>,
-    event_sessions: HashSet<std::sync::Arc<str>>,
+/// A row's text as a map key: equal only to the same text whole, but hashed by its length and
+/// 16 bytes at its start, middle and end alone, so a long text costs no more than a short one.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Text<'a>(&'a str);
+
+impl std::hash::Hash for Text<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let bytes = self.0.as_bytes();
+        let sample = |at: usize| &bytes[at..bytes.len().min(at + 16)];
+        state.write_usize(bytes.len());
+        state.write(sample(0));
+        state.write(sample(bytes.len() / 2));
+        state.write(sample(bytes.len().saturating_sub(16)));
+    }
 }
 
-/// How many rows bear each `(session, timestamp, text digest)`.
-type RowCounts<'a> = HashMap<(&'a str, i64, crate::cache::TextDigest), usize>;
+/// Rows counted by `(session, timestamp, text)`.
+#[derive(Default)]
+struct RowCounts<'a>(HashMap<(&'a str, i64, Text<'a>), usize>);
 
-impl HeldRows {
-    /// The rows `entries` hold of each agent `wanted` accepts.
-    fn census<'a>(
-        entries: impl Iterator<Item = &'a Entry>,
-        wanted: impl Fn(&str) -> bool,
-    ) -> HashMap<String, Self> {
-        fn rows_of<'m>(
-            held: &'m mut HashMap<String, Option<HeldRows>>,
-            agent: &str,
-            wanted: &impl Fn(&str) -> bool,
-        ) -> Option<&'m mut HeldRows> {
-            if !held.contains_key(agent) {
-                held.insert(agent.to_owned(), wanted(agent).then(HeldRows::default));
-            }
-            held.get_mut(agent).and_then(Option::as_mut)
-        }
-        let mut held: HashMap<String, Option<Self>> = HashMap::new();
-        for entry in entries {
-            for message in &entry.msgs {
-                if let Some(rows) = rows_of(&mut held, &message.agent, &wanted) {
-                    rows.rows.push(message.clone());
-                }
-            }
-            for key in &entry.event_keys {
-                if let Some(rows) = rows_of(&mut held, &key.agent, &wanted) {
-                    rows.event_sessions.insert(key.session.as_str().into());
-                }
-            }
-        }
-        held.into_iter()
-            .filter_map(|(agent, rows)| Some((agent, rows?)))
-            .collect()
+impl<'a> RowCounts<'a> {
+    fn add(&mut self, (session, ts, text): (&'a str, i64, &'a str), count: usize) {
+        *self.0.entry((session, ts, Text(text))).or_default() += count;
     }
 
-    /// The rows publication keeps of `rows`, counted: of rows sharing a session, raw turn and
-    /// text, dedupe keeps the canonical one. A tie it may break either way, if the tied rows'
-    /// timestamps differ, counts for neither.
-    fn published_counts<'a>(rows: impl IntoIterator<Item = &'a CMsg>) -> RowCounts<'a> {
-        let mut kept: HashMap<(&str, u32, &str), Option<&CMsg>> = HashMap::new();
-        for row in rows {
-            let canonical = kept
-                .entry((&row.session, row.turn, &row.text))
-                .or_insert(Some(row));
-            let Some(prior) = *canonical else {
+    fn count(&self, (session, ts, text): (&'a str, i64, &'a str)) -> usize {
+        self.0.get(&(session, ts, Text(text))).copied().unwrap_or(0)
+    }
+
+    /// Takes one row bearing `key`, if one is left.
+    fn take(&mut self, (session, ts, text): (&'a str, i64, &'a str)) -> bool {
+        let left = self
+            .0
+            .get_mut(&(session, ts, Text(text)))
+            .filter(|count| **count > 0);
+        left.map(|count| *count -= 1).is_some()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = ((&'a str, i64, &'a str), usize)> + '_ {
+        let counts = self.0.iter();
+        counts.map(|(&(session, ts, Text(text)), &count)| ((session, ts, text), count))
+    }
+}
+
+/// A cached row of the agent a published generation is judged for.
+struct CachedRow<'a> {
+    row: &'a CMsg,
+    /// Its source lies outside the scopes the preflight failed to read.
+    beside: bool,
+    /// Its entry is the base's own.
+    unchanged: bool,
+}
+
+/// The rows publication keeps of `rows`, counted: of rows sharing a session, raw turn and
+/// text, dedupe keeps the canonical one. A tie it may break either way, if the tied rows'
+/// timestamps differ, counts for neither.
+fn published_counts<'a>(rows: impl IntoIterator<Item = &'a CMsg>) -> RowCounts<'a> {
+    use std::collections::hash_map::Entry as Slot;
+
+    let rows = rows.into_iter();
+    let mut kept: HashMap<(&str, u32, Text), Option<&CMsg>> =
+        HashMap::with_capacity(rows.size_hint().0);
+    for row in rows {
+        let mut slot = match kept.entry((row.session.as_ref(), row.turn, Text(&row.text))) {
+            Slot::Vacant(slot) => {
+                slot.insert(Some(row));
+                continue;
+            }
+            Slot::Occupied(slot) => slot,
+        };
+        let Some(prior) = *slot.get() else {
+            continue;
+        };
+        let order = crate::ingest::registry::canonical_message_cmp(&row.to_msg(), &prior.to_msg());
+        if order.is_gt() {
+            slot.insert(Some(row));
+        } else if order.is_eq() && row.ts != prior.ts {
+            slot.insert(None);
+        }
+    }
+    let mut counts = RowCounts(HashMap::with_capacity(kept.len()));
+    for ((session, _, Text(text)), row) in kept {
+        if let Some(row) = row {
+            counts.add((session, row.ts, text), 1);
+        }
+    }
+    counts
+}
+
+/// Of one agent, what passes since the published generation saw go beside the scopes they
+/// failed to read: rows this pass's base held, rows only an earlier pass's record names, by
+/// `(session, timestamp)` and [`crate::cache::text_digest`], and sessions gone whole.
+#[derive(Default)]
+struct Released<'a> {
+    rows: RowCounts<'a>,
+    recorded: HashMap<(&'a str, i64), Vec<(crate::cache::TextDigest, usize)>>,
+    sessions: HashSet<&'a str>,
+}
+
+impl<'a> Released<'a> {
+    /// Takes one row bearing `key`, if one is left.
+    fn take(&mut self, key: (&'a str, i64, &'a str)) -> bool {
+        if self.rows.take(key) {
+            return true;
+        }
+        let (session, ts, text) = key;
+        let Some(recorded) = self.recorded.get_mut(&(session, ts)) else {
+            return false;
+        };
+        let digest = crate::cache::text_digest(text);
+        let left = recorded
+            .iter_mut()
+            .find(|(held, count)| *count > 0 && *held == digest);
+        left.map(|(_, count)| *count -= 1).is_some()
+    }
+
+    fn record(&self) -> ReleasedRows {
+        let mut rows = HashMap::new();
+        for ((session, ts, text), count) in self.rows.iter() {
+            let digest = crate::cache::text_digest(text);
+            *rows.entry((session.to_owned(), ts, digest)).or_default() += count;
+        }
+        for (&(session, ts), recorded) in &self.recorded {
+            for &(digest, count) in recorded.iter().filter(|(_, count)| *count > 0) {
+                *rows.entry((session.to_owned(), ts, digest)).or_default() += count;
+            }
+        }
+        let sessions = self.sessions.iter().map(|session| (*session).to_owned());
+        ReleasedRows {
+            rows,
+            sessions: sessions.collect(),
+        }
+    }
+}
+
+/// [`Released`] as the cache stages it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReleasedRows {
+    rows: HashMap<(String, i64, crate::cache::TextDigest), usize>,
+    sessions: HashSet<String>,
+}
+
+/// Reserved keys stage [`ReleasedRows`] with the cache, each naming the generation it counts
+/// against. Their entries name no source and hold no rows or events, so nothing else reads them.
+const RELEASED_ROW_KEY: &str = "\0released-row\0";
+const RELEASED_SESSION_KEY: &str = "\0released-session\0";
+
+fn released_key(key: &str) -> bool {
+    key.starts_with(RELEASED_ROW_KEY) || key.starts_with(RELEASED_SESSION_KEY)
+}
+
+fn released_entry(count: usize) -> Entry {
+    Entry {
+        mtime: 0,
+        size: count as u64,
+        identity: None,
+        msgs: Vec::new(),
+        event_keys: Vec::new(),
+        legacy_had_events: false,
+        legacy_needs_reparse: false,
+    }
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hex16(text: &str) -> Option<[u8; 16]> {
+    let mut bytes = [0; 16];
+    if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// The [`ReleasedRows`] of each agent `entries` record against the generation `seal` names.
+fn recorded_released_rows(
+    entries: &HashMap<String, Entry>,
+    seal: &str,
+) -> HashMap<String, ReleasedRows> {
+    let mut released: HashMap<String, ReleasedRows> = HashMap::new();
+    for (key, entry) in entries {
+        if let Some(record) = key.strip_prefix(RELEASED_ROW_KEY) {
+            let mut fields = record.splitn(5, '\0');
+            let mut field = || fields.next();
+            let (Some(sealed), Some(agent), Some(ts), Some(digest), Some(session)) =
+                (field(), field(), field(), field(), field())
+            else {
                 continue;
             };
-            let order =
-                crate::ingest::registry::canonical_message_cmp(&row.to_msg(), &prior.to_msg());
-            if order.is_gt() {
-                *canonical = Some(row);
-            } else if order.is_eq() && row.ts != prior.ts {
-                *canonical = None;
+            let (Ok(ts), Some(digest), Ok(count)) = (
+                ts.parse::<i64>(),
+                parse_hex16(digest),
+                usize::try_from(entry.size),
+            ) else {
+                continue;
+            };
+            if sealed == seal && count > 0 {
+                let rows = &mut released.entry(agent.to_owned()).or_default().rows;
+                rows.insert((session.to_owned(), ts, digest), count);
+            }
+        } else if let Some(record) = key.strip_prefix(RELEASED_SESSION_KEY) {
+            let mut fields = record.splitn(3, '\0');
+            let mut field = || fields.next();
+            if let (Some(sealed), Some(agent), Some(session)) = (field(), field(), field()) {
+                if sealed == seal {
+                    let sessions = &mut released.entry(agent.to_owned()).or_default().sessions;
+                    sessions.insert(session.to_owned());
+                }
             }
         }
-        let mut counts = RowCounts::new();
-        for row in kept.into_values().flatten() {
-            *counts
-                .entry((&row.session, row.ts, crate::cache::text_digest(&row.text)))
-                .or_default() += 1;
-        }
-        counts
     }
-
-    fn sessions(&self) -> impl Iterator<Item = &str> {
-        self.rows
-            .iter()
-            .map(|row| row.session.as_ref())
-            .chain(self.event_sessions.iter().map(AsRef::as_ref))
-    }
+    released
 }
 
 pub struct IngestCache {
@@ -647,9 +784,15 @@ pub struct IngestCache {
     /// For each per-file agent whose failed read this cache cannot answer for alone, whether the
     /// pass holds every row the published generation does; None where that could not be read.
     published_rows: HashMap<String, Option<bool>>,
-    /// What the decoded base held of each per-file agent `published_rows` may be judged for,
-    /// taken before ingest: a row this pass then drops went with a change it observed.
-    base_rows: HashMap<String, HeldRows>,
+    /// The base's own version of each entry changed since [`Self::mark_base_rows`], None where it
+    /// held none: the base is the current entries with these put back.
+    displaced: HashMap<String, Option<Entry>>,
+    /// The scopes the preflight failed to read, which no count of rows seen go looks under.
+    failed_scopes: Vec<PathBuf>,
+    /// The published generation this pass compares with and stages released rows against.
+    published_seal: Option<crate::cache::GenerationSeal>,
+    /// What passes since that generation saw go, by agent: [`Self::record_released_rows`].
+    released: HashMap<String, ReleasedRows>,
     /// `(agent, database namespace)` of every token conversation the published generation may
     /// hold rows or events of. `None` is unknown: every token database counts as material.
     published_token_namespaces: Option<HashSet<(String, String)>>,
@@ -1050,16 +1193,17 @@ fn decode_cache_payload(
             // Takeover re-encodes an older generation at this version with every entry flagged:
             // it reparses whole. Once a pass has made any entry current, the entries it could not
             // reparse keep their flag and rows and reparse one by one on warm passes.
-            let generation = if !cache.entries.is_empty()
-                && cache
-                    .entries
-                    .values()
-                    .all(|entry| entry.legacy_needs_reparse)
-            {
-                CacheGeneration::LegacyReparse
-            } else {
-                CacheGeneration::Current
-            };
+            let mut held = cache
+                .entries
+                .iter()
+                .filter(|(key, _)| !released_key(key))
+                .peekable();
+            let generation =
+                if held.peek().is_some() && held.all(|(_, entry)| entry.legacy_needs_reparse) {
+                    CacheGeneration::LegacyReparse
+                } else {
+                    CacheGeneration::Current
+                };
             return Ok((cache.entries, generation, true));
         }
         if reparse_compatible_cache_version(cache.version) {
@@ -2435,7 +2579,10 @@ impl IngestCache {
             seeded_snapshots: HashSet::new(),
             unvouched_reads: HashSet::new(),
             published_rows: HashMap::new(),
-            base_rows: HashMap::new(),
+            displaced: HashMap::new(),
+            failed_scopes: Vec::new(),
+            published_seal: None,
+            released: HashMap::new(),
             published_token_namespaces: None,
             last_good_base: false,
             legacy_generation: false,
@@ -2459,13 +2606,17 @@ impl IngestCache {
     }
 
     fn put_entry(&mut self, key: String, entry: Entry) {
-        self.entries.insert(key.clone(), entry);
+        let base = self.entries.insert(key.clone(), entry);
+        self.displaced.entry(key.clone()).or_insert(base);
         self.deleted.remove(&key);
         self.dirty.insert(key);
     }
 
     fn remove_entry(&mut self, key: &str) -> Option<Entry> {
         let entry = self.entries.remove(key)?;
+        if !self.displaced.contains_key(key) {
+            self.displaced.insert(key.to_owned(), Some(entry.clone()));
+        }
         self.dirty.remove(key);
         self.deleted.insert(key.to_string());
         Some(entry)
@@ -2486,6 +2637,9 @@ impl IngestCache {
         let Some(entry) = self.entries.get_mut(key) else {
             return false;
         };
+        if !self.displaced.contains_key(key) {
+            self.displaced.insert(key.to_owned(), Some(entry.clone()));
+        }
         update(entry);
         self.deleted.remove(key);
         self.dirty.insert(key.to_string());
@@ -2955,10 +3109,8 @@ impl IngestCache {
                 .filter(|read| self.cache_cannot_answer_for(read.agent, &read.path))
                 .map(|read| read.agent.to_owned()),
         );
-        let scopes: Vec<&Path> = issues.into_iter().map(|(_, scope)| scope).collect();
         for agent in needed {
-            let held =
-                published(&agent).map(|rows| self.holds_published_rows(&agent, &rows, &scopes));
+            let held = published(&agent).map(|rows| self.holds_published_rows(&agent, &rows));
             self.published_rows.insert(agent, held);
         }
     }
@@ -2970,60 +3122,29 @@ impl IngestCache {
         &self,
         agent: &str,
         published: &crate::cache::PublishedAgentRows,
-        failed_scopes: &[&Path],
     ) -> bool {
-        let under_failed_scope = |key: &str| {
-            source_path_from_key(key).is_some_and(|path| {
-                failed_scopes
-                    .iter()
-                    .any(|scope| source_path_within(&path, scope))
-            })
-        };
-        fn rows_of<'a>(entries: impl Iterator<Item = &'a Entry>, agent: &str) -> Vec<&'a CMsg> {
-            entries
-                .flat_map(|entry| entry.msgs.iter())
-                .filter(|row| row.agent == agent)
-                .collect()
-        }
-        let after = rows_of(self.entries.values(), agent);
-        let beside = self
-            .entries
-            .iter()
-            .filter(|(key, _)| !under_failed_scope(key))
-            .map(|(_, entry)| entry);
-        let beside = rows_of(beside, agent);
-        let none = HeldRows::default();
-        let base = self.base_rows.get(agent).unwrap_or(&none);
-        let output = HeldRows::published_counts(after.iter().copied());
-        let (base_counts, beside_counts) = (
-            HeldRows::published_counts(&base.rows),
-            HeldRows::published_counts(beside),
-        );
-        // What this pass publishes, and what the base held beside the failed scopes that this
-        // pass no longer holds there: rows it saw go.
-        let held = |key: &(&str, i64, crate::cache::TextDigest)| {
-            let count = |counts: &RowCounts| counts.get(key).copied().unwrap_or(0);
-            count(&output) + count(&base_counts).saturating_sub(count(&beside_counts))
-        };
-        let mut wanted = RowCounts::new();
-        for ((session, _), row) in &published.turns {
-            *wanted
-                .entry((session.as_str(), row.ts, row.text))
-                .or_default() += 1;
-        }
+        let changed = self.changed_entries();
+        let rows = self.cached_rows(agent, &changed, |_| true);
+        let touched = Self::touched_sessions(agent, &changed);
+        let mut released = self.released_rows(agent, &changed, &touched, &rows);
+        let mut output = published_counts(rows.iter().map(|row| row.row));
+        let rows_held = published.turns.iter().all(|((session, _), row)| {
+            let key = (session.as_str(), row.ts, row.text.as_str());
+            output.take(key) || released.take(key)
+        });
         let event_sessions = self
             .entries
             .values()
             .flat_map(|entry| &entry.event_keys)
             .filter(|key| key.agent == agent)
             .map(|key| key.session.as_str());
-        let sessions: HashSet<&str> = after
+        let sessions: HashSet<&str> = rows
             .iter()
-            .map(|row| row.session.as_ref())
+            .map(|row| row.row.session.as_ref())
             .chain(event_sessions)
-            .chain(base.sessions())
+            .chain(released.sessions.iter().copied())
             .collect();
-        wanted.iter().all(|(key, count)| held(key) >= *count)
+        rows_held
             && published
                 .sessions
                 .iter()
@@ -3031,49 +3152,232 @@ impl IngestCache {
                 .all(|session| sessions.contains(session.as_str()))
     }
 
-    /// Before ingest mutates this decoded base, census what it holds outside failed preflight scopes
-    /// of each per-file agent such a scope may compare with the published generation (with
-    /// `every_agent`, of every per-file agent): rows a failed scope loses are no change it saw.
-    pub fn census_base_rows<'a>(
+    fn under_failed_scope(&self, key: &str) -> bool {
+        source_path_from_key(key).is_some_and(|path| {
+            self.failed_scopes
+                .iter()
+                .any(|scope| source_path_within(&path, scope))
+        })
+    }
+
+    /// The entries whose rows or events this pass changed, each with the base's version.
+    fn changed_entries(&self) -> HashMap<&str, (Option<&Entry>, Option<&Entry>)> {
+        fn held(entry: Option<&Entry>) -> (&[CMsg], &[CEventKey]) {
+            entry.map_or((&[], &[]), |entry| (&entry.msgs, &entry.event_keys))
+        }
+        let mut changed = HashMap::new();
+        for (key, base) in &self.displaced {
+            let (base, current) = (base.as_ref(), self.entries.get(key));
+            let same = held(base) == held(current);
+            if !same {
+                changed.insert(key.as_str(), (base, current));
+            }
+        }
+        changed
+    }
+
+    /// Sessions of `agent` a `changed` entry holds, or held in the base.
+    fn touched_sessions<'a>(
+        agent: &str,
+        changed: &HashMap<&str, (Option<&'a Entry>, Option<&'a Entry>)>,
+    ) -> HashSet<&'a str> {
+        let mut touched = HashSet::new();
+        for (base, current) in changed.values() {
+            for entry in base.iter().chain(current) {
+                let rows = entry.msgs.iter().filter(|row| row.agent == agent);
+                touched.extend(rows.map(|row| row.session.as_ref()));
+                let events = entry.event_keys.iter().filter(|event| event.agent == agent);
+                touched.extend(events.map(|event| event.session.as_str()));
+            }
+        }
+        touched
+    }
+
+    /// The cached rows of `agent` in the sessions `within` accepts.
+    fn cached_rows(
+        &self,
+        agent: &str,
+        changed: &HashMap<&str, (Option<&Entry>, Option<&Entry>)>,
+        within: impl Fn(&str) -> bool,
+    ) -> Vec<CachedRow<'_>> {
+        let mut rows = Vec::new();
+        for (key, entry) in &self.entries {
+            let mut place = None;
+            for row in &entry.msgs {
+                if row.agent != agent || !within(&row.session) {
+                    continue;
+                }
+                let (beside, unchanged) = *place.get_or_insert_with(|| {
+                    (
+                        !self.under_failed_scope(key),
+                        !changed.contains_key(key.as_str()),
+                    )
+                });
+                rows.push(CachedRow {
+                    row,
+                    beside,
+                    unchanged,
+                });
+            }
+        }
+        rows
+    }
+
+    /// What this pass, after the passes since the published generation, saw go of `agent` beside
+    /// the scopes the preflight failed to read. Base and current entries differ only in `touched`
+    /// sessions, so `rows` need hold only the cached rows of those.
+    fn released_rows<'a>(
+        &'a self,
+        agent: &str,
+        changed: &HashMap<&'a str, (Option<&'a Entry>, Option<&'a Entry>)>,
+        touched: &HashSet<&'a str>,
+        rows: &[CachedRow<'a>],
+    ) -> Released<'a> {
+        let beside = rows
+            .iter()
+            .filter(|row| row.beside && touched.contains(row.row.session.as_ref()));
+        let mut base: Vec<&CMsg> = Vec::new();
+        let mut sessions: HashSet<&str> = HashSet::new();
+        if self.last_good_base {
+            base.extend(
+                beside
+                    .clone()
+                    .filter(|row| row.unchanged)
+                    .map(|row| row.row),
+            );
+            for (key, (entry, _)) in changed {
+                let Some(entry) = entry.filter(|_| !self.under_failed_scope(key)) else {
+                    continue;
+                };
+                for row in entry.msgs.iter().filter(|row| row.agent == agent) {
+                    base.push(row);
+                    sessions.insert(row.session.as_ref());
+                }
+                let events = entry.event_keys.iter().filter(|event| event.agent == agent);
+                sessions.extend(events.map(|event| event.session.as_str()));
+            }
+        }
+        let base = published_counts(base);
+        let beside = published_counts(beside.map(|row| row.row));
+        let mut released = Released::default();
+        if let Some(prior) = self.released.get(agent) {
+            for ((session, ts, digest), count) in &prior.rows {
+                let recorded = released.recorded.entry((session.as_str(), *ts));
+                recorded.or_default().push((*digest, *count));
+            }
+            sessions.extend(prior.sessions.iter().map(String::as_str));
+        }
+        // In the touched sessions, what the base held and earlier passes recorded, less what this
+        // pass holds there; elsewhere, the records alone.
+        let only_beside = beside.iter().filter(|(key, _)| base.count(*key) == 0);
+        for (key, _) in base.iter().chain(only_beside) {
+            let mut recorded = 0;
+            if let Some(records) = released.recorded.get_mut(&(key.0, key.1)) {
+                let digest = crate::cache::text_digest(key.2);
+                for (_, count) in records.iter_mut().filter(|(held, _)| *held == digest) {
+                    recorded += std::mem::take(count);
+                }
+            }
+            let gone = (base.count(key) + recorded).saturating_sub(beside.count(key));
+            if gone > 0 {
+                released.rows.add(key, gone);
+            }
+        }
+        for entry in self.entries.values() {
+            if sessions.is_empty() {
+                break;
+            }
+            for row in entry.msgs.iter().filter(|row| row.agent == agent) {
+                sessions.remove(row.session.as_ref());
+            }
+            for event in entry.event_keys.iter().filter(|event| event.agent == agent) {
+                sessions.remove(event.session.as_str());
+            }
+        }
+        released.sessions = sessions;
+        released
+    }
+
+    /// Before ingest mutates this decoded base, take it as what the pass's changes count from, and
+    /// adopt what passes since the published generation, sealed `published`, saw go before a kill
+    /// left it published. No count of rows seen go looks under the scopes the preflight failed.
+    pub fn mark_base_rows<'a>(
         &mut self,
         preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
-        every_agent: bool,
+        published: Option<crate::cache::GenerationSeal>,
     ) {
-        if !self.last_good_base {
-            return;
-        }
-        let scopes: Vec<(&str, &Path)> = preflight_issues.into_iter().collect();
-        let agents: HashSet<&str> = scopes
-            .iter()
-            .filter(|(agent, scope)| self.may_compare_published_rows(agent, scope))
-            .map(|(agent, _)| *agent)
+        self.displaced.clear();
+        self.failed_scopes = preflight_issues
+            .into_iter()
+            .map(|(_, scope)| scope.to_path_buf())
             .collect();
-        let wanted =
-            |agent: &str| agents.contains(agent) || (every_agent && Self::per_file_agent(agent));
-        let outside_failed_scopes = |key: &str| {
-            source_path_from_key(key).is_none_or(|path| {
-                !scopes
-                    .iter()
-                    .any(|(_, scope)| source_path_within(&path, scope))
-            })
+        self.published_seal = published.filter(|_| self.last_good_base);
+        self.released = match &self.published_seal {
+            Some(seal) => recorded_released_rows(&self.entries, &hex16(seal)),
+            None => HashMap::new(),
         };
-        let entries = self
+    }
+
+    /// Stage with the cache what this pass and those since the published generation saw go: a kill
+    /// between the cache commit and that generation's replacement leaves the cache short of rows
+    /// still published. Records against any other generation go.
+    pub fn record_released_rows(&mut self) {
+        let mut records: HashMap<String, usize> = HashMap::new();
+        if let Some(seal) = self.published_seal.as_ref().map(hex16) {
+            let changed = self.changed_entries();
+            let mut agents: HashSet<&str> = self.released.keys().map(String::as_str).collect();
+            for (base, current) in changed.values() {
+                for entry in base.iter().chain(current) {
+                    agents.extend(entry.msgs.iter().map(|row| row.agent.as_str()));
+                    agents.extend(entry.event_keys.iter().map(|event| event.agent.as_str()));
+                }
+            }
+            for agent in agents
+                .into_iter()
+                .filter(|agent| Self::per_file_agent(agent))
+            {
+                let touched = Self::touched_sessions(agent, &changed);
+                let rows = self.cached_rows(agent, &changed, |session| touched.contains(session));
+                let released = self
+                    .released_rows(agent, &changed, &touched, &rows)
+                    .record();
+                for ((session, ts, digest), count) in released.rows {
+                    let digest = hex16(&digest);
+                    let key =
+                        format!("{RELEASED_ROW_KEY}{seal}\0{agent}\0{ts}\0{digest}\0{session}");
+                    records.insert(key, count);
+                }
+                for session in released.sessions {
+                    records.insert(
+                        format!("{RELEASED_SESSION_KEY}{seal}\0{agent}\0{session}"),
+                        1,
+                    );
+                }
+            }
+        }
+        let stale: Vec<String> = self
             .entries
-            .iter()
-            .filter(|(key, _)| outside_failed_scopes(key))
-            .map(|(_, entry)| entry);
-        self.base_rows = HeldRows::census(entries, wanted);
+            .keys()
+            .filter(|key| released_key(key) && !records.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.remove_entry(&key);
+        }
+        for (key, count) in records {
+            let staged = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.size == count as u64 && !entry.legacy_needs_reparse);
+            if !staged {
+                self.put_entry(key, released_entry(count));
+            }
+        }
     }
 
     fn per_file_agent(agent: &str) -> bool {
         !crate::ingest::registry::whole_store_agent(agent)
             && !crate::ingest::registry::token_store_agent(agent)
-    }
-
-    fn may_compare_published_rows(&self, agent: &str, scope: &Path) -> bool {
-        Self::per_file_agent(agent)
-            && ((self.legacy_generation && crate::ingest::registry::partial_read_agent(agent))
-                || self.listed_files_cached(scope).is_some())
     }
 
     fn cache_cannot_answer_for(&self, agent: &str, scope: &Path) -> bool {
@@ -6381,7 +6685,7 @@ mod tests {
                         project: "project".into(),
                         model: None,
                         ts: 1,
-                        text: crate::cache::text_digest(text),
+                        text: (*text).to_owned(),
                     };
                     (((*session).to_owned(), turn as u32), row)
                 })
@@ -6412,7 +6716,7 @@ mod tests {
             let key = deleted.to_string_lossy().into_owned();
             cache.put_entry(key.clone(), cached_entry(std::slice::from_ref(&row)));
             if census {
-                cache.census_base_rows([("claude", scope)], false);
+                cache.mark_base_rows([("claude", scope)], None);
             }
             cache.remove_entry(&key);
             let mut once = Some(published_rows(published));
@@ -6449,7 +6753,7 @@ mod tests {
             let key = under.to_string_lossy().into_owned();
             cache.put_entry(key.clone(), cached_entry(std::slice::from_ref(&row)));
             let issues = [("codex", scope), ("codex", never_read.parent().unwrap())];
-            cache.census_base_rows(issues, false);
+            cache.mark_base_rows(issues, None);
             if !kept {
                 cache.remove_entry(&key);
             }
@@ -6526,7 +6830,7 @@ mod tests {
                     project: "project".into(),
                     model: None,
                     ts: *ts,
-                    text: crate::cache::text_digest(text),
+                    text: (*text).to_owned(),
                 };
                 (("split".to_owned(), *turn), row)
             });
@@ -6592,7 +6896,7 @@ mod tests {
             cache.set_published_material(HashSet::from([never_read.clone(), old.into()]));
             let entry = || cached_entry(std::slice::from_ref(&row));
             cache.put_entry(old.to_string_lossy().into_owned(), entry());
-            cache.census_base_rows([("claude", scope)], false);
+            cache.mark_base_rows([("claude", scope)], None);
             cache.remove_entry(&old.to_string_lossy());
             if let Some(path) = after {
                 cache.put_entry(path.to_string_lossy().into_owned(), entry());
@@ -6638,7 +6942,7 @@ mod tests {
                     project: "project".into(),
                     model: None,
                     ts: *ts,
-                    text: crate::cache::text_digest("continue"),
+                    text: "continue".to_owned(),
                 };
                 (("session".to_owned(), turn), row)
             });
@@ -6654,6 +6958,150 @@ mod tests {
         assert_eq!(verdict(&[5]), MaterialVerdict::Retained);
         // The later time, published by a file behind the locked directory, is one this pass drops.
         assert_eq!(verdict(&[5, 6]), MaterialVerdict::Drops);
+    }
+
+    #[test]
+    fn rows_a_killed_pass_saw_go_count_once_while_its_generation_stays_published() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let chat = Path::new("/fixture/.claude/projects/p/chat.jsonl");
+        let copy = Path::new("/fixture/.claude/projects/p/copy.jsonl");
+        let key = |path: &Path| path.to_string_lossy().into_owned();
+        let sealed = [1; 16];
+        // A pass over `entries` against the generation `sealed` names: it makes `change`, stages
+        // what it saw go with its cache, and is killed before replacing that generation.
+        let killed = |entries: &HashMap<String, super::Entry>,
+                      change: &dyn Fn(&mut IngestCache)| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.entries = entries.clone();
+            cache.mark_base_rows([("claude", scope)], Some(sealed));
+            change(&mut cache);
+            cache.record_released_rows();
+            cache.entries
+        };
+        // The next pass over `entries`, against the generation `seal` names, which holds the
+        // chat's first row `published` times.
+        let verdict = |entries: &HashMap<String, super::Entry>,
+                       seal: crate::cache::GenerationSeal,
+                       published: usize| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.entries = entries.clone();
+            cache.set_published_material(HashSet::from([never_read.clone(), chat.into()]));
+            cache.mark_base_rows([("claude", scope)], Some(seal));
+            let rows = vec![("session", "as first written"); published];
+            let mut once = Some(published_rows(&rows));
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+        let first = || cached_entry(&[test_message("as first written")]);
+        let written = HashMap::from([(key(chat), first())]);
+        let rewritten = killed(&written, &|cache| {
+            cache.put_entry(key(chat), cached_entry(&[test_message("as rewritten")]));
+        });
+
+        assert_eq!(verdict(&rewritten, sealed, 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(&rewritten, sealed, 2), MaterialVerdict::Drops);
+        // A pass that replaced that generation published what its cache held instead.
+        assert_eq!(verdict(&rewritten, [2; 16], 1), MaterialVerdict::Drops);
+        // Another killed pass carries the record on; one that brings the row back holds it itself.
+        let carried = killed(&rewritten, &|_| {});
+        assert_eq!(verdict(&carried, sealed, 1), MaterialVerdict::Retained);
+        let restored = killed(&rewritten, &|cache| cache.put_entry(key(copy), first()));
+        assert_eq!(verdict(&restored, sealed, 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(&restored, sealed, 2), MaterialVerdict::Drops);
+        // The chat deleted, its session with it.
+        let deleted = killed(&written, &|cache| {
+            cache.remove_entry(&key(chat));
+        });
+        assert_eq!(verdict(&deleted, sealed, 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(&deleted, [2; 16], 1), MaterialVerdict::Drops);
+        // The records serve nothing: no row, event, source or published material.
+        let mut records = IngestCache::cold();
+        records.entries = deleted;
+        assert!(records.entries.keys().all(|key| super::released_key(key)));
+        assert!(records.session_sources().is_empty() && records.live_event_files().is_empty());
+        records.set_published_material_from_cache();
+        assert_eq!(records.published_material, Some(HashSet::new()));
+    }
+
+    #[test]
+    fn a_released_record_leaves_a_cache_awaiting_its_whole_reparse() {
+        let record = format!(
+            "{}{}\0claude\0session",
+            super::RELEASED_SESSION_KEY,
+            super::hex16(&[1; 16])
+        );
+        let entries = HashMap::from([
+            (
+                "\0snapshot\0cline".to_owned(),
+                cached_entry(&[test_message("a row awaiting reparse")]),
+            ),
+            (record, super::released_entry(1)),
+        ]);
+        let payload = bincode::serialize(&super::CacheFileRef {
+            version: CACHE_VERSION,
+            entries: &entries,
+        })
+        .unwrap();
+        let Ok((decoded, generation, _)) =
+            super::decode_cache_payload(&payload, std::path::Path::new("cache.bin"))
+        else {
+            panic!("the cache did not decode");
+        };
+        assert_eq!(decoded.len(), 2);
+        assert!(generation == super::CacheGeneration::LegacyReparse);
+    }
+
+    #[test]
+    fn judging_a_large_agent_against_its_published_rows_stays_fast() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let mut cache = IngestCache::cold();
+        cache.last_good_base = true;
+        let mut listed = HashSet::from([never_read]);
+        let mut published = crate::cache::PublishedAgentRows::default();
+        for file in 0..6_000 {
+            let path = PathBuf::from(format!("/fixture/.claude/projects/p/{file}.jsonl"));
+            let session = format!("session-{file}");
+            let rows: Vec<_> = (0..10_u32)
+                .map(|turn| {
+                    let mut row =
+                        test_message(&format!("{file}:{turn} {}", "row text ".repeat(48)));
+                    (row.session, row.turn) = (session.as_str().into(), turn);
+                    let turn_row = crate::cache::PublishedTurn {
+                        project: "project".into(),
+                        model: None,
+                        ts: row.ts,
+                        text: row.text.to_string(),
+                    };
+                    published.turns.insert((session.clone(), turn), turn_row);
+                    row
+                })
+                .collect();
+            published.sessions.insert(session);
+            cache.put_entry(path.to_string_lossy().into_owned(), cached_entry(&rows));
+            listed.insert(path);
+        }
+        cache.set_published_material(listed);
+        cache.mark_base_rows([("claude", scope)], None);
+        let started = std::time::Instant::now();
+        let mut once = Some(published);
+        cache.record_published_rows([("claude", scope)], |_| once.take());
+        cache.record_released_rows();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            cache.published_material_under("claude", scope),
+            MaterialVerdict::Retained
+        );
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]
@@ -6734,7 +7182,7 @@ mod tests {
                     project: project.to_owned(),
                     model: model.map(str::to_owned),
                     ts: 1,
-                    text: crate::cache::text_digest("a readable task"),
+                    text: "a readable task".to_owned(),
                 },
             )]),
             sessions: HashSet::from(["session".to_owned()]),

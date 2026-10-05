@@ -4095,15 +4095,14 @@ pub struct PublishedTurn {
     /// The model its source named; None where publication backfilled or labelled it.
     pub model: Option<String>,
     pub ts: i64,
-    /// [`text_digest`] of its text.
-    pub text: TextDigest,
+    pub text: String,
 }
 
 /// A collision-resistant digest of a row's text.
 pub type TextDigest = [u8; 16];
 
-/// SHA-256 of a row's text, truncated: with its session and timestamp, a key turn-collision
-/// repair, which renumbers turns, never changes.
+/// SHA-256 of a row's text, truncated: how a record staged with the parse cache names a row
+/// without holding its text.
 pub fn text_digest(text: &str) -> TextDigest {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(text.as_bytes());
@@ -4111,6 +4110,31 @@ pub fn text_digest(text: &str) -> TextDigest {
     key.copy_from_slice(&digest[..16]);
     key
 }
+
+/// The identity of the files [`published_agent_rows`] reads, which differs once a pass replaces
+/// either; None when either is no regular file.
+pub fn published_generation_seal(data: &Path) -> Option<GenerationSeal> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    for name in ["sessions.jsonl", "messages.jsonl"] {
+        let seal = file_identity_seal(&data.join(name)).ok()?;
+        for field in [
+            seal.device,
+            seal.inode,
+            seal.size,
+            seal.modified_ns,
+            seal.changed_ns,
+        ] {
+            hasher.update(field.to_le_bytes());
+        }
+    }
+    let mut seal = [0; 16];
+    seal.copy_from_slice(&hasher.finalize()[..16]);
+    Some(seal)
+}
+
+/// See [`published_generation_seal`].
+pub type GenerationSeal = [u8; 16];
 
 /// Every row and event session of `agent` the published generation in `data` holds; None when
 /// any of them cannot be read whole or named. The caller must have verified those files the way
@@ -4165,7 +4189,7 @@ pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRo
                     project: row.project,
                     model,
                     ts: row.ts,
-                    text: text_digest(&row.text),
+                    text: row.text,
                 };
                 rows.turns.insert((row.session, turn), attribution);
             }

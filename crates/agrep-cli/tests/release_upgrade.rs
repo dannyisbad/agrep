@@ -1095,6 +1095,137 @@ fn a_cacheless_pass_keeps_a_locked_rollout_whose_session_resumed_beside_it() {
     }
 }
 
+/// What the pass a kill stops past its cache commit saw go.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum KilledChange {
+    /// A rollout rewound: its second prompt rewritten in place, at the same time.
+    Rewound,
+    /// A rollout deleted, its session with it.
+    Deleted,
+}
+
+/// A pass killed between its cache commit and the replacement of the published generation leaves
+/// a cache short of rows that generation still publishes, rows the pass saw go. Beside a rollout
+/// never read, its directory locked, every pass after it publishes that change all the same.
+#[cfg(unix)]
+#[test]
+fn a_pass_killed_past_its_cache_commit_leaves_what_it_saw_go_publishable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A tool call each change also rewrites or deletes, so the stopped pass's commit revokes
+    // the event proofs: the passes after it repair them.
+    let with_call = |rollout: PathBuf, command: &[&str]| {
+        let call = serde_json::json!({"type": "response_item",
+            "timestamp": "2026-01-06T13:00:00.000Z",
+            "payload": {"type": "function_call", "name": "shell", "call_id": "call-1",
+                        "arguments": serde_json::json!({"command": command}).to_string()}});
+        let mut body = fs::read_to_string(&rollout).unwrap();
+        body.push_str(&format!("{call}\n"));
+        fs::write(&rollout, body).unwrap();
+        rollout
+    };
+    for change in [KilledChange::Rewound, KilledChange::Deleted] {
+        let home = temp_dir("killed-past-commit-home");
+        copy_dir(&fixture_home("claude"), &home);
+        let first = ["prompt one", "prompt two"];
+        with_call(
+            codex_rollout(&home, "03", SPLIT_SESSION, 10, &first),
+            &["ls"],
+        );
+        let deleted_session = "77777777-7777-4777-8777-777777777777";
+        let deleted = codex_rollout(&home, "04", deleted_session, 11, &["a rollout deleted"]);
+        let gone = with_call(deleted, &["ls"]);
+        let never_session = "66666666-6666-4666-8666-666666666666";
+        let never = codex_rollout(&home, "06", never_session, 12, &["a prompt never read"]);
+        fs::set_permissions(&never, fs::Permissions::from_mode(0o000)).unwrap();
+        let chat = plant_chat(&home);
+        let data = temp_dir("killed-past-commit-data");
+        assert_published(&ingest_output("all", &home, &data, false), "first index");
+        let unreadable = fs::read(&never).is_err();
+        let messages = data.join("messages.jsonl");
+        let published = fs::read(&messages).unwrap();
+        let (stale, fresh) = match change {
+            KilledChange::Rewound => {
+                let prompts = ["prompt one", "second prompt, reworded"];
+                let rewound = codex_rollout(&home, "03", SPLIT_SESSION, 10, &prompts);
+                with_call(rewound, &["ls", "-la"]);
+                ("prompt two", Some(prompts[1]))
+            }
+            KilledChange::Deleted => {
+                fs::remove_file(&gone).unwrap();
+                ("a rollout deleted", None)
+            }
+        };
+        let cache = || {
+            [".ingest_cache.bin", ".ingest_cache.bin.journal"]
+                .map(|name| fs::read(data.join(name)).ok())
+        };
+        let proofs = || {
+            let names = fs::read_dir(&data)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name());
+            names
+                .filter(|name| name.to_string_lossy().starts_with(".events_complete"))
+                .count()
+        };
+        let committed = cache();
+        // A record the pass cannot replace stops it right after its cache commit.
+        let record = data.join(".token_material.json");
+        let saved = fs::read(&record).unwrap();
+        fs::remove_file(&record).unwrap();
+        fs::create_dir_all(record.join("in-the-way")).unwrap();
+        let killed = ingest_output("all", &home, &data, false);
+        fs::remove_dir_all(&record).unwrap();
+        fs::write(&record, saved).unwrap();
+        assert!(!killed.status.success(), "{change:?}: the pass ran on");
+        assert_ne!(
+            cache(),
+            committed,
+            "{change:?}: the pass stopped before its cache commit"
+        );
+        assert_eq!(
+            proofs(),
+            0,
+            "{change:?}: the stopped pass kept its event proofs"
+        );
+        assert_eq!(
+            fs::read(&messages).unwrap(),
+            published,
+            "{change:?}: the stopped pass replaced the published rows"
+        );
+        let locked = unreadable
+            .then(|| lock_dir(never.parent().unwrap()))
+            .flatten();
+        let passes: Vec<_> = (1..=3)
+            .filter(|_| locked.is_some())
+            .map(|minute| {
+                let churn = format!("upgrade churn {minute}");
+                append_line(&chat, minute, &churn);
+                let output = ingest_output("all", &home, &data, false);
+                let published = normalize(&data);
+                let settled = published.contains(&churn)
+                    && published.contains("prompt one")
+                    && !published.contains(stale)
+                    && fresh.is_none_or(|text| published.contains(text));
+                (output, settled)
+            })
+            .collect();
+        if let Some(locked) = &locked {
+            unlock_dir(locked);
+        }
+        fs::set_permissions(&never, fs::Permissions::from_mode(0o644)).unwrap();
+        for (minute, (output, settled)) in (1..).zip(passes) {
+            let context = format!("{change:?}, pass {minute}");
+            assert_published(&output, &context);
+            assert!(settled, "{context}: churn unpublished, or the change");
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
 /// An upgrade held back by one scope past others it could publish past names that scope: here
 /// the opencode store whose rows the release published uncached, not the foreign crush database
 /// listed before it. Its rows stay published, and access to the store heals the index.
