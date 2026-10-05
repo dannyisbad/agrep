@@ -202,6 +202,37 @@ class PacketTests(unittest.TestCase):
         self.assertNotIn(
             "window(s) before this boundary", postcompact._human(packet))
 
+    def test_the_window_opens_at_the_previous_recap_turn_without_its_summary(self) -> None:
+        # pi/omp keep the summary as recap text, and the reply written after it shares the
+        # recap's turn; this chat opens on a compaction.
+        db = _db()
+        try:
+            db.executemany(
+                "INSERT INTO msgs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (70, "opened", 0, 1, "omp", "agrep", "", "recap", "recap",
+                     "first summary text", None),
+                    (71, "opened", 0, 2, "omp", "agrep", "m", "explicit", "agent",
+                     "reply after the first compaction", None),
+                    (72, "opened", 1, 3, "omp", "agrep", "m", "explicit", "user",
+                     "prompt between the compactions", None),
+                    (73, "opened", 2, 4, "omp", "agrep", "", "recap", "recap",
+                     "second summary text", None),
+                    (74, "opened", 2, 5, "omp", "agrep", "m", "explicit", "agent",
+                     "reply after the second compaction", None),
+                ])
+            family = session_context.CallingFamily(
+                "opened", "opened", frozenset({"opened"}), True, 2)
+            packet = postcompact.read_packet(db, family)
+        finally:
+            db.close()
+        self.assertEqual(packet["selection"]["previous_boundary_turn"], 0)
+        self.assertEqual(
+            [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
+            [(0, "agent", "reply after the first compaction"),
+             (1, "user", "prompt between the compactions")])
+        self.assertNotIn("summary text", json.dumps(packet))
+
     def test_child_sessions_are_never_injected_into_the_root_packet(self) -> None:
         db = _db()
         try:
@@ -1147,28 +1178,21 @@ CODEX_TAIL = [
 ]
 
 
-class _IndexedCodexCompaction:
-    """Black-box: the real ingest indexes a codex rollout that compacted mid-turn, and the
-    search db is built from that publication, never from hand-inserted rows. codex writes
-    the compaction as an empty recap row; every read path must find the boundary there."""
-
-    REPLIED = False
+class _IngestSandbox:
+    """Black-box: the real ingest indexes synthetic stores, and the search db is built from that
+    publication, never from hand-inserted rows."""
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def _sandbox(cls) -> Path:
         repo = Path(__file__).resolve().parents[1]
         binary = Path(os.environ.get("AGREP_RS_BIN") or repo / "target" / "release" / (
             "agrep-rs.exe" if os.name == "nt" else "agrep-rs"))
         if not binary.is_file():
             raise unittest.SkipTest("release ingest binary is required")
-        temp = tempfile.TemporaryDirectory(prefix="agrep-codex-compaction-")
+        temp = tempfile.TemporaryDirectory(prefix="agrep-ingest-sandbox-")
         cls.addClassCleanup(temp.cleanup)
         root = Path(temp.name)
         home, cls.data = root / "home", root / "data"
-        source = next(CODEX_FIXTURE.glob("rollout-*.jsonl"))
-        rollout = home / ".codex" / "sessions" / "2026" / "06" / "11" / source.name
-        rollout.parent.mkdir(parents=True)
-        rollout.write_bytes(source.read_bytes())
         cls.data.mkdir()
         (cls.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
         cls.env = {key: value for key, value in os.environ.items()
@@ -1186,12 +1210,7 @@ class _IndexedCodexCompaction:
             "CRUSH_GLOBAL_DATA": str(root / "crush"), "OPENCODE_DB": "",
         })
         cls.cli = [sys.executable, str(repo / "cli.py")]
-        cls._index()
-        if cls.REPLIED:
-            # the reply lands later and reaches the search db through the incremental refresh
-            with rollout.open("ab") as stream:
-                stream.write((CODEX_FIXTURE / "reply_after_compaction.jsonl").read_bytes())
-            cls._index()
+        return home
 
     @classmethod
     def _index(cls) -> None:
@@ -1204,6 +1223,27 @@ class _IndexedCodexCompaction:
         return subprocess.run(
             [*cls.cli, *argv], cwd=cls.data.parent, env={**cls.env, **env},
             capture_output=True, text=True, encoding="utf-8", timeout=120, check=False)
+
+
+class _IndexedCodexCompaction(_IngestSandbox):
+    """The real ingest indexes a codex rollout that compacted mid-turn. codex writes the
+    compaction as an empty recap row; every read path must find the boundary there."""
+
+    REPLIED = False
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        home = cls._sandbox()
+        source = next(CODEX_FIXTURE.glob("rollout-*.jsonl"))
+        rollout = home / ".codex" / "sessions" / "2026" / "06" / "11" / source.name
+        rollout.parent.mkdir(parents=True)
+        rollout.write_bytes(source.read_bytes())
+        cls._index()
+        if cls.REPLIED:
+            # the reply lands later and reaches the search db through the incremental refresh
+            with rollout.open("ab") as stream:
+                stream.write((CODEX_FIXTURE / "reply_after_compaction.jsonl").read_bytes())
+            cls._index()
 
     def _rows(self, argv: list[str]) -> list[dict]:
         result = self._run([*argv, "--json", "--no-auto"])
@@ -1316,6 +1356,90 @@ class CodexCompactionAfterReply(_IndexedCodexCompaction, unittest.TestCase):
     """A reply written after the compaction files under the recap's turn."""
 
     REPLIED = True
+
+
+TWO_COMPACTIONS = Path(__file__).resolve().parent / "fixtures" / "postcompact_two_compactions"
+CODEX_TWICE = "7c7c7c7c-0612-4000-8000-000000000612"
+CLAUDE_TWICE = "7d7d7d7d-0612-4000-8000-000000000613"
+
+
+def _ms(moment: str) -> int:
+    return int(datetime.fromisoformat(moment).timestamp() * 1000)
+
+
+# Each chat compacts twice and replies once between: the newest boundary's packet, and the first's.
+TWICE = {
+    CODEX_TWICE: {
+        "first_ms": _ms("2026-06-12T09:20:00+00:00"),
+        "first": [(0, "user", "Rebuild the heron shards from the archive.")],
+        "second": [
+            (1, "agent", "All five heron shards are rebuilt; the kestrel checksum still differs."),
+            (2, "user", "Track down the kestrel checksum mismatch."),
+        ],
+    },
+    CLAUDE_TWICE: {
+        "first_ms": _ms("2026-06-12T09:10:01+00:00"),
+        "first": [(0, "user", "Port the heron importer to the async client.")],
+        "second": [
+            (1, "agent",
+             "The heron importer now uses the async client; two kestrel retries still block."),
+            (2, "user", "Remove the two blocking kestrel retries."),
+        ],
+    },
+}
+NEVER_REPLAYED = (
+    "Summary:", "continued from a previous conversation",
+    "Shard four was rebuilt twice", "Both blocking kestrel retries are removed",
+)
+
+
+class ReplyBetweenTwoCompactions(_IngestSandbox, unittest.TestCase):
+    """codex and claude file the reply written after a compaction under that recap's own turn,
+    so the next boundary's window opens at that turn and still leaves the recap text out."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        home = cls._sandbox()
+        store = TWO_COMPACTIONS / "store"
+        for source in store.rglob("*.jsonl"):
+            relative = source.relative_to(store)
+            destination = home / ("." + relative.parts[0]) / Path(*relative.parts[1:])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+        cls._index()
+
+    def _packet(self, session: str, *extra: str) -> dict:
+        result = self._run(["postcompact", "--session", session, "--json", *extra])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        packet = json.loads(result.stdout)
+        self.assertEqual(packet["status"], "recovered")
+        wire = json.dumps(packet, ensure_ascii=False)
+        for text in NEVER_REPLAYED:
+            self.assertNotIn(text, wire)
+        return packet
+
+    def test_the_next_boundary_replays_the_reply_written_after_the_previous_one(self) -> None:
+        for session, case in TWICE.items():
+            with self.subTest(session=session):
+                packet = self._packet(session)
+                selection = packet["selection"]
+                self.assertEqual(
+                    (selection["boundary_turn"], selection["previous_boundary_turn"],
+                     selection["window_fallbacks"]), (3, 1, 0))
+                self.assertEqual(
+                    [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
+                    case["second"])
+
+    def test_the_first_boundary_still_stops_before_its_own_reply(self) -> None:
+        for session, case in TWICE.items():
+            with self.subTest(session=session):
+                packet = self._packet(session, "--boundary-ms", str(case["first_ms"]))
+                selection = packet["selection"]
+                self.assertEqual(
+                    (selection["boundary_turn"], selection["previous_boundary_turn"]), (1, None))
+                self.assertEqual(
+                    [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
+                    case["first"])
 
 
 if __name__ == "__main__":

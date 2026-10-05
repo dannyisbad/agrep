@@ -151,7 +151,9 @@ def _eligible_rows(db, session: str, lower: int | None, upper: int) -> list[dict
     where = ["session=?", "turn<?", "who IN ('user','agent')", "text<>''"]
     params: list[object] = [session, int(upper)]
     if lower is not None:
-        where.append("turn>?")
+        # A reply written after a compaction files under that recap's own turn, so the
+        # window opens there; the who filter keeps the recap text itself out.
+        where.append("turn>=?")
         params.append(int(lower))
     rows = db.execute(
         "SELECT session, turn, coalesce(ts,0), who, text, "
