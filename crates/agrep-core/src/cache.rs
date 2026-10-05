@@ -4088,12 +4088,21 @@ pub struct PublishedAgentRows {
     pub event_sessions: HashSet<String>,
 }
 
-/// The attribution a published message row carries.
+/// The attribution and content a published message row carries.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PublishedTurn {
     pub project: String,
     /// The model its source named; None where publication backfilled or labelled it.
     pub model: Option<String>,
+    pub ts: i64,
+    /// [`text_digest`] of its text.
+    pub text: u64,
+}
+
+/// FNV-1a 64-bit of a row's text: with its session and timestamp, a key no turn renumbering
+/// changes.
+pub fn text_digest(text: &str) -> u64 {
+    content_hash(text.as_bytes())
 }
 
 /// Every row and event session of `agent` the published generation in `data` holds; None when
@@ -4111,6 +4120,10 @@ pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRo
         model: String,
         #[serde(default)]
         model_source: String,
+        #[serde(default)]
+        ts: i64,
+        #[serde(default)]
+        text: String,
     }
     let read = || -> anyhow::Result<PublishedAgentRows> {
         let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
@@ -4144,6 +4157,8 @@ pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRo
                 let attribution = PublishedTurn {
                     project: row.project,
                     model,
+                    ts: row.ts,
+                    text: text_digest(&row.text),
                 };
                 rows.turns.insert((row.session, turn), attribution);
             }

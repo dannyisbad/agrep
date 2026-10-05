@@ -760,6 +760,218 @@ fn crash_repair_publishes_a_deletion_beside_an_unlistable_directory_listing_a_fi
     );
 }
 
+#[cfg(unix)]
+const SPLIT_SESSION: &str = "55555555-5555-4555-8555-555555555555";
+
+/// Write a codex rollout of `session` under `sessions/2026/01/<day>`, a prompt a minute from
+/// `hour`, each answered.
+#[cfg(unix)]
+fn codex_rollout(home: &Path, day: &str, session: &str, hour: u32, prompts: &[&str]) -> PathBuf {
+    let dir = home.join(".codex/sessions/2026/01").join(day);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!(
+        "rollout-2026-01-{day}T{hour:02}-00-00-{session}.jsonl"
+    ));
+    let mut lines = vec![
+        serde_json::json!({"type": "session_meta",
+                           "payload": {"id": session, "cwd": "/work/split", "source": "cli"}}),
+        serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.5-codex"}}),
+    ];
+    for (minute, prompt) in prompts.iter().enumerate() {
+        let ts = format!("2026-01-{day}T{hour:02}:{minute:02}:00.000Z");
+        let message = |role: &str, kind: &str, text: String| {
+            serde_json::json!({"type": "response_item", "timestamp": ts,
+                               "payload": {"type": "message", "role": role,
+                                           "content": [{"type": kind, "text": text}]}})
+        };
+        lines.push(message("user", "input_text", (*prompt).to_owned()));
+        lines.push(serde_json::json!({"type": "event_msg", "timestamp": ts,
+                                      "payload": {"type": "user_message", "message": prompt}}));
+        lines.push(message(
+            "assistant",
+            "output_text",
+            format!("done: {prompt}"),
+        ));
+    }
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    fs::write(&path, body).unwrap();
+    path
+}
+
+/// How the passes beside a day directory turned into a link begin.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum LinkStart {
+    /// A current data dir, warm.
+    Warm,
+    /// The first pass after an upgrade from release 0.3.2, which published the snapshot.
+    Upgrade,
+    /// A current data dir whose event proofs a crash revoked.
+    CrashRepair,
+}
+
+/// A codex session split over a rollout and a fork replaying its first two prompts. Its day
+/// directory then moves onto a drive, linked back, that unmounts: no pass may drop the prompts
+/// only that rollout holds, nor stop disclosing it, and the remounted drive leaves them in place.
+#[cfg(unix)]
+fn keeps_rows_behind_a_day_directory_link_whose_target_is_gone(start: LinkStart) {
+    let home = temp_dir("release-upgrade-link-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let prompts = ["prompt one", "prompt two", "prompt three", "prompt four"];
+    let rollout = codex_rollout(&home, "03", SPLIT_SESSION, 10, &prompts);
+    codex_rollout(&home, "05", SPLIT_SESSION, 10, &prompts[..2]);
+    let chat = plant_chat(&home);
+    let data = temp_dir("release-upgrade-link-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    let unique = |published: &str| prompts[2..].iter().all(|text| published.contains(text));
+    assert!(unique(&normalize(&data)));
+    match start {
+        LinkStart::Warm => {}
+        LinkStart::Upgrade => age_to_release_0_3_2(&data, Snapshot::Published),
+        LinkStart::CrashRepair => strip_event_proofs(&data),
+    }
+    let day = rollout.parent().unwrap().to_path_buf();
+    let drive = home.join("drive");
+    fs::create_dir_all(&drive).unwrap();
+    fs::rename(&day, drive.join("03")).unwrap();
+    std::os::unix::fs::symlink(drive.join("03"), &day).unwrap();
+    fs::rename(drive.join("03"), drive.join("03-unmounted")).unwrap();
+
+    for minute in [1, 2, 3] {
+        let churn = format!("upgrade churn {minute}");
+        append_line(&chat, minute, &churn);
+        let context = format!("{start:?}, pass {minute} with the drive unmounted");
+        assert_published(&ingest_output("all", &home, &data, false), &context);
+        let published = normalize(&data);
+        assert!(
+            published.contains(&churn),
+            "{context}: churn was not published"
+        );
+        assert!(
+            unique(&published),
+            "{context}: the rollout's own prompts were dropped"
+        );
+        assert!(
+            issue_kinds(&data, "codex", &day).contains(&"unsupported-link".to_owned()),
+            "{context}: the link was not disclosed"
+        );
+    }
+    fs::rename(drive.join("03-unmounted"), drive.join("03")).unwrap();
+    for minute in [4, 5] {
+        let churn = format!("upgrade churn {minute}");
+        append_line(&chat, minute, &churn);
+        let context = format!("{start:?}, pass {minute} with the drive remounted");
+        assert_published(&ingest_output("all", &home, &data, false), &context);
+        let published = normalize(&data);
+        assert!(
+            published.contains(&churn) && unique(&published),
+            "{context}"
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_pass_keeps_rows_behind_a_day_directory_link_whose_target_is_gone() {
+    keeps_rows_behind_a_day_directory_link_whose_target_is_gone(LinkStart::Warm);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_keeps_rows_behind_a_day_directory_link_whose_target_is_gone() {
+    keeps_rows_behind_a_day_directory_link_whose_target_is_gone(LinkStart::Upgrade);
+}
+
+#[cfg(unix)]
+#[test]
+fn crash_repair_keeps_rows_behind_a_day_directory_link_whose_target_is_gone() {
+    keeps_rows_behind_a_day_directory_link_whose_target_is_gone(LinkStart::CrashRepair);
+}
+
+/// A codex session resumed after compaction spans two rollouts whose turns collide, so it
+/// publishes renumbered. Beside a rollout unreadable since the first index, which the upgrade
+/// cannot list (`Upgrade`) or crash repair cannot read, the cache still holds every one of them.
+#[cfg(unix)]
+fn publishes_a_renumbered_session_beside_a_rollout_never_read(start: NeverReadStart) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_dir("release-upgrade-renumbered-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let before = ["prompt one", "prompt two", "prompt three", "prompt four"];
+    let after = ["after compaction one", "after compaction two"];
+    codex_rollout(&home, "03", SPLIT_SESSION, 10, &before);
+    codex_rollout(&home, "05", SPLIT_SESSION, 11, &after);
+    let never_session = "66666666-6666-4666-8666-666666666666";
+    let never = codex_rollout(
+        &home,
+        "06",
+        never_session,
+        12,
+        &["a prompt no pass could read"],
+    );
+    fs::set_permissions(&never, fs::Permissions::from_mode(0o000)).unwrap();
+    let chat = plant_chat(&home);
+    let data = temp_dir("release-upgrade-renumbered-data");
+    let first = ingest_output("all", &home, &data, false);
+    let all_held = |published: &str| {
+        before
+            .iter()
+            .chain(&after)
+            .all(|text| published.contains(text))
+    };
+    let released = all_held(&normalize(&data));
+    let observable = fs::read(&never).is_err() && data.join(".source_snapshot.bin").exists();
+    let day = never.parent().unwrap().to_path_buf();
+    let locked = match start {
+        NeverReadStart::Upgrade if observable => {
+            age_to_release_0_3_2(&data, Snapshot::Published);
+            lock_dir(&day).map(Some)
+        }
+        NeverReadStart::CrashRepair if observable => {
+            strip_event_proofs(&data);
+            Some(None)
+        }
+        _ => None,
+    };
+    let passes: Vec<_> = (1..=3)
+        .filter(|_| locked.is_some())
+        .map(|minute| {
+            let churn = format!("upgrade churn {minute}");
+            append_line(&chat, minute, &churn);
+            let output = ingest_output("all", &home, &data, false);
+            let published = normalize(&data);
+            (output, published.contains(&churn) && all_held(&published))
+        })
+        .collect();
+    if let Some(Some(locked)) = &locked {
+        unlock_dir(locked);
+    }
+    fs::set_permissions(&never, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_published(&first, "first index");
+    assert!(released, "the first index did not publish the session");
+    for (minute, (output, kept)) in (1..).zip(passes) {
+        let context = format!("{start:?}, pass {minute}");
+        assert_published(&output, &context);
+        assert!(kept, "{context}: churn or published rows missing");
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_publishes_a_renumbered_session_beside_a_rollout_never_read() {
+    publishes_a_renumbered_session_beside_a_rollout_never_read(NeverReadStart::Upgrade);
+}
+
+#[cfg(unix)]
+#[test]
+fn crash_repair_publishes_a_renumbered_session_beside_a_rollout_never_read() {
+    publishes_a_renumbered_session_beside_a_rollout_never_read(NeverReadStart::CrashRepair);
+}
+
 /// An upgrade held back by one scope past others it could publish past names that scope: here
 /// the opencode store whose rows the release published uncached, not the foreign crush database
 /// listed before it. Its rows stay published, and access to the store heals the index.

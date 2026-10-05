@@ -489,10 +489,12 @@ impl CMsg {
     }
 }
 
-/// The message turns, by session, and the event sessions cache entries hold of one agent.
+/// The message turns and texts, by session, and the event sessions cache entries hold of one
+/// agent. Turns are the adapter's own: merging a session's files may renumber them on publication.
 #[derive(Default)]
 struct HeldRows {
     turns: HashMap<std::sync::Arc<str>, HashSet<u32>>,
+    texts: HashMap<std::sync::Arc<str>, HashMap<i64, Vec<std::sync::Arc<str>>>>,
     event_sessions: HashSet<std::sync::Arc<str>>,
 }
 
@@ -517,7 +519,16 @@ impl HeldRows {
             for message in &entry.msgs {
                 if let Some(rows) = rows_of(&mut held, &message.agent, &wanted) {
                     let session = message.session.clone();
-                    rows.turns.entry(session).or_default().insert(message.turn);
+                    rows.turns
+                        .entry(session.clone())
+                        .or_default()
+                        .insert(message.turn);
+                    rows.texts
+                        .entry(session)
+                        .or_default()
+                        .entry(message.ts)
+                        .or_default()
+                        .push(message.text.clone());
                 }
             }
             for key in &entry.event_keys {
@@ -531,10 +542,21 @@ impl HeldRows {
             .collect()
     }
 
-    fn holds_turn(&self, session: &str, turn: u32) -> bool {
+    /// Whether these entries hold the published `row` at `(session, turn)`: by its turn, or by
+    /// its timestamp and text where publication renumbered the session's turns.
+    fn holds_row(&self, session: &str, turn: u32, row: &crate::cache::PublishedTurn) -> bool {
         self.turns
             .get(session)
             .is_some_and(|turns| turns.contains(&turn))
+            || self
+                .texts
+                .get(session)
+                .and_then(|by_ts| by_ts.get(&row.ts))
+                .is_some_and(|texts| {
+                    texts
+                        .iter()
+                        .any(|text| crate::cache::text_digest(text) == row.text)
+                })
     }
 
     fn holds_session(&self, session: &str) -> bool {
@@ -739,6 +761,29 @@ fn source_relative(path: &Path, root: &Path) -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn source_relative(path: &Path, root: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// Whether `path`, NotFound beneath `root`, may still exist behind an ancestor no walk follows: a
+/// link (a day directory moved onto a drive since unmounted) or anything not proven a directory.
+/// Only beneath directories proven real is NotFound a deletion.
+fn absence_unproven(root: &Path, path: &Path) -> bool {
+    let Some(relative) = source_relative(path, root) else {
+        return false;
+    };
+    let mut ancestor = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            return false;
+        }
+        ancestor.push(component);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            _ => return true,
+        }
+    }
+    false
 }
 
 pub(crate) fn epoch_ns(time: std::time::SystemTime) -> Option<i64> {
@@ -2909,9 +2954,9 @@ impl IngestCache {
         }
     }
 
-    /// Before ingest mutates this decoded base, census what it holds of each per-file agent a
-    /// failed preflight scope may compare with the published generation; of every per-file agent
-    /// with `every_agent`, for read failures this pass has yet to meet.
+    /// Before ingest mutates this decoded base, census what it holds outside failed preflight scopes
+    /// of each per-file agent such a scope may compare with the published generation (with
+    /// `every_agent`, of every per-file agent): rows a failed scope loses are no change it saw.
     pub fn census_base_rows<'a>(
         &mut self,
         preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
@@ -2920,14 +2965,27 @@ impl IngestCache {
         if !self.last_good_base {
             return;
         }
-        let agents: HashSet<&str> = preflight_issues
-            .into_iter()
+        let scopes: Vec<(&str, &Path)> = preflight_issues.into_iter().collect();
+        let agents: HashSet<&str> = scopes
+            .iter()
             .filter(|(agent, scope)| self.may_compare_published_rows(agent, scope))
-            .map(|(agent, _)| agent)
+            .map(|(agent, _)| *agent)
             .collect();
         let wanted =
             |agent: &str| agents.contains(agent) || (every_agent && Self::per_file_agent(agent));
-        self.base_rows = HeldRows::census(self.entries.values(), wanted);
+        let outside_failed_scopes = |key: &str| {
+            source_path_from_key(key).is_none_or(|path| {
+                !scopes
+                    .iter()
+                    .any(|(_, scope)| source_path_within(&path, scope))
+            })
+        };
+        let entries = self
+            .entries
+            .iter()
+            .filter(|(key, _)| outside_failed_scopes(key))
+            .map(|(_, entry)| entry);
+        self.base_rows = HeldRows::census(entries, wanted);
     }
 
     fn per_file_agent(agent: &str) -> bool {
@@ -2977,10 +3035,10 @@ impl IngestCache {
         let rows = self.published_rows.get(agent)?.as_ref()?;
         let after = HeldRows::census(self.entries.values(), |owner| owner == agent);
         let held = [after.get(agent), self.base_rows.get(agent)];
-        let holds_turn = |session: &str, turn: u32| {
+        let holds_row = |(session, turn): &(String, u32), row: &crate::cache::PublishedTurn| {
             held.iter()
                 .flatten()
-                .any(|rows| rows.holds_turn(session, turn))
+                .any(|rows| rows.holds_row(session, *turn, row))
         };
         let holds_session = |session: &str| {
             held.iter()
@@ -2988,9 +3046,7 @@ impl IngestCache {
                 .any(|rows| rows.holds_session(session))
         };
         Some(
-            rows.turns
-                .keys()
-                .all(|(session, turn)| holds_turn(session, *turn))
+            rows.turns.iter().all(|(key, row)| holds_row(key, row))
                 && rows
                     .sessions
                     .iter()
@@ -6216,6 +6272,8 @@ mod tests {
                     let row = crate::cache::PublishedTurn {
                         project: "project".into(),
                         model: None,
+                        ts: i64::MIN,
+                        text: 0,
                     };
                     (((*session).to_owned(), 0), row)
                 })
@@ -6259,6 +6317,121 @@ mod tests {
         // A row the base never held is one only the published generation can still serve.
         assert_eq!(
             verdict(true, &["gone", "never-read"]),
+            MaterialVerdict::Drops
+        );
+    }
+
+    #[test]
+    fn a_row_the_base_held_under_a_failed_scope_counts_only_while_this_pass_holds_it() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.codex/sessions/2026/01/03");
+        let under = scope.join("rollout-a.jsonl");
+        let never_read = Path::new("/fixture/.codex/sessions/2026/01/06/rollout-c.jsonl");
+        let mut row = test_message("a prompt only the unreadable rollout holds");
+        row.agent = "codex";
+        row.session = "split".into();
+        // Whether this pass still holds the rollout's entry after ingest.
+        let verdict = |kept: bool| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([under.clone(), never_read.into()]));
+            let key = under.to_string_lossy().into_owned();
+            cache.put_entry(key.clone(), cached_entry(std::slice::from_ref(&row)));
+            let issues = [("codex", scope), ("codex", never_read.parent().unwrap())];
+            cache.census_base_rows(issues, false);
+            if !kept {
+                cache.remove_entry(&key);
+            }
+            let mut once = Some(published_rows(&["split"]));
+            cache.record_published_rows(issues, |_| once.take());
+            cache.published_material_under("codex", never_read.parent().unwrap())
+        };
+
+        assert_eq!(verdict(true), MaterialVerdict::Retained);
+        assert_eq!(verdict(false), MaterialVerdict::Drops);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_absent_only_beneath_directories_proven_real() {
+        use std::path::Path;
+
+        let root = std::env::temp_dir().join(format!(
+            "agrep-absence-unproven-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let day = root.join("2026/01/03");
+        fs::create_dir_all(&day).unwrap();
+        let drive = root.join("drive");
+        fs::create_dir_all(drive.join("05")).unwrap();
+        std::os::unix::fs::symlink(drive.join("05"), root.join("2026/01/05")).unwrap();
+        std::os::unix::fs::symlink(drive.join("gone"), root.join("2026/01/06")).unwrap();
+        fs::write(root.join("2026/01/07"), b"a file where a day directory was").unwrap();
+        let unproven = |relative: &str| super::absence_unproven(&root, &root.join(relative));
+
+        assert!(!unproven("2026/01/03/rollout.jsonl"), "real directories");
+        assert!(!unproven("2026/01/04/rollout.jsonl"), "its directory gone");
+        assert!(unproven("2026/01/05/rollout.jsonl"), "a resolving link");
+        assert!(unproven("2026/01/06/rollout.jsonl"), "a dangling link");
+        assert!(unproven("2026/01/07/rollout.jsonl"), "no directory");
+        assert!(!unproven("rollout.jsonl"), "directly beneath the root");
+        let elsewhere = Path::new("/elsewhere/rollout.jsonl");
+        assert!(!super::absence_unproven(&root, elsewhere));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_published_row_renumbered_by_turn_collision_repair_is_held_by_its_content() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.codex/sessions/2026/01/06");
+        let never_read = scope.join("rollout-c.jsonl");
+        let resumed = Path::new("/fixture/.codex/sessions/2026/01/05/rollout-b.jsonl");
+        let mut row = test_message("a prompt after compaction");
+        row.agent = "codex";
+        row.session = "resumed".into();
+        row.ts = 7;
+        // The published row: the cached turn 0 renumbered to 4, with this timestamp and text.
+        let verdict = |ts: i64, text: &str| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), resumed.into()]));
+            cache.put_entry(
+                resumed.to_string_lossy().into_owned(),
+                cached_entry(std::slice::from_ref(&row)),
+            );
+            let published = crate::cache::PublishedAgentRows {
+                turns: HashMap::from([(
+                    ("resumed".to_owned(), 4),
+                    crate::cache::PublishedTurn {
+                        project: "project".into(),
+                        model: None,
+                        ts,
+                        text: crate::cache::text_digest(text),
+                    },
+                )]),
+                sessions: HashSet::from(["resumed".to_owned()]),
+                event_sessions: HashSet::new(),
+            };
+            let mut once = Some(published);
+            cache.record_published_rows([("codex", scope)], |_| once.take());
+            cache.published_material_under("codex", scope)
+        };
+
+        assert_eq!(
+            verdict(7, "a prompt after compaction"),
+            MaterialVerdict::Retained
+        );
+        assert_eq!(verdict(7, "another prompt"), MaterialVerdict::Drops);
+        assert_eq!(
+            verdict(8, "a prompt after compaction"),
             MaterialVerdict::Drops
         );
     }
@@ -6328,6 +6501,8 @@ mod tests {
                 crate::cache::PublishedTurn {
                     project: project.to_owned(),
                     model: model.map(str::to_owned),
+                    ts: 1,
+                    text: crate::cache::text_digest("a readable task"),
                 },
             )]),
             sessions: HashSet::from(["session".to_owned()]),
@@ -9279,7 +9454,9 @@ where
                 reconciled_files.push(path.clone());
                 listed_paths.insert(path.clone());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !absence_unproven(root, path) => {}
             Err(_) => {
                 reconciled_files.push(path.clone());
                 listed_paths.insert(path.clone());
