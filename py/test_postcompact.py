@@ -1371,6 +1371,7 @@ def _ms(moment: str) -> int:
 TWICE = {
     CODEX_TWICE: {
         "first_ms": _ms("2026-06-12T09:20:00+00:00"),
+        "model": "gpt-5",
         "first": [(0, "user", "Rebuild the heron shards from the archive.")],
         "second": [
             (1, "agent", "All five heron shards are rebuilt; the kestrel checksum still differs."),
@@ -1379,6 +1380,7 @@ TWICE = {
     },
     CLAUDE_TWICE: {
         "first_ms": _ms("2026-06-12T09:10:01+00:00"),
+        "model": "claude-sonnet-4",
         "first": [(0, "user", "Port the heron importer to the async client.")],
         "second": [
             (1, "agent",
@@ -1387,15 +1389,21 @@ TWICE = {
         ],
     },
 }
+# codex, claude and pi chats that compact, reply, then compact again with no prompt between.
+REPLY_ONLY = (
+    "7e7e7e7e-0612-4000-8000-000000000614", "7f7f7f7f-0612-4000-8000-000000000615",
+    "7a7a7a7a-0612-4000-8000-000000000616",
+)
 NEVER_REPLAYED = (
     "Summary:", "continued from a previous conversation",
     "Shard four was rebuilt twice", "Both blocking kestrel retries are removed",
+    "refreshed after the second compaction",
 )
 
 
 class ReplyBetweenTwoCompactions(_IngestSandbox, unittest.TestCase):
-    """codex and claude file the reply written after a compaction under that recap's own turn,
-    so the next boundary's window opens at that turn and still leaves the recap text out."""
+    """codex, claude and pi file the reply written after a compaction under that recap's own
+    turn, so the next boundary's window opens at that turn and still leaves the recap text out."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1429,6 +1437,8 @@ class ReplyBetweenTwoCompactions(_IngestSandbox, unittest.TestCase):
                 self.assertEqual(
                     [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
                     case["second"])
+                self.assertEqual(
+                    (selection["model"], selection["model_source"]), (case["model"], "explicit"))
 
     def test_the_first_boundary_still_stops_before_its_own_reply(self) -> None:
         for session, case in TWICE.items():
@@ -1440,6 +1450,20 @@ class ReplyBetweenTwoCompactions(_IngestSandbox, unittest.TestCase):
                 self.assertEqual(
                     [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
                     case["first"])
+
+    def test_a_reply_only_window_never_reports_the_recap_placeholder_model(self) -> None:
+        # that reply row carries the recap's placeholder model, which names no real model
+        for session in REPLY_ONLY:
+            with self.subTest(session=session):
+                packet = self._packet(session)
+                selection = packet["selection"]
+                self.assertEqual(
+                    (selection["boundary_turn"], selection["previous_boundary_turn"],
+                     selection["window_fallbacks"]), (2, 1, 0))
+                self.assertEqual(
+                    [(row["turn"], row["who"], row["text"]) for row in packet["rows"]],
+                    [(1, "agent", "The osprey catalog is reindexed; the plover shard is stale.")])
+                self.assertEqual((selection["model"], selection["model_source"]), ("", ""))
 
 
 if __name__ == "__main__":

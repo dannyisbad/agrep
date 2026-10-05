@@ -1,0 +1,12 @@
+{"timestamp":"2026-06-12T10:00:00.000Z","type":"session_meta","payload":{"id":"7e7e7e7e-0612-4000-8000-000000000614","cwd":"/work/osprey"}}
+{"timestamp":"2026-06-12T10:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5","turn_id":"osprey-turn-a"}}
+{"timestamp":"2026-06-12T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Reindex the osprey catalog."}]}}
+{"timestamp":"2026-06-12T10:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"Reindex the osprey catalog."}}
+{"timestamp":"2026-06-12T10:01:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reindexing the osprey catalog now."}]}}
+{"timestamp":"2026-06-12T10:01:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"osprey-turn-a","last_agent_message":"Reindexing the osprey catalog now."}}
+{"timestamp":"2026-06-12T10:20:00.000Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Summary: the osprey catalog reindex is running."}]}]}}
+{"timestamp":"2026-06-12T10:21:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The osprey catalog is reindexed; the plover shard is stale."}]}}
+{"timestamp":"2026-06-12T10:21:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"osprey-turn-a","last_agent_message":"The osprey catalog is reindexed; the plover shard is stale."}}
+{"timestamp":"2026-06-12T10:40:00.000Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Summary: the plover shard is stale."}]}]}}
+{"timestamp":"2026-06-12T10:41:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The plover shard is refreshed after the second compaction."}]}}
+{"timestamp":"2026-06-12T10:41:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"osprey-turn-a","last_agent_message":"The plover shard is refreshed after the second compaction."}}

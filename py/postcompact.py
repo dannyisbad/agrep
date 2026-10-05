@@ -251,9 +251,11 @@ def read_packet(
                     if row.get("project")), "")
     agent = next((str(row["agent"]) for row in reversed(eligible)
                   if row.get("agent")), "")
-    model = next((str(row["model"]) for row in reversed(eligible)
+    # A reply filed on a recap turn carries the recap's placeholder model, not a real one.
+    attributed = [row for row in eligible if row.get("model_source") != "recap"]
+    model = next((str(row["model"]) for row in reversed(attributed)
                   if row.get("model")), "")
-    model_source = next((str(row["model_source"]) for row in reversed(eligible)
+    model_source = next((str(row["model_source"]) for row in reversed(attributed)
                          if row.get("model_source")), "")
     packet = {
         "kind": "agrep-postcompact",
