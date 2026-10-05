@@ -4152,6 +4152,29 @@ fn stage_token_material(
     }
 }
 
+/// The token databases the published generation may hold material of; None when unknown.
+/// Without a record bound to that generation (a pre-record build published it, or the record
+/// is damaged), its parse cache stands in.
+fn published_token_inventory(
+    data: &Path,
+    prior_generation: bool,
+    signature: Option<&str>,
+    cache: &IngestCache,
+) -> Option<HashSet<(String, String)>> {
+    if !prior_generation {
+        return Some(HashSet::new());
+    }
+    if let Some(recorded) = read_token_material(data, signature) {
+        return Some(recorded);
+    }
+    // Releases since 0.3.0 commit the parse cache before any derived write, and a token entry
+    // with rows leaves it only after a clean census of its database: a decoded cache names every
+    // database the published rows can come from. A cold or discarded cache names nothing.
+    cache
+        .decoded_last_good_base()
+        .then(|| cache.token_namespaces())
+}
+
 const SOURCE_SNAPSHOT_FILE: &str = ".source_snapshot.bin";
 const INGEST_PENDING_FILE: &str = ".ingest_pending.bin";
 const SOURCE_ABSENCE_FILE: &str = ".source_absence_pending";
@@ -5489,11 +5512,8 @@ fn index_cmd_locked(
     } else if !prior_generation {
         pcache.set_published_material(HashSet::new());
     }
-    let published_token_material = if prior_generation {
-        read_token_material(&data, previous_sig.as_deref())
-    } else {
-        Some(HashSet::new())
-    };
+    let published_token_material =
+        published_token_inventory(&data, prior_generation, previous_sig.as_deref(), &pcache);
     pcache.set_published_token_namespaces(published_token_material.clone());
     // A token store the preflight could not fully read is the only kind whose verdicts can turn
     // on what the published generation holds, so only then is that generation read for it.
@@ -6289,6 +6309,85 @@ mod tests {
 
         std::fs::write(data.join(super::TOKEN_MATERIAL_FILE), b"{not json").unwrap();
         assert_eq!(read_token_material(&data, Some("4:h")), None);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn unbound_record_is_seeded_only_from_a_decoded_parse_cache() {
+        use super::{published_token_inventory, write_token_material, TOKEN_MATERIAL_FILE};
+        use agrep_core::ingest_cache::IngestCache;
+
+        let data = std::env::temp_dir().join(format!(
+            "agrep-token-inventory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let database = data.join("crush.db");
+        let namespace = agrep_core::ingest::registry::token_prefix("crush", &database).unwrap();
+        let cache_path = data.join(".ingest_cache.bin");
+        let mut seed = IngestCache::cold();
+        seed.collect_token_cached(
+            "crush",
+            Some(vec![(format!("{namespace}session"), "v1".into())]),
+            |session| {
+                let message = agrep_core::model::RawMessage {
+                    agent: "crush",
+                    project: "crush".into(),
+                    session: session.into(),
+                    ts: 1,
+                    turn: 0,
+                    text: "cached conversation".into(),
+                    model: String::new(),
+                    reply: String::new(),
+                    reply_chars: 0,
+                    side: false,
+                    parent: String::new(),
+                };
+                (vec![message.freeze()], Vec::new())
+            },
+        );
+        seed.save(&cache_path).unwrap();
+        let decoded = IngestCache::load(&cache_path);
+        assert!(decoded.decoded_last_good_base());
+        let cached = HashSet::from([("crush".to_string(), namespace)]);
+
+        assert_eq!(
+            published_token_inventory(&data, false, None, &IngestCache::cold()),
+            Some(HashSet::new())
+        );
+        assert_eq!(
+            published_token_inventory(&data, true, Some("3:g"), &decoded),
+            Some(cached.clone())
+        );
+        // A cache that decoded nothing proves nothing.
+        let empty = IngestCache::load(&data.join("missing-cache.bin"));
+        assert!(!empty.decoded_last_good_base());
+        for undecoded in [&empty, &IngestCache::cold()] {
+            let inventory = published_token_inventory(&data, true, Some("3:g"), undecoded);
+            assert_eq!(inventory, None);
+        }
+        // A bound record wins; a stale or damaged one is replaced by the decoded cache alone.
+        let recorded = HashSet::from([("cursor".to_string(), String::new())]);
+        write_token_material(&data, Some("3:g"), &recorded).unwrap();
+        assert_eq!(
+            published_token_inventory(&data, true, Some("3:g"), &decoded),
+            Some(recorded)
+        );
+        std::fs::write(data.join(TOKEN_MATERIAL_FILE), b"{not json").unwrap();
+        let damaged = published_token_inventory(&data, true, Some("3:g"), &decoded);
+        assert_eq!(damaged, Some(cached.clone()));
+        write_token_material(&data, Some("3:g"), &HashSet::new()).unwrap();
+        let stale = published_token_inventory(&data, true, Some("4:h"), &decoded);
+        assert_eq!(stale, Some(cached));
+        let stale_unknown = published_token_inventory(&data, true, Some("4:h"), &empty);
+        assert_eq!(stale_unknown, None);
+        std::fs::write(data.join(TOKEN_MATERIAL_FILE), b"{not json").unwrap();
+        let damaged_unknown = published_token_inventory(&data, true, Some("3:g"), &empty);
+        assert_eq!(damaged_unknown, None);
         let _ = std::fs::remove_dir_all(data);
     }
 

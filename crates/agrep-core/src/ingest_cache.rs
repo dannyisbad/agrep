@@ -2578,6 +2578,11 @@ impl IngestCache {
         self.discarded_base
     }
 
+    /// Whether this cache decoded an on-disk generation rather than starting empty.
+    pub fn decoded_last_good_base(&self) -> bool {
+        self.last_good_base
+    }
+
     /// Supply the second stable source observation (a byte-identical preflight pair) that
     /// lets a discarded base's stable-deletion grant bind. Without it the grant is inert.
     pub fn confirm_discarded_base_observation(&mut self) {
@@ -2962,11 +2967,10 @@ impl IngestCache {
             );
             return (merged, false);
         }
+        // The reparse flag marks a format upgrade, not material: a flagged entry with no rows or
+        // events holds nothing a publication could drop, so it guards nothing.
         let prior_material = self.entries.get(&key).map(|entry| {
-            !entry.msgs.is_empty()
-                || !entry.event_keys.is_empty()
-                || entry.legacy_had_events
-                || entry.legacy_needs_reparse
+            !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
         });
         // A complete preflight with no files/tokens proves clean ENOENT absence.
         // Permission/share failures remain incomplete; legacy expectations without prior rows
@@ -3705,6 +3709,70 @@ mod tests {
         );
         cache.set_current_source_agents(HashSet::new());
         assert!(!cache.adapter_required("kimi"));
+    }
+
+    /// A reparse-compatible upgrade flags every cached entry for reparse. An Always store's empty
+    /// snapshot entry still holds nothing, so its absent store publishes; flagged material guards.
+    #[test]
+    fn upgraded_empty_always_snapshot_does_not_guard_an_absent_store() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-upgraded-empty-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let store = root.join("store");
+        let cache_path = root.join("cache.bin");
+        let mut published = IngestCache::cold();
+        for (agent, fresh) in [
+            ("kimi", Vec::new()),
+            ("cline", vec![test_message("cline row")]),
+        ] {
+            published.guard_never_empty(agent, &store, fresh, &[], ReadOutcome::Complete);
+        }
+        published.guard_never_empty(
+            "antigravity",
+            &store,
+            Vec::new(),
+            &[test_event("brain", "call")],
+            ReadOutcome::Complete,
+        );
+        let reparse_compatible = CACHE_VERSION - 1;
+        assert!(super::reparse_compatible_cache_version(reparse_compatible));
+        fs::write(
+            &cache_path,
+            bincode::serialize(&super::CacheFileRef {
+                version: reparse_compatible,
+                entries: &published.entries,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut empty = IngestCache::load(&cache_path);
+        let flagged = empty
+            .entries
+            .values()
+            .all(|entry| entry.legacy_needs_reparse);
+        assert!(flagged);
+        let (rows, guarded) =
+            empty.guard_never_empty("kimi", &store, Vec::new(), &[], ReadOutcome::Complete);
+        assert!(rows.is_empty());
+        assert!(!guarded, "an empty upgraded snapshot guarded");
+        assert!(empty.source_snapshot_safe());
+        assert!(empty.output_complete());
+
+        for agent in ["cline", "antigravity"] {
+            let mut material = IngestCache::load(&cache_path);
+            let (_, guarded) =
+                material.guard_never_empty(agent, &store, Vec::new(), &[], ReadOutcome::Complete);
+            assert!(guarded, "{agent}: upgraded material stopped guarding");
+            assert!(!material.source_snapshot_safe());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn source_stamp(path: &std::path::Path) -> crate::ingest::registry::SourceStatStamp {

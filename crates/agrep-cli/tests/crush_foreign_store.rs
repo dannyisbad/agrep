@@ -528,6 +528,77 @@ fn complete_pass_beside_a_foreign_crush_store_keeps_its_rows_and_publishes_churn
     let _ = fs::remove_dir_all(&data);
 }
 
+/// Leaves `data` as a pre-record build would: ownerless, its parse cache the bare v25 payload the
+/// takeover tests forge, and the record `absent`, `stale` (bound to another generation, as after a
+/// downgrade and an upgrade) or `damaged`.
+fn age_data_dir_to_v25(data: &Path, record: &str) {
+    assert!(!data.join(".ingest_cache.bin.journal").exists());
+    let cache = data.join(".ingest_cache.bin");
+    let wrapped = fs::read(&cache).unwrap();
+    assert_eq!(&wrapped[12..20], b"AGRPCB01");
+    assert_eq!(&wrapped[84..88], &0_u32.to_le_bytes());
+    let mut legacy = wrapped[100..].to_vec();
+    legacy[..4].copy_from_slice(&25_u32.to_le_bytes());
+    // The cold pass dispatched every adapter; absent Always stores left empty snapshot entries.
+    assert!(legacy.windows(14).any(|key| key == b"\0snapshot\0kimi"));
+    fs::write(&cache, legacy).unwrap();
+    fs::remove_file(data.join(".derived-owner.json")).unwrap();
+    let record_path = data.join(".token_material.json");
+    match record {
+        "absent" => fs::remove_file(&record_path).unwrap(),
+        "stale" => {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            value["signature"] = serde_json::json!("0:an-earlier-generation");
+            value["namespaces"] = serde_json::json!([]);
+            fs::write(&record_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        "damaged" => fs::write(&record_path, b"{\"version\":").unwrap(),
+        _ => unreachable!("unknown record state {record}"),
+    }
+}
+
+/// Upgrading over a v25 data dir whose generation has no bound record must not hold any pass,
+/// the first included, beside a crush database that never held a conversation or beside
+/// absent stores: the decoded cache names the databases that generation published from.
+#[test]
+fn upgrade_without_a_bound_record_publishes_beside_a_never_populated_foreign_database() {
+    for record in ["absent", "stale", "damaged"] {
+        let home = crush_home();
+        copy_dir(&fixture_home("claude"), &home);
+        let foreign = home.join(".crush").join("crush.db");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        plant_not_sqlite(&foreign);
+        let data = temp_dir("crush-upgrade-v25-data");
+        ingest_into("all", &home, &data, true);
+        assert!(normalize(&data).contains(CRUSH_TEXT));
+        assert!(crush_issue_kinds(&data, &foreign).contains(&"unsupported-file-type".to_string()));
+        age_data_dir_to_v25(&data, record);
+
+        for minute in [1, 2] {
+            append_churn(&claude_transcript(&home), minute);
+            let output = ingest_output("all", &home, &data, false);
+            assert_published(
+                &output,
+                &format!("{record} record, pass {minute} after upgrade"),
+            );
+            let published = normalize(&data);
+            assert!(
+                published.contains(&format!("crush probe churn {minute}")),
+                "{record} record: claude churn was not published after the upgrade"
+            );
+            assert!(
+                published.contains(CRUSH_TEXT),
+                "{record} record: indexed crush rows were dropped"
+            );
+        }
+        assert!(data.join(".token_material.json").exists());
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_crush_store_is_disclosed_and_does_not_block_other_agents() {
