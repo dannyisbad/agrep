@@ -5419,6 +5419,7 @@ fn index_cmd_locked(
     if let Some(published) = published_source.as_deref() {
         pcache.set_published_material(ingest::registry::source_snapshot_published_material(
             published,
+            pending_source.as_deref(),
         ));
         // That inventory lists only what it could read. Name the scopes it could not, so a
         // scope it published as an issue record cannot be mistaken for one it proved empty.
@@ -5430,6 +5431,20 @@ fn index_cmd_locked(
         );
     } else if !prior_generation {
         pcache.set_published_material(HashSet::new());
+    }
+    // A token store the preflight could not fully read is the only kind whose verdicts can turn
+    // on what the published generation holds, so only then is that generation read for it.
+    if prior_generation && derived_valid {
+        let unpublished: HashSet<String> = source_issues
+            .iter()
+            .map(|issue| issue.agent())
+            .filter(|agent| ingest::registry::token_store_agent(agent))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|agent| !cache::published_agent_material(&data, agent))
+            .map(str::to_owned)
+            .collect();
+        pcache.set_unpublished_token_agents(unpublished);
     }
     if let Some(snapshot) = source_before_view.as_ref() {
         pcache.set_current_source_snapshot(snapshot);

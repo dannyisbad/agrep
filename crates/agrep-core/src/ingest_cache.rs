@@ -549,6 +549,8 @@ pub struct IngestCache {
     /// Scopes the published inventory could not enumerate, so it contributed no path for them
     /// whether or not they held material. Absence under such a scope proves nothing.
     published_blind_scopes: HashSet<(String, PathBuf)>,
+    /// Token-store agents the verified published generation holds no row or event of.
+    unpublished_token_agents: HashSet<String>,
     /// This cache decoded a last-good generation, so "no entry under X" is a positive fact
     /// about what was published rather than a missing witness.
     last_good_base: bool,
@@ -2271,6 +2273,7 @@ impl IngestCache {
             provisional_deletions: false,
             published_material: None,
             published_blind_scopes: HashSet::new(),
+            unpublished_token_agents: HashSet::new(),
             last_good_base: false,
             repair_expected_agents: HashSet::new(),
             repair_expected_paths: HashSet::new(),
@@ -2611,6 +2614,12 @@ impl IngestCache {
         self.published_blind_scopes = scopes;
     }
 
+    /// Token-store agents whose verified published generation was read and holds none of their
+    /// rows or events: no database of theirs can lose published material, whatever is listed.
+    pub fn set_unpublished_token_agents(&mut self, agents: HashSet<String>) {
+        self.unpublished_token_agents = agents;
+    }
+
     /// Sessions the last-good rows attribute to `scope`. Read before ingest, this is the
     /// per-scope row census a publication may not silently shrink while `scope` is unreadable.
     pub fn sessions_under(&self, scope: &Path) -> HashSet<String> {
@@ -2638,15 +2647,27 @@ impl IngestCache {
             })
     }
 
-    /// Whether this cache holds conversations of the token store database at `scope`. The
-    /// published inventory carries one snapshot's tokens, and a pass that held its snapshot back
-    /// may still have published rows past it.
+    /// Whether this cache holds conversations with rows or events of the token store database
+    /// at `scope`: a pass that held its snapshot back may still have published them.
     fn holds_token_entries(&self, agent: &str, scope: &Path) -> bool {
         let Some(prefix) = crate::ingest::registry::token_prefix(agent, scope) else {
             return false;
         };
         let prefix = format!("\0tok\0{agent}\0{prefix}");
-        self.entries.keys().any(|key| key.starts_with(&prefix))
+        self.entries.iter().any(|(key, entry)| {
+            key.starts_with(&prefix)
+                && (!entry.msgs.is_empty()
+                    || !entry.event_keys.is_empty()
+                    || entry.legacy_had_events)
+        })
+    }
+
+    /// A token store database with nothing at stake: its agent has nothing published and this
+    /// cache holds none of its conversations, so no publication without it can drop a row.
+    fn unpublished_token_scope(&self, agent: &str, scope: &Path) -> bool {
+        self.unpublished_token_agents.contains(agent)
+            && crate::ingest::registry::token_prefix(agent, scope).is_some()
+            && !self.holds_token_entries(agent, scope)
     }
 
     /// Would publishing without `scope` (an unobservable subtree of `agent`'s store) drop
@@ -2656,6 +2677,10 @@ impl IngestCache {
     /// whose job is proving absence must not be satisfiable by absence of its own input.
     /// An inventory blind to `scope` is likewise unknown unless retained rows still answer.
     pub fn published_material_under(&self, agent: &str, scope: &Path) -> MaterialVerdict {
+        // A read of the published generation itself, not an absent input.
+        if self.unpublished_token_scope(agent, scope) {
+            return MaterialVerdict::Retained;
+        }
         let Some(published) = self.published_material.as_ref() else {
             return MaterialVerdict::Unknown;
         };
@@ -2706,6 +2731,9 @@ impl IngestCache {
 
     /// The published inventory's positive claim that `scope` held no material.
     fn published_proves_empty(&self, agent: &str, scope: &Path) -> bool {
+        if self.unpublished_token_scope(agent, scope) {
+            return true;
+        }
         match self.published_material.as_ref() {
             Some(paths) => {
                 !paths.iter().any(|path| source_path_within(path, scope))
@@ -5267,6 +5295,60 @@ mod tests {
         assert_eq!(
             cache.published_material_under("claude", chats),
             MaterialVerdict::Retained
+        );
+    }
+
+    #[test]
+    fn unpublished_token_agent_relaxes_only_listed_databases_without_cached_rows() {
+        use super::MaterialVerdict;
+        use std::path::{Path, PathBuf};
+
+        let chats = Path::new("/fixture/chats/crush.db");
+        let listed = Path::new("/fixture/listed/crush.db");
+        let transcript = Path::new("/fixture/claude/chat.jsonl");
+        let prefix = crate::ingest::registry::token_prefix("crush", chats).unwrap();
+        let mut cache = IngestCache::cold();
+        // No inventory at all: only the read of the published generation can answer.
+        cache.set_unpublished_token_agents(HashSet::from(["crush".to_string()]));
+        assert_eq!(
+            cache.published_material_under("crush", listed),
+            MaterialVerdict::Retained
+        );
+        cache.set_published_material(HashSet::from([
+            PathBuf::from(listed),
+            PathBuf::from(transcript),
+        ]));
+        cache.set_published_blind_scopes(HashSet::from([("crush".into(), listed.into())]));
+        assert_eq!(
+            cache.published_material_under("crush", listed),
+            MaterialVerdict::Retained
+        );
+        assert!(cache.unreadable_scope_covered("crush", listed));
+        cache.collect_token_cached_keyed_partial(
+            "crush",
+            Some(vec![(
+                format!("{prefix}session"),
+                "session".into(),
+                "v1".into(),
+            )]),
+            &[],
+            false,
+            true,
+            |_, _| (vec![test_message("cached, not yet published")], Vec::new()),
+        );
+        assert_eq!(
+            cache.published_material_under("crush", chats),
+            MaterialVerdict::Drops
+        );
+        // Stat scopes and other token agents keep the listed inventory.
+        cache.set_unpublished_token_agents(HashSet::from(["claude".to_string()]));
+        assert_eq!(
+            cache.published_material_under("claude", transcript),
+            MaterialVerdict::Drops
+        );
+        assert_eq!(
+            cache.published_material_under("crush", listed),
+            MaterialVerdict::Drops
         );
     }
 

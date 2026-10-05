@@ -1891,23 +1891,14 @@ impl SourceSnapshotView {
         (agents, paths)
     }
 
-    /// The publication guard's inventory: the listed paths, except that a token store's database
-    /// counts only while the snapshot carries a token of its conversations.
-    pub fn published_material(&self) -> HashSet<PathBuf> {
-        let mut paths = HashSet::new();
-        for adapter in &self.snapshot.adapters {
-            paths.extend(
-                listed_sources(adapter)
-                    .filter(|source| match token_prefix(&adapter.agent, &source.path) {
-                        Some(prefix) => {
-                            adapter.tokens.iter().any(|(id, _)| id.starts_with(&prefix))
-                        }
-                        None => true,
-                    })
-                    .map(|source| source.path.clone()),
-            );
-        }
-        paths
+    /// The token store databases this snapshot listed.
+    fn listed_token_databases(&self) -> impl Iterator<Item = &Path> + '_ {
+        self.snapshot
+            .adapters
+            .iter()
+            .filter(|adapter| token_store_agent(&adapter.agent))
+            .flat_map(listed_sources)
+            .map(|source| source.path.as_path())
     }
 
     pub(crate) fn coverage(&self) -> SourceCoverage {
@@ -2021,11 +2012,25 @@ pub fn source_snapshot_expectations(bytes: &[u8]) -> (HashSet<String>, HashSet<P
     snapshot.expectations()
 }
 
-/// [`SourceSnapshotView::published_material`] of serialized snapshot bytes.
-pub fn source_snapshot_published_material(bytes: &[u8]) -> HashSet<PathBuf> {
-    source_snapshot_view(bytes)
-        .map(|snapshot| snapshot.published_material())
-        .unwrap_or_default()
+/// The publication guard's inventory: every path the published snapshot listed, plus the token
+/// store databases the pending one did. A pass that held its snapshot back may have published
+/// their conversations, and a token cache entry names no path the guard could find instead.
+pub fn source_snapshot_published_material(
+    published: &[u8],
+    pending: Option<&[u8]>,
+) -> HashSet<PathBuf> {
+    let (_, mut paths) = source_snapshot_expectations(published);
+    if let Some(pending) = pending.and_then(source_snapshot_view) {
+        paths.extend(pending.listed_token_databases().map(Path::to_path_buf));
+    }
+    paths
+}
+
+/// Whether `agent` names a registered `Fingerprint::Token` adapter.
+pub fn token_store_agent(agent: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
 }
 
 /// Exact current preflight coverage consumed by the ingest collectors. Stat paths let the cache
@@ -5102,7 +5107,7 @@ mod tests {
     }
 
     #[test]
-    fn published_material_counts_a_token_database_only_with_its_conversations() {
+    fn published_material_adds_only_the_pending_snapshots_token_databases() {
         let file = |agent: &str, path: &Path| SourceFile {
             agent: agent.into(),
             path: path.to_path_buf(),
@@ -5114,44 +5119,58 @@ mod tests {
             file_identity: None,
             content_hash: None,
         };
-        let adapter = |agent: &str, files: Vec<SourceFile>, tokens| AdapterSource {
+        let adapter = |agent: &str, files: Vec<SourceFile>, issues| AdapterSource {
             agent: agent.into(),
             files,
-            tokens,
-            issues: Vec::new(),
+            tokens: Vec::new(),
+            issues,
             complete: true,
+        };
+        let snapshot = |adapters| {
+            bincode::serialize(&SourceSnapshot {
+                snapshot_version: SOURCE_SNAPSHOT_VERSION,
+                cache_version: crate::ingest_cache::CACHE_VERSION,
+                selection: "all".into(),
+                adapters,
+                complete: true,
+            })
+            .unwrap()
         };
         let transcript = PathBuf::from("/fixture/claude/chat.jsonl");
+        let new_transcript = PathBuf::from("/fixture/claude/new.jsonl");
         let empty_db = PathBuf::from("/fixture/empty/crush.db");
-        let chats_db = PathBuf::from("/fixture/chats/crush.db");
+        let new_db = PathBuf::from("/fixture/new/crush.db");
+        let foreign_db = PathBuf::from("/fixture/foreign/crush.db");
         let cursor_db = PathBuf::from("/fixture/User/globalStorage/state.vscdb");
-        let chats = token_prefix("crush", &chats_db).unwrap();
-        assert!(!token_prefix("crush", &empty_db).unwrap().is_empty());
-        assert_eq!(token_prefix("claude", &transcript), None);
-        let snapshot = SourceSnapshot {
-            snapshot_version: SOURCE_SNAPSHOT_VERSION,
-            cache_version: crate::ingest_cache::CACHE_VERSION,
-            selection: "all".into(),
-            adapters: vec![
-                adapter("claude", vec![file("claude", &transcript)], Vec::new()),
-                adapter(
+        assert!(token_store_agent("crush") && token_store_agent("cursor"));
+        assert!(!token_store_agent("claude"));
+        let published = snapshot(vec![
+            adapter("claude", vec![file("claude", &transcript)], Vec::new()),
+            adapter("crush", vec![file("crush", &empty_db)], Vec::new()),
+        ]);
+        let pending = snapshot(vec![
+            adapter("claude", vec![file("claude", &new_transcript)], Vec::new()),
+            adapter(
+                "crush",
+                vec![file("crush", &new_db), file("crush", &foreign_db)],
+                vec![SourceIssue::new(
                     "crush",
-                    vec![file("crush", &empty_db), file("crush", &chats_db)],
-                    vec![(format!("{chats}session"), "u:1".into())],
-                ),
-                adapter("cursor", vec![file("cursor", &cursor_db)], Vec::new()),
-            ],
-            complete: true,
-        };
-        let encoded = bincode::serialize(&snapshot).unwrap();
+                    &foreign_db,
+                    "unsupported-file-type",
+                    "not a crush database",
+                )],
+            ),
+            adapter("cursor", vec![file("cursor", &cursor_db)], Vec::new()),
+        ]);
         assert_eq!(
-            source_snapshot_published_material(&encoded),
-            HashSet::from([transcript.clone(), chats_db.clone()])
+            source_snapshot_published_material(&published, None),
+            HashSet::from([transcript.clone(), empty_db.clone()])
         );
-        // Repair expectations still name every listed file.
+        // Stat paths keep their published-only inventory; a database the census could not
+        // read proves no conversation either way.
         assert_eq!(
-            source_snapshot_expectations(&encoded).1,
-            HashSet::from([transcript, empty_db, chats_db, cursor_db])
+            source_snapshot_published_material(&published, Some(&pending)),
+            HashSet::from([transcript, empty_db, new_db, cursor_db])
         );
     }
 }

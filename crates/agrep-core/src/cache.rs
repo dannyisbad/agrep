@@ -4023,6 +4023,74 @@ pub fn event_fname(agent: &str, session: &str) -> String {
     )
 }
 
+/// Whether the published generation in `data` may hold rows or events of `agent`. False only
+/// when its sessions, messages and event stores were all read and none names the agent; the
+/// caller must have verified those files against their generation's derived proof.
+pub fn published_agent_material(data: &Path, agent: &str) -> bool {
+    let unnamed = || -> anyhow::Result<bool> {
+        // Compact serde output escapes every quote inside a value, so only the field matches.
+        let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
+        for name in ["sessions.jsonl", "messages.jsonl"] {
+            if file_contains(&data.join(name), needle.as_bytes())? {
+                return Ok(false);
+            }
+        }
+        let events = data.join("events");
+        // Every event name starts with the agent's readable name and '-'; '.' sorts next.
+        let readable = readable_name(agent, 20);
+        let prefix = format!("{readable}-");
+        if let Some(connection) = open_existing_event_store(&events)? {
+            let named: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM event_sessions WHERE name >= ?1 AND name < ?2)",
+                params![prefix, format!("{readable}.")],
+                |row| row.get(0),
+            )?;
+            if named {
+                return Ok(false);
+            }
+        }
+        let entries = match fs::read_dir(&events) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            if name.to_str().is_none_or(|name| name.starts_with(&prefix)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    !unnamed().unwrap_or(false)
+}
+
+/// Whether the regular file at `path` contains `needle`, read in bounded chunks.
+fn file_contains(path: &Path, needle: &[u8]) -> anyhow::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    let finder = memchr::memmem::Finder::new(needle);
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0_u8; 1 << 20];
+    let mut carried = 0;
+    loop {
+        let read = file.read(&mut buffer[carried..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let filled = carried + read;
+        if finder.find(&buffer[..filled]).is_some() {
+            return Ok(true);
+        }
+        carried = needle.len().saturating_sub(1).min(filled);
+        buffer.copy_within(filled - carried..filled, 0);
+    }
+}
+
 /// Aggregate per-agent call/fail counts, tool mix, and subagent totals while events are
 /// already in memory at index time.
 pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {

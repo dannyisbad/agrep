@@ -350,13 +350,7 @@ fn index_empty_store_until_published(home: &Path, data: &Path, agent: &str, db: 
 fn crush_store_published_without_conversations_then_foreign_does_not_block_other_agents() {
     let home = claude_home("crush-empty-then-foreign-home");
     let db = crush_db(&home);
-    fs::create_dir_all(db.parent().unwrap()).unwrap();
-    plant_crush_seed(&db);
-    let connection = rusqlite::Connection::open(&db).unwrap();
-    connection
-        .execute_batch("DELETE FROM messages; DELETE FROM sessions;")
-        .unwrap();
-    connection.close().unwrap();
+    plant_empty_crush(&db);
     let data = temp_dir("crush-empty-then-foreign-data");
     index_empty_store_until_published(&home, &data, "crush", &db);
     assert!(!has_crush_rows(&data));
@@ -443,15 +437,10 @@ fn unreadable_cursor_store_retains_indexed_conversations_and_refuses_without_cac
         );
     }
 
-    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
-    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+    remove_parse_cache(&data);
     append_churn(&claude_transcript(&home), 3);
     let lost = ingest_output("all", &home, &data, false);
-    assert!(
-        !lost.status.success(),
-        "published past rows no cache could serve"
-    );
-    assert!(String::from_utf8_lossy(&lost.stderr).contains("retained the old generation"));
+    assert_refused(&lost, "unreadable cursor store after a lost cache");
     assert!(
         normalize(&data).contains(CURSOR_TEXT),
         "refusal did not retain cursor rows"
@@ -487,15 +476,10 @@ fn foreign_crush_store_retains_previously_indexed_crush_rows() {
         assert!(crush_issue_kinds(&data, &db).contains(&"unsupported-file-type".to_string()));
     }
 
-    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
-    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+    remove_parse_cache(&data);
     append_churn(&claude_transcript(&home), 3);
     let lost = ingest_output("all", &home, &data, false);
-    assert!(
-        !lost.status.success(),
-        "published past rows no cache could serve"
-    );
-    assert!(String::from_utf8_lossy(&lost.stderr).contains("retained the old generation"));
+    assert_refused(&lost, "foreign crush store after a lost cache");
     assert!(
         normalize(&data).contains(CRUSH_TEXT),
         "refusal did not retain crush rows"
@@ -533,6 +517,252 @@ fn unreadable_crush_store_is_disclosed_and_does_not_block_other_agents() {
     ingest_into("all", &home, &data, false);
     assert!(normalize(&data).contains(CRUSH_TEXT));
     assert!(crush_issue_kinds(&data, &db).is_empty());
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+fn plant_empty_crush(db: &Path) {
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    plant_crush_seed(db);
+    let connection = rusqlite::Connection::open(db).unwrap();
+    connection
+        .execute_batch("DELETE FROM messages; DELETE FROM sessions;")
+        .unwrap();
+    connection.close().unwrap();
+}
+
+#[cfg(unix)]
+fn add_crush_conversation(db: &Path, session: &str, text: &str) {
+    let parts = serde_json::json!([{"type": "text", "data": {"text": text}}]);
+    let connection = rusqlite::Connection::open(db).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions VALUES (?1, NULL, 'held', 1767349000000, 1767349000000)",
+            [session],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO messages VALUES (?1, ?2, 'user', ?3, 'gpt-5.5', 1767349000000, \
+             1767349000000)",
+            [
+                format!("{session}-m1"),
+                session.to_string(),
+                parts.to_string(),
+            ],
+        )
+        .unwrap();
+    connection.close().unwrap();
+}
+
+#[cfg(unix)]
+fn crush_rows(data: &Path) -> usize {
+    sorted_lines(&data.join("messages.jsonl"))
+        .iter()
+        .filter(|line| line.contains("\"agent\":\"crush\""))
+        .count()
+}
+
+fn remove_parse_cache(data: &Path) {
+    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+}
+
+/// Makes `path` unreadable; false when this runner ignores mode bits, so there is no denial.
+#[cfg(unix)]
+fn deny(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(path).is_err() {
+        return true;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    false
+}
+
+#[cfg(unix)]
+fn allow(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn assert_refused(output: &std::process::Output, context: &str) {
+    assert!(
+        !output.status.success(),
+        "{context}: published past rows no cache could serve"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("retained the old generation"),
+        "{context}: unexpected failure:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A sibling database failing the census leaves its snapshot with no conversation tokens at all,
+/// which must not read as the healthy database never having published its rows.
+#[cfg(unix)]
+#[test]
+fn sibling_census_failure_cannot_unpublish_another_databases_rows() {
+    let home = crush_home();
+    let indexed = crush_db(&home);
+    let sibling = home.join(".crush").join("crush.db");
+    plant_empty_crush(&sibling);
+    let data = temp_dir("crush-sibling-census-data");
+    ingest_into("all", &home, &data, false);
+    assert_eq!(crush_rows(&data), 3);
+
+    remove_database(&sibling);
+    plant_not_sqlite(&sibling);
+    let foreign = ingest_output("all", &home, &data, false);
+    assert_published(&foreign, "foreign sibling database");
+    assert_eq!(crush_rows(&data), 3);
+
+    remove_database(&sibling);
+    if !deny(&indexed) {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    remove_parse_cache(&data);
+    let lost = ingest_output("all", &home, &data, false);
+    allow(&indexed);
+    assert_refused(
+        &lost,
+        "unreadable database after a sibling's census failure",
+    );
+    assert_eq!(crush_rows(&data), 3, "published crush rows were dropped");
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[cfg(unix)]
+const HELD_TEXT: &str = "crush conversation published past a held snapshot";
+
+/// An empty crush store published beside cursor, then a crush conversation that a pass holding
+/// its snapshot back (a cursor rollback journal) publishes. Returns the home, data and database.
+#[cfg(unix)]
+fn publish_past_held_snapshot(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let home = cursor_home();
+    let crush = crush_db(&home);
+    plant_empty_crush(&crush);
+    let data = temp_dir(tag);
+    index_empty_store_until_published(&home, &data, "crush", &crush);
+
+    add_crush_conversation(&crush, "held-session", HELD_TEXT);
+    let journal = cursor_db(&home).with_file_name("state.vscdb-journal");
+    fs::write(&journal, b"hot").unwrap();
+    let held = ingest_output("all", &home, &data, false);
+    fs::remove_file(&journal).unwrap();
+    assert_published(&held, "cursor journal holds the snapshot back");
+    assert!(normalize(&data).contains(HELD_TEXT));
+    assert!(data.join(".ingest_pending.bin").exists());
+    (home, data, crush)
+}
+
+/// Conversations published by a pass that held its snapshot back stay published material although
+/// the published snapshot still shows their database without one.
+#[cfg(unix)]
+#[test]
+fn conversations_published_past_a_held_snapshot_survive_a_lost_cache() {
+    let (home, data, crush) = publish_past_held_snapshot("crush-held-snapshot-data");
+
+    if !deny(&crush) {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    for pass in [1, 2] {
+        let served = ingest_output("all", &home, &data, false);
+        assert_published(&served, &format!("unreadable crush store, run {pass}"));
+        assert!(normalize(&data).contains(HELD_TEXT));
+    }
+    remove_parse_cache(&data);
+    let lost = ingest_output("all", &home, &data, false);
+    allow(&crush);
+    assert_refused(&lost, "rows published past a held snapshot");
+    assert!(
+        normalize(&data).contains(HELD_TEXT),
+        "published crush rows were dropped"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// One clean read of a database without its conversation is not yet a deletion. A pending
+/// snapshot taken from that read lists none, yet the published rows survive a lost cache.
+#[cfg(unix)]
+#[test]
+fn one_observed_deletion_cannot_unpublish_rows_once_the_cache_is_lost() {
+    let (home, data, crush) = publish_past_held_snapshot("crush-one-deletion-data");
+    let connection = rusqlite::Connection::open(&crush).unwrap();
+    connection
+        .execute_batch("DELETE FROM messages; DELETE FROM sessions;")
+        .unwrap();
+    connection.close().unwrap();
+    let observed = ingest_output("all", &home, &data, false);
+    assert_published(&observed, "one observation of the deletion");
+    assert!(
+        normalize(&data).contains(HELD_TEXT),
+        "one observation deleted rows"
+    );
+
+    if !deny(&crush) {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    remove_parse_cache(&data);
+    let lost = ingest_output("all", &home, &data, false);
+    allow(&crush);
+    assert_refused(&lost, "rows seen deleted once, then a lost cache");
+    assert!(
+        normalize(&data).contains(HELD_TEXT),
+        "published crush rows were dropped"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A database first read by a pass that held its snapshot back is listed only by the pending
+/// snapshot; its published conversations survive it turning unreadable with the cache gone.
+#[cfg(unix)]
+#[test]
+fn new_database_published_past_a_held_snapshot_survives_a_lost_cache() {
+    let home = cursor_home();
+    let crush = crush_db(&home);
+    let data = temp_dir("crush-new-database-data");
+    ingest_into("all", &home, &data, false);
+    assert!(data.join(".source_snapshot.bin").exists());
+
+    fs::create_dir_all(crush.parent().unwrap()).unwrap();
+    plant_crush_seed(&crush);
+    let journal = cursor_db(&home).with_file_name("state.vscdb-journal");
+    fs::write(&journal, b"hot").unwrap();
+    let held = ingest_output("all", &home, &data, false);
+    fs::remove_file(&journal).unwrap();
+    assert_published(&held, "cursor journal holds the snapshot back");
+    assert_eq!(crush_rows(&data), 3);
+    assert!(data.join(".ingest_pending.bin").exists());
+
+    if !deny(&crush) {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    let served = ingest_output("all", &home, &data, false);
+    assert_published(&served, "unreadable new crush store");
+    assert_eq!(crush_rows(&data), 3);
+    remove_parse_cache(&data);
+    let lost = ingest_output("all", &home, &data, false);
+    allow(&crush);
+    assert_refused(&lost, "new database's rows after a lost cache");
+    assert_eq!(crush_rows(&data), 3, "published crush rows were dropped");
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
