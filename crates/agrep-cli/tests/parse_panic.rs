@@ -446,3 +446,94 @@ fn never_indexed_whole_store_that_keeps_panicking_does_not_freeze_other_agents()
         let _ = fs::remove_dir_all(&data);
     }
 }
+
+/// An unchanged pass publishes nothing, so the disclosure of the pass that did stands as it was:
+/// the session still panics, beside any preflight issue the same snapshot records.
+#[test]
+fn an_unchanged_pass_keeps_the_disclosure_of_the_publication_it_skips() {
+    for foreign_crush in [false, true] {
+        let (home, claude, _) = claude_codex_home("parse-panic-unchanged-home");
+        if foreign_crush {
+            let foreign = home.join(".crush").join("crush.db");
+            fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+            fs::write(foreign, b"plain text where crush keeps its database\n").unwrap();
+        }
+        let data = temp_dir("parse-panic-unchanged-data");
+        let stderr = assert_published(&index(&home, &data, Some(&claude)), "panicking pass");
+        assert_disclosed(&data, &stderr, "claude", &claude);
+        let health = fs::read(data.join(".source-health.json")).unwrap();
+
+        let output = index(&home, &data, Some(&claude));
+        assert_published(&output, "unchanged pass");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("unchanged since last index"),
+            "the second pass reparsed"
+        );
+        assert_eq!(
+            fs::read(data.join(".source-health.json")).ok(),
+            Some(health),
+            "foreign crush {foreign_crush}: the unchanged pass rewrote the disclosure"
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
+/// A data dir that never recorded its harness policy (an `--emit-rows` first index before this
+/// build took none) records it with its first publication: a source it keeps failing to read
+/// holds the source snapshot back, yet costs one full corpus refresh, not one on every pass.
+#[test]
+fn the_first_publication_records_the_policy_even_while_it_holds_the_snapshot_back() {
+    let (home, claude, codex) = claude_codex_home("parse-panic-policy-home");
+    let data = temp_dir("parse-panic-policy-data");
+    let first = run(&home, &data, BUILD, None, &["--emit-rows"]);
+    assert!(first.status.success(), "--emit-rows index failed");
+    assert!(!data.join(".source_snapshot.bin").exists());
+    let _ = fs::remove_file(data.join(".harness_prefixes.snapshot"));
+
+    for round in 1..=2 {
+        let churn = format!("codex churn {round}");
+        append_codex_turn(&codex, &churn);
+        append_claude_turn(&claude, &format!("claude churn {round}"));
+        // Its consumer deletes the changed-session delta once it has applied it.
+        let _ = fs::remove_file(data.join(".changed_sessions"));
+        let stderr = assert_published(&index(&home, &data, Some(&claude)), &churn);
+        assert!(
+            messages(&data).contains(&churn),
+            "{churn} was not published"
+        );
+        assert_disclosed(&data, &stderr, "claude", &claude);
+        assert!(!data.join(".source_snapshot.bin").exists());
+        let changed = fs::read_to_string(data.join(".changed_sessions")).unwrap();
+        if round > 1 {
+            assert_ne!(changed, "*\n", "pass {round} marked every session changed");
+        }
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A crash between the renames of a publication leaves its proof stale, never its files
+/// illegible: a never-indexed store that keeps panicking still costs the other agents nothing.
+#[test]
+fn a_torn_publication_still_admits_a_never_indexed_panicking_store() {
+    let (home, session, target, codex) = whole_store_home("parse-panic-torn-home", "kimi", false);
+    let data = temp_dir("parse-panic-torn-data");
+    assert_published(&run(&home, &data, BUILD, Some(&target), &[]), "first index");
+    for (round, extra) in [&[][..], &["--full"][..]].into_iter().enumerate() {
+        // As if killed between renames: messages moved on, the generation proof did not.
+        let published = data.join("messages.jsonl");
+        let body = fs::read(&published).unwrap();
+        fs::remove_file(&published).unwrap();
+        fs::write(&published, body).unwrap();
+        let churn = format!("codex churn {round}");
+        append_codex_turn(&codex, &churn);
+        let output = run(&home, &data, BUILD, Some(&target), extra);
+        let stderr = assert_published(&output, &format!("torn {extra:?} pass"));
+        assert!(messages(&data).contains(&churn), "{churn} froze");
+        assert!(!messages(&data).contains("\"agent\":\"kimi\""));
+        assert_disclosed(&data, &stderr, "kimi", &session);
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}

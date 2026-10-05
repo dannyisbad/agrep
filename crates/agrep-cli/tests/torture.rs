@@ -2581,6 +2581,103 @@ fn event_repair_aborts_on_transient_empty_source_then_retries() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// A crash after a pass committed its cache but before it wrote its events, while a project stays
+/// unreadable, costs no pass: the repair publishes beside it with its rows kept, and the first good
+/// read rebuilds its events although regaining access moved none of the transcript's stamps.
+#[cfg(unix)]
+#[test]
+fn event_repair_after_a_crash_beside_an_unreadable_transcript_publishes_and_heals() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_dir("crash-repair-unreadable-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let transcript = home.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl");
+    let churn = home.join(".claude/projects/proj-beta/22222222-2222-4222-8222-222222222222.jsonl");
+    fs::create_dir_all(churn.parent().unwrap()).unwrap();
+    let churn_line = |minute: u32| {
+        format!(
+            concat!(
+                "{{\"type\":\"user\",\"userType\":\"external\",",
+                "\"sessionId\":\"22222222-2222-4222-8222-222222222222\",",
+                "\"timestamp\":\"2026-01-03T10:{:02}:00.000Z\",\"cwd\":\"/work/beta\",",
+                "\"message\":{{\"role\":\"user\",\"content\":\"repair churn {}\"}}}}\n"
+            ),
+            minute, minute
+        )
+    };
+    fs::write(&churn, churn_line(0)).unwrap();
+    let data = temp_dir("crash-repair-unreadable-data");
+    ingest_into("all", &home, &data, false);
+    let event_name =
+        agrep_core::cache::event_fname("claude", "11111111-1111-4111-8111-111111111111");
+    let event_before = event_row(&data, &event_name).unwrap();
+    let store_before = temp_dir("crash-repair-unreadable-events");
+    copy_dir(&data.join("events"), &store_before);
+
+    let mut body = fs::read_to_string(&transcript).unwrap();
+    body.push_str(concat!(
+        "{\"type\":\"assistant\",\"sessionId\":\"11111111-1111-4111-8111-111111111111\",",
+        "\"timestamp\":\"2026-01-02T13:00:01.000Z\",\"cwd\":\"/work/alpha\",",
+        "\"message\":{\"role\":\"assistant\",\"model\":\"claude-fable-5\",",
+        "\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_crash_5c2d\",",
+        "\"name\":\"Bash\",\"input\":{\"command\":\"echo crash\"}}]}}\n"
+    ));
+    fs::write(&transcript, body).unwrap();
+    ingest_into("all", &home, &data, false);
+    let event_after = event_row(&data, &event_name).unwrap();
+    assert_ne!(event_after, event_before);
+    // The crash: this pass's cache is committed, its events never written, their proofs gone.
+    fs::remove_dir_all(data.join("events")).unwrap();
+    copy_dir(&store_before, &data.join("events"));
+    for proof in fs::read_dir(&data).unwrap().flatten() {
+        if proof
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".events_complete")
+        {
+            fs::remove_file(proof.path()).unwrap();
+        }
+    }
+
+    let project = transcript.parent().unwrap().to_path_buf();
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::metadata(&transcript).is_ok() {
+        // Privileged runners ignore the mode bits; there is no denial to observe.
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+        for dir in [&home, &data, &store_before] {
+            let _ = fs::remove_dir_all(dir);
+        }
+        return;
+    }
+    let mut body = fs::read_to_string(&churn).unwrap();
+    body.push_str(&churn_line(1));
+    fs::write(&churn, body).unwrap();
+    let repaired = ingest_output("all", &home, &data, false);
+    let health = fs::read_to_string(data.join(".source-health.json")).unwrap_or_default();
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        repaired.status.success(),
+        "event repair froze every agent: {}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let published = normalize(&data);
+    assert!(published.contains("repair churn 1"));
+    assert!(published.contains("how do i fix the flaky timer test"));
+    assert!(data.join(".events_complete.claude.json").exists());
+    assert_eq!(event_row(&data, &event_name), Some(event_before));
+    assert!(health.contains("permission-denied"), "{health}");
+
+    ingest_into("all", &home, &data, false);
+    assert_eq!(
+        event_row(&data, &event_name),
+        Some(event_after),
+        "the healed transcript's events were never rebuilt"
+    );
+    for dir in [&home, &data, &store_before] {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 #[cfg(not(windows))]
 #[test]
 fn rejected_message_publication_cannot_commit_event_generation() {
@@ -2594,7 +2691,6 @@ fn rejected_message_publication_cannot_commit_event_generation() {
     let event_name =
         agrep_core::cache::event_fname("claude", "11111111-1111-4111-8111-111111111111");
     let event_before = event_row(&data, &event_name).unwrap();
-    let messages_before = fs::read(data.join("messages.jsonl")).unwrap();
     let marker = "atomic publication event marker 7e41";
     let mut changed_source = original_source.clone();
     changed_source.extend_from_slice(
@@ -2633,8 +2729,14 @@ fn rejected_message_publication_cannot_commit_event_generation() {
     fs::rename(&parked, &messages).unwrap();
     fs::write(&source, b"").unwrap();
     let unavailable = ingest_output("claude", &home, &data, false);
-    assert!(!unavailable.status.success());
-    assert_eq!(fs::read(&messages).unwrap(), messages_before);
+    // The repair serves the rows the rejected pass cached, the source's last good read, and
+    // keeps that session's events as they stand until the source reads again.
+    assert!(
+        unavailable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unavailable.stderr)
+    );
+    assert!(fs::read_to_string(&messages).unwrap().contains(marker));
     assert_eq!(event_row(&data, &event_name).unwrap(), event_before);
 
     fs::write(&source, changed_source).unwrap();
@@ -2683,10 +2785,9 @@ fn has_antigravity_rows(data: &Path) -> bool {
         .contains("\"agent\":\"antigravity\"")
 }
 
-/// An uninstalled store is complete knowledge: ENOENT at the root, observed by two complete
-/// preflights, must converge even while unrelated sources keep changing between runs. The
-/// first repair run retains and records the absence; the second confirms the tombstone,
-/// publishes, and leaves no stale-source hedge for queries to render.
+/// An uninstalled store is complete knowledge: ENOENT at the root, seen by two complete preflights,
+/// converges while unrelated sources churn. The first (repairing) run publishes the churn but keeps
+/// the store's rows; the second confirms the tombstone and leaves no stale-source hedge behind.
 #[test]
 fn vanished_root_converges_despite_unrelated_source_churn() {
     let (home, brain, churn) = churning_two_store_home();
@@ -2699,15 +2800,12 @@ fn vanished_root_converges_despite_unrelated_source_churn() {
     append_claude_churn(&churn, 4);
     let first = ingest_output("all", &home, &data, false);
     assert!(
-        !first.status.success(),
-        "first absence must retain and retry"
-    );
-    assert!(
-        String::from_utf8_lossy(&first.stderr).contains("event repair observed"),
-        "unexpected failure: {}",
+        first.status.success(),
+        "first absence froze the churn: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    assert!(has_antigravity_rows(&data));
+    assert!(normalize(&data).contains("churn probe 4"));
+    assert!(has_antigravity_rows(&data), "first absence must retain");
     assert!(data.join(".source-health.json").exists());
 
     append_claude_churn(&churn, 5);

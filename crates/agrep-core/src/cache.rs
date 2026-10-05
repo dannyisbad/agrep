@@ -3099,6 +3099,13 @@ fn publish_events_complete_trusted(dir: &Path, agents: &[&str]) -> anyhow::Resul
     Ok(true)
 }
 
+/// Whether every payload of `agents` matches the inventory the store's own writes keep. A crash
+/// leaves it so (each write is one transaction); only a full rebuild repairs a store that is not.
+pub fn event_store_consistent(dir: &Path, agents: &[&str]) -> anyhow::Result<bool> {
+    Ok(exact_event_inventories(dir, agents)?
+        .is_some_and(|inventories| inventories.iter().all(Option::is_some)))
+}
+
 /// Reuse a current proof or validate every payload once before establishing authority.
 pub fn publish_events_complete(dir: &Path, agents: &[&str]) -> anyhow::Result<bool> {
     if events_complete(dir, agents)? {

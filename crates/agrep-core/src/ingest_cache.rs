@@ -549,11 +549,17 @@ pub struct IngestCache {
     /// Scopes the published inventory could not enumerate, so it contributed no path for them
     /// whether or not they held material. Absence under such a scope proves nothing.
     published_blind_scopes: HashSet<(String, PathBuf)>,
+    /// The inventory was rebuilt from this cache, which names token databases only: it proves
+    /// no Stat file or whole store empty, since a partial read publishes those uncached.
+    published_tokens_only: bool,
     /// Agents the verified published generation holds no row or event of.
     unpublished_agents: HashSet<String>,
     /// Agents whose snapshot this pass seeded from a read that missed part of their store: not
     /// yet published, it vouches for nothing the read missed.
     seeded_snapshots: HashSet<String>,
+    /// `(agent, root)` of whole-store reads that failed with no last-good snapshot to serve:
+    /// output only once the inventory or a read of the published generation proves it empty.
+    unvouched_reads: HashSet<(String, PathBuf)>,
     /// `(agent, database namespace)` of every token conversation the published generation may
     /// hold rows or events of. `None` is unknown: every token database counts as material.
     published_token_namespaces: Option<HashSet<(String, String)>>,
@@ -2283,8 +2289,10 @@ impl IngestCache {
             provisional_deletions: false,
             published_material: None,
             published_blind_scopes: HashSet::new(),
+            published_tokens_only: false,
             unpublished_agents: HashSet::new(),
             seeded_snapshots: HashSet::new(),
+            unvouched_reads: HashSet::new(),
             published_token_namespaces: None,
             last_good_base: false,
             repair_expected_agents: HashSet::new(),
@@ -2391,15 +2399,22 @@ impl IngestCache {
         writer_build_id: WriterBuildId,
     ) -> (Self, Option<CacheDecodeRefusal>) {
         match decode_cache_for(path, writer_build_id) {
-            Ok((entries, _generation, _backing)) => (
-                IngestCache {
-                    force_reparse: true,
-                    repair_mode: true,
-                    last_good_base: true,
-                    ..Self::base(entries, CacheBacking::Rewrite)
-                },
-                None,
-            ),
+            Ok((mut entries, _generation, _backing)) => {
+                // This pass rebuilds every entry's events; one it cannot re-read keeps the flag,
+                // so its first good read rebuilds them rather than hitting an unchanged stamp.
+                for entry in entries.values_mut() {
+                    entry.legacy_needs_reparse = true;
+                }
+                (
+                    IngestCache {
+                        force_reparse: true,
+                        repair_mode: true,
+                        last_good_base: true,
+                        ..Self::base(entries, CacheBacking::Rewrite)
+                    },
+                    None,
+                )
+            }
             Err(CacheDecodeRefusal::ForeignOwner) => (
                 IngestCache {
                     force_reparse: true,
@@ -2591,15 +2606,11 @@ impl IngestCache {
         self.last_good_base
     }
 
-    /// Source paths of every cached entry holding rows or events.
-    pub fn material_source_paths(&self) -> HashSet<PathBuf> {
-        self.entries
-            .iter()
-            .filter(|(_, entry)| {
-                !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
-            })
-            .filter_map(|(key, _)| source_path_from_key(key))
-            .collect()
+    /// No publication recorded an inventory (a release held every snapshot back): stand in
+    /// with this decoded cache, sound only for the token databases it names.
+    pub fn set_published_material_from_cache(&mut self) {
+        self.published_material = Some(HashSet::new());
+        self.published_tokens_only = true;
     }
 
     /// Supply the second stable source observation (a byte-identical preflight pair) that
@@ -2621,8 +2632,13 @@ impl IngestCache {
         !self.guarded_stale
     }
 
+    /// Checked after admission: a read of the published generation can still vouch for a store.
     pub fn output_complete(&self) -> bool {
         !self.output_incomplete
+            && self
+                .unvouched_reads
+                .iter()
+                .all(|(agent, root)| self.published_proves_empty(agent, root))
     }
 
     pub fn source_read_issues(&self) -> &[SourceReadIssue] {
@@ -2722,6 +2738,11 @@ impl IngestCache {
             })
     }
 
+    /// Whether a cache-derived inventory is silent on `scope`: it vouches for token databases only.
+    fn cache_inventory_silent_on(&self, agent: &str, scope: &Path) -> bool {
+        self.published_tokens_only && crate::ingest::registry::token_prefix(agent, scope).is_none()
+    }
+
     /// Whether this cache holds conversations with rows or events of the token store database
     /// at `scope`: a pass that held its snapshot back may still have published them.
     fn holds_token_entries(&self, agent: &str, scope: &Path) -> bool {
@@ -2811,7 +2832,9 @@ impl IngestCache {
         }
         // No path here, and nothing retained. Only an inventory that could actually read the
         // scope turns that silence into the positive claim "it held nothing".
-        if self.published_inventory_blind_to(agent, scope) && !self.last_good_base {
+        if self.cache_inventory_silent_on(agent, scope)
+            || (self.published_inventory_blind_to(agent, scope) && !self.last_good_base)
+        {
             return MaterialVerdict::Unknown;
         }
         MaterialVerdict::Retained
@@ -2832,6 +2855,15 @@ impl IngestCache {
         self.published_proves_empty(agent, scope)
     }
 
+    /// Did this pass still publish what `scope` held although it could not read it? Covered,
+    /// or (outside whole stores, whose stale per-file entries go unserved) its cached rows,
+    /// which the per-file and token lanes re-emit for every read that fails.
+    pub fn unread_scope_served(&self, agent: &str, scope: &Path) -> bool {
+        self.unreadable_scope_covered(agent, scope)
+            || (!crate::ingest::registry::whole_store_agent(agent)
+                && self.published_material_under(agent, scope) == MaterialVerdict::Retained)
+    }
+
     /// The published inventory's positive claim that `scope` held no material.
     fn published_proves_empty(&self, agent: &str, scope: &Path) -> bool {
         if self.unpublished_scope(agent, scope) {
@@ -2842,6 +2874,7 @@ impl IngestCache {
                 !paths.iter().any(|path| source_path_within(path, scope))
                     && !self.token_scope_material(agent, scope)
                     && !self.published_inventory_blind_to(agent, scope)
+                    && !self.cache_inventory_silent_on(agent, scope)
             }
             None => false,
         }
@@ -2912,6 +2945,40 @@ impl IngestCache {
         }
     }
 
+    /// Seed a whole store's first last-good snapshot from a read that missed part of it. It is
+    /// no witness this pass, and it publishes only where nothing published is at stake.
+    fn seed_snapshot(
+        &mut self,
+        agent: &str,
+        root: &Path,
+        key: String,
+        fresh: &[Message],
+        event_keys: Vec<CEventKey>,
+    ) {
+        self.seeded_snapshots.insert(agent.to_owned());
+        self.unvouched_reads
+            .insert((agent.to_owned(), root.to_path_buf()));
+        let sessions: Vec<String> = fresh
+            .iter()
+            .map(|message| message.session.to_string())
+            .chain(event_keys.iter().map(|event| event.session.clone()))
+            .collect();
+        self.touched.extend(sessions);
+        self.touch_event_keys(&event_keys);
+        self.put_entry(
+            key,
+            Entry {
+                mtime: 0,
+                size: 0,
+                identity: None,
+                msgs: fresh.iter().map(CMsg::from).collect(),
+                event_keys,
+                legacy_had_events: false,
+                legacy_needs_reparse: false,
+            },
+        );
+    }
+
     /// Last-good fallback for full-parse adapters: never let a transient empty
     /// result (store locked/absent/unreadable) become an emitted empty - that cascades to
     /// session-index rewrite -> corpus removal-reconciliation -> event-file unlink. A
@@ -2935,11 +3002,14 @@ impl IngestCache {
             if let Some(entry) = self.entries.get(&key) {
                 return (entry.msgs.iter().map(CMsg::to_msg).collect(), true);
             }
-            if source_outcome == ReadOutcome::Invalid && !self.published_proves_empty(agent, root) {
-                // No snapshot and published material at stake: may not replace the
-                // generation. A provably-empty store has nothing to lose, so it
-                // publishes with disclosure instead of freezing every other agent.
-                self.output_incomplete = true;
+            // No snapshot: may replace the generation only where nothing published is at stake.
+            // What did parse seeds the last-good snapshot later failed reads serve; its events
+            // stay unwritten, like the rest of this lossy read.
+            if fresh.is_empty() {
+                self.unvouched_reads
+                    .insert((agent.to_owned(), root.to_path_buf()));
+            } else {
+                self.seed_snapshot(agent, root, key, &fresh, Vec::new());
             }
             return (fresh, true);
         }
@@ -2950,30 +3020,7 @@ impl IngestCache {
                     self.output_incomplete = true;
                     return (fresh, true);
                 }
-                // Seeded from the sessions that did parse, it cannot vouch for the rest this pass.
-                self.seeded_snapshots.insert(agent.to_owned());
-                if !self.published_proves_empty(agent, root) {
-                    self.output_incomplete = true;
-                }
-                let fresh_sessions: HashSet<String> = fresh
-                    .iter()
-                    .map(|message| message.session.to_string())
-                    .chain(fresh_events.iter().map(|event| event.session.clone()))
-                    .collect();
-                self.touched.extend(fresh_sessions);
-                self.touch_event_keys(&fresh_event_keys);
-                self.put_entry(
-                    key,
-                    Entry {
-                        mtime: 0,
-                        size: 0,
-                        identity: None,
-                        msgs: fresh.iter().map(CMsg::from).collect(),
-                        event_keys: fresh_event_keys,
-                        legacy_had_events: false,
-                        legacy_needs_reparse: false,
-                    },
-                );
+                self.seed_snapshot(agent, root, key, &fresh, fresh_event_keys);
                 return (fresh, false);
             };
             let fresh_sessions: HashSet<String> = fresh
@@ -5628,6 +5675,61 @@ mod tests {
             MaterialVerdict::Retained
         );
         assert!(!cache.unreadable_scope_covered("claude", transcript));
+    }
+
+    #[test]
+    fn an_invalid_read_without_a_snapshot_seeds_one_that_covers_only_later_passes() {
+        use std::path::Path;
+
+        let root = Path::new("/fixture/.cline/data");
+        let task = Path::new("/fixture/.cline/data/tasks/1/api_conversation_history.json");
+        let invalid = |cache: &mut IngestCache, rows: Vec<Message>| {
+            cache.guard_never_empty("cline", root, rows, &[], ReadOutcome::Invalid)
+        };
+
+        let mut first = IngestCache::cold();
+        first.set_published_material(HashSet::new());
+        let (rows, guarded) = invalid(&mut first, vec![test_message("readable task")]);
+        assert_eq!(rows.len(), 1);
+        assert!(guarded);
+        assert!(first.output_complete());
+
+        // Published material at stake: the seed licenses nothing until a read of the
+        // published generation finds none of this agent's rows.
+        let mut at_stake = IngestCache::cold();
+        at_stake.set_published_material(HashSet::from([task.to_path_buf()]));
+        invalid(&mut at_stake, vec![test_message("readable task")]);
+        at_stake.record_source_read_issue("cline", task, "source-invalid", "torn");
+        assert!(!at_stake.output_complete());
+        assert!(!at_stake.unreadable_scope_covered("cline", task));
+        at_stake.admit_unpublished_whole_store_agents(|_| true);
+        assert!(!at_stake.output_complete());
+        at_stake.admit_unpublished_whole_store_agents(|_| false);
+        assert!(at_stake.output_complete());
+
+        let dir = std::env::temp_dir().join(format!(
+            "agrep-seeded-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join(".ingest_cache.bin");
+        first.save(&cache_path).unwrap();
+        let mut next = IngestCache::load(&cache_path);
+        next.set_published_material(HashSet::from([task.to_path_buf()]));
+        let (served, guarded) = invalid(&mut next, Vec::new());
+        assert_eq!(
+            served.len(),
+            1,
+            "the seed did not serve the next failed read"
+        );
+        assert!(guarded);
+        assert!(next.output_complete());
+        assert!(next.unreadable_scope_covered("cline", task));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

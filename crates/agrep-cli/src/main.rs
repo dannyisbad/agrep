@@ -4384,7 +4384,7 @@ fn validated_source_snapshot(
 }
 
 enum GenerationValidation {
-    Valid((Vec<u8>, Vec<u8>)),
+    Valid(Vec<u8>),
     Unreadable(Vec<ingest::registry::SourceIssue>, String),
     Moved,
 }
@@ -4423,16 +4423,16 @@ fn validated_generation_snapshots(
     if policy != policy_before {
         return GenerationValidation::Moved;
     }
-    GenerationValidation::Valid((source, policy))
+    GenerationValidation::Valid(source)
 }
 
 fn generation_for_publication(
     data: &Path,
     agent: &str,
     validation: GenerationValidation,
-) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+) -> anyhow::Result<Option<Vec<u8>>> {
     match validation {
-        GenerationValidation::Valid(snapshots) => Ok(Some(snapshots)),
+        GenerationValidation::Valid(source) => Ok(Some(source)),
         GenerationValidation::Moved => Ok(None),
         GenerationValidation::Unreadable(issues, reason) => {
             publish_source_unreadable(data, agent, &issues, &[], &reason)?;
@@ -4781,16 +4781,11 @@ struct SourcePublishOutcome {
 /// A racy stamp licenses no source-identical shortcut: the parse cache re-verifies that file
 /// next run, so the published generation must not let that run's preflight match it.
 fn withhold_racy_stamps(
-    snapshots: Option<(Vec<u8>, Vec<u8>)>,
+    source: Option<Vec<u8>>,
     racy: &HashSet<PathBuf>,
-) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    snapshots
-        .map(|(source, policy)| {
-            Ok((
-                ingest::registry::withhold_racy_stamps(&source, racy)?,
-                policy,
-            ))
-        })
+) -> anyhow::Result<Option<Vec<u8>>> {
+    source
+        .map(|source| ingest::registry::withhold_racy_stamps(&source, racy))
         .transpose()
 }
 
@@ -4798,14 +4793,17 @@ fn withhold_racy_stamps(
 /// next all-hit shortcut, so it may never precede messages/replies/sessions/events publication.
 /// A failed validation deliberately preserves both the last published snapshot and the pending
 /// preflight: the latter disables the shortcut without throwing away the incremental baseline.
+/// `policy` is the harness policy the generation just published was derived under.
 fn publish_source_snapshot(
-    snapshots: Option<(Vec<u8>, Vec<u8>)>,
+    source: Option<Vec<u8>>,
+    policy: &[u8],
     path: &std::path::Path,
     policy_path: &std::path::Path,
     pending_path: &std::path::Path,
 ) -> anyhow::Result<SourcePublishOutcome> {
     publish_source_snapshot_with(
-        snapshots,
+        source,
+        policy,
         path,
         policy_path,
         pending_path,
@@ -4814,7 +4812,8 @@ fn publish_source_snapshot(
 }
 
 fn publish_source_snapshot_with<F>(
-    snapshots: Option<(Vec<u8>, Vec<u8>)>,
+    source: Option<Vec<u8>>,
+    policy: &[u8],
     path: &Path,
     policy_path: &Path,
     pending_path: &Path,
@@ -4824,13 +4823,15 @@ where
     F: FnOnce(&Path, &Path) -> anyhow::Result<()>,
 {
     let started = Instant::now();
-    let has_snapshots = snapshots.is_some();
+    let has_source = source.is_some();
     let mut outcome = SourcePublishOutcome::default();
-    if let Some((source, policy)) = snapshots {
-        if !regular_file_has_bytes(policy_path, &policy)? {
-            cache::write_bytes_atomic(policy_path, &policy)?;
-            outcome.policy_written = true;
-        }
+    // Recorded whether or not the source snapshot validated: the shortcut still needs that
+    // snapshot, and a policy left unrecorded would mark every later pass a full refresh.
+    if !regular_file_has_bytes(policy_path, policy)? {
+        cache::write_bytes_atomic(policy_path, policy)?;
+        outcome.policy_written = true;
+    }
+    if let Some(source) = source {
         if regular_file_has_bytes(pending_path, &source)? {
             promote(pending_path, path)?;
             outcome.pending_promoted = true;
@@ -4842,14 +4843,12 @@ where
     if std::env::var_os("AGREP_DEBUG").is_some() {
         eprintln!(
             "* [agrep ingest] source policy={} · snapshot={} ({:.1}ms)",
-            if !has_snapshots {
-                "held"
-            } else if outcome.policy_written {
+            if outcome.policy_written {
                 "write"
             } else {
                 "reuse"
             },
-            if !has_snapshots {
+            if !has_source {
                 "held"
             } else if outcome.pending_promoted {
                 "promote"
@@ -5220,17 +5219,6 @@ fn index_cmd_locked(
     let durable_blocked = source_issues
         .iter()
         .any(|issue| durable_source_issue(issue.kind()));
-    if !source_issues.is_empty() || source_preflight_error.is_some() {
-        publish_source_unreadable(
-            &data,
-            agent,
-            &source_issues,
-            &[],
-            source_preflight_error
-                .as_deref()
-                .unwrap_or("a source was unreadable during preflight"),
-        )?;
-    }
     let (previous_sig, previous_sig_mtime) =
         match agrep_core::ingest::registry::read_bounded_regular_file_snapshot(
             &sig_path,
@@ -5308,9 +5296,8 @@ fn index_cmd_locked(
         if pending_residue {
             cache::remove_if_exists(&pending_path)?;
         }
-        if source_issues.is_empty() {
-            clear_source_health(&data, agent)?;
-        }
+        // The published generation stands as the pass that published it disclosed it; no
+        // refused attempt intervened, since one leaves the pending marker that bars this lane.
         lap!("source-check");
         println!(
             "  unchanged since last index ({} messages); skipped ingest + writes ({:.0}ms)",
@@ -5418,6 +5405,19 @@ fn index_cmd_locked(
     {
         cache::write_bytes_atomic(&pending_path, source_before.as_deref().unwrap_or_default())?;
     }
+    // Only now, behind the pending marker: a pass that dies after this disclosure is never
+    // followed by the unchanged-source shortcut, which keeps whatever health it finds.
+    if !source_issues.is_empty() || source_preflight_error.is_some() {
+        publish_source_unreadable(
+            &data,
+            agent,
+            &source_issues,
+            &[],
+            source_preflight_error
+                .as_deref()
+                .unwrap_or("a source was unreadable during preflight"),
+        )?;
+    }
 
     // Event recovery must force parsing without discarding last-good cache rows because event
     // payloads are not serialized. A source-drift retry enables the same absence guards but
@@ -5512,17 +5512,22 @@ fn index_cmd_locked(
     } else if !prior_generation {
         pcache.set_published_material(HashSet::new());
     } else if pcache.decoded_last_good_base() {
-        // Publication withheld every snapshot (0.3.2 held it beside any source issue), yet every
-        // row it published came through this cache first, as `published_token_inventory` relies
-        // on: the decoded cache's sources cover that generation.
-        pcache.set_published_material(pcache.material_source_paths());
+        // Publication withheld every snapshot (0.3.2 held it beside any source issue, and an
+        // `--emit-rows` pass takes none). Every token row it published was cached first, as
+        // `published_token_inventory` relies on; Stat and whole-store rows need not have been.
+        pcache.set_published_material_from_cache();
     }
     let published_token_material =
         published_token_inventory(&data, prior_generation, previous_sig.as_deref(), &pcache);
     pcache.set_published_token_namespaces(published_token_material.clone());
+    // Every derived file on disk was renamed into place by a pass whose guards approved it,
+    // so even a publication a crash tore apart is legible: an agent absent from all of them is
+    // absent from both generations they mix. Missing outputs leave nothing to read it from.
+    let published_legible = prior_generation
+        && (derived_valid || (path.is_file() && data.join("sessions.jsonl").is_file()));
     // A token store the preflight could not fully read is the only kind whose verdicts can turn
     // on what the published generation holds, so only then is that generation read for it.
-    if prior_generation && derived_valid {
+    if published_legible {
         let unpublished: HashSet<String> = source_issues
             .iter()
             .map(|issue| issue.agent())
@@ -5576,7 +5581,7 @@ fn index_cmd_locked(
     lap!("ingest+dedupe");
     // A whole store holds last-good rows only in its snapshot; when no snapshot covers a failed
     // read, the published generation itself is read for its agent, but only then.
-    if prior_generation && derived_valid {
+    if published_legible {
         pcache.admit_unpublished_whole_store_agents(|agent| {
             cache::published_agent_material(&data, agent)
         });
@@ -5653,6 +5658,21 @@ fn index_cmd_locked(
     // A pass complete only because a decoded base awaits reparse serves that base's rows as a
     // warm pass does, so it publishes as one: an unreparsable entry would otherwise pin it.
     let reparse_upgrade = !full && !repair_events && pcache.decoded_last_good_base();
+    // Event repair after a crash may do the same only where the decoded base served every scope
+    // it could not read and the crash left the event store consistent: the unread entries keep
+    // their events and their reparse flag, so their next good read rebuilds those events.
+    let repair_served = repair_events
+        && pcache.decoded_last_good_base()
+        && source_preflight_error.is_none()
+        && source_issues.iter().all(|issue| {
+            durable_source_issue(issue.kind())
+                && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
+                    == agrep_core::ingest_cache::MaterialVerdict::Retained
+        })
+        && pcache
+            .source_read_issues()
+            .iter()
+            .all(|read| pcache.unread_scope_served(read.agent, &read.path));
     // Incremental retries may publish cache-merged healthy sessions while the pending marker
     // forces another attempt; a complete pass has no safe partial fallback. A stably
     // unreadable source is a disclosed fact, not a retryable condition, so it may publish.
@@ -5661,6 +5681,7 @@ fn index_cmd_locked(
         && !reparse_upgrade
         && !source_snapshot_safe
         && !stable_unreadable
+        && !(repair_served && cache::event_store_consistent(&edir, &run_agents)?)
     {
         let detail = source_detail_suffix(
             first_source_issue_label(&source_issues, pcache.source_read_issues())
@@ -5832,6 +5853,7 @@ fn index_cmd_locked(
         let source_published = source_after.is_some();
         publish_source_snapshot(
             withhold_racy_stamps(source_after, &racy_sources)?,
+            &policy_before,
             &source_path,
             &policy_path,
             &pending_path,
@@ -5986,6 +6008,7 @@ fn index_cmd_locked(
     let source_published = source_after.is_some();
     publish_source_snapshot(
         withhold_racy_stamps(source_after, &racy_sources)?,
+        &policy_before,
         &source_path,
         &policy_path,
         &pending_path,
@@ -8188,27 +8211,27 @@ mod tests {
         std::fs::write(&source, b"last-good").unwrap();
         std::fs::write(&pending, b"attempted-preflight").unwrap();
 
+        // A held source snapshot keeps last-good and pending; the policy is still recorded.
         assert_eq!(
-            publish_source_snapshot(None, &source, &policy, &pending).unwrap(),
-            SourcePublishOutcome::default()
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), b"last-good");
-        assert_eq!(std::fs::read(&pending).unwrap(), b"attempted-preflight");
-
-        let outcome = publish_source_snapshot(
-            Some((b"validated".to_vec(), b"policy".to_vec())),
-            &source,
-            &policy,
-            &pending,
-        )
-        .unwrap();
-        assert_eq!(
-            outcome,
+            publish_source_snapshot(None, b"policy", &source, &policy, &pending).unwrap(),
             SourcePublishOutcome {
                 policy_written: true,
                 pending_promoted: false,
             }
         );
+        assert_eq!(std::fs::read(&source).unwrap(), b"last-good");
+        assert_eq!(std::fs::read(&pending).unwrap(), b"attempted-preflight");
+        assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
+
+        let outcome = publish_source_snapshot(
+            Some(b"validated".to_vec()),
+            b"policy",
+            &source,
+            &policy,
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(outcome, SourcePublishOutcome::default());
         assert_eq!(std::fs::read(&source).unwrap(), b"validated");
         assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
         assert_eq!(read_optional_bytes(&pending, 1024).unwrap(), None);
@@ -8235,7 +8258,8 @@ mod tests {
         std::fs::write(&pending, b"validated").unwrap();
 
         let outcome = publish_source_snapshot(
-            Some((b"validated".to_vec(), b"policy".to_vec())),
+            Some(b"validated".to_vec()),
+            b"policy",
             &source,
             &policy,
             &pending,
@@ -8275,7 +8299,8 @@ mod tests {
         let policy_for_check = policy.clone();
 
         let error = publish_source_snapshot_with(
-            Some((b"validated".to_vec(), b"new-policy".to_vec())),
+            Some(b"validated".to_vec()),
+            b"new-policy",
             &source,
             &policy,
             &pending,
