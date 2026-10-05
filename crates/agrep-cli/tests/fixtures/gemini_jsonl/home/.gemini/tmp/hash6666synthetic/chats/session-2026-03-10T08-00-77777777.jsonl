@@ -1,0 +1,7 @@
+{"sessionId":"77777777-7777-4777-8777-777777777777","projectHash":"hash6666synthetic","startTime":"2026-03-10T08:00:00.000Z","lastUpdated":"2026-03-10T08:00:09.000Z"}
+{"id":"m1","timestamp":"2026-03-10T08:00:01.000Z","type":"user","content":[{"text":"add retries to the fetch client"}]}
+{"id":"m2","timestamp":"2026-03-10T08:00:09.000Z","type":"gemini","content":"Added exponential retries.","model":"gemini-2.5-pro","toolCalls":[{"id":"replace-1","name":"replace","args":{"file_path":"src/fetch.ts"},"result":[{"functionResponse":{"id":"replace-1","name":"replace","response":{"output":"edited src/fetch.ts"}}}],"status":"success"}]}
+{"$set":{"sessionId":"77777777-7777-4777-8777-777777777777"}}
+{"$patch":{"updates":[{"id":"m2","content":[{"text":"Added exponential retries."}]}]}}
+{"id":"m3","timestamp":"2026-04-22T10:00:01.000Z","type":"user","content":[{"text":"cap the retry backoff at 30s"}]}
+{"id":"m4","timestamp":"2026-04-22T10:00:05.000Z","type":"gemini","content":"Capped the backoff at 30s.","model":"gemini-3-pro-preview"}

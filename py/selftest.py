@@ -5578,8 +5578,8 @@ def t_archive():
     import tempfile
     from pathlib import Path as P
     import archive
-    if len(archive.ROOTS) != 16:  # a new adapter should land with its archive glob
-        return ("FAIL", f"ROOTS has {len(archive.ROOTS)} entries, pinned 16 - "
+    if len(archive.ROOTS) != 17:  # a new adapter should land with its archive glob
+        return ("FAIL", f"ROOTS has {len(archive.ROOTS)} entries, pinned 17 - "
                         "add the new store glob AND re-pin here")
     sid = "0199aaaa-bbbb-cccc-dddd-eeeeffff0000"
     saved = {k: getattr(archive, k) for k in

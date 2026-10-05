@@ -504,7 +504,7 @@ syntax).
 | Antigravity | `~/.gemini/antigravity-cli/brain/<uuid>/` |
 | Kimi CLI | `~/.kimi/sessions/<workdir-hash>/<uuid>/` |
 | Cline | each editor's `globalStorage/saoudrizwan.claude-dev/tasks/`, plus `~/.cline/data/` |
-| Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.json` |
+| Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.jsonl`, plus legacy `session-*.json` (a `.json` with a `.jsonl` beside it was migrated into it and is skipped) |
 | crush | `~/.local/share/crush/crush.db` (SQLite; also legacy `~/.crush/`), plus each per-project `crush.db` at the `data_dir` its registry (`projects.json`) names - wherever that directory lives |
 | Cursor | `Cursor/User/globalStorage/state.vscdb` under the editor's per-OS app-data dir (SQLite) |
 | pi / oh-my-pi | `~/.pi/agent/sessions/<cwd-slug>/*.jsonl` and `~/.omp/agent/sessions/<cwd-slug>/*.jsonl` |

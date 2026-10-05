@@ -1,0 +1,10 @@
+{
+  "sessionId": "6e6e0002-0216-4000-8000-000000000216",
+  "projectHash": "5f0c2a7e9b1d3f5a7c9e0b2d4f6a8c1e3f5a7b9d0c2e4f6a8b1d3f5a7c9e0b2d",
+  "startTime": "2026-02-16T10:00:00.000Z",
+  "lastUpdated": "2026-02-16T10:00:30.000Z",
+  "messages": [
+    {"id": "p1", "timestamp": "2026-02-16T10:00:00.000Z", "type": "user", "content": [{"text": "rename the wombat flag to --trace"}]},
+    {"id": "p2", "timestamp": "2026-02-16T10:00:30.000Z", "type": "gemini", "content": "Renamed --wombat to --trace.", "model": "gemini-2.5-pro"}
+  ]
+}

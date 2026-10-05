@@ -1,0 +1,20 @@
+=== messages.jsonl (5 lines) ===
+{"id":"gemini:66666666-6666-4666-8666-666666666666:0","agent":"gemini","project":"gemini","session":"66666666-6666-4666-8666-666666666666","ts":1776675601000,"turn":0,"text":"port the env loader to the new config API","content_digest":"7587","who":"user","model":"gemini-3-pro-preview","model_source":"explicit"}
+{"id":"gemini:66666666-6666-4666-8666-666666666666:1","agent":"gemini","project":"gemini","session":"66666666-6666-4666-8666-666666666666","ts":1776675720000,"turn":1,"text":"@docs/config.md update the loader docs","content_digest":"e062","who":"user","model":"gemini-3-pro-preview","model_source":"explicit"}
+{"id":"gemini:77777777-7777-4777-8777-777777777777:0","agent":"gemini","project":"gemini","session":"77777777-7777-4777-8777-777777777777","ts":1773129601000,"turn":0,"text":"add retries to the fetch client","content_digest":"365b","who":"user","model":"gemini-2.5-pro","model_source":"explicit"}
+{"id":"gemini:77777777-7777-4777-8777-777777777777:1","agent":"gemini","project":"gemini","session":"77777777-7777-4777-8777-777777777777","ts":1776852001000,"turn":1,"text":"cap the retry backoff at 30s","content_digest":"6d03","who":"user","model":"gemini-3-pro-preview","model_source":"explicit"}
+{"id":"gemini:88888888-8888-4888-8888-888888888888:0","agent":"gemini","project":"gemini","session":"88888888-8888-4888-8888-888888888888","ts":1771149601000,"turn":0,"text":"rename the verbose flag to --debug","content_digest":"2e8c","who":"user","model":"gemini-2.5-pro","model_source":"explicit"}
+=== replies.jsonl (5 lines) ===
+{"id":"gemini:66666666-6666-4666-8666-666666666666:0","reply":"Ported the env loader.","content_digest":"8d88","reply_chars":22,"reply_truncated":false}
+{"id":"gemini:66666666-6666-4666-8666-666666666666:1","reply":"Updated the loader docs; examples refreshed.","content_digest":"7ed3","reply_chars":44,"reply_truncated":false}
+{"id":"gemini:77777777-7777-4777-8777-777777777777:0","reply":"Added exponential retries.","content_digest":"68c2","reply_chars":26,"reply_truncated":false}
+{"id":"gemini:77777777-7777-4777-8777-777777777777:1","reply":"Capped the backoff at 30s.","content_digest":"d9c6","reply_chars":26,"reply_truncated":false}
+{"id":"gemini:88888888-8888-4888-8888-888888888888:0","reply":"Renamed --verbose to --debug.","content_digest":"4173","reply_chars":29,"reply_truncated":false}
+=== sessions.jsonl (3 lines) ===
+{"session":"66666666-6666-4666-8666-666666666666","agent":"gemini","project":"gemini","n":2,"first_ts":1776675601000,"last_ts":1776675720000,"first_text":"port the env loader to the new config API"}
+{"session":"77777777-7777-4777-8777-777777777777","agent":"gemini","project":"gemini","n":2,"first_ts":1773129601000,"last_ts":1776852001000,"first_text":"add retries to the fetch client"}
+{"session":"88888888-8888-4888-8888-888888888888","agent":"gemini","project":"gemini","n":1,"first_ts":1771149601000,"last_ts":1771149601000,"first_text":"rename the verbose flag to --debug"}
+=== events/gemini-66666666-6666-4666-8666-666666666666--6cd62f35d5473f3edc8f85c3e8b7bdc4061b91d49588430d.jsonl (1 lines) ===
+{"ts":1776675605000,"kind":"tool","name":"write_todos","input":"{\"todos\":[{\"description\":\"Port the env loader\",\"status\":\"in_progress\"},{\"description\":\"Port the yaml loader\",\"status\":\"pending\"}]}","output":"Successfully updated the todo list.","input_chars":130,"output_chars":35,"output_bytes":35,"ok":true,"call_id":"write_todos-1"}
+=== events/gemini-77777777-7777-4777-8777-777777777777--f276d2e18246b2e0a116ac7511d76b9d822b4f3e39f63fc7.jsonl (1 lines) ===
+{"ts":1773129609000,"kind":"tool","name":"replace","input":"src/fetch.ts","output":"edited src/fetch.ts","input_chars":12,"output_chars":19,"output_bytes":19,"ok":true,"call_id":"replace-1"}

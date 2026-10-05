@@ -86,6 +86,7 @@ ROOTS: list[tuple[str, str, bool]] = [
     ("codex", ".codex/sessions/*/*/*/rollout-*.jsonl", False),
     ("codex", ".codex/archived_sessions/rollout-*.jsonl", False),
     ("gemini", ".gemini/tmp/*/chats/*.json", False),
+    ("gemini", ".gemini/tmp/*/chats/*.jsonl", False),
     ("antigravity", ".gemini/antigravity-cli/brain/**/*.json", False),
     ("antigravity", ".gemini/antigravity-cli/brain/**/*.jsonl", False),
     ("kimi", ".kimi/sessions/**/*.jsonl", False),

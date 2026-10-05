@@ -113,6 +113,82 @@ fn golden_gemini() {
     check("gemini", &fixture_home("gemini"));
 }
 
+/// Current Gemini CLI: `session-*.jsonl` records (last write per id, `$rewindTo`, `$patch`),
+/// Part[] prompts, and a resumed legacy `.json` superseded by its `.jsonl` sibling.
+#[test]
+fn golden_gemini_jsonl() {
+    check_fixture("gemini", "gemini_jsonl", &fixture_home("gemini_jsonl"));
+}
+
+fn gemini_turns(data: &Path, session: &str) -> Vec<(u64, String)> {
+    let mut turns: Vec<(u64, String)> = sorted_lines(&data.join("messages.jsonl"))
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["session"] == session)
+        .map(|row| {
+            let text = row["text"].as_str().unwrap().to_string();
+            (row["turn"].as_u64().unwrap(), text)
+        })
+        .collect();
+    turns.sort();
+    turns
+}
+
+/// Resuming migrates `X.json` into `X.jsonl` and leaves the `.json` behind. A warm cache must
+/// retire the `.json` instead of serving both, keep the session id, follow appends to the
+/// `.jsonl`, and serve the `.json` again once the `.jsonl` is gone.
+#[test]
+fn gemini_resume_migration_retires_the_legacy_json_warm() {
+    use std::io::Write;
+    let session = "77777777-7777-4777-8777-777777777777";
+    let home = temp_dir("gemini-migrate-home");
+    copy_dir(&fixture_home("gemini_jsonl"), &home);
+    let jsonl = home
+        .join(".gemini/tmp/hash6666synthetic/chats")
+        .join("session-2026-03-10T08-00-77777777.jsonl");
+    let parked = home.join("parked.jsonl");
+    fs::rename(&jsonl, &parked).unwrap();
+    let data = temp_dir("gemini-migrate-data");
+    let first = (0, "add retries to the fetch client".to_string());
+
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(gemini_turns(&data, session), vec![first.clone()]);
+
+    fs::rename(&parked, &jsonl).unwrap();
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(
+        gemini_turns(&data, session),
+        vec![
+            first.clone(),
+            (1, "cap the retry backoff at 30s".to_string())
+        ]
+    );
+
+    let mut file = fs::OpenOptions::new().append(true).open(&jsonl).unwrap();
+    writeln!(file, r#"{{"$rewindTo":"m3"}}"#).unwrap();
+    writeln!(
+        file,
+        r#"{{"id":"m5","timestamp":"2026-04-22T10:05:00.000Z","type":"user","content":[{{"text":"cap the retry backoff at 10s"}}]}}"#
+    )
+    .unwrap();
+    drop(file);
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(
+        gemini_turns(&data, session),
+        vec![
+            first.clone(),
+            (1, "cap the retry backoff at 10s".to_string())
+        ]
+    );
+
+    fs::remove_file(&jsonl).unwrap();
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(gemini_turns(&data, session), vec![first]);
+    check_intake_identity(&data);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 #[test]
 fn golden_crush() {
     let home = crush_home();

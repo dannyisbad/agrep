@@ -91,6 +91,8 @@ fn mutations(seed: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
 
 struct Target {
     adapter: &'static str,
+    /// fixture directory under tests/fixtures (an adapter can own several store shapes)
+    fixture: &'static str,
     /// fixture-home-relative path of the file the mutations are derived from
     seed: &'static [&'static str],
     /// session-id bytes inside the seed to re-key per variant (empty = identity is
@@ -116,6 +118,7 @@ fn torture_uuid(idx: usize) -> String {
 const TARGETS: &[Target] = &[
     Target {
         adapter: "claude",
+        fixture: "claude",
         seed: &[
             ".claude",
             "projects",
@@ -134,6 +137,7 @@ const TARGETS: &[Target] = &[
     },
     Target {
         adapter: "codex",
+        fixture: "codex",
         seed: &[
             ".codex",
             "sessions",
@@ -163,6 +167,7 @@ const TARGETS: &[Target] = &[
     },
     Target {
         adapter: "kimi",
+        fixture: "kimi",
         seed: &[
             ".kimi",
             "sessions",
@@ -183,6 +188,7 @@ const TARGETS: &[Target] = &[
     },
     Target {
         adapter: "gemini",
+        fixture: "gemini",
         seed: &[
             ".gemini",
             "tmp",
@@ -203,6 +209,7 @@ const TARGETS: &[Target] = &[
     },
     Target {
         adapter: "cline",
+        fixture: "cline",
         seed: &[
             ".cline",
             "data",
@@ -221,6 +228,27 @@ const TARGETS: &[Target] = &[
             fs::write(dir.join("api_conversation_history.json"), bytes).unwrap();
         },
     },
+    Target {
+        adapter: "gemini",
+        fixture: "gemini_jsonl",
+        seed: &[
+            ".gemini",
+            "tmp",
+            "hash6666synthetic",
+            "chats",
+            "session-2026-04-20T09-00-66666666.jsonl",
+        ],
+        id: "66666666-6666-4666-8666-666666666666",
+        plant: |home, idx, bytes| {
+            let p = home
+                .join(".gemini")
+                .join("tmp")
+                .join("hash6666synthetic")
+                .join("chats")
+                .join(format!("session-2026-04-23T09-00-torture{idx}.jsonl"));
+            fs::write(p, bytes).unwrap();
+        },
+    },
 ];
 
 /// The core torture contract, per adapter: plant all five hostile variants beside the
@@ -228,10 +256,10 @@ const TARGETS: &[Target] = &[
 /// every tallied file, (3) every pristine message row still present - hostile input may
 /// cost its own records, never a neighbour's.
 fn torture_adapter(t: &Target) {
-    let seed = fs::read(seed_path(&fixture_home(t.adapter), t.seed)).unwrap();
+    let seed = fs::read(seed_path(&fixture_home(t.fixture), t.seed)).unwrap();
 
     let baseline_data = temp_dir(&format!("torture-base-{}", t.adapter));
-    ingest_into(t.adapter, &fixture_home(t.adapter), &baseline_data, true);
+    ingest_into(t.adapter, &fixture_home(t.fixture), &baseline_data, true);
     let baseline: HashSet<String> = sorted_lines(&baseline_data.join("messages.jsonl"))
         .into_iter()
         .collect();
@@ -242,7 +270,7 @@ fn torture_adapter(t: &Target) {
     );
 
     let home = temp_dir(&format!("torture-home-{}", t.adapter));
-    copy_dir(&fixture_home(t.adapter), &home);
+    copy_dir(&fixture_home(t.fixture), &home);
     for (idx, (_name, bytes)) in mutations(&seed).into_iter().enumerate() {
         let rekeyed = if t.id.is_empty() {
             bytes
@@ -335,6 +363,11 @@ fn torture_gemini() {
 #[test]
 fn torture_cline() {
     torture_adapter(&TARGETS[4]);
+}
+
+#[test]
+fn torture_gemini_jsonl() {
+    torture_adapter(&TARGETS[5]);
 }
 
 /// Truncation sweep: cut the transcript at arbitrary byte offsets and require that the

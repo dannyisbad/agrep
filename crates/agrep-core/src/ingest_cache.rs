@@ -29,7 +29,7 @@ use crate::model::{Event, Message};
 
 /// Increment when entry layout or parse semantics change.
 /// Supported prior generations retain last-good entries until their source reparse completes.
-pub const CACHE_VERSION: u32 = 25;
+pub const CACHE_VERSION: u32 = 26;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -874,7 +874,7 @@ impl std::fmt::Display for CacheDecodeRefusal {
 
 /// These generations share the current entry layout but require current parser semantics.
 fn reparse_compatible_cache_version(version: u32) -> bool {
-    matches!(version, 18..=19 | 21..=24)
+    matches!(version, 18..=19 | 21..=25)
 }
 
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
@@ -4290,6 +4290,47 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn a_retired_source_is_forgotten_like_a_deletion_instead_of_re_added() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-cache-retired-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("session.json");
+        let current = root.join("session.jsonl");
+        fs::write(&legacy, b"legacy").unwrap();
+        let mut cache = IngestCache::cold();
+        collect_cached(&mut cache, &root, std::slice::from_ref(&legacy), |_| {
+            (vec![test_message("legacy row")], Vec::<Event>::new())
+        });
+        // a present cached file the walker did not list is served again, not dropped
+        let omitted = collect_cached(&mut cache, &root, &[], |_| {
+            (vec![test_message("legacy row")], Vec::<Event>::new())
+        });
+        assert_eq!(omitted.messages.len(), 1);
+
+        fs::write(&current, b"current").unwrap();
+        let retired = std::collections::HashSet::from([legacy.clone()]);
+        let pass = super::collect_cached_retiring_for(
+            &mut cache,
+            "ingest",
+            &root,
+            std::slice::from_ref(&current),
+            &retired,
+            |_| (vec![test_message("current row")], Vec::<Event>::new()),
+        );
+        let texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        assert_eq!(texts, vec!["current row"]);
+        assert!(!cache.entries.contains_key(&source_key(&legacy)));
+        assert!(cache.entries.contains_key(&source_key(&current)));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn exact_preflight_stamp_bypasses_restat_but_missing_stamp_does_not() {
@@ -7123,7 +7164,9 @@ mod tests {
     #[test]
     fn takeover_adopts_released_cache_versions_with_last_good_rows() {
         for (version, journaled) in [
-            (24_u32, false),
+            (25_u32, false),
+            (25, true),
+            (24, false),
             (24, true),
             (22, false),
             (22, true),
@@ -7855,6 +7898,41 @@ where
     F: Fn(&Path, i64, u64) -> R + Sync,
     R: IntoParsed,
 {
+    collect_cached_stamped_retiring_for(cache, agent, root, files, &HashSet::new(), parse)
+}
+
+/// [`collect_cached_for`] for a store where a file that still exists can stop being a source
+/// because a newer sibling supersedes it: `retired` paths are forgotten exactly like deletions
+/// instead of being re-added from the cache or the coverage snapshot.
+pub fn collect_cached_retiring_for<F, R>(
+    cache: &mut IngestCache,
+    agent: &'static str,
+    root: &Path,
+    files: &[PathBuf],
+    retired: &HashSet<PathBuf>,
+    parse: F,
+) -> Pass
+where
+    F: Fn(&Path) -> R + Sync,
+    R: IntoParsed,
+{
+    collect_cached_stamped_retiring_for(cache, agent, root, files, retired, |path, _, _| {
+        parse(path)
+    })
+}
+
+fn collect_cached_stamped_retiring_for<F, R>(
+    cache: &mut IngestCache,
+    agent: &'static str,
+    root: &Path,
+    files: &[PathBuf],
+    retired: &HashSet<PathBuf>,
+    parse: F,
+) -> Pass
+where
+    F: Fn(&Path, i64, u64) -> R + Sync,
+    R: IntoParsed,
+{
     // Windows walkers transiently omit entries (`read_dir` errors under live writers/AV), so
     // re-add cached paths: only metadata NotFound confirms deletion; other stat errors guard.
     let mut cached_paths: HashMap<String, PathBuf> = cache
@@ -7870,13 +7948,15 @@ where
         }
     }
     for path in &cache.coverage_expected_paths {
-        if source_path_within(path, root) && !listed_paths.contains(path) {
+        if source_path_within(path, root) && !listed_paths.contains(path) && !retired.contains(path)
+        {
             reconciled_files.push(path.clone());
             listed_paths.insert(path.clone());
         }
     }
     for path in cached_paths.values() {
-        if !source_path_within(path, root) || listed_paths.contains(path) {
+        if !source_path_within(path, root) || listed_paths.contains(path) || retired.contains(path)
+        {
             continue;
         }
         match fs::symlink_metadata(path) {
