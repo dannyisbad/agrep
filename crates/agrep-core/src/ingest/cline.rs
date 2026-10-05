@@ -604,6 +604,13 @@ impl crate::ingest::registry::Adapter for Cline {
             Some("api_conversation_history.json" | "taskHistory.json")
         )
     }
+    fn unit_scoped_read_issue(&self, path: &std::path::Path) -> bool {
+        // A task's own directory, never taskHistory.json, which attributes every task.
+        roots().into_iter().any(|root| {
+            path.strip_prefix(root.join("tasks"))
+                .is_ok_and(|task| task.components().next().is_some())
+        })
+    }
     fn runtime_issue_root(&self) -> std::path::PathBuf {
         std::env::var_os("CLINE_DIR")
             .map(std::path::PathBuf::from)

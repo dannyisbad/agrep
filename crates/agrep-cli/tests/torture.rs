@@ -1390,8 +1390,9 @@ fn live_fenced_foreign_owner_returns_before_lock_sweep_or_publication() {
     fs::write(
         data.join(".indexd.v2.lock"),
         format!(
-            "pid={} start=unknown protocol=2 package=x build={owner_a} group=1 token=aa time=1\n",
-            std::process::id()
+            "pid={} start=fixture protocol=2 package=x build={owner_a} group=1 token={} time=1\n",
+            std::process::id(),
+            "a".repeat(32)
         ),
     )
     .unwrap();
@@ -1456,8 +1457,9 @@ fn live_fenced_foreign_database_owner_fences_ownerless_missing_or_legacy_cache()
         fs::write(
             data.join(".indexd.v2.lock"),
             format!(
-                "pid={} start=unknown protocol=2 package=x build={owner_a} group=1 token=aa time=1\n",
-                std::process::id()
+                "pid={} start=fixture protocol=2 package=x build={owner_a} group=1 token={} time=1\n",
+                std::process::id(),
+                "a".repeat(32)
             ),
         )
         .unwrap();

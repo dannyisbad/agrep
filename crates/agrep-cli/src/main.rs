@@ -219,6 +219,8 @@ const ROOT_STAGING_ARTIFACTS: &[&str] = &[
     ".derived-owner.json",
     ".derived_generation.json",
     ".harness_prefixes.snapshot",
+    ".indexd.lock",
+    ".indexd.v2.lock",
     ".ingest.sig",
     ".ingest_cache.bin",
     ".ingest_cache.bin.journal",
@@ -1063,22 +1065,9 @@ impl AdoptionClaim {
         };
         for name in [".indexd.lock", ".indexd.v2.lock"] {
             let path = data.join(name);
-            match fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    if let Err(error) = file.write_all(&raw).and_then(|()| file.sync_all()) {
-                        let _ = fs::remove_file(&path);
-                        return Err(format!(
-                            "cannot publish derived-adoption claim {}: {error}",
-                            path.display()
-                        ));
-                    }
-                    claim.files.push((path, raw.clone()));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            match publish_claim_record(&path, &raw, nanos) {
+                Ok(true) => claim.files.push((path, raw.clone())),
+                Ok(false) => {}
                 Err(error) => {
                     return Err(format!(
                         "cannot publish derived-adoption claim {}: {error}",
@@ -1093,6 +1082,44 @@ impl AdoptionClaim {
         }
         Ok(claim)
     }
+}
+
+/// Install `raw` at `path` whole or not at all; false when a record is already there. Staged under
+/// a name the staging sweep reaps once its writer dies, it is linked into place, never over a
+/// record. A store without hard links takes it in place, the window a stale-record reclaim covers.
+fn publish_claim_record(path: &Path, raw: &[u8], nanos: u128) -> std::io::Result<bool> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staged = path.with_file_name(format!("{name}.tmp.{}.{nanos}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staged)?;
+    let written = file.write_all(raw).and_then(|()| file.sync_all());
+    drop(file);
+    let linked = written.and_then(|()| fs::hard_link(&staged, path));
+    let _ = fs::remove_file(&staged);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => write_claim_record_in_place(path, raw),
+    }
+}
+
+fn write_claim_record_in_place(path: &Path, raw: &[u8]) -> std::io::Result<bool> {
+    let mut file = match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = file.write_all(raw).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(true)
 }
 
 impl Drop for AdoptionClaim {
@@ -5609,19 +5636,27 @@ fn index_cmd_locked(
     let session_aliases = session_aliases(&pcache, &msgs);
     lap!("ingest+dedupe");
     // A whole store holds last-good rows only in its snapshot; when no snapshot covers a failed
-    // read, the published generation itself is read for its agent, but only then. So is it for
-    // an adapter an older generation's cache-derived inventory is silent on.
+    // read, the published generation itself is read for its agent, but only then. So is it where
+    // an older cache-derived inventory is silent, or a failed per-file read outruns this cache.
     if published_legible {
+        let issue_scopes = || {
+            source_issues
+                .iter()
+                .map(|issue| (issue.agent(), Path::new(issue.path())))
+        };
         pcache.admit_unpublished_whole_store_agents(|agent| {
             cache::published_agent_material(&data, agent)
         });
-        pcache.admit_fully_served_whole_store_agents(|agent| {
+        pcache.admit_fully_served_whole_store_agents(issue_scopes(), |agent| {
             cache::published_agent_rows(&data, agent)
         });
         pcache.admit_unpublished_partial_read_agents(
             source_issues.iter().map(|issue| issue.agent()),
             |agent| cache::published_agent_material(&data, agent),
         );
+        pcache.record_published_rows(issue_scopes(), |agent| {
+            cache::published_agent_rows(&data, agent)
+        });
     }
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
@@ -7618,6 +7653,39 @@ mod tests {
         ));
         assert!(!data.exists());
         assert_eq!(super::adoption_daemon_fence(&data), None);
+    }
+
+    #[test]
+    fn a_claim_record_is_published_whole_beside_no_staging_and_never_over_a_record() {
+        let data = std::env::temp_dir().join(format!(
+            "agrep-claim-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let claim = data.join(".indexd.v2.lock");
+        assert!(super::publish_claim_record(&claim, b"first\n", 1).unwrap());
+        assert_eq!(std::fs::read(&claim).unwrap(), b"first\n");
+        assert!(!super::publish_claim_record(&claim, b"second\n", 2).unwrap());
+        assert_eq!(std::fs::read(&claim).unwrap(), b"first\n");
+        let empty = data.join(".indexd.lock");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!super::publish_claim_record(&empty, b"third\n", 3).unwrap());
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+        let names: Vec<_> = std::fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "staging left behind: {names:?}");
+        assert_eq!(
+            staging_temp_owner(&format!(".indexd.v2.lock.tmp.{}.1", std::process::id())),
+            Some(std::process::id()),
+            "the staging sweep cannot reap a dead writer's staged claim"
+        );
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

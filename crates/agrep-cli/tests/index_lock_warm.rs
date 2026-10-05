@@ -520,3 +520,117 @@ fn plain_and_foreign_corpusdb_holders_cannot_bypass() {
         let _ = fs::remove_dir_all(data);
     }
 }
+
+/// Backdate `path` past the publication grace a freshly written owner record gets.
+fn age_past_publication_grace(path: &Path) {
+    let aged = std::time::SystemTime::now() - Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(aged))
+        .unwrap();
+}
+
+/// Index a churned claude chat in `home` beside a freshness-daemon owner record `body` at `name`,
+/// backdated past its publication grace. Returns the pass and whether it published the churn.
+fn index_beside_a_stale_daemon_record(name: &str, body: &[u8]) -> (std::process::Output, bool) {
+    let home = temp_dir("stale-daemon-record-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("stale-daemon-record-data");
+    ingest_into("all", &home, &data, false);
+    let record = data.join(name);
+    fs::write(&record, body).unwrap();
+    age_past_publication_grace(&record);
+    let chat = home.join(".claude/projects/proj-beta/22222222-2222-4222-8222-222222222222.jsonl");
+    fs::create_dir_all(chat.parent().unwrap()).unwrap();
+    let row = serde_json::json!({
+        "type": "user", "userType": "external",
+        "sessionId": "22222222-2222-4222-8222-222222222222",
+        "timestamp": "2026-01-03T10:01:00.000Z", "cwd": "/work/beta",
+        "message": {"role": "user", "content": "churn past a stale daemon record"},
+    });
+    fs::write(&chat, format!("{row}\n")).unwrap();
+    let output = ingest_output("all", &home, &data, false);
+    let published = normalize(&data).contains("churn past a stale daemon record");
+    if published {
+        assert!(
+            !record.exists(),
+            "{name} survived the pass that reclaimed it"
+        );
+        assert_no_temp_residue(&data);
+    } else {
+        assert_eq!(
+            fs::read(&record).unwrap(),
+            body,
+            "{name} changed under a live owner"
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+    (output, published)
+}
+
+/// A writer killed between creating its derived-adoption claim and writing it leaves the record
+/// empty or torn. Past the publication grace no live owner can stand behind it: the next pass
+/// reclaims it and publishes, rather than serving the snapshot read-only for good.
+#[test]
+fn a_stale_empty_or_torn_daemon_record_no_longer_holds_the_index_read_only() {
+    let torn = format!("state=derived-adoption pid={}", u32::MAX >> 1);
+    for (name, body) in [
+        (".indexd.v2.lock", &b""[..]),
+        (".indexd.lock", &b""[..]),
+        (".indexd.v2.lock", torn.as_bytes()),
+        (".indexd.lock", &b"state=derived-adoption pi"[..]),
+    ] {
+        let (output, published) = index_beside_a_stale_daemon_record(name, body);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name}: {stderr}");
+        assert!(!stderr.contains("read-only"), "{name}: {stderr}");
+        assert!(
+            published,
+            "{name} {body:?}: the churn was not published\n{stderr}"
+        );
+    }
+}
+
+/// The control: a record naming a live process as a complete owner or a derived-adoption claim
+/// is a real foreign lock at any age. The pass still declines to write and says why.
+#[test]
+fn a_daemon_record_naming_a_live_owner_keeps_the_index_read_only_at_any_age() {
+    let pid = std::process::id();
+    let (writer, token) = ("e".repeat(20), "f".repeat(32));
+    for (name, body) in [
+        (
+            ".indexd.v2.lock",
+            format!(
+                "pid={pid} start=fixture protocol=2 package=x build=y writer={writer} \
+                 group=1 token={token} time=1\n"
+            ),
+        ),
+        (
+            ".indexd.v2.lock",
+            format!(
+                "state=derived-adoption pid={pid} start=unknown writer={writer} token={token}\n"
+            ),
+        ),
+        (
+            ".indexd.lock",
+            format!("pid={pid} start=fixture protocol=1 package=0.2.0 build=legacy\n"),
+        ),
+    ] {
+        let (output, published) = index_beside_a_stale_daemon_record(name, body.as_bytes());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name}: {stderr}");
+        assert!(!published, "{name}: a live owner's record was reclaimed");
+        assert!(
+            stderr.contains("freshness-daemon ownership")
+                || stderr.contains("freshness-daemon owner"),
+            "{name}: {stderr}"
+        );
+        assert!(
+            stderr.contains("serving the published snapshot read-only"),
+            "{stderr}"
+        );
+    }
+}

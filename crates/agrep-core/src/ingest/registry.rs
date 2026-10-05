@@ -138,6 +138,12 @@ pub trait Adapter: Sync {
     fn may_read_partially(&self) -> bool {
         false
     }
+    /// Whether a failed read of `path` costs a whole-store read exactly the rows of the units
+    /// beneath it. A path every unit draws on (an index or registry) may change what the rest
+    /// yield, so the default claims nothing.
+    fn unit_scoped_read_issue(&self, _path: &std::path::Path) -> bool {
+        false
+    }
     /// Where this adapter's store lives (dirs or files; absent candidates are fine).
     /// The doctor freshness canary stats these: store activity the parser never turns
     /// into messages is adapter drift, and this is what makes it visible.
@@ -2043,6 +2049,14 @@ pub fn partial_read_agent(agent: &str) -> bool {
     ADAPTERS
         .iter()
         .any(|adapter| adapter.name() == agent && adapter.may_read_partially())
+}
+
+/// Whether `agent`'s adapter scopes a failed read of `path` to the units beneath it; see
+/// [`Adapter::unit_scoped_read_issue`].
+pub fn unit_scoped_read_issue(agent: &str, path: &Path) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.unit_scoped_read_issue(path))
 }
 
 /// Exact current preflight coverage consumed by the ingest collectors. Stat paths let the cache

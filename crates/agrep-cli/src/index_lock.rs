@@ -157,10 +157,17 @@ fn is_derived_adoption_claim(raw: &[u8]) -> bool {
         && token.is_some_and(|value| validate_token(value).is_ok())
 }
 
+/// Reclaim a freshness-daemon owner record no live owner stands behind: a derived-adoption claim
+/// whose holder died or whose pid was reused, or one the daemon runtime reclaims too, as a kill
+/// between creating and writing a record leaves it (see `ownerless_daemon_record`).
 pub(crate) fn reclaim_dead_owner_record(path: &Path) -> io::Result<bool> {
     let observed = snapshot(path)?;
     if !is_derived_adoption_claim(&observed.raw) {
-        return Ok(false);
+        let legacy = path.file_name().is_some_and(|name| name == ".indexd.lock");
+        return Ok(
+            ownerless_daemon_record(&observed, legacy, SystemTime::now())
+                && remove_exact(path, &observed),
+        );
     }
     let Some(owner) = parse_owner(&observed.raw) else {
         return Ok(false);
@@ -173,6 +180,46 @@ pub(crate) fn reclaim_dead_owner_record(path: &Path) -> io::Result<bool> {
     };
     let reused = process_identity_reused(owner.start.as_deref(), actual_start.as_deref());
     Ok((liveness == Liveness::Dead || reused) && remove_exact(path, &observed))
+}
+
+/// Whether the daemon runtime itself would reclaim this record: past the publication grace, one
+/// naming no process (for a legacy record, no valid pid), or an incomplete current-protocol
+/// record whose process is dead or reused. A complete record stays its daemon's to retire.
+fn ownerless_daemon_record(observed: &Snapshot, legacy: bool, now: SystemTime) -> bool {
+    if publication_is_fresh(observed.modified, now) {
+        return false;
+    }
+    let body = String::from_utf8_lossy(&observed.raw);
+    let field = |name: &str| {
+        body.split_ascii_whitespace()
+            .filter_map(|part| part.split_once('='))
+            .find_map(|(key, value)| (key == name && !value.is_empty()).then_some(value))
+    };
+    let pid = field("pid")
+        .filter(|pid| pid.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|pid| pid.parse::<u64>().ok())
+        .filter(|pid| *pid != 0 && *pid <= u64::from(MAX_PID))
+        .map(|pid| pid as u32);
+    if legacy {
+        return pid.is_none();
+    }
+    let start = field("start").filter(|start| !["None", "unknown"].contains(start));
+    let complete = observed.raw.ends_with(b"\n")
+        && ["protocol", "package", "build"]
+            .into_iter()
+            .all(|name| field(name).is_some())
+        && field("token").is_some_and(|token| validate_token(token).is_ok());
+    let (Some(pid), Some(start)) = (pid, start) else {
+        return true;
+    };
+    if complete {
+        return false;
+    }
+    match process_liveness(pid) {
+        Liveness::Dead => true,
+        Liveness::Unknown => false,
+        Liveness::Alive => process_start_identity(pid).is_some_and(|actual| actual != start),
+    }
 }
 
 pub struct IndexLock {
@@ -1603,13 +1650,105 @@ mod tests {
         let dir = temp_dir("dead-daemon-owner");
         let path = dir.join(".indexd.v2.lock");
         let raw = format!(
-            "pid={MAX_PID} start=fixture protocol=2 writer={} token={}\n",
+            "pid={MAX_PID} start=fixture protocol=2 package=x build=y writer={} token={}\n",
             "e".repeat(20),
             "f".repeat(32)
         );
         fs::write(&path, &raw).unwrap();
         assert!(!reclaim_dead_owner_record(&path).unwrap());
         assert_eq!(fs::read(&path).unwrap(), raw.as_bytes());
+        let observed = snapshot(&path).unwrap();
+        let stale = observed.modified + Duration::from_secs(60);
+        assert!(!ownerless_daemon_record(&observed, false, stale));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `(record, reclaimed as legacy .indexd.lock, reclaimed as .indexd.v2.lock)` once stale.
+    fn malformed_daemon_records() -> Vec<(Vec<u8>, bool, bool)> {
+        let start = current_process_start_identity().unwrap();
+        let own = std::process::id();
+        vec![
+            (Vec::new(), true, true),
+            (b"\xff\xfe\n".to_vec(), true, true),
+            (b"pid=not-a-number start=fixture\n".to_vec(), true, true),
+            (b"start=fixture protocol=2\n".to_vec(), true, true),
+            (
+                format!("state=derived-adoption pid={MAX_PID}").into_bytes(),
+                false,
+                true,
+            ),
+            (
+                format!("pid={MAX_PID} start=fixture protocol=2\n").into_bytes(),
+                false,
+                true,
+            ),
+            (
+                format!("pid={own} start=not-this-process\n").into_bytes(),
+                false,
+                true,
+            ),
+            (
+                format!("pid={own} start={start} protocol=2\n").into_bytes(),
+                false,
+                false,
+            ),
+            (
+                format!("pid={own} start=unknown protocol=2\n").into_bytes(),
+                false,
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_malformed_daemon_record_is_reclaimed_only_past_its_grace_and_never_from_a_live_owner() {
+        let dir = temp_dir("malformed-daemon-record");
+        for (raw, legacy_reclaimed, current_reclaimed) in malformed_daemon_records() {
+            let path = dir.join(".indexd.v2.lock");
+            fs::write(&path, &raw).unwrap();
+            let observed = snapshot(&path).unwrap();
+            let record = String::from_utf8_lossy(&raw);
+            for (legacy, reclaimed) in [(true, legacy_reclaimed), (false, current_reclaimed)] {
+                let at = |offset: Duration, ahead: bool| {
+                    let now = if ahead {
+                        observed.modified + offset
+                    } else {
+                        observed.modified - offset
+                    };
+                    ownerless_daemon_record(&observed, legacy, now)
+                };
+                assert!(!at(Duration::from_secs(1), true), "fresh {record:?}");
+                assert_eq!(at(Duration::from_secs(4), true), reclaimed, "{record:?}");
+                assert_eq!(
+                    at(Duration::from_secs(60), false),
+                    reclaimed,
+                    "future {record:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_daemon_record_left_by_a_killed_writer_is_reclaimed_once_stale() {
+        let dir = temp_dir("empty-daemon-record");
+        for name in [".indexd.lock", ".indexd.v2.lock"] {
+            let path = dir.join(name);
+            fs::write(&path, b"").unwrap();
+            assert!(
+                !reclaim_dead_owner_record(&path).unwrap(),
+                "{name} inside its grace"
+            );
+            let aged = SystemTime::now() - Duration::from_secs(10);
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(aged))
+                .unwrap();
+            assert!(reclaim_dead_owner_record(&path).unwrap(), "{name}");
+            assert!(!path.exists());
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -380,7 +380,8 @@ fn release_dir_with_uncached_opencode_rows(
     rusqlite::Connection::open(db)
         .unwrap()
         .execute(
-            "INSERT INTO part VALUES('p9','m2','sess-oc-1',?1,1767348001900)",
+            "INSERT INTO part SELECT 'p9', id, session_id, ?1, 1767348001900 FROM message
+             WHERE id = 'm2'",
             [r#"{"type":"text","text":"torn mid-wri"#],
         )
         .unwrap();
@@ -473,6 +474,175 @@ fn upgrade_keeps_uncached_opencode_rows_behind_a_store_directory_it_cannot_list(
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&data);
     }
+}
+
+const NIGHTLY_TEXT: &str = "convert config to toml";
+
+/// opencode keeps one database per release channel side by side. The release published a partial
+/// read of one uncached beside one it cached; the cached one's rows vouch for nothing of the
+/// other, so a store directory neither can be listed in keeps both until access returns.
+#[cfg(unix)]
+#[test]
+fn upgrade_keeps_uncached_rows_of_one_opencode_channel_beside_a_cached_one() {
+    for snapshot in [Snapshot::Published, Snapshot::Withheld, Snapshot::Pending] {
+        let home = opencode_home();
+        copy_dir(&fixture_home("claude"), &home);
+        let store = home.join(".local/share/opencode");
+        let nightly = store.join("opencode-nightly.db");
+        let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql"))
+            .unwrap()
+            .replace("sess-oc", "nightly-oc")
+            .replace(OPENCODE_TEXT, NIGHTLY_TEXT);
+        rusqlite::Connection::open(&nightly)
+            .unwrap()
+            .execute_batch(&seed)
+            .unwrap();
+        let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &nightly, snapshot);
+        assert!(normalize(&data).contains(NIGHTLY_TEXT));
+        fs::rename(&parked, &nightly).unwrap();
+        let Some(locked) = lock_dir(&store) else {
+            let _ = fs::remove_dir_all(&home);
+            let _ = fs::remove_dir_all(&data);
+            return;
+        };
+        let passes: Vec<_> = (1..=3)
+            .map(|_| {
+                let code = ingest_output("all", &home, &data, false).status.code();
+                let published = normalize(&data);
+                let kept = published.contains(NIGHTLY_TEXT) && published.contains(OPENCODE_TEXT);
+                (kept, code)
+            })
+            .collect();
+        unlock_dir(&locked);
+        for (pass, (kept, code)) in passes.into_iter().enumerate() {
+            assert!(
+                kept,
+                "{snapshot:?} snapshot, pass {} dropped rows the release published (exit {code:?})",
+                pass + 1
+            );
+        }
+        for pass in 1..=2 {
+            assert_published(
+                &ingest_output("all", &home, &data, false),
+                &format!("{snapshot:?} snapshot, healed pass {pass}"),
+            );
+            let published = normalize(&data);
+            assert!(published.contains(NIGHTLY_TEXT) && published.contains(OPENCODE_TEXT));
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
+const EMPTY_CHAT: &str = "44444444-4444-4444-8444-444444444444";
+
+/// A transcript the release read whole and found nothing to publish in leaves a cached entry with
+/// no rows. Its directory turning unlistable costs no row, so every pass after the upgrade
+/// publishes as a warm pass does, rather than holding every agent until access returns.
+#[cfg(unix)]
+#[test]
+fn upgrade_publishes_beside_an_unlistable_directory_whose_files_published_nothing() {
+    for snapshot in [Snapshot::Published, Snapshot::Pending] {
+        let home = temp_dir("release-upgrade-empty-home");
+        copy_dir(&fixture_home("claude"), &home);
+        let project = home.join(".claude/projects/proj-empty");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(format!("{EMPTY_CHAT}.jsonl")),
+            "{\"type\":\"summary\",\"summary\":\"an empty chat\",\"leafUuid\":\"x\"}\n",
+        )
+        .unwrap();
+        let chat = plant_chat(&home);
+        let data = temp_dir("release-upgrade-empty-data");
+        assert_published(&ingest_output("all", &home, &data, false), "first index");
+        age_to_release_0_3_2(&data, snapshot);
+        let Some(locked) = lock_dir(&project) else {
+            let _ = fs::remove_dir_all(&home);
+            let _ = fs::remove_dir_all(&data);
+            return;
+        };
+        let passes: Vec<_> = (1..=3)
+            .map(|minute| {
+                let churn = format!("upgrade churn {minute}");
+                append_line(&chat, minute, &churn);
+                let output = ingest_output("all", &home, &data, false);
+                let published = normalize(&data);
+                (
+                    output,
+                    published.contains(&churn) && published.contains(CLAUDE_TEXT),
+                )
+            })
+            .collect();
+        unlock_dir(&locked);
+        for (minute, (output, published)) in (1..).zip(passes) {
+            let context = format!("{snapshot:?} snapshot, pass {minute} after the upgrade");
+            assert_published(&output, &context);
+            assert!(published, "{context}: churn or published rows missing");
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
+/// A transcript unreadable since the first index has no cache entry and published nothing,
+/// though the inventory lists it. Its directory turning unlistable must not hold the upgrade back:
+/// the published generation shows the cache holds every row it does.
+#[cfg(unix)]
+#[test]
+fn upgrade_publishes_beside_an_unlistable_directory_listing_a_file_never_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_dir("release-upgrade-never-read-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let project = home.join(".claude/projects/proj-mixed");
+    fs::create_dir_all(&project).unwrap();
+    let transcript = |session: &str, text: &str| {
+        let row = serde_json::json!({
+            "type": "user", "userType": "external", "sessionId": session,
+            "timestamp": "2026-01-03T09:00:00.000Z", "cwd": "/work/mixed",
+            "message": {"role": "user", "content": text},
+        });
+        let path = project.join(format!("{session}.jsonl"));
+        fs::write(&path, format!("{row}\n")).unwrap();
+        path
+    };
+    transcript(
+        "55555555-5555-4555-8555-555555555555",
+        "a row beside a chat never read",
+    );
+    let never = transcript(EMPTY_CHAT, "a row no pass could read");
+    fs::set_permissions(&never, fs::Permissions::from_mode(0o000)).unwrap();
+    let chat = plant_chat(&home);
+    let data = temp_dir("release-upgrade-never-read-data");
+    let first = ingest_output("all", &home, &data, false);
+    let release_listed = fs::read(&never).is_err() && data.join(".source_snapshot.bin").exists();
+    let locked = release_listed.then(|| lock_dir(&project)).flatten();
+    let passes: Vec<_> = (1..=3)
+        .filter(|_| locked.is_some())
+        .map(|minute| {
+            if minute == 1 {
+                age_to_release_0_3_2(&data, Snapshot::Published);
+            }
+            let churn = format!("upgrade churn {minute}");
+            append_line(&chat, minute, &churn);
+            let output = ingest_output("all", &home, &data, false);
+            let published = normalize(&data);
+            let kept = published.contains(&churn) && published.contains("a chat never read");
+            (output, kept)
+        })
+        .collect();
+    if let Some(locked) = &locked {
+        unlock_dir(locked);
+    }
+    fs::set_permissions(&never, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_published(&first, "first index");
+    for (minute, (output, kept)) in (1..).zip(passes) {
+        let context = format!("pass {minute} after the upgrade");
+        assert_published(&output, &context);
+        assert!(kept, "{context}: churn or published rows missing");
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
 }
 
 /// An upgrade held back by one scope past others it could publish past names that scope: here
@@ -779,6 +949,57 @@ fn upgrade_keeps_whole_store_rows_release_published_once_their_task_tears() {
     assert_published(&ingest_output("all", &home, &data, false), "healed pass");
     let published = normalize(&data);
     assert!(published.contains(CLINE_SECOND_TEXT) && published.contains("upgrade churn 3"));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// `(id, project)` of every cline row `data` publishes, sorted.
+fn cline_projects(data: &Path) -> Vec<(String, String)> {
+    let mut rows: Vec<_> = fs::read_to_string(data.join("messages.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["agent"] == "cline")
+        .map(|row| {
+            let field = |name: &str| row[name].as_str().unwrap().to_owned();
+            (field("id"), field("project"))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// taskHistory.json attributes every task to its project. Torn, the upgrade's read still parses
+/// each readable task, under a fallback attribution: those rows are not the ones the release
+/// published, so no pass replaces them, and the restored index publishes them unchanged.
+#[test]
+fn upgrade_keeps_whole_store_attribution_once_the_task_index_tears() {
+    let (home, data, chat) = release_dir_beside_a_torn_whole_store_task();
+    let released = cline_projects(&data);
+    assert_eq!(released.len(), 4);
+    assert!(released.iter().all(|(_, project)| project == "delta"));
+    let history = home.join(".cline/data/state/taskHistory.json");
+    let body = fs::read(&history).unwrap();
+    fs::write(&history, &body[..body.len() / 2]).unwrap();
+    append_line(&chat, 1, "upgrade churn 1");
+    ingest_output("all", &home, &data, false);
+    assert_eq!(
+        cline_projects(&data),
+        released,
+        "a torn task index re-attributed rows"
+    );
+
+    fs::write(&history, body).unwrap();
+    for minute in [2, 3] {
+        let churn = format!("upgrade churn {minute}");
+        append_line(&chat, minute, &churn);
+        assert_published(
+            &ingest_output("all", &home, &data, false),
+            &format!("pass {minute} after the upgrade"),
+        );
+        assert!(normalize(&data).contains(&churn));
+        assert_eq!(cline_projects(&data), released, "pass {minute}");
+    }
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
 }

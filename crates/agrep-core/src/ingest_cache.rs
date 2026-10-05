@@ -563,6 +563,9 @@ pub struct IngestCache {
     /// `(agent, root)` of whole-store reads that failed with no last-good snapshot to serve:
     /// output only once the inventory or a read of the published generation proves it empty.
     unvouched_reads: HashSet<(String, PathBuf)>,
+    /// What the published generation holds of each per-file agent whose failed read this cache
+    /// cannot answer for alone; None where that generation could not be read.
+    published_rows: HashMap<String, Option<crate::cache::PublishedAgentRows>>,
     /// `(agent, database namespace)` of every token conversation the published generation may
     /// hold rows or events of. `None` is unknown: every token database counts as material.
     published_token_namespaces: Option<HashSet<(String, String)>>,
@@ -2324,6 +2327,7 @@ impl IngestCache {
             unpublished_agents: HashSet::new(),
             seeded_snapshots: HashSet::new(),
             unvouched_reads: HashSet::new(),
+            published_rows: HashMap::new(),
             published_token_namespaces: None,
             last_good_base: false,
             legacy_generation: false,
@@ -2753,16 +2757,30 @@ impl IngestCache {
     }
 
     /// Whole stores whose failed read seeded a snapshot this pass: a read of the published
-    /// generation, `published`, admits one whose every row and event session the seed serves.
-    /// A failed unit yields neither, so whatever the seed serves of a session came whole.
-    pub fn admit_fully_served_whole_store_agents(
+    /// generation, `published`, admits one whose every row, with its attribution, and every event
+    /// session the seed serves. Only a failed unit yields nothing, so each failure must be one.
+    pub fn admit_fully_served_whole_store_agents<'a>(
         &mut self,
+        preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
         mut published: impl FnMut(&str) -> Option<crate::cache::PublishedAgentRows>,
     ) {
+        let unit_scoped = crate::ingest::registry::unit_scoped_read_issue;
+        let mut agent_wide: HashSet<String> = preflight_issues
+            .into_iter()
+            .filter(|(agent, path)| !unit_scoped(agent, path))
+            .map(|(agent, _)| agent.to_owned())
+            .collect();
+        agent_wide.extend(
+            self.source_read_issues
+                .iter()
+                .filter(|read| !unit_scoped(read.agent, &read.path))
+                .map(|read| read.agent.to_owned()),
+        );
         let seeded: Vec<String> = self
             .seeded_snapshots
             .iter()
             .filter(|agent| !self.unpublished_agents.contains(*agent))
+            .filter(|agent| !agent_wide.contains(*agent))
             .filter(|agent| crate::ingest::registry::whole_store_agent(agent))
             .filter(|agent| !crate::ingest::registry::partial_read_agent(agent))
             .cloned()
@@ -2771,25 +2789,33 @@ impl IngestCache {
             let Some(seed) = self.entries.get(&format!("\x00snapshot\x00{agent}")) else {
                 continue;
             };
-            let turns: HashSet<(&str, u32)> = seed
+            let turns: HashMap<(&str, u32), &CMsg> = seed
                 .msgs
                 .iter()
-                .map(|message| (message.session.as_ref(), message.turn))
+                .map(|message| ((message.session.as_ref(), message.turn), message))
                 .collect();
-            let sessions: HashSet<&str> = turns.iter().map(|(session, _)| *session).collect();
+            let sessions: HashSet<&str> = turns.keys().map(|(session, _)| *session).collect();
             let event_sessions: HashSet<&str> = seed
                 .event_keys
                 .iter()
                 .map(|key| key.session.as_str())
                 .collect();
+            let attributed = |message: &CMsg, row: &crate::cache::PublishedTurn| {
+                *message.project == *row.project
+                    && row
+                        .model
+                        .as_deref()
+                        .is_none_or(|model| *message.model == *model)
+            };
             let served = published(&agent).is_some_and(|rows| {
-                rows.turns
+                rows.turns.iter().all(|((session, turn), row)| {
+                    turns
+                        .get(&(session.as_str(), *turn))
+                        .is_some_and(|message| attributed(message, row))
+                }) && rows
+                    .sessions
                     .iter()
-                    .all(|(session, turn)| turns.contains(&(session.as_str(), *turn)))
-                    && rows
-                        .sessions
-                        .iter()
-                        .all(|session| sessions.contains(session.as_str()))
+                    .all(|session| sessions.contains(session.as_str()))
                     && rows
                         .event_sessions
                         .iter()
@@ -2799,6 +2825,89 @@ impl IngestCache {
                 self.unpublished_agents.insert(agent);
             }
         }
+    }
+
+    /// A per-file agent's failed read the cache alone cannot answer for pays one read of the
+    /// published generation, `published`: an older generation's partial read may have published
+    /// uncached, and a listed file this cache never held may have published rows only there.
+    pub fn record_published_rows<'a>(
+        &mut self,
+        preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        mut published: impl FnMut(&str) -> Option<crate::cache::PublishedAgentRows>,
+    ) {
+        let mut needed: HashSet<String> = preflight_issues
+            .into_iter()
+            .filter(|(agent, scope)| self.cache_cannot_answer_for(agent, scope))
+            .map(|(agent, _)| agent.to_owned())
+            .collect();
+        needed.extend(
+            self.source_read_issues
+                .iter()
+                .filter(|read| self.cache_cannot_answer_for(read.agent, &read.path))
+                .map(|read| read.agent.to_owned()),
+        );
+        for agent in needed {
+            let rows = published(&agent);
+            self.published_rows.insert(agent, rows);
+        }
+    }
+
+    fn cache_cannot_answer_for(&self, agent: &str, scope: &Path) -> bool {
+        let per_file = !crate::ingest::registry::whole_store_agent(agent)
+            && !crate::ingest::registry::token_store_agent(agent);
+        per_file
+            && !self.published_rows.contains_key(agent)
+            && ((self.legacy_generation && crate::ingest::registry::partial_read_agent(agent))
+                || self.listed_files_cached(scope) == Some(false))
+    }
+
+    /// Whether this cache holds an entry, with rows or none, for every file the published
+    /// inventory lists under `scope`; None when it lists none there.
+    fn listed_files_cached(&self, scope: &Path) -> Option<bool> {
+        let published = self.published_material.as_ref()?;
+        let mut listed = published
+            .iter()
+            .filter(|path| source_path_within(path, scope))
+            .peekable();
+        listed.peek()?;
+        let cached: Vec<PathBuf> = self
+            .entries
+            .keys()
+            .filter_map(|key| source_path_from_key(key))
+            .filter(|path| source_path_within(path, scope))
+            .collect();
+        let exact: HashSet<&Path> = cached.iter().map(PathBuf::as_path).collect();
+        Some(listed.all(|path| {
+            exact.contains(path.as_path())
+                || (cfg!(windows) && cached.iter().any(|held| source_path_eq(held, path)))
+        }))
+    }
+
+    /// Whether this cache holds every row and session of `agent` the published generation does,
+    /// as [`Self::record_published_rows`] read it; None when it was not read.
+    fn cache_holds_published_rows(&self, agent: &str) -> Option<bool> {
+        let rows = self.published_rows.get(agent)?.as_ref()?;
+        let mut turns = HashSet::new();
+        let mut sessions = HashSet::new();
+        for entry in self.entries.values() {
+            for message in entry.msgs.iter().filter(|message| message.agent == agent) {
+                turns.insert((message.session.as_ref(), message.turn));
+                sessions.insert(message.session.as_ref());
+            }
+            for key in entry.event_keys.iter().filter(|key| key.agent == agent) {
+                sessions.insert(key.session.as_str());
+            }
+        }
+        Some(
+            rows.turns
+                .keys()
+                .all(|(session, turn)| turns.contains(&(session.as_str(), *turn)))
+                && rows
+                    .sessions
+                    .iter()
+                    .chain(&rows.event_sessions)
+                    .all(|session| sessions.contains(session.as_str())),
+        )
     }
 
     /// An inventory rebuilt from a cache an older generation wrote.
@@ -2946,21 +3055,53 @@ impl IngestCache {
         let has_material = |entry: &Entry| {
             !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
         };
-        // An Always adapter's last-good snapshot carries its whole store, path keys and all;
-        // a token collect serves every cached conversation of a database it cannot read.
-        let retained_here = self.snapshot_witnesses(agent)
-            || self.holds_token_entries(agent, scope)
-            || self.entries.iter().any(|(key, entry)| {
+        let per_file = !crate::ingest::registry::whole_store_agent(agent)
+            && !crate::ingest::registry::token_store_agent(agent);
+        if per_file {
+            if self.legacy_generation && crate::ingest::registry::partial_read_agent(agent) {
+                // An older build published a partial read uncached, under any entry or none.
+                return match self.cache_holds_published_rows(agent) {
+                    Some(true) => MaterialVerdict::Retained,
+                    Some(false) => MaterialVerdict::Drops,
+                    None => MaterialVerdict::Unknown,
+                };
+            }
+            // A failed read re-emits a cached file's entry, rows or none; a listed file the cache
+            // never held may have published rows only that generation holds, unless it shows none.
+            match self.listed_files_cached(scope) {
+                Some(true) => return MaterialVerdict::Retained,
+                Some(false) => {
+                    return match self.cache_holds_published_rows(agent) {
+                        Some(true) => MaterialVerdict::Retained,
+                        _ => MaterialVerdict::Drops,
+                    };
+                }
+                None => {}
+            }
+            let retained_rows = self.entries.iter().any(|(key, entry)| {
                 source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
                     && has_material(entry)
             });
-        if retained_here {
-            return MaterialVerdict::Retained;
-        }
-        if published.iter().any(|path| source_path_within(path, scope))
-            || self.token_scope_material(agent, scope)
-        {
-            return MaterialVerdict::Drops;
+            if retained_rows {
+                return MaterialVerdict::Retained;
+            }
+        } else {
+            // An Always adapter's last-good snapshot carries its whole store, path keys and
+            // all; a token collect serves every cached conversation of a database it cannot read.
+            let retained_here = self.snapshot_witnesses(agent)
+                || self.holds_token_entries(agent, scope)
+                || self.entries.iter().any(|(key, entry)| {
+                    source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
+                        && has_material(entry)
+                });
+            if retained_here {
+                return MaterialVerdict::Retained;
+            }
+            if published.iter().any(|path| source_path_within(path, scope))
+                || self.token_scope_material(agent, scope)
+            {
+                return MaterialVerdict::Drops;
+            }
         }
         // No path here, and nothing retained. Only an inventory that could actually read the
         // scope turns that silence into the positive claim "it held nothing".
@@ -5913,6 +6054,198 @@ mod tests {
         assert!(next.output_complete());
         assert!(next.unreadable_scope_covered("cline", task));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    fn cached_entry(rows: &[crate::model::Message]) -> super::Entry {
+        super::Entry {
+            mtime: 1,
+            size: 1,
+            identity: None,
+            msgs: rows.iter().map(CMsg::from).collect(),
+            event_keys: Vec::new(),
+            legacy_had_events: false,
+            legacy_needs_reparse: true,
+        }
+    }
+
+    #[test]
+    fn a_per_file_scope_is_served_only_when_the_cache_holds_every_file_listed_under_it() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/p");
+        let chat = scope.join("chat.jsonl");
+        let summary = scope.join("summary.jsonl");
+        let listed = || HashSet::from([chat.clone(), summary.clone()]);
+        // Each cached file, with a row or with none, and the sessions a read of the published
+        // generation finds should the scope pay one.
+        let verdict = |files: &[(&Path, bool)], sessions: &[&str]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(listed());
+            for (path, with_row) in files {
+                let rows = if *with_row {
+                    vec![test_message("a cached row")]
+                } else {
+                    Vec::new()
+                };
+                cache.put_entry(path.to_string_lossy().into_owned(), cached_entry(&rows));
+            }
+            let mut read = false;
+            cache.record_published_rows([("claude", scope)], |_| {
+                read = true;
+                Some(published_rows(sessions))
+            });
+            (cache.published_material_under("claude", scope), read)
+        };
+
+        // A file read whole that published nothing is served as surely as one with rows.
+        assert_eq!(
+            verdict(&[(&chat, true), (&summary, false)], &["session"]),
+            (MaterialVerdict::Retained, false)
+        );
+        // Of a listed file the cache never held, only the published generation can tell.
+        assert_eq!(
+            verdict(&[(&chat, true)], &["session"]),
+            (MaterialVerdict::Retained, true)
+        );
+        assert_eq!(
+            verdict(&[(&chat, true)], &["session", "uncached"]),
+            (MaterialVerdict::Drops, true)
+        );
+        assert_eq!(
+            verdict(&[(&summary, false)], &["session"]),
+            (MaterialVerdict::Drops, true)
+        );
+    }
+
+    fn published_rows(sessions: &[&str]) -> crate::cache::PublishedAgentRows {
+        crate::cache::PublishedAgentRows {
+            turns: sessions
+                .iter()
+                .map(|session| {
+                    let row = crate::cache::PublishedTurn {
+                        project: "project".into(),
+                        model: None,
+                    };
+                    (((*session).to_owned(), 0), row)
+                })
+                .collect(),
+            sessions: sessions
+                .iter()
+                .map(|session| (*session).to_owned())
+                .collect(),
+            event_sessions: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn a_legacy_partial_read_agent_is_served_only_where_its_published_rows_are_cached() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let store = Path::new("/fixture/.local/share/opencode");
+        let stable = store.join("opencode.db");
+        let mut cached = test_message("a cached channel");
+        cached.agent = "opencode";
+        cached.session = "stable".into();
+        let project = Path::new("/fixture/.claude/projects/p");
+        let verdict = |rows: Option<crate::cache::PublishedAgentRows>, record: bool| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.legacy_generation = true;
+            cache.set_published_material(HashSet::from([stable.clone()]));
+            cache.put_entry(
+                stable.to_string_lossy().into_owned(),
+                cached_entry(std::slice::from_ref(&cached)),
+            );
+            let mut once = Some(rows);
+            let mut read = 0;
+            if record {
+                cache.record_published_rows([("opencode", store), ("claude", project)], |agent| {
+                    assert_eq!(agent, "opencode", "only a partial-read agent pays the read");
+                    read += 1;
+                    once.take().flatten()
+                });
+                assert_eq!(read, 1);
+            }
+            cache.published_material_under("opencode", store)
+        };
+
+        assert_eq!(
+            verdict(Some(published_rows(&["stable"])), true),
+            MaterialVerdict::Retained
+        );
+        // A second channel's rows, published uncached beside a cached one.
+        assert_eq!(
+            verdict(Some(published_rows(&["stable", "nightly"])), true),
+            MaterialVerdict::Drops
+        );
+        assert_eq!(verdict(None, true), MaterialVerdict::Unknown);
+        assert_eq!(
+            verdict(Some(published_rows(&["stable"])), false),
+            MaterialVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn a_seed_is_admitted_only_past_failed_units_and_with_the_attribution_it_published() {
+        use std::path::{Path, PathBuf};
+
+        let root = std::env::var_os("CLINE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::ingest::home().join(".cline"))
+            .join("data");
+        let torn_task = root.join("tasks/2/api_conversation_history.json");
+        let history = root.join("state/taskHistory.json");
+        let published = |project: &str, model: Option<&str>| crate::cache::PublishedAgentRows {
+            turns: HashMap::from([(
+                ("session".to_owned(), 0),
+                crate::cache::PublishedTurn {
+                    project: project.to_owned(),
+                    model: model.map(str::to_owned),
+                },
+            )]),
+            sessions: HashSet::from(["session".to_owned()]),
+            event_sessions: HashSet::new(),
+        };
+        let admitted = |issue: &Path, rows: crate::cache::PublishedAgentRows| {
+            let mut cache = IngestCache::cold();
+            cache.set_published_material(HashSet::from([torn_task.clone()]));
+            let mut row = test_message("a readable task");
+            row.agent = "cline";
+            row.project = "delta".into();
+            row.model = "claude-fable-5".into();
+            cache.guard_never_empty("cline", &root, vec![row], &[], ReadOutcome::Invalid);
+            cache.record_source_read_issue("cline", issue, "source-invalid", "torn");
+            let mut once = Some(rows);
+            let mut read = false;
+            cache.admit_fully_served_whole_store_agents(std::iter::empty(), |_| {
+                read = true;
+                once.take()
+            });
+            (cache.output_complete(), read)
+        };
+
+        assert_eq!(
+            admitted(&torn_task, published("delta", Some("claude-fable-5"))),
+            (true, true)
+        );
+        assert_eq!(admitted(&torn_task, published("delta", None)), (true, true));
+        assert_eq!(
+            admitted(&torn_task, published("cline", Some("claude-fable-5"))),
+            (false, true),
+            "a seed that re-attributes a published row is not that row"
+        );
+        assert_eq!(
+            admitted(&torn_task, published("delta", Some("another-model"))),
+            (false, true)
+        );
+        // An index every task draws on failed: the seed's attribution proves nothing.
+        assert_eq!(
+            admitted(&history, published("delta", Some("claude-fable-5"))),
+            (false, false)
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! `write_messages` emits compact JSON Lines with stable `agent:session:turn` identifiers. The
 //! Python search layer imports those rows and joins optional enrichment by the same identifier.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 #[cfg(windows)]
 use std::io;
@@ -4080,12 +4080,20 @@ pub fn published_agent_material(data: &Path, agent: &str) -> bool {
 /// What the published generation in `data` holds of one agent.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublishedAgentRows {
-    /// `(session, turn)` of every message row.
-    pub turns: HashSet<(String, u32)>,
+    /// Every message row, by `(session, turn)`.
+    pub turns: HashMap<(String, u32), PublishedTurn>,
     /// Every session with a session row.
     pub sessions: HashSet<String>,
     /// Every session with stored events.
     pub event_sessions: HashSet<String>,
+}
+
+/// The attribution a published message row carries.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PublishedTurn {
+    pub project: String,
+    /// The model its source named; None where publication backfilled or labelled it.
+    pub model: Option<String>,
 }
 
 /// Every row and event session of `agent` the published generation in `data` holds; None when
@@ -4097,6 +4105,12 @@ pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRo
         agent: String,
         session: String,
         turn: Option<u32>,
+        #[serde(default)]
+        project: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        model_source: String,
     }
     let read = || -> anyhow::Result<PublishedAgentRows> {
         let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
@@ -4118,11 +4132,20 @@ pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRo
                 if row.agent != agent {
                     continue;
                 }
-                match (name, row.turn) {
-                    ("messages.jsonl", Some(turn)) => rows.turns.insert((row.session, turn)),
-                    ("messages.jsonl", None) => anyhow::bail!("a message row without a turn"),
-                    _ => rows.sessions.insert(row.session),
+                if name == "sessions.jsonl" {
+                    rows.sessions.insert(row.session);
+                    continue;
+                }
+                let turn = row
+                    .turn
+                    .ok_or_else(|| anyhow::anyhow!("a message row without a turn"))?;
+                let model = matches!(row.model_source.as_str(), "explicit" | "explicit_harness")
+                    .then_some(row.model);
+                let attribution = PublishedTurn {
+                    project: row.project,
+                    model,
                 };
+                rows.turns.insert((row.session, turn), attribution);
             }
         }
         let events = data.join("events");

@@ -165,6 +165,8 @@ _RUST_STAGING_ARTIFACTS = frozenset({
     ".derived-owner.json",
     ".derived_generation.json",
     ".harness_prefixes.snapshot",
+    ".indexd.lock",
+    ".indexd.v2.lock",
     ".ingest.sig",
     ".ingest_cache.bin",
     ".ingest_cache.bin.journal",
