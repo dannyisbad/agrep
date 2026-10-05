@@ -362,18 +362,64 @@ fn cache_id(namespace: &str, session: &str) -> String {
     format!("{namespace}{session}")
 }
 
-fn open_ro(path: &std::path::Path) -> Option<crate::ingest::ReadOnlyConnection> {
-    match crate::ingest::open_sqlite_ro(path) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!(
-                "  ! crush: cannot open {}: {}",
-                crate::ingest::terminal_safe(path.display()),
-                crate::ingest::terminal_safe(&e)
-            );
-            None
+/// Why the census could not list a database's conversations, as the source issue kind the
+/// publication guard reads: only a defect no retry heals lets the other stores publish past it.
+#[derive(Clone, Debug)]
+struct Unenumerable {
+    kind: &'static str,
+    reason: String,
+}
+
+impl Unenumerable {
+    /// Locks, torn snapshots and I/O errors: the fail-closed retry may clear them.
+    fn transient() -> Self {
+        Self {
+            kind: "source-unreadable",
+            reason: "database could not be opened or enumerated".to_string(),
         }
     }
+
+    fn foreign(error: &rusqlite::Error) -> Self {
+        Self {
+            kind: "unsupported-file-type",
+            reason: format!("not a crush database: {error}"),
+        }
+    }
+}
+
+/// The primary result code, including the input errors SQLite reports with a token offset.
+fn sqlite_code(error: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => Some(failure.code),
+        rusqlite::Error::SqlInputError { error, .. } => Some(error.code),
+        _ => None,
+    }
+}
+
+fn open_failure(path: &Path, error: &rusqlite::Error) -> Unenumerable {
+    if sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase) {
+        return Unenumerable::foreign(error);
+    }
+    // The open flattens I/O errors into CANTOPEN; a zero-byte secure probe recovers the
+    // permission case without letting a swapped-in special file block the census.
+    match crate::ingest::registry::regular_file_edge_snapshot(path, 0) {
+        Err(probe) if probe.kind() == std::io::ErrorKind::PermissionDenied => Unenumerable {
+            kind: "permission-denied",
+            reason: probe.to_string(),
+        },
+        _ => Unenumerable::transient(),
+    }
+}
+
+fn open_ro(path: &Path) -> Result<crate::ingest::ReadOnlyConnection, Unenumerable> {
+    crate::ingest::open_sqlite_ro(path).map_err(|error| {
+        eprintln!(
+            "  ! crush: cannot open {}: {}",
+            crate::ingest::terminal_safe(path.display()),
+            crate::ingest::terminal_safe(&error)
+        );
+        open_failure(path, &error)
+    })
 }
 
 /// A part wrapper's text, if it is a text part.
@@ -398,10 +444,7 @@ fn parse_session(
 ) -> (Vec<Message>, Vec<Event>, bool) {
     // seen = message rows in this conversation
     let tally = crate::intake::keyed_token("crush", db_path, session, token.to_string());
-    let mut stmt = match conn.prepare(
-        "SELECT role, parts, model, created_at FROM messages \
-         WHERE session_id = ? ORDER BY created_at, id",
-    ) {
+    let mut stmt = match conn.prepare(MESSAGES_QUERY) {
         Ok(s) => s,
         Err(e) => {
             tally.error(&format!("message query: {e}"));
@@ -428,11 +471,7 @@ fn parse_session(
     let mut events: Vec<Event> = Vec::new();
     let mut pending: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut healthy = true;
-    let parent = match conn.query_row(
-        "SELECT COALESCE(parent_session_id,'') FROM sessions WHERE id = ?1",
-        [session],
-        |r| r.get::<_, String>(0),
-    ) {
+    let parent = match conn.query_row(PARENT_QUERY, [session], |r| r.get::<_, String>(0)) {
         Ok(parent) => parent,
         Err(error) => {
             tally.error(&format!("session parent: {error}"));
@@ -620,15 +659,38 @@ fn stable_generation_read<T>(
     (before == after).then_some(value)
 }
 
-/// Every session's exact generation-qualified staleness token; None if the query fails.
+const TOKENS_QUERY: &str = "SELECT id, updated_at FROM sessions";
+const PARENT_QUERY: &str = "SELECT COALESCE(parent_session_id,'') FROM sessions WHERE id = ?1";
+const MESSAGES_QUERY: &str = "SELECT role, parts, model, created_at FROM messages \
+     WHERE session_id = ? ORDER BY created_at, id";
+
+fn schema_rejection(error: &rusqlite::Error) -> Option<Unenumerable> {
+    (sqlite_code(error) == Some(rusqlite::ErrorCode::Unknown)).then(|| Unenumerable::foreign(error))
+}
+
+/// Every session's exact generation-qualified staleness token. SQLite rejecting the census or a
+/// parse statement means a schema crush never wrote; every other failure may clear on retry.
 fn session_tokens(
     conn: &crate::ingest::ReadOnlyConnection,
     path: &Path,
     project: &str,
-) -> Option<Vec<(String, String)>> {
+) -> Result<Vec<(String, String)>, Unenumerable> {
     let project_token = crate::ingest::registry::fnv_token(project.as_bytes());
-    stable_generation_read(path, Some(conn.source_generation()), |generation| {
-        let mut stmt = conn.prepare("SELECT id, updated_at FROM sessions").ok()?;
+    let mut rejected = None;
+    let tokens = stable_generation_read(path, Some(conn.source_generation()), |generation| {
+        let mut stmt = match conn.prepare(TOKENS_QUERY) {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                rejected = schema_rejection(&error);
+                return None;
+            }
+        };
+        for query in [PARENT_QUERY, MESSAGES_QUERY] {
+            if let Err(error) = conn.prepare(query) {
+                rejected = schema_rejection(&error);
+                return None;
+            }
+        }
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
             .ok()?;
@@ -644,14 +706,15 @@ fn session_tokens(
         }
         out.sort();
         Some(out)
-    })
+    });
+    tokens.ok_or_else(|| rejected.unwrap_or_else(Unenumerable::transient))
 }
 
 struct Opened {
     databases: Vec<(Database, crate::ingest::ReadOnlyConnection)>,
     tokens: Vec<(String, String, String)>,
     locations: HashMap<String, usize>,
-    unavailable: Vec<(String, PathBuf)>,
+    unavailable: Vec<(String, PathBuf, Unenumerable)>,
 }
 
 fn open_with_tokens(discovery: &Discovery) -> Opened {
@@ -661,17 +724,23 @@ fn open_with_tokens(discovery: &Discovery) -> Opened {
     let mut unavailable = Vec::new();
     for database in &discovery.databases {
         let namespace = cache_namespace(&database.path);
-        let Some(connection) = open_ro(&database.path) else {
-            unavailable.push((namespace, database.path.clone()));
-            continue;
+        let connection = match open_ro(&database.path) {
+            Ok(connection) => connection,
+            Err(failure) => {
+                unavailable.push((namespace, database.path.clone(), failure));
+                continue;
+            }
         };
-        let Some(sessions) = session_tokens(&connection, &database.path, &database.project) else {
-            eprintln!(
-                "  ! crush: cannot read sessions from {}",
-                crate::ingest::terminal_safe(database.path.display())
-            );
-            unavailable.push((namespace, database.path.clone()));
-            continue;
+        let sessions = match session_tokens(&connection, &database.path, &database.project) {
+            Ok(sessions) => sessions,
+            Err(failure) => {
+                eprintln!(
+                    "  ! crush: cannot read sessions from {}",
+                    crate::ingest::terminal_safe(database.path.display())
+                );
+                unavailable.push((namespace, database.path.clone(), failure));
+                continue;
+            }
         };
         let index = opened.len();
         for (session, token) in sessions {
@@ -712,7 +781,7 @@ fn collect_discovered(
         }
     }
     if let Some(opened) = opened.as_ref() {
-        for (_, path) in &opened.unavailable {
+        for (_, path, _) in &opened.unavailable {
             cache.record_source_read_issue(
                 "crush",
                 path,
@@ -751,7 +820,7 @@ fn collect_discovered(
             opened
                 .unavailable
                 .iter()
-                .map(|(namespace, _)| namespace.clone())
+                .map(|(namespace, _, _)| namespace.clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -826,8 +895,8 @@ fn live_tokens(intake_keys: bool) -> crate::ingest::registry::TokenAvailability 
         let mut issues: Vec<_> = opened
             .unavailable
             .iter()
-            .map(|(_, path)| {
-                TokenReadIssue::new(path, "database could not be opened or enumerated")
+            .map(|(_, path, failure)| {
+                TokenReadIssue::with_kind(path, failure.kind, failure.reason.clone())
             })
             .collect();
         issues.extend(
@@ -963,6 +1032,62 @@ mod tests {
                 [parts.to_string()],
             )
             .unwrap();
+    }
+
+    fn census_failure(path: &Path) -> Unenumerable {
+        let connection = match open_ro(path) {
+            Ok(connection) => connection,
+            Err(failure) => return failure,
+        };
+        session_tokens(&connection, path, "crush").unwrap_err()
+    }
+
+    #[test]
+    fn census_names_a_schema_the_parser_cannot_read_as_unsupported() {
+        let base = temp_dir("census-schema");
+        let schemas = [
+            ("foreign", "CREATE TABLE notes(id TEXT, body TEXT);"),
+            (
+                "no-column",
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, updated_at INTEGER);",
+            ),
+            (
+                "no-messages",
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                 updated_at INTEGER);",
+            ),
+        ];
+        for (label, schema) in schemas {
+            let path = base.join(format!("{label}.db"));
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(schema)
+                .unwrap();
+            let failure = census_failure(&path);
+            assert_eq!(
+                failure.kind, "unsupported-file-type",
+                "{label}: {failure:?}"
+            );
+        }
+        for (label, bytes) in [("empty", &b""[..]), ("not-sqlite", &b"plain text\n"[..])] {
+            let path = base.join(format!("{label}.db"));
+            fs::write(&path, bytes).unwrap();
+            let failure = census_failure(&path);
+            assert_eq!(
+                failure.kind, "unsupported-file-type",
+                "{label}: {failure:?}"
+            );
+        }
+        let healthy = base.join("healthy.db");
+        write_db(&healthy, "fine");
+        let connection = open_ro(&healthy).unwrap_or_else(|failure| panic!("{failure:?}"));
+        assert_eq!(
+            session_tokens(&connection, &healthy, "crush")
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     fn cached_message(project: &str, text: &str) -> Message {
@@ -1207,10 +1332,11 @@ mod tests {
         let opened = open_with_tokens(&partial);
         assert_eq!(opened.databases.len(), 1);
         assert_eq!(opened.unavailable.len(), 1);
+        assert_eq!(opened.unavailable[0].2.kind, "unsupported-file-type");
         let unavailable: Vec<String> = opened
             .unavailable
             .iter()
-            .map(|(namespace, _)| namespace.clone())
+            .map(|(namespace, _, _)| namespace.clone())
             .collect();
         let second = warm.collect_token_cached_keyed_partial(
             "crush",

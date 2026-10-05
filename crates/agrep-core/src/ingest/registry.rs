@@ -46,13 +46,25 @@ pub enum TokenAvailability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenReadIssue {
     pub path: PathBuf,
+    pub kind: &'static str,
     pub reason: String,
 }
 
 impl TokenReadIssue {
+    /// A census failure a retry may clear; the publication guard keeps its fail-closed retry.
     pub fn new(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
+        Self::with_kind(path, "source-unreadable", reason)
+    }
+
+    /// `kind` is the snapshot issue kind, so an adapter can name a durable defect as one.
+    pub fn with_kind(
+        path: impl Into<PathBuf>,
+        kind: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
+            kind,
             reason: reason.into(),
         }
     }
@@ -1861,11 +1873,19 @@ impl SourceSnapshotView {
             if !adapter.files.is_empty() || !adapter.tokens.is_empty() {
                 agents.insert(adapter.agent.clone());
             }
+            // A database the token census could not enumerate is named by an issue, so the
+            // scope reads as unobserved: its stamp proves a file, never published conversations.
             paths.extend(
                 adapter
                     .files
                     .iter()
                     .filter(|source| !is_sqlite_sidecar(&source.path))
+                    .filter(|source| {
+                        !adapter
+                            .issues
+                            .iter()
+                            .any(|issue| Path::new(issue.path()) == source.path)
+                    })
                     .map(|source| source.path.clone()),
             );
         }
@@ -2348,7 +2368,7 @@ fn adapter_source_with_timing(
                     issues.push(SourceIssue::new(
                         adapter.name(),
                         &issue.path,
-                        "source-unreadable",
+                        issue.kind,
                         issue.reason,
                     ));
                 }
