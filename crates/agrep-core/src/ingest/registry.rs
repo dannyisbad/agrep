@@ -2829,7 +2829,7 @@ pub fn runtime_issue_roots(agent: &str) -> Vec<(String, PathBuf)> {
         .unwrap_or_else(|_| vec![(agent.to_string(), crate::ingest::home())])
 }
 
-fn canonical_message_cmp(left: &Message, right: &Message) -> std::cmp::Ordering {
+pub(crate) fn canonical_message_cmp(left: &Message, right: &Message) -> std::cmp::Ordering {
     left.reply_chars
         .cmp(&right.reply_chars)
         .then_with(|| left.reply.len().cmp(&right.reply.len()))

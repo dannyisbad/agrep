@@ -4096,13 +4096,20 @@ pub struct PublishedTurn {
     pub model: Option<String>,
     pub ts: i64,
     /// [`text_digest`] of its text.
-    pub text: u64,
+    pub text: TextDigest,
 }
 
-/// FNV-1a 64-bit of a row's text: with its session and timestamp, a key no turn renumbering
-/// changes.
-pub fn text_digest(text: &str) -> u64 {
-    content_hash(text.as_bytes())
+/// A collision-resistant digest of a row's text.
+pub type TextDigest = [u8; 16];
+
+/// SHA-256 of a row's text, truncated: with its session and timestamp, a key turn-collision
+/// repair, which renumbers turns, never changes.
+pub fn text_digest(text: &str) -> TextDigest {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    let mut key = [0; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
 }
 
 /// Every row and event session of `agent` the published generation in `data` holds; None when

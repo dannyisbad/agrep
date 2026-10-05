@@ -489,14 +489,15 @@ impl CMsg {
     }
 }
 
-/// The message turns and texts, by session, and the event sessions cache entries hold of one
-/// agent. Turns are the adapter's own: merging a session's files may renumber them on publication.
+/// The rows and the event sessions cache entries hold of one agent.
 #[derive(Default)]
 struct HeldRows {
-    turns: HashMap<std::sync::Arc<str>, HashSet<u32>>,
-    texts: HashMap<std::sync::Arc<str>, HashMap<i64, Vec<std::sync::Arc<str>>>>,
+    rows: Vec<CMsg>,
     event_sessions: HashSet<std::sync::Arc<str>>,
 }
+
+/// How many rows bear each `(session, timestamp, text digest)`.
+type RowCounts<'a> = HashMap<(&'a str, i64, crate::cache::TextDigest), usize>;
 
 impl HeldRows {
     /// The rows `entries` hold of each agent `wanted` accepts.
@@ -518,17 +519,7 @@ impl HeldRows {
         for entry in entries {
             for message in &entry.msgs {
                 if let Some(rows) = rows_of(&mut held, &message.agent, &wanted) {
-                    let session = message.session.clone();
-                    rows.turns
-                        .entry(session.clone())
-                        .or_default()
-                        .insert(message.turn);
-                    rows.texts
-                        .entry(session)
-                        .or_default()
-                        .entry(message.ts)
-                        .or_default()
-                        .push(message.text.clone());
+                    rows.rows.push(message.clone());
                 }
             }
             for key in &entry.event_keys {
@@ -542,25 +533,40 @@ impl HeldRows {
             .collect()
     }
 
-    /// Whether these entries hold the published `row` at `(session, turn)`: by its turn, or by
-    /// its timestamp and text where publication renumbered the session's turns.
-    fn holds_row(&self, session: &str, turn: u32, row: &crate::cache::PublishedTurn) -> bool {
-        self.turns
-            .get(session)
-            .is_some_and(|turns| turns.contains(&turn))
-            || self
-                .texts
-                .get(session)
-                .and_then(|by_ts| by_ts.get(&row.ts))
-                .is_some_and(|texts| {
-                    texts
-                        .iter()
-                        .any(|text| crate::cache::text_digest(text) == row.text)
-                })
+    /// The rows publication keeps of `rows`, counted: of rows sharing a session, raw turn and
+    /// text, dedupe keeps the canonical one. A tie it may break either way, if the tied rows'
+    /// timestamps differ, counts for neither.
+    fn published_counts<'a>(rows: impl IntoIterator<Item = &'a CMsg>) -> RowCounts<'a> {
+        let mut kept: HashMap<(&str, u32, &str), Option<&CMsg>> = HashMap::new();
+        for row in rows {
+            let canonical = kept
+                .entry((&row.session, row.turn, &row.text))
+                .or_insert(Some(row));
+            let Some(prior) = *canonical else {
+                continue;
+            };
+            let order =
+                crate::ingest::registry::canonical_message_cmp(&row.to_msg(), &prior.to_msg());
+            if order.is_gt() {
+                *canonical = Some(row);
+            } else if order.is_eq() && row.ts != prior.ts {
+                *canonical = None;
+            }
+        }
+        let mut counts = RowCounts::new();
+        for row in kept.into_values().flatten() {
+            *counts
+                .entry((&row.session, row.ts, crate::cache::text_digest(&row.text)))
+                .or_default() += 1;
+        }
+        counts
     }
 
-    fn holds_session(&self, session: &str) -> bool {
-        self.turns.contains_key(session) || self.event_sessions.contains(session)
+    fn sessions(&self) -> impl Iterator<Item = &str> {
+        self.rows
+            .iter()
+            .map(|row| row.session.as_ref())
+            .chain(self.event_sessions.iter().map(AsRef::as_ref))
     }
 }
 
@@ -638,10 +644,10 @@ pub struct IngestCache {
     /// `(agent, root)` of whole-store reads that failed with no last-good snapshot to serve:
     /// output only once the inventory or a read of the published generation proves it empty.
     unvouched_reads: HashSet<(String, PathBuf)>,
-    /// What the published generation holds of each per-file agent whose failed read this cache
-    /// cannot answer for alone; None where that generation could not be read.
-    published_rows: HashMap<String, Option<crate::cache::PublishedAgentRows>>,
-    /// What the decoded base held of each per-file agent `published_rows` may be compared for,
+    /// For each per-file agent whose failed read this cache cannot answer for alone, whether the
+    /// pass holds every row the published generation does; None where that could not be read.
+    published_rows: HashMap<String, Option<bool>>,
+    /// What the decoded base held of each per-file agent `published_rows` may be judged for,
     /// taken before ingest: a row this pass then drops went with a change it observed.
     base_rows: HashMap<String, HeldRows>,
     /// `(agent, database namespace)` of every token conversation the published generation may
@@ -2937,10 +2943,11 @@ impl IngestCache {
         preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
         mut published: impl FnMut(&str) -> Option<crate::cache::PublishedAgentRows>,
     ) {
-        let mut needed: HashSet<String> = preflight_issues
-            .into_iter()
+        let issues: Vec<(&str, &Path)> = preflight_issues.into_iter().collect();
+        let mut needed: HashSet<String> = issues
+            .iter()
             .filter(|(agent, scope)| self.cache_cannot_answer_for(agent, scope))
-            .map(|(agent, _)| agent.to_owned())
+            .map(|(agent, _)| (*agent).to_owned())
             .collect();
         needed.extend(
             self.source_read_issues
@@ -2948,10 +2955,80 @@ impl IngestCache {
                 .filter(|read| self.cache_cannot_answer_for(read.agent, &read.path))
                 .map(|read| read.agent.to_owned()),
         );
+        let scopes: Vec<&Path> = issues.into_iter().map(|(_, scope)| scope).collect();
         for agent in needed {
-            let rows = published(&agent);
-            self.published_rows.insert(agent, rows);
+            let held =
+                published(&agent).map(|rows| self.holds_published_rows(&agent, &rows, &scopes));
+            self.published_rows.insert(agent, held);
         }
+    }
+
+    /// Whether this pass publishes, or saw go, every row and session of `agent` that `published`
+    /// holds. Rows match by session, timestamp and text, one for one: turn-collision repair
+    /// renumbers turns but changes none of those, so no other row can stand in for a lost one.
+    fn holds_published_rows(
+        &self,
+        agent: &str,
+        published: &crate::cache::PublishedAgentRows,
+        failed_scopes: &[&Path],
+    ) -> bool {
+        let under_failed_scope = |key: &str| {
+            source_path_from_key(key).is_some_and(|path| {
+                failed_scopes
+                    .iter()
+                    .any(|scope| source_path_within(&path, scope))
+            })
+        };
+        fn rows_of<'a>(entries: impl Iterator<Item = &'a Entry>, agent: &str) -> Vec<&'a CMsg> {
+            entries
+                .flat_map(|entry| entry.msgs.iter())
+                .filter(|row| row.agent == agent)
+                .collect()
+        }
+        let after = rows_of(self.entries.values(), agent);
+        let beside = self
+            .entries
+            .iter()
+            .filter(|(key, _)| !under_failed_scope(key))
+            .map(|(_, entry)| entry);
+        let beside = rows_of(beside, agent);
+        let none = HeldRows::default();
+        let base = self.base_rows.get(agent).unwrap_or(&none);
+        let output = HeldRows::published_counts(after.iter().copied());
+        let (base_counts, beside_counts) = (
+            HeldRows::published_counts(&base.rows),
+            HeldRows::published_counts(beside),
+        );
+        // What this pass publishes, and what the base held beside the failed scopes that this
+        // pass no longer holds there: rows it saw go.
+        let held = |key: &(&str, i64, crate::cache::TextDigest)| {
+            let count = |counts: &RowCounts| counts.get(key).copied().unwrap_or(0);
+            count(&output) + count(&base_counts).saturating_sub(count(&beside_counts))
+        };
+        let mut wanted = RowCounts::new();
+        for ((session, _), row) in &published.turns {
+            *wanted
+                .entry((session.as_str(), row.ts, row.text))
+                .or_default() += 1;
+        }
+        let event_sessions = self
+            .entries
+            .values()
+            .flat_map(|entry| &entry.event_keys)
+            .filter(|key| key.agent == agent)
+            .map(|key| key.session.as_str());
+        let sessions: HashSet<&str> = after
+            .iter()
+            .map(|row| row.session.as_ref())
+            .chain(event_sessions)
+            .chain(base.sessions())
+            .collect();
+        wanted.iter().all(|(key, count)| held(key) >= *count)
+            && published
+                .sessions
+                .iter()
+                .chain(&published.event_sessions)
+                .all(|session| sessions.contains(session.as_str()))
     }
 
     /// Before ingest mutates this decoded base, census what it holds outside failed preflight scopes
@@ -3028,31 +3105,10 @@ impl IngestCache {
         }))
     }
 
-    /// Whether this cache holds every row and session of `agent` the published generation does,
-    /// as [`Self::record_published_rows`] read it, or held it before this pass; None when it was
-    /// not read. A row only the published generation holds is one this cache cannot serve.
+    /// Whether this pass holds every row and session of `agent` the published generation does, as
+    /// [`Self::record_published_rows`] judged it; None when it was not read.
     fn cache_holds_published_rows(&self, agent: &str) -> Option<bool> {
-        let rows = self.published_rows.get(agent)?.as_ref()?;
-        let after = HeldRows::census(self.entries.values(), |owner| owner == agent);
-        let held = [after.get(agent), self.base_rows.get(agent)];
-        let holds_row = |(session, turn): &(String, u32), row: &crate::cache::PublishedTurn| {
-            held.iter()
-                .flatten()
-                .any(|rows| rows.holds_row(session, *turn, row))
-        };
-        let holds_session = |session: &str| {
-            held.iter()
-                .flatten()
-                .any(|rows| rows.holds_session(session))
-        };
-        Some(
-            rows.turns.iter().all(|(key, row)| holds_row(key, row))
-                && rows
-                    .sessions
-                    .iter()
-                    .chain(&rows.event_sessions)
-                    .all(|session| holds_session(session)),
-        )
+        self.published_rows.get(agent).copied().flatten()
     }
 
     /// An inventory rebuilt from a cache an older generation wrote.
@@ -6263,9 +6319,9 @@ mod tests {
         let chat = scope.join("chat.jsonl");
         let summary = scope.join("summary.jsonl");
         let listed = || HashSet::from([chat.clone(), summary.clone()]);
-        // Each cached file, with a row or with none, and the sessions a read of the published
+        // Each cached file, with a row or with none, and the rows a read of the published
         // generation finds should the scope pay one.
-        let verdict = |files: &[(&Path, bool)], sessions: &[&str]| {
+        let verdict = |files: &[(&Path, bool)], published: &[(&str, &str)]| {
             let mut cache = IngestCache::cold();
             cache.last_good_base = true;
             cache.set_published_material(listed());
@@ -6280,48 +6336,59 @@ mod tests {
             let mut read = false;
             cache.record_published_rows([("claude", scope)], |_| {
                 read = true;
-                Some(published_rows(sessions))
+                Some(published_rows(published))
             });
             (cache.published_material_under("claude", scope), read)
         };
 
         // A file read whole that published nothing is served as surely as one with rows.
         assert_eq!(
-            verdict(&[(&chat, true), (&summary, false)], &["session"]),
+            verdict(
+                &[(&chat, true), (&summary, false)],
+                &[("session", "a cached row")]
+            ),
             (MaterialVerdict::Retained, false)
         );
         // Of a listed file the cache never held, only the published generation can tell.
         assert_eq!(
-            verdict(&[(&chat, true)], &["session"]),
+            verdict(&[(&chat, true)], &[("session", "a cached row")]),
             (MaterialVerdict::Retained, true)
         );
         assert_eq!(
-            verdict(&[(&chat, true)], &["session", "uncached"]),
+            verdict(
+                &[(&chat, true)],
+                &[
+                    ("session", "a cached row"),
+                    ("uncached", "a row only published")
+                ]
+            ),
             (MaterialVerdict::Drops, true)
         );
         assert_eq!(
-            verdict(&[(&summary, false)], &["session"]),
+            verdict(&[(&summary, false)], &[("session", "a cached row")]),
             (MaterialVerdict::Drops, true)
         );
     }
 
-    fn published_rows(sessions: &[&str]) -> crate::cache::PublishedAgentRows {
+    /// Published rows, as `(session, text)`, each stamped as `test_message` stamps its rows.
+    fn published_rows(rows: &[(&str, &str)]) -> crate::cache::PublishedAgentRows {
         crate::cache::PublishedAgentRows {
-            turns: sessions
+            turns: rows
                 .iter()
-                .map(|session| {
+                .enumerate()
+                .map(|(turn, (session, text))| {
                     let row = crate::cache::PublishedTurn {
                         project: "project".into(),
                         model: None,
-                        ts: i64::MIN,
-                        text: 0,
+                        ts: 1,
+                        text: crate::cache::text_digest(text),
                     };
-                    (((*session).to_owned(), 0), row)
+                    (((*session).to_owned(), turn as u32), row)
                 })
                 .collect(),
-            sessions: sessions
+            sessions: rows
                 .iter()
-                .map(|session| (*session).to_owned())
+                .map(|(session, _)| (*session).to_owned())
                 .collect(),
             event_sessions: HashSet::new(),
         }
@@ -6338,7 +6405,7 @@ mod tests {
         let mut row = test_message("a row this pass deletes");
         row.session = "gone".into();
         // Whether the base census runs, and the sessions the published generation holds.
-        let verdict = |census: bool, sessions: &[&str]| {
+        let verdict = |census: bool, published: &[(&str, &str)]| {
             let mut cache = IngestCache::cold();
             cache.last_good_base = true;
             cache.set_published_material(HashSet::from([never_read.clone(), deleted.into()]));
@@ -6348,16 +6415,17 @@ mod tests {
                 cache.census_base_rows([("claude", scope)], false);
             }
             cache.remove_entry(&key);
-            let mut once = Some(published_rows(sessions));
+            let mut once = Some(published_rows(published));
             cache.record_published_rows([("claude", scope)], |_| once.take());
             cache.published_material_under("claude", scope)
         };
 
-        assert_eq!(verdict(true, &["gone"]), MaterialVerdict::Retained);
-        assert_eq!(verdict(false, &["gone"]), MaterialVerdict::Drops);
+        let gone = ("gone", "a row this pass deletes");
+        assert_eq!(verdict(true, &[gone]), MaterialVerdict::Retained);
+        assert_eq!(verdict(false, &[gone]), MaterialVerdict::Drops);
         // A row the base never held is one only the published generation can still serve.
         assert_eq!(
-            verdict(true, &["gone", "never-read"]),
+            verdict(true, &[gone, ("never-read", "a never-read row")]),
             MaterialVerdict::Drops
         );
     }
@@ -6385,7 +6453,8 @@ mod tests {
             if !kept {
                 cache.remove_entry(&key);
             }
-            let mut once = Some(published_rows(&["split"]));
+            let held = ("split", "a prompt only the unreadable rollout holds");
+            let mut once = Some(published_rows(&[held]));
             cache.record_published_rows(issues, |_| once.take());
             cache.published_material_under("codex", never_read.parent().unwrap())
         };
@@ -6428,53 +6497,163 @@ mod tests {
     }
 
     #[test]
-    fn a_published_row_renumbered_by_turn_collision_repair_is_held_by_its_content() {
+    fn a_published_row_is_held_only_by_as_many_cached_rows_of_its_session_time_and_text() {
         use super::MaterialVerdict;
         use std::path::Path;
 
-        let scope = Path::new("/fixture/.codex/sessions/2026/01/06");
-        let never_read = scope.join("rollout-c.jsonl");
+        let scope = Path::new("/fixture/.codex/sessions/2026/01/03");
+        let lost = scope.join("rollout-a.jsonl");
         let resumed = Path::new("/fixture/.codex/sessions/2026/01/05/rollout-b.jsonl");
-        let mut row = test_message("a prompt after compaction");
-        row.agent = "codex";
-        row.session = "resumed".into();
-        row.ts = 7;
-        // The published row: the cached turn 0 renumbered to 4, with this timestamp and text.
-        let verdict = |ts: i64, text: &str| {
+        // The resumed rollout's rows as `(ts, text)`, its raw turns counted from 0, against the
+        // session's published rows as `(turn, ts, text)`, renumbered by turn-collision repair.
+        let verdict = |cached: &[(i64, &str)], published: &[(u32, i64, &str)]| {
             let mut cache = IngestCache::cold();
             cache.last_good_base = true;
-            cache.set_published_material(HashSet::from([never_read.clone(), resumed.into()]));
-            cache.put_entry(
-                resumed.to_string_lossy().into_owned(),
-                cached_entry(std::slice::from_ref(&row)),
-            );
-            let published = crate::cache::PublishedAgentRows {
-                turns: HashMap::from([(
-                    ("resumed".to_owned(), 4),
-                    crate::cache::PublishedTurn {
-                        project: "project".into(),
-                        model: None,
-                        ts,
-                        text: crate::cache::text_digest(text),
-                    },
-                )]),
-                sessions: HashSet::from(["resumed".to_owned()]),
+            cache.set_published_material(HashSet::from([lost.clone(), resumed.into()]));
+            let rows: Vec<_> = (0..)
+                .zip(cached)
+                .map(|(turn, (ts, text))| {
+                    let mut row = test_message(text);
+                    (row.agent, row.session, row.turn, row.ts) =
+                        ("codex", "split".into(), turn, *ts);
+                    row
+                })
+                .collect();
+            let key = resumed.to_string_lossy().into_owned();
+            cache.put_entry(key, cached_entry(&rows));
+            let turns = published.iter().map(|(turn, ts, text)| {
+                let row = crate::cache::PublishedTurn {
+                    project: "project".into(),
+                    model: None,
+                    ts: *ts,
+                    text: crate::cache::text_digest(text),
+                };
+                (("split".to_owned(), *turn), row)
+            });
+            let mut once = Some(crate::cache::PublishedAgentRows {
+                turns: turns.collect(),
+                sessions: HashSet::from(["split".to_owned()]),
                 event_sessions: HashSet::new(),
-            };
-            let mut once = Some(published);
+            });
             cache.record_published_rows([("codex", scope)], |_| once.take());
             cache.published_material_under("codex", scope)
         };
+        let resumed_rows = [(11, "three"), (12, "four")];
 
+        // Held by content, whatever turn repair gave it.
+        let renumbered = [(2, 11, "three"), (3, 12, "four")];
         assert_eq!(
-            verdict(7, "a prompt after compaction"),
+            verdict(&resumed_rows, &renumbered),
             MaterialVerdict::Retained
         );
-        assert_eq!(verdict(7, "another prompt"), MaterialVerdict::Drops);
         assert_eq!(
-            verdict(8, "a prompt after compaction"),
+            verdict(&resumed_rows, &[(3, 12, "five")]),
             MaterialVerdict::Drops
         );
+        assert_eq!(
+            verdict(&resumed_rows, &[(3, 13, "four")]),
+            MaterialVerdict::Drops
+        );
+        // The lost rollout's rows sort first, onto turns the resumed rollout's raw rows bear.
+        let split = [
+            (0, 9, "one"),
+            (1, 10, "two"),
+            (2, 11, "three"),
+            (3, 12, "four"),
+        ];
+        assert_eq!(verdict(&resumed_rows, &split), MaterialVerdict::Drops);
+        // A lost row at the very time of a held one, renumbered onto that one's raw turn.
+        let same_time = [(0, 11, "a lost prompt"), (1, 11, "three")];
+        assert_eq!(
+            verdict(&[(11, "three")], &same_time),
+            MaterialVerdict::Drops
+        );
+        // A row published twice is held only by two.
+        let twice = [(3, 5, "continue"), (7, 5, "continue")];
+        assert_eq!(verdict(&[(5, "continue")], &twice), MaterialVerdict::Drops);
+        let held_twice = [(5, "continue"), (5, "continue")];
+        assert_eq!(verdict(&held_twice, &twice), MaterialVerdict::Retained);
+    }
+
+    #[test]
+    fn a_row_both_the_base_and_this_pass_hold_counts_once() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let old = Path::new("/fixture/.claude/projects/p/old.jsonl");
+        let new = Path::new("/fixture/.claude/projects/p/new.jsonl");
+        let row = test_message("continue");
+        // Where this pass holds the base's row after ingest, against how often it was published.
+        let verdict = |after: Option<&Path>, published: usize| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), old.into()]));
+            let entry = || cached_entry(std::slice::from_ref(&row));
+            cache.put_entry(old.to_string_lossy().into_owned(), entry());
+            cache.census_base_rows([("claude", scope)], false);
+            cache.remove_entry(&old.to_string_lossy());
+            if let Some(path) = after {
+                cache.put_entry(path.to_string_lossy().into_owned(), entry());
+            }
+            let rows = vec![("session", "continue"); published];
+            let mut once = Some(published_rows(&rows));
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+
+        assert_eq!(verdict(Some(old), 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(Some(new), 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(None, 1), MaterialVerdict::Retained);
+        // Its file renamed, the one row does not stand in for a second the published generation
+        // holds behind the locked directory.
+        assert_eq!(verdict(Some(new), 2), MaterialVerdict::Drops);
+        assert_eq!(verdict(Some(old), 2), MaterialVerdict::Drops);
+    }
+
+    #[test]
+    fn a_cached_row_publication_folds_into_another_holds_nothing() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let original = Path::new("/fixture/.claude/projects/p/original.jsonl");
+        let replay = Path::new("/fixture/.claude/projects/p/replay.jsonl");
+        // A replay of the original's turn at a later time: dedupe publishes the earlier one.
+        let at = |ts: i64| {
+            let mut row = test_message("continue");
+            row.ts = ts;
+            cached_entry(&[row])
+        };
+        let verdict = |published: &[i64]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), original.into()]));
+            cache.put_entry(original.to_string_lossy().into_owned(), at(5));
+            cache.put_entry(replay.to_string_lossy().into_owned(), at(6));
+            let turns = (0..).zip(published).map(|(turn, ts)| {
+                let row = crate::cache::PublishedTurn {
+                    project: "project".into(),
+                    model: None,
+                    ts: *ts,
+                    text: crate::cache::text_digest("continue"),
+                };
+                (("session".to_owned(), turn), row)
+            });
+            let mut once = Some(crate::cache::PublishedAgentRows {
+                turns: turns.collect(),
+                sessions: HashSet::from(["session".to_owned()]),
+                event_sessions: HashSet::new(),
+            });
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+
+        assert_eq!(verdict(&[5]), MaterialVerdict::Retained);
+        // The later time, published by a file behind the locked directory, is one this pass drops.
+        assert_eq!(verdict(&[5, 6]), MaterialVerdict::Drops);
     }
 
     #[test]
@@ -6511,17 +6690,29 @@ mod tests {
         };
 
         assert_eq!(
-            verdict(Some(published_rows(&["stable"])), true),
+            verdict(
+                Some(published_rows(&[("stable", "a cached channel")])),
+                true
+            ),
             MaterialVerdict::Retained
         );
         // A second channel's rows, published uncached beside a cached one.
         assert_eq!(
-            verdict(Some(published_rows(&["stable", "nightly"])), true),
+            verdict(
+                Some(published_rows(&[
+                    ("stable", "a cached channel"),
+                    ("nightly", "a nightly channel"),
+                ])),
+                true
+            ),
             MaterialVerdict::Drops
         );
         assert_eq!(verdict(None, true), MaterialVerdict::Unknown);
         assert_eq!(
-            verdict(Some(published_rows(&["stable"])), false),
+            verdict(
+                Some(published_rows(&[("stable", "a cached channel")])),
+                false
+            ),
             MaterialVerdict::Unknown
         );
     }

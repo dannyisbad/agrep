@@ -534,6 +534,55 @@ fn upgrade_keeps_uncached_rows_of_one_opencode_channel_beside_a_cached_one() {
     }
 }
 
+/// opencode's release channels may share session ids. The release published a torn nightly
+/// database uncached beside the stable one, renumbering the sessions both hold. Once a link no
+/// pass follows replaces it, the stable rows renumbered onto its turns must not stand in for it.
+#[cfg(unix)]
+#[test]
+fn upgrade_keeps_uncached_rows_of_an_opencode_channel_sharing_session_ids() {
+    const NIGHTLY_CHILD_TEXT: &str = "check the toml schema";
+    for snapshot in [Snapshot::Published, Snapshot::Withheld, Snapshot::Pending] {
+        let home = opencode_home();
+        copy_dir(&fixture_home("claude"), &home);
+        let nightly = home.join(".local/share/opencode/opencode-nightly.db");
+        // The same sessions, earlier: the nightly rows take the turns repair numbers first.
+        let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql"))
+            .unwrap()
+            .replace(OPENCODE_TEXT, NIGHTLY_TEXT)
+            .replace("check the generated yaml schema", NIGHTLY_CHILD_TEXT)
+            .replace("1767348", "1767347");
+        rusqlite::Connection::open(&nightly)
+            .unwrap()
+            .execute_batch(&seed)
+            .unwrap();
+        let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &nightly, snapshot);
+        let kept = |published: &str| {
+            [OPENCODE_TEXT, NIGHTLY_TEXT, NIGHTLY_CHILD_TEXT]
+                .iter()
+                .all(|text| published.contains(text))
+        };
+        assert!(
+            kept(&normalize(&data)),
+            "{snapshot:?}: the release did not publish both"
+        );
+        let target = home.join("nightly-copy.db");
+        fs::rename(&parked, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &nightly).unwrap();
+        let chat = plant_chat(&home);
+        for minute in [1, 2, 3] {
+            append_line(&chat, minute, &format!("upgrade churn {minute}"));
+            let code = ingest_output("all", &home, &data, false).status.code();
+            assert!(
+                kept(&normalize(&data)),
+                "{snapshot:?} snapshot, pass {minute} dropped rows the release published \
+                 (exit {code:?})"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
 /// opencode's channel database is a symlink no pass follows, a durable issue in its store. A
 /// session deleted from the readable database since the release indexed it is a change the pass
 /// observes, not a row lost behind that link: every pass publishes it, as the churn beside it.
@@ -970,6 +1019,80 @@ fn upgrade_publishes_a_renumbered_session_beside_a_rollout_never_read() {
 #[test]
 fn crash_repair_publishes_a_renumbered_session_beside_a_rollout_never_read() {
     publishes_a_renumbered_session_beside_a_rollout_never_read(NeverReadStart::CrashRepair);
+}
+
+/// How a pass loses its parse cache.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum CacheLoss {
+    Deleted,
+    Corrupted,
+}
+
+/// A codex session resumed in a second rollout publishes renumbered across both. With the parse
+/// cache lost and the first rollout's directory locked, the second's rows, renumbered onto the
+/// first's raw turns, must not stand in for the first's: no pass, plain or `--full`, drops them.
+#[cfg(unix)]
+#[test]
+fn a_cacheless_pass_keeps_a_locked_rollout_whose_session_resumed_beside_it() {
+    for loss in [CacheLoss::Deleted, CacheLoss::Corrupted] {
+        let home = temp_dir("cacheless-split-home");
+        copy_dir(&fixture_home("claude"), &home);
+        let first = ["prompt one", "prompt two"];
+        let rollout = codex_rollout(&home, "03", SPLIT_SESSION, 10, &first);
+        let after = ["after one", "after two", "after three", "after four"];
+        codex_rollout(&home, "05", SPLIT_SESSION, 11, &after);
+        let chat = plant_chat(&home);
+        let data = temp_dir("cacheless-split-data");
+        assert_published(&ingest_output("all", &home, &data, false), "first index");
+        let held = |published: &str| {
+            first
+                .iter()
+                .chain(&after)
+                .all(|text| published.contains(text))
+        };
+        assert!(held(&normalize(&data)));
+        let cache = data.join(".ingest_cache.bin");
+        let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+        match loss {
+            CacheLoss::Deleted => fs::remove_file(&cache).unwrap(),
+            CacheLoss::Corrupted => {
+                let mut bytes = fs::read(&cache).unwrap();
+                let middle = bytes.len() / 2;
+                bytes[middle] ^= 0xff;
+                fs::write(&cache, bytes).unwrap();
+            }
+        }
+        let Some(locked) = lock_dir(rollout.parent().unwrap()) else {
+            let _ = fs::remove_dir_all(&home);
+            let _ = fs::remove_dir_all(&data);
+            return;
+        };
+        let passes: Vec<_> = [(1, false), (2, false), (3, true)]
+            .into_iter()
+            .map(|(minute, full)| {
+                append_line(&chat, minute, &format!("upgrade churn {minute}"));
+                let code = ingest_output("all", &home, &data, full).status.code();
+                (held(&normalize(&data)), code)
+            })
+            .collect();
+        unlock_dir(&locked);
+        for (pass, (kept, code)) in (1..).zip(passes) {
+            assert!(
+                kept,
+                "{loss:?} cache, pass {pass} dropped published rows (exit {code:?})"
+            );
+        }
+        append_line(&chat, 4, "upgrade churn 4");
+        assert_published(&ingest_output("all", &home, &data, false), "healed pass");
+        let published = normalize(&data);
+        assert!(
+            held(&published) && published.contains("upgrade churn 4"),
+            "{loss:?}"
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
 }
 
 /// An upgrade held back by one scope past others it could publish past names that scope: here
