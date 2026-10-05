@@ -141,6 +141,51 @@ fn past_injected(mut parts: &[Value]) -> &[Value] {
     parts
 }
 
+/// A message upstream's `convertSessionToClientHistory` (sessionUtils.ts 110-228 at fb972b2) leaves
+/// out of the history it rebuilds on `/rewind` and `--resume`: info, error and warning notices, and
+/// user turns `isIgnoredUserContent` (97-105) rejects. That tests the trimmed
+/// `partListUnionToString`: `partToString` verbose (partUtils.ts 18-82), parts joined.
+fn conversion_skips(message: &Value) -> bool {
+    match message.get("type").and_then(Value::as_str) {
+        Some("info" | "error" | "warning") => return true,
+        Some("user") => {}
+        _ => return false,
+    }
+    let mut text = String::new();
+    for part in parts_of(message.get("content").unwrap_or(&Value::Null)) {
+        // verbose describes every non-text part as `[…]`: only that leading `[` can matter here
+        const DESCRIBED: [&str; 8] = [
+            "videoMetadata",
+            "thought",
+            "codeExecutionResult",
+            "executableCode",
+            "fileData",
+            "functionCall",
+            "functionResponse",
+            "inlineData",
+        ];
+        match part {
+            Value::String(piece) => text.push_str(piece),
+            Value::Object(fields) if DESCRIBED.iter().any(|key| fields.contains_key(*key)) => {
+                text.push('[');
+            }
+            Value::Object(fields) => match fields.get("text") {
+                Some(Value::String(piece)) => text.push_str(piece),
+                None | Some(Value::Null) => {}
+                Some(_) => text.push('#'),
+            },
+            _ => {}
+        }
+    }
+    // JS `trim`: Unicode White_Space without U+0085, plus U+FEFF
+    let text =
+        text.trim_start_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}');
+    text.is_empty()
+        || ["/", "?", "<session_context>", "<hook_context>"]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+}
+
 /// Compression (upstream `ChatCompressionService`) records the model-written `<state_snapshot>`
 /// as a user turn, then this canned model acknowledgement, before the kept tail.
 const COMPRESSION_ACK: &str = "Got it. Thanks for the additional context!";
@@ -429,6 +474,10 @@ fn key_hash(key: &CopyKey) -> u64 {
 ///   to them, or to messages dropped earlier, as replays. A re-sync never overwrites a recorded
 ///   tool result.
 ///
+/// Two removals are neither, and their messages stay, as dropped: the re-sync right after a
+/// `/rewind`, which removes only what upstream's conversion of the rewound history skips (see
+/// `converting`), and a declined tool's rollback (see `declined`).
+///
 /// Work stays linear in the file: each entry is keyed at most once as removed and once as a
 /// copy, and the map is a slot list compacted as removals accumulate and wherever the rollback
 /// walk crossed a gap, so no gap is walked twice.
@@ -452,6 +501,10 @@ struct Fold {
     /// Map entries recorded before `mark`: none left after a re-sync means it re-recorded the
     /// whole context (`setHistory` with fresh ids: masking, truncation, `/chat resume`).
     before_mark: usize,
+    /// Set by a `$rewindTo` until the next record that is not a message. `/rewind` writes it, then
+    /// re-syncs to `convertSessionToClientHistory` of what is left (rewindCommand.tsx 47-60 at
+    /// fb972b2), so a re-sync then that removes only what the conversion skips is that one.
+    converting: bool,
     /// Dropped entries by `CopyKey` hash, the pool a whole-context rewrite pairs from: a
     /// `/chat resume` of a save from before a compression copies messages already out of the
     /// context. Entries no longer dropped are pruned on use.
@@ -488,20 +541,23 @@ impl Fold {
     }
 
     fn apply(&mut self, record: Value) {
+        let converting = std::mem::take(&mut self.converting);
         if let Some(target) = record.get("$rewindTo").and_then(Value::as_str) {
             self.meta += 1;
-            self.rewind(target);
+            self.converting = self.rewind(target, converting);
         } else if let Some(patch) = record.get("$patch").filter(|patch| is_js_object(patch)) {
             self.meta += 1;
-            self.patch(patch);
+            self.patch(patch, converting);
         } else if let (Some(Value::String(id)), None) = (record.get("id"), record.get("$patch")) {
             let id = id.clone();
             self.put(id, record);
+            // the conversion's re-sync first records the tool results it re-derives
+            self.converting = converting;
             return;
         } else if let Some(set) = record.get("$set").filter(|set| is_js_object(set)) {
             self.meta += 1;
             if let Some(Value::Array(messages)) = set.get("messages") {
-                self.checkpoint(messages);
+                self.checkpoint(messages, converting);
             }
             self.merge_metadata(set);
         } else if record.get("sessionId").is_some_and(Value::is_string)
@@ -636,7 +692,8 @@ impl Fold {
     }
 
     /// `$rewindTo`: the message and every later one in the map; an unknown id clears the map.
-    fn rewind(&mut self, target: &str) {
+    /// True when it was the person's `/rewind`, not the conversion's or a decline's rollback.
+    fn rewind(&mut self, target: &str, converting: bool) -> bool {
         let from = self
             .live_index(target)
             .and_then(|index| self.slot_of(index))
@@ -649,9 +706,56 @@ impl Fold {
             .flatten()
             .copied()
             .collect();
-        self.undo(undone);
+        let kept = (converting && self.only_conversion_skips(&undone))
+            || undone.last().is_some_and(|index| self.declined(*index));
+        if kept {
+            for index in &undone {
+                self.leave(*index);
+            }
+            let keys: Vec<Option<CopyKey>> =
+                undone.iter().map(|index| self.copy_key(*index)).collect();
+            self.mark_dropped(&undone, &keys);
+        } else {
+            self.undo(undone);
+        }
         self.tidy();
         self.set_mark();
+        !kept
+    }
+
+    /// Messages, at least one, that upstream's conversion leaves out of the rebuilt history: an
+    /// env-led coalesced copy is one, and following its links would undo the prompt in it.
+    fn only_conversion_skips(&self, indices: &[usize]) -> bool {
+        !indices.is_empty()
+            && indices.iter().all(|index| {
+                self.entries
+                    .get(*index)
+                    .is_some_and(|entry| conversion_skips(&entry.message))
+            })
+    }
+
+    /// A model turn whose tool calls the person declined. With every declinable call cancelled,
+    /// useGeminiStream sets the history back to its length before the prompt (2105-2140 at
+    /// fb972b2): that leaves this turn last in the map only when it rolls back everything since,
+    /// as an abort would when nothing came before the prompt. A declined turn stays, as dropped.
+    fn declined(&self, index: usize) -> bool {
+        let Some(message) = self.entries.get(index).map(|entry| &entry.message) else {
+            return false;
+        };
+        let calls = match (message.get("type"), message.get("toolCalls")) {
+            (Some(Value::String(kind)), Some(Value::Array(calls))) if kind == "gemini" => calls,
+            _ => return false,
+        };
+        let cancelled =
+            |call: &&Value| call.get("status").and_then(Value::as_str) == Some("cancelled");
+        // `isTopicTool` (125-126): the person never gets to decline it
+        let topic = |call: &&Value| {
+            let name = call.get("name").and_then(Value::as_str);
+            matches!(name, Some("update_topic" | "Update Topic Context"))
+        };
+        let mut declinable = calls.iter().filter(|call| !topic(call)).peekable();
+        let all_declinable = declinable.peek().is_some() && declinable.all(|call| cancelled(&call));
+        all_declinable || (!calls.is_empty() && calls.iter().all(|call| cancelled(&call)))
     }
 
     /// Delete entries and, through each copy, the originals it re-recorded.
@@ -669,7 +773,7 @@ impl Fold {
         }
     }
 
-    fn patch(&mut self, patch: &Value) {
+    fn patch(&mut self, patch: &Value, converting: bool) {
         if patch.get("id").is_some_and(Value::is_string) {
             self.update(patch);
         }
@@ -692,12 +796,12 @@ impl Fold {
         let removed = ids("removeIds");
         // upstream moves listed messages to the end in list order; unlisted ones keep theirs
         let order = ids("orderIds");
-        self.resync(removed, order);
+        self.resync(removed, order, converting);
     }
 
     /// A `$set.messages` history checkpoint (gemini-cli up to 361b0bb; `$patch` replaced it in
     /// d1cc08a): upstream rebuilds its map from the list, so unlisted messages leave it.
-    fn checkpoint(&mut self, messages: &[Value]) {
+    fn checkpoint(&mut self, messages: &[Value], converting: bool) {
         let first_new = self.entries.len();
         let mut listed: Vec<usize> = Vec::new();
         for message in messages {
@@ -722,12 +826,12 @@ impl Fold {
             .copied()
             .filter(|index| !kept.contains(index))
             .collect();
-        self.resync(removed, listed);
+        self.resync(removed, listed, converting);
     }
 
     /// Remove `removed` from the map and move `order` to its end, as a tail rollback or a
     /// context rewrite (see `Fold`).
-    fn resync(&mut self, removed: Vec<usize>, order: Vec<usize>) {
+    fn resync(&mut self, removed: Vec<usize>, order: Vec<usize>, converting: bool) {
         let mut removed: Vec<(usize, usize)> = removed
             .into_iter()
             .filter_map(|index| self.slot_of(index).map(|slot| (slot, index)))
@@ -737,8 +841,10 @@ impl Fold {
         let removed: Vec<usize> = removed.into_iter().map(|(_, index)| index).collect();
         let gone: HashSet<usize> = removed.iter().copied().collect();
         let mut tail: HashSet<usize> = HashSet::new();
+        let mut tail_end = None;
+        let converted = converting && self.only_conversion_skips(&removed);
         let mut copies: Vec<(usize, usize)> = Vec::new();
-        if !removed.is_empty() {
+        if !removed.is_empty() && !converted {
             // walked back past what this re-sync recorded, the map ends with its rolled-back tail
             let mut from = self.order.len();
             let mut gaps = false;
@@ -750,6 +856,7 @@ impl Fold {
                     None => gaps = true,
                     Some(index) if self.entered_now(index) => {}
                     Some(index) if gone.contains(&index) => {
+                        tail_end.get_or_insert(index);
                         tail.insert(index);
                     }
                     Some(_) => break,
@@ -759,6 +866,9 @@ impl Fold {
             // each gap is crossed once: one-in-one-out re-syncs would otherwise walk them all again
             if gaps {
                 self.compact_from(from);
+            }
+            if tail_end.is_some_and(|index| self.declined(index)) {
+                tail.clear();
             }
         }
         if let Some(last) = removed.last().and_then(|index| self.slot_of(*index)) {
@@ -797,20 +907,25 @@ impl Fold {
                 dropped.iter().map(|index| self.copy_key(*index)).collect();
             let whole = self.before_mark == 0;
             self.pair(&dropped, &keys, &copies, whole);
-            for (index, key) in dropped.iter().zip(&keys) {
-                if let Some(entry) = self.entries.get_mut(*index) {
-                    entry.state = State::Dropped;
-                }
-                if let Some(key) = key {
-                    self.dropped
-                        .entry(key_hash(key))
-                        .or_default()
-                        .insert(*index);
-                }
-            }
+            self.mark_dropped(&dropped, &keys);
             self.tidy();
         }
         self.set_mark();
+    }
+
+    /// Mark messages already out of the map dropped, and pool them for later whole rewrites.
+    fn mark_dropped(&mut self, dropped: &[usize], keys: &[Option<CopyKey>]) {
+        for (index, key) in dropped.iter().zip(keys) {
+            if let Some(entry) = self.entries.get_mut(*index) {
+                entry.state = State::Dropped;
+            }
+            if let Some(key) = key {
+                self.dropped
+                    .entry(key_hash(key))
+                    .or_default()
+                    .insert(*index);
+            }
+        }
     }
 
     /// Pair copies with the removed messages they repeat, order-preserving. Compression copies a
@@ -837,35 +952,39 @@ impl Fold {
                 at.entry(key).or_default().push(position);
             }
         }
-        let mut starts: HashMap<PartKey, Vec<usize>> = HashMap::new();
-        let mut ends: HashMap<PartKey, Vec<usize>> = HashMap::new();
-        for (position, index) in removed.iter().enumerate() {
+        let part_keys = |index: &usize| -> Vec<PartKey> {
             let parts = self.user_parts(*index).unwrap_or_default();
+            parts.iter().map(part_key).collect()
+        };
+        let removed_parts: Vec<Vec<PartKey>> = removed.iter().map(part_keys).collect();
+        let copy_parts: Vec<Vec<PartKey>> = copies.iter().map(part_keys).collect();
+        let mut starts: HashMap<&PartKey, Vec<usize>> = HashMap::new();
+        let mut ends: HashMap<&PartKey, Vec<usize>> = HashMap::new();
+        for (position, parts) in removed_parts.iter().enumerate() {
             if let (Some(first), Some(last)) = (parts.first(), parts.last()) {
-                starts.entry(part_key(first)).or_default().push(position);
-                ends.entry(part_key(last)).or_default().push(position);
+                starts.entry(first).or_default().push(position);
+                ends.entry(last).or_default().push(position);
             }
         }
+        let wanted = |slot: usize| copy_parts.get(slot).map(Vec::as_slice).unwrap_or_default();
         let opens = matches!(
             (copy_keys.first(), removed_keys.first()),
             (Some(Some(copy)), Some(Some(first))) if copy == first
-        ) || copies
-            .first()
-            .and_then(|copy| self.run(*copy, removed, &starts, 0, true))
+        ) || Self::run(wanted(0), &removed_parts, &starts, 0, true)
             .is_some_and(|(start, _)| start == 0);
         // a whole rewrite re-records the context from its start, but a save made after `/rewind`
         // or `--resume` lacks the environment message, so judge by the first copy past it
-        let lead = copy_keys.iter().zip(copies).find_map(|(key, copy)| {
+        let lead = copy_keys.iter().enumerate().find_map(|(slot, key)| {
             let context = |(kind, text, _): &CopyKey| kind == "user" && is_injected_context(text);
             key.as_ref()
                 .filter(|key| !context(key))
-                .map(|key| (key, *copy))
+                .map(|key| (key, slot))
         });
         let front = opens
             || (whole
-                && lead.is_some_and(|(key, copy)| {
+                && lead.is_some_and(|(key, slot)| {
                     at.contains_key(key)
-                        || self.run(copy, removed, &starts, 0, true).is_some()
+                        || Self::run(wanted(slot), &removed_parts, &starts, 0, true).is_some()
                         || self.dropped_original(key, 0).is_some()
                 }));
         let mut originals: Vec<Vec<usize>> = vec![Vec::new(); copies.len()];
@@ -877,7 +996,7 @@ impl Fold {
         let mut bound = if front { 0 } else { removed.len() };
         let mut dropped_bound = 0;
         for slot in order {
-            let (Some(copy), Some(Some(key))) = (copies.get(slot), copy_keys.get(slot)) else {
+            let Some(Some(key)) = copy_keys.get(slot) else {
                 continue;
             };
             let positions = at.get(key).map(Vec::as_slice).unwrap_or_default();
@@ -887,7 +1006,7 @@ impl Fold {
                 let below = positions.partition_point(|p| *p < bound);
                 below.checked_sub(1).and_then(|p| positions.get(p))
             };
-            let run = self.run(*copy, removed, edges, bound, front);
+            let run = Self::run(wanted(slot), &removed_parts, edges, bound, front);
             // the nearer of the two in pairing order
             let span = match (found.copied(), run) {
                 (Some(at), Some((start, end)))
@@ -924,18 +1043,17 @@ impl Fold {
         }
     }
 
-    /// The run of two or more consecutive `removed` user turns whose parts, one after another, are
-    /// the user copy's: the one starting at or after `bound` from the front, else the one ending
-    /// before it. `edges` maps each removed user turn's first (front) or last part to positions.
+    /// The run of two or more consecutive removed user turns whose parts, one after another, are
+    /// the user copy's (`want`): the one starting at or after `bound` from the front, else the one
+    /// ending before it. `edges` maps each removed user turn's first (front) or last part to
+    /// positions; every part is keyed once per `pair`, so a comparison never re-reads its text.
     fn run(
-        &self,
-        copy: usize,
-        removed: &[usize],
-        edges: &HashMap<PartKey, Vec<usize>>,
+        want: &[PartKey],
+        removed_parts: &[Vec<PartKey>],
+        edges: &HashMap<&PartKey, Vec<usize>>,
         bound: usize,
         front: bool,
     ) -> Option<(usize, usize)> {
-        let want: Vec<PartKey> = self.user_parts(copy)?.iter().map(part_key).collect();
         if want.len() < 2 {
             return None;
         }
@@ -946,7 +1064,7 @@ impl Fold {
         // stop at a few per part of the copy, so a crafted run of repeats stays linear
         let budget = std::cell::Cell::new(4 * want.len());
         let fits = |at: usize, taken: usize| -> Option<usize> {
-            let parts = self.user_parts(*removed.get(at)?)?;
+            let parts = removed_parts.get(at).filter(|parts| !parts.is_empty())?;
             let range = if front {
                 taken..taken + parts.len()
             } else {
@@ -954,11 +1072,7 @@ impl Fold {
             };
             let wanted = want.get(range)?;
             budget.set(budget.get().checked_sub(wanted.len())?);
-            let same = wanted
-                .iter()
-                .zip(parts)
-                .all(|(w, part)| *w == part_key(part));
-            same.then_some(parts.len())
+            (wanted == parts.as_slice()).then_some(parts.len())
         };
         let (mut next, mut edge, mut taken, mut members) = (Some(start), start, 0, 0);
         while taken < want.len() {
@@ -1745,7 +1859,7 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
-        assert_eq!(files.len(), 112);
+        assert_eq!(files.len(), 124);
         let mut failures = Vec::new();
         for path in files {
             let (messages, _, tally) = parse(&path);
@@ -1804,8 +1918,9 @@ mod tests {
     }
 
     /// Hostile shapes stay linear: one id removed per re-sync from a long map, comment-dense
-    /// prompts passing through a rewrite, and one-in-one-out re-syncs behind a long map, whose
-    /// gaps the rollback walk would cross again each time. Quadratic handling took minutes.
+    /// prompts passing through a rewrite, one-in-one-out re-syncs behind a long map, whose gaps the
+    /// rollback walk would cross again each time, and many coalesced-looking copies ending like a
+    /// removed turn with a huge part, which pairing would re-read per copy. Each took minutes.
     #[test]
     fn hostile_re_syncs_parse_in_linear_time() {
         let root = temp_root("hostile");
@@ -1865,12 +1980,100 @@ mod tests {
         let started = std::time::Instant::now();
         let (_, _, tally) = parse(&path);
         let elapsed = started.elapsed();
-        let _ = std::fs::remove_dir_all(&root);
         let (seen, rows, agent_rows, skips, errors) = identity(&tally);
         assert_eq!(seen, (stable + 2 * rounds) as u64);
         assert_eq!(seen, rows + agent_rows + skips + errors);
         assert!(body.len() > 25_000_000);
         assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+
+        let path = root.join("session-2026-04-27T09-00-6e6e6e6e.jsonl");
+        let copies = 150_000;
+        let mut body = String::from(
+            r#"{"sessionId":"6e6e6e6e-0000-4000-8000-00000000000c","projectHash":"h"}"#,
+        );
+        body.push('\n');
+        let huge = "x".repeat(8 << 20);
+        body.push_str(&format!(
+            r#"{{"id":"r","type":"user","content":[{{"text":"{huge}"}},{{"text":"a"}}]}}"#
+        ));
+        body.push('\n');
+        for n in 0..copies {
+            body.push_str(&format!(
+                "{{\"id\":\"c{n}\",\"type\":\"user\",\"content\":[{{\"text\":\"b\"}},{{\"text\":\"a\"}}]}}\n"
+            ));
+        }
+        body.push_str(r#"{"$patch":{"removeIds":["r"]}}"#);
+        std::fs::write(&path, &body).unwrap();
+        let started = std::time::Instant::now();
+        let (rows, _, _) = parse(&path);
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(rows.len(), copies + 1);
+        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+    }
+
+    /// A declined tool sets the history back to before its prompt. Coalesced, the first prompt
+    /// stays in the environment's copy, which `/rewind`'s conversion then leaves out of the map
+    /// with a `$rewindTo` of its own; and with nothing before the prompt the decline itself rolls
+    /// everything back. Neither is the person undoing the prompt. A second `/rewind` still is.
+    #[test]
+    fn declined_prompts_survive_the_rollbacks_around_them() {
+        let root = temp_root("declined");
+        let env = r#"{"text":"<session_context>\nx\n</session_context>"}"#;
+        let declined =
+            r#""toolCalls":[{"id":"t1","name":"run_shell_command","status":"cancelled"}]"#;
+        let flows = [
+            (
+                vec![
+                    format!(r#"{{"id":"env","type":"user","content":[{env}]}}"#),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:00:00.000Z"}}"#.to_string(),
+                    r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:01:00.000Z"}}"#.to_string(),
+                    format!(r#"{{"id":"g1","type":"gemini","content":"",{declined}}}"#),
+                    format!(r#"{{"id":"c1","type":"user","content":[{env},{{"text":"alpaca"}}]}}"#),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:02:00.000Z"}}"#.to_string(),
+                    r#"{"$patch":{"removeIds":["env","u1","g1"]}}"#.to_string(),
+                    r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:03:00.000Z"}}"#.to_string(),
+                    r#"{"$rewindTo":"u2"}"#.to_string(),
+                    r#"{"$rewindTo":"c1"}"#.to_string(),
+                    r#"{"id":"u3","type":"user","content":[{"text":"cheetah"}]}"#.to_string(),
+                ],
+                vec!["alpaca", "cheetah"],
+            ),
+            (
+                vec![
+                    r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:01:00.000Z"}}"#.to_string(),
+                    format!(r#"{{"id":"g1","type":"gemini","content":"",{declined}}}"#),
+                    r#"{"$rewindTo":"u1"}"#.to_string(),
+                    r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+                ],
+                vec!["alpaca", "bison"],
+            ),
+            (
+                vec![
+                    r#"{"id":"u1","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                    r#"{"id":"u2","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+                    r#"{"id":"u3","type":"user","content":[{"text":"cheetah"}]}"#.to_string(),
+                    r#"{"$set":{"lastUpdated":"2026-04-28T09:03:00.000Z"}}"#.to_string(),
+                    r#"{"$rewindTo":"u3"}"#.to_string(),
+                    r#"{"$rewindTo":"u2"}"#.to_string(),
+                ],
+                vec!["alpaca"],
+            ),
+        ];
+        for (n, (lines, want)) in flows.into_iter().enumerate() {
+            let path = root.join(format!("session-2026-04-28T09-00-6f6f6f6{n}.jsonl"));
+            let head = r#"{"sessionId":"6f6f6f6f-0000-4000-8000-00000000000d","projectHash":"h"}"#;
+            std::fs::write(&path, format!("{head}\n{}", lines.join("\n"))).unwrap();
+            let (messages, _, tally) = parse(&path);
+            let texts: Vec<&str> = messages.iter().map(|m| &*m.text).collect();
+            assert_eq!(texts, want, "flow {n}");
+            let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+            assert_eq!(seen, rows + agent_rows + skips + errors, "flow {n}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

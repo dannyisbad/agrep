@@ -1,0 +1,20 @@
+{"sessionId":"7c7c7c7c-301c-4000-8000-7c7c7c7c7c7c","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-07-29T09:01:00.000Z","lastUpdated":"2026-07-29T09:01:00.000Z","kind":"main"}
+{"$set":{"messages":[{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-07-29T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}],"lastUpdated":"2026-07-29T09:01:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000001","timestamp":"2026-07-29T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-07-29T09:02:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000002","timestamp":"2026-07-29T09:03:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-07-29T09:03:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000002","timestamp":"2026-07-29T09:03:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"shell-alpaca","name":"run_shell_command","args":{"command":"rm -r alpaca"},"result":[{"functionResponse":{"id":"shell-alpaca","name":"run_shell_command","response":{"output":"[Operation Cancelled] Reason: User denied execution."}}}],"status":"cancelled","timestamp":"2026-07-29T09:03:00.000Z","displayName":"run_shell_command","description":"run_shell_command tool","renderOutputAsMarkdown":false}]}
+{"id":"7c7c7c7c-0000-4000-8000-000000000003","timestamp":"2026-07-29T09:04:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-07-29T09:04:00.000Z"}}
+{"$set":{"messages":[{"id":"7c7c7c7c-0000-4000-8000-000000000003","timestamp":"2026-07-29T09:04:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}],"lastUpdated":"2026-07-29T09:04:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000004","timestamp":"2026-07-29T09:05:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-07-29T09:05:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000005","timestamp":"2026-07-29T09:06:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-07-29T09:06:00.000Z"}}
+{"$rewindTo":"7c7c7c7c-0000-4000-8000-000000000004"}
+{"$set":{"messages":[],"lastUpdated":"2026-07-29T09:07:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000006","timestamp":"2026-07-29T09:08:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-07-29T09:08:00.000Z"}}
+{"id":"7c7c7c7c-0000-4000-8000-000000000007","timestamp":"2026-07-29T09:09:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-07-29T09:09:00.000Z"}}

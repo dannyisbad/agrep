@@ -73,6 +73,7 @@ const ENV_TEXT = '<session_context>\nThis is the Gemini CLI.\n</session_context>
 const ACK = 'Got it. Thanks for the additional context!';
 const INTERRUPTED = '[The previous response was interrupted before it completed.]';
 const CANCELLED = '[Operation Cancelled] Reason: User cancelled the operation.';
+const DENIED = '[Operation Cancelled] Reason: User denied execution.';
 const MASKED = '<tool_output_masked>\noutput hidden to save context\n</tool_output_masked>';
 
 // Both classes expose the Recorder surface; their declared private fields differ by version.
@@ -181,6 +182,18 @@ class Session {
   tool(callId: string, name: string, args: Record<string, unknown>, output: string): void {
     this.call(callId, name, args, output);
     this.respond(callId, name, output);
+  }
+
+  /**
+   * A prompt whose tool call the person declines. useGeminiStream notes getHistory().length before
+   * sending (1742-1745 at fb972b2) and, with every tool cancelled, sets the history back to that
+   * length (2119-2140); coalesced, the first prompt is merged into the environment turn and stays.
+   */
+  declined(text: string, callId: string, name: string, args: Record<string, unknown>): void {
+    const before = this.contents().length;
+    this.prompt(text);
+    this.call(callId, name, args, DENIED, 'cancelled');
+    this.setHistory(this.contents().slice(0, before));
   }
 
   /** sendMessageStream in IDE mode: the editor context goes in as its own turn (addHistory). */
@@ -669,6 +682,41 @@ const SCENARIOS: Scenario[] = [
       s.rewind(s.idOf('alpaca'));
       s.setHistory(saved);
       plainTurn(s, 'bison');
+    },
+  },
+  {
+    // coalesced, the decline re-records the environment and the declined prompt as one copy;
+    // /rewind's conversion later leaves that copy out, which undoes nothing
+    name: 'decline_rewind',
+    expect: [user('alpaca', ''), user('cheetah')],
+    run: async (s) => {
+      s.declined('alpaca', 'shell-alpaca', 'run_shell_command', { command: 'rm -r alpaca' });
+      plainTurn(s, 'bison');
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    name: 'decline_twice_rewind',
+    expect: [user('alpaca', ''), user('bison', ''), user('dingo')],
+    run: async (s) => {
+      s.declined('alpaca', 'shell-alpaca', 'run_shell_command', { command: 'rm -r alpaca' });
+      s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
+      plainTurn(s, 'cheetah');
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    name: 'decline_later_resume_rewind',
+    expect: [user('alpaca'), user('bison', ''), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
+      await s.resume();
+      plainTurn(s, 'cheetah');
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
     },
   },
 ];

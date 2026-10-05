@@ -147,6 +147,20 @@
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"]
  ]},
+ "4c4c4c4c-001c-4000-8000-4c4c4c4c4c4c": {"flow": "current/decline_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "4d4d4d4d-001d-4000-8000-4d4d4d4d4d4d": {"flow": "current/decline_twice_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "4e4e4e4e-001e-4000-8000-4e4e4e4e4e4e": {"flow": "current/decline_later_resume_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
  "10101010-1000-4000-8000-101010101010": {"flow": "checkpoint/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"],
@@ -294,6 +308,20 @@
  "5b5b5b5b-101b-4000-8000-5b5b5b5b5b5b": {"flow": "checkpoint/chat_resume_rewound_first", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"]
+ ]},
+ "5c5c5c5c-101c-4000-8000-5c5c5c5c5c5c": {"flow": "checkpoint/decline_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "5d5d5d5d-101d-4000-8000-5d5d5d5d5d5d": {"flow": "checkpoint/decline_twice_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "5e5e5e5e-101e-4000-8000-5e5e5e5e5e5e": {"flow": "checkpoint/decline_later_resume_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
  ]},
  "20202020-2000-4000-8000-202020202020": {"flow": "current+coalesced/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
@@ -443,6 +471,20 @@
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"]
  ]},
+ "6c6c6c6c-201c-4000-8000-6c6c6c6c6c6c": {"flow": "current+coalesced/decline_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "6d6d6d6d-201d-4000-8000-6d6d6d6d6d6d": {"flow": "current+coalesced/decline_twice_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "6e6e6e6e-201e-4000-8000-6e6e6e6e6e6e": {"flow": "current+coalesced/decline_later_resume_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
  "30303030-3000-4000-8000-303030303030": {"flow": "checkpoint+coalesced/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"],
@@ -590,5 +632,19 @@
  "7b7b7b7b-301b-4000-8000-7b7b7b7b7b7b": {"flow": "checkpoint+coalesced/chat_resume_rewound_first", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"]
+ ]},
+ "7c7c7c7c-301c-4000-8000-7c7c7c7c7c7c": {"flow": "checkpoint+coalesced/decline_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","cheetah","ok cheetah"]
+ ]},
+ "7d7d7d7d-301d-4000-8000-7d7d7d7d7d7d": {"flow": "checkpoint+coalesced/decline_twice_rewind", "rows": [
+  ["user","alpaca",""],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
+ "7e7e7e7e-301e-4000-8000-7e7e7e7e7e7e": {"flow": "checkpoint+coalesced/decline_later_resume_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
  ]}
 }
