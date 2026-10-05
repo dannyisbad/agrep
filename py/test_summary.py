@@ -173,6 +173,12 @@ TASKS_LISTED = "ct000010-0710-4000-8000-000000000710"
 TASKS_KIN_NARRATED = "ct000011-0711-4000-8000-000000000711"
 TASKS_KIN_NESTED = "ct000012-0712-4000-8000-000000000712"
 TASKS_KIN_NESTED_RELAY = "ct000013-0713-4000-8000-000000000713"
+# a resumed agent keeps its id: SendMessage resumed it in the background (2.1.84), Agent(resume=)
+# never returned (2.1.71), or the resumed run returned and closed the root's task
+TASKS_RESUMED_BACKGROUND = "ct000014-0714-4000-8000-000000000714"
+TASKS_RESUMED_UNRETURNED = "ct000015-0715-4000-8000-000000000715"
+TASKS_RESUMED_RETURNED = "ct000016-0716-4000-8000-000000000716"
+TASKS_BATCH_OUT = "ct000017-0717-4000-8000-000000000717"  # A returned, its batch-mate C did not
 # cursor todo_write merge=true: statuses by id, content plus a new id, a new id without content
 CURSOR_MERGE_STATUS = "k1000001-0715-4000-8000-000000000715"
 CURSOR_MERGE_CONTENT = "k2000002-0716-4000-8000-000000000716"
@@ -693,6 +699,28 @@ class SummaryTests(unittest.TestCase):
         for session in (TASKS_KIN_NESTED, TASKS_KIN_NESTED_RELAY):
             with self.subTest(session=session):
                 self.assertNotIn(session, pending)
+
+    def test_an_earlier_runs_result_never_hands_back_a_resumed_agent(self) -> None:
+        # the first run's agentId line proves only that run; the resumed one is still working
+        pending = self._tasks_pending("--project", "mx-tasks")
+        for session, side in ((TASKS_RESUMED_BACKGROUND, "agent-ct14side01"),
+                              (TASKS_RESUMED_UNRETURNED, "agent-ct15side01")):
+            with self.subTest(session=session):
+                item = pending.get(session, {})
+                self.assertEqual(
+                    (item.get("status"), item.get("source"), item.get("evidence_session"),
+                     item.get("signals")),
+                    ("agent_work_incomplete", "side-chat", side,
+                     ["side chat has no captured reply to its last turn"]))
+        # a resumed run that returned names the agent again, so its task closure counts
+        self.assertNotIn(TASKS_RESUMED_RETURNED, pending)
+
+    def test_a_hand_back_counts_for_the_root_only_once_its_batch_returned(self) -> None:
+        # Claude goes on only after every agent call of a batch returned; C's is still out, so
+        # the root never saw C close #2, while A's closure came back with A's result
+        item = self._tasks_pending("--project", "mx-tasks").get(TASKS_BATCH_OUT, {})
+        self.assertEqual((item.get("status"), item.get("source"), item.get("items")),
+                         ("todo_open", "root", ["Port the yaml reader"]))
 
     def test_capped_cursor_merge_leaves_the_list_unknown(self) -> None:
         # the merge closing items 9 and 10 was cut by the event cap: they are neither open nor done

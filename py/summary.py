@@ -894,25 +894,36 @@ def _listed_tasks(event: dict, known: dict[str, list[str]]) -> dict[str, list[st
     return listed
 
 
-def _received_horizon(root: _Chat) -> int:
-    """The latest moment the root is provably past: its own, or that of a kin whose result it
-    received, directly or through another kin."""
-    return max(_latest_ts(member) for member in (root, *_handed_back(root, root.task_kin)))
+def _received_horizon(root: _Chat, handed_back: list[_Chat]) -> int:
+    """The latest moment the root is provably past: its own, or that of a kin whose result reached
+    it while no agent call it made before then was still out, since Claude goes on only once every
+    call of a batch returned."""
+    out = _latest_ts(root)
+    unreturned = [int(event.get("ts") or 0) for event in root.events
+                  if event.get("kind") == "subagent_start" and event.get("ok") is None]
+    for member in handed_back:
+        latest = _latest_ts(member)
+        if all(called > latest for called in unreturned):
+            out = max(out, latest)
+    return out
 
 
 def _task_events(chat: _Chat) -> list[dict]:
-    """The chat's events with its kin's Claude task tool calls merged in by time, up to the latest
-    moment it is past: a side chat's own, the root's received horizon. A caller's live window is
-    never history."""
+    """The chat's events with its kin's Claude task tool calls merged in by time: every call of a
+    kin whose result reached the root, else those up to the latest moment the chat is past, a side
+    chat's own or the root's received horizon. A caller's live window is never history."""
     calls = [(kin, [event for event in kin.events if event.get("kind") == "tool"
                     and _TASK_TOOL_RE.match(str(event.get("name") or ""))])
              for kin in chat.task_kin]
     if not any(kin_calls for _kin, kin_calls in calls):
         return chat.events
-    horizon = _received_horizon(chat) if chat.root == chat.session else _latest_ts(chat)
+    handed_back = _handed_back(chat, chat.task_kin) if chat.root == chat.session else []
+    horizon = _received_horizon(chat, handed_back)
     foreign = []
     for kin, kin_calls in calls:
-        until = horizon if kin.withheld_from is None else min(horizon, kin.withheld_from - 1)
+        until = _latest_ts(kin) if any(kin is got for got in handed_back) else horizon
+        if kin.withheld_from is not None:
+            until = min(until, kin.withheld_from - 1)
         foreign += [event for event in kin_calls if int(event.get("ts") or 0) <= until]
     if not foreign:
         return chat.events
@@ -1292,14 +1303,22 @@ def _notified(root: _Chat, side: _Chat) -> bool:
 
 
 def _agent_returned(root: _Chat, side: _Chat) -> bool:
-    """Did a Claude agent call in the root return the side chat's finished result? Claude Code
-    ends that result with a line naming the agent, which narration or a short reply can't hide."""
-    if not side.session.startswith(_AGENT_SESSION_PREFIX):
+    """Did a Claude agent call in the root return the side chat's latest run? Claude Code ends a
+    finished agent's result with a line naming it, which narration or a short reply can't hide. A
+    resumed agent keeps its id, so that call proves only the run it launched: the side chat's first
+    turn at or after the call."""
+    last = side.last_turn()
+    if last is None or not side.session.startswith(_AGENT_SESSION_PREFIX):
         return False
     agent_id = side.session[len(_AGENT_SESSION_PREFIX):]
-    return any(event.get("kind") == "subagent_start" and event.get("ok") is True
-               and agent_id in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))
-               for event in root.events)
+    for event in root.events:
+        if (event.get("kind") != "subagent_start" or event.get("ok") is not True
+                or agent_id not in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))):
+            continue
+        called = int(event.get("ts") or 0)
+        if min((row.ts for row in side.turns if row.ts >= called), default=None) == last.ts:
+            return True
+    return False
 
 
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
