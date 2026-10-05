@@ -2638,6 +2638,17 @@ impl IngestCache {
             })
     }
 
+    /// Whether this cache holds conversations of the token store database at `scope`. The
+    /// published inventory carries one snapshot's tokens, and a pass that held its snapshot back
+    /// may still have published rows past it.
+    fn holds_token_entries(&self, agent: &str, scope: &Path) -> bool {
+        let Some(prefix) = crate::ingest::registry::token_prefix(agent, scope) else {
+            return false;
+        };
+        let prefix = format!("\0tok\0{agent}\0{prefix}");
+        self.entries.keys().any(|key| key.starts_with(&prefix))
+    }
+
     /// Would publishing without `scope` (an unobservable subtree of `agent`'s store) drop
     /// material the last published generation held and this pass cannot serve?
     ///
@@ -2661,7 +2672,9 @@ impl IngestCache {
         if retained_here {
             return MaterialVerdict::Retained;
         }
-        if published.iter().any(|path| source_path_within(path, scope)) {
+        if published.iter().any(|path| source_path_within(path, scope))
+            || self.holds_token_entries(agent, scope)
+        {
             return MaterialVerdict::Drops;
         }
         // No path here, and nothing retained. Only an inventory that could actually read the
@@ -2696,6 +2709,7 @@ impl IngestCache {
         match self.published_material.as_ref() {
             Some(paths) => {
                 !paths.iter().any(|path| source_path_within(path, scope))
+                    && !self.holds_token_entries(agent, scope)
                     && !self.published_inventory_blind_to(agent, scope)
             }
             None => false,
@@ -5174,6 +5188,45 @@ mod tests {
         assert!(warm.output_complete());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_token_conversations_keep_their_database_published_material() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let chats = Path::new("/fixture/chats/crush.db");
+        let empty = Path::new("/fixture/empty/crush.db");
+        let prefix = crate::ingest::registry::token_prefix("crush", chats).unwrap();
+        let mut cache = IngestCache::cold();
+        cache.collect_token_cached_keyed_partial(
+            "crush",
+            Some(vec![(
+                format!("{prefix}session"),
+                "session".into(),
+                "v1".into(),
+            )]),
+            &[],
+            false,
+            true,
+            |_, _| (vec![test_message("cached chat")], Vec::new()),
+        );
+        cache.set_published_material(HashSet::new());
+        assert_eq!(
+            cache.published_material_under("crush", chats),
+            MaterialVerdict::Drops
+        );
+        assert!(!cache.unreadable_scope_covered("crush", chats));
+        assert_eq!(
+            cache.published_material_under("crush", empty),
+            MaterialVerdict::Retained
+        );
+        assert!(cache.unreadable_scope_covered("crush", empty));
+        // A Stat agent's scope never reads token entries.
+        assert_eq!(
+            cache.published_material_under("claude", chats),
+            MaterialVerdict::Retained
+        );
     }
 
     #[test]

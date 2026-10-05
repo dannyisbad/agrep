@@ -45,8 +45,10 @@ fn cursor_schema_absent_is_a_successful_empty_publication() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// A file SQLite rejects is a defect no retry heals: a fresh box discloses it and publishes an
+/// empty generation rather than refusing every agent, and no row is invented from it.
 #[test]
-fn cursor_garbage_database_is_unreadable_and_aborts_publication() {
+fn cursor_garbage_database_is_disclosed_and_publishes_nothing_from_it() {
     let home = temp_dir("cursor-garbage-home");
     let data = temp_dir("cursor-garbage-data");
     let database = cursor_db(&home);
@@ -55,21 +57,22 @@ fn cursor_garbage_database_is_unreadable_and_aborts_publication() {
 
     let output = ingest_output("cursor", &home, &data, true);
     assert!(
-        !output.status.success(),
-        "garbage Cursor store published successfully"
+        output.status.success(),
+        "one garbage Cursor store refused the first index:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(sorted_lines(&data.join("messages.jsonl")).is_empty());
+    let health: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join(".source-health.json")).unwrap()).unwrap();
+    let database = database.to_string_lossy();
     assert!(
-        stderr.contains("cursor"),
-        "adapter absent from error: {stderr}"
+        health["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["agent"] == "cursor"
+                && issue["path"] == database.as_ref()
+                && issue["kind"] == "unsupported-file-type"
+        }),
+        "garbage Cursor store published silently: {health}"
     );
-    assert!(
-        stderr.contains("state.vscdb"),
-        "source path absent from error: {stderr}"
-    );
-    assert!(!data.join("messages.jsonl").exists());
-    assert!(!data.join(".ingest.sig").exists());
-    assert!(!data.join("sessions.jsonl").exists());
 
     let _ = fs::remove_dir_all(data);
     let _ = fs::remove_dir_all(home);

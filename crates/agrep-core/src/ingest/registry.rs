@@ -168,6 +168,11 @@ pub trait Adapter: Sync {
     fn intake_tokens(&self) -> TokenAvailability {
         self.freshness_tokens()
     }
+    /// For `Fingerprint::Token` stores: the prefix every freshness token id and parse-cache id of
+    /// `database`'s conversations starts with. None keeps a listed database counted as material.
+    fn token_prefix(&self, _database: &Path) -> Option<String> {
+        None
+    }
     /// Actionable adapter root used only when a guarded collector cannot name a finer path.
     fn runtime_issue_root(&self) -> PathBuf {
         self.freshness_roots()
@@ -198,6 +203,14 @@ pub fn session_alias(agent: &str, path: &Path, session: &str) -> Option<String> 
         .iter()
         .find(|adapter| adapter.name() == agent)
         .and_then(|adapter| adapter.session_alias(path, session))
+}
+
+/// [`Adapter::token_prefix`] of `agent`'s store, when it is a `Fingerprint::Token` adapter.
+pub fn token_prefix(agent: &str, database: &Path) -> Option<String> {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
+        .and_then(|adapter| adapter.token_prefix(database))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1873,23 +1886,28 @@ impl SourceSnapshotView {
             if !adapter.files.is_empty() || !adapter.tokens.is_empty() {
                 agents.insert(adapter.agent.clone());
             }
-            // A database the token census could not enumerate is named by an issue, so the
-            // scope reads as unobserved: its stamp proves a file, never published conversations.
+            paths.extend(listed_sources(adapter).map(|source| source.path.clone()));
+        }
+        (agents, paths)
+    }
+
+    /// The publication guard's inventory: the listed paths, except that a token store's database
+    /// counts only while the snapshot carries a token of its conversations.
+    pub fn published_material(&self) -> HashSet<PathBuf> {
+        let mut paths = HashSet::new();
+        for adapter in &self.snapshot.adapters {
             paths.extend(
-                adapter
-                    .files
-                    .iter()
-                    .filter(|source| !is_sqlite_sidecar(&source.path))
-                    .filter(|source| {
-                        !adapter
-                            .issues
-                            .iter()
-                            .any(|issue| Path::new(issue.path()) == source.path)
+                listed_sources(adapter)
+                    .filter(|source| match token_prefix(&adapter.agent, &source.path) {
+                        Some(prefix) => {
+                            adapter.tokens.iter().any(|(id, _)| id.starts_with(&prefix))
+                        }
+                        None => true,
                     })
                     .map(|source| source.path.clone()),
             );
         }
-        (agents, paths)
+        paths
     }
 
     pub(crate) fn coverage(&self) -> SourceCoverage {
@@ -2001,6 +2019,13 @@ pub fn source_snapshot_expectations(bytes: &[u8]) -> (HashSet<String>, HashSet<P
         return (HashSet::new(), HashSet::new());
     };
     snapshot.expectations()
+}
+
+/// [`SourceSnapshotView::published_material`] of serialized snapshot bytes.
+pub fn source_snapshot_published_material(bytes: &[u8]) -> HashSet<PathBuf> {
+    source_snapshot_view(bytes)
+        .map(|snapshot| snapshot.published_material())
+        .unwrap_or_default()
 }
 
 /// Exact current preflight coverage consumed by the ingest collectors. Stat paths let the cache
@@ -2304,6 +2329,21 @@ fn is_sqlite_sidecar(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+        })
+}
+
+/// The content files `adapter` listed. A database the token census could not enumerate is named
+/// by an issue, so it reads as unobserved: its stamp proves a file, never published conversations.
+fn listed_sources(adapter: &AdapterSource) -> impl Iterator<Item = &SourceFile> {
+    adapter
+        .files
+        .iter()
+        .filter(|source| !is_sqlite_sidecar(&source.path))
+        .filter(|source| {
+            !adapter
+                .issues
+                .iter()
+                .any(|issue| Path::new(issue.path()) == source.path)
         })
 }
 
@@ -5059,5 +5099,59 @@ mod tests {
         assert!(!empty.contains("crush"));
         // the ENOENT set is unchanged: a present store is not absent
         assert!(!view.cleanly_absent_agents().contains("cursor"));
+    }
+
+    #[test]
+    fn published_material_counts_a_token_database_only_with_its_conversations() {
+        let file = |agent: &str, path: &Path| SourceFile {
+            agent: agent.into(),
+            path: path.to_path_buf(),
+            len: 4096,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            change_token: ChangeToken::Metadata(1),
+            #[cfg(windows)]
+            file_identity: None,
+            content_hash: None,
+        };
+        let adapter = |agent: &str, files: Vec<SourceFile>, tokens| AdapterSource {
+            agent: agent.into(),
+            files,
+            tokens,
+            issues: Vec::new(),
+            complete: true,
+        };
+        let transcript = PathBuf::from("/fixture/claude/chat.jsonl");
+        let empty_db = PathBuf::from("/fixture/empty/crush.db");
+        let chats_db = PathBuf::from("/fixture/chats/crush.db");
+        let cursor_db = PathBuf::from("/fixture/User/globalStorage/state.vscdb");
+        let chats = token_prefix("crush", &chats_db).unwrap();
+        assert!(!token_prefix("crush", &empty_db).unwrap().is_empty());
+        assert_eq!(token_prefix("claude", &transcript), None);
+        let snapshot = SourceSnapshot {
+            snapshot_version: SOURCE_SNAPSHOT_VERSION,
+            cache_version: crate::ingest_cache::CACHE_VERSION,
+            selection: "all".into(),
+            adapters: vec![
+                adapter("claude", vec![file("claude", &transcript)], Vec::new()),
+                adapter(
+                    "crush",
+                    vec![file("crush", &empty_db), file("crush", &chats_db)],
+                    vec![(format!("{chats}session"), "u:1".into())],
+                ),
+                adapter("cursor", vec![file("cursor", &cursor_db)], Vec::new()),
+            ],
+            complete: true,
+        };
+        let encoded = bincode::serialize(&snapshot).unwrap();
+        assert_eq!(
+            source_snapshot_published_material(&encoded),
+            HashSet::from([transcript.clone(), chats_db.clone()])
+        );
+        // Repair expectations still name every listed file.
+        assert_eq!(
+            source_snapshot_expectations(&encoded).1,
+            HashSet::from([transcript, empty_db, chats_db, cursor_db])
+        );
     }
 }

@@ -391,27 +391,14 @@ impl Unenumerable {
     }
 }
 
-/// The primary result code, including the input errors SQLite reports with a token offset.
-fn sqlite_code(error: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
-    match error {
-        rusqlite::Error::SqliteFailure(failure, _) => Some(failure.code),
-        rusqlite::Error::SqlInputError { error, .. } => Some(error.code),
-        _ => None,
-    }
-}
-
 fn open_failure(path: &Path, error: &rusqlite::Error) -> Unenumerable {
-    if sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase) {
-        return Unenumerable::foreign(error);
-    }
-    // The open flattens I/O errors into CANTOPEN; a zero-byte secure probe recovers the
-    // permission case without letting a swapped-in special file block the census.
-    match crate::ingest::registry::regular_file_edge_snapshot(path, 0) {
-        Err(probe) if probe.kind() == std::io::ErrorKind::PermissionDenied => Unenumerable {
-            kind: "permission-denied",
-            reason: probe.to_string(),
+    match crate::ingest::sqlite_open_defect(path, error) {
+        Some("unsupported-file-type") => Unenumerable::foreign(error),
+        Some(kind) => Unenumerable {
+            kind,
+            reason: error.to_string(),
         },
-        _ => Unenumerable::transient(),
+        None => Unenumerable::transient(),
     }
 }
 
@@ -669,7 +656,8 @@ const MESSAGES_QUERY: &str = "SELECT role, parts, model, created_at FROM message
      WHERE session_id = ? ORDER BY created_at, id";
 
 fn schema_rejection(error: &rusqlite::Error) -> Option<Unenumerable> {
-    (sqlite_code(error) == Some(rusqlite::ErrorCode::Unknown)).then(|| Unenumerable::foreign(error))
+    (crate::ingest::sqlite_code(error) == Some(rusqlite::ErrorCode::Unknown))
+        .then(|| Unenumerable::foreign(error))
 }
 
 /// Every session's exact generation-qualified staleness token. SQLite rejecting the census or a
@@ -986,6 +974,10 @@ impl crate::ingest::registry::Adapter for Crush {
     }
     fn store_content(&self, path: &Path) -> bool {
         path.file_name().and_then(|name| name.to_str()) == Some("crush.db")
+    }
+    fn token_prefix(&self, database: &Path) -> Option<String> {
+        self.store_content(database)
+            .then(|| cache_namespace(database))
     }
     fn freshness_tokens(&self) -> crate::ingest::registry::TokenAvailability {
         live_tokens(false)
@@ -1553,7 +1545,7 @@ mod tests {
             assert!(!at_stake.output_complete());
         }
 
-        // Retained over a warm base: every cached conversation is served and none is deleted.
+        // A warm base still holding the database's conversations serves them and deletes none.
         for _pass in 0..2 {
             let mut warm = IngestCache::load(&cache_path);
             warm.set_published_material(HashSet::new());

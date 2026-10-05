@@ -886,6 +886,31 @@ pub(crate) fn open_sqlite_ro(path: &Path) -> Result<ReadOnlyConnection, rusqlite
     open_sqlite_ro_with_hook(path, || {})
 }
 
+/// The primary result code, including the input errors SQLite reports with a token offset.
+pub(crate) fn sqlite_code(error: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => Some(failure.code),
+        rusqlite::Error::SqlInputError { error, .. } => Some(error.code),
+        _ => None,
+    }
+}
+
+/// The source issue kind of a read-only open failure no retry heals: a file SQLite rejects as
+/// no database, or one the user may not read. None for failures a retry may clear.
+pub(crate) fn sqlite_open_defect(path: &Path, error: &rusqlite::Error) -> Option<&'static str> {
+    if sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase) {
+        return Some("unsupported-file-type");
+    }
+    // The open flattens I/O errors into CANTOPEN; a zero-byte secure probe recovers the
+    // permission case without letting a swapped-in special file block the census.
+    match crate::ingest::registry::regular_file_edge_snapshot(path, 0) {
+        Err(probe) if probe.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some("permission-denied")
+        }
+        _ => None,
+    }
+}
+
 /// Metadata generation for a SQLite database and its committed WAL. The shared-memory file is
 /// lock coordination rather than durable content and must not invalidate warm generations.
 pub(crate) fn sqlite_generation_token(path: &std::path::Path) -> std::io::Result<String> {

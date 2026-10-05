@@ -1,6 +1,6 @@
-//! A file at crush's store path that is not a readable crush database (foreign tables, empty, not
-//! SQLite, partial schema, unreadable) is disclosed as a source issue while every other agent keeps
-//! publishing, and never reads as a cleanly empty store that could converge away crush's rows.
+//! A file at a token store's database path (crush, cursor) that is not a readable database of it
+//! (foreign tables, empty, not SQLite, partial schema, unreadable) is disclosed as a source issue
+//! while every other agent keeps publishing, and never reads as a cleanly empty store.
 
 mod common;
 
@@ -121,20 +121,24 @@ fn plant_claude_chat(home: &Path, text: &str) -> PathBuf {
     path
 }
 
-/// Kinds of the disclosed source-health issues naming `db` for crush.
-fn crush_issue_kinds(data: &Path, db: &Path) -> Vec<String> {
+/// Kinds of the disclosed source-health issues naming `path` for `agent`.
+fn source_issue_kinds(data: &Path, agent: &str, path: &Path) -> Vec<String> {
     let Ok(body) = fs::read(data.join(".source-health.json")) else {
         return Vec::new();
     };
     let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let db = db.to_string_lossy();
+    let path = path.to_string_lossy();
     health["issues"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|issue| issue["agent"] == "crush" && issue["path"] == db.as_ref())
+        .filter(|issue| issue["agent"] == agent && issue["path"] == path.as_ref())
         .filter_map(|issue| issue["kind"].as_str().map(str::to_owned))
         .collect()
+}
+
+fn crush_issue_kinds(data: &Path, db: &Path) -> Vec<String> {
+    source_issue_kinds(data, "crush", db)
 }
 
 fn assert_published(output: &std::process::Output, context: &str) {
@@ -304,6 +308,154 @@ fn foreign_crush_store_beside_a_vanished_claude_root_retains_and_publishes() {
     let restored = ingest_output("all", &home, &data, false);
     assert_published(&restored, "claude root restored");
     assert!(normalize(&data).contains("crush probe churn 1"));
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+fn cursor_db(home: &Path) -> PathBuf {
+    home.join(".config")
+        .join("Cursor")
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb")
+}
+
+fn plant_empty_cursor(db: &Path) {
+    remove_database(db);
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB); \
+             CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+        )
+        .unwrap();
+    connection.close().unwrap();
+}
+
+/// An empty token store is a deletion-shaped observation: its generation publishes once a second
+/// healthy pass confirms it, and only then is `agent`'s disclosure for `db` retired.
+fn index_empty_store_until_published(home: &Path, data: &Path, agent: &str, db: &Path) {
+    for _pass in 0..2 {
+        ingest_into("all", home, data, false);
+    }
+    assert!(data.join(".source_snapshot.bin").exists());
+    assert!(source_issue_kinds(data, agent, db).is_empty());
+}
+
+/// A database published while it held no conversation has nothing a generation could lose, so
+/// once it turns foreign every run publishes beside the disclosure instead of refusing.
+#[test]
+fn crush_store_published_without_conversations_then_foreign_does_not_block_other_agents() {
+    let home = claude_home("crush-empty-then-foreign-home");
+    let db = crush_db(&home);
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    plant_crush_seed(&db);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch("DELETE FROM messages; DELETE FROM sessions;")
+        .unwrap();
+    connection.close().unwrap();
+    let data = temp_dir("crush-empty-then-foreign-data");
+    index_empty_store_until_published(&home, &data, "crush", &db);
+    assert!(!has_crush_rows(&data));
+
+    remove_database(&db);
+    plant_foreign_tables(&db);
+    for minute in [1, 2, 3] {
+        append_churn(&claude_transcript(&home), minute);
+        let output = ingest_output("all", &home, &data, false);
+        assert_published(
+            &output,
+            &format!("emptied crush store turned foreign, run {minute}"),
+        );
+        assert!(normalize(&data).contains(&format!("crush probe churn {minute}")));
+        assert!(crush_issue_kinds(&data, &db).contains(&"unsupported-file-type".to_string()));
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// Cursor's one database follows the same rule: unreadable on a first index, or after a
+/// generation that held none of its conversations, it is disclosed and every other agent publishes.
+#[test]
+fn cursor_store_without_published_conversations_turning_unreadable_does_not_block_other_agents() {
+    let home = claude_home("cursor-empty-then-foreign-home");
+    let db = cursor_db(&home);
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    plant_not_sqlite(&db);
+    let data = temp_dir("cursor-empty-then-foreign-data");
+    let first = ingest_output("all", &home, &data, false);
+    assert_published(&first, "unreadable cursor store on a first index");
+    assert!(normalize(&data).contains(CLAUDE_TEXT));
+    assert!(source_issue_kinds(&data, "cursor", &db).contains(&"unsupported-file-type".to_string()));
+
+    plant_empty_cursor(&db);
+    index_empty_store_until_published(&home, &data, "cursor", &db);
+
+    remove_database(&db);
+    plant_not_sqlite(&db);
+    for minute in [1, 2, 3] {
+        append_churn(&claude_transcript(&home), minute);
+        let output = ingest_output("all", &home, &data, false);
+        assert_published(
+            &output,
+            &format!("emptied cursor store unreadable, run {minute}"),
+        );
+        assert!(normalize(&data).contains(&format!("crush probe churn {minute}")));
+        assert!(
+            source_issue_kinds(&data, "cursor", &db).contains(&"unsupported-file-type".to_string())
+        );
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// Cursor conversations already indexed stay published behind an unreadable database, and with
+/// the cache gone the pass refuses rather than publishing a generation without them.
+#[test]
+fn unreadable_cursor_store_retains_indexed_conversations_and_refuses_without_cache() {
+    const CURSOR_TEXT: &str = "the login test fails every third run, figure out why";
+    let home = cursor_home();
+    copy_dir(&fixture_home("claude"), &home);
+    let db = cursor_db(&home);
+    let data = temp_dir("cursor-retained-data");
+    ingest_into("all", &home, &data, false);
+    assert!(normalize(&data).contains(CURSOR_TEXT));
+
+    remove_database(&db);
+    plant_not_sqlite(&db);
+    for minute in [1, 2] {
+        append_churn(&claude_transcript(&home), minute);
+        let output = ingest_output("all", &home, &data, false);
+        assert_published(
+            &output,
+            "unreadable cursor store with indexed conversations",
+        );
+        let published = normalize(&data);
+        assert!(published.contains(&format!("crush probe churn {minute}")));
+        assert!(
+            published.contains(CURSOR_TEXT),
+            "indexed cursor rows were dropped"
+        );
+    }
+
+    fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+    let _ = fs::remove_file(data.join(".ingest_cache.bin.journal"));
+    append_churn(&claude_transcript(&home), 3);
+    let lost = ingest_output("all", &home, &data, false);
+    assert!(
+        !lost.status.success(),
+        "published past rows no cache could serve"
+    );
+    assert!(String::from_utf8_lossy(&lost.stderr).contains("retained the old generation"));
+    assert!(
+        normalize(&data).contains(CURSOR_TEXT),
+        "refusal did not retain cursor rows"
+    );
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);

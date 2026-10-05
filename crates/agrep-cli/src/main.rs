@@ -5417,8 +5417,9 @@ fn index_cmd_locked(
     // --full still converges real deletions: what the last published generation contained,
     // or a proven-empty set when nothing was ever published.
     if let Some(published) = published_source.as_deref() {
-        let (_, paths) = ingest::registry::source_snapshot_expectations(published);
-        pcache.set_published_material(paths);
+        pcache.set_published_material(ingest::registry::source_snapshot_published_material(
+            published,
+        ));
         // That inventory lists only what it could read. Name the scopes it could not, so a
         // scope it published as an issue record cannot be mistaken for one it proved empty.
         pcache.set_published_blind_scopes(
