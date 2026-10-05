@@ -8009,11 +8009,13 @@ impl ReadOutcome {
     }
 }
 
-fn read_issue_reason(outcome: Option<ReadOutcome>) -> &'static str {
-    if outcome == Some(ReadOutcome::Partial) {
-        "source parser could not cover part of the read"
+fn read_issue_reason(outcome: Option<ReadOutcome>, panicked: Option<String>) -> String {
+    if let Some(reason) = panicked {
+        reason
+    } else if outcome == Some(ReadOutcome::Partial) {
+        "source parser could not cover part of the read".to_owned()
     } else {
-        "source parser could not complete the read"
+        "source parser could not complete the read".to_owned()
     }
 }
 
@@ -8044,6 +8046,31 @@ impl IntoParsed for (Vec<Message>, Vec<Event>, ReadOutcome) {
     }
 }
 
+type IsolatedParse = (
+    Vec<Message>,
+    Vec<Event>,
+    Option<ReadOutcome>,
+    Option<String>,
+);
+
+/// A parser that panics reads as an unreadable (skipped) source, with the panic's disclosable
+/// reason carried for its issue; see [`crate::ingest::parse_guard`].
+fn parse_isolated<R: IntoParsed>(
+    agent: &'static str,
+    path: &Path,
+    parse: impl FnOnce() -> R,
+) -> IsolatedParse {
+    match crate::ingest::parse_guard::isolate(agent, path, || parse().into_parsed()) {
+        Ok((messages, events, outcome)) => (messages, events, outcome, None),
+        Err(panic) => (
+            Vec::new(),
+            Vec::new(),
+            Some(ReadOutcome::Skipped),
+            Some(panic.reason),
+        ),
+    }
+}
+
 type IdentifiedStat = std::io::Result<Option<(String, i64, u64, CacheIdentity)>>;
 type ObservedFile = (PathBuf, Option<String>, IdentifiedStat);
 type ParsedMiss = (
@@ -8055,6 +8082,7 @@ type ParsedMiss = (
     Vec<Message>,
     Vec<Event>,
     Option<ReadOutcome>,
+    Option<String>,
 );
 type ParsedSibling = (
     String,
@@ -8062,6 +8090,7 @@ type ParsedSibling = (
     Vec<Message>,
     Vec<Event>,
     Option<ReadOutcome>,
+    Option<String>,
 );
 
 /// Parse `files`, pulling unchanged ones from `cache`. Updates the cache in place.
@@ -8429,7 +8458,7 @@ where
     let miss_parsed: Vec<ParsedMiss> = misses
         .par_iter()
         .map(|(p, key, mtime, size, identity)| {
-            let (m, e, healthy) = parse(p, *mtime, *size).into_parsed();
+            let (m, e, healthy, panicked) = parse_isolated(agent, p, || parse(p, *mtime, *size));
             crate::emit::file_done(&m);
             (
                 key.clone(),
@@ -8440,6 +8469,7 @@ where
                 m,
                 e,
                 healthy,
+                panicked,
             )
         })
         .collect();
@@ -8447,7 +8477,7 @@ where
     // sessions touched: from the fresh parses AND from the OLD cache entries of changed files
     // (so a session that moved between files is fully refreshed)
     let mut affected: HashSet<std::sync::Arc<str>> = HashSet::new();
-    for (_, _, _, _, _, m, events, _) in &miss_parsed {
+    for (_, _, _, _, _, m, events, _, _) in &miss_parsed {
         for msg in m {
             affected.insert(msg.session.clone());
         }
@@ -8508,9 +8538,9 @@ where
     let sib_parsed: Vec<ParsedSibling> = siblings
         .par_iter()
         .map(|(p, key, mtime, size)| {
-            let (m, e, healthy) = parse(p, *mtime, *size).into_parsed();
+            let (m, e, healthy, panicked) = parse_isolated(agent, p, || parse(p, *mtime, *size));
             crate::emit::file_done(&m);
-            (key.clone(), p.clone(), m, e, healthy)
+            (key.clone(), p.clone(), m, e, healthy, panicked)
         })
         .collect();
 
@@ -8590,7 +8620,7 @@ where
     let racy_start = cache.racy_scan_start_ns;
     let racy = |mtime: i64| racy_start.is_some_and(|start| racy_stamp(mtime, start, now_ns));
     // fresh: changed files (messages + events) + sibling files (messages cached-equal + events)
-    for (key, path, mt, sz, identity, m, e, healthy) in miss_parsed {
+    for (key, path, mt, sz, identity, m, e, healthy, panicked) in miss_parsed {
         // A failed, skipped or partial reparse retains the prior entry instead of publishing
         // deletion. Only a partial read with no prior entry falls through and publishes.
         if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
@@ -8599,7 +8629,7 @@ where
                 agent,
                 &path,
                 "source-read-failed",
-                read_issue_reason(healthy),
+                read_issue_reason(healthy, panicked),
             );
             if let Some(prev) = cache.entries.get(&key) {
                 blocked_event_sessions
@@ -8691,7 +8721,7 @@ where
         messages.extend(m);
         events.extend(e);
     }
-    for (key, path, m, e, healthy) in sib_parsed {
+    for (key, path, m, e, healthy, panicked) in sib_parsed {
         // A sibling read can fail independently after its successful stat. Serving its cached
         // rows mirrors the changed-file last-good guard; its session event files remain untouched
         // because `events` cannot be reconstructed completely without this sibling.
@@ -8701,7 +8731,7 @@ where
                 agent,
                 &path,
                 "source-read-failed",
-                read_issue_reason(healthy),
+                read_issue_reason(healthy, panicked),
             );
             if let Some(prev) = cache.entries.get(&key) {
                 blocked_event_sessions

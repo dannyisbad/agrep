@@ -844,33 +844,52 @@ fn collect_discovered(
         preserve_unlisted,
         has_readable_source,
         |id, session| {
+            use crate::ingest_cache::ReadOutcome;
             let Some(opened) = opened.as_ref() else {
-                return (Vec::new(), Vec::new(), false);
+                return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
             };
             let Some(&index) = opened.locations.get(id) else {
-                return (Vec::new(), Vec::new(), false);
+                return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
             };
             let (database, connection) = &opened.databases[index];
-            let parsed = parse_session(
-                connection,
-                &database.path,
-                &database.project,
-                session,
-                token_by_cache.get(id).map(String::as_str).unwrap_or(""),
-            );
-            if !parsed.2 || (parsed.0.is_empty() && parsed.1.is_empty()) {
-                parse_issues.borrow_mut().push(database.path.clone());
+            let parsed = crate::ingest::parse_guard::isolate("crush", &database.path, || {
+                parse_session(
+                    connection,
+                    &database.path,
+                    &database.project,
+                    session,
+                    token_by_cache.get(id).map(String::as_str).unwrap_or(""),
+                )
+            });
+            match parsed {
+                Ok((messages, events, true)) => {
+                    if messages.is_empty() && events.is_empty() {
+                        parse_issues
+                            .borrow_mut()
+                            .push((database.path.clone(), None));
+                    }
+                    (messages, events, ReadOutcome::Complete)
+                }
+                Ok((messages, events, false)) => {
+                    parse_issues
+                        .borrow_mut()
+                        .push((database.path.clone(), None));
+                    (messages, events, ReadOutcome::Invalid)
+                }
+                Err(panic) => {
+                    parse_issues
+                        .borrow_mut()
+                        .push((database.path.clone(), Some(panic.reason)));
+                    (Vec::new(), Vec::new(), ReadOutcome::Skipped)
+                }
             }
-            parsed
         },
     );
-    for path in parse_issues.into_inner() {
-        cache.record_source_read_issue(
-            "crush",
-            &path,
-            "source-read-failed",
-            "the database session query did not produce a complete row",
-        );
+    for (path, panicked) in parse_issues.into_inner() {
+        let reason = panicked.unwrap_or_else(|| {
+            "the database session query did not produce a complete row".to_owned()
+        });
+        cache.record_source_read_issue("crush", &path, "source-read-failed", reason);
     }
     (pass.messages, pass.events)
 }

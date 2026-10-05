@@ -533,7 +533,17 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
 
     let pairs: Vec<DetailedRead> = work
         .par_iter()
-        .map(|(dir, meta)| parse_task(dir, meta.as_ref()))
+        .map(|(dir, meta)| {
+            crate::ingest::parse_guard::isolate("cline", dir, || parse_task(dir, meta.as_ref()))
+                .unwrap_or_else(|panic| {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        crate::ingest_cache::ReadOutcome::Skipped,
+                        vec![issue(dir, "source-read-failed", panic.reason)],
+                    )
+                })
+        })
         .collect();
     let mut msgs = Vec::new();
     let mut evts = Vec::new();

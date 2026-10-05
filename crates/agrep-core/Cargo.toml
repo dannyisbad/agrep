@@ -23,6 +23,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # the real paths, so we hash each registered path to find its sessions dir.
 md5 = "0.7"
 
+[features]
+# Enabled only by agrep-ingest's dev-dependency, so shipped `cargo build` binaries never carry it;
+# AGREP_TEST_PARSE_PANIC then names the one source whose parse panics (see intake::keyed).
+parse-panic-injection = []
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Globalization",

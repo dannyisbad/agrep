@@ -970,6 +970,7 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
         tokens.as_ref().into_iter().flatten().cloned().collect();
     let empty_projects = HashMap::new();
     let projects = projects.as_ref().unwrap_or(&empty_projects);
+    let panics = std::cell::RefCell::new(Vec::new());
     let pass = cache.collect_token_cached_keyed_partial(
         "cursor",
         tokens.map(|tokens| {
@@ -981,20 +982,33 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
         &[],
         unenumerable,
         has_readable_source,
-        |_, sid| match &conn {
-            _ if sid == SCHEMA_ABSENT_SESSION => (Vec::new(), Vec::new(), true),
-            Some(c) => parse_session(
-                c,
-                db_path
-                    .as_deref()
-                    .expect("open connection has a database path"),
-                projects,
-                sid,
-                token_by_session.get(sid).map(String::as_str).unwrap_or(""),
-            ),
-            None => (Vec::new(), Vec::new(), false),
+        |_, sid| {
+            use crate::ingest_cache::ReadOutcome;
+            if sid == SCHEMA_ABSENT_SESSION {
+                return (Vec::new(), Vec::new(), ReadOutcome::Complete);
+            }
+            let Some(c) = &conn else {
+                return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+            };
+            let path = db_path
+                .as_deref()
+                .expect("open connection has a database path");
+            let token = token_by_session.get(sid).map(String::as_str).unwrap_or("");
+            match crate::ingest::parse_guard::isolate("cursor", path, || {
+                parse_session(c, path, projects, sid, token)
+            }) {
+                Ok((messages, events, true)) => (messages, events, ReadOutcome::Complete),
+                Ok((messages, events, false)) => (messages, events, ReadOutcome::Invalid),
+                Err(panic) => {
+                    panics.borrow_mut().push((path.to_path_buf(), panic.reason));
+                    (Vec::new(), Vec::new(), ReadOutcome::Skipped)
+                }
+            }
         },
     );
+    for (path, reason) in panics.into_inner() {
+        cache.record_source_read_issue("cursor", &path, "source-read-failed", reason);
+    }
     (pass.messages, pass.events)
 }
 

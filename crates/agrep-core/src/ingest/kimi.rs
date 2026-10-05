@@ -24,6 +24,7 @@ use crate::ingest::{
     cap_event_output, cap_str_with_chars, is_wrapper, project_name,
     summarize_tool_input_with_chars, EVENT_CAP,
 };
+use crate::ingest_cache::SourceReadIssue;
 use crate::model::{Event, Message, RawMessage};
 
 const REGISTRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -375,39 +376,41 @@ fn workdir_registry(root: &Path) -> (HashMap<String, String>, bool) {
     (map, true)
 }
 
+type Collected = (Vec<Message>, Vec<Event>, bool, Vec<SourceReadIssue>);
+
 /// Walk every `sessions/<md5(workdir)>/<uuid>/` and collect kimi messages + tool events.
-fn collect_from_root(root: &Path) -> (Vec<Message>, Vec<Event>, bool) {
+fn collect_from_root(root: &Path) -> Collected {
     match fs::symlink_metadata(root) {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
-        Ok(_) => return (Vec::new(), Vec::new(), true),
+        Ok(_) => return (Vec::new(), Vec::new(), true, Vec::new()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), true)
+            return (Vec::new(), Vec::new(), true, Vec::new())
         }
         Err(error) => {
             crate::ingest::warn_source_skip("kimi", root, &error);
-            return (Vec::new(), Vec::new(), false);
+            return (Vec::new(), Vec::new(), false, Vec::new());
         }
     }
     let sessions = root.join("sessions");
     match fs::symlink_metadata(&sessions) {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
-        Ok(_) => return (Vec::new(), Vec::new(), true),
+        Ok(_) => return (Vec::new(), Vec::new(), true, Vec::new()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), true)
+            return (Vec::new(), Vec::new(), true, Vec::new())
         }
         Err(error) => {
             crate::ingest::warn_source_skip("kimi", &sessions, &error);
-            return (Vec::new(), Vec::new(), false);
+            return (Vec::new(), Vec::new(), false, Vec::new());
         }
     }
     let rd = match fs::read_dir(&sessions) {
         Ok(d) => d,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), true)
+            return (Vec::new(), Vec::new(), true, Vec::new())
         }
         Err(error) => {
             crate::ingest::warn_source_skip("kimi", &sessions, &error);
-            return (Vec::new(), Vec::new(), false);
+            return (Vec::new(), Vec::new(), false, Vec::new());
         }
     };
     let (registry, mut healthy) = workdir_registry(root);
@@ -522,24 +525,35 @@ fn collect_from_root(root: &Path) -> (Vec<Message>, Vec<Event>, bool) {
         }
     }
 
-    let pairs: Vec<(Vec<Message>, Vec<Event>, bool)> = work
+    let parsed: Vec<_> = work
         .par_iter()
-        .map(|(d, proj, parent)| parse_session(d, proj, parent))
+        .map(|(d, proj, parent)| {
+            crate::ingest::parse_guard::isolate("kimi", d, || parse_session(d, proj, parent))
+                .map_err(|panic| {
+                    SourceReadIssue::new("kimi", d, "source-read-failed", panic.reason)
+                })
+        })
         .collect();
     let mut msgs = Vec::new();
     let mut evts = Vec::new();
-    for (m, e, session_healthy) in pairs {
-        if session_healthy {
-            msgs.extend(m);
-            evts.extend(e);
-        } else {
-            healthy = false;
+    let mut issues = Vec::new();
+    for session in parsed {
+        match session {
+            Ok((m, e, true)) => {
+                msgs.extend(m);
+                evts.extend(e);
+            }
+            Ok((_, _, false)) => healthy = false,
+            Err(issue) => {
+                healthy = false;
+                issues.push(issue);
+            }
         }
     }
-    (msgs, evts, healthy)
+    (msgs, evts, healthy, issues)
 }
 
-pub fn collect() -> (Vec<Message>, Vec<Event>, bool) {
+pub fn collect() -> Collected {
     collect_from_root(&crate::ingest::home().join(".kimi"))
 }
 
@@ -553,7 +567,7 @@ impl crate::ingest::registry::Adapter for Kimi {
         crate::ingest::registry::Fingerprint::Always
     }
     fn collect(&self, _cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
-        let (messages, events, _) = collect();
+        let (messages, events, _, _) = collect();
         (messages, events)
     }
     fn collect_checked(
@@ -563,15 +577,15 @@ impl crate::ingest::registry::Adapter for Kimi {
         Vec<Message>,
         Vec<Event>,
         crate::ingest_cache::ReadOutcome,
-        Vec<crate::ingest_cache::SourceReadIssue>,
+        Vec<SourceReadIssue>,
     ) {
-        let (messages, events, healthy) = collect();
+        let (messages, events, healthy, issues) = collect();
         let outcome = if healthy {
             crate::ingest_cache::ReadOutcome::Complete
         } else {
             crate::ingest_cache::ReadOutcome::Skipped
         };
-        (messages, events, outcome, Vec::new())
+        (messages, events, outcome, issues)
     }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
         vec![crate::ingest::home().join(".kimi").join("sessions")]
@@ -725,7 +739,7 @@ mod tests {
         symlink(outside.join("children"), safe.join("subagents")).unwrap();
         symlink(&outside, root.join("sessions/linked-project")).unwrap();
 
-        let (messages, _, healthy) = super::collect_from_root(&root);
+        let (messages, _, healthy, _) = super::collect_from_root(&root);
         assert!(healthy);
         assert_eq!(messages.len(), 1);
         assert_eq!(&*messages[0].text, "inside");

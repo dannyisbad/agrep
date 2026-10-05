@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod gemini;
 pub mod kimi;
 pub mod opencode;
+pub(crate) mod parse_guard;
 pub mod parse_timestamp;
 pub mod pi;
 pub mod registry;

@@ -10,6 +10,7 @@
 //! the parse cache keep the tally from the run that actually parsed them, and the
 //! accounting stays complete across incremental runs.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -222,6 +223,70 @@ static RUN: LazyLock<Run> = LazyLock::new(|| Run {
     forgotten: Mutex::new(Vec::new()),
 });
 
+thread_local! {
+    /// Tallies opened by each guarded parse running on this thread, innermost last.
+    static GUARDED: RefCell<Vec<Vec<Arc<Tally>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `parse`, which must not unwind, and return the tallies it opened on this thread.
+pub(crate) fn scoped<T>(parse: impl FnOnce() -> T) -> (T, Vec<Arc<Tally>>) {
+    GUARDED.with(|scopes| scopes.borrow_mut().push(Vec::new()));
+    let value = parse();
+    let opened = GUARDED.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        let opened = scopes.pop().unwrap_or_default();
+        if let Some(outer) = scopes.last_mut() {
+            outer.extend(opened.iter().cloned());
+        }
+        opened
+    });
+    (value, opened)
+}
+
+/// Withdraw the tallies of a parse that never finished: a half-counted tally would otherwise
+/// replace the book entry of the run that last parsed the source, whose rows are still served.
+pub(crate) fn discard(tallies: &[Arc<Tally>]) {
+    if tallies.is_empty() {
+        return;
+    }
+    RUN.open
+        .lock()
+        .unwrap()
+        .retain(|(.., tally)| !tallies.iter().any(|gone| Arc::ptr_eq(gone, tally)));
+}
+
+/// Serializes unit tests that inspect or drain the process-wide run book.
+#[cfg(test)]
+pub(crate) static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn is_open(tally: &Arc<Tally>) -> bool {
+    RUN.open
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(.., open)| Arc::ptr_eq(open, tally))
+}
+
+fn opened(tally: &Arc<Tally>) {
+    // try_with: thread teardown has no guarded parse left to attribute the tally to.
+    let _ = GUARDED.try_with(|scopes| {
+        if let Some(scope) = scopes.borrow_mut().last_mut() {
+            scope.push(Arc::clone(tally));
+        }
+    });
+}
+
+/// Panics the parse that opens a tally for the source `AGREP_TEST_PARSE_PANIC` names, after the
+/// tally is registered, quoting store text the way std's `unwrap` of a hostile-input error does.
+#[cfg(feature = "parse-panic-injection")]
+fn inject_parse_panic(source: &str) {
+    if std::env::var_os("AGREP_TEST_PARSE_PANIC").is_some_and(|target| target == source) {
+        let excerpt: Result<(), String> = Err("injected transcript excerpt".to_owned());
+        std::hint::black_box(excerpt).unwrap();
+    }
+}
+
 /// Drop `path`'s entry at the next [`commit`]. For a file that still exists but is no longer a
 /// source (a newer sibling supersedes it): commit keeps every unparsed entry, and audit reads a
 /// present, undiscovered, tallied path as a coverage gap.
@@ -277,6 +342,9 @@ pub fn keyed(agent: &'static str, id: &str, fingerprint: String) -> Arc<Tally> {
         .lock()
         .unwrap()
         .push((id.to_string(), None, agent, fingerprint, Arc::clone(&t)));
+    opened(&t);
+    #[cfg(feature = "parse-panic-injection")]
+    inject_parse_panic(id);
     t
 }
 
@@ -311,6 +379,9 @@ pub fn keyed_token(
         .lock()
         .unwrap()
         .push((id, Some(legacy), agent, fingerprint, Arc::clone(&tally)));
+    opened(&tally);
+    #[cfg(feature = "parse-panic-injection")]
+    inject_parse_panic(&path.to_string_lossy());
     tally
 }
 
@@ -472,6 +543,9 @@ mod tests {
 
     #[test]
     fn identity_and_persistence_round_trip() {
+        let _run = RUN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let t = keyed("testagent", "x.jsonl", "s:1:2".into());
         t.seen_n(4);
         t.seen();
