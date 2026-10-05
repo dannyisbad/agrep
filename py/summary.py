@@ -134,6 +134,9 @@ _TASK_NOTIFICATION = "task_notification"
 _COMPACTED = "compacted"
 _MARKERS = frozenset({_API_ERROR, _TASK_NOTIFICATION, _COMPACTED})
 _AGENT_SESSION_PREFIX = "agent-"
+# the line Claude Code (2.0.69 on) adds to a finished foreground agent's result; an async launch
+# names the agent with an `(internal ID` note instead; recent Explore/Plan results carry none
+_AGENT_RETURNED_RE = re.compile(r"(?<![\w-])agentId: (\S+) \((?:use SendMessage|for resuming)\b")
 # tools that stop the turn until the human answers: claude AskUserQuestion/ExitPlanMode, omp ask,
 # codex request_user_input, opencode question
 _QUESTION_TOOL_RE = re.compile(
@@ -891,24 +894,26 @@ def _listed_tasks(event: dict, known: dict[str, list[str]]) -> dict[str, list[st
     return listed
 
 
+def _received_horizon(root: _Chat) -> int:
+    """The latest moment the root is provably past: its own, or that of a kin whose result it
+    received, directly or through another kin."""
+    return max(_latest_ts(member) for member in (root, *_handed_back(root, root.task_kin)))
+
+
 def _task_events(chat: _Chat) -> list[dict]:
-    """The chat's events with its kin's Claude task tool calls merged in by time. A side chat sees
-    the family's calls up to its latest moment; the root sees them up to its own, and all of a
-    side chat's once it received that chat's result. A caller's live window is never history."""
-    if not chat.task_kin:
+    """The chat's events with its kin's Claude task tool calls merged in by time, up to the latest
+    moment it is past: a side chat's own, the root's received horizon. A caller's live window is
+    never history."""
+    calls = [(kin, [event for event in kin.events if event.get("kind") == "tool"
+                    and _TASK_TOOL_RE.match(str(event.get("name") or ""))])
+             for kin in chat.task_kin]
+    if not any(kin_calls for _kin, kin_calls in calls):
         return chat.events
-    latest = _latest_ts(chat)
-    root = chat.root == chat.session
+    horizon = _received_horizon(chat) if chat.root == chat.session else _latest_ts(chat)
     foreign = []
-    for kin in chat.task_kin:
-        calls = [event for event in kin.events if event.get("kind") == "tool"
-                 and _TASK_TOOL_RE.match(str(event.get("name") or ""))]
-        if not calls:
-            continue
-        until = float("inf") if root and _result_received(chat, kin) is True else latest
-        if kin.withheld_from is not None:
-            until = min(until, kin.withheld_from - 1)
-        foreign += [event for event in calls if int(event.get("ts") or 0) <= until]
+    for kin, kin_calls in calls:
+        until = horizon if kin.withheld_from is None else min(horizon, kin.withheld_from - 1)
+        foreign += [event for event in kin_calls if int(event.get("ts") or 0) <= until]
     if not foreign:
         return chat.events
     foreign.sort(key=lambda event: (int(event.get("ts") or 0), int(event.get("i") or 0)))
@@ -956,11 +961,15 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, 
         tasks_last = False
         items = _todo_items(payload, raw, cut)
         if items is not None and _todo_merges(payload, raw, cut):
+            # a merge updates rows by id, and the part a cap cut may have changed any earlier row
+            if cut:
+                unknown = _TODO_CAP_DRIFT
+                continue
             merged = _merged_todos(tasks, items)
             if merged is None:
                 unknown = _TODO_UNMATCHED
                 continue
-            tasks, capped = merged, capped or cut
+            tasks = merged
             continue
         if items is not None:
             tasks, capped, unknown = _todo_rows(items), cut, ""
@@ -1226,8 +1235,9 @@ _DELIVERY_MIN_CHARS = 24
 
 
 def _delivers(output: str, final: str) -> bool:
-    """Does a delegation result carry the side chat's final reply? Claude and opencode return
-    the reply itself; omp wraps it in a task-result envelope; codex nests it in JSON."""
+    """Does a delegation result carry the side chat's final reply? Claude returns the reply's last
+    message (since 2.0.69 followed by an agentId line); opencode returns the reply itself; omp wraps
+    it in a task-result envelope; codex nests it in JSON."""
     text = " ".join(output.rstrip("…").split())
     body = _TASK_RESULT_BODY_RE.search(text) if text.startswith("<task-result") else None
     if body is not None:
@@ -1281,11 +1291,23 @@ def _notified(root: _Chat, side: _Chat) -> bool:
     return False
 
 
+def _agent_returned(root: _Chat, side: _Chat) -> bool:
+    """Did a Claude agent call in the root return the side chat's finished result? Claude Code
+    ends that result with a line naming the agent, which narration or a short reply can't hide."""
+    if not side.session.startswith(_AGENT_SESSION_PREFIX):
+        return False
+    agent_id = side.session[len(_AGENT_SESSION_PREFIX):]
+    return any(event.get("kind") == "subagent_start" and event.get("ok") is True
+               and agent_id in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))
+               for event in root.events)
+
+
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
-    """Did the side chat hand its result back? A terminal `yield` or a linked task notification
-    is the hand-back itself; else the root's delegation result must carry the side chat's final
-    reply, the only indexed proof the root went on after it. None when a capped reply can't say."""
-    if _side_yielded(side) or _notified(root, side):
+    """Did the side chat hand its result back? A terminal `yield`, a linked task notification or
+    a Claude agent result that names it is the hand-back itself; else the root's delegation
+    result must carry the side chat's final reply, the only indexed proof the root went on after
+    it. None when a capped reply can't say."""
+    if _side_yielded(side) or _notified(root, side) or _agent_returned(root, side):
         return True
     last = side.last_turn()
     reply = side.replies.get(last.turn, "") if last is not None else ""
@@ -1304,13 +1326,26 @@ def _result_received(root: _Chat, side: _Chat) -> bool | None:
     return False
 
 
-def _classify_side(chat: _Chat, root: _Chat) -> dict | None:
+def _handed_back(root: _Chat, members: list[_Chat]) -> list[_Chat]:
+    """The members whose result reached the root: directly, or through a member it reached, since
+    a nested subagent hands back to the agent that launched it."""
+    reached = [root]
+    pending = list(members)
+    for holder in reached:
+        received = [member for member in pending if _result_received(holder, member) is True]
+        reached += received
+        pending = [member for member in pending if all(member is not got for got in received)]
+    return reached[1:]
+
+
+def _classify_side(chat: _Chat, root: _Chat, handed_back: list[_Chat]) -> dict | None:
     """Side-chat evidence rolls up only when the side chat is provably the family's latest
-    activity: after every timestamp the index holds for the root, with no result handed back."""
+    activity: after every timestamp the index holds for the root, with no result handed back to
+    the root or to an agent whose result reached it."""
     last = chat.last_turn()
     if last is None or last.ts <= 0 or _latest_ts(chat) <= _latest_ts(root):
         return None
-    if _result_received(root, chat) is not False:
+    if _result_received(root, chat) is not False or any(chat is got for got in handed_back):
         return None
     record = {"turn": last.turn, "turn_ts": last.ts, "signals": [], "evidence": "",
               "items": [], "caveats": []}
@@ -1343,8 +1378,10 @@ def _pending_item(root: _Chat, sides: list[_Chat], handles) -> dict | None:
     source_chat = root
     source = "root"
     if record is None:
+        handed_back = (_handed_back(root, sides)
+                       if any(_latest_ts(side) > _latest_ts(root) for side in sides) else [])
         for side in sorted(sides, key=lambda chat: -_latest_ts(chat)):
-            record = _classify_side(side, root)
+            record = _classify_side(side, root, handed_back)
             if record is not None:
                 source_chat, source = side, "side-chat"
                 break

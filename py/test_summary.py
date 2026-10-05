@@ -168,10 +168,16 @@ TASKS_KIN_CLOSES = "ct000007-0707-4000-8000-000000000707"
 TASKS_KIN_CREATES = "ct000008-0708-4000-8000-000000000708"
 TASKS_KIN_LAST_STEP = "ct000009-0709-4000-8000-000000000709"
 TASKS_LISTED = "ct000010-0710-4000-8000-000000000710"
+# Claude Code 2.1.289 results end in an `agentId: … (use SendMessage …` trailer: a narrated subagent
+# with a short final message, then root -> A -> B where A closes a task after B, or only relays B
+TASKS_KIN_NARRATED = "ct000011-0711-4000-8000-000000000711"
+TASKS_KIN_NESTED = "ct000012-0712-4000-8000-000000000712"
+TASKS_KIN_NESTED_RELAY = "ct000013-0713-4000-8000-000000000713"
 # cursor todo_write merge=true: statuses by id, content plus a new id, a new id without content
 CURSOR_MERGE_STATUS = "k1000001-0715-4000-8000-000000000715"
 CURSOR_MERGE_CONTENT = "k2000002-0716-4000-8000-000000000716"
 CURSOR_MERGE_UNMATCHED = "k3000003-0717-4000-8000-000000000717"
+CURSOR_MERGE_CAPPED = "k4000004-0718-4000-8000-000000000718"  # the last merge passes the event cap
 # kimi's SetTodoList before 2025-12 wrote Pending / In Progress / Done
 KIMI_TITLE_CASE = "4b000001-1120-4000-8000-000000001120"
 KIMI_WINDOW = ("--since", "2025-11-01", "--until", "2025-11-30")
@@ -675,6 +681,26 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(
             (unmatched["status"], unmatched["items"], unmatched["caveats"]),
             ("unknown", [], ["todo list merges an item whose id could not be resolved"]))
+
+    def test_claude_agent_result_naming_the_subagent_is_its_hand_back(self) -> None:
+        # the subagent narrated before a short final message, so the root's result, which ends in
+        # Claude's agentId trailer, matches neither the reply's head nor its whole text
+        self.assertNotIn(TASKS_KIN_NARRATED, self._tasks_pending("--project", "mx-tasks"))
+
+    def test_nested_subagent_tasks_count_once_the_root_is_past_them(self) -> None:
+        # B hands back to A, never to the root; the root received A after B finished
+        pending = self._tasks_pending("--project", "mx-tasks")
+        for session in (TASKS_KIN_NESTED, TASKS_KIN_NESTED_RELAY):
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
+
+    def test_capped_cursor_merge_leaves_the_list_unknown(self) -> None:
+        # the merge closing items 9 and 10 was cut by the event cap: they are neither open nor done
+        item = self._tasks_pending("--agent", "cursor")[CURSOR_MERGE_CAPPED]
+        self.assertEqual(
+            (item["status"], item["confidence"], item["items"], item.get("caveats")),
+            ("unknown", "low", [],
+             ["todo list capped at index time; its later changes could not be replayed"]))
 
     def test_kimi_in_progress_with_a_space_is_open(self) -> None:
         _meta, items = _rows(self.sandbox.summary("pending", *KIMI_WINDOW, "--agent", "kimi",
