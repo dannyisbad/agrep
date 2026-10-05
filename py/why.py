@@ -2,13 +2,15 @@
 
 Read-only by construction: never indexes, writes the data dir or wakes the daemon. "Searchable"
 is what `agrep search` would serve, decided by corpusdb's own reader predicates and connectors.
-A reference resolves like `agrep resume` after a path lane (a torn sessions.jsonl falls back to
-messages.jsonl as resume does), then against the chats corpus.db still holds when search
-serves it; every evidence line names the file it came from.
+A reference resolves like `agrep resume` after a path lane (a torn or missing sessions.jsonl
+falls back to messages.jsonl as resume does), then against the chats corpus.db still holds when
+search serves it; every evidence line names the file it came from.
 
 Token-store conversations resolve through intake session keys and the census token list; a
 whole-store file belongs to its deepest chat directory, an indexed chat or one laid out like
-the files that agent parsed. Without that link, whole-store freshness is unverified.
+the files that agent parsed. Without that link, whole-store freshness is unverified. A file's
+age never shows the last index saw it (a move or restore keeps the mtime): only that index's
+store walk, published as .source_snapshot.bin, does.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import json
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -45,6 +48,9 @@ _DATABASE_EXTENSIONS = frozenset({".db", ".sqlite", ".sqlite3", ".vscdb"})
 _TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json"}) | _DATABASE_EXTENSIONS
 _TOKEN_ID_PREFIX = "\0agrep-intake-token-v1\0"
 _RESERVED_SESSIONS = frozenset({"\0census\0", "\0schema-absent\0"})
+# registry.rs `SOURCE_SNAPSHOT_VERSION`; `_published_walk` decodes that version's bincode layout.
+_SNAPSHOT_VERSION = 11
+_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _token_identity(token_id: object) -> tuple[str, str] | None:
@@ -114,9 +120,9 @@ def _derived_rows() -> dict[str, dict]:
     return out
 
 
-def _index_rows() -> tuple[list[dict], bool, int, str]:
-    """Index rows (newest first), whether sessions.jsonl exists, corrupt lines skipped, and the
-    file the rows came from: messages.jsonl when sessions.jsonl is torn, the way resume reads."""
+def _index_rows() -> tuple[list[dict], int, str]:
+    """Index rows (newest first), corrupt lines skipped, and where the rows came from:
+    messages.jsonl when sessions.jsonl is torn or missing, the way resume reads."""
     # A torn aggregate is repaired by the daemon on resume's path; `why` only reads it.
     explore._kick_derived_repair = lambda: None
     explore._session_index_read.cache_clear()
@@ -125,9 +131,83 @@ def _index_rows() -> tuple[list[dict], bool, int, str]:
     origin = "sessions.jsonl"
     if not rows and common.MESSAGES_PATH.exists():
         explore._messages_by_session_read.cache_clear()
-        rows, origin = _derived_rows(), "messages.jsonl"
+        derived = _derived_rows()
+        # explore's test: a materialized aggregate is torn when it lists nothing the corpus holds.
+        if derived or skipped:
+            rows = derived
+            origin = f"messages.jsonl (sessions.jsonl {'torn' if present else 'missing'})"
     ordered = sorted(rows.values(), key=lambda row: row.get("last_ts", 0), reverse=True)
-    return ordered, present, skipped, origin
+    return ordered, skipped, origin
+
+
+def _published_walk() -> tuple[dict[str, set[str]] | None, str | None]:
+    """Per agent, the files the last validated index's store walk listed, decoded from the
+    `SourceSnapshot` bincode registry.rs publishes as .source_snapshot.bin; else (None, why)."""
+    try:
+        with (common.DATA_DIR / ".source_snapshot.bin").open("rb") as handle:
+            data = handle.read(_SNAPSHOT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError as exc:
+        return None, f"unreadable ({exc})"
+    if len(data) > _SNAPSHOT_MAX_BYTES:
+        return None, f"larger than {_SNAPSHOT_MAX_BYTES} bytes"
+    pos = 0
+
+    def take(size: int) -> bytes:
+        nonlocal pos
+        if pos + size > len(data):
+            raise ValueError("truncated")
+        pos += size
+        return data[pos - size:pos]
+
+    def number(fmt: str) -> int:
+        return struct.unpack(fmt, take(struct.calcsize(fmt)))[0]
+
+    def text() -> str:
+        return take(number("<Q")).decode("utf-8")
+
+    def flag() -> bool:
+        value = take(1)[0]
+        if value > 1:
+            raise ValueError(f"bool or Option tag {value}")
+        return bool(value)
+
+    walk: dict[str, set[str]] = {}
+    try:
+        version = number("<I")
+        if version != _SNAPSHOT_VERSION:
+            return None, f"snapshot version {version}, this build reads {_SNAPSHOT_VERSION}"
+        number("<I")
+        text()
+        for _ in range(number("<Q")):
+            walk.setdefault(text(), set())
+            for _ in range(number("<Q")):
+                owner = text()
+                # Windows serializes the path as its UTF-16 units and adds an Option<file identity>.
+                path = (take(2 * number("<Q")).decode("utf-16-le", "surrogatepass") if common.WIN
+                        else text())
+                take(8 + 8 + 4)  # len, mtime_secs, mtime_nanos
+                token = number("<I")
+                if token > 1:
+                    raise ValueError(f"change token variant {token}")
+                take(32 if token else 8)
+                if common.WIN and flag():
+                    take(1 + 8 + 16)  # kind, volume, id
+                if flag():
+                    take(8)
+                walk.setdefault(owner, set()).add(path)
+            for _ in range(2 * number("<Q")):  # tokens: (id, key)
+                text()
+            for _ in range(4 * number("<Q")):  # issues: agent, path, kind, reason
+                text()
+            flag()
+        flag()
+        if pos != len(data):
+            raise ValueError("trailing bytes")
+    except (ValueError, struct.error) as exc:
+        return None, f"undecodable ({exc})"
+    return walk, None
 
 
 def _ingest_sig() -> dict:
@@ -298,6 +378,16 @@ def _key_mtime_ms(key: str | None) -> int | None:
     return None
 
 
+def _changed_ms(path: object) -> int | None:
+    """The later of a file's mtime and ctime in ms: a rename or copy keeps the mtime but moves the
+    ctime (on Windows the creation time, which a copy moves too). None when it cannot be read."""
+    try:
+        stat = os.stat(str(path or ""))
+    except (OSError, ValueError):
+        return None
+    return max(stat.st_mtime_ns, stat.st_ctime_ns) // 1_000_000
+
+
 def _skips_text(skips: dict | None) -> str:
     skips = skips if isinstance(skips, dict) else {}
     ordered = [k for k in _SKIP_ORDER if skips.get(k)] + sorted(
@@ -372,15 +462,14 @@ def _candidate_label(candidate: dict) -> str:
 class _Context:
     def __init__(self, reference: str) -> None:
         self.reference = reference
-        self.rows, self.index_present, self.index_skipped, origin = _index_rows()
-        self.index_origin = ("sessions.jsonl" if origin == "sessions.jsonl"
-                             else "messages.jsonl (sessions.jsonl torn)")
+        self.rows, self.index_skipped, self.index_origin = _index_rows()
         self.payload, self.census_error = source_projection()
         self.sig = _ingest_sig()
         self._real: dict[str, str] = {}
         self._by_real: dict[str, dict] | None = None
         self._layouts: dict[str, tuple[set[str], set[tuple[str, ...]], set[str]]] = {}
         self._chat_dirs: dict[tuple[str, str], tuple[str, str] | None] = {}
+        self._walk: tuple[dict[str, set[str]] | None, str | None] | None = None
 
     def real(self, path: object) -> str:
         text = str(path or "")
@@ -482,11 +571,69 @@ class _Context:
         found = self.chat_dir(agent, path)
         return found[0] if found else None
 
+    @property
+    def published_ms(self) -> int | None:
+        return self.sig.get("mtime_ms") if self.sig.get("present") else None
+
     def changed_since_index(self, source: dict) -> bool:
         """A census file last modified at or after the last index published, or of unknown age."""
         modified = _key_mtime_ms(source.get("stat_key"))
-        published = self.sig.get("mtime_ms") if self.sig.get("present") else None
+        published = self.published_ms
         return modified is None or not published or modified >= published
+
+    def touched_since_index(self, path: object) -> bool:
+        """A file modified, moved or copied in at or after the last index published, or of unknown age."""
+        changed, published = _changed_ms(path), self.published_ms
+        return changed is None or not published or changed >= published
+
+    @property
+    def walk(self) -> tuple[dict[str, set[str]] | None, str | None]:
+        if self._walk is None:
+            self._walk = _published_walk()
+        return self._walk
+
+    def walk_line(self, agent: object, walked: bool | None) -> str:
+        if walked is not None:
+            return (".source_snapshot.bin: the last index's store walk "
+                    + ("listed" if walked else "did not list") + " this file")
+        listing, reason = self.walk
+        return (f".source_snapshot.bin: {reason}" if listing is None
+                else f".source_snapshot.bin: the last index did not walk the {agent} store")
+
+    def walked(self, agent: object, path: object) -> bool | None:
+        """Whether the last index's store walk listed `path`, or a file below it; None when
+        .source_snapshot.bin cannot say or that index did not walk `agent`'s store."""
+        files = (self.walk[0] or {}).get(str(agent or ""))
+        if files is None:
+            return None
+        text = str(path or "")
+        return text in files or (not os.path.isfile(text) and any(_under(f, text) for f in files))
+
+    def unseen(self, agent: str, source: dict) -> bool:
+        """A census file no index is shown to have walked: modified at or after the last one,
+        missing from its store walk or, with no walk to read, moved or copied in after it."""
+        if self.changed_since_index(source):
+            return True
+        walked = self.walked(agent, source.get("path"))
+        return self.touched_since_index(source.get("path")) if walked is None else not walked
+
+    def gone_before_index(self, agent: object, path: object) -> bool:
+        """A vanished path the last index already missed: missing from its store walk or, with no
+        walk to read, in a directory (an unlink changes its mtime) last changed before that index."""
+        text = str(path or "")
+        if not text or os.path.lexists(text):
+            return False
+        walked = self.walked(agent, text)
+        if walked is not None:
+            return not walked
+        parent = os.path.dirname(text)
+        while not os.path.isdir(parent) and os.path.dirname(parent) != parent:
+            parent = os.path.dirname(parent)
+        published = self.published_ms
+        try:
+            return bool(published) and os.stat(parent).st_mtime_ns // 1_000_000 < published
+        except OSError:
+            return False
 
     def census_line(self) -> str:
         if self.payload is None:
@@ -558,20 +705,23 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     paths = [c["path"] for c in claims if c.get("path")]
     unparsed: list[dict] = []
     if whole_store:
+        # A file deleted before the last index left search with it; its record lasts until an audit.
         entries = [e for e in ctx.intake_files if e.get("agent") == agent and not e.get("session")
-                   and ctx.chat_of(agent, e.get("path")) == session]
+                   and ctx.chat_of(agent, e.get("path")) == session
+                   and not ctx.gone_before_index(agent, e.get("path"))]
         if ctx.intake_ok:
             unparsed = [s for s in ctx.sources if s.get("agent") == agent
                         and s.get("path") not in ctx.tallied(agent)
                         and ctx.chat_of(agent, s.get("path")) == session
-                        and ctx.changed_since_index(s)]
+                        and ctx.unseen(agent, s)]
         paths = [e["path"] for e in entries] + [s["path"] for s in unparsed]
     else:
         entries = [e for e in ctx.intake_files if e.get("path") in paths and not e.get("session")]
         entries += [e for e in ctx.intake_files if e.get("session") == session]
     moved = {id(e): _store_wide_move(ctx, e, session) for e in entries if e.get("fresh") is False}
     stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
-    issue = next((i for i in (_issue_covering(ctx, p) for p in paths) if i), None)
+    stores = [e["path"] for e in entries if e.get("session") and e.get("path")]
+    issue = next((i for i in (_issue_covering(ctx, p) for p in paths + stores) if i), None)
     store_issue = next((i for i in ctx.issues if i.get("agent") == agent), None) if whole_store else None
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
              "sources": paths, "intake": entries, "unparsed": [s["path"] for s in unparsed],
@@ -810,8 +960,8 @@ def _unparsed_conversations(ctx: _Context, path: str, entries: list[dict]) -> li
 
 def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
                conversation: str | None, facts: dict) -> dict:
-    """A discovered file, or token-store conversation, that no intake record tallies. A file older
-    than the last index went unparsed by it, and no index will ever tally what its agent skips."""
+    """A discovered file, or token-store conversation, that no intake record tallies. Only a file
+    the last index's store walk listed went unparsed by it: no index tallies what its agent skips."""
     if not ctx.sig.get("present"):
         return _report(
             ctx, "not-provable",
@@ -819,15 +969,14 @@ def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
             [ctx.census_line(), ctx.sig_line()], facts=facts, next_action="agrep index")
     source = next((s for s in ctx.sources if s.get("path") == path), None) or {}
     modified = f"store census: file modified {_when(_key_mtime_ms(source.get('stat_key')))}"
+    unparsed = "intake_stats.json: no record of this file, so no index has parsed it"
     # The census token list alone shows a conversation is new: sqlite WAL writes can leave the
     # database file's mtime older than the index that never saw the conversation.
     if conversation or ctx.changed_since_index(source):
         return _report(
             ctx, "written-after-last-index",
             f"not indexed yet: {label} appeared after the last index",
-            ["intake_stats.json: no record of this file, so no index has parsed it", modified,
-             ctx.sig_line()],
-            facts=facts, next_action="agrep index")
+            [unparsed, modified, ctx.sig_line()], facts=facts, next_action="agrep index")
     if not ctx.intake_ok:
         book = (ctx.payload or {}).get("intake") or {}
         return _report(
@@ -837,13 +986,27 @@ def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
             [f"intake_stats.json: {book.get('reason') or book.get('state')}", modified,
              ctx.sig_line()],
             facts=facts)
+    walked = ctx.walked(agent, path)
+    if walked:
+        return _report(
+            ctx, "discovered-no-rows",
+            f"discovered but not parsed: {ctx.display(path)} is not a file {agent or 'its agent'} "
+            "parses, so none of it is searchable",
+            [ctx.walk_line(agent, walked) + ", yet intake_stats.json has no record of it", modified,
+             ctx.sig_line()],
+            facts=facts)
+    if ctx.touched_since_index(path):
+        return _report(
+            ctx, "written-after-last-index",
+            f"not indexed yet: {label} appeared after the last index",
+            [unparsed, f"filesystem: moved, copied or changed {_when(_changed_ms(path))}; a move "
+             "or copy keeps the older modification time", modified, ctx.sig_line()],
+            facts=facts, next_action="agrep index")
     return _report(
-        ctx, "discovered-no-rows",
-        f"discovered but not parsed: {ctx.display(path)} is not a file {agent or 'its agent'} "
-        "parses, so none of it is searchable",
-        ["intake_stats.json: no record of this file, though it predates the last index", modified,
-         ctx.sig_line()],
-        facts=facts)
+        ctx, "not-provable",
+        f"unprovable: {label} predates the last index, but nothing shows that index saw it",
+        [ctx.walk_line(agent, walked), unparsed, modified, ctx.sig_line()],
+        facts=facts, next_action="agrep index")
 
 
 def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | None = None) -> dict:
@@ -865,7 +1028,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             owner = session or (found[0] if found else None)
             names_dir = bool(found) and found[1] == str(Path(path))
             row = (ctx.row_for(owner) if owner and (entries or names_dir or not ctx.intake_ok)
-                   else None)
+                   and not ctx.gone_before_index(agent, path) else None)
             indexed = [row] if row and row.get("agent") == agent else []
         else:
             indexed = [r for r in (ctx.row_for(e["session"]) for e in conversations
@@ -897,11 +1060,21 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             ["parse cache: session " + ", ".join(c["session"] for c in claims),
              f"{ctx.index_origin}: {len(ctx.rows)} chats, none with that id", ctx.sig_line()],
             facts=facts, next_action="agrep index")
+    tallies = conversations or entries
+    if tallies and not os.path.lexists(path):
+        # intake_stats.json keeps a vanished source's record until an audit drops it.
+        held = sorted(str(e.get("session")) for e in conversations)
+        shown = ", ".join(held[:_CANDIDATE_LINES]) + (" …" if len(held) > _CANDIDATE_LINES else "")
+        tally = (f"intake_stats.json: {_plural(len(conversations), 'conversation')} parsed from it: "
+                 f"{shown}" if len(conversations) > 1 else _intake_line(tallies[0]))
+        return _report(
+            ctx, "source-not-discovered",
+            f"not indexed: {label} was deleted after an index parsed it",
+            [f"filesystem: no file at {ctx.display(path)}", tally, ctx.sig_line()], facts=facts)
     if session is None and len(conversations) > 1:
         candidates = [{"agent": e.get("agent"), "path": path, "session": e.get("session"),
                        "rows": e.get("rows")} for e in conversations[:_CANDIDATE_LINES]]
         return _ambiguous(ctx, candidates, "conversations in that database", "intake_stats.json")
-    tallies = conversations or entries
     entry = tallies[0] if tallies else None
     if entry is None:
         return _untallied(ctx, agent, path, label, conversation, facts)
@@ -913,14 +1086,19 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             [f"intake_stats.json: parsed at {_when(_key_mtime_ms(then))} ({then}), "
              f"now {_when(_key_mtime_ms(now))} ({now})", _intake_line(entry), ctx.sig_line()],
             facts=facts, next_action="agrep index")
+    token = entry.get("session")
+    if entry.get("fresh") is None and token and token not in _RESERVED_SESSIONS and not any(
+            i.get("kind") == "token-census-unreadable" and i.get("agent") == entry.get("agent")
+            for i in ctx.issues):
+        # The census read this store's token list whole, and the conversation is not in it.
+        listed = {t["session"] for t in ctx.token_conversations if t["path"] == path} - _RESERVED_SESSIONS
+        return _report(
+            ctx, "source-not-discovered",
+            f"not indexed: {entry.get('agent') or agent} conversation {token} was deleted from "
+            f"{ctx.display(path)} after an index parsed it",
+            [f"store census: {ctx.display(path)} holds {_plural(len(listed), 'conversation')}, "
+             f"none of them {token}", _intake_line(entry), ctx.sig_line()], facts=facts)
     if entry.get("fresh") is None:
-        # intake_stats.json keeps a vanished source's record until an audit drops it.
-        if not os.path.lexists(path):
-            return _report(
-                ctx, "source-not-discovered",
-                f"not indexed: {label} was deleted after an index parsed it",
-                [f"filesystem: no file at {ctx.display(path)}", _intake_line(entry), ctx.sig_line()],
-                facts=facts)
         return _report(
             ctx, "not-provable",
             f"unprovable: {label} has an intake record but its current state cannot be read",
@@ -931,6 +1109,19 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             f"discovered but empty: every record in {label} was skipped, so no row was indexed",
             [_intake_line(entry), ctx.sig_line()], facts=facts,
             next_action="agrep audit" if entry.get("errors") else None)
+    cache = (ctx.payload or {}).get("cache") or {}
+    if not whole_store and not token and cache.get("state") != "ok":
+        detail = cache.get("reason") or cache.get("state")
+        # A plain index trusts the published source snapshot and never refills an absent cache;
+        # undecodable bytes make every index, --full included, decline.
+        rebuild = "agrep index --full" if cache.get("state") == "missing" else None
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: the parse cache is {cache.get('state')} ({detail}), so {label} cannot be "
+            "tied to its chat",
+            [f"parse cache: {detail}; no file can be tied to its chat", _intake_line(entry),
+             ctx.sig_line()],
+            facts=facts, next_action=rebuild)
     return _report(
         ctx, "not-provable",
         f"unprovable: {label} yielded {entry.get('rows')} rows that no published session references",
@@ -1048,20 +1239,22 @@ def _path_lane(ctx: _Context, reference: str) -> tuple[str, list[dict]]:
         suffix = suffix[2:]
     found: dict[str, dict] = {}
 
-    def consider(agent: object, path: object) -> None:
+    def consider(agent: object, path: object, *, trailing: bool = True) -> None:
         path = str(path or "")
         if not path or path in found:
             return
-        if path == expanded or (suffix and path.endswith(os.sep + suffix)):
+        if path == expanded or (trailing and suffix and path.endswith(os.sep + suffix)):
             found[path] = {"agent": agent, "path": path}
 
     for source in ctx.sources:
         consider(source.get("agent"), source.get("path"))
     for issue in ctx.issues:
         consider(issue.get("agent"), issue.get("path"))
-    # A deleted transcript stays claimed and searchable until the next index, tallied until an audit.
+    # A deleted transcript stays claimed and searchable until the next index, tallied until an
+    # audit; once a file was moved, the live one a trailing part fits outranks its stale record.
+    live = bool(found)
     for record in ctx.cache_sessions + ctx.intake_files:
-        consider(record.get("agent"), record.get("path"))
+        consider(record.get("agent"), record.get("path"), trailing=not live)
     if not found and _names_a_file(reference):
         alias = ctx.entries_by_real.get(ctx.real(expanded))
         if alias:

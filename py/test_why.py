@@ -1336,6 +1336,99 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         payload = self.assert_verdict("indexed", "11111111-1111")
         self.assertTrue(any("freshness unverified" in line for line in payload["evidence"]["lines"]))
 
+    def test_moved_or_restored_transcript_waits_for_the_next_index(self) -> None:
+        """A move, `cp -p` or restore keeps a transcript's old mtime, so its age shows nothing; only
+        the last index's store walk (.source_snapshot.bin) proves a file was seen and left unparsed."""
+        birch = self.sandbox.store(f"claude/projects/-projects-birch/{CLAUDE_TWIN}.jsonl")
+        moved = self.sandbox.store(f"claude/projects/-projects-oak/{CLAUDE_TWIN}.jsonl")
+        moved.parent.mkdir()
+        os.rename(birch, moved)
+        restored_id = "99999999-9999-4999-8999-999999999999"
+        restored = moved.with_name(f"{restored_id}.jsonl")
+        _append_claude_turn(restored, self.sandbox.home, "A restored question.",
+                            "2000-03-01T00:00:00.000Z", session=restored_id, project="oak")
+        os.utime(restored, (time.time() - 86400,) * 2)
+        # A move keeps a Windows file's creation time, the ctime Python reports there.
+        renamed = "not-provable" if os.name == "nt" else "written-after-last-index"
+        for path, verdict in ((moved, renamed), (restored, "written-after-last-index")):
+            with self.subTest(path=path.name):
+                payload = self.assert_verdict(verdict, str(path), next_action="agrep index")
+                self.assertIn("intake_stats.json: no record of this file, so no index has parsed it",
+                              payload["evidence"]["lines"])
+                self.assertNotIn("parses", payload["summary"])
+        cedar = self.sandbox.store("claude/projects/-projects-cedar")
+        elm = cedar.with_name("-projects-elm")
+        os.rename(cedar, elm)
+        relocated = elm / f"{CLAUDE}.jsonl"
+        payload = self.assert_verdict("not-provable", str(relocated), next_action="agrep index")
+        self.assertEqual(payload["summary"],
+                         f"unprovable: claude file {self.sandbox.display(relocated)} "
+                         "predates the last index, but nothing shows that index saw it")
+        self.assertEqual(payload["evidence"]["lines"][0],
+                         ".source_snapshot.bin: the last index's store walk did not list this file")
+        self.sandbox.index()
+        for path, session in ((moved, CLAUDE_TWIN), (restored, restored_id), (relocated, CLAUDE)):
+            with self.subTest(path=path.name):
+                payload = self.assert_verdict("indexed", str(path))
+                self.assertEqual(payload["evidence"]["index_row"]["session"], session)
+
+    def test_trailing_part_after_a_move_names_the_live_file(self) -> None:
+        """intake_stats.json keeps a moved transcript's old path until an audit: a trailing part both
+        fit names the live file, and only the old relative path still reaches the stale record."""
+        birch = self.sandbox.store(f"claude/projects/-projects-birch/{CLAUDE_TWIN}.jsonl")
+        moved = self.sandbox.store(f"claude/projects/-projects-oak/{CLAUDE_TWIN}.jsonl")
+        moved.parent.mkdir()
+        os.rename(birch, moved)
+        self.sandbox.index()
+        payload = self.assert_verdict("indexed", f"{CLAUDE_TWIN}.jsonl")
+        self.assertEqual(payload["evidence"]["sources"], [str(moved)])
+        payload = self.assert_verdict("source-not-discovered",
+                                      _native(f"-projects-birch/{CLAUDE_TWIN}.jsonl"))
+        self.assertEqual(payload["summary"], f"not indexed: claude file {self.sandbox.display(birch)} was "
+                                             "deleted after an index parsed it")
+
+    def test_unreadable_parse_cache_is_named_for_a_transcript_path(self) -> None:
+        """Only the parse cache ties a stat-store file to its chat: with the cache unreadable a path
+        is unprovable for that reason, never rows that no published session references."""
+        path = self.sandbox.store(f"claude/projects/-projects-cedar/{CLAUDE}.jsonl")
+        cache = self.sandbox.data / ".ingest_cache.bin"
+        cache.write_bytes(b"garbage")
+        payload = self.assert_verdict("not-provable", str(path))
+        self.assertEqual(payload["summary"],
+                         "unprovable: the parse cache is unreadable (undecodable cache payload), so "
+                         f"claude file {self.sandbox.display(path)} cannot be tied to its chat")
+        self.assertEqual(payload["evidence"]["lines"][0],
+                         "parse cache: undecodable cache payload; no file can be tied to its chat")
+        self.assert_verdict("indexed", CLAUDE)
+        cache.unlink()
+        payload = self.assert_verdict("not-provable", str(path), next_action="agrep index --full")
+        self.assertIn("the parse cache is missing (missing cache file)", payload["summary"])
+        full = self.sandbox.cli("index", "--full")
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        self.assert_verdict("indexed", str(path))
+
+    def test_missing_sessions_index_is_labelled_missing_not_torn(self) -> None:
+        """messages.jsonl answers when sessions.jsonl is gone, as resume reads; the evidence names
+        the aggregate missing, a different damage from a torn one."""
+        (self.sandbox.data / "sessions.jsonl").unlink()
+        payload = self.assert_verdict("indexed", CLAUDE)
+        self.assertTrue(payload["evidence"]["lines"][0].startswith(
+            f"messages.jsonl (sessions.jsonl missing): claude chat {CLAUDE}, 2 messages"),
+            payload["evidence"]["lines"])
+
+    def test_empty_index_is_not_called_torn(self) -> None:
+        """An index of no chats publishes an empty sessions.jsonl beside an empty messages.jsonl:
+        nothing is torn, so the evidence reads from sessions.jsonl."""
+        self.sandbox.close()
+        self.sandbox = Sandbox()
+        for store in (".claude", ".pi", ".omp"):
+            shutil.rmtree(self.sandbox.home / store)
+        self.sandbox.index()
+        self.assertEqual((self.sandbox.data / "sessions.jsonl").read_text(encoding="utf-8"), "")
+        payload = self.assert_verdict("source-not-discovered", "deadbeefcafe")
+        self.assertEqual(payload["evidence"]["lines"][0],
+                         "sessions.jsonl: 0 chats, none match by id, alias, project or first line")
+
 
 class WhyUnclaimedStoreTests(_VerdictAssertions):
     def setUp(self) -> None:
@@ -1351,6 +1444,13 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
     def cursor_path(self) -> Path:
         return (self.sandbox.home / ".config" / "Cursor" / "User"
                 / "globalStorage" / "state.vscdb")
+
+    def crush_path(self) -> Path:
+        return self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
+
+    def assert_no_hits(self, query: str) -> None:
+        search = self.sandbox.cli("search", query, "--json")
+        self.assertEqual(json.loads(search.stdout)["completeness"]["shown"], 0, search.stdout)
 
     def test_whole_store_changed_transcripts_are_not_fully_indexed(self) -> None:
         stores = self.whole_stores()
@@ -1649,6 +1749,130 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
         self.assert_verdict("indexed", session)
         search = self.sandbox.cli("search", "zeppelin", "--json")
         self.assertEqual(search.returncode, 0, search.stderr)
+
+    def test_file_moved_into_an_indexed_chat_waits_for_the_next_index(self) -> None:
+        """A mailbox message copied in with an old mtime is as new to the index as a fresh one, and
+        without .source_snapshot.bin no old untallied file is proven skipped by the last index."""
+        stores = {agent: (session, path) for agent, session, path in self.whole_stores()}
+        brain, transcript = stores["antigravity"]
+        rotated = stores["kimi"][1].with_name("context_1.jsonl")
+        _whole_store_add(rotated, "kimi", "quokka pre-clear question")
+        self.sandbox.index()
+        self.assert_verdict("discovered-no-rows", str(rotated))
+        mailbox = transcript.parents[1] / "messages"
+        mailbox.mkdir()
+        restored = mailbox / "m1.json"
+        restored.write_text(json.dumps({"sender": f"{brain}/task-1", "content": "zeppelin result"}),
+                            encoding="utf-8")
+        os.utime(restored, (time.time() - 86400,) * 2)
+        payload = self.assert_verdict("written-after-last-index", brain, next_action="agrep index")
+        self.assertEqual(payload["evidence"]["unparsed"], [str(restored)])
+        self.assert_verdict("written-after-last-index", str(restored), next_action="agrep index")
+        (self.sandbox.data / ".source_snapshot.bin").unlink()
+        payload = self.assert_verdict("not-provable", str(rotated), next_action="agrep index")
+        self.assertEqual(payload["evidence"]["lines"][0], ".source_snapshot.bin: missing")
+        self.assert_verdict("written-after-last-index", str(restored), next_action="agrep index")
+        self.sandbox.index()
+        self.assert_verdict("indexed", brain)
+        self.assert_verdict("discovered-no-rows", str(rotated))
+
+    def test_deleted_file_of_a_chat_with_other_files_is_deleted_after_the_next_index(self) -> None:
+        """A chat that keeps other files stays indexed when one is deleted; that file answers like
+        its chat only until an index walks the store without it, then it was deleted."""
+        stores = {agent: (session, path) for agent, session, path in self.whole_stores()}
+        brain, transcript = stores["antigravity"]
+        mailbox = transcript.parents[1] / "messages"
+        mailbox.mkdir()
+        message = mailbox / "m1.json"
+        message.write_text(json.dumps({"sender": f"{brain}/task-1", "content": "zeppelin result"}),
+                           encoding="utf-8")
+        self.sandbox.index()
+        message.unlink()
+        relative = _native("messages/m1.json")
+        for reference in (str(message), relative):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("indexed", reference)
+                self.assertEqual(payload["evidence"]["index_row"]["session"], brain)
+        self.assertIn(brain, self.sandbox.cli("search", "zeppelin", "--json").stdout)
+        self.sandbox.index()
+        self.assert_no_hits("zeppelin")
+        for reference in (str(message), relative):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("source-not-discovered", reference)
+                self.assertEqual(payload["summary"], f"not indexed: antigravity file "
+                                                     f"{self.sandbox.display(message)} was deleted after "
+                                                     "an index parsed it")
+        self.assertEqual(self.assert_verdict("indexed", brain)["evidence"]["sources"], [str(transcript)])
+        # Without .source_snapshot.bin, a directory last changed before the index dates the deletion.
+        (self.sandbox.data / ".source_snapshot.bin").unlink()
+        os.utime(mailbox, (time.time() - 3600,) * 2)
+        self.assert_verdict("source-not-discovered", str(message))
+        self.assertEqual(self.assert_verdict("indexed", brain)["evidence"]["sources"], [str(transcript)])
+
+    def test_deleted_token_store_is_deleted_not_ambiguous(self) -> None:
+        """intake_stats.json tallies a deleted database's conversations until an audit; once the
+        index drops their chats the path is a deleted file, never ambiguous between them."""
+        crush = self.crush_path()
+        _crush_store(crush, [("sc1", 1000, "walnut ledger question"),
+                             ("sc2", 2000, "hazel invoice question")])
+        self.sandbox.index()
+        crush.unlink()
+        # The first index after the store vanishes keeps its last good parse; the next drops it.
+        self.sandbox.index()
+        self.sandbox.index()
+        self.assert_no_hits("walnut")
+        payload = self.assert_verdict("source-not-discovered", str(crush))
+        self.assertEqual(payload["summary"], f"not indexed: crush file {self.sandbox.display(crush)} was "
+                                             "deleted after an index parsed it")
+        self.assertEqual(payload["evidence"]["lines"][:2], [
+            f"filesystem: no file at {self.sandbox.display(crush)}",
+            "intake_stats.json: 2 conversations parsed from it: sc1, sc2"])
+        self.assertEqual(payload["candidates"], [])
+
+    def test_conversation_deleted_from_a_live_token_store_is_deleted(self) -> None:
+        """The census reads a live database's whole token list, so a tallied conversation missing
+        from it was deleted after an index parsed it while the store's other chat stays indexed."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question"),
+                             ("crushchat-two", 2000, "hazel invoice question")])
+        self.sandbox.index()
+        db = sqlite3.connect(str(crush))
+        try:
+            with db:
+                db.execute("DELETE FROM messages WHERE session_id = 'crushchat-two'")
+                db.execute("DELETE FROM sessions WHERE id = 'crushchat-two'")
+        finally:
+            db.close()
+        self.assert_verdict("indexed", "crushchat-two")
+        self.sandbox.index()
+        self.assert_no_hits("hazel")
+        payload = self.assert_verdict("source-not-discovered", "crushchat-two")
+        self.assertEqual(payload["summary"], "not indexed: crush conversation crushchat-two was deleted "
+                                             f"from {self.sandbox.display(crush)} after an index parsed it")
+        self.assertEqual(payload["evidence"]["lines"][0], f"store census: {self.sandbox.display(crush)} "
+                                                          "holds 1 conversation, none of them crushchat-two")
+        self.assert_verdict("indexed", "crushchat-one")
+        self.assert_verdict("indexed", str(crush))
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_unreadable_token_store_is_not_called_indexed(self) -> None:
+        """A token-store chat reads its issues from its database the way a transcript does: an
+        unreadable crush.db still serves the last good parse, which is not fully indexed."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        crush.chmod(0)
+        self.sandbox.index()
+        for reference in ("crushchat-one", str(crush)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("source-unreadable", reference,
+                                              next_action="make the file readable, then agrep index")
+                self.assertEqual(payload["evidence"]["issue"]["path"], str(crush))
+                self.assertIn("sessions.jsonl still serves the last good parse (1 message)",
+                              payload["evidence"]["lines"])
+        crush.chmod(0o600)
+        self.sandbox.index()
+        self.assert_verdict("indexed", "crushchat-one")
 
 
 if __name__ == "__main__":
