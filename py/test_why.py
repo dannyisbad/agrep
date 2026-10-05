@@ -42,6 +42,7 @@ KIMI_NEW = "88888888-8888-4888-8888-888888888888"
 KIMI_CHILD = "99999999-9999-4999-8999-999999999999"
 KIMI_NESTED = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 CLINE_NEW = "1767349000000"
+GEMINI = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 VERDICT_EXIT = {"indexed": 0, "indexed-under-alias": 0, "indexed-as-side-chat": 0,
                 "ambiguous": 2, "not-provable": 2}
 NOT_SERVED = 97
@@ -187,6 +188,19 @@ def _cursor_store(path: Path, turns: list[tuple[str, str]]) -> None:
                            (f"bubbleId:{session}:u", json.dumps({"type": 1, "text": text})))
     finally:
         db.close()
+
+
+def _gemini_session(path: Path, session: str, texts: list[str]) -> None:
+    """A gemini chat of user turns: a legacy `.json` record, or the `.jsonl` log resuming writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    head = {"sessionId": session, "projectHash": "hashsynthetic",
+            "startTime": "2000-03-10T08:00:00.000Z", "lastUpdated": "2000-03-10T08:00:09.000Z"}
+    turns = [{"id": f"m{n}", "timestamp": f"2000-03-10T08:00:0{n}.000Z", "type": "user",
+              "content": [{"text": text}]} for n, text in enumerate(texts, 1)]
+    if path.suffix == ".json":
+        path.write_text(json.dumps({**head, "messages": turns}), encoding="utf-8")
+    else:
+        path.write_text("".join(json.dumps(record) + "\n" for record in (head, *turns)), encoding="utf-8")
 
 
 def _whole_store_add(path: Path, agent: str, text: str) -> None:
@@ -1458,6 +1472,17 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
     def crush_path(self) -> Path:
         return self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
 
+    def crush_project(self, name: str, turns: list[tuple[str, int, str]]) -> tuple[Path, Path]:
+        """A crush store in a project that projects.json registers, and that registry."""
+        project = self.sandbox.home / "projects" / name
+        store = project / ".crush" / "crush.db"
+        _crush_store(store, turns)
+        registry = self.crush_path().with_name("projects.json")
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(json.dumps({"projects": [{"path": str(project), "data_dir": str(store.parent)}]}),
+                            encoding="utf-8")
+        return store, registry
+
     def assert_no_hits(self, query: str) -> None:
         search = self.sandbox.cli("search", query, "--json")
         self.assertEqual(json.loads(search.stdout)["completeness"]["shown"], 0, search.stdout)
@@ -1967,13 +1992,7 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
     def test_store_the_census_no_longer_discovers_is_not_called_deleted(self) -> None:
         """crush reads only the databases projects.json registers. One dropped from it still holds its
         chats, so a census that never opened it proves no deletion."""
-        project = self.sandbox.home / "projects" / "oak"
-        store = project / ".crush" / "crush.db"
-        _crush_store(store, [("projchat-one", 1000, "marzipan ledger question")])
-        registry = self.crush_path().with_name("projects.json")
-        registry.parent.mkdir(parents=True)
-        registry.write_text(json.dumps({"projects": [{"path": str(project), "data_dir": str(store.parent)}]}),
-                            encoding="utf-8")
+        store, registry = self.crush_project("oak", [("projchat-one", 1000, "marzipan ledger question")])
         self.sandbox.index()
         self.assert_verdict("indexed", "projchat-one")
         registry.write_text(json.dumps({"projects": []}), encoding="utf-8")
@@ -2006,6 +2025,116 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
             f"store census: {shown} holds 0 conversations, none of the 2 an index parsed",
             "intake_stats.json: 2 conversations parsed from it: crushchat-one, crushchat-two"])
         self.assertEqual(payload["candidates"], [])
+
+    def test_unregistered_store_of_several_chats_is_unprovable_not_ambiguous(self) -> None:
+        """A census that never opened a database projects.json dropped tells none of its chats apart:
+        its path is as unprovable as each id, never ambiguous between chats search no longer serves."""
+        store, registry = self.crush_project("oak", [("projchat-one", 1000, "marzipan ledger question"),
+                                                     ("projchat-two", 2000, "nutmeg invoice question")])
+        self.sandbox.index()
+        registry.write_text(json.dumps({"projects": []}), encoding="utf-8")
+        self.sandbox.index()
+        self.sandbox.index()
+        self.assert_no_hits("marzipan")
+        unlisted = f"store census: discovers no crush store at {self.sandbox.display(store)}"
+        for reference in ("projchat-one", "projchat-two"):
+            with self.subTest(reference=reference):
+                self.assertEqual(self.assert_verdict("not-provable", reference)["evidence"]["lines"][0],
+                                 unlisted)
+        payload = self.assert_verdict("not-provable", str(store))
+        self.assertEqual(payload["evidence"]["lines"][:2], [
+            unlisted, "intake_stats.json: 2 conversations parsed from it: projchat-one, projchat-two"])
+        self.assertEqual(payload["candidates"], [])
+
+    def test_blind_token_census_proves_no_chat_current_or_absent(self) -> None:
+        """crush lists no conversation of any database while one cannot be read: the census shows
+        neither that a healthy database's chat is unchanged nor that an unknown one is not in it."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        store, _ = self.crush_project("elm", [("elmchat-one", 1000, "hazel invoice question")])
+        self.sandbox.index()
+        store.write_bytes(b"not a crush database")
+        self.sandbox.index()
+        self.assert_verdict("source-unreadable", "elmchat-one",
+                            next_action="make the file readable, then agrep index")
+        _crush_add(crush, "crushchat-new", 3000, "quince new question")
+        _crush_add(crush, "crushchat-one", 4000, "maple follow-up question", new_session=False)
+        self.assert_no_hits("maple")
+        blind = f"store census: token-census-unreadable on {self.sandbox.display(store)} - "
+        for round_, references in enumerate((("crushchat-one", str(crush), "crushchat-new"),
+                                             ("crushchat-one", "crushchat-new"))):
+            for reference in references:
+                with self.subTest(reference=reference, round=round_):
+                    payload = self.assert_verdict("not-provable", reference, next_action="agrep index")
+                    self.assertTrue(any(line.startswith(blind) for line in payload["evidence"]["lines"]),
+                                    payload)
+            self.sandbox.index()
+        for query, session in (("maple", "crushchat-one"), ("quince", "crushchat-new")):
+            self.assertIn(session, self.sandbox.cli("search", query, "--json").stdout)
+        store.unlink()
+        _crush_store(store, [("elmchat-one", 1000, "hazel invoice question")])
+        self.sandbox.index()
+        for session in ("crushchat-one", "crushchat-new", "elmchat-one"):
+            with self.subTest(session=session):
+                self.assert_verdict("indexed", session)
+
+    def test_resumed_gemini_chat_is_judged_by_the_jsonl_gemini_reads(self) -> None:
+        """Resuming a legacy gemini `X.json` copies it into `X.jsonl`, which carries the chat from then
+        on: the chat waits for the next index, after which the retired file answers like its successor."""
+        legacy = (self.sandbox.home / ".gemini" / "tmp" / "hashsynthetic" / "chats"
+                  / "session-2000-03-10T08-00-eeeeeeee.json")
+        resumed = legacy.with_suffix(".jsonl")
+        _gemini_session(legacy, GEMINI, ["walnut ledger question"])
+        self.sandbox.index()
+        self.assert_verdict("indexed", str(legacy))
+        book = self.sandbox.data / "intake_stats.json"
+        tally = json.loads(book.read_text(encoding="utf-8"))["files"][str(legacy)]
+        _gemini_session(resumed, GEMINI, ["walnut ledger question", "zeppelin follow-up question"])
+        for reference in (GEMINI, str(legacy)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("written-after-last-index", reference,
+                                              next_action="agrep index")
+                self.assertEqual(payload["evidence"]["unparsed"], [str(resumed)])
+        self.assert_no_hits("zeppelin")
+        retired = (f"gemini: reads {self.sandbox.display(resumed)} instead; "
+                   "resuming copied this legacy file into it")
+        for round_ in range(2):
+            self.sandbox.index()
+            self.assertIn(GEMINI, self.sandbox.cli("search", "zeppelin", "--json").stdout)
+            for reference in (GEMINI, str(resumed)):
+                self.assert_verdict("indexed", reference)
+            # A data dir indexed before intake forgot retired files still tallies the legacy one.
+            for tallied in (True, False):
+                book_data = json.loads(book.read_text(encoding="utf-8"))
+                book_data["files"].pop(str(legacy), None)
+                if tallied:
+                    book_data["files"][str(legacy)] = tally
+                book.write_text(json.dumps(book_data), encoding="utf-8")
+                for reference in (str(legacy), legacy.name):
+                    with self.subTest(round=round_, tallied=tallied, reference=reference):
+                        payload = self.assert_verdict("indexed", reference)
+                        self.assertEqual(payload["evidence"]["lines"][0], retired)
+                        self.assertEqual(payload["evidence"]["superseded_by"], str(resumed))
+                        self.assertEqual(payload["evidence"]["index_row"]["session"], GEMINI)
+
+    def test_store_file_its_agent_stopped_reading_is_not_indexed(self) -> None:
+        """opencode reads the database OPENCODE_DB names only while it names it: a parsed file the census
+        no longer discovers and the last index did not walk is one its agent stopped reading."""
+        store = self.sandbox.home / "elsewhere" / "oak.db"
+        _opencode_store(store, self.sandbox.home, [("ses_quince", 1000, "quince ledger question")])
+        named = {**self.sandbox.env, "OPENCODE_DB": str(store)}
+        indexed = self.sandbox.cli("index", env=named)
+        self.assertEqual(indexed.returncode, 0, indexed.stdout + indexed.stderr)
+        self.assert_verdict("indexed", str(store), env=named)
+        for round_ in range(2):
+            self.sandbox.index()
+            self.assert_no_hits("quince")
+            for reference in (str(store), "ses_quince"):
+                with self.subTest(reference=reference, round=round_):
+                    payload = self.assert_verdict("source-not-discovered", reference)
+                    self.assertEqual(payload["summary"], f"not indexed: opencode no longer reads "
+                                                         f"{self.sandbox.display(store)}, which an index "
+                                                         "parsed before")
 
 
 if __name__ == "__main__":

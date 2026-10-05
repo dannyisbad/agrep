@@ -718,14 +718,22 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     else:
         entries = [e for e in ctx.intake_files if e.get("path") in paths and not e.get("session")]
         entries += [e for e in ctx.intake_files if e.get("session") == session]
+        if ctx.intake_ok:
+            # A resumed legacy chat continues in its successor, untallied until the next index.
+            tallied = {e.get("path") for e in ctx.intake_files}
+            unparsed = [s for s in (_successor(ctx, agent, p) for p in paths)
+                        if s and s.get("path") not in tallied]
     moved = {id(e): _store_wide_move(ctx, e, session) for e in entries if e.get("fresh") is False}
     stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
     stores = [e["path"] for e in entries if e.get("session") and e.get("path") and _token_trouble(ctx, e)]
-    issue = next((i for i in (_issue_covering(ctx, p) for p in paths + stores) if i), None)
+    checked = paths + [s["path"] for s in unparsed] + stores
+    issue = next((i for i in (_issue_covering(ctx, p) for p in checked) if i), None)
     store_issue = next((i for i in ctx.issues if i.get("agent") == agent), None) if whole_store else None
+    unlisted = [e["path"] for e in entries if e.get("session") and e.get("fresh") is None]
+    census_issue = _census_issue(ctx, agent) if unlisted else None
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
              "sources": paths, "intake": entries, "unparsed": [s["path"] for s in unparsed],
-             "issue": issue, "store_issue": store_issue}
+             "issue": issue, "store_issue": store_issue, "census_issue": census_issue}
     lines = [_index_line(ctx, row), _corpus_line(corpus)]
     for entry in entries:
         if moved.get(id(entry)):
@@ -813,6 +821,13 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             f"unprovable: freshness unverified for {agent} chat {_short(session)}; a {agent} "
             "store issue may have kept an older parse in search",
             lines, facts=facts, next_action=_READABLE_ACTION)
+    if census_issue:
+        lines.insert(1, _issue_line(ctx, census_issue))
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: freshness unverified for {agent} chat {_short(session)}; the census lists "
+            f"no {agent} conversation while one of its databases cannot be read",
+            lines, facts=facts, next_action=_census_action(ctx, agent))
     if via == "alias" or (via == "path" and row.get("alias")):
         verdict, summary = "indexed-under-alias", (
             f"indexed under an alias: {agent} chat {row.get('alias')} is stored as "
@@ -958,9 +973,40 @@ def _unparsed_conversations(ctx: _Context, path: str, entries: list[dict]) -> li
                    and t["session"] not in _RESERVED_SESSIONS} - tallied)
 
 
-def _census_blind(ctx: _Context, agent: object) -> bool:
-    """The census could not read `agent`'s token lists, so a conversation missing from them proves nothing."""
-    return any(i.get("kind") == "token-census-unreadable" and i.get("agent") == agent for i in ctx.issues)
+def _census_issue(ctx: _Context, agent: object) -> dict | None:
+    """The issue that kept the census from reading `agent`'s token lists: one unreadable database
+    blanks them all, so a conversation missing from them, or listed under no key, proves nothing."""
+    return next((i for i in ctx.issues if i.get("kind") == "token-census-unreadable"
+                 and i.get("agent") == agent), None)
+
+
+def _census_action(ctx: _Context, agent: object) -> str:
+    """An index still reads every healthy database of `agent` while its census is blind; with none,
+    only a readable database can show a conversation."""
+    healthy = any(s.get("agent") == agent and not _issue_covering(ctx, str(s.get("path") or ""))
+                  for s in ctx.sources)
+    return "agrep index" if healthy else _READABLE_ACTION
+
+
+def _unlisted_line(ctx: _Context, agent: object, path: str, discovered: bool) -> str | None:
+    """Why the census lists no conversation of the token store at `path`."""
+    if not discovered:
+        return f"store census: discovers no {agent or 'token'} store at {ctx.display(path)}"
+    issue = _census_issue(ctx, agent)
+    return _issue_line(ctx, issue) if issue else None
+
+
+def _retired_by(agent: object, path: object) -> str | None:
+    """The legacy file the census file `path` retires: gemini.rs `superseded` drops `X.json` once
+    resuming copied it into `X.jsonl`, which carries the chat from then on."""
+    text = str(path or "")
+    return text[:-1] if agent == "gemini" and text.endswith(".jsonl") else None
+
+
+def _successor(ctx: _Context, agent: object, path: str) -> dict | None:
+    """The census file `agent` reads instead of the legacy file `path`."""
+    return next((s for s in ctx.sources if s.get("agent") == agent
+                 and _retired_by(agent, s.get("path")) == path), None)
 
 
 def _token_trouble(ctx: _Context, entry: dict) -> bool:
@@ -969,7 +1015,7 @@ def _token_trouble(ctx: _Context, entry: dict) -> bool:
     records that same database-wide issue."""
     if entry.get("errors") or not (entry.get("rows") or entry.get("agent_rows")):
         return True
-    return entry.get("fresh") is None and _census_blind(ctx, entry.get("agent"))
+    return entry.get("fresh") is None and _census_issue(ctx, entry.get("agent")) is not None
 
 
 def _parsed_line(conversations: list[dict]) -> str:
@@ -1099,6 +1145,23 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             [f"store census: {_plural(len(unparsed), 'conversation')} with no intake_stats.json "
              f"record: {shown}", ctx.sig_line()],
             facts=facts, next_action="agrep index")
+    discovered = any(s.get("path") == path for s in ctx.sources)
+    successor = None if discovered or not os.path.lexists(path) else _successor(ctx, agent, path)
+    if successor:
+        report = _judge_source(ctx, agent, successor["path"])
+        report["evidence"]["lines"].insert(0, f"{agent}: reads {ctx.display(successor['path'])} instead; "
+                                              "resuming copied this legacy file into it")
+        report["evidence"]["superseded_by"] = successor["path"]
+        return report
+    if (ctx.fingerprint(agent or "") == "stat" and not discovered and (claims or entries)
+            and os.path.lexists(path) and ctx.walked(agent, path) is False):
+        held = ("parse cache: session " + ", ".join(c["session"] for c in claims) if claims
+                else _intake_line(entries[0]))
+        return _report(
+            ctx, "source-not-discovered",
+            f"not indexed: {agent} no longer reads {ctx.display(path)}, which an index parsed before",
+            [f"store census: {agent} discovers no file at {ctx.display(path)}, though it exists",
+             ctx.walk_line(agent, False), held, ctx.sig_line()], facts=facts)
     if claims:
         return _report(
             ctx, "not-provable",
@@ -1114,11 +1177,11 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             ctx, "source-not-discovered",
             f"not indexed: {label} was deleted after an index parsed it",
             [f"filesystem: no file at {ctx.display(path)}", tally, ctx.sig_line()], facts=facts)
-    discovered = any(s.get("path") == path for s in ctx.sources)
     # Only a token store the census discovered and read lists every conversation it still holds.
-    listed_whole = discovered and not _census_blind(ctx, agent)
-    if (session is None and len(conversations) > 1 and listed_whole
-            and all(e.get("session") and e.get("fresh") is None for e in conversations)):
+    listed_whole = discovered and not _census_issue(ctx, agent)
+    several = session is None and len(conversations) > 1
+    unlisted = all(e.get("session") and e.get("fresh") is None for e in conversations)
+    if several and unlisted and listed_whole:
         listed = {t["session"] for t in ctx.token_conversations if t["path"] == path} - _RESERVED_SESSIONS
         return _report(
             ctx, "source-not-discovered",
@@ -1126,7 +1189,14 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             [f"store census: {ctx.display(path)} holds {_plural(len(listed), 'conversation')}, none of "
              f"the {len(conversations)} an index parsed", _parsed_line(conversations), ctx.sig_line()],
             facts=facts)
-    if session is None and len(conversations) > 1:
+    if several and unlisted:
+        lead = _unlisted_line(ctx, agent, path, discovered)
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: {label} has intake records for {len(conversations)} conversations but their "
+            "current state cannot be read",
+            [*([lead] if lead else []), _parsed_line(conversations), ctx.sig_line()], facts=facts)
+    if several:
         candidates = [{"agent": e.get("agent"), "path": path, "session": e.get("session"),
                        "rows": e.get("rows")} for e in conversations[:_CANDIDATE_LINES]]
         return _ambiguous(ctx, candidates, "conversations in that database", "intake_stats.json")
@@ -1152,8 +1222,9 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
              f"none of them {token}", _intake_line(entry), ctx.sig_line()], facts=facts)
     if entry.get("fresh") is None:
         lines = [_intake_line(entry), ctx.sig_line()]
-        if token and not discovered:
-            lines.insert(0, f"store census: discovers no {agent or 'token'} store at {ctx.display(path)}")
+        lead = _unlisted_line(ctx, agent, path, discovered) if token else None
+        if lead:
+            lines.insert(0, lead)
         return _report(
             ctx, "not-provable",
             f"unprovable: {label} has an intake record but its current state cannot be read",
@@ -1260,6 +1331,13 @@ def _no_match(ctx: _Context, stored_line: str | None = None) -> dict:
             f"unprovable: nothing agrep discovered matches '{ctx.reference}', but a store that "
             "changed since the last index may hold it",
             [moved, *lines], next_action="agrep index")
+    blind = next((i for i in ctx.issues if i.get("kind") == "token-census-unreadable"), None)
+    if blind:
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: nothing agrep discovered matches '{ctx.reference}', but the census lists no "
+            f"{blind.get('agent')} conversation while one of its databases cannot be read",
+            [_issue_line(ctx, blind), *lines], next_action=_census_action(ctx, blind.get("agent")))
     return _report(ctx, "source-not-discovered",
                    f"not indexed: nothing agrep discovered matches '{ctx.reference}'", lines)
 
@@ -1310,6 +1388,11 @@ def _path_lane(ctx: _Context, reference: str) -> tuple[str, list[dict]]:
     live = bool(found)
     for record in ctx.cache_sessions + ctx.intake_files:
         consider(record.get("agent"), record.get("path"), trailing=not live)
+    if not found:
+        # A retired legacy file names no census entry, and no record once intake forgets its tally.
+        for source in ctx.sources:
+            consider(source.get("agent"), _retired_by(source.get("agent"), source.get("path")))
+        found = {p: c for p, c in found.items() if os.path.isfile(p)}
     if not found and _names_a_file(reference):
         alias = ctx.entries_by_real.get(ctx.real(expanded))
         if alias:
