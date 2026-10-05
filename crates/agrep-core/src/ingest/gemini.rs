@@ -78,21 +78,71 @@ fn part_text(value: &Value) -> String {
 
 fn parts_text(parts: &[Value]) -> String {
     let mut out = String::new();
-    for part in parts {
-        match part {
-            Value::String(text) => out.push_str(text),
-            Value::Object(fields) => {
-                let thought = fields
-                    .get("thought")
-                    .is_some_and(|flag| !matches!(flag, Value::Null | Value::Bool(false)));
-                if let (false, Some(Value::String(text))) = (thought, fields.get("text")) {
-                    out.push_str(text);
-                }
-            }
-            _ => {}
-        }
+    for text in parts.iter().filter_map(prose) {
+        out.push_str(text);
     }
     out
+}
+
+/// A part's text when it is prose: a string, or a text part that is no thought.
+fn prose(part: &Value) -> Option<&str> {
+    match part {
+        Value::String(text) => Some(text),
+        Value::Object(fields) => {
+            let thought = fields
+                .get("thought")
+                .is_some_and(|flag| !matches!(flag, Value::Null | Value::Bool(false)));
+            fields
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|_| !thought)
+        }
+        _ => None,
+    }
+}
+
+/// A model turn's recorded reply, moved out of its content: the string upstream records, or the
+/// prose of the parts a re-sync left (see `with_recorded_reply`).
+fn recorded_text(content: Value) -> String {
+    let parts = match content {
+        Value::String(text) => return text,
+        Value::Array(parts) => parts,
+        part => vec![part],
+    };
+    if parts.iter().filter(|part| prose(part).is_some()).count() != 1 {
+        return parts_text(&parts);
+    }
+    match parts.into_iter().find(|part| prose(part).is_some()) {
+        Some(Value::String(text)) => text,
+        Some(Value::Object(mut fields)) => match fields.remove("text") {
+            Some(Value::String(text)) => text,
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// A model turn's parts as a re-sync writes them back, with the reply upstream recorded in place
+/// of their prose: the first prose part carries it and the others go, so the turn keeps both its
+/// cleaned reply and the calls a copy of it repeats.
+fn with_recorded_reply(parts: &Value, reply: String) -> Value {
+    let mut reply = Some(reply);
+    let mut out = Vec::new();
+    for part in parts_of(parts) {
+        if prose(part).is_none() {
+            out.push(part.clone());
+        } else if let Some(text) = reply.take() {
+            let mut part = part.clone();
+            match &mut part {
+                Value::Object(fields) => {
+                    fields.insert("text".to_string(), Value::String(text));
+                }
+                bare => *bare = Value::String(text),
+            }
+            out.push(part);
+        }
+    }
+    Value::Array(out)
 }
 
 /// A PartListUnion as its parts: a lone string or part is a list of one.
@@ -1196,7 +1246,8 @@ impl Fold {
     /// copy's (`want`): the one starting at or after `bound` from the front, else the one ending
     /// before it. `edges` maps each removed turn's first (front) or last part to positions; every
     /// part is keyed once per `pair`, so a comparison never re-reads its text. A `stale` message,
-    /// one upstream's conversion leaves out, can sit inside the run without being in the copy.
+    /// one upstream's conversion leaves out, and a turn without parts to key (thought-only, like a
+    /// binary read's acknowledgement) can sit inside the run without being in the copy.
     fn run(
         want: &[PartKey],
         removed_parts: &[Vec<PartKey>],
@@ -1244,9 +1295,14 @@ impl Fold {
                 // `--resume` re-derives a tool result the file also holds, under the same id:
                 // the history carries that message twice and upstream's map once
                 taken += len;
-            } else if members > 0 && next.is_some_and(|at| stale.get(at) == Some(&true)) {
-                // the map can keep it after a conversion when the file never re-synced: the
-                // `$set.messages` recorder writes none when the count comes out the same
+            } else if members > 0
+                && next.is_some_and(|at| {
+                    stale.get(at) == Some(&true) || removed_parts.get(at).is_some_and(Vec::is_empty)
+                })
+            {
+                // the map can keep a stale one after a conversion when the file never re-synced
+                // (the `$set.messages` recorder writes none when the count comes out the same);
+                // `stripThoughts` drops a turn left without parts (geminiChat.ts 1841-1880)
                 budget.set(budget.get().checked_sub(1)?);
                 edge = next?;
                 next = step(edge);
@@ -1321,7 +1377,8 @@ impl Fold {
     /// calls a result by id, only where none was recorded. Upstream records a model turn's reply
     /// cleaned (`responseText`, geminiChat.ts 1547-1659 at fb972b2), and a re-sync writes back the
     /// history's raw parts (chatRecordingService.ts 1364-1381): when those read the same (see
-    /// `visible_text`), the turn keeps the reply it recorded.
+    /// `visible_text`), the turn keeps the reply it recorded, among the parts' calls (see
+    /// `with_recorded_reply`).
     fn update(&mut self, patch: &Value) {
         let Some(index) = patch
             .get("id")
@@ -1351,6 +1408,21 @@ impl Fold {
             };
             if !kept {
                 message.insert("content".to_string(), content.clone());
+            } else if parts_of(content)
+                .iter()
+                .any(|part| part.get("functionCall").is_some())
+            {
+                let slot = message.entry("content").or_insert(Value::Null);
+                // a copy's parts already split its prose as the history does, which pairing keys
+                let same = slot.is_array()
+                    && (parts_of(slot).iter().filter_map(prose))
+                        .eq(parts_of(content).iter().filter_map(prose));
+                if same {
+                    *slot = content.clone();
+                } else {
+                    let recorded = recorded_text(std::mem::take(slot));
+                    *slot = with_recorded_reply(content, recorded);
+                }
             }
         }
         let Some(Value::Array(calls)) = patch.get("toolCalls") else {
@@ -2033,7 +2105,7 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
-        assert_eq!(files.len(), 156);
+        assert_eq!(files.len(), 164);
         let mut failures = Vec::new();
         for path in files {
             let (messages, _, tally) = parse(&path);
@@ -2095,7 +2167,8 @@ mod tests {
     /// prompts passing through a rewrite, one-in-one-out re-syncs behind a long map, whose gaps the
     /// rollback walk would cross again each time, many coalesced-looking copies ending like a
     /// removed turn with a huge part, which pairing would re-read per copy, and many patches of a
-    /// long reply that read the same, which would compare it each time. Naively each takes minutes.
+    /// long reply that read the same, half with a call, which would compare or copy it each time.
+    /// Naively each takes minutes.
     #[test]
     fn hostile_re_syncs_parse_in_linear_time() {
         let root = temp_root("hostile");
@@ -2198,10 +2271,15 @@ mod tests {
             r#"{{"id":"g","type":"gemini","content":"{comment}"}}"#
         ));
         body.push('\n');
-        for _ in 0..patches {
-            body.push_str(
-                "{\"$patch\":{\"updates\":[{\"id\":\"g\",\"content\":[{\"text\":\"ok\"}]}]}}\n",
-            );
+        for n in 0..patches {
+            let call = if n % 2 == 0 {
+                r#",{"functionCall":{"id":"c","name":"read_file"}}"#
+            } else {
+                ""
+            };
+            body.push_str(&format!(
+                "{{\"$patch\":{{\"updates\":[{{\"id\":\"g\",\"content\":[{{\"text\":\"ok\"}}{call}]}}]}}}}\n"
+            ));
         }
         std::fs::write(&path, &body).unwrap();
         let started = std::time::Instant::now();

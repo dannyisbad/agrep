@@ -205,6 +205,17 @@
   ["user","dingo","ok dingo"],
   ["user","elephant","ok elephant"]
  ]},
+ "87878787-0027-4000-8000-878787878787": {"flow": "current/esc_preamble_abort_mask", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","I will read bison."],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "88888888-0028-4000-8000-888888888888": {"flow": "current/binary_fail_mask_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
  "10101010-1000-4000-8000-101010101010": {"flow": "checkpoint/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"],
@@ -410,6 +421,17 @@
   ["user","cheetah",""],
   ["user","dingo","ok dingo"],
   ["user","elephant","ok elephant"]
+ ]},
+ "97979797-1027-4000-8000-979797979797": {"flow": "checkpoint/esc_preamble_abort_mask", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","I will read bison."],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "98989898-1028-4000-8000-989898989898": {"flow": "checkpoint/binary_fail_mask_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
  ]},
  "20202020-2000-4000-8000-202020202020": {"flow": "current+coalesced/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
@@ -617,6 +639,17 @@
   ["user","dingo","ok dingo"],
   ["user","elephant","ok elephant"]
  ]},
+ "a7a7a7a7-2027-4000-8000-a7a7a7a7a7a7": {"flow": "current+coalesced/esc_preamble_abort_mask", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","I will read bison."],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "a8a8a8a8-2028-4000-8000-a8a8a8a8a8a8": {"flow": "current+coalesced/binary_fail_mask_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
+ ]},
  "30303030-3000-4000-8000-303030303030": {"flow": "checkpoint+coalesced/compress1", "rows": [
   ["user","alpaca","ok alpaca"],
   ["user","bison","ok bison"],
@@ -822,5 +855,16 @@
   ["user","cheetah",""],
   ["user","dingo","ok dingo"],
   ["user","elephant","ok elephant"]
+ ]},
+ "b7b7b7b7-3027-4000-8000-b7b7b7b7b7b7": {"flow": "checkpoint+coalesced/esc_preamble_abort_mask", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison","I will read bison."],
+  ["user","cheetah","ok cheetah"],
+  ["user","elephant","ok elephant"]
+ ]},
+ "b8b8b8b8-3028-4000-8000-b8b8b8b8b8b8": {"flow": "checkpoint+coalesced/binary_fail_mask_rewind", "rows": [
+  ["user","alpaca","ok alpaca"],
+  ["user","bison",""],
+  ["user","dingo","ok dingo"]
  ]}
 }

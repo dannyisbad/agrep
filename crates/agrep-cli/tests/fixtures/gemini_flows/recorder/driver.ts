@@ -107,6 +107,11 @@ function coalesce(contents: Content[]): Content[] {
   return out;
 }
 
+/** The reply text upstream records: zero-width characters and HTML comments go (1552-1563). */
+function responseText(raw: string): string {
+  return raw.replace(/[\u200B-\u200D\uFEFF\u200E\u200F]/g, '').replace(/<!--[\s\S]*?-->/g, '').trim();
+}
+
 /** GeminiClient + GeminiChat, reduced to the calls that reach the recorder. */
 class Session {
   history: Turn[] = [];
@@ -162,8 +167,7 @@ class Session {
   /** A model text response: the record keeps upstream's cleaned `responseText`. */
   reply(raw: string): void {
     this.tick();
-    const cleaned = raw.replace(/[\u200B-\u200D\uFEFF\u200E\u200F]/g, '').replace(/<!--[\s\S]*?-->/g, '').trim();
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: cleaned });
+    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: responseText(raw) });
     this.history.push({ id, content: { role: 'model', parts: [{ text: raw }] } });
   }
 
@@ -202,12 +206,14 @@ class Session {
    * Esc while a tool runs: cancelOngoingRequest's notice (915-923) comes first, then the scheduler
    * completes the cancelled call (useToolScheduler.ts 210-222, useGeminiStream.ts 352-363) and
    * recordToolCalls, finding a notice last, starts a record of its own for it (chatRecordingService
-   * 1133-1157); then the cancelled result goes in through addHistory.
+   * 1133-1157); then the cancelled result goes in through addHistory. Text the model streamed
+   * before the call stays in the first record, cleaned, and in the history's turn, raw.
    */
-  escTool(callId: string, name: string, args: Record<string, unknown>): void {
+  escTool(callId: string, name: string, args: Record<string, unknown>, lead = ''): void {
     this.tick();
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: '' });
-    this.history.push({ id, content: { role: 'model', parts: [{ functionCall: { id: callId, name, args } }] } });
+    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: responseText(lead) });
+    const call = { functionCall: { id: callId, name, args } };
+    this.history.push({ id, content: { role: 'model', parts: lead ? [{ text: lead }, call] : [call] } });
     this.notice('info', 'Request cancelled.');
     const response = [{ functionResponse: { id: callId, name, response: { output: CANCELLED } } }];
     this.recorder.recordToolCalls(MODEL, [
@@ -945,6 +951,38 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'dingo');
       s.mask(MASKED);
       plainTurn(s, 'elephant');
+    },
+  },
+  {
+    // the abort's re-sync writes the Esc'd turn back with its call and raw text, over a record
+    // holding the cleaned text only; the mask then copies that turn
+    name: 'esc_preamble_abort_mask',
+    expect: [user('alpaca'), user('bison', 'I will read bison.'), user('cheetah'), user('elephant')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' }, 'I will read <!-- x -->bison.\u200B');
+      plainTurn(s, 'cheetah');
+      s.prompt('dingo');
+      s.abort();
+      s.mask(MASKED);
+      plainTurn(s, 'elephant');
+    },
+  },
+  {
+    // the stream answering an audio read fails, which rolls nothing back (geminiChat.ts 812), so
+    // coalesced, the next prompt joins the read's result and data in one copy, without the ack
+    name: 'binary_fail_mask_rewind',
+    expect: [user('alpaca'), user('bison', ''), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.binaryTool('read-bison', 'bison');
+      s.notice('error', '[API Error: The model is overloaded. Please try again later.]');
+      plainTurn(s, 'cheetah');
+      s.mask(MASKED);
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
     },
   },
 ];

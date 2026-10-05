@@ -1,0 +1,49 @@
+{"sessionId":"a7a7a7a7-2027-4000-8000-a7a7a7a7a7a7","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-10-09T09:01:00.000Z","lastUpdated":"2026-10-09T09:01:00.000Z","kind":"main"}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-10-09T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:01:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000001","timestamp":"2026-10-09T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:02:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000002","timestamp":"2026-10-09T09:03:00.000Z","type":"gemini","content":"ok alpaca","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-09T09:03:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000003","timestamp":"2026-10-09T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:04:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000004","timestamp":"2026-10-09T09:05:00.000Z","type":"gemini","content":"I will read bison.","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-09T09:05:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000005","timestamp":"2026-10-09T09:05:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-10-09T09:05:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000006","timestamp":"2026-10-09T09:05:00.000Z","type":"gemini","content":"","toolCalls":[{"id":"read-bison","name":"read_file","args":{"file_path":"bison.ts"},"result":[{"functionResponse":{"id":"read-bison","name":"read_file","response":{"output":"[Operation Cancelled] Reason: User cancelled the operation."}}}],"status":"cancelled","timestamp":"2026-10-09T09:05:00.000Z","displayName":"read_file","description":"read_file tool","renderOutputAsMarkdown":false}],"thoughts":[],"model":"gemini-2.5-pro"}
+{"id":"a7a7a7a7-0000-4000-8000-000000000007","timestamp":"2026-10-09T09:05:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-bison","name":"read_file","response":{"output":"[Operation Cancelled] Reason: User cancelled the operation."}}}]}
+{"$set":{"lastUpdated":"2026-10-09T09:05:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000009","timestamp":"2026-10-09T09:06:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:06:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000010","timestamp":"2026-10-09T09:07:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-09T09:07:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000011","timestamp":"2026-10-09T09:08:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:08:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000012","timestamp":"2026-10-09T09:08:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-10-09T09:08:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000008","timestamp":"2026-10-09T09:09:00.000Z","type":"gemini","content":[{"text":"[The previous response was interrupted before it completed.]"}]}
+{"$patch":{"updates":[{"id":"a7a7a7a7-0000-4000-8000-000000000002","content":[{"text":"ok alpaca"}]},{"id":"a7a7a7a7-0000-4000-8000-000000000004","content":[{"text":"I will read <!-- x -->bison.​"},{"functionCall":{"id":"read-bison","name":"read_file","args":{"file_path":"bison.ts"}}}]},{"id":"a7a7a7a7-0000-4000-8000-000000000010","content":[{"text":"ok cheetah"}]}],"removeIds":["a7a7a7a7-0000-4000-8000-000000000005","a7a7a7a7-0000-4000-8000-000000000006","a7a7a7a7-0000-4000-8000-000000000011","a7a7a7a7-0000-4000-8000-000000000012"],"orderIds":["d04923d38bb0f6017037e74183378ef4","a7a7a7a7-0000-4000-8000-000000000001","a7a7a7a7-0000-4000-8000-000000000002","a7a7a7a7-0000-4000-8000-000000000003","a7a7a7a7-0000-4000-8000-000000000004","a7a7a7a7-0000-4000-8000-000000000007","a7a7a7a7-0000-4000-8000-000000000008","a7a7a7a7-0000-4000-8000-000000000009","a7a7a7a7-0000-4000-8000-000000000010"]}}
+{"$set":{"lastUpdated":"2026-10-09T09:09:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000013","timestamp":"2026-10-09T09:10:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000014","timestamp":"2026-10-09T09:10:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000015","timestamp":"2026-10-09T09:10:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000016","timestamp":"2026-10-09T09:10:00.000Z","type":"gemini","content":[{"text":"I will read <!-- x -->bison.​"},{"functionCall":{"id":"read-bison","name":"read_file","args":{"file_path":"bison.ts"}}}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000017","timestamp":"2026-10-09T09:10:00.000Z","type":"user","content":[{"functionResponse":{"id":"read-bison","name":"read_file","response":{"output":"<tool_output_masked>\noutput hidden to save context\n</tool_output_masked>"}}}]}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000018","timestamp":"2026-10-09T09:10:00.000Z","type":"gemini","content":[{"text":"[The previous response was interrupted before it completed.]"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000019","timestamp":"2026-10-09T09:10:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000020","timestamp":"2026-10-09T09:10:00.000Z","type":"gemini","content":[{"text":"ok cheetah"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4","a7a7a7a7-0000-4000-8000-000000000001","a7a7a7a7-0000-4000-8000-000000000002","a7a7a7a7-0000-4000-8000-000000000003","a7a7a7a7-0000-4000-8000-000000000004","a7a7a7a7-0000-4000-8000-000000000007","a7a7a7a7-0000-4000-8000-000000000008","a7a7a7a7-0000-4000-8000-000000000009","a7a7a7a7-0000-4000-8000-000000000010"]}}
+{"$set":{"lastUpdated":"2026-10-09T09:10:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000021","timestamp":"2026-10-09T09:11:00.000Z","type":"user","content":[{"text":"elephant"}]}
+{"$set":{"lastUpdated":"2026-10-09T09:11:00.000Z"}}
+{"id":"a7a7a7a7-0000-4000-8000-000000000022","timestamp":"2026-10-09T09:12:00.000Z","type":"gemini","content":"ok elephant","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-09T09:12:00.000Z"}}
