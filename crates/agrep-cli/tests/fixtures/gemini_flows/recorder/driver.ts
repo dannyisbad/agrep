@@ -171,11 +171,15 @@ class Session {
     this.history.push({ id, content: { role: 'model', parts: [{ text: raw }] } });
   }
 
-  /** A model function call and its completion record (recordCompletedToolCalls). */
-  call(callId: string, name: string, args: Record<string, unknown>, output: string, status = 'success'): void {
+  /**
+   * A model function call and its completion record (recordCompletedToolCalls), which merges into
+   * the model's record (chatRecordingService.ts 1133-1157) beside any text streamed before the call.
+   */
+  call(callId: string, name: string, args: Record<string, unknown>, output: string, status = 'success', lead = ''): void {
     this.tick();
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: '' });
-    this.history.push({ id, content: { role: 'model', parts: [{ functionCall: { id: callId, name, args } }] } });
+    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: responseText(lead) });
+    const call = { functionCall: { id: callId, name, args } };
+    this.history.push({ id, content: { role: 'model', parts: lead ? [{ text: lead }, call] : [call] } });
     const response = [{ functionResponse: { id: callId, name, response: { output } } }];
     this.recorder.recordToolCalls(MODEL, [
       { id: callId, name, args, result: response, status, timestamp: new Date().toISOString() },
@@ -227,7 +231,7 @@ class Session {
    * sending (1742-1745 at fb972b2) and, with every tool cancelled, records 'Request cancelled.'
    * and sets the history back to that length when it is longer (2105-2147); coalesced, the first
    * prompt is merged into the environment turn and stays. Auto-compression in the same turn
-   * (processTurn, client.ts 703) leaves it shorter, so nothing is rolled back.
+   * (processTurn, client.ts 703) changes the length the target is measured against.
    */
   async declined(
     text: string,
@@ -235,11 +239,31 @@ class Session {
     name: string,
     args: Record<string, unknown>,
     compressed?: { goal: string; keep: number },
+    lead = '',
   ): Promise<void> {
     const before = this.contents().length;
     if (compressed) await this.compress(compressed.goal, compressed.keep);
     this.prompt(text);
-    this.call(callId, name, args, DENIED, 'cancelled');
+    this.call(callId, name, args, DENIED, 'cancelled', lead);
+    this.notice('info', 'Request cancelled.');
+    if (this.contents().length > before) this.setHistory(this.contents().slice(0, before));
+  }
+
+  /**
+   * A call declined in a later round. submitQuery notes the length for every send, the tool
+   * results' too (1742-1745, 2189-2195), so the rollback keeps the prompt and its first call.
+   */
+  declinedLater(
+    text: string,
+    first: { callId: string; name: string; args: Record<string, unknown>; output: string },
+    declined: { callId: string; name: string; args: Record<string, unknown> },
+    lead: string,
+  ): void {
+    this.prompt(text);
+    this.call(first.callId, first.name, first.args, first.output);
+    const before = this.contents().length;
+    this.respond(first.callId, first.name, first.output);
+    this.call(declined.callId, declined.name, declined.args, DENIED, 'cancelled', lead);
     this.notice('info', 'Request cancelled.');
     if (this.contents().length > before) this.setHistory(this.contents().slice(0, before));
   }
@@ -350,7 +374,7 @@ class Session {
     const conversation = this.recorder.getConversation();
     const filePath = this.recorder.getConversationFilePath();
     if (!conversation || !filePath) throw new Error('nothing to compress');
-    const tail = this.contents().slice(-keep);
+    const tail = keep > 0 ? this.contents().slice(-keep) : [];
     const before = this.recorder;
     await this.start(
       [
@@ -399,6 +423,8 @@ type Row = [who: string, text: string, reply: string];
 type Scenario = {
   name: string;
   expect: Row[];
+  /** The call ids of the tool events left, sorted, where a flow pins them. */
+  events?: string[];
   run: (s: Session) => Promise<void>;
 };
 
@@ -985,6 +1011,91 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'dingo');
     },
   },
+  {
+    // after Esc on a call alone and an abort's re-sync, the mask's copy of the turn pairs with
+    // the calls' own record, and /rewind past the turn takes the cancelled call with it
+    name: 'esc_abort_mask_rewind',
+    expect: [user('alpaca'), user('dingo')],
+    events: [],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
+      s.prompt('cheetah');
+      s.abort();
+      s.mask(MASKED);
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // a failed prompt's re-sync takes the Esc'd tool's calls record out of the map; /rewind to
+    // the Esc'd prompt undoes it with the prompt
+    name: 'esc_fail_rewind',
+    expect: [user('alpaca'), user('dingo')],
+    events: [],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.escTool('grep-bison', 'grep_search', { pattern: 'bison' }, 'I will search for bison.');
+      s.prompt('cheetah');
+      s.fail();
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // a call declined in a later round keeps the prompt, its first call and the declined turn
+    name: 'decline_later',
+    expect: [user('alpaca'), user('bison', 'I will remove bison.'), user('cheetah')],
+    events: ['read-bison', 'shell-bison'],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.declinedLater(
+        'bison',
+        { callId: 'read-bison', name: 'read_file', args: { file_path: 'bison.ts' }, output: 'export const bison = 1;' },
+        { callId: 'shell-bison', name: 'run_shell_command', args: { command: 'rm -r bison' } },
+        'I will remove <!-- x -->bison.',
+      );
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // the rollback leaves the declined turn out of the map, uncopied; /rewind to its prompt
+    // undoes the turn's text and call with the rest of the exchange
+    name: 'decline_later_rewind',
+    expect: [user('alpaca'), user('cheetah')],
+    events: [],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.declinedLater(
+        'bison',
+        { callId: 'read-bison', name: 'read_file', args: { file_path: 'bison.ts' }, output: 'export const bison = 1;' },
+        { callId: 'shell-bison', name: 'run_shell_command', args: { command: 'rm -r bison' } },
+        'I will remove <!-- x -->bison.',
+      );
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // uncoalesced, compression in the declined turn leaves the history one turn short of the
+    // target, so the rollback keeps the prompt; coalesced, compressing it all leaves the turn
+    // unrolled. Either way /rewind to the prompt undoes the declined turn's text and call
+    name: 'decline_compressed_rewind',
+    expect: [user('alpaca'), user('bison'), recap('alpaca and bison'), user('dingo')],
+    events: [],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.ide('{"file":"bison.ts"}');
+      plainTurn(s, 'bison');
+      const compressed = { goal: 'alpaca and bison', keep: s.coalesced ? 0 : 2 };
+      const args = { command: 'rm -r cheetah' };
+      await s.declined('cheetah', 'shell-cheetah', 'run_shell_command', args, compressed, 'I will remove cheetah.');
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
+    },
+  },
 ];
 
 const expected: string[] = [];
@@ -1018,7 +1129,8 @@ for (const coalesced of [false, true]) {
       await scenario.run(session);
       const flow = `${version.name}${coalesced ? '+coalesced' : ''}/${scenario.name}`;
       const rows = scenario.expect.map((row) => `  ${JSON.stringify(row)}`).join(',\n');
-      expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${flow}", "rows": [\n${rows}\n ]}`);
+      const events = scenario.events ? `, "events": ${JSON.stringify(scenario.events)}` : '';
+      expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${flow}", "rows": [\n${rows}\n ]${events}}`);
       const file = session.recorder.getConversationFilePath();
       console.log(flow, file ? path.basename(file) : '?');
     }

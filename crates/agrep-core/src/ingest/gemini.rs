@@ -512,6 +512,27 @@ struct Entry {
     reply: Option<String>,
 }
 
+impl Entry {
+    /// A row's message as `emit_messages` reads one, a prompt or a snapshot that is no copy: the
+    /// model turns after it, up to the next one, answer it.
+    fn opens_exchange(&self) -> bool {
+        let message = &self.message;
+        let content = message.get("content").unwrap_or(&Value::Null);
+        if !self.originals.is_empty()
+            || message.get("type").and_then(Value::as_str) != Some("user")
+            || carries_function_response(content)
+        {
+            return false;
+        }
+        let typed = message
+            .get("displayContent")
+            .map(part_text)
+            .filter(|text| !text.trim().is_empty());
+        let text = typed.unwrap_or_else(|| parts_text(past_injected(parts_of(content))));
+        !text.trim().is_empty() && !is_wrapper(&text) && !is_injected_context(&text)
+    }
+}
+
 /// What a re-recorded copy shares with the message it repeats: type, visible text and the
 /// (name, call id) of every tool call or result it carries.
 type CopyKey = (String, String, Vec<(String, String)>);
@@ -869,7 +890,8 @@ impl Fold {
                 undone.iter().map(|index| self.copy_key(*index)).collect();
             self.mark_dropped(&undone, &keys);
         } else {
-            self.undo(undone);
+            let deleted = self.undo(undone);
+            self.undo_answers(&deleted);
         }
         self.tidy();
         self.set_mark();
@@ -939,8 +961,9 @@ impl Fold {
         all_declinable || (!calls.is_empty() && calls.iter().all(|call| cancelled(&call)))
     }
 
-    /// Delete entries and, through each copy, the originals it re-recorded.
-    fn undo(&mut self, mut pending: Vec<usize>) {
+    /// Delete entries and, through each copy, the originals it re-recorded; returns those deleted.
+    fn undo(&mut self, mut pending: Vec<usize>) -> Vec<usize> {
+        let mut deleted = Vec::new();
         while let Some(index) = pending.pop() {
             let Some(entry) = self.entries.get_mut(index) else {
                 continue;
@@ -951,7 +974,35 @@ impl Fold {
             entry.state = State::Deleted;
             pending.extend_from_slice(&entry.originals);
             self.leave(index);
+            deleted.push(index);
         }
+        deleted
+    }
+
+    /// A person's `/rewind` undoes a prompt's whole exchange: also the model turns recorded after
+    /// its row, before the next row, that a rewrite left out of the map, copied or not. A declined
+    /// later round's (2105-2147 at fb972b2: the rollback ends at the last tool result sent) and an
+    /// Esc'd tool's calls record (chatRecordingService.ts 1133-1157) are such turns. Copies there
+    /// repeat other exchanges, so they stay; a copy of one of these turns is out of the map too, as
+    /// the map keeps a prompt's copy before its answer's. A row is deleted once and its scan stops
+    /// at the next one, deleted or not, so the work stays linear.
+    fn undo_answers(&mut self, deleted: &[usize]) {
+        let mut answers = Vec::new();
+        for row in deleted {
+            if !self.entries.get(*row).is_some_and(Entry::opens_exchange) {
+                continue;
+            }
+            for (index, entry) in self.entries.iter().enumerate().skip(row + 1) {
+                if entry.opens_exchange() {
+                    break;
+                }
+                let gemini = entry.message.get("type").and_then(Value::as_str) == Some("gemini");
+                if gemini && entry.originals.is_empty() && entry.state == State::Dropped {
+                    answers.push(index);
+                }
+            }
+        }
+        self.undo(answers);
     }
 
     fn patch(&mut self, patch: &Value, converting: bool) {
@@ -1378,7 +1429,8 @@ impl Fold {
     /// cleaned (`responseText`, geminiChat.ts 1547-1659 at fb972b2), and a re-sync writes back the
     /// history's raw parts (chatRecordingService.ts 1364-1381): when those read the same (see
     /// `visible_text`), the turn keeps the reply it recorded, among the parts' calls (see
-    /// `with_recorded_reply`).
+    /// `with_recorded_reply`). A turn without one keeps its content: after Esc its calls have a
+    /// record of their own (1133-1157), which a copy of the turn then pairs with.
     fn update(&mut self, patch: &Value) {
         let Some(index) = patch
             .get("id")
@@ -1408,9 +1460,10 @@ impl Fold {
             };
             if !kept {
                 message.insert("content".to_string(), content.clone());
-            } else if parts_of(content)
-                .iter()
-                .any(|part| part.get("functionCall").is_some())
+            } else if reply.as_ref().is_some_and(|reply| !reply.is_empty())
+                && parts_of(content)
+                    .iter()
+                    .any(|part| part.get("functionCall").is_some())
             {
                 let slot = message.entry("content").or_insert(Value::Null);
                 // a copy's parts already split its prose as the history does, which pairing keys
@@ -2092,7 +2145,7 @@ mod tests {
     }
 
     /// Every session upstream's recorders wrote in tests/fixtures/gemini_flows reads as its
-    /// `expected.json` transcript, with each record accounted for.
+    /// `expected.json` transcript, with the tool events it pins and each record accounted for.
     #[test]
     fn every_recorded_flow_reads_its_expected_transcript() {
         let fixture =
@@ -2105,10 +2158,10 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
-        assert_eq!(files.len(), 164);
+        assert_eq!(files.len(), 184);
         let mut failures = Vec::new();
         for path in files {
-            let (messages, _, tally) = parse(&path);
+            let (messages, events, tally) = parse(&path);
             let session = messages[0].session.to_string();
             let case = &expected[session.as_str()];
             let rows: Vec<serde_json::Value> = messages
@@ -2117,6 +2170,14 @@ mod tests {
                 .collect();
             if serde_json::Value::Array(rows.clone()) != case["rows"] {
                 failures.push(format!("{}: {rows:?}", case["flow"]));
+            }
+            let mut calls: Vec<&str> = events.iter().map(|e| e.call_id.as_str()).collect();
+            calls.sort_unstable();
+            if case
+                .get("events")
+                .is_some_and(|pinned| *pinned != serde_json::json!(calls))
+            {
+                failures.push(format!("{}: events {calls:?}", case["flow"]));
             }
             let (seen, rows, agent_rows, skips, errors) = identity(&tally);
             assert_eq!(seen, rows + agent_rows + skips + errors, "{}", case["flow"]);
@@ -2166,9 +2227,10 @@ mod tests {
     /// Hostile shapes stay linear: one id removed per re-sync from a long map, comment-dense
     /// prompts passing through a rewrite, one-in-one-out re-syncs behind a long map, whose gaps the
     /// rollback walk would cross again each time, many coalesced-looking copies ending like a
-    /// removed turn with a huge part, which pairing would re-read per copy, and many patches of a
-    /// long reply that read the same, half with a call, which would compare or copy it each time.
-    /// Naively each takes minutes.
+    /// removed turn with a huge part, which pairing would re-read per copy, many patches of a long
+    /// reply that read the same, half with a call, which would compare or copy it each time, and
+    /// `/rewind` to each prompt from the last, whose answers a scan past undone rows would cross
+    /// again each time. Naively each takes minutes.
     #[test]
     fn hostile_re_syncs_parse_in_linear_time() {
         let root = temp_root("hostile");
@@ -2285,11 +2347,45 @@ mod tests {
         let started = std::time::Instant::now();
         let (rows, _, _) = parse(&path);
         let elapsed = started.elapsed();
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0].reply.starts_with("ok<!--xxx"),
             "the recorded reply is kept"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+
+        let path = root.join("session-2026-04-29T09-00-70707070.jsonl");
+        let prompts = 50_000;
+        let mut body = String::from(
+            r#"{"sessionId":"70707070-0000-4000-8000-00000000000f","projectHash":"h"}"#,
+        );
+        body.push('\n');
+        let mut answers = Vec::new();
+        for n in 0..prompts {
+            body.push_str(&format!(
+                "{{\"id\":\"u{n}\",\"type\":\"user\",\"content\":\"p{n}\"}}\n\
+                 {{\"id\":\"g{n}\",\"type\":\"gemini\",\"content\":\"r{n}\",\
+                 \"toolCalls\":[{{\"id\":\"c{n}\",\"name\":\"read_file\"}}]}}\n"
+            ));
+            answers.push(format!("\"g{n}\""));
+        }
+        body.push_str(&format!(
+            "{{\"$patch\":{{\"removeIds\":[{}]}}}}\n",
+            answers.join(",")
+        ));
+        for n in (0..prompts).rev() {
+            body.push_str(&format!("{{\"$rewindTo\":\"u{n}\"}}\n"));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let started = std::time::Instant::now();
+        let (rows, events, _) = parse(&path);
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            rows.is_empty() && events.is_empty(),
+            "{} {}",
+            rows.len(),
+            events.len()
         );
         assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
     }

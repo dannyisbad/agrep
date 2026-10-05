@@ -220,8 +220,8 @@ fn intake_ids(data: &Path) -> Vec<String> {
 /// fb972b2 and the `$set.messages` 361b0bb, each with and without `getHistory()` coalescing) in
 /// tests/fixtures/gemini_flows. `expected.json` holds the conversation a person had: what upstream
 /// resumes, plus turns a context rewrite (compression, masking, truncation, `/chat resume`) took
-/// out of the model's view. Rewound and rolled-back turns are gone, and every recording of one
-/// flow reads the same.
+/// out of the model's view. Rewound and rolled-back turns are gone, with their tool events where a
+/// flow pins them, and every recording of one flow reads the same.
 #[test]
 fn gemini_flows_read_as_the_conversation_a_person_had() {
     let fixture = fixtures_dir().join("gemini_flows");
@@ -241,6 +241,21 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
                 )
             })
             .collect();
+    let mut calls: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (name, body) in event_rows(&data) {
+        let session = name
+            .trim_start_matches("gemini-")
+            .split("--")
+            .next()
+            .unwrap_or("");
+        let ids = String::from_utf8_lossy(&body)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|event| event["call_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        calls.entry(session.to_string()).or_default().extend(ids);
+    }
     let mut failures = Vec::new();
     for (session, case) in expected.as_object().unwrap() {
         let rows = session_rows(&data, session);
@@ -262,6 +277,14 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
             || turns != (0..rows.len() as u64).collect::<Vec<_>>()
         {
             failures.push(format!("{}: got {got:?} turns {turns:?}", case["flow"]));
+        }
+        let mut events = calls.get(session).cloned().unwrap_or_default();
+        events.sort_unstable();
+        if case
+            .get("events")
+            .is_some_and(|pinned| *pinned != serde_json::json!(events))
+        {
+            failures.push(format!("{}: events {events:?}", case["flow"]));
         }
     }
     let _ = fs::remove_dir_all(&data);
