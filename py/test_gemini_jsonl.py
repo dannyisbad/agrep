@@ -176,6 +176,9 @@ class RecordedFlowsTests(_Sandbox):
                  if row.get("kind") != "agrep-meta"}
         for session, case in expected.items():
             with self.subTest(flow=case["flow"]):
+                if not case["rows"]:
+                    self.assertNotIn(session, chats)
+                    continue
                 self.assertEqual(chats[session]["turns"], len(case["rows"]))
                 self.assertEqual(chats[session]["first_text"], case["rows"][0][1])
 

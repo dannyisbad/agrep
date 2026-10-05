@@ -29,7 +29,7 @@ use crate::model::{Event, Message};
 
 /// Increment when entry layout or parse semantics change.
 /// Supported prior generations retain last-good entries until their source reparse completes.
-pub const CACHE_VERSION: u32 = 36;
+pub const CACHE_VERSION: u32 = 37;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -1023,7 +1023,7 @@ impl std::fmt::Display for CacheDecodeRefusal {
 
 /// These generations share the current entry layout but require current parser semantics.
 fn reparse_compatible_cache_version(version: u32) -> bool {
-    matches!(version, 18..=19 | 21..=35)
+    matches!(version, 18..=19 | 21..=36)
 }
 
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
@@ -5281,6 +5281,47 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A read the parser proves empty (`ReadOutcome::Undone`) publishes the emptiness over
+    /// last-good rows and events once the file grew, as an append-only log that recorded its own
+    /// undo does; a file that shrank may be mid-rewrite, so last-good still wins there.
+    #[test]
+    fn undone_reparse_publishes_empty_only_after_growth() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-undone-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        for (before, after, kept) in [
+            (&b"prompt\n"[..], &b"prompt\nrewind\n"[..], false),
+            (&b"prompt\nrewind\n"[..], &b"rewind\n"[..], true),
+        ] {
+            fs::write(&source, before).unwrap();
+            let mut cache = IngestCache::cold();
+            collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+                (
+                    vec![test_message("rewound")],
+                    vec![test_event("session", "rewound-call")],
+                    ReadOutcome::Complete,
+                )
+            });
+            fs::write(&source, after).unwrap();
+            let pass = collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+                (Vec::new(), Vec::new(), ReadOutcome::Undone)
+            });
+            assert_eq!(pass.messages.len(), usize::from(kept));
+            assert!(pass.events.is_empty());
+            assert_eq!(cache.source_snapshot_safe(), !kept);
+            let pruned = cache.event_prune_files(&cache.live_event_files());
+            assert_eq!(pruned.is_empty(), kept);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn policy_empty_reparse_preserves_unattributed_legacy_events() {
         let root = std::env::temp_dir().join(format!(
@@ -8602,7 +8643,9 @@ mod tests {
     #[test]
     fn takeover_adopts_released_cache_versions_with_last_good_rows() {
         for (version, journaled) in [
-            (35_u32, false),
+            (36_u32, false),
+            (36, true),
+            (35, false),
             (35, true),
             (34, false),
             (34, true),
@@ -9225,6 +9268,10 @@ pub enum ReadOutcome {
     /// license deletion, so last-good wins; with no last-good there is nothing to lose and
     /// what parsed is published.
     Partial,
+    /// A complete read that came back empty because the source itself undid what it held: rolled
+    /// back or rewound in records the read saw whole. Where an empty read of a changed file may be
+    /// torn, this one proves the emptiness, so a file that only grew may publish it over last-good.
+    Undone,
 }
 
 impl ReadOutcome {
@@ -9239,7 +9286,16 @@ impl ReadOutcome {
 
     /// Whether this read may replace a cached entry wholesale (and so publish deletions).
     fn licenses_replacement(self) -> bool {
-        self == Self::Complete
+        matches!(self, Self::Complete | Self::Undone)
+    }
+
+    /// An `Undone` read is otherwise the complete read it also is.
+    fn settled(self) -> Self {
+        if self == Self::Undone {
+            Self::Complete
+        } else {
+            self
+        }
     }
 }
 
@@ -9857,6 +9913,9 @@ where
     let racy = |mtime: i64| racy_start.is_some_and(|start| racy_stamp(mtime, start, now_ns));
     // fresh: changed files (messages + events) + sibling files (messages cached-equal + events)
     for (key, path, mt, sz, identity, m, e, healthy, panicked) in miss_parsed {
+        // only a proven-empty read (see `ReadOutcome::Undone`) differs from a complete one
+        let undone = healthy == Some(ReadOutcome::Undone);
+        let healthy = healthy.map(ReadOutcome::settled);
         // A failed, skipped or partial reparse retains the prior entry instead of publishing
         // deletion; a partial one that lost nothing the entry held refreshes it instead.
         if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
@@ -9922,6 +9981,7 @@ where
             let keep_prior = cache.entries.get(&key).is_some_and(|prev| {
                 prev.legacy_had_events
                     || ((!prev.msgs.is_empty() || !prev.event_keys.is_empty())
+                        && !(undone && prev.size < sz)
                         && (healthy != Some(ReadOutcome::Complete)
                             || prev.mtime != mt
                             || prev.size != sz
@@ -10003,6 +10063,7 @@ where
         events.extend(e);
     }
     for (key, path, m, e, healthy, panicked) in sib_parsed {
+        let healthy = healthy.map(ReadOutcome::settled);
         // A sibling read can fail independently after its successful stat. Serving its cached
         // rows mirrors the changed-file last-good guard; its session event files remain untouched
         // because `events` cannot be reconstructed completely without this sibling.

@@ -510,27 +510,26 @@ struct Entry {
     /// A model turn's visible reply, once `update` has read it: patches that write the same back
     /// can come by the hundred thousand.
     reply: Option<String>,
+    /// Opens an exchange (see `opens_exchange`): fixed when recorded and cleared when paired as a
+    /// copy, so the boundaries `undo_answers` scans between never appear later.
+    row: bool,
 }
 
-impl Entry {
-    /// A row's message as `emit_messages` reads one, a prompt or a snapshot that is no copy: the
-    /// model turns after it, up to the next one, answer it.
-    fn opens_exchange(&self) -> bool {
-        let message = &self.message;
-        let content = message.get("content").unwrap_or(&Value::Null);
-        if !self.originals.is_empty()
-            || message.get("type").and_then(Value::as_str) != Some("user")
-            || carries_function_response(content)
-        {
-            return false;
-        }
-        let typed = message
-            .get("displayContent")
-            .map(part_text)
-            .filter(|text| !text.trim().is_empty());
-        let text = typed.unwrap_or_else(|| parts_text(past_injected(parts_of(content))));
-        !text.trim().is_empty() && !is_wrapper(&text) && !is_injected_context(&text)
+/// A prompt or a snapshot, as `emit_messages` reads a row's message: the model turns after it, up
+/// to the next one, answer it. A copy, which emits no row, is no such message once paired.
+fn opens_exchange(message: &Value) -> bool {
+    let content = message.get("content").unwrap_or(&Value::Null);
+    if message.get("type").and_then(Value::as_str) != Some("user")
+        || carries_function_response(content)
+    {
+        return false;
     }
+    let typed = message
+        .get("displayContent")
+        .map(part_text)
+        .filter(|text| !text.trim().is_empty());
+    let text = typed.unwrap_or_else(|| parts_text(past_injected(parts_of(content))));
+    !text.trim().is_empty() && !is_wrapper(&text) && !is_injected_context(&text)
 }
 
 /// What a re-recorded copy shares with the message it repeats: type, visible text and the
@@ -776,6 +775,7 @@ impl Fold {
         }
         let index = self.entries.len();
         self.by_id.insert(id, index);
+        let row = opens_exchange(&message);
         self.entries.push(Entry {
             message,
             state: State::Live,
@@ -783,6 +783,7 @@ impl Fold {
             slot: None,
             entered: self.epoch,
             reply: None,
+            row,
         });
         self.enter(index);
     }
@@ -984,16 +985,17 @@ impl Fold {
     /// later round's (2105-2147 at fb972b2: the rollback ends at the last tool result sent) and an
     /// Esc'd tool's calls record (chatRecordingService.ts 1133-1157) are such turns. Copies there
     /// repeat other exchanges, so they stay; a copy of one of these turns is out of the map too, as
-    /// the map keeps a prompt's copy before its answer's. A row is deleted once and its scan stops
-    /// at the next one, deleted or not, so the work stays linear.
+    /// the map keeps a prompt's copy before its answer's. The work stays linear: a row is deleted
+    /// once, its scan stops at the next row, and as rows never appear later (see `Entry::row`) and
+    /// pairing never clears a deleted one, no two scans cross the same entry.
     fn undo_answers(&mut self, deleted: &[usize]) {
         let mut answers = Vec::new();
         for row in deleted {
-            if !self.entries.get(*row).is_some_and(Entry::opens_exchange) {
+            if !self.entries.get(*row).is_some_and(|entry| entry.row) {
                 continue;
             }
             for (index, entry) in self.entries.iter().enumerate().skip(row + 1) {
-                if entry.opens_exchange() {
+                if entry.row {
                     break;
                 }
                 let gemini = entry.message.get("type").and_then(Value::as_str) == Some("gemini");
@@ -1288,6 +1290,7 @@ impl Fold {
         }
         for (copy, found) in copies.iter().zip(originals) {
             if let Some(entry) = self.entries.get_mut(*copy) {
+                entry.row &= found.is_empty();
                 entry.originals = found;
             }
         }
@@ -1537,18 +1540,37 @@ impl Fold {
     }
 }
 
-fn parse_jsonl(data: &str, path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>) {
+/// `Undone` when the read is empty because the file itself undid what it held: rolled back or
+/// rewound in records the read saw whole. Upstream only appends complete lines, so an error-free
+/// read ending on one is the session as it stood; a torn or foreign read never qualifies.
+fn parse_jsonl(data: &str, path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
     let fold = Fold::read(data);
     if !fold.complete() {
         if let Ok(root) = serde_json::from_str::<Value>(data) {
             if root.get("sessionId").is_some() {
-                return parse_document(&root, path, tally);
+                let (messages, events) = parse_document(&root, path, tally);
+                return (messages, events, ReadOutcome::Complete);
             }
         }
     }
     fold.record(tally);
     let session = fold.session().unwrap_or_else(|| file_stem(path));
-    emit_messages(&session, fold.messages(), tally)
+    let (messages, events) = emit_messages(&session, fold.messages(), tally);
+    let undone = messages.is_empty()
+        && events.is_empty()
+        && fold.complete()
+        && fold.errors == 0
+        && data.ends_with('\n')
+        && fold
+            .entries
+            .iter()
+            .any(|entry| entry.state == State::Deleted);
+    let outcome = if undone {
+        ReadOutcome::Undone
+    } else {
+        ReadOutcome::Complete
+    };
+    (messages, events, outcome)
 }
 
 fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
@@ -1570,8 +1592,7 @@ fn parse_with_tally(path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>, Re
         }
     };
     if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-        let (messages, events) = parse_jsonl(&data, path, tally);
-        return (messages, events, ReadOutcome::Complete);
+        return parse_jsonl(&data, path, tally);
     }
     match serde_json::from_str::<Value>(&data) {
         Ok(root) => {
@@ -1784,7 +1805,8 @@ mod tests {
     fn parse(path: &Path) -> (Vec<crate::model::Message>, Vec<crate::model::Event>, Tally) {
         let tally = Tally::default();
         let (messages, events, outcome) = parse_with_tally(path, &tally);
-        assert_eq!(outcome, ReadOutcome::Complete);
+        let undone = outcome == ReadOutcome::Undone && messages.is_empty() && events.is_empty();
+        assert!(outcome == ReadOutcome::Complete || undone, "{outcome:?}");
         (messages, events, tally)
     }
 
@@ -2158,12 +2180,14 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
-        assert_eq!(files.len(), 184);
+        assert_eq!(files.len(), 196);
         let mut failures = Vec::new();
         for path in files {
             let (messages, events, tally) = parse(&path);
-            let session = messages[0].session.to_string();
-            let case = &expected[session.as_str()];
+            let body = std::fs::read_to_string(&path).unwrap();
+            let meta: serde_json::Value =
+                serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            let case = &expected[meta["sessionId"].as_str().unwrap()];
             let rows: Vec<serde_json::Value> = messages
                 .iter()
                 .map(|m| serde_json::json!([&*m.who, &*m.text, &*m.reply]))
@@ -2228,9 +2252,10 @@ mod tests {
     /// prompts passing through a rewrite, one-in-one-out re-syncs behind a long map, whose gaps the
     /// rollback walk would cross again each time, many coalesced-looking copies ending like a
     /// removed turn with a huge part, which pairing would re-read per copy, many patches of a long
-    /// reply that read the same, half with a call, which would compare or copy it each time, and
+    /// reply that read the same, half with a call, which would compare or copy it each time,
     /// `/rewind` to each prompt from the last, whose answers a scan past undone rows would cross
-    /// again each time. Naively each takes minutes.
+    /// again each time, and prompts patched out of being rows and back before each `/rewind`,
+    /// which a scan reading their content would cross again each time. Naively each takes minutes.
     #[test]
     fn hostile_re_syncs_parse_in_linear_time() {
         let root = temp_root("hostile");
@@ -2380,7 +2405,6 @@ mod tests {
         let started = std::time::Instant::now();
         let (rows, events, _) = parse(&path);
         let elapsed = started.elapsed();
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             rows.is_empty() && events.is_empty(),
             "{} {}",
@@ -2388,6 +2412,74 @@ mod tests {
             events.len()
         );
         assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+
+        let path = root.join("session-2026-04-30T09-00-71717171.jsonl");
+        let (prompts, turns) = (20_000, 20_000);
+        let mut body = String::from(
+            r#"{"sessionId":"71717171-0000-4000-8000-000000000010","projectHash":"h"}"#,
+        );
+        body.push('\n');
+        for n in 0..prompts {
+            body.push_str(&format!(
+                "{{\"id\":\"u{n}\",\"type\":\"user\",\"content\":\"p{n}\"}}\n"
+            ));
+        }
+        for n in 0..turns {
+            body.push_str(&format!(
+                "{{\"id\":\"g{n}\",\"type\":\"gemini\",\"content\":\"\"}}\n"
+            ));
+        }
+        let emptied: Vec<String> = (1..prompts)
+            .map(|n| format!("{{\"id\":\"u{n}\",\"content\":\"\"}}"))
+            .collect();
+        body.push_str(&format!(
+            "{{\"$patch\":{{\"updates\":[{}]}}}}\n",
+            emptied.join(",")
+        ));
+        for n in 1..prompts {
+            body.push_str(&format!(
+                "{{\"$patch\":{{\"updates\":[{{\"id\":\"u{n}\",\"content\":\"p{n}\"}}],\
+                 \"orderIds\":[\"u{n}\"]}}}}\n{{\"$rewindTo\":\"u{n}\"}}\n"
+            ));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let started = std::time::Instant::now();
+        let (rows, _, _) = parse(&path);
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(rows.len(), 1);
+        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+    }
+
+    /// A read is proven empty (`ReadOutcome::Undone`) only when the file undid what it held in
+    /// records the read saw whole: never on a torn last line, a read ending mid-record, a file
+    /// that had nothing to undo, or one that still reads as rows.
+    #[test]
+    fn only_a_whole_read_of_an_undone_session_is_proven_empty() {
+        let root = temp_root("undone");
+        let path = root.join("session-2026-05-01T09-00-72727272.jsonl");
+        let meta = r#"{"sessionId":"72727272-0000-4000-8000-000000000011","projectHash":"h"}"#;
+        let prompt = r#"{"id":"u1","type":"user","content":"alpaca"}"#;
+        let reply = r#"{"id":"g1","type":"gemini","content":"ok alpaca"}"#;
+        let rewind = r#"{"$rewindTo":"u1"}"#;
+        let hook = r#"{"id":"h1","type":"user","content":"<hook_context>x</hook_context>"}"#;
+        for (lines, end, want) in [
+            (vec![meta, prompt, reply, rewind], "\n", ReadOutcome::Undone),
+            (vec![meta, prompt, reply, rewind], "", ReadOutcome::Complete),
+            (
+                vec![meta, prompt, reply, rewind, r#"{"id":"u2","ty"#],
+                "",
+                ReadOutcome::Complete,
+            ),
+            (vec![meta, hook], "\n", ReadOutcome::Complete),
+            (vec![meta, prompt, reply], "\n", ReadOutcome::Complete),
+            (vec![prompt, reply, rewind], "\n", ReadOutcome::Complete),
+        ] {
+            std::fs::write(&path, format!("{}{end}", lines.join("\n"))).unwrap();
+            let (_, _, outcome) = parse_with_tally(&path, &Tally::default());
+            assert_eq!(outcome, want, "{lines:?} {end:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A declined tool sets the history back to before its prompt, after the UI records

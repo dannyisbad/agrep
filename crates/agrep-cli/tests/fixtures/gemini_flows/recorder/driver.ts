@@ -118,6 +118,8 @@ class Session {
   recorder!: Recorder;
   private promptStart: number | undefined;
   private minute = 0;
+  /** The file as an index saw it while the session was under way (see `midway`). */
+  seen: { size: number; body: string } | undefined;
 
   constructor(
     readonly version: Version,
@@ -416,6 +418,14 @@ class Session {
     );
     if (!found) throw new Error(`no live turn for ${text}`);
     return found.id;
+  }
+
+  /** Marks the file as an index reads it now, for a later warm index of the whole file. */
+  midway(): void {
+    const file = this.recorder.getConversationFilePath();
+    if (!file) throw new Error('no file yet');
+    const body = fs.readFileSync(file, 'utf8');
+    this.seen = { size: Buffer.byteLength(body), body };
   }
 }
 
@@ -1096,6 +1106,47 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'dingo');
     },
   },
+  {
+    // indexed after a later round's decline, then rewound to its only prompt: nothing is left
+    name: 'decline_later_rewind_all',
+    expect: [],
+    events: [],
+    run: async (s) => {
+      s.declinedLater(
+        'bison',
+        { callId: 'read-bison', name: 'read_file', args: { file_path: 'bison.ts' }, output: 'export const bison = 1;' },
+        { callId: 'shell-bison', name: 'run_shell_command', args: { command: 'rm -r bison' } },
+        'I will remove <!-- x -->bison.',
+      );
+      s.midway();
+      s.rewind(s.idOf('bison'));
+    },
+  },
+  {
+    // indexed after an Esc'd tool and a failed prompt, then rewound to the first prompt
+    name: 'esc_fail_rewind_all',
+    expect: [],
+    events: [],
+    run: async (s) => {
+      s.prompt('bison');
+      s.escTool('grep-bison', 'grep_search', { pattern: 'bison' }, 'I will search for bison.');
+      s.prompt('cheetah');
+      s.fail();
+      s.midway();
+      s.rewind(s.idOf('bison'));
+    },
+  },
+  {
+    // indexed while the only prompt's reply streamed, which Esc then rolled back
+    name: 'abort_only',
+    expect: [],
+    events: [],
+    run: async (s) => {
+      s.prompt('alpaca');
+      s.midway();
+      s.abort();
+    },
+  },
 ];
 
 const expected: string[] = [];
@@ -1130,8 +1181,13 @@ for (const coalesced of [false, true]) {
       const flow = `${version.name}${coalesced ? '+coalesced' : ''}/${scenario.name}`;
       const rows = scenario.expect.map((row) => `  ${JSON.stringify(row)}`).join(',\n');
       const events = scenario.events ? `, "events": ${JSON.stringify(scenario.events)}` : '';
-      expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${flow}", "rows": [\n${rows}\n ]${events}}`);
       const file = session.recorder.getConversationFilePath();
+      const seen = session.seen;
+      // a warm index of the whole file only stands for the session if the file only grew
+      if (seen && !(file && fs.readFileSync(file, 'utf8').startsWith(seen.body))) throw new Error(`${flow} rewrote`);
+      const midway = seen ? `, "midway": ${seen.size}` : '';
+      const body = rows ? `[\n${rows}\n ]` : '[]';
+      expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${flow}", "rows": ${body}${events}${midway}}`);
       console.log(flow, file ? path.basename(file) : '?');
     }
   }

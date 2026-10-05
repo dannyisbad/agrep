@@ -241,21 +241,7 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
                 )
             })
             .collect();
-    let mut calls: std::collections::HashMap<String, Vec<String>> = Default::default();
-    for (name, body) in event_rows(&data) {
-        let session = name
-            .trim_start_matches("gemini-")
-            .split("--")
-            .next()
-            .unwrap_or("");
-        let ids = String::from_utf8_lossy(&body)
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .map(|event| event["call_id"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        calls.entry(session.to_string()).or_default().extend(ids);
-    }
+    let calls = gemini_event_ids(&data);
     let mut failures = Vec::new();
     for (session, case) in expected.as_object().unwrap() {
         let rows = session_rows(&data, session);
@@ -288,6 +274,80 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
         }
     }
     let _ = fs::remove_dir_all(&data);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Each session's tool event call ids, as the event store holds them.
+fn gemini_event_ids(data: &Path) -> std::collections::HashMap<String, Vec<String>> {
+    let mut calls: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (name, body) in event_rows(data) {
+        let session = name
+            .trim_start_matches("gemini-")
+            .split("--")
+            .next()
+            .unwrap_or("");
+        let ids = String::from_utf8_lossy(&body)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|event| event["call_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        calls.entry(session.to_string()).or_default().extend(ids);
+    }
+    calls
+}
+
+/// A session indexed while under way, then again, warm, once everything in it was undone (a
+/// rewind to its first prompt, or Esc rolling back its only one): the file grew by its own undo
+/// records, so the later runs publish the session empty instead of keeping what the first did.
+#[test]
+fn gemini_sessions_undone_after_a_warm_index_publish_nothing() {
+    let fixture = fixtures_dir().join("gemini_flows");
+    let expected: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.join("expected.json")).unwrap()).unwrap();
+    let chats = Path::new(".gemini/tmp/hash8888synthetic/chats");
+    let home = temp_dir("gemini-undone-home");
+    fs::create_dir_all(home.join(chats)).unwrap();
+    let data = temp_dir("gemini-undone");
+    let mut cases = Vec::new();
+    for entry in fs::read_dir(fixture.join("home").join(chats)).unwrap() {
+        let path = entry.unwrap().path();
+        let body = fs::read(&path).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(body.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let session = meta["sessionId"].as_str().unwrap().to_string();
+        let case = &expected[session.as_str()];
+        if let Some(midway) = case.get("midway").and_then(serde_json::Value::as_u64) {
+            let target = home.join(chats).join(path.file_name().unwrap());
+            fs::write(&target, &body[..midway as usize]).unwrap();
+            cases.push((session, case["flow"].to_string(), target, body));
+        }
+    }
+    assert_eq!(cases.len(), 12);
+    ingest_into("gemini", &home, &data, false);
+    for (session, flow, _, _) in &cases {
+        assert!(
+            !session_rows(&data, session).is_empty(),
+            "{flow} published nothing midway"
+        );
+    }
+    for (_, _, target, body) in &cases {
+        fs::write(target, body).unwrap();
+    }
+    let mut failures = Vec::new();
+    for run in ["after the undo", "on the next run"] {
+        ingest_into("gemini", &home, &data, false);
+        let calls = gemini_event_ids(&data);
+        for (session, flow, _, _) in &cases {
+            let rows = session_rows(&data, session).len();
+            let events = calls.get(session).map_or(0, Vec::len);
+            if rows + events > 0 {
+                failures.push(format!("{flow} {run}: {rows} rows, {events} events"));
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&data);
+    let _ = fs::remove_dir_all(&home);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
