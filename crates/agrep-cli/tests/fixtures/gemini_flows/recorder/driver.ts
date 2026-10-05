@@ -1,7 +1,8 @@
 // Drives gemini-cli's own ChatRecordingService the way GeminiClient/GeminiChat do, under both the
-// current recorder (fb972b2) and the `$set.messages` one released before it (361b0bb), and writes
-// one session file per flow plus the transcript a person would read (expected.json). Run through
-// record.sh, which fetches those recorders; each flow's `expect` is written by hand.
+// current recorder (fb972b2) and the `$set.messages` one released before it (361b0bb), each with
+// and without getHistory()'s coalescing, and writes one session file per flow plus the transcript
+// a person would read (expected.json). Run through record.sh, which fetches those recorders; each
+// flow's `expect` is written by hand.
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
@@ -88,6 +89,17 @@ const VERSIONS: Version[] = [
   },
 ];
 
+/** coalesceConsecutiveRoles: one turn per run of a role, its parts concatenated. */
+function coalesce(contents: Content[]): Content[] {
+  const out: Content[] = [];
+  for (const content of contents) {
+    const last = out.at(-1);
+    if (last && last.role === content.role) last.parts = [...last.parts, ...content.parts];
+    else out.push({ role: content.role, parts: content.parts });
+  }
+  return out;
+}
+
 /** GeminiClient + GeminiChat, reduced to the calls that reach the recorder. */
 class Session {
   history: Turn[] = [];
@@ -99,6 +111,9 @@ class Session {
     readonly version: Version,
     readonly ctx: Context,
     readonly day: string,
+    // getHistoryTurns (geminiChat.ts 1179-1194) coalesces for Gemini 2, Gemini 3 and custom
+    // models, the default `auto` included, and contextManagement's scrubHistory always does
+    readonly coalesced: boolean,
   ) {}
 
   tick(): string {
@@ -168,6 +183,13 @@ class Session {
     this.respond(callId, name, output);
   }
 
+  /** sendMessageStream in IDE mode: the editor context goes in as its own turn (addHistory). */
+  ide(json: string): void {
+    const parts = [{ text: `Here is the user's editor context as a JSON object. This is for your information only.\n\`\`\`json\n${json}\n\`\`\`` }];
+    const id = this.recorder.recordSyntheticMessage('user', parts);
+    this.history.push({ id, content: { role: 'user', parts } });
+  }
+
   /** The `finally` of sendMessageStream: abort or failure rolls back to before the prompt. */
   abort(): void {
     this.tick();
@@ -188,11 +210,13 @@ class Session {
     this.recorder.updateMessagesFromHistory(this.history);
   }
 
+  /** GeminiChat.getHistory(), which saves, masking and compression's kept tail start from. */
   contents(rewrite: (part: Part) => Part = (part) => part): Content[] {
-    return this.history.map((turn) => ({
+    const contents = this.history.map((turn) => ({
       role: turn.content.role,
       parts: structuredClone(turn.content.parts).map(rewrite),
     }));
+    return this.coalesced ? coalesce(contents) : contents;
   }
 
   /** client.tryMaskToolOutputs and CONTENT_TRUNCATED: tool outputs replaced, then setHistory. */
@@ -555,36 +579,132 @@ const SCENARIOS: Scenario[] = [
       plainTurn(s, 'dingo');
     },
   },
+  {
+    // coalesced, the mask re-records the environment and the first prompt as one copy
+    name: 'mask_rewind_first',
+    expect: [user('cheetah')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      toolTurn(s, 'bison');
+      s.mask(MASKED);
+      s.rewind(s.idOf('alpaca'));
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // --resume drops the never-recorded closer, so a cancelled tool's result and the next prompt
+    // are consecutive user turns that a coalesced mask re-records as one
+    name: 'esc_resume_mask_rewind',
+    expect: [user('alpaca'), user('bison', ''), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
+      s.respond('read-bison', 'read_file', CANCELLED);
+      plainTurn(s, 'cheetah');
+      await s.resume();
+      s.mask(MASKED);
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // IDE mode: each prompt follows its own editor-context turn, never a row
+    name: 'ide_context_mask',
+    expect: [user('alpaca'), user('bison'), user('cheetah')],
+    run: async (s) => {
+      s.ide('{"activeFile":"alpaca.ts"}');
+      toolTurn(s, 'alpaca');
+      s.ide('{"activeFile":"bison.ts"}');
+      toolTurn(s, 'bison');
+      s.mask(MASKED);
+      s.ide('{"activeFile":"cheetah.ts"}');
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // each --resume re-derives the cancelled tool's result under the id the first one recorded it
+    // with, so the history holds it twice while the file maps it once; the second also drops the
+    // closer, and a coalesced mask re-records all three results with the next prompt
+    name: 'esc_resume_twice_mask_rewind',
+    expect: [user('alpaca'), user('bison', ''), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.call('read-bison', 'read_file', { file_path: 'bison.ts' }, CANCELLED, 'cancelled');
+      s.respond('read-bison', 'read_file', CANCELLED);
+      await s.resume();
+      plainTurn(s, 'cheetah');
+      await s.resume();
+      s.mask(MASKED);
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // the first /chat resume pairs with the oldest copy of the saved turn, which /rewind then
+    // undoes; the second resume brings the turn back rather than a copy of the undone one
+    name: 'chat_resume_twice_around_rewind',
+    expect: [user('bison'), recap('bison only'), user('cheetah'), user('alpaca'), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      const saved = s.contents();
+      s.mask(MASKED);
+      plainTurn(s, 'bison');
+      await s.compress('bison only', 2);
+      s.setHistory(saved);
+      s.rewind(s.idOf('alpaca'));
+      plainTurn(s, 'cheetah');
+      s.setHistory(saved);
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // /chat resume restores a prompt /rewind took away, the environment coalesced into it
+    name: 'chat_resume_rewound_first',
+    expect: [user('alpaca'), user('bison')],
+    run: async (s) => {
+      toolTurn(s, 'alpaca');
+      const saved = s.contents();
+      s.rewind(s.idOf('alpaca'));
+      s.setHistory(saved);
+      plainTurn(s, 'bison');
+    },
+  },
 ];
 
 const expected: string[] = [];
-for (const [v, version] of VERSIONS.entries()) {
-  for (const [n, scenario] of SCENARIOS.entries()) {
-    // the first sixteen flows keep the ids their fixtures were recorded with
-    const code = n < 16 ? v * 16 + n : 0x40 + v * 16 + (n - 16);
-    const tag = `${code.toString(16).padStart(2, '0')}`.repeat(4);
-    setIdPrefix(tag);
-    const sessionId = `${tag}-${v}${n.toString(16).padStart(3, '0')}-4000-8000-${tag}${tag.slice(0, 4)}`;
-    const day = `2026-0${v + 4}-${String(n + 1).padStart(2, '0')}`;
-    const ctx: Context = {
-      promptId: sessionId,
-      config: {
-        getProjectRoot: () => '/work/zoo',
-        storage: { getProjectTempDir: () => path.join(OUT, 'hash8888synthetic') },
-        getWorkspaceContext: () => ({ getDirectories: () => ['/work/zoo'] }),
-      },
-      toolRegistry: {
-        getTool: (name) => ({ displayName: name, description: `${name} tool`, isOutputMarkdown: false }),
-      },
-    };
-    const session = new Session(version, ctx, day);
-    session.tick();
-    await session.start([]);
-    await scenario.run(session);
-    const rows = scenario.expect.map((row) => `  ${JSON.stringify(row)}`).join(',\n');
-    expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${version.name}/${scenario.name}", "rows": [\n${rows}\n ]}`);
-    const file = session.recorder.getConversationFilePath();
-    console.log(version.name, scenario.name, file ? path.basename(file) : '?');
+for (const coalesced of [false, true]) {
+  for (const [r, version] of VERSIONS.entries()) {
+    const v = (coalesced ? VERSIONS.length : 0) + r;
+    for (const [n, scenario] of SCENARIOS.entries()) {
+      // the first sixteen flows keep the ids their fixtures were recorded with
+      const code = n < 16 ? v * 16 + n : 0x40 + v * 16 + (n - 16);
+      const tag = `${code.toString(16).padStart(2, '0')}`.repeat(4);
+      setIdPrefix(tag);
+      const sessionId = `${tag}-${v}${n.toString(16).padStart(3, '0')}-4000-8000-${tag}${tag.slice(0, 4)}`;
+      const day = `2026-0${v + 4}-${String(n + 1).padStart(2, '0')}`;
+      const ctx: Context = {
+        promptId: sessionId,
+        config: {
+          getProjectRoot: () => '/work/zoo',
+          storage: { getProjectTempDir: () => path.join(OUT, 'hash8888synthetic') },
+          getWorkspaceContext: () => ({ getDirectories: () => ['/work/zoo'] }),
+        },
+        toolRegistry: {
+          getTool: (name) => ({ displayName: name, description: `${name} tool`, isOutputMarkdown: false }),
+        },
+      };
+      const session = new Session(version, ctx, day, coalesced);
+      session.tick();
+      await session.start([]);
+      await scenario.run(session);
+      const flow = `${version.name}${coalesced ? '+coalesced' : ''}/${scenario.name}`;
+      const rows = scenario.expect.map((row) => `  ${JSON.stringify(row)}`).join(',\n');
+      expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${flow}", "rows": [\n${rows}\n ]}`);
+      const file = session.recorder.getConversationFilePath();
+      console.log(flow, file ? path.basename(file) : '?');
+    }
   }
 }
 fs.writeFileSync(path.join(OUT, 'expected.json'), `{\n${expected.join(',\n')}\n}\n`);

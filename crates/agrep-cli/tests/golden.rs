@@ -217,10 +217,11 @@ fn intake_ids(data: &Path) -> Vec<String> {
 }
 
 /// Every flow that rewrites a Gemini session file, recorded by upstream's own recorders (current
-/// fb972b2 and the `$set.messages` 361b0bb) in tests/fixtures/gemini_flows. `expected.json` holds
-/// the conversation a person had: what upstream resumes, plus turns a context rewrite (compression,
-/// masking, truncation, `/chat resume`) took out of the model's view. Rewound and rolled-back
-/// turns are gone, and both recorder versions of one flow read the same.
+/// fb972b2 and the `$set.messages` 361b0bb, each with and without `getHistory()` coalescing) in
+/// tests/fixtures/gemini_flows. `expected.json` holds the conversation a person had: what upstream
+/// resumes, plus turns a context rewrite (compression, masking, truncation, `/chat resume`) took
+/// out of the model's view. Rewound and rolled-back turns are gone, and every recording of one
+/// flow reads the same.
 #[test]
 fn gemini_flows_read_as_the_conversation_a_person_had() {
     let fixture = fixtures_dir().join("gemini_flows");

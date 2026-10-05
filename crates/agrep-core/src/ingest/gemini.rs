@@ -19,8 +19,9 @@
 //! `content` is a string or, since early 2026, a Part[] such as `[{"text": ...}]`:
 //!   type=="user"   -> the human's prompt; `displayContent` holds what was typed when the sent
 //!                     request differs (expanded @file context). Tool results are recorded as
-//!                     user turns of functionResponse parts and the environment preamble as a
-//!                     `<session_context>` user turn - neither is the human
+//!                     user turns of functionResponse parts, the environment preamble as a
+//!                     `<session_context>` user turn and IDE mode's editor context as one of its
+//!                     own - none is the human
 //!   type=="gemini" -> the model's turn: `content` prose reply (thought parts excluded),
 //!                     `model`, `toolCalls[]`, plus `thoughts` (reasoning, excluded) and `tokens`
 //!   type=="info"   -> CLI system notices (auth flow, etc.) - not the user, skipped
@@ -72,7 +73,12 @@ fn tool_result(tc: &Value) -> (String, usize, usize, Option<bool>) {
 /// The text a PartListUnion carries: the string itself, or its text parts joined the way
 /// upstream's `partToString` joins them. Thought parts are reasoning, never prose.
 fn part_text(value: &Value) -> String {
-    fn push_part(out: &mut String, part: &Value) {
+    parts_text(parts_of(value))
+}
+
+fn parts_text(parts: &[Value]) -> String {
+    let mut out = String::new();
+    for part in parts {
         match part {
             Value::String(text) => out.push_str(text),
             Value::Object(fields) => {
@@ -86,12 +92,15 @@ fn part_text(value: &Value) -> String {
             _ => {}
         }
     }
-    let mut out = String::new();
-    match value {
-        Value::Array(parts) => parts.iter().for_each(|part| push_part(&mut out, part)),
-        part => push_part(&mut out, part),
-    }
     out
+}
+
+/// A PartListUnion as its parts: a lone string or part is a list of one.
+fn parts_of(value: &Value) -> &[Value] {
+    match value {
+        Value::Array(parts) => parts,
+        part => std::slice::from_ref(part),
+    }
 }
 
 /// A user turn carrying a functionResponse part is a tool result, not something typed.
@@ -104,11 +113,32 @@ fn carries_function_response(value: &Value) -> bool {
     }
 }
 
-/// Upstream `isIgnoredUserContent`'s machine-written prefixes: the environment preamble every
-/// new session records as its first user turn, and hook-injected context.
+/// Machine-written user turns: upstream `isIgnoredUserContent`'s prefixes (the environment
+/// preamble every new session records first, hook-injected context) and, in IDE mode, the editor
+/// context `GeminiClient.getIdeContextParts` sends as its own turn before a prompt (client.ts
+/// 484-485 full, 594-595 changes, joined at 751 at fb972b2).
 fn is_injected_context(text: &str) -> bool {
+    const PREFIXES: [&str; 4] = [
+        "<session_context>",
+        "<hook_context>",
+        "Here is the user's editor context as a JSON object. This is for your information only.",
+        "Here is a summary of changes in the user's editor context, in JSON format. This is for \
+         your information only.",
+    ];
     let text = text.trim_start();
-    text.starts_with("<session_context>") || text.starts_with("<hook_context>")
+    PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+}
+
+/// A user turn's parts past its leading injected context when more follows: `getHistory()`
+/// coalesces the context turn into the prompt after it for Gemini 2 and 3 models.
+fn past_injected(mut parts: &[Value]) -> &[Value] {
+    while let Some((first, rest)) = parts.split_first() {
+        if rest.is_empty() || !is_injected_context(&parts_text(std::slice::from_ref(first))) {
+            break;
+        }
+        parts = rest;
+    }
+    parts
 }
 
 /// Compression (upstream `ChatCompressionService`) records the model-written `<state_snapshot>`
@@ -155,7 +185,7 @@ fn emit_messages<'a>(
                     .get("displayContent")
                     .map(part_text)
                     .filter(|text| !text.trim().is_empty());
-                let text = typed.unwrap_or_else(|| part_text(content));
+                let text = typed.unwrap_or_else(|| parts_text(past_injected(parts_of(content))));
                 if text.trim().is_empty() {
                     tally.skip(Skip::EmptyText);
                     continue;
@@ -342,8 +372,9 @@ enum State {
 struct Entry {
     message: Value,
     state: State,
-    /// The entry this one re-records under a new id during a context rewrite.
-    original: Option<usize>,
+    /// The entries this one re-records under a new id during a context rewrite: one, or the run
+    /// of consecutive user turns upstream's `getHistory()` coalesced into it.
+    originals: Vec<usize>,
     /// Position in `Fold::order` while in the context map.
     slot: Option<usize>,
     /// The `Fold::epoch` in which the entry entered the map.
@@ -353,6 +384,31 @@ struct Entry {
 /// What a re-recorded copy shares with the message it repeats: type, visible text and the
 /// (name, call id) of every tool call or result it carries.
 type CopyKey = (String, String, Vec<(String, String)>);
+
+/// One part of a user turn as a coalesced copy repeats it: its text and its tool call or result.
+type PartKey = (String, Option<(String, String)>);
+
+fn part_key(part: &Value) -> PartKey {
+    (parts_text(std::slice::from_ref(part)), part_tool(part))
+}
+
+/// The (name, call id) of a functionCall or functionResponse part.
+fn part_tool(part: &Value) -> Option<(String, String)> {
+    ["functionCall", "functionResponse"]
+        .iter()
+        .find_map(|kind| part.get(*kind))
+        .map(name_and_id)
+}
+
+fn name_and_id(call: &Value) -> (String, String) {
+    let field = |name: &str| {
+        call.get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    (field("name"), field("id"))
+}
 
 fn key_hash(key: &CopyKey) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -374,7 +430,8 @@ fn key_hash(key: &CopyKey) -> u64 {
 ///   tool result.
 ///
 /// Work stays linear in the file: each entry is keyed at most once as removed and once as a
-/// copy, and the map is a slot list compacted as removals accumulate.
+/// copy, and the map is a slot list compacted as removals accumulate and wherever the rollback
+/// walk crossed a gap, so no gap is walked twice.
 /// Every non-blank line and every message inside a `messages` array is one seen unit, and each
 /// leaves through exactly one counter below or as one transcript entry.
 #[derive(Default)]
@@ -502,7 +559,7 @@ impl Fold {
         self.entries.push(Entry {
             message,
             state: State::Live,
-            original: None,
+            originals: Vec::new(),
             slot: None,
             entered: self.epoch,
         });
@@ -546,13 +603,18 @@ impl Fold {
             self.order.pop();
         }
         if self.order.len() > 2 * self.in_map + 64 {
-            let order: Vec<usize> = self.order.drain(..).flatten().collect();
-            for (slot, index) in order.iter().enumerate() {
-                if let Some(entry) = self.entries.get_mut(*index) {
-                    entry.slot = Some(slot);
-                }
+            self.compact_from(0);
+        }
+    }
+
+    /// Close the gaps in `order` from `from` on, keeping its order.
+    fn compact_from(&mut self, from: usize) {
+        let moved: Vec<usize> = self.order.drain(from..).flatten().collect();
+        for index in moved {
+            if let Some(entry) = self.entries.get_mut(index) {
+                entry.slot = Some(self.order.len());
+                self.order.push(Some(index));
             }
-            self.order = order.into_iter().map(Some).collect();
         }
     }
 
@@ -592,7 +654,7 @@ impl Fold {
         self.set_mark();
     }
 
-    /// Delete entries and, through each copy, the original it re-recorded.
+    /// Delete entries and, through each copy, the originals it re-recorded.
     fn undo(&mut self, mut pending: Vec<usize>) {
         while let Some(index) = pending.pop() {
             let Some(entry) = self.entries.get_mut(index) else {
@@ -602,7 +664,7 @@ impl Fold {
                 continue;
             }
             entry.state = State::Deleted;
-            pending.extend(entry.original);
+            pending.extend_from_slice(&entry.originals);
             self.leave(index);
         }
     }
@@ -676,23 +738,36 @@ impl Fold {
         let gone: HashSet<usize> = removed.iter().copied().collect();
         let mut tail: HashSet<usize> = HashSet::new();
         let mut copies: Vec<(usize, usize)> = Vec::new();
-        if let Some(last) = removed.last().and_then(|index| self.slot_of(*index)) {
+        if !removed.is_empty() {
             // walked back past what this re-sync recorded, the map ends with its rolled-back tail
-            for index in self.order.iter().rev().flatten() {
-                if self.entered_now(*index) {
-                    continue;
-                }
-                if !gone.contains(index) || tail.len() == gone.len() {
+            let mut from = self.order.len();
+            let mut gaps = false;
+            while tail.len() < gone.len() {
+                let Some(slot) = from.checked_sub(1) else {
                     break;
+                };
+                match self.order.get(slot).copied().flatten() {
+                    None => gaps = true,
+                    Some(index) if self.entered_now(index) => {}
+                    Some(index) if gone.contains(&index) => {
+                        tail.insert(index);
+                    }
+                    Some(_) => break,
                 }
-                tail.insert(*index);
+                from = slot;
             }
+            // each gap is crossed once: one-in-one-out re-syncs would otherwise walk them all again
+            if gaps {
+                self.compact_from(from);
+            }
+        }
+        if let Some(last) = removed.last().and_then(|index| self.slot_of(*index)) {
             for index in self.mark..self.entries.len() {
                 let Some(entry) = self.entries.get(index) else {
                     continue;
                 };
                 if let Some(slot) = entry.slot.filter(|slot| *slot > last) {
-                    if entry.original.is_none() && !gone.contains(&index) {
+                    if entry.originals.is_empty() && !gone.contains(&index) {
                         copies.push((slot, index));
                     }
                 }
@@ -742,6 +817,9 @@ impl Fold {
     /// suffix after its snapshot, paired from the back. A rewrite that re-records the context from
     /// its first message (masking, truncation, `/chat resume`) pairs from the front, and when it
     /// re-records the whole context a copy of nothing removed may repeat an earlier dropped message.
+    /// `getHistory()` coalesces consecutive user turns for Gemini 2 and 3 models, so one user copy
+    /// can repeat a run of them (the environment and the first prompt, a cancelled tool's result
+    /// and the next prompt, IDE context and its prompt).
     fn pair(
         &mut self,
         removed: &[usize],
@@ -759,26 +837,47 @@ impl Fold {
                 at.entry(key).or_default().push(position);
             }
         }
-        // a save made after `/rewind` or `--resume` lacks the environment message the context has
-        let front = match copy_keys.first() {
-            Some(Some(first)) => {
-                removed_keys
-                    .first()
-                    .is_some_and(|key| key.as_ref() == Some(first))
-                    || (whole
-                        && (at.contains_key(first) || self.dropped_original(first, 0).is_some()))
+        let mut starts: HashMap<PartKey, Vec<usize>> = HashMap::new();
+        let mut ends: HashMap<PartKey, Vec<usize>> = HashMap::new();
+        for (position, index) in removed.iter().enumerate() {
+            let parts = self.user_parts(*index).unwrap_or_default();
+            if let (Some(first), Some(last)) = (parts.first(), parts.last()) {
+                starts.entry(part_key(first)).or_default().push(position);
+                ends.entry(part_key(last)).or_default().push(position);
             }
-            _ => false,
-        };
-        let mut originals: Vec<Option<usize>> = vec![None; copies.len()];
+        }
+        let opens = matches!(
+            (copy_keys.first(), removed_keys.first()),
+            (Some(Some(copy)), Some(Some(first))) if copy == first
+        ) || copies
+            .first()
+            .and_then(|copy| self.run(*copy, removed, &starts, 0, true))
+            .is_some_and(|(start, _)| start == 0);
+        // a whole rewrite re-records the context from its start, but a save made after `/rewind`
+        // or `--resume` lacks the environment message, so judge by the first copy past it
+        let lead = copy_keys.iter().zip(copies).find_map(|(key, copy)| {
+            let context = |(kind, text, _): &CopyKey| kind == "user" && is_injected_context(text);
+            key.as_ref()
+                .filter(|key| !context(key))
+                .map(|key| (key, *copy))
+        });
+        let front = opens
+            || (whole
+                && lead.is_some_and(|(key, copy)| {
+                    at.contains_key(key)
+                        || self.run(copy, removed, &starts, 0, true).is_some()
+                        || self.dropped_original(key, 0).is_some()
+                }));
+        let mut originals: Vec<Vec<usize>> = vec![Vec::new(); copies.len()];
         let mut order: Vec<usize> = (0..copies.len()).collect();
         if !front {
             order.reverse();
         }
+        let edges = if front { &starts } else { &ends };
         let mut bound = if front { 0 } else { removed.len() };
         let mut dropped_bound = 0;
         for slot in order {
-            let Some(Some(key)) = copy_keys.get(slot) else {
+            let (Some(copy), Some(Some(key))) = (copies.get(slot), copy_keys.get(slot)) else {
                 continue;
             };
             let positions = at.get(key).map(Vec::as_slice).unwrap_or_default();
@@ -788,10 +887,22 @@ impl Fold {
                 let below = positions.partition_point(|p| *p < bound);
                 below.checked_sub(1).and_then(|p| positions.get(p))
             };
-            if let Some(found) = found {
-                bound = if front { *found + 1 } else { *found };
-                if let Some(original) = originals.get_mut(slot) {
-                    *original = removed.get(*found).copied();
+            let run = self.run(*copy, removed, edges, bound, front);
+            // the nearer of the two in pairing order
+            let span = match (found.copied(), run) {
+                (Some(at), Some((start, end)))
+                    if (front && at < start) || (!front && at >= end) =>
+                {
+                    Some((at, at + 1))
+                }
+                (_, Some(span)) => Some(span),
+                (Some(at), None) => Some((at, at + 1)),
+                (None, None) => None,
+            };
+            if let Some((start, end)) = span {
+                bound = if front { end } else { start };
+                if let Some(cell) = originals.get_mut(slot) {
+                    *cell = removed.get(start..end).unwrap_or_default().to_vec();
                 }
                 continue;
             }
@@ -802,29 +913,106 @@ impl Fold {
             if let Some(found) = self.dropped_original(key, dropped_bound) {
                 dropped_bound = found + 1;
                 if let Some(original) = originals.get_mut(slot) {
-                    *original = Some(found);
+                    original.push(found);
                 }
             }
         }
-        for (copy, original) in copies.iter().zip(originals) {
-            if let (Some(entry), Some(original)) = (self.entries.get_mut(*copy), original) {
-                entry.original = Some(original);
+        for (copy, found) in copies.iter().zip(originals) {
+            if let Some(entry) = self.entries.get_mut(*copy) {
+                entry.originals = found;
             }
         }
     }
 
+    /// The run of two or more consecutive `removed` user turns whose parts, one after another, are
+    /// the user copy's: the one starting at or after `bound` from the front, else the one ending
+    /// before it. `edges` maps each removed user turn's first (front) or last part to positions.
+    fn run(
+        &self,
+        copy: usize,
+        removed: &[usize],
+        edges: &HashMap<PartKey, Vec<usize>>,
+        bound: usize,
+        front: bool,
+    ) -> Option<(usize, usize)> {
+        let want: Vec<PartKey> = self.user_parts(copy)?.iter().map(part_key).collect();
+        if want.len() < 2 {
+            return None;
+        }
+        let positions = edges.get(if front { want.first() } else { want.last() }?)?;
+        let below = positions.partition_point(|p| *p < bound);
+        let start = *positions.get(if front { below } else { below.checked_sub(1)? })?;
+        // how many parts the removed turn at `at` covers next, if it fits there; comparisons
+        // stop at a few per part of the copy, so a crafted run of repeats stays linear
+        let budget = std::cell::Cell::new(4 * want.len());
+        let fits = |at: usize, taken: usize| -> Option<usize> {
+            let parts = self.user_parts(*removed.get(at)?)?;
+            let range = if front {
+                taken..taken + parts.len()
+            } else {
+                want.len().checked_sub(taken + parts.len())?..want.len() - taken
+            };
+            let wanted = want.get(range)?;
+            budget.set(budget.get().checked_sub(wanted.len())?);
+            let same = wanted
+                .iter()
+                .zip(parts)
+                .all(|(w, part)| *w == part_key(part));
+            same.then_some(parts.len())
+        };
+        let (mut next, mut edge, mut taken, mut members) = (Some(start), start, 0, 0);
+        while taken < want.len() {
+            if let Some(len) = next.and_then(|at| fits(at, taken)) {
+                edge = next?;
+                next = if front {
+                    edge.checked_add(1)
+                } else {
+                    edge.checked_sub(1)
+                };
+                taken += len;
+            } else {
+                // `--resume` re-derives a tool result the file also holds, under the same id:
+                // the history carries that message twice and upstream's map once
+                taken += (members > 0).then(|| fits(edge, taken)).flatten()?;
+            }
+            members += 1;
+        }
+        if members < 2 {
+            return None;
+        }
+        Some(if front {
+            (start, edge + 1)
+        } else {
+            (edge, start + 1)
+        })
+    }
+
+    /// A user message's parts, when it has any.
+    fn user_parts(&self, index: usize) -> Option<&[Value]> {
+        let message = &self.entries.get(index)?.message;
+        if message.get("type").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        let parts = parts_of(message.get("content")?);
+        (!parts.is_empty()).then_some(parts)
+    }
+
     /// The oldest dropped entry at or after `bound` that `key` repeats, pruning entries that are
-    /// no longer dropped.
+    /// no longer dropped, or repeat a turn since undone through another copy of it.
     fn dropped_original(&mut self, key: &CopyKey, bound: usize) -> Option<usize> {
         let hash = key_hash(key);
         let mut cursor = bound;
         loop {
             let index = *self.dropped.get(&hash)?.range(cursor..).next()?;
-            let dropped = self
-                .entries
-                .get(index)
-                .is_some_and(|entry| entry.state == State::Dropped);
-            if !dropped {
+            let usable = self.entries.get(index).is_some_and(|entry| {
+                let deleted = |original: &usize| {
+                    self.entries
+                        .get(*original)
+                        .is_none_or(|entry| entry.state == State::Deleted)
+                };
+                entry.state == State::Dropped && !entry.originals.iter().any(deleted)
+            });
+            if !usable {
                 if let Some(set) = self.dropped.get_mut(&hash) {
                     set.remove(&index);
                 }
@@ -838,37 +1026,22 @@ impl Fold {
     }
 
     /// None for the interrupted-turn closer: the CLI writes it the first time inside a rewrite,
-    /// where it would take the place of an earlier closer and misalign every pair after it.
+    /// where it would take the place of an earlier closer and misalign every pair after it. A
+    /// coalesced user copy keys past its leading injected context (see `past_injected`).
     fn copy_key(&self, index: usize) -> Option<CopyKey> {
         let message = &self.entries.get(index)?.message;
         let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
-        let content = message.get("content").unwrap_or(&Value::Null);
-        let field = |value: &Value, name: &str| {
-            value
-                .get(name)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        let mut tools: Vec<(String, String)> = Vec::new();
+        let mut parts = parts_of(message.get("content").unwrap_or(&Value::Null));
         let calls = message.get("toolCalls").and_then(Value::as_array);
-        for call in calls.into_iter().flatten() {
-            tools.push((field(call, "name"), field(call, "id")));
-        }
-        let parts = match content {
-            Value::Array(parts) => parts.as_slice(),
-            part => std::slice::from_ref(part),
-        };
-        for part in parts {
-            for kind in ["functionCall", "functionResponse"] {
-                if let Some(call) = part.get(kind) {
-                    tools.push((field(call, "name"), field(call, "id")));
-                }
-            }
-        }
+        let mut tools: Vec<(String, String)> =
+            calls.into_iter().flatten().map(name_and_id).collect();
+        tools.extend(parts.iter().filter_map(part_tool));
         tools.sort_unstable();
         tools.dedup();
-        let text = visible_text(&part_text(content));
+        if kind == "user" {
+            parts = past_injected(parts);
+        }
+        let text = visible_text(&parts_text(parts));
         if tools.is_empty() && text == INTERRUPTED_PLACEHOLDER {
             return None;
         }
@@ -947,7 +1120,7 @@ impl Fold {
         self.entries
             .iter()
             .filter(|entry| entry.state != State::Deleted)
-            .map(|entry| (&entry.message, entry.original.is_some()))
+            .map(|entry| (&entry.message, !entry.originals.is_empty()))
     }
 }
 
@@ -1523,6 +1696,41 @@ mod tests {
         assert_eq!(rows, vec![("alpaca", "ok alpaca"), ("cheetah", "")]);
     }
 
+    /// `/rewind` to the environment message undoes it; a `/chat resume` after that still re-records
+    /// the saved context from its start, so its copies pair with what they repeat from the front.
+    #[test]
+    fn a_chat_resume_after_rewinding_the_environment_pairs_from_the_front() {
+        let root = temp_root("resume-after-env");
+        let path = root.join("session-2026-04-24T09-00-6a6a6a6a.jsonl");
+        let env =
+            r#""type":"user","content":[{"text":"<session_context>\nx\n</session_context>"}]"#;
+        let lines = [
+            r#"{"sessionId":"6a6a6a6a-0000-4000-8000-00000000000b","projectHash":"h"}"#.to_string(),
+            format!(r#"{{"id":"env","timestamp":"2026-04-24T09:00:00.000Z",{env}}}"#),
+            r#"{"id":"u1","timestamp":"2026-04-24T09:01:00.000Z","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+            r#"{"id":"g1","timestamp":"2026-04-24T09:01:30.000Z","type":"gemini","content":"ok alpaca"}"#.to_string(),
+            r#"{"$set":{"lastUpdated":"2026-04-24T09:01:30.000Z"}}"#.to_string(),
+            format!(r#"{{"id":"env","timestamp":"2026-04-24T09:00:00.000Z",{env}}}"#),
+            r#"{"id":"s1","timestamp":"2026-04-24T09:02:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca</overall_goal>\n</state_snapshot>"}]}"#.to_string(),
+            r#"{"id":"a1","timestamp":"2026-04-24T09:02:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}"#.to_string(),
+            r#"{"$patch":{"removeIds":["u1","g1"]}}"#.to_string(),
+            r#"{"$rewindTo":"env"}"#.to_string(),
+            r#"{"id":"u2","timestamp":"2026-04-24T09:03:00.000Z","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+            r#"{"$set":{"lastUpdated":"2026-04-24T09:03:00.000Z"}}"#.to_string(),
+            format!(r#"{{"id":"e3","timestamp":"2026-04-24T09:04:00.000Z",{env}}}"#),
+            r#"{"id":"u3","timestamp":"2026-04-24T09:04:00.000Z","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+            r#"{"id":"g3","timestamp":"2026-04-24T09:04:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}]}"#.to_string(),
+            r#"{"$patch":{"removeIds":["u2"]}}"#.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (messages, _, tally) = parse(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        let rows: Vec<(&str, &str)> = messages.iter().map(|m| (&*m.text, &*m.reply)).collect();
+        assert_eq!(rows, vec![("alpaca", "ok alpaca"), ("bison", "")]);
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+    }
+
     /// Every session upstream's recorders wrote in tests/fixtures/gemini_flows reads as its
     /// `expected.json` transcript, with each record accounted for.
     #[test]
@@ -1537,7 +1745,7 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
-        assert_eq!(files.len(), 44);
+        assert_eq!(files.len(), 112);
         let mut failures = Vec::new();
         for path in files {
             let (messages, _, tally) = parse(&path);
@@ -1595,8 +1803,9 @@ mod tests {
         }
     }
 
-    /// Hostile shapes stay linear: one id removed per re-sync from a long map, and comment-dense
-    /// prompts passing through a rewrite. Quadratic handling took minutes on this file.
+    /// Hostile shapes stay linear: one id removed per re-sync from a long map, comment-dense
+    /// prompts passing through a rewrite, and one-in-one-out re-syncs behind a long map, whose
+    /// gaps the rollback walk would cross again each time. Quadratic handling took minutes.
     #[test]
     fn hostile_re_syncs_parse_in_linear_time() {
         let root = temp_root("hostile");
@@ -1629,11 +1838,39 @@ mod tests {
         let started = std::time::Instant::now();
         let (rows, _, tally) = parse(&path);
         let elapsed = started.elapsed();
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(rows.len(), messages + 2);
         assert_eq!(tally.test_record_counts(Skip::Replay).3, 2);
         assert!(body.len() > 3_000_000);
         assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
+
+        let path = root.join("session-2026-04-26T09-00-6d6d6d6d.jsonl");
+        let (stable, rounds) = (400_000, 400_000);
+        let mut body = String::from(
+            r#"{"sessionId":"6d6d6d6d-0000-4000-8000-00000000000a","projectHash":"h"}"#,
+        );
+        body.push('\n');
+        for n in 0..stable {
+            body.push_str(&format!("{{\"id\":\"a{n}\"}}\n"));
+        }
+        for n in 0..rounds {
+            body.push_str(&format!("{{\"id\":\"b{n}\"}}\n"));
+            if n > 0 {
+                let before = n - 1;
+                body.push_str(&format!(
+                    "{{\"$patch\":{{\"removeIds\":[\"b{before}\"]}}}}\n"
+                ));
+            }
+        }
+        std::fs::write(&path, &body).unwrap();
+        let started = std::time::Instant::now();
+        let (_, _, tally) = parse(&path);
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
+        assert_eq!(seen, (stable + 2 * rounds) as u64);
+        assert_eq!(seen, rows + agent_rows + skips + errors);
+        assert!(body.len() > 25_000_000);
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]

@@ -158,7 +158,8 @@ class CompressedResumeTests(_Sandbox):
 
 @unittest.skipUnless(os.name == "posix", "the sandbox relies on POSIX paths")
 class RecordedFlowsTests(_Sandbox):
-    """Compression, masking, truncation, /chat resume, aborts, failures, /rewind and resume."""
+    """Compression, masking, truncation, /chat resume, aborts, failures, /rewind, resume and
+    IDE mode, recorded with and without getHistory()'s coalescing."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -168,7 +169,8 @@ class RecordedFlowsTests(_Sandbox):
 
     def test_each_chat_has_the_turns_its_person_had(self) -> None:
         expected = json.loads((FLOWS / "expected.json").read_text(encoding="utf-8"))
-        result = self._run(ROOT / "cli.py", "chats", "--agent", "gemini", "--json", "-n", "80")
+        result = self._run(ROOT / "cli.py", "chats", "--agent", "gemini", "--json",
+                           "-n", str(len(expected)))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         chats = {row["session"]: row for row in map(json.loads, result.stdout.splitlines())
                  if row.get("kind") != "agrep-meta"}
@@ -176,6 +178,13 @@ class RecordedFlowsTests(_Sandbox):
             with self.subTest(flow=case["flow"]):
                 self.assertEqual(chats[session]["turns"], len(case["rows"]))
                 self.assertEqual(chats[session]["first_text"], case["rows"][0][1])
+
+    def test_editor_context_is_no_prompt_and_audit_accounts_for_it(self) -> None:
+        # IDE mode sends the editor context as a user turn of its own; nobody typed it
+        self.assertEqual(self._count("information only"), 0)
+        self.assertGreater(self._count("cheetah"), 0)
+        result = self._run(ROOT / "cli.py", "audit", "--agent", "gemini", "--strict")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

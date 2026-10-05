@@ -1,0 +1,46 @@
+{"sessionId":"6a6a6a6a-201a-4000-8000-6a6a6a6a6a6a","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-06-27T09:01:00.000Z","lastUpdated":"2026-06-27T09:01:00.000Z","kind":"main"}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-06-27T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:01:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000001","timestamp":"2026-06-27T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:02:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000002","timestamp":"2026-06-27T09:03:00.000Z","type":"gemini","content":"ok alpaca","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-06-27T09:03:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000003","timestamp":"2026-06-27T09:04:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:04:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000004","timestamp":"2026-06-27T09:04:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-06-27T09:04:00.000Z"}}
+{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4","6a6a6a6a-0000-4000-8000-000000000001","6a6a6a6a-0000-4000-8000-000000000002"]}}
+{"$set":{"lastUpdated":"2026-06-27T09:04:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000005","timestamp":"2026-06-27T09:05:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:05:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000006","timestamp":"2026-06-27T09:06:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-06-27T09:06:00.000Z"}}
+{"$set":{"sessionId":"6a6a6a6a-201a-4000-8000-6a6a6a6a6a6a"}}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-06-27T09:07:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"id":"6a6a6a6a-0000-4000-8000-000000000007","timestamp":"2026-06-27T09:07:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>bison only</overall_goal>\n</state_snapshot>"}]}
+{"id":"6a6a6a6a-0000-4000-8000-000000000008","timestamp":"2026-06-27T09:07:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}
+{"id":"6a6a6a6a-0000-4000-8000-000000000009","timestamp":"2026-06-27T09:07:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"id":"6a6a6a6a-0000-4000-8000-000000000010","timestamp":"2026-06-27T09:07:00.000Z","type":"gemini","content":[{"text":"ok bison"}]}
+{"$patch":{"removeIds":["6a6a6a6a-0000-4000-8000-000000000003","6a6a6a6a-0000-4000-8000-000000000004","6a6a6a6a-0000-4000-8000-000000000005","6a6a6a6a-0000-4000-8000-000000000006"]}}
+{"$set":{"lastUpdated":"2026-06-27T09:07:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000011","timestamp":"2026-06-27T09:08:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:08:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000012","timestamp":"2026-06-27T09:08:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-06-27T09:08:00.000Z"}}
+{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4","6a6a6a6a-0000-4000-8000-000000000007","6a6a6a6a-0000-4000-8000-000000000008","6a6a6a6a-0000-4000-8000-000000000009","6a6a6a6a-0000-4000-8000-000000000010"]}}
+{"$set":{"lastUpdated":"2026-06-27T09:08:00.000Z"}}
+{"$rewindTo":"6a6a6a6a-0000-4000-8000-000000000011"}
+{"id":"6a6a6a6a-0000-4000-8000-000000000013","timestamp":"2026-06-27T09:10:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:10:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000014","timestamp":"2026-06-27T09:11:00.000Z","type":"gemini","content":"ok cheetah","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-06-27T09:11:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000015","timestamp":"2026-06-27T09:12:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"},{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:12:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000016","timestamp":"2026-06-27T09:12:00.000Z","type":"gemini","content":[{"text":"ok alpaca"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-06-27T09:12:00.000Z"}}
+{"$patch":{"removeIds":["6a6a6a6a-0000-4000-8000-000000000013","6a6a6a6a-0000-4000-8000-000000000014"]}}
+{"$set":{"lastUpdated":"2026-06-27T09:12:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000017","timestamp":"2026-06-27T09:13:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"$set":{"lastUpdated":"2026-06-27T09:13:00.000Z"}}
+{"id":"6a6a6a6a-0000-4000-8000-000000000018","timestamp":"2026-06-27T09:14:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-06-27T09:14:00.000Z"}}
