@@ -90,10 +90,16 @@ const VERSIONS: Version[] = [
   },
 ];
 
-/** coalesceConsecutiveRoles: one turn per run of a role, its parts concatenated. */
+/**
+ * stripThoughts then coalesceConsecutiveRoles (geminiChat.ts 1813-1881): thought parts go, with
+ * turns left without parts, then one turn per run of a role, its parts concatenated.
+ */
 function coalesce(contents: Content[]): Content[] {
   const out: Content[] = [];
-  for (const content of contents) {
+  const stripped = contents
+    .map((content) => ({ role: content.role, parts: content.parts.filter((part) => !part.thought) }))
+    .filter((content) => content.parts.length > 0);
+  for (const content of stripped) {
     const last = out.at(-1);
     if (last && last.role === content.role) last.parts = [...last.parts, ...content.parts];
     else out.push({ role: content.role, parts: content.parts });
@@ -192,10 +198,21 @@ class Session {
     this.recorder.recordMessage({ model: undefined, type, content: text });
   }
 
-  /** Esc while a tool runs: cancelOngoingRequest's notice (915-923), then the cancelled result. */
+  /**
+   * Esc while a tool runs: cancelOngoingRequest's notice (915-923) comes first, then the scheduler
+   * completes the cancelled call (useToolScheduler.ts 210-222, useGeminiStream.ts 352-363) and
+   * recordToolCalls, finding a notice last, starts a record of its own for it (chatRecordingService
+   * 1133-1157); then the cancelled result goes in through addHistory.
+   */
   escTool(callId: string, name: string, args: Record<string, unknown>): void {
-    this.call(callId, name, args, CANCELLED, 'cancelled');
+    this.tick();
+    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: '' });
+    this.history.push({ id, content: { role: 'model', parts: [{ functionCall: { id: callId, name, args } }] } });
     this.notice('info', 'Request cancelled.');
+    const response = [{ functionResponse: { id: callId, name, response: { output: CANCELLED } } }];
+    this.recorder.recordToolCalls(MODEL, [
+      { id: callId, name, args, result: response, status: 'cancelled', timestamp: new Date().toISOString() },
+    ]);
     this.respond(callId, name, CANCELLED);
   }
 
@@ -226,6 +243,41 @@ class Session {
     const parts = [{ text: `Here is the user's editor context as a JSON object. This is for your information only.\n\`\`\`json\n${json}\n\`\`\`` }];
     const id = this.recorder.recordSyntheticMessage('user', parts);
     this.history.push({ id, content: { role: 'user', parts } });
+  }
+
+  /** The SessionStart hook, at startup or resume: addHistory of its context (AppContainer.tsx 489-507). */
+  hook(context: string): void {
+    const parts = [{ text: `<hook_context>${context}</hook_context>` }];
+    const id = this.recorder.recordSyntheticMessage('user', parts);
+    this.history.push({ id, content: { role: 'user', parts } });
+  }
+
+  /**
+   * A read_file of audio answered and replied to. The tool's result carries the data under
+   * __binary_injection__ (generateContentResponseUtilities.ts 96-150); sendMessageStream records
+   * the result, then removes it and records a thought acknowledgement and the data as an info
+   * message, which the history keeps as a user turn (geminiChat.ts 575-622).
+   */
+  binaryTool(callId: string, word: string): void {
+    this.tick();
+    const name = 'read_file';
+    const args = { file_path: `${word}.mp3` };
+    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: '' });
+    this.history.push({ id, content: { role: 'model', parts: [{ functionCall: { id: callId, name, args } }] } });
+    const data = [{ inlineData: { mimeType: 'audio/mpeg', data: 'SUQzBAAAAAAA' } }];
+    const output = 'Binary content (audio/mpeg) read successfully. Content will be injected for analysis in the next sequence.';
+    const response: Part[] = [{ functionResponse: { id: callId, name, response: { output, __binary_injection__: data } } }];
+    this.recorder.recordToolCalls(MODEL, [
+      { id: callId, name, args, result: structuredClone(response), status: 'success', timestamp: new Date().toISOString() },
+    ]);
+    const rid = this.recorder.recordSyntheticMessage('user', response);
+    delete ((response[0].functionResponse as Part).response as Part).__binary_injection__;
+    this.history.push({ id: rid, content: { role: 'user', parts: response } });
+    const ack = [{ text: 'Binary content received. Proceeding with analysis.', thought: true, thoughtSignature: 'skip_thought_signature_validator' }];
+    const aid = this.recorder.recordSyntheticMessage('gemini', ack);
+    this.history.push({ id: aid, content: { role: 'model', parts: ack } });
+    const bid = this.recorder.recordSyntheticMessage('info', data);
+    this.history.push({ id: bid, content: { role: 'user', parts: data } });
   }
 
   /** Esc while a reply streams: the notice (915-923), then sendMessageStream's rollback. */
@@ -293,6 +345,7 @@ class Session {
     const filePath = this.recorder.getConversationFilePath();
     if (!conversation || !filePath) throw new Error('nothing to compress');
     const tail = this.contents().slice(-keep);
+    const before = this.recorder;
     await this.start(
       [
         { role: 'user', parts: [{ text: `<state_snapshot>\n<overall_goal>${goal}</overall_goal>\n</state_snapshot>` }] },
@@ -301,8 +354,9 @@ class Session {
       ],
       { conversation, filePath },
     );
-    // handleChatCompressionEvent's item (1370-1398), recorded by the new chat's recorder
-    this.notice('info', 'Context compressed from 74% to 21%.');
+    // handleChatCompressionEvent's item (1370-1398) goes through the recorder addItem was bound to
+    // (AppContainer.tsx 235-237), the one tryCompressChat just replaced (client.ts 1236-1250)
+    before.recordMessage({ model: undefined, type: 'info', content: 'Context compressed from 74% to 21%.' });
   }
 
   /** rewindCommand: recorder.rewindTo, then client.setHistory(convertSessionToClientHistory). */
@@ -788,6 +842,109 @@ const SCENARIOS: Scenario[] = [
       s.abort();
       s.rewind(s.idOf('dingo'));
       plainTurn(s, 'fox');
+    },
+  },
+  {
+    // the binary data is an info message the history keeps as a user turn; compression copies it
+    // as a user message, and /rewind to a copy of the prompt takes the whole chain back
+    name: 'binary_compress_rewind',
+    expect: [user('alpaca'), recap('alpaca and bison'), recap('bison and cheetah'), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.binaryTool('read-bison', 'bison');
+      s.reply('ok bison');
+      await s.compress('alpaca and bison', 6);
+      s.prompt('cheetah');
+      s.binaryTool('read-cheetah', 'cheetah');
+      s.reply('ok cheetah');
+      await s.compress('bison and cheetah', 12);
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // --resume leaves out a hook-led copy, so the replies around it become consecutive model
+    // turns that a coalesced mask re-records as one
+    name: 'hook_resume_merged_replies',
+    expect: [user('alpaca'), user('bison'), user('cheetah')],
+    run: async (s) => {
+      s.hook('startup');
+      plainTurn(s, 'alpaca');
+      s.mask(MASKED);
+      await s.resume();
+      s.hook('resumed');
+      plainTurn(s, 'bison');
+      s.mask(MASKED);
+      await s.resume();
+      s.hook('resumed again');
+      s.mask(MASKED);
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // coalesced, the decline after a resume keeps its prompt merged into the hook's turn, and the
+    // next --resume leaves that copy out without undoing the prompt
+    name: 'hook_resume_decline',
+    expect: [user('alpaca'), user('bison', ''), user('cheetah')],
+    run: async (s) => {
+      s.hook('startup');
+      plainTurn(s, 'alpaca');
+      await s.resume();
+      s.hook('resumed');
+      await s.declined('bison', 'shell-bison', 'run_shell_command', { command: 'rm -r bison' });
+      await s.resume();
+      s.hook('resumed again');
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // a re-sync writes the history's raw reply back over the cleaned one upstream recorded
+    name: 'raw_reply_after_abort',
+    expect: [user('alpaca'), user('cheetah')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca', 'ok <!-- note -->alpaca\u200B\n');
+      s.prompt('bison');
+      s.abort();
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // the `$set.messages` recorder skips the second resume's re-sync when the counts match, so
+    // the first resume's hook stays in the file's map though the history the mask copies lacks it
+    name: 'hook_resume_twice_esc_rewind',
+    expect: [user('alpaca'), user('bison', ''), user('dingo')],
+    run: async (s) => {
+      s.hook('startup');
+      plainTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' });
+      await s.resume();
+      s.hook('resumed');
+      await s.resume();
+      s.hook('resumed again');
+      plainTurn(s, 'cheetah');
+      s.mask(MASKED);
+      s.rewind(s.idOf('cheetah'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // uncoalesced, the hook leaves the compressed history one turn short of the rollback target,
+    // so the rollback takes the call but leaves the declined prompt in the model's view
+    name: 'hook_decline_compressed_longer',
+    expect: [user('alpaca'), user('bison'), recap('alpaca and bison'), user('cheetah', ''), user('dingo'), user('elephant')],
+    run: async (s) => {
+      s.hook('startup');
+      plainTurn(s, 'alpaca');
+      plainTurn(s, 'bison');
+      await s.declined('cheetah', 'shell-cheetah', 'run_shell_command', { command: 'rm -r cheetah' }, {
+        goal: 'alpaca and bison',
+        keep: 2,
+      });
+      plainTurn(s, 'dingo');
+      s.mask(MASKED);
+      plainTurn(s, 'elephant');
     },
   },
 ];

@@ -1,0 +1,69 @@
+{"sessionId":"86868686-0026-4000-8000-868686868686","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-08-08T09:01:00.000Z","lastUpdated":"2026-08-08T09:01:00.000Z","kind":"main"}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-08-08T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:01:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000001","timestamp":"2026-08-08T09:01:00.000Z","type":"user","content":[{"text":"<hook_context>startup</hook_context>"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:01:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000002","timestamp":"2026-08-08T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:02:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000003","timestamp":"2026-08-08T09:03:00.000Z","type":"gemini","content":"ok alpaca","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-08-08T09:03:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000004","timestamp":"2026-08-08T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:04:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000005","timestamp":"2026-08-08T09:05:00.000Z","type":"gemini","content":"ok bison","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-08-08T09:05:00.000Z"}}
+{"$set":{"sessionId":"86868686-0026-4000-8000-868686868686"}}
+{"id":"86868686-0000-4000-8000-000000000006","timestamp":"2026-08-08T09:06:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>"}]}
+{"id":"86868686-0000-4000-8000-000000000007","timestamp":"2026-08-08T09:06:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}
+{"id":"86868686-0000-4000-8000-000000000008","timestamp":"2026-08-08T09:06:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"id":"86868686-0000-4000-8000-000000000009","timestamp":"2026-08-08T09:06:00.000Z","type":"gemini","content":[{"text":"ok bison"}]}
+{"$patch":{"removeIds":["86868686-0000-4000-8000-000000000001","86868686-0000-4000-8000-000000000002","86868686-0000-4000-8000-000000000003","86868686-0000-4000-8000-000000000004","86868686-0000-4000-8000-000000000005"]}}
+{"$set":{"lastUpdated":"2026-08-08T09:06:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000010","timestamp":"2026-08-08T09:06:00.000Z","type":"info","content":"Context compressed from 74% to 21%."}
+{"$set":{"lastUpdated":"2026-08-08T09:06:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000011","timestamp":"2026-08-08T09:07:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:07:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000012","timestamp":"2026-08-08T09:08:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-08-08T09:08:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000012","timestamp":"2026-08-08T09:08:00.000Z","type":"gemini","content":"","thoughts":[],"tokens":null,"model":"gemini-2.5-pro","toolCalls":[{"id":"shell-cheetah","name":"run_shell_command","args":{"command":"rm -r cheetah"},"result":[{"functionResponse":{"id":"shell-cheetah","name":"run_shell_command","response":{"output":"[Operation Cancelled] Reason: User denied execution."}}}],"status":"cancelled","timestamp":"2026-08-08T09:08:00.000Z","displayName":"run_shell_command","description":"run_shell_command tool","renderOutputAsMarkdown":false}]}
+{"id":"86868686-0000-4000-8000-000000000013","timestamp":"2026-08-08T09:08:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-08-08T09:08:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000014","timestamp":"2026-08-08T09:09:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000015","timestamp":"2026-08-08T09:09:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000016","timestamp":"2026-08-08T09:09:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000017","timestamp":"2026-08-08T09:09:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000018","timestamp":"2026-08-08T09:09:00.000Z","type":"gemini","content":[{"text":"ok bison"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000019","timestamp":"2026-08-08T09:09:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4","86868686-0000-4000-8000-000000000006","86868686-0000-4000-8000-000000000007","86868686-0000-4000-8000-000000000008","86868686-0000-4000-8000-000000000009","86868686-0000-4000-8000-000000000011","86868686-0000-4000-8000-000000000012","86868686-0000-4000-8000-000000000013"]}}
+{"$set":{"lastUpdated":"2026-08-08T09:09:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000020","timestamp":"2026-08-08T09:10:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:10:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000021","timestamp":"2026-08-08T09:11:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-08-08T09:11:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000022","timestamp":"2026-08-08T09:12:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000023","timestamp":"2026-08-08T09:12:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca and bison</overall_goal>\n</state_snapshot>"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000024","timestamp":"2026-08-08T09:12:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000025","timestamp":"2026-08-08T09:12:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000026","timestamp":"2026-08-08T09:12:00.000Z","type":"gemini","content":[{"text":"ok bison"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000027","timestamp":"2026-08-08T09:12:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000028","timestamp":"2026-08-08T09:12:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000029","timestamp":"2026-08-08T09:12:00.000Z","type":"gemini","content":[{"text":"ok dingo"}],"thoughts":[],"tokens":null}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"$patch":{"removeIds":["86868686-0000-4000-8000-000000000014","86868686-0000-4000-8000-000000000015","86868686-0000-4000-8000-000000000016","86868686-0000-4000-8000-000000000017","86868686-0000-4000-8000-000000000018","86868686-0000-4000-8000-000000000019","86868686-0000-4000-8000-000000000020","86868686-0000-4000-8000-000000000021"]}}
+{"$set":{"lastUpdated":"2026-08-08T09:12:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000030","timestamp":"2026-08-08T09:13:00.000Z","type":"user","content":[{"text":"elephant"}]}
+{"$set":{"lastUpdated":"2026-08-08T09:13:00.000Z"}}
+{"id":"86868686-0000-4000-8000-000000000031","timestamp":"2026-08-08T09:14:00.000Z","type":"gemini","content":"ok elephant","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-08-08T09:14:00.000Z"}}
