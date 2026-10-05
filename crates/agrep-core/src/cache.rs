@@ -552,6 +552,8 @@ struct EventRecord<'a> {
     call_id: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     child: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    meta: &'a str,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -3368,6 +3370,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
             left.input.as_str(),
             left.output.as_str(),
             left.child_session.as_str(),
+            left.meta.as_str(),
             left.ok,
             left.input_chars,
             left.output_chars,
@@ -3381,6 +3384,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
                 right.input.as_str(),
                 right.output.as_str(),
                 right.child_session.as_str(),
+                right.meta.as_str(),
                 right.ok,
                 right.input_chars,
                 right.output_chars,
@@ -3404,6 +3408,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
             ok: event.ok,
             call_id: &event.call_id,
             child: &event.child_session,
+            meta: &event.meta,
         };
         serde_json::to_writer(&mut bytes, &record)?;
         bytes.push(b'\n');
@@ -4138,6 +4143,7 @@ mod tests {
             ok: Some(true),
             call_id: "call-1".into(),
             child_session: String::new(),
+            meta: String::new(),
         }
     }
 

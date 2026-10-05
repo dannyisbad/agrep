@@ -276,6 +276,7 @@ fn compaction_marker(
         ok: None,
         call_id: format!("codex:{source_stem}:{record_ordinal}:compacted"),
         child_session: String::new(),
+        meta: String::new(),
     }
 }
 
@@ -1330,6 +1331,7 @@ fn parse_file_with_tally(
                     ok,
                     call_id,
                     child_session: String::new(),
+                    meta: String::new(),
                 });
                 continue;
             }
@@ -1395,6 +1397,7 @@ fn parse_file_with_tally(
                     ok: None,
                     call_id: event_id(),
                     child_session: String::new(),
+                    meta: String::new(),
                 });
                 continue;
             }

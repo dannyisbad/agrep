@@ -122,4 +122,8 @@ pub struct Event {
     pub call_id: String,
     /// Subagent events: the child's own session id when it is independently viewable.
     pub child_session: String,
+    /// Facts the store recorded for this call beside its display text, as space-separated
+    /// `key=value` tokens (Claude: an agent call's `name`/`status`, a message's `to`/`handback`,
+    /// and when either `returned`). Never capped; empty when the store recorded none.
+    pub meta: String,
 }

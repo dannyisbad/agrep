@@ -286,6 +286,7 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) -> bo
                     .unwrap_or_default()
             }),
             child_session: String::new(),
+            meta: String::new(),
         });
     }
     healthy
@@ -422,6 +423,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                         ok,
                         call_id: format!("ag{}", seq),
                         child_session: String::new(),
+                        meta: String::new(),
                     });
                     continue;
                 }
@@ -456,6 +458,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                         ok: None,
                         call_id: format!("ag{}", seq),
                         child_session: String::new(),
+                        meta: String::new(),
                     });
                     continue;
                 }

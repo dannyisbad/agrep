@@ -180,8 +180,8 @@ TASKS_RESUMED_UNRETURNED = "ct000015-0715-4000-8000-000000000715"
 TASKS_RESUMED_RETURNED = "ct000016-0716-4000-8000-000000000716"
 TASKS_BATCH_OUT = "ct000017-0717-4000-8000-000000000717"  # A returned, its batch-mate C did not
 # 2.1.289 SendMessage resumes keep the id and write an isMeta prompt the index skips: by id with
-# resumedAgentId, by name without it (shown only by the run's duration, or by a later prompt when
-# the cap cut the usage block), and a resume that waited and handed its result back inline
+# resumedAgentId, by a name no family call gave (shown only by activity after the first run
+# returned, also past a later prompt), and a resume that waited and handed its result back inline
 TASKS_RESUMED_META = "ct000018-0718-4000-8000-000000000718"
 TASKS_RESUMED_BY_NAME = "ct000019-0719-4000-8000-000000000719"
 TASKS_RESUMED_AFTER_PROMPT = "ct000020-0720-4000-8000-000000000720"
@@ -189,6 +189,15 @@ TASKS_RESUMED_INLINE = "ct000021-0721-4000-8000-000000000721"
 # an older agentId line with no usage block, then an unreturned Task(resume=) in the same turn
 TASKS_RESUMED_OLD_LINE = "ct000022-0722-4000-8000-000000000722"
 TASKS_USAGE_CUT_IN_DIGITS = "ct000023-0723-4000-8000-000000000723"  # one run, handed back
+# 2.1.289 with toolUseResult: a narrated agent's framed long report, the same one call deeper read
+# as text, inline resumes by a name the root gave and by an id cut from the kept input, and by a
+# recipient the ingest can't keep, alone and beside a busy background agent
+TASKS_FRAMED_REPORT = "ct000024-0724-4000-8000-000000000724"
+TASKS_FRAMED_NESTED = "ct000025-0725-4000-8000-000000000725"
+TASKS_INLINE_BY_NAME = "ct000026-0726-4000-8000-000000000726"
+TASKS_INLINE_BY_LONG_ID = "ct000027-0727-4000-8000-000000000727"
+TASKS_INLINE_UNKEPT_NAME = "ct000028-0728-4000-8000-000000000728"
+TASKS_INLINE_UNKEPT_BUSY = "ct000029-0729-4000-8000-000000000729"
 # cursor todo_write merge=true: statuses by id, content plus a new id, a new id without content
 CURSOR_MERGE_STATUS = "k1000001-0715-4000-8000-000000000715"
 CURSOR_MERGE_CONTENT = "k2000002-0716-4000-8000-000000000716"
@@ -741,8 +750,8 @@ class SummaryTests(unittest.TestCase):
                          ("todo_open", "root", ["Update the csv writer docs"]))
 
     def test_side_activity_after_the_returned_run_ended_supersedes_its_result(self) -> None:
-        # nothing in the root names the agent again: its activity past the run's reported
-        # duration, or past the root's next prompt, is a later run
+        # nothing in the root ties the agent to its later run: its activity past the moment the
+        # call that returned its first run came back, or past the root's next prompt, is a later run
         pending = self._tasks_pending("--project", "mx-tasks")
         for session, task in ((TASKS_RESUMED_BY_NAME, "Update the json writer docs"),
                               (TASKS_RESUMED_AFTER_PROMPT, "Update the yaml writer docs")):
@@ -754,6 +763,69 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn(TASKS_RESUMED_INLINE, pending)
         # a duration the cap cut inside its digits bounds nothing: this run closed #1 and returned
         self.assertNotIn(TASKS_USAGE_CUT_IN_DIGITS, pending)
+
+    def test_framed_long_report_hands_back_through_the_stored_link(self) -> None:
+        # the cap cuts a framed long report's agentId line and the frame hides its head; the
+        # agentId and status the ingest kept from toolUseResult still prove the hand-back
+        self.assertNotIn(TASKS_FRAMED_REPORT, self._tasks_pending("--project", "mx-tasks"))
+
+    def test_inline_resume_by_name_or_cut_id_hands_back_through_the_stored_link(self) -> None:
+        # the ingest keeps each message's recipient and inline hand-back uncapped, and each agent
+        # call's name and agentId, so neither a name nor a cut input hides the resumed run
+        pending = self._tasks_pending("--project", "mx-tasks")
+        # what stays open in these families is the background agent, still running
+        for session, busy in ((TASKS_INLINE_BY_NAME, "agent-a26c0ffee0000c0de"),
+                              (TASKS_INLINE_BY_LONG_ID, "agent-a27c0ffee0000c0de")):
+            with self.subTest(session=session):
+                item = pending.get(session, {})
+                self.assertEqual(
+                    (item.get("status"), item.get("source"), item.get("evidence_session")),
+                    ("agent_work_incomplete", "side-chat", busy))
+
+    def test_framed_report_read_as_text_still_hands_back(self) -> None:
+        # a call made inside a subagent keeps no toolUseResult: past the frame's header the
+        # result still carries the head of the nested agent's reply
+        self.assertNotIn(TASKS_FRAMED_NESTED, self._tasks_pending("--project", "mx-tasks"))
+
+    def test_inline_resume_tied_to_no_agent_is_the_one_run_it_blocked_on(self) -> None:
+        # an inline resume holds the root until the run ends, so the one agent active only in
+        # that span is the run it handed back; with a second agent busy then, nothing is proven
+        pending = self._tasks_pending("--project", "mx-tasks")
+        self.assertNotIn(TASKS_INLINE_UNKEPT_NAME, pending)
+        item = pending.get(TASKS_INLINE_UNKEPT_BUSY, {})
+        self.assertEqual((item.get("status"), item.get("source"), item.get("items")),
+                         ("todo_open", "root", ["Update the xml reader docs"]))
+
+    def test_events_without_stored_results_keep_the_text_rules(self) -> None:
+        # an event file written before the ingest kept toolUseResult has no `child` or `meta`
+        import summary
+
+        def chat(session: str, turns: list[int], events: list[dict]) -> summary._Chat:
+            out = summary._Chat(session=session, agent="claude", project="p", root="r",
+                                side=session != "r", first_ts=0, last_ts=0, first_text="")
+            out.turns = [summary._Turn(turn=n, ts=ts, who="user", text="go", digest=None)
+                         for n, ts in enumerate(turns)]
+            out.events = events
+            return out
+
+        agent = "a30c0ffee0000beef"
+        returned = {"kind": "subagent_start", "name": "Agent", "ts": 1_000, "ok": True,
+                    "output": f"Done.\nagentId: {agent} (use SendMessage with to: '{agent}') "
+                              f"\n<usage>tool_uses: 1\nduration_ms: 5000</usage>"}
+        tool = {"kind": "tool", "name": "Read", "ok": True}
+        for later, handed_back in ((5_500, True), (9_000, False)):
+            with self.subTest(later=later):
+                side = chat(f"agent-{agent}", [1_001], [{**tool, "ts": later}])
+                root = chat("r", [0], [returned])
+                root.task_kin, side.task_kin = [side], [root]
+                # past the run's reported duration, the activity is a later run
+                self.assertIs(summary._agent_returned(root, side), handed_back)
+        message = {"kind": "tool", "name": "SendMessage", "ts": 2_000, "ok": True,
+                   "input": json.dumps({"message": "m", "to": agent}), "output": "{}"}
+        side = chat(f"agent-{agent}", [1_001], [])
+        root = chat("r", [0], [returned, message])
+        root.task_kin, side.task_kin = [side], [root]
+        self.assertTrue(summary._addresses(root, message, side))
 
     def test_capped_cursor_merge_leaves_the_list_unknown(self) -> None:
         # the merge closing items 9 and 10 was cut by the event cap: they are neither open nor done

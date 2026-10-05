@@ -242,6 +242,7 @@ fn emit_messages<'a>(
                                     format!("gemini:{message_ordinal}:{call_ordinal}")
                                 }),
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                 }

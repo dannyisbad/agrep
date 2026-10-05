@@ -623,6 +623,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             ok,
             call_id: r.call_id.unwrap_or(r.p_id),
             child_session: String::new(),
+            meta: String::new(),
         });
     }
 
@@ -672,6 +673,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
                         ok: None,
                         call_id: child.clone(),
                         child_session: child,
+                        meta: String::new(),
                     });
                 }
             }

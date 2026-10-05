@@ -303,6 +303,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                             ok,
                             call_id,
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                 }

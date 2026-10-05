@@ -2968,6 +2968,10 @@ fn hash_event_identity(event: &Event) -> u64 {
     add(event.output.as_bytes());
     add(&[event.ok.map(u8::from).unwrap_or(2)]);
     add(event.child_session.as_bytes());
+    // only when set, so identities minted before the field existed stay byte-stable
+    if !event.meta.is_empty() {
+        add(event.meta.as_bytes());
+    }
     h
 }
 
@@ -3509,6 +3513,7 @@ mod tests {
             ok: None,
             call_id: call_id.into(),
             child_session: String::new(),
+            meta: String::new(),
         }
     }
 

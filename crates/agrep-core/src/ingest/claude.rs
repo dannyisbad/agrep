@@ -55,6 +55,9 @@ struct Line<'a> {
     origin: Option<&'a RawValue>,
     #[serde(borrow)]
     attachment: Option<&'a RawValue>,
+    // the tool's structured result beside its display text; raw, parsed only for agent calls
+    #[serde(rename = "toolUseResult", borrow)]
+    tool_use_result: Option<&'a RawValue>,
 }
 
 /// A `queued_command` attachment: a prompt queued while a turn ran and delivered into it.
@@ -266,6 +269,84 @@ fn agent_task_session(task_id: &str) -> Option<String> {
     (plain || labelled).then(|| format!("agent-{task_id}"))
 }
 
+/// The side session a stored agent id names: Claude Code writes its transcript as
+/// `agent-<id>.jsonl`. None for an id that could not be a plain file stem.
+fn agent_session(agent_id: &str) -> Option<String> {
+    let id = notification_token(Some(agent_id))?;
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        .then(|| format!("agent-{id}"))
+}
+
+/// The `meta` token an agent call's or a message's own input carries: the name that makes the
+/// spawned agent addressable, or the recipient SendMessage was given.
+fn call_meta(name: &str, input: Option<&serde_json::Value>) -> String {
+    let key = match name {
+        "Task" | "Agent" => "name",
+        "SendMessage" => "to",
+        _ => return String::new(),
+    };
+    notification_token(
+        input
+            .and_then(|input| input.get(key))
+            .and_then(|value| value.as_str()),
+    )
+    .map(|token| format!("{key}={token}"))
+    .unwrap_or_default()
+}
+
+/// The `toolUseResult` fields that tie an agent call or a message to an agent's run. Raw, so one
+/// unexpected shape leaves the other fields readable.
+#[derive(Deserialize)]
+struct AgentOutcome<'a> {
+    #[serde(borrow)]
+    status: Option<&'a RawValue>,
+    #[serde(rename = "agentId", borrow)]
+    agent_id: Option<&'a RawValue>,
+    #[serde(rename = "resumedAgentId", borrow)]
+    resumed_agent_id: Option<&'a RawValue>,
+    #[serde(rename = "inlineHandback", borrow)]
+    inline_handback: Option<&'a RawValue>,
+    #[serde(borrow)]
+    message: Option<&'a RawValue>,
+}
+
+fn push_meta(event: &mut Event, token: &str) {
+    if !event.meta.is_empty() {
+        event.meta.push(' ');
+    }
+    event.meta.push_str(token);
+}
+
+/// Record, uncapped, the agent run a Task/Agent or SendMessage result names: `child_session` is
+/// that agent's transcript, and `meta` gains the call's status or the message's inline hand-back.
+fn apply_agent_outcome(event: &mut Event, raw: &RawValue) {
+    let Ok(outcome) = serde_json::from_str::<AgentOutcome>(raw.get()) else {
+        return;
+    };
+    let text = |value: Option<&RawValue>| {
+        value.and_then(|value| serde_json::from_str::<String>(value.get()).ok())
+    };
+    let agent_id = if event.kind == "subagent_start" {
+        if let Some(status) = notification_token(text(outcome.status).as_deref()) {
+            push_meta(event, &format!("status={status}"));
+        }
+        text(outcome.agent_id)
+    } else {
+        // 2.1.240 on returns an inline result as `inlineHandback`; 2.1.199 said so in `message`
+        let inline = outcome.inline_handback.is_some()
+            || text(outcome.message)
+                .is_some_and(|message| message.contains("ran to completion. Result:"));
+        if inline {
+            push_meta(event, "handback=inline");
+        }
+        text(outcome.resumed_agent_id)
+    };
+    if let Some(session) = agent_id.as_deref().and_then(agent_session) {
+        event.child_session = session;
+    }
+}
+
 fn notification_blocks(content: Option<&serde_json::Value>) -> Vec<TaskNotification<'_>> {
     content
         .map(content_texts)
@@ -332,6 +413,7 @@ fn push_task_notifications(
             ok: None,
             call_id,
             child_session: task_id.and_then(agent_task_session).unwrap_or_default(),
+            meta: String::new(),
         });
     }
 }
@@ -758,6 +840,7 @@ fn parse_file_with_tally(
                                 if native_call_id.is_some() {
                                     pending.insert(call_id.clone(), events.len());
                                 }
+                                let meta = call_meta(&name, b.get("input"));
                                 tally.event();
                                 events.push(Event {
                                     agent: "claude",
@@ -773,6 +856,7 @@ fn parse_file_with_tally(
                                     ok: None,
                                     call_id,
                                     child_session: String::new(),
+                                    meta,
                                 });
                             }
                         }
@@ -797,6 +881,7 @@ fn parse_file_with_tally(
                             ok: None,
                             call_id: format!("claude:{file_session}:{record_ordinal}:api-error"),
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                     if let Some(last) = out.last_mut() {
@@ -837,8 +922,13 @@ fn parse_file_with_tally(
         if f_toolres.find(bytes).is_some() {
             content_val = raw_content.and_then(|r| serde_json::from_str(r.get()).ok());
             if let Some(serde_json::Value::Array(blocks)) = &content_val {
+                let is_result = |b: &serde_json::Value| {
+                    b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                };
+                // a row's toolUseResult belongs to its call only when it carries that one result
+                let lone = blocks.iter().filter(|b| is_result(b)).count() == 1;
                 for b in blocks {
-                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                    if !is_result(b) {
                         continue;
                     }
                     let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -848,6 +938,17 @@ fn parse_file_with_tally(
                             (ev.output, ev.output_chars, ev.output_bytes) = tool_result_text(c);
                         }
                         ev.ok = Some(b.get("is_error").and_then(|v| v.as_bool()) != Some(true));
+                        if ev.kind == "subagent_start" || ev.name == "SendMessage" {
+                            if let Some(raw) = l.tool_use_result.filter(|_| lone) {
+                                apply_agent_outcome(ev, raw);
+                            }
+                            // the result row is written once the call returned, after any run
+                            // it waited on had ended
+                            let returned = parse_timestamp::rfc3339(l.timestamp.as_deref());
+                            if returned > 0 {
+                                push_meta(ev, &format!("returned={returned}"));
+                            }
+                        }
                         pending.remove(id);
                     }
                 }
@@ -1678,6 +1779,216 @@ mod tests {
             assert_eq!(&*m.session, "agent-child1");
             assert_eq!(&*m.parent, "11111111-aaaa-4bbb-8ccc-222222222222");
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_calls_and_messages_keep_the_stored_link_to_their_run() {
+        let root = scratch("agent-outcome");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let call = |ts: &str, id: &str, name: &str, input: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "sessionId": "s-main", "timestamp": ts,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": input}]}})
+        };
+        let result = |ts: &str, ids: &[&str], stored: serde_json::Value| {
+            let blocks: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": [
+                        {"type": "text", "text": format!("{} done\nagentId: ab", "x".repeat(900))}]})
+                })
+                .collect();
+            serde_json::json!({"type": "user", "sessionId": "s-main", "timestamp": ts,
+                "message": {"role": "user", "content": blocks}, "toolUseResult": stored})
+        };
+        let agent = "a0123456789abcdef";
+        write_rows(
+            &path,
+            &[
+                prompt("2026-07-01T09:00:00Z", "port the writers"),
+                call(
+                    "2026-07-01T09:00:01Z",
+                    "t1",
+                    "Agent",
+                    serde_json::json!({"prompt": "p", "name": "docs-writer"}),
+                ),
+                result(
+                    "2026-07-01T09:05:00Z",
+                    &["t1"],
+                    serde_json::json!({"status": "completed",
+                    "prompt": "p", "agentId": agent, "content": [], "totalDurationMs": 297000.4}),
+                ),
+                call(
+                    "2026-07-01T09:05:01Z",
+                    "t2",
+                    "Task",
+                    serde_json::json!({"prompt": "p", "run_in_background": true}),
+                ),
+                result(
+                    "2026-07-01T09:05:02Z",
+                    &["t2"],
+                    serde_json::json!({"isAsync": true,
+                    "status": "async_launched", "agentId": "a1111111111111111"}),
+                ),
+                call(
+                    "2026-07-01T09:06:00Z",
+                    "t3",
+                    "SendMessage",
+                    serde_json::json!({"to": "docs-writer", "message": "m".repeat(900)}),
+                ),
+                result(
+                    "2026-07-01T09:07:00Z",
+                    &["t3"],
+                    serde_json::json!({"success": true,
+                    "message": "Resumed agent. Its final report is not in this message.",
+                    "inlineHandback": {"displayName": "docs-writer", "content": []}}),
+                ),
+                call(
+                    "2026-07-01T09:08:00Z",
+                    "t4",
+                    "SendMessage",
+                    serde_json::json!({"to": agent, "message": "again"}),
+                ),
+                result(
+                    "2026-07-01T09:08:01Z",
+                    &["t4"],
+                    serde_json::json!({"success": true,
+                    "message": "Resuming agent a012345", "resumedAgentId": agent}),
+                ),
+                call(
+                    "2026-07-01T09:09:00Z",
+                    "t5",
+                    "SendMessage",
+                    serde_json::json!({"to": "two words", "message": "m"}),
+                ),
+                result(
+                    "2026-07-01T09:09:01Z",
+                    &["t5"],
+                    serde_json::json!({"success": true,
+                    "message": "Agent \"x\" was stopped (completed); resumed it with your message \
+                                and ran to completion. Result:\n\ndone"}),
+                ),
+                // an error result, two results sharing one row, an id that is no file stem and a
+                // tool that is no agent call: none of them is linked
+                call(
+                    "2026-07-01T09:10:00Z",
+                    "t6",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                result(
+                    "2026-07-01T09:10:01Z",
+                    &["t6"],
+                    serde_json::json!("Error: denied"),
+                ),
+                call(
+                    "2026-07-01T09:11:00Z",
+                    "t7",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                call(
+                    "2026-07-01T09:11:00Z",
+                    "t8",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                result(
+                    "2026-07-01T09:12:00Z",
+                    &["t7", "t8"],
+                    serde_json::json!({
+                    "status": "completed", "agentId": "a2222222222222222"}),
+                ),
+                call(
+                    "2026-07-01T09:13:00Z",
+                    "t9",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                result(
+                    "2026-07-01T09:13:01Z",
+                    &["t9"],
+                    serde_json::json!({
+                    "status": "completed", "agentId": "../a3333333333333333"}),
+                ),
+                call(
+                    "2026-07-01T09:14:00Z",
+                    "t10",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                ),
+                result(
+                    "2026-07-01T09:14:01Z",
+                    &["t10"],
+                    serde_json::json!({
+                    "status": "completed", "agentId": "a4444444444444444"}),
+                ),
+            ],
+        );
+        let (_, events, outcome) = parse_file(&path);
+        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
+        let linked: Vec<_> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.call_id.as_str(),
+                    e.child_session.as_str(),
+                    e.meta.as_str(),
+                )
+            })
+            .collect();
+        let session = format!("agent-{agent}");
+        let returned = |ts: &str| format!("returned={}", rfc3339(Some(ts)));
+        let expected = [
+            (
+                "t1",
+                session.as_str(),
+                format!(
+                    "name=docs-writer status=completed {}",
+                    returned("2026-07-01T09:05:00Z")
+                ),
+            ),
+            (
+                "t2",
+                "agent-a1111111111111111",
+                format!("status=async_launched {}", returned("2026-07-01T09:05:02Z")),
+            ),
+            (
+                "t3",
+                "",
+                format!(
+                    "to=docs-writer handback=inline {}",
+                    returned("2026-07-01T09:07:00Z")
+                ),
+            ),
+            (
+                "t4",
+                session.as_str(),
+                format!("to={agent} {}", returned("2026-07-01T09:08:01Z")),
+            ),
+            (
+                "t5",
+                "",
+                format!("handback=inline {}", returned("2026-07-01T09:09:01Z")),
+            ),
+            ("t6", "", returned("2026-07-01T09:10:01Z")),
+            ("t7", "", returned("2026-07-01T09:12:00Z")),
+            ("t8", "", returned("2026-07-01T09:12:00Z")),
+            (
+                "t9",
+                "",
+                format!("status=completed {}", returned("2026-07-01T09:13:01Z")),
+            ),
+            ("t10", "", String::new()),
+        ];
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(id, child, meta)| (*id, *child, meta.as_str()))
+            .collect();
+        assert_eq!(linked, expected);
+        // the display text stays capped; the link never depended on it
+        assert!(events[0].output.ends_with('…') && events[0].output_chars > 800);
         let _ = std::fs::remove_dir_all(root);
     }
 

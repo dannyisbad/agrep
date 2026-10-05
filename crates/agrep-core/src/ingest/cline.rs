@@ -430,6 +430,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                             ok: None,
                             call_id,
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                     _ => {}

@@ -134,7 +134,8 @@ _TASK_NOTIFICATION = "task_notification"
 _COMPACTED = "compacted"
 _MARKERS = frozenset({_API_ERROR, _TASK_NOTIFICATION, _COMPACTED})
 _AGENT_SESSION_PREFIX = "agent-"
-# the line Claude Code (2.0.69 on) adds to a finished foreground agent's result; an async launch
+# text fallbacks for rows with no toolUseResult (calls made inside a subagent, 2.1.71 on): the
+# line Claude Code (2.0.69 on) adds to a finished foreground agent's result. An async launch
 # names the agent with an `(internal ID` note instead; recent Explore/Plan results carry none
 _AGENT_RETURNED_RE = re.compile(r"(?<![\w-])agentId: (\S+) \((?:use SendMessage|for resuming)\b")
 # the run time that result's usage block reports, measured from before the run wrote its prompt;
@@ -147,6 +148,8 @@ _INLINE_HANDBACK_RE = re.compile(r"\bResumed agent(?: (\S+?))?\. (?:Result:|Its 
 _PLAIN_AGENT_ID_RE = re.compile(r"a[0-9a-f]{16}")
 # the recipient in the compact JSON the ingest keeps as a SendMessage's input
 _SEND_TO_RE = re.compile(r'"to"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# 2.1.289 frames a finished agent's result: this 474-char header, then the report indented
+_HANDBACK_FRAME_RE = re.compile(r"\[Subagent hand-back\].*?The report follows:", re.DOTALL)
 # tools that stop the turn until the human answers: claude AskUserQuestion/ExitPlanMode, omp ask,
 # codex request_user_input, opencode question
 _QUESTION_TOOL_RE = re.compile(
@@ -1257,12 +1260,16 @@ _DELIVERY_MIN_CHARS = 24
 
 def _delivers(output: str, final: str) -> bool:
     """Does a delegation result carry the side chat's final reply? Claude returns the reply's last
-    message (since 2.0.69 followed by an agentId line); opencode returns the reply itself; omp wraps
-    it in a task-result envelope; codex nests it in JSON."""
+    message (since 2.0.69 followed by an agentId line, in 2.1.289 framed by a hand-back header);
+    opencode returns the reply itself; omp wraps it in a task-result envelope; codex nests it in
+    JSON."""
     text = " ".join(output.rstrip("…").split())
     body = _TASK_RESULT_BODY_RE.search(text) if text.startswith("<task-result") else None
     if body is not None:
         text = body.group(1).strip()
+    frame = _HANDBACK_FRAME_RE.search(text)
+    if frame is not None:
+        text = text[frame.end():].strip()
     candidates = [text]
     if text[:1] in ("{", "["):
         try:
@@ -1281,25 +1288,26 @@ def _delivers(output: str, final: str) -> bool:
     return False
 
 
-def _marker_field(event: dict, key: str) -> str:
-    """One `key=value` field of a marker's compact input."""
-    for part in str(event.get("input") or "").split():
+def _marker_field(event: dict, key: str, field: str = "input") -> str:
+    """One `key=value` token of an event field: a marker's compact input, or (`meta`) the facts
+    the ingest stored for a call beside its capped display text."""
+    for part in str(event.get(field) or "").split():
         name, sep, value = part.partition("=")
         if sep and name == key:
             return value
     return ""
 
 
+def _fact(event: dict, key: str) -> str:
+    return _marker_field(event, key, "meta")
+
+
 def _notified(root: _Chat, side: _Chat) -> bool:
     """Did the root receive a task notification exactly linked to the side chat, at or after
     its latest activity? Linked: the marker names the side session, or its tool-use id is the
-    root's launch call whose result names the side chat's agent id. Others prove nothing."""
+    root's launch call that ran the side chat's agent. Others prove nothing."""
     latest = _latest_ts(side)
-    agent_id = (side.session[len(_AGENT_SESSION_PREFIX):]
-                if side.session.startswith(_AGENT_SESSION_PREFIX) else "")
-    named = (re.compile(rf"(?<![\w-]){re.escape(agent_id)}(?![\w-])") if agent_id else None)
-    launches = {str(event.get("call_id")): str(event.get("output") or "")
-                for event in root.events
+    launches = {str(event.get("call_id")): event for event in root.events
                 if event.get("kind") == "subagent_start" and event.get("call_id")}
     for event in root.events:
         if not _is_marker(event, _TASK_NOTIFICATION) or int(event.get("ts") or 0) < latest:
@@ -1307,7 +1315,7 @@ def _notified(root: _Chat, side: _Chat) -> bool:
         if str(event.get("child") or "") == side.session:
             return True
         launch = launches.get(_marker_field(event, "tool_use_id"))
-        if launch is not None and named is not None and named.search(launch):
+        if launch is not None and _launched(launch, side):
             return True
     return False
 
@@ -1323,26 +1331,90 @@ def _names_agent(text: str, agent_id: str) -> bool:
     return re.search(rf"(?<![\w-]){re.escape(agent_id)}(?![\w-])", text) is not None
 
 
-def _addresses(event: dict, agent_id: str) -> bool:
-    """Does a root SendMessage address the agent? Its input's `to` names the recipient; a resume
-    result may name it (`resumedAgentId`, the output path) or show the id's first 7."""
-    recipient = _SEND_TO_RE.search(str(event.get("input") or ""))
+def _launched(event: dict, side: _Chat) -> bool:
+    """Did an agent call run the side chat's agent? The link the ingest stored says; without one,
+    the call's result text naming the agent's id does."""
+    child = str(event.get("child") or "")
+    if child:
+        return child == side.session
+    agent_id = _claude_agent_id(side)
+    return bool(agent_id) and _names_agent(str(event.get("output") or ""), agent_id)
+
+
+def _finished_run(event: dict, side: _Chat) -> bool:
+    """Did an agent call return the side chat's agent's finished run? The stored link and status
+    say; without them, the agentId line its capped result may still end in."""
+    child = str(event.get("child") or "")
+    if child:
+        return child == side.session and _fact(event, "status") == "completed"
+    return _claude_agent_id(side) in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))
+
+
+def _family(holder: _Chat) -> set[str]:
+    return {holder.session, *(kin.session for kin in holder.task_kin)}
+
+
+def _named_agent(holder: _Chat, name: str, before: int) -> str:
+    """The agent session the family's latest call that gave an agent `name` launched, up to
+    `before`: its stored link, else the agentId line of its result. "" when none says."""
+    calls = sorted((event for chat in (holder, *holder.task_kin) for event in chat.events
+                    if event.get("kind") == "subagent_start" and _fact(event, "name") == name
+                    and int(event.get("ts") or 0) <= before),
+                   key=lambda event: -int(event.get("ts") or 0))
+    for event in calls:
+        child = str(event.get("child") or "")
+        named = _AGENT_RETURNED_RE.search(str(event.get("output") or ""))
+        if child or named:
+            return child or _AGENT_SESSION_PREFIX + named.group(1)
+    return ""
+
+
+def _message_target(holder: _Chat, event: dict) -> str:
+    """The agent session a SendMessage reached: the agent its result resumed, else its recipient,
+    a name read through the family call that gave it. "" when no recipient was kept."""
+    child = str(event.get("child") or "")
+    if child:
+        return child
+    to = _fact(event, "to")
+    if not to:
+        recipient = _SEND_TO_RE.search(str(event.get("input") or ""))
+        to = recipient.group(1) if recipient else ""
+    if not to:
+        return ""
+    return _named_agent(holder, to, int(event.get("ts") or 0)) or _AGENT_SESSION_PREFIX + to
+
+
+def _addresses(holder: _Chat, event: dict, side: _Chat) -> bool:
+    """Does a SendMessage address the side chat's agent? A target in the family decides; else a
+    capped result may still name the agent's id, or show its first 7 inline."""
+    target = _message_target(holder, event)
+    if target in _family(holder):
+        return target == side.session
+    agent_id = _claude_agent_id(side)
     output = str(event.get("output") or "")
-    if _names_agent(f"{recipient.group(1) if recipient else ''}\n{output}", agent_id):
+    if not agent_id:
+        return False
+    if _names_agent(output, agent_id):
         return True
     inline = _INLINE_HANDBACK_RE.search(output)
     return (inline is not None and _PLAIN_AGENT_ID_RE.fullmatch(agent_id) is not None
             and inline.group(1) == agent_id[:7])
 
 
-def _engagements(root: _Chat, agent_id: str) -> list[dict]:
-    """The root's calls that ran or messaged the agent: an agent call whose result names it, or a
+def _inline_handback(event: dict) -> bool:
+    """Did a SendMessage resume an agent and wait, returning that run's result?"""
+    return (event.get("kind") == "tool" and event.get("name") == "SendMessage"
+            and (_fact(event, "handback") == "inline"
+                 or _INLINE_HANDBACK_RE.search(str(event.get("output") or "")) is not None))
+
+
+def _engagements(holder: _Chat, side: _Chat) -> list[dict]:
+    """The calls that ran or messaged the side chat's agent: an agent call that launched it, or a
     SendMessage addressed to it. Each starts or steers a run of that agent."""
-    return [event for event in root.events
-            if (event.get("kind") == "subagent_start"
-                and _names_agent(str(event.get("output") or ""), agent_id))
+    return [event for event in holder.events
+            if (event.get("kind") == "subagent_start" and _launched(event, side))
             or (event.get("kind") == "tool" and event.get("name") == "SendMessage"
-                and _addresses(event, agent_id))]
+                and _addresses(holder, event, side))]
 
 
 def _side_moments(side: _Chat) -> list[int]:
@@ -1351,18 +1423,32 @@ def _side_moments(side: _Chat) -> list[int]:
             if moment > 0]
 
 
+def _returned(event: dict) -> int | None:
+    """When a call that waited on a run returned, which the ingest kept from the result row; never
+    for a launch that returned while its run went on."""
+    returned = _fact(event, "returned")
+    if not returned.isdigit() or _fact(event, "status") not in ("", "completed"):
+        return None
+    return int(returned)
+
+
 def _run_end(root: _Chat, side: _Chat, event: dict, agent_id: str) -> int | None:
     """A moment by which the run the root's call at `event` waited on had ended: the root's next
-    prompt, or the run's first moment plus the duration its result reports. None when unknown."""
+    prompt, and when the call returned, else the run's first moment plus the duration its result
+    reports. None when unknown."""
     called = int(event.get("ts") or 0)
-    bounds = [min((row.ts for row in root.turns if row.ts > called), default=None)]
-    output = str(event.get("output") or "")
-    trailer = next((match for match in _AGENT_RETURNED_RE.finditer(output)
-                    if match.group(1) == agent_id), None)
-    duration = _AGENT_DURATION_RE.search(output, trailer.end()) if trailer is not None else None
-    started = min((moment for moment in _side_moments(side) if moment >= called), default=None)
-    if duration is not None and started is not None:
-        bounds.append(started + int(duration.group(1)))
+    bounds = [min((row.ts for row in root.turns if row.ts > called), default=None),
+              _returned(event)]
+    if bounds[1] is None:
+        output = str(event.get("output") or "")
+        trailer = next((match for match in _AGENT_RETURNED_RE.finditer(output)
+                        if match.group(1) == agent_id), None)
+        duration = (_AGENT_DURATION_RE.search(output, trailer.end())
+                    if trailer is not None else None)
+        started = min((moment for moment in _side_moments(side) if moment >= called),
+                      default=None)
+        if duration is not None and started is not None:
+            bounds.append(started + int(duration.group(1)))
     return min((bound for bound in bounds if bound is not None), default=None)
 
 
@@ -1372,7 +1458,7 @@ def _superseded(root: _Chat, side: _Chat, agent_id: str, event: dict) -> bool:
     later root call that runs or messages it, a later prompt, or activity after that run ended."""
     called = int(event.get("ts") or 0)
     if any(other is not event and int(other.get("ts") or 0) > called
-           for other in _engagements(root, agent_id)):
+           for other in _engagements(root, side)):
         return True
     if sum(1 for row in side.turns if row.ts >= called) > 1:
         return True
@@ -1380,10 +1466,28 @@ def _superseded(root: _Chat, side: _Chat, agent_id: str, event: dict) -> bool:
     return ended is not None and any(moment > ended for moment in _side_moments(side))
 
 
+def _blocked_on(holder: _Chat, event: dict, side: _Chat) -> bool:
+    """An inline hand-back neither its stored target nor its text ties to a family agent: the
+    call held its chat until the run ended, so the run is the one agent active, and only active,
+    from the call until it returned (else until the chat went on)."""
+    if _message_target(holder, event) in _family(holder) or any(
+            _addresses(holder, event, kin) for kin in holder.task_kin):
+        return False
+    called = int(event.get("ts") or 0)
+    resumed = _returned(event) or min(
+        (moment for moment in _side_moments(holder) if moment > called), default=None)
+    if resumed is None:
+        return False
+    active = [kin for kin in holder.task_kin
+              if any(called < moment <= resumed for moment in _side_moments(kin))]
+    return (len(active) == 1 and active[0] is side
+            and all(moment <= resumed for moment in _side_moments(side) if moment > called))
+
+
 def _agent_returned(root: _Chat, side: _Chat) -> bool:
-    """Did a root call return the Claude side chat's latest run? An agent call's result ends in a
-    line naming the agent, which narration or a short reply can't hide; a SendMessage that resumed
-    it may wait and return its result inline. Either proves only the run it closed."""
+    """Did a root call return the Claude side chat's latest run? An agent call that returned its
+    finished run, or a SendMessage that resumed it and waited for its result; either proves only
+    the run it closed."""
     agent_id = _claude_agent_id(side)
     if not agent_id:
         return False
@@ -1391,11 +1495,10 @@ def _agent_returned(root: _Chat, side: _Chat) -> bool:
         if event.get("ok") is not True:
             continue
         if event.get("kind") == "subagent_start":
-            proof = agent_id in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))
+            proof = _finished_run(event, side)
         else:
-            proof = (event.get("kind") == "tool" and event.get("name") == "SendMessage"
-                     and _INLINE_HANDBACK_RE.search(str(event.get("output") or "")) is not None
-                     and _addresses(event, agent_id))
+            proof = _inline_handback(event) and (_addresses(root, event, side)
+                                                 or _blocked_on(root, event, side))
         if proof and not _superseded(root, side, agent_id, event):
             return True
     return False
@@ -1403,7 +1506,7 @@ def _agent_returned(root: _Chat, side: _Chat) -> bool:
 
 def _result_received(root: _Chat, side: _Chat) -> bool | None:
     """Did the side chat hand its result back? A terminal `yield`, a linked task notification or
-    a Claude result that names the agent is the hand-back itself; else the root's delegation
+    a Claude result for the agent's run is the hand-back itself; else the root's delegation
     result must carry the side chat's final reply, the only indexed proof the root went on after
     it, and for a Claude agent belong to its latest run. None when a capped reply can't say."""
     if _side_yielded(side) or _notified(root, side) or _agent_returned(root, side):
@@ -1420,6 +1523,11 @@ def _result_received(root: _Chat, side: _Chat) -> bool | None:
         if event.get("kind") != "subagent_start" and not (
                 event.get("kind") == "tool"
                 and _DELEGATION_TOOL_RE.match(str(event.get("name") or ""))):
+            continue
+        # a result the store linked to another child is never this one's, and a Claude agent's
+        # own linked result was already settled by that link
+        child = str(event.get("child") or "")
+        if child and (child != side.session or agent_id):
             continue
         # a resumed run's text joins the earlier run's reply, which an earlier result also carries
         if (_delivers(str(event.get("output") or ""), final)

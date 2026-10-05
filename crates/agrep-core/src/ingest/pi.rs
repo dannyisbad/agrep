@@ -464,6 +464,7 @@ fn parse_with_tally(
                             ok,
                             call_id,
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                 } else if is_role(message, "bashExecution") {
@@ -507,6 +508,7 @@ fn parse_with_tally(
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("{agent}:bash:{}", record.ordinal)),
                         child_session: String::new(),
+                        meta: String::new(),
                     });
                     tally.agent_row();
                 } else {

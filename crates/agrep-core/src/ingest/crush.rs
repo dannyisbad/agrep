@@ -586,6 +586,7 @@ fn parse_session(
                             ok: None,
                             call_id,
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                     Some("tool_result") => {

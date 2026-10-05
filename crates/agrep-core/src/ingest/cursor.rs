@@ -711,6 +711,7 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
             // bubbleId is Cursor's durable row identity when toolFormerData omits its correlation id.
             .unwrap_or_else(|| format!("cursor:{bubble_id}")),
         child_session: String::new(),
+        meta: String::new(),
     }
 }
 
