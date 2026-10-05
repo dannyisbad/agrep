@@ -835,13 +835,12 @@ mod tests {
     }
 
     fn write(body: &str) -> PathBuf {
+        // Parallel tests share the pid and macOS clocks tick in microseconds.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "agrep-pi-{}-{}.jsonl",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, body).unwrap();
         path
