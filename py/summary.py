@@ -11,11 +11,11 @@ and unioned across a chat and its side chats so a subagent minute never counts
 twice. It is never elapsed session span and never billable time.
 
 Pending status reads each root chat's final reply, its latest tool events and
-its todo list (whole-list writes, omp's ops replayed, codex plans), and reports
-a status with a stated confidence. Explicit completion always wins over an
-open-looking bullet. A compaction recap is never a turn of its own, and a side
-chat that handed its result back (a terminal yield, or a delegation result that
-carries its reply) never reopens a finished family.
+its todo list (whole-list writes, omp's ops and Claude's task tools replayed,
+codex plans), and reports a status with a stated confidence. Explicit completion
+always wins over an open-looking bullet. A compaction recap is never a turn of
+its own, and a side chat that handed its result back (a terminal yield, or a
+delegation result that carries its reply) never reopens a finished family.
 """
 
 from __future__ import annotations
@@ -97,8 +97,14 @@ _ITEM_PUNCT_RE = re.compile(r"[.!?;,][)\]\"'”’]*$")
 # a lowercase word, then a capitalized word opening a run of at least three words
 _CAPITAL_BREAK_RE = re.compile(r"\b[a-z][a-z'’]*\s+[A-Z][a-z][\w'’-]*(?:\s+\S+){2,}$")
 _GLUED_BULLET_CAVEAT = "the last bullet may include a later reply block the index joined to it"
-# claude TodoWrite/TodoRead, opencode todowrite/todoread, omp todo, codex update_plan
+# claude TodoWrite/TodoRead, opencode todowrite/todoread, omp todo, codex update_plan,
+# gemini write_todos
 _TODO_TOOL_RE = re.compile(r"todo|update_plan", re.IGNORECASE)
+# Claude Code's task tools; TaskList and TaskGet only read. The ingest keeps TaskCreate's
+# description as its input, so a task's id and subject come from the result Claude printed
+_TASK_TOOL_RE = re.compile(r"^Task(?:Create|Update)$")
+_TASK_CREATED_RE = re.compile(r"Task #(\S+) created successfully: (.*)", re.DOTALL)
+_TASK_UPDATED_RE = re.compile(r"Updated task #(\S+) ?([^\n]*)")
 _TODO_OPEN_STATUSES = frozenset({
     "pending", "in_progress", "in-progress", "not_started", "not-started", "open",
     "todo", "active", "blocked", "queued"})
@@ -604,14 +610,16 @@ def _todo_entry(item: object) -> tuple[str, str] | None:
         return (common.one_line(item), "open") if item.strip() else None
     if not isinstance(item, dict):
         return None
-    name = next((str(item[key]) for key in ("content", "title", "task", "step", "text", "name")
+    # gemini's write_todos names an item only by `description`; last, so others keep their names
+    name = next((str(item[key]) for key in ("content", "title", "task", "step", "text", "name",
+                                            "description")
                  if isinstance(item.get(key), str) and item[key].strip()), "")
     status = str(item.get("status") or item.get("state") or "").strip().lower()
     return (common.one_line(name), status) if name else None
 
 
 def _snapshot_tasks(payload: object, raw: str, capped: bool) -> list[list[str]] | None:
-    """[phase, content, status] rows from a whole-list todo write: claude/opencode `todos`,
+    """[phase, content, status] rows from a whole-list todo write: claude/opencode/gemini `todos`,
     codex `plan`, or a bare list. None when the payload is not that shape."""
     key = next((k for k in ("todos", "plan") if isinstance(payload, dict) and k in payload), None)
     if capped:
@@ -756,20 +764,70 @@ def _apply_capped_todo_op(tasks: list[list[str]], raw: str,
 _TODO_UNKNOWN_SHAPE = "todo list captured in an unknown shape"
 _TODO_UNREPLAYABLE = "todo list uses an op this build cannot replay"
 _TODO_CAP_DRIFT = "todo list capped at index time; its later changes could not be replayed"
+_TASK_UNRESOLVED = "task list changes a task whose id could not be resolved"
+
+
+def _apply_task_tool(tasks: dict[str, list[str]], event: dict) -> bool:
+    """Claude's TaskCreate/TaskUpdate replayed over {id: [subject, status]}; False when the call's
+    task id cannot be resolved. An update Claude rejected (not found, a hook blocked it, the delete
+    failed) printed no `Updated task` line and changed nothing."""
+    output = str(event.get("output") or "").strip()
+    if event.get("name") == "TaskCreate":
+        created = _TASK_CREATED_RE.match(output)
+        if created is None:
+            return False
+        task_id = created.group(1)
+        tasks[task_id] = [common.one_line(created.group(2)) or f"Task #{task_id}", "pending"]
+        return True
+    updated = _TASK_UPDATED_RE.match(output)
+    if output and updated is None:
+        return True
+    try:
+        fields = json.loads(str(event.get("input") or ""))
+    except ValueError:
+        fields = None
+    # not JSON when the ingest kept only the update's new description or cut the input short
+    fields = fields if isinstance(fields, dict) else {}
+    # the result names the id Claude ran; the raw input may use the `id`/`task_id` Claude repairs
+    task_id = updated.group(1) if updated else next(
+        (fields[key] for key in ("taskId", "id", "task_id") if isinstance(fields.get(key), str)),
+        None)
+    if task_id not in tasks:
+        return False
+    changed = set(updated.group(2).split(", ")) if updated else None
+    status = fields.get("status")
+    if status == "deleted" or (changed is not None and "deleted" in changed):
+        del tasks[task_id]
+        return True
+    if isinstance(status, str):
+        tasks[task_id][1] = status
+    elif changed is not None and "status" in changed:
+        return False
+    if isinstance(fields.get("subject"), str) and fields["subject"].strip():
+        tasks[task_id][0] = common.one_line(fields["subject"])
+    return True
 
 
 def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, str]:
     """(items after the last todo write, present, capped, why unknowable). Whole-list writes
-    replace the state; omp ops replay in order. An op omp rejected (`ok` false) left its state
-    alone; any other op the replay cannot apply is drift, so the state is unknown from there."""
+    replace the state; omp ops and Claude's task tools replay in order. An op omp rejected (`ok`
+    false) left its state alone; any other op the replay can't apply makes it unknown from there."""
     tasks: list[list[str]] = []
-    present = capped = False
-    unknown = ""
+    claude_tasks: dict[str, list[str]] = {}
+    present = capped = tasks_last = False
+    unknown = task_unknown = ""
     for event in chat.events:
-        if event.get("kind") != "tool" or not _TODO_TOOL_RE.search(str(event.get("name") or "")):
+        name = str(event.get("name") or "")
+        claude_task = _TASK_TOOL_RE.match(name) is not None
+        if event.get("kind") != "tool" or not (claude_task or _TODO_TOOL_RE.search(name)):
             continue
         present = True
         if event.get("ok") is False:
+            continue
+        if claude_task:
+            tasks_last = True
+            if not task_unknown and not _apply_task_tool(claude_tasks, event):
+                task_unknown = _TASK_UNRESOLVED
             continue
         raw = str(event.get("input") or "")
         cut = _input_capped(event)
@@ -777,14 +835,15 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, 
             payload: object = json.loads(raw) if raw else {}
         except ValueError:
             if not cut:
-                unknown = _TODO_UNKNOWN_SHAPE
+                unknown, tasks_last = _TODO_UNKNOWN_SHAPE, False
                 continue
             payload = None
+        if payload == {}:
+            continue
+        tasks_last = False
         snapshot = _snapshot_tasks(payload, raw, cut)
         if snapshot is not None:
             tasks, capped, unknown = snapshot, cut, ""
-            continue
-        if payload == {}:
             continue
         if payload is None:
             op = _capped_todo_op(raw, tasks)
@@ -808,6 +867,12 @@ def _todo_state(chat: _Chat) -> tuple[list[tuple[str, str]] | None, bool, bool, 
         tasks = applied
         if op == "init":
             capped, unknown = False, ""
+    # Claude enables TodoWrite only while its task tools are off, so after a resume across that
+    # switch the store written last is the one the agent could still see and update
+    if tasks_last:
+        if task_unknown:
+            return None, present, False, task_unknown
+        return [(content, status) for content, status in claude_tasks.values()], present, False, ""
     if unknown:
         return None, present, capped, unknown
     return [(content, status) for _phase, content, status in tasks], present, capped, ""

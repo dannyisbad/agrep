@@ -148,6 +148,17 @@ MX_CLAUDE_EXIT_PLAN = "ca000018-0518-4000-8000-000000000518"
 MX_CLAUDE_ASK = "ca000019-0519-4000-8000-000000000519"
 MX_CLAUDE_ASK_ANSWERED = "ca000020-0520-4000-8000-000000000520"
 MX_OMP_ASK = "om000010-0530-4000-8000-000000000530"
+# July 2026: Claude Code's task tools (TaskCreate/TaskUpdate) and gemini's write_todos
+TASKS = ("--since", "2026-07-01", "--until", "2026-07-31")
+TASKS_OPEN = "ct000001-0701-4000-8000-000000000701"  # 4 created: 1 done, 1 deleted, 2 open
+TASKS_DONE = "ct000002-0702-4000-8000-000000000702"
+TASKS_SIDE = "ct000003-0703-4000-8000-000000000703"  # a background subagent's own tasks stay open
+TASKS_SIDE_CHAT = "agent-ct03side01"
+TASKS_UNSEEN_ID = "ct000004-0704-4000-8000-000000000704"  # updates a task it never created
+TASKS_AFTER_TODOWRITE = "ct000005-0705-4000-8000-000000000705"  # resumed with task tools on
+TODOWRITE_AFTER_TASKS = "ct000006-0706-4000-8000-000000000706"  # resumed with task tools off
+GEMINI_TODOS_OPEN = "9e000001-0713-4000-8000-000000000713"
+GEMINI_TODOS_DONE = "9e000002-0714-4000-8000-000000000714"
 
 
 class SummarySandbox:
@@ -190,7 +201,9 @@ class SummarySandbox:
                           for amount, unit in re.findall(r"([+-]\d+)([dhms])", match[1]))
             return (origin + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        for source in sorted((FIXTURES / "store").rglob("*.jsonl")):
+        # gemini keeps one JSON document per session; every other store is JSONL
+        for source in sorted(path for path in (FIXTURES / "store").rglob("*")
+                             if path.suffix in (".jsonl", ".json")):
             relative = source.relative_to(FIXTURES / "store")
             destination = self.home / ("." + relative.parts[0]) / Path(*relative.parts[1:])
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -556,6 +569,54 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual((plan["status"], plan["items"]),
                          ("todo_open", ["port the papa writer", "update the papa docs"]))
         self.assertNotIn(MX["codex"]["finished"], pending)
+
+    def _tasks_pending(self, *argv) -> dict[str, dict]:
+        _meta, items = _rows(self.sandbox.summary("pending", *TASKS, *argv, "--json"))
+        return {item["session"]: item for item in items}
+
+    def test_claude_task_tools_replay_into_the_open_task_list(self) -> None:
+        # ids and subjects come from TaskCreate's result; #4 was deleted, the update to #9 was
+        # rejected and #3's description-only update kept its status; TaskList/TaskGet only read
+        pending = self._tasks_pending("--project", "mx-tasks")
+        item = pending[TASKS_OPEN]
+        self.assertEqual((item["status"], item["confidence"], item["source"], item["items"]),
+                         ("todo_open", "medium", "root",
+                          ["Port the yaml loader", "Update the loader docs"]))
+        self.assertNotIn("caveats", item)
+        self.assertNotIn(TASKS_DONE, pending)
+
+    def test_claude_side_chat_task_list_rolls_up(self) -> None:
+        pending = self._tasks_pending("--project", "mx-tasks")
+        item = pending[TASKS_SIDE]
+        self.assertEqual((item["status"], item["source"], item["evidence_session"], item["items"]),
+                         ("todo_open", "side-chat", TASKS_SIDE_CHAT,
+                          ["Rebuild the kilo index", "Report the kilo rebuild"]))
+
+    def test_claude_task_update_to_an_unseen_id_is_unknown(self) -> None:
+        # Claude accepted an update to #2, which this chat never created: its own tasks all read
+        # completed, but that is no proof nothing is open
+        item = self._tasks_pending("--project", "mx-tasks")[TASKS_UNSEEN_ID]
+        self.assertEqual((item["status"], item["confidence"], item["items"], item["caveats"]),
+                         ("unknown", "low", [],
+                          ["task list changes a task whose id could not be resolved"]))
+
+    def test_store_written_last_decides_when_todowrite_and_tasks_mix(self) -> None:
+        # Claude never enables TodoWrite and the task tools together, so a chat resumed across
+        # the switch tracks its work in the store it wrote last; the other one is stale
+        pending = self._tasks_pending("--project", "mx-tasks")
+        self.assertNotIn(TASKS_AFTER_TODOWRITE, pending)
+        item = pending[TODOWRITE_AFTER_TASKS]
+        self.assertEqual((item["status"], item["items"]),
+                         ("todo_open", ["send the november notes"]))
+
+    def test_gemini_write_todos_items_are_named_by_description(self) -> None:
+        pending = self._tasks_pending("--agent", "gemini")
+        item = pending[GEMINI_TODOS_OPEN]
+        self.assertEqual((item["status"], item["agent"], item["items"]),
+                         ("todo_open", "gemini",
+                          ["Port the yaml loader", "Update the loader docs"]))
+        self.assertNotIn("caveats", item)
+        self.assertNotIn(GEMINI_TODOS_DONE, pending)
 
     def test_trailing_compaction_recap_does_not_reopen_a_finished_chat(self) -> None:
         # claude: manual /compact after the final reply; omp: auto-compaction after it; codex: a
