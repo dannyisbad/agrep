@@ -93,7 +93,11 @@ fn panic_reason(payload: &(dyn Any + Send), site: Option<&str>) -> String {
 /// or backticks. Keep the message up to the first quote that is not std naming its own code,
 /// such as `Option::unwrap()` or `None`, so no store text reaches a disclosed reason.
 fn withhold_operands(message: &str) -> String {
-    let mut rest = message.lines().next().unwrap_or_default();
+    let line = message.lines().next().unwrap_or_default();
+    let (mut rest, mut withheld) = match buffer_start(line) {
+        Some(start) => (&line[..start], true),
+        None => (line, false),
+    };
     let mut kept = String::new();
     while let Some(open) = rest.find(['`', '"', '\'']) {
         let quote = &rest[open..open + 1];
@@ -105,13 +109,38 @@ fn withhold_operands(message: &str) -> String {
                 rest = &quoted[close + 1..];
             }
             _ => {
-                kept.push('…');
+                withheld = true;
                 rest = "";
             }
         }
     }
     kept.push_str(rest);
+    if withheld {
+        kept.push('…');
+    }
     crate::ingest::cap_str(&crate::ingest::terminal_safe(kept.trim_end()), MESSAGE_CAP)
+}
+
+/// Debug prints byte buffers unquoted (`FromUtf8Error { bytes: [109, 121, …] }`): a list bracket
+/// or a run like `109, 121` starts store data too. Only bytes the cap could keep are scanned.
+fn buffer_start(line: &str) -> Option<usize> {
+    let bytes = &line.as_bytes()[..line.len().min(MESSAGE_CAP * 4)];
+    let digits = |at: usize| {
+        bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    let run = (0..bytes.len()).find(|&at| {
+        let first = digits(at);
+        first > 0 && bytes[at + first..].starts_with(b", ") && digits(at + first + 2) > 0
+    });
+    bytes
+        .iter()
+        .position(|&byte| byte == b'[')
+        .into_iter()
+        .chain(run)
+        .min()
 }
 
 fn is_code_reference(text: &str) -> bool {
@@ -178,8 +207,37 @@ mod tests {
             "unterminated …"
         );
         assert_eq!(withhold_operands("first line\nsecond line"), "first line");
-        assert_eq!(withhold_operands("x\u{1b}[2J"), "x\\u001b[2J");
+        assert_eq!(withhold_operands("x\u{7}y"), "x\\u0007y");
         assert!(withhold_operands(&"long ".repeat(100)).chars().count() <= MESSAGE_CAP + 1);
+    }
+
+    #[test]
+    fn debug_printed_buffers_are_withheld_from_the_reason() {
+        let utf8 = isolate("test", Path::new("/fixture"), || {
+            String::from_utf8(std::hint::black_box(b"my api key\xff".to_vec())).unwrap()
+        });
+        let reason = utf8.unwrap_err().reason;
+        assert!(
+            reason.ends_with("on an `Err` value: FromUtf8Error { bytes: …"),
+            "{reason}"
+        );
+        let nul = isolate("test", Path::new("/fixture"), || {
+            std::ffi::CString::new(std::hint::black_box(b"secret\0tail".to_vec())).unwrap()
+        });
+        let reason = nul.unwrap_err().reason;
+        assert!(
+            reason.ends_with("on an `Err` value: NulError(6, …"),
+            "{reason}"
+        );
+
+        assert_eq!(withhold_operands("read 109, 121, 32 then"), "read …");
+        assert_eq!(withhold_operands("`a[0]` is out of range"), "…");
+        for kept in [
+            "index out of bounds: the len is 3 but the index is 5",
+            "Utf8Error { valid_up_to: 3, error_len: Some(1) }",
+        ] {
+            assert_eq!(withhold_operands(kept), kept);
+        }
     }
 
     #[test]

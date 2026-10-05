@@ -299,19 +299,48 @@ fn token_lane_panic_keeps_each_conversation_last_good() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// A whole-store agent's fixture plus codex: (home, the session the injected panic lands in, the
+/// file whose parse panics, a codex rollout). Without `sibling` it is the store's only session.
+fn whole_store_home(tag: &str, agent: &str, sibling: bool) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let home = temp_dir(tag);
+    copy_dir(&fixture_home(agent), &home);
+    copy_dir(&fixture_home("codex"), &home);
+    let codex = home.join(".codex/sessions").join(CODEX_ROLLOUT);
+    let (session, target) = match agent {
+        "kimi" => {
+            let session = fs::read_dir(home.join(".kimi/sessions"))
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap()
+                .path()
+                .join("44444444-4444-4444-8444-444444444444");
+            if !sibling {
+                fs::remove_dir_all(session.join("subagents")).unwrap();
+            }
+            let target = session.join("wire.jsonl");
+            (session, target)
+        }
+        "antigravity" => {
+            let brain = home.join(".gemini/antigravity-cli/brain");
+            let session = brain.join("33333333-3333-4333-8333-333333333333");
+            if sibling {
+                copy_dir(
+                    &session,
+                    &brain.join("66666666-6666-4666-8666-666666666666"),
+                );
+            }
+            let target = session.join(".system_generated/logs/transcript.jsonl");
+            (session, target)
+        }
+        _ => unreachable!("not a whole-store fixture: {agent}"),
+    };
+    (home, session, target, codex)
+}
+
 #[test]
 fn always_lane_panic_keeps_the_session_last_good() {
-    let home = temp_dir("parse-panic-always-home");
-    copy_dir(&fixture_home("kimi"), &home);
-    copy_dir(&fixture_home("codex"), &home);
-    let session = fs::read_dir(home.join(".kimi/sessions"))
-        .unwrap()
-        .flatten()
-        .next()
-        .unwrap()
-        .path()
-        .join("44444444-4444-4444-8444-444444444444");
-    let codex = home.join(".codex/sessions").join(CODEX_ROLLOUT);
+    let (home, session, _, codex) = whole_store_home("parse-panic-always-home", "kimi", true);
     let data = temp_dir("parse-panic-always-data");
     assert_published(&index(&home, &data, None), "first index");
     let indexed = messages(&data);
@@ -340,4 +369,80 @@ fn always_lane_panic_keeps_the_session_last_good() {
     assert!(!data.join(".source-health.json").exists());
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
+}
+
+/// With no last-good snapshot (the parse cache was lost, or `--full` starts cold) the rows a
+/// whole-store pass just read cannot vouch for the session that panicked: the published
+/// generation is kept until that session parses again.
+#[test]
+fn whole_store_panic_without_last_good_rows_keeps_the_published_generation() {
+    for agent in ["kimi", "antigravity"] {
+        let (home, session, target, codex) =
+            whole_store_home(&format!("parse-panic-cold-{agent}-home"), agent, true);
+        let data = temp_dir(&format!("parse-panic-cold-{agent}-data"));
+        assert_published(&index(&home, &data, None), "first index");
+        let published = normalize(&data);
+        let session_id = session.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(published.contains(&session_id));
+        // Churn elsewhere keeps the unchanged-source shortcut from skipping the parse.
+        for (round, extra) in [&[][..], &["--full"][..]].into_iter().enumerate() {
+            for cache in [".ingest_cache.bin", ".ingest_cache.bin.journal"] {
+                let _ = fs::remove_file(data.join(cache));
+            }
+            append_codex_turn(&codex, &format!("codex churn {round}"));
+            let output = run(&home, &data, BUILD, Some(&target), extra);
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                !output.status.success(),
+                "{agent} {extra:?} published without its panicking session:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(stderr.contains("retained the old generation"), "{stderr}");
+            assert_eq!(normalize(&data), published, "{agent} {extra:?}");
+            assert_disclosed(&data, &stderr, agent, &session);
+        }
+        assert_published(&index(&home, &data, None), "healed pass");
+        let healed = normalize(&data);
+        assert!(healed.contains("codex churn 1"));
+        let agent_row = format!("\"agent\":\"{agent}\"");
+        for row in published.lines().filter(|row| row.contains(&agent_row)) {
+            assert!(healed.contains(row), "{agent} lost a published row: {row}");
+        }
+        assert!(!data.join(".source-health.json").exists());
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
+/// A whole-store agent that never published a row has nothing a panic could cost, so its only
+/// session panicking pass after pass, warm or cold, never freezes the other agents.
+#[test]
+fn never_indexed_whole_store_that_keeps_panicking_does_not_freeze_other_agents() {
+    for agent in ["kimi", "antigravity"] {
+        let (home, session, target, codex) = whole_store_home(
+            &format!("parse-panic-unpublished-{agent}-home"),
+            agent,
+            false,
+        );
+        let data = temp_dir(&format!("parse-panic-unpublished-{agent}-data"));
+        let agent_row = format!("\"agent\":\"{agent}\"");
+        for (round, extra) in [&[][..], &[][..], &["--full"][..]].into_iter().enumerate() {
+            let churn = format!("codex churn {round}");
+            append_codex_turn(&codex, &churn);
+            let output = run(&home, &data, BUILD, Some(&target), extra);
+            let stderr = assert_published(&output, &format!("{agent} panicking pass {round}"));
+            let published = messages(&data);
+            assert!(
+                published.contains(&churn),
+                "{agent} froze codex on pass {round}"
+            );
+            assert!(!published.contains(&agent_row));
+            assert_disclosed(&data, &stderr, agent, &session);
+        }
+        assert_published(&index_fixed_build(&home, &data), "fixed-build pass");
+        assert!(messages(&data).contains(&agent_row));
+        assert!(!data.join(".source-health.json").exists());
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
 }

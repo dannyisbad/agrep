@@ -549,8 +549,11 @@ pub struct IngestCache {
     /// Scopes the published inventory could not enumerate, so it contributed no path for them
     /// whether or not they held material. Absence under such a scope proves nothing.
     published_blind_scopes: HashSet<(String, PathBuf)>,
-    /// Token-store agents the verified published generation holds no row or event of.
-    unpublished_token_agents: HashSet<String>,
+    /// Agents the verified published generation holds no row or event of.
+    unpublished_agents: HashSet<String>,
+    /// Agents whose snapshot this pass seeded from a read that missed part of their store: not
+    /// yet published, it vouches for nothing the read missed.
+    seeded_snapshots: HashSet<String>,
     /// `(agent, database namespace)` of every token conversation the published generation may
     /// hold rows or events of. `None` is unknown: every token database counts as material.
     published_token_namespaces: Option<HashSet<(String, String)>>,
@@ -2276,7 +2279,8 @@ impl IngestCache {
             provisional_deletions: false,
             published_material: None,
             published_blind_scopes: HashSet::new(),
-            unpublished_token_agents: HashSet::new(),
+            unpublished_agents: HashSet::new(),
+            seeded_snapshots: HashSet::new(),
             published_token_namespaces: None,
             last_good_base: false,
             repair_expected_agents: HashSet::new(),
@@ -2626,7 +2630,28 @@ impl IngestCache {
     /// Token-store agents whose verified published generation was read and holds none of their
     /// rows or events: no database of theirs can lose published material, whatever is listed.
     pub fn set_unpublished_token_agents(&mut self, agents: HashSet<String>) {
-        self.unpublished_token_agents = agents;
+        self.unpublished_agents = agents;
+    }
+
+    /// Whole-store agents with a failed read neither a last-good snapshot nor the inventory
+    /// covers: each pays one read of the published generation, `published`, and one that holds
+    /// no row or event of it has nothing a publication could drop.
+    pub fn admit_unpublished_whole_store_agents(
+        &mut self,
+        mut published: impl FnMut(&str) -> bool,
+    ) {
+        let uncovered: HashSet<&'static str> = self
+            .source_read_issues
+            .iter()
+            .filter(|read| crate::ingest::registry::whole_store_agent(read.agent))
+            .filter(|read| !self.unreadable_scope_covered(read.agent, &read.path))
+            .map(|read| read.agent)
+            .collect();
+        for agent in uncovered {
+            if !published(agent) {
+                self.unpublished_agents.insert(agent.to_owned());
+            }
+        }
     }
 
     /// The token databases the published generation may hold material of; see
@@ -2713,12 +2738,27 @@ impl IngestCache {
                 .is_none_or(|published| published.iter().any(recorded))
     }
 
-    /// A token store database with nothing at stake: its agent has nothing published and this
-    /// cache holds none of its conversations, so no publication without it can drop a row.
-    fn unpublished_token_scope(&self, agent: &str, scope: &Path) -> bool {
-        self.unpublished_token_agents.contains(agent)
-            && crate::ingest::registry::token_prefix(agent, scope).is_some()
-            && !self.holds_token_entries(agent, scope)
+    /// A scope with nothing at stake: its agent has nothing published, and it is a whole store
+    /// or a token database this cache holds no conversation of, so no publication drops a row.
+    fn unpublished_scope(&self, agent: &str, scope: &Path) -> bool {
+        self.unpublished_agents.contains(agent)
+            && match crate::ingest::registry::token_prefix(agent, scope) {
+                Some(_) => !self.holds_token_entries(agent, scope),
+                None => crate::ingest::registry::whole_store_agent(agent),
+            }
+    }
+
+    /// Whether `agent`'s whole-store snapshot holds material an earlier pass published.
+    fn snapshot_witnesses(&self, agent: &str) -> bool {
+        !self.seeded_snapshots.contains(agent)
+            && self
+                .entries
+                .get(&format!("\x00snapshot\x00{agent}"))
+                .is_some_and(|entry| {
+                    !entry.msgs.is_empty()
+                        || !entry.event_keys.is_empty()
+                        || entry.legacy_had_events
+                })
     }
 
     /// Would publishing without `scope` (an unobservable subtree of `agent`'s store) drop
@@ -2729,7 +2769,7 @@ impl IngestCache {
     /// An inventory blind to `scope` is likewise unknown unless retained rows still answer.
     pub fn published_material_under(&self, agent: &str, scope: &Path) -> MaterialVerdict {
         // A read of the published generation itself, not an absent input.
-        if self.unpublished_token_scope(agent, scope) {
+        if self.unpublished_scope(agent, scope) {
             return MaterialVerdict::Retained;
         }
         let Some(published) = self.published_material.as_ref() else {
@@ -2740,8 +2780,7 @@ impl IngestCache {
         };
         // An Always adapter's last-good snapshot carries its whole store, path keys and all;
         // a token collect serves every cached conversation of a database it cannot read.
-        let snapshot_key = format!("\x00snapshot\x00{agent}");
-        let retained_here = self.entries.get(&snapshot_key).is_some_and(has_material)
+        let retained_here = self.snapshot_witnesses(agent)
             || self.holds_token_entries(agent, scope)
             || self.entries.iter().any(|(key, entry)| {
                 source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
@@ -2772,11 +2811,7 @@ impl IngestCache {
     /// Always-adapter's stale per-file entries are never re-emitted, so their
     /// Retained verdict must not license publishing without their rows.
     pub fn unreadable_scope_covered(&self, agent: &str, scope: &Path) -> bool {
-        let snapshot_key = format!("\x00snapshot\x00{agent}");
-        let has_material = |entry: &Entry| {
-            !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
-        };
-        if self.entries.get(&snapshot_key).is_some_and(has_material) {
+        if self.snapshot_witnesses(agent) {
             return true;
         }
         self.published_proves_empty(agent, scope)
@@ -2784,7 +2819,7 @@ impl IngestCache {
 
     /// The published inventory's positive claim that `scope` held no material.
     fn published_proves_empty(&self, agent: &str, scope: &Path) -> bool {
-        if self.unpublished_token_scope(agent, scope) {
+        if self.unpublished_scope(agent, scope) {
             return true;
         }
         match self.published_material.as_ref() {
@@ -2899,6 +2934,11 @@ impl IngestCache {
                 if fresh.is_empty() && fresh_event_keys.is_empty() {
                     self.output_incomplete = true;
                     return (fresh, true);
+                }
+                // Seeded from the sessions that did parse, it cannot vouch for the rest this pass.
+                self.seeded_snapshots.insert(agent.to_owned());
+                if !self.published_proves_empty(agent, root) {
+                    self.output_incomplete = true;
                 }
                 let fresh_sessions: HashSet<String> = fresh
                     .iter()
@@ -4981,7 +5021,18 @@ mod tests {
         assert!(guarded);
         assert!(!always.source_snapshot_safe());
 
+        // A partial cold read publishes only past an inventory proving nothing was at stake.
+        let mut unknown = IngestCache::cold();
+        unknown.guard_never_empty(
+            "cline",
+            std::path::Path::new("/fixture-store"),
+            vec![test_message("readable sibling")],
+            &[],
+            ReadOutcome::Skipped,
+        );
+        assert!(!unknown.output_complete());
         let mut partial = IngestCache::cold();
+        partial.set_published_material(HashSet::new());
         let (readable, guarded) = partial.guard_never_empty(
             "cline",
             std::path::Path::new("/fixture-store"),
@@ -5488,6 +5539,79 @@ mod tests {
             cache.published_material_under("crush", listed),
             MaterialVerdict::Drops
         );
+    }
+
+    #[test]
+    fn a_snapshot_seeded_from_a_partial_read_never_covers_its_own_pass() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let root = Path::new("/fixture/.kimi");
+        let lost = Path::new("/fixture/.kimi/sessions/a/lost");
+        let published = || HashSet::from([lost.join("context.jsonl")]);
+        let skipped = |cache: &mut IngestCache| {
+            let fresh = vec![test_message("a sibling session still parses")];
+            cache.guard_never_empty("kimi", root, fresh, &[], ReadOutcome::Skipped)
+        };
+
+        let mut lost_cache = IngestCache::cold();
+        lost_cache.set_published_material(published());
+        assert_eq!(skipped(&mut lost_cache).0.len(), 1);
+        assert!(!lost_cache.output_complete());
+        assert!(!lost_cache.unreadable_scope_covered("kimi", lost));
+        assert_eq!(
+            lost_cache.published_material_under("kimi", lost),
+            MaterialVerdict::Drops
+        );
+
+        let mut last_good = IngestCache::cold();
+        last_good.set_published_material(published());
+        let mut row = test_message("the lost session's last good row");
+        row.session = "lost".into();
+        last_good.guard_never_empty("kimi", root, vec![row], &[], ReadOutcome::Complete);
+        let served = skipped(&mut last_good).0;
+        assert!(served.iter().any(|message| &*message.session == "lost"));
+        assert!(last_good.output_complete());
+        assert!(last_good.unreadable_scope_covered("kimi", lost));
+
+        let mut first = IngestCache::cold();
+        first.set_published_material(HashSet::new());
+        skipped(&mut first);
+        assert!(first.output_complete());
+        assert!(first.unreadable_scope_covered("kimi", lost));
+    }
+
+    #[test]
+    fn only_an_unpublished_whole_store_agent_is_admitted_past_its_failed_read() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let lost = Path::new("/fixture/.kimi/sessions/a/lost");
+        let transcript = Path::new("/fixture/.claude/projects/p/chat.jsonl");
+        let mut cache = IngestCache::cold();
+        cache.set_published_material(HashSet::from([lost.join("wire.jsonl"), transcript.into()]));
+        cache.record_source_read_issue("kimi", lost, "source-read-failed", "parser panicked");
+        cache.record_source_read_issue(
+            "claude",
+            transcript,
+            "source-read-failed",
+            "parser panicked",
+        );
+        cache.admit_unpublished_whole_store_agents(|_| true);
+        assert!(!cache.unreadable_scope_covered("kimi", lost));
+
+        let mut read = Vec::new();
+        cache.admit_unpublished_whole_store_agents(|agent| {
+            read.push(agent.to_owned());
+            false
+        });
+        assert_eq!(read, ["kimi"]);
+        assert!(cache.unreadable_scope_covered("kimi", lost));
+        assert_eq!(
+            cache.published_material_under("kimi", lost),
+            MaterialVerdict::Retained
+        );
+        assert!(!cache.unreadable_scope_covered("claude", transcript));
     }
 
     #[test]

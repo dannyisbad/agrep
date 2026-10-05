@@ -5569,6 +5569,13 @@ fn index_cmd_locked(
     let (msgs, evts, repaired_sessions) = ingest_agent(agent, &mut pcache, &harness_prefixes)?;
     let session_aliases = session_aliases(&pcache, &msgs);
     lap!("ingest+dedupe");
+    // A whole store holds last-good rows only in its snapshot; when no snapshot covers a failed
+    // read, the published generation itself is read for its agent, but only then.
+    if prior_generation && derived_valid {
+        pcache.admit_unpublished_whole_store_agents(|agent| {
+            cache::published_agent_material(&data, agent)
+        });
+    }
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
         && source_preflight_error.is_none();

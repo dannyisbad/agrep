@@ -2024,6 +2024,14 @@ pub fn token_store_agent(agent: &str) -> bool {
         .any(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
 }
 
+/// Whether `agent` names a registered `Fingerprint::Always` adapter, whose last-good rows live
+/// only in its whole-store snapshot.
+pub fn whole_store_agent(agent: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Always)
+}
+
 /// Exact current preflight coverage consumed by the ingest collectors. Stat paths let the cache
 /// recover a new file omitted by a transient `read_dir` entry error; Token identities detect a
 /// partial DB enumeration even when the outer source snapshot itself succeeds.
