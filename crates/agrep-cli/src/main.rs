@@ -3771,6 +3771,19 @@ fn publish_source_unreadable(
     write_source_health(data, records)
 }
 
+/// Disclose `runtime_issues` beside every record already on source health.
+fn add_source_read_issues(
+    data: &Path,
+    runtime_issues: &[agrep_core::ingest_cache::SourceReadIssue],
+) -> anyhow::Result<()> {
+    if runtime_issues.is_empty() {
+        return Ok(());
+    }
+    let mut records = source_health_records(data)?;
+    records.extend(runtime_issues.iter().map(runtime_source_issue_value));
+    write_source_health(data, records)
+}
+
 fn runtime_source_issue_value(
     issue: &agrep_core::ingest_cache::SourceReadIssue,
 ) -> serde_json::Value {
@@ -5513,8 +5526,8 @@ fn index_cmd_locked(
         pcache.set_published_material(HashSet::new());
     } else if pcache.decoded_last_good_base() {
         // Publication withheld every snapshot (0.3.2 held it beside any source issue, and an
-        // `--emit-rows` pass takes none). Every token row it published was cached first, as
-        // `published_token_inventory` relies on; Stat and whole-store rows need not have been.
+        // `--emit-rows` pass takes none). Every Stat and token row it published was cached
+        // first, as `published_token_inventory` relies on; whole-store rows need not have been.
         pcache.set_published_material_from_cache();
     }
     let published_token_material =
@@ -5615,7 +5628,11 @@ fn index_cmd_locked(
     // This pass read every source, so its verdict is the whole truth about
     // their health. Publication can still be declined for reasons that say
     // nothing about readability, and a record no pass retires outlives its bug.
-    if !source_snapshot_safe {
+    if emit_rows {
+        // Without a preflight it saw only what it parsed: it adds what failed to the record
+        // and retires nothing, since the next pass may take the shortcut that keeps it.
+        add_source_read_issues(&data, pcache.source_read_issues())?;
+    } else if !source_snapshot_safe {
         publish_source_unreadable(
             &data,
             agent,

@@ -152,7 +152,7 @@ fn a_partially_read_file_published_by_an_emit_rows_index_keeps_its_rows_once_unr
         .join("opencode")
         .join("opencode.db");
     // A text part caught mid-write: the read publishes the rest of the database but stays
-    // partial, so it is retried rather than cached.
+    // partial, so every pass retries it until a read completes.
     rusqlite::Connection::open(&db)
         .unwrap()
         .execute(
@@ -168,6 +168,8 @@ fn a_partially_read_file_published_by_an_emit_rows_index_keeps_its_rows_once_unr
     assert!(normalize(&data).contains(OPENCODE_TEXT));
     assert!(!data.join(".source_snapshot.bin").exists());
 
+    let parked = home.join("opencode.db.parked");
+    fs::copy(&db, &parked).unwrap();
     fs::write(&db, b"not a database at all\n").unwrap();
     for pass in 1..=2 {
         let output = ingest_output("all", &home, &data, false);
@@ -179,6 +181,117 @@ fn a_partially_read_file_published_by_an_emit_rows_index_keeps_its_rows_once_unr
         assert!(
             disclosed(&data, "opencode"),
             "pass {pass}: opencode not disclosed"
+        );
+    }
+
+    // A partial read that keeps every row publishes what it adds, as the first one did.
+    fs::copy(&parked, &db).unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(concat!(
+            "INSERT INTO session VALUES('sess-oc-2','/work/epsilon',NULL,NULL,1767348100000);",
+            "INSERT INTO message VALUES('m9','sess-oc-2','{\"role\":\"user\"}',1767348100000);",
+            "INSERT INTO part VALUES('p10','m9','sess-oc-2',",
+            "'{\"type\":\"text\",\"text\":\"list the yaml keys\"}',1767348100000);"
+        ))
+        .unwrap();
+    assert_published(&ingest_output("all", &home, &data, false), "partial pass");
+    let published = normalize(&data);
+    assert!(published.contains(OPENCODE_TEXT) && published.contains("list the yaml keys"));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// The first index streamed `--emit-rows`, which records no source inventory, beside a claude
+/// project no pass could ever read: a directory that never read published nothing.
+#[cfg(unix)]
+#[test]
+fn an_emit_rows_first_index_beside_a_never_read_directory_settles() {
+    let home = temp_dir("unrecorded-emit-locked-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let Some(locked) = lock_claude_project(&home) else {
+        let _ = fs::remove_dir_all(&home);
+        return;
+    };
+    let data = temp_dir("unrecorded-emit-locked-data");
+    assert_published(
+        &ingest_emit_output("all", &home, &data),
+        "--emit-rows index",
+    );
+    assert!(!data.join(".source_snapshot.bin").exists());
+    assert_settles_beside_a_never_read_dir(&home, &data, &locked, 1, |minute| {
+        churn_claude(&home, minute)
+    });
+    unlock_dir(&locked);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// The first plain index was killed after its derived writes, before its source snapshot: the
+/// preflight it took is still the pending marker, and no source inventory was recorded.
+#[cfg(unix)]
+#[test]
+fn a_first_index_killed_before_its_snapshot_beside_a_never_read_directory_settles() {
+    let home = temp_dir("unrecorded-killed-locked-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let Some(locked) = lock_claude_project(&home) else {
+        let _ = fs::remove_dir_all(&home);
+        return;
+    };
+    let data = temp_dir("unrecorded-killed-locked-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    fs::rename(
+        data.join(".source_snapshot.bin"),
+        data.join(".ingest_pending.bin"),
+    )
+    .unwrap();
+    let _ = fs::remove_file(data.join(".harness_prefixes.snapshot"));
+    assert_settles_beside_a_never_read_dir(&home, &data, &locked, 1, |minute| {
+        churn_claude(&home, minute)
+    });
+    unlock_dir(&locked);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// An `--emit-rows` pass has no preflight, so it retires no disclosed source issue: the unchanged
+/// passes after it keep the disclosure of the pass that published their generation.
+#[test]
+fn an_emit_rows_pass_keeps_the_disclosure_unchanged_passes_stand_on() {
+    let home = temp_dir("unrecorded-emit-health-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let foreign = home
+        .join(".local")
+        .join("share")
+        .join("crush")
+        .join("crush.db");
+    fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    fs::write(&foreign, b"plain text where crush keeps its database\n").unwrap();
+    let kinds = |data: &Path| -> Vec<String> {
+        let health: serde_json::Value =
+            serde_json::from_slice(&fs::read(data.join(".source-health.json")).unwrap_or_default())
+                .unwrap_or_default();
+        health["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|issue| issue["agent"] == "crush")
+            .filter_map(|issue| issue["kind"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let data = temp_dir("unrecorded-emit-health-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    assert!(kinds(&data).contains(&"unsupported-file-type".to_string()));
+
+    // The first-search lane streams rows when the published messages are missing.
+    fs::remove_file(data.join("messages.jsonl")).unwrap();
+    assert_published(&ingest_emit_output("all", &home, &data), "--emit-rows pass");
+    for pass in 1..=2 {
+        assert_published(&ingest_output("all", &home, &data, false), "plain pass");
+        assert!(
+            kinds(&data).contains(&"unsupported-file-type".to_string()),
+            "pass {pass} after --emit-rows lost the disclosure: {:?}",
+            kinds(&data)
         );
     }
     let _ = fs::remove_dir_all(&home);

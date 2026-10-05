@@ -549,9 +549,11 @@ pub struct IngestCache {
     /// Scopes the published inventory could not enumerate, so it contributed no path for them
     /// whether or not they held material. Absence under such a scope proves nothing.
     published_blind_scopes: HashSet<(String, PathBuf)>,
-    /// The inventory was rebuilt from this cache, which names token databases only: it proves
-    /// no Stat file or whole store empty, since a partial read publishes those uncached.
-    published_tokens_only: bool,
+    /// The inventory was rebuilt from this cache. Every Stat and token row reaches the cache
+    /// before it publishes, but a whole store's need not, nor a partial read of an older build.
+    published_from_cache: bool,
+    /// Decoded from an older cache generation, whose builds published partial reads uncached.
+    legacy_generation: bool,
     /// Agents the verified published generation holds no row or event of.
     unpublished_agents: HashSet<String>,
     /// Agents whose snapshot this pass seeded from a read that missed part of their store: not
@@ -779,6 +781,34 @@ fn cached_event_keys(events: &[Event]) -> Vec<CEventKey> {
     keys.sort_unstable();
     keys.dedup();
     keys
+}
+
+/// Whether a partial read kept everything a cached entry holds: each of its rows, whose reply may
+/// only have grown, and each session it owns events of. Replacing the entry then loses nothing.
+fn partial_read_extends(prev: &Entry, fresh: &[Message], fresh_events: &[Event]) -> bool {
+    if prev.legacy_had_events {
+        return false;
+    }
+    let rows: HashMap<(&str, u32, &str), &str> = fresh
+        .iter()
+        .map(|row| {
+            (
+                (row.session.as_ref(), row.turn, row.text.as_ref()),
+                row.reply.as_ref(),
+            )
+        })
+        .collect();
+    let sessions: HashSet<&str> = fresh_events
+        .iter()
+        .map(|event| event.session.as_str())
+        .collect();
+    prev.msgs.iter().all(|row| {
+        rows.get(&(row.session.as_ref(), row.turn, row.text.as_ref()))
+            .is_some_and(|reply| reply.starts_with(row.reply.as_ref()))
+    }) && prev
+        .event_keys
+        .iter()
+        .all(|key| sessions.contains(key.session.as_str()))
 }
 
 #[cfg(not(windows))]
@@ -2289,12 +2319,13 @@ impl IngestCache {
             provisional_deletions: false,
             published_material: None,
             published_blind_scopes: HashSet::new(),
-            published_tokens_only: false,
+            published_from_cache: false,
             unpublished_agents: HashSet::new(),
             seeded_snapshots: HashSet::new(),
             unvouched_reads: HashSet::new(),
             published_token_namespaces: None,
             last_good_base: false,
+            legacy_generation: false,
             repair_expected_agents: HashSet::new(),
             repair_expected_paths: HashSet::new(),
             current_snapshot_complete: false,
@@ -2374,6 +2405,7 @@ impl IngestCache {
                 warm: generation != CacheGeneration::LegacyReparse,
                 force_reparse: generation != CacheGeneration::Current,
                 last_good_base: true,
+                legacy_generation: generation == CacheGeneration::LegacyReparse,
                 ..Self::base(entries, backing)
             },
             Err(CacheDecodeRefusal::ForeignOwner) => Self::foreign_owned(),
@@ -2399,7 +2431,7 @@ impl IngestCache {
         writer_build_id: WriterBuildId,
     ) -> (Self, Option<CacheDecodeRefusal>) {
         match decode_cache_for(path, writer_build_id) {
-            Ok((mut entries, _generation, _backing)) => {
+            Ok((mut entries, generation, _backing)) => {
                 // This pass rebuilds every entry's events; one it cannot re-read keeps the flag,
                 // so its first good read rebuilds them rather than hitting an unchanged stamp.
                 for entry in entries.values_mut() {
@@ -2410,6 +2442,7 @@ impl IngestCache {
                         force_reparse: true,
                         repair_mode: true,
                         last_good_base: true,
+                        legacy_generation: generation == CacheGeneration::LegacyReparse,
                         ..Self::base(entries, CacheBacking::Rewrite)
                     },
                     None,
@@ -2459,6 +2492,7 @@ impl IngestCache {
                     repair_mode: true,
                     allow_stable_deletions: true,
                     last_good_base: true,
+                    legacy_generation: generation == CacheGeneration::LegacyReparse,
                     ..Self::base(entries, backing)
                 },
                 None,
@@ -2607,10 +2641,18 @@ impl IngestCache {
     }
 
     /// No publication recorded an inventory (a release held every snapshot back): stand in
-    /// with this decoded cache, sound only for the token databases it names.
+    /// with this decoded cache. It names the Stat sources with rows; see `published_from_cache`.
     pub fn set_published_material_from_cache(&mut self) {
-        self.published_material = Some(HashSet::new());
-        self.published_tokens_only = true;
+        let paths = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
+            })
+            .filter_map(|(key, _)| source_path_from_key(key))
+            .collect();
+        self.published_material = Some(paths);
+        self.published_from_cache = true;
     }
 
     /// Supply the second stable source observation (a byte-identical preflight pair) that
@@ -2738,9 +2780,12 @@ impl IngestCache {
             })
     }
 
-    /// Whether a cache-derived inventory is silent on `scope`: it vouches for token databases only.
+    /// Whether a cache-derived inventory is silent on `scope`: a whole store, which admission
+    /// decides, or any non-token scope when an older build may have published it uncached.
     fn cache_inventory_silent_on(&self, agent: &str, scope: &Path) -> bool {
-        self.published_tokens_only && crate::ingest::registry::token_prefix(agent, scope).is_none()
+        self.published_from_cache
+            && crate::ingest::registry::token_prefix(agent, scope).is_none()
+            && (self.legacy_generation || crate::ingest::registry::whole_store_agent(agent))
     }
 
     /// Whether this cache holds conversations with rows or events of the token store database
@@ -7624,6 +7669,82 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_read_is_cached_and_refreshed_only_by_a_read_that_loses_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "agrep-partial-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("store.db");
+        fs::write(&source, b"store").unwrap();
+        let row = |session: &str, text: &str| {
+            let mut row = test_message(text);
+            row.session = session.into();
+            row
+        };
+        let texts = |pass: &super::Pass| {
+            let mut texts: Vec<String> = pass.messages.iter().map(|m| m.text.to_string()).collect();
+            texts.sort_unstable();
+            texts
+        };
+        let mut cache = IngestCache::cold();
+        let read = |cache: &mut IngestCache,
+                    rows: Vec<Message>,
+                    events: Vec<Event>,
+                    outcome: ReadOutcome| {
+            collect_cached(cache, &dir, std::slice::from_ref(&source), move |_| {
+                (rows.clone(), events.clone(), outcome)
+            })
+        };
+
+        let first = read(
+            &mut cache,
+            vec![row("a", "first")],
+            vec![],
+            ReadOutcome::Partial,
+        );
+        assert_eq!(texts(&first), ["first"]);
+        let entry = &cache.entries[&source_key(&source)];
+        assert_eq!(entry.msgs.len(), 1);
+        assert!(entry.identity.is_none(), "a partial entry must retry");
+
+        let rows = vec![row("a", "first"), row("b", "second")];
+        let events = vec![test_event("a", "old-a"), test_event("b", "new-b")];
+        let grown = read(&mut cache, rows, events, ReadOutcome::Partial);
+        assert_eq!(texts(&grown), ["first", "second"]);
+        let sessions: Vec<&str> = grown.events.iter().map(|e| e.session.as_str()).collect();
+        assert_eq!(
+            sessions,
+            ["b"],
+            "events of a session the entry held were rewritten"
+        );
+
+        let lost = read(
+            &mut cache,
+            vec![row("b", "second")],
+            vec![],
+            ReadOutcome::Partial,
+        );
+        assert_eq!(texts(&lost), ["first", "second"]);
+        let failed = read(&mut cache, vec![], vec![], ReadOutcome::Invalid);
+        assert_eq!(texts(&failed), ["first", "second"]);
+
+        let complete = read(
+            &mut cache,
+            vec![row("c", "third")],
+            vec![],
+            ReadOutcome::Complete,
+        );
+        assert_eq!(texts(&complete), ["third"]);
+        assert!(cache.entries[&source_key(&source)].identity.is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn leftover_flagged_entries_reparse_one_by_one_on_a_warm_cache() {
         let dir = std::env::temp_dir().join(format!(
             "agrep-leftover-reparse-{}-{}",
@@ -8957,7 +9078,7 @@ where
     // fresh: changed files (messages + events) + sibling files (messages cached-equal + events)
     for (key, path, mt, sz, identity, m, e, healthy, panicked) in miss_parsed {
         // A failed, skipped or partial reparse retains the prior entry instead of publishing
-        // deletion. Only a partial read with no prior entry falls through and publishes.
+        // deletion; a partial one that lost nothing the entry held refreshes it instead.
         if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
             cache.mark_guarded_stale();
             cache.record_source_read_issue(
@@ -8967,6 +9088,37 @@ where
                 read_issue_reason(healthy, panicked),
             );
             if let Some(prev) = cache.entries.get(&key) {
+                if healthy == Some(ReadOutcome::Partial) && partial_read_extends(prev, &m, &e) {
+                    // Events already stored for its sessions stay as written: this read
+                    // may have missed some of them.
+                    blocked_event_sessions
+                        .extend(prev.msgs.iter().map(|message| message.session.clone()));
+                    blocked_event_sessions.extend(
+                        prev.event_keys
+                            .iter()
+                            .map(|event| std::sync::Arc::from(event.session.as_str())),
+                    );
+                    let mut event_keys = prev.event_keys.clone();
+                    event_keys.extend(cached_event_keys(&e));
+                    event_keys.sort_unstable();
+                    event_keys.dedup();
+                    let legacy_needs_reparse = prev.legacy_needs_reparse;
+                    cache.put_entry(
+                        key,
+                        Entry {
+                            mtime: mt,
+                            size: sz,
+                            identity: None,
+                            msgs: m.iter().map(CMsg::from).collect(),
+                            event_keys,
+                            legacy_had_events: false,
+                            legacy_needs_reparse,
+                        },
+                    );
+                    messages.extend(m);
+                    events.extend(e);
+                    continue;
+                }
                 blocked_event_sessions
                     .extend(prev.msgs.iter().map(|message| message.session.clone()));
                 blocked_event_sessions.extend(
@@ -9034,8 +9186,22 @@ where
             }
         }
         if healthy == Some(ReadOutcome::Partial) {
-            // Publish recoverable cold rows for this pass, but retry until a complete read
-            // produces the first cacheable entry.
+            // Cached so a later failed read serves these rows and the cache names this source as
+            // published; no identity, so every pass retries it until a read completes.
+            if !m.is_empty() || !e.is_empty() {
+                cache.put_entry(
+                    key,
+                    Entry {
+                        mtime: mt,
+                        size: sz,
+                        identity: None,
+                        msgs: m.iter().map(CMsg::from).collect(),
+                        event_keys: cached_event_keys(&e),
+                        legacy_had_events: false,
+                        legacy_needs_reparse: false,
+                    },
+                );
+            }
             messages.extend(m);
             events.extend(e);
             continue;

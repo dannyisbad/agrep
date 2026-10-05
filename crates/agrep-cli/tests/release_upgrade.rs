@@ -223,6 +223,85 @@ fn upgrade_publishes_beside_a_foreign_crush_database_that_release_never_read() {
     }
 }
 
+/// The release held its snapshot back beside a foreign crush database and a claude project no
+/// pass could ever read. It published partial reads uncached, so its cache proves nothing about
+/// a directory it holds no rows of: the first pass publishes, the second (current cache) settles.
+#[cfg(unix)]
+#[test]
+fn upgrade_settles_beside_a_project_directory_release_never_read() {
+    let (home, foreign) = crush_upgrade_home();
+    fs::write(&foreign, b"plain text where crush keeps its database\n").unwrap();
+    let Some(locked) = lock_claude_project(&home) else {
+        let _ = fs::remove_dir_all(&home);
+        return;
+    };
+    let chat = plant_chat(&home);
+    let data = temp_dir("release-upgrade-locked-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    age_to_release_0_3_2(&data, Snapshot::Withheld);
+    assert_settles_beside_a_never_read_dir(&home, &data, &locked, 2, |minute| {
+        let text = format!("upgrade churn {minute}");
+        append_line(&chat, minute, &text);
+        text
+    });
+    assert!(normalize(&data).contains(CRUSH_TEXT));
+    unlock_dir(&locked);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// The release published a partial opencode read without caching it, and held its snapshot back
+/// beside some other source issue. If that database fails the first pass after the upgrade, the
+/// cache cannot prove it held no rows: the pass keeps them, and the next good read caches them.
+#[test]
+fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
+    const OPENCODE_TEXT: &str = "convert config to yaml";
+    let home = opencode_home();
+    copy_dir(&fixture_home("claude"), &home);
+    let db = home.join(".local/share/opencode/opencode.db");
+    // A text part caught mid-write: the read publishes the rest of the database, but partial.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO part VALUES('p9','m2','sess-oc-1',?1,1767348001900)",
+            [r#"{"type":"text","text":"torn mid-wri"#],
+        )
+        .unwrap();
+    let data = temp_dir("release-upgrade-partial-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    assert!(normalize(&data).contains(OPENCODE_TEXT));
+    // The release's cache: every other source, and nothing of the partial read.
+    let parked = home.join("opencode.db.parked");
+    fs::rename(&db, &parked).unwrap();
+    let scratch = temp_dir("release-upgrade-partial-scratch");
+    assert_published(&ingest_output("all", &home, &scratch, false), "cache donor");
+    fs::copy(
+        scratch.join(".ingest_cache.bin"),
+        data.join(".ingest_cache.bin"),
+    )
+    .unwrap();
+    let _ = fs::remove_dir_all(&scratch);
+    age_to_release_0_3_2(&data, Snapshot::Withheld);
+
+    fs::write(&db, b"not a database at all\n").unwrap();
+    let failed = ingest_output("all", &home, &data, false);
+    assert!(
+        normalize(&data).contains(OPENCODE_TEXT),
+        "the first pass dropped rows the release published (exit {:?})",
+        failed.status.code()
+    );
+    fs::rename(&parked, &db).unwrap();
+    for pass in 1..=2 {
+        assert_published(
+            &ingest_output("all", &home, &data, false),
+            &format!("healed pass {pass}"),
+        );
+        assert!(normalize(&data).contains(OPENCODE_TEXT));
+    }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 #[cfg(unix)]
 #[test]
 fn upgrade_publishes_beside_an_unreadable_crush_database_that_release_never_read() {
