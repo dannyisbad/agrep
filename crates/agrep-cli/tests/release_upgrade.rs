@@ -223,7 +223,7 @@ fn upgrade_publishes_beside_a_foreign_crush_database_that_release_never_read() {
     }
 }
 
-/// How the first pass after an upgrade beside a never-readable claude project begins.
+/// How the first pass after an upgrade beside a never-readable store begins.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum UpgradeStart {
@@ -237,14 +237,28 @@ enum UpgradeStart {
     KilledInCommit,
 }
 
-/// The release held its snapshot back beside a foreign crush database and a claude project no
-/// pass could ever read. Only an opencode read could publish uncached under the release, so its
-/// cache proves that directory held nothing and the first pass settles, event repair included.
+/// A store no pass could ever read, locked beside the release's data dir.
 #[cfg(unix)]
-fn upgrade_settles_beside_a_project_directory_release_never_read(start: UpgradeStart) {
+#[derive(Clone, Copy, Debug)]
+enum NeverRead {
+    ClaudeProject,
+    /// The one adapter whose reads may be partial: its silence must not outlast a read of the
+    /// published generation showing the release published none of its rows.
+    OpencodeStore,
+}
+
+/// The release held its snapshot back beside a foreign crush database and a store no pass could
+/// ever read. Its cache proves a claude directory held nothing; the published generation proves
+/// opencode published nothing. Either way the first pass settles, event repair included.
+#[cfg(unix)]
+fn upgrade_settles_beside_a_store_release_never_read(start: UpgradeStart, store: NeverRead) {
     let (home, foreign) = crush_upgrade_home();
     fs::write(&foreign, b"plain text where crush keeps its database\n").unwrap();
-    let Some(locked) = lock_claude_project(&home) else {
+    let locked = match store {
+        NeverRead::ClaudeProject => lock_claude_project(&home),
+        NeverRead::OpencodeStore => lock_opencode_store(&home),
+    };
+    let Some(locked) = locked else {
         let _ = fs::remove_dir_all(&home);
         return;
     };
@@ -277,13 +291,16 @@ fn upgrade_settles_beside_a_project_directory_release_never_read(start: UpgradeS
             }
         }
     }
-    assert!(!data.join(".source_snapshot.bin").exists(), "{start:?}");
+    assert!(
+        !data.join(".source_snapshot.bin").exists(),
+        "{start:?} {store:?}"
+    );
     assert_settles_beside_a_never_read_dir(&home, &data, &locked, 1, |minute| {
         let text = format!("upgrade churn {minute}");
         append_line(&chat, minute, &text);
         text
     });
-    assert!(normalize(&data).contains(CRUSH_TEXT), "{start:?}");
+    assert!(normalize(&data).contains(CRUSH_TEXT), "{start:?} {store:?}");
     unlock_dir(&locked);
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
@@ -292,32 +309,64 @@ fn upgrade_settles_beside_a_project_directory_release_never_read(start: UpgradeS
 #[cfg(unix)]
 #[test]
 fn upgrade_settles_on_its_first_pass_beside_a_project_directory_release_never_read() {
-    upgrade_settles_beside_a_project_directory_release_never_read(UpgradeStart::AsReleased);
+    upgrade_settles_beside_a_store_release_never_read(
+        UpgradeStart::AsReleased,
+        NeverRead::ClaudeProject,
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn upgrade_that_must_rebuild_events_settles_beside_a_project_directory_release_never_read() {
-    upgrade_settles_beside_a_project_directory_release_never_read(UpgradeStart::ProofsLost);
+    upgrade_settles_beside_a_store_release_never_read(
+        UpgradeStart::ProofsLost,
+        NeverRead::ClaudeProject,
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn upgrade_killed_inside_its_first_commit_settles_beside_a_project_directory_release_never_read() {
-    upgrade_settles_beside_a_project_directory_release_never_read(UpgradeStart::KilledInCommit);
+    upgrade_settles_beside_a_store_release_never_read(
+        UpgradeStart::KilledInCommit,
+        NeverRead::ClaudeProject,
+    );
 }
 
-/// The release published a partial opencode read without caching it, and held its snapshot back
-/// beside some other source issue. If that database fails the first pass after the upgrade, the
-/// cache cannot prove it held no rows: the pass keeps them, and the next good read caches them.
+#[cfg(unix)]
 #[test]
-fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
-    const OPENCODE_TEXT: &str = "convert config to yaml";
-    let home = opencode_home();
-    copy_dir(&fixture_home("claude"), &home);
-    let db = home.join(".local/share/opencode/opencode.db");
-    // A text part caught mid-write: the read publishes the rest of the database, but partial.
-    rusqlite::Connection::open(&db)
+fn upgrade_settles_on_its_first_pass_beside_an_opencode_store_release_never_read() {
+    upgrade_settles_beside_a_store_release_never_read(
+        UpgradeStart::AsReleased,
+        NeverRead::OpencodeStore,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_that_must_rebuild_events_settles_beside_an_opencode_store_release_never_read() {
+    upgrade_settles_beside_a_store_release_never_read(
+        UpgradeStart::ProofsLost,
+        NeverRead::OpencodeStore,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_killed_inside_its_first_commit_settles_beside_an_opencode_store_release_never_read() {
+    upgrade_settles_beside_a_store_release_never_read(
+        UpgradeStart::KilledInCommit,
+        NeverRead::OpencodeStore,
+    );
+}
+
+const OPENCODE_TEXT: &str = "convert config to yaml";
+
+/// Index `home`'s opencode store at `db`, with a text part caught mid-write, as release 0.3.2
+/// would have: the partial read publishes the rest of the database without caching it, and the
+/// snapshot is held back. Returns the data dir, the database parked aside.
+fn release_dir_with_uncached_opencode_rows(home: &Path, db: &Path) -> (PathBuf, PathBuf) {
+    rusqlite::Connection::open(db)
         .unwrap()
         .execute(
             "INSERT INTO part VALUES('p9','m2','sess-oc-1',?1,1767348001900)",
@@ -325,13 +374,13 @@ fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
         )
         .unwrap();
     let data = temp_dir("release-upgrade-partial-data");
-    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    assert_published(&ingest_output("all", home, &data, false), "first index");
     assert!(normalize(&data).contains(OPENCODE_TEXT));
     // The release's cache: every other source, and nothing of the partial read.
     let parked = home.join("opencode.db.parked");
-    fs::rename(&db, &parked).unwrap();
+    fs::rename(db, &parked).unwrap();
     let scratch = temp_dir("release-upgrade-partial-scratch");
-    assert_published(&ingest_output("all", &home, &scratch, false), "cache donor");
+    assert_published(&ingest_output("all", home, &scratch, false), "cache donor");
     fs::copy(
         scratch.join(".ingest_cache.bin"),
         data.join(".ingest_cache.bin"),
@@ -339,6 +388,18 @@ fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
     .unwrap();
     let _ = fs::remove_dir_all(&scratch);
     age_to_release_0_3_2(&data, Snapshot::Withheld);
+    (data, parked)
+}
+
+/// The release published a partial opencode read without caching it, and held its snapshot back
+/// beside some other source issue. If that database fails the first pass after the upgrade, the
+/// cache cannot prove it held no rows: the pass keeps them, and the next good read caches them.
+#[test]
+fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
+    let home = opencode_home();
+    copy_dir(&fixture_home("claude"), &home);
+    let db = home.join(".local/share/opencode/opencode.db");
+    let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db);
 
     fs::write(&db, b"not a database at all\n").unwrap();
     let failed = ingest_output("all", &home, &data, false);
@@ -355,6 +416,54 @@ fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
         );
         assert!(normalize(&data).contains(OPENCODE_TEXT));
     }
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// An upgrade held back by one scope past others it could publish past names that scope: here
+/// the opencode store whose rows the release published uncached, not the foreign crush database
+/// listed before it. Its rows stay published, and access to the store heals the index.
+#[cfg(unix)]
+#[test]
+fn upgrade_refusal_names_the_store_that_holds_it_back() {
+    let (home, foreign) = crush_upgrade_home();
+    fs::write(&foreign, b"plain text where crush keeps its database\n").unwrap();
+    let store = home.join(".local/share/opencode");
+    fs::create_dir_all(&store).unwrap();
+    let db = store.join("opencode.db");
+    let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql")).unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(&seed)
+        .unwrap();
+    let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db);
+    fs::rename(&parked, &db).unwrap();
+    for proof in fs::read_dir(&data).unwrap().flatten() {
+        if proof
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".events_complete")
+        {
+            fs::remove_file(proof.path()).unwrap();
+        }
+    }
+    let Some(locked) = lock_dir(&store) else {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    };
+    let held = ingest_output("all", &home, &data, false);
+    unlock_dir(&locked);
+    let stderr = String::from_utf8_lossy(&held.stderr);
+    assert!(!held.status.success(), "{stderr}");
+    let blocking = format!("agent opencode: {}", store.display());
+    assert!(stderr.contains(&blocking), "{stderr}");
+    assert!(!stderr.contains("agent crush"), "{stderr}");
+    let published = normalize(&data);
+    assert!(published.contains(OPENCODE_TEXT) && published.contains(CRUSH_TEXT));
+
+    assert_published(&ingest_output("all", &home, &data, false), "healed pass");
+    assert!(normalize(&data).contains(OPENCODE_TEXT));
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
 }

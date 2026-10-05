@@ -2727,6 +2727,35 @@ impl IngestCache {
         }
     }
 
+    /// In an older generation's cache-derived inventory, an adapter that can read partially is
+    /// silent; a failed read of one pays a read of the published generation, `published`, and
+    /// one holding no row or event of it could have published nothing uncached either.
+    pub fn admit_unpublished_partial_read_agents<'a>(
+        &mut self,
+        preflight_agents: impl IntoIterator<Item = &'a str>,
+        mut published: impl FnMut(&str) -> bool,
+    ) {
+        if !self.legacy_cache_inventory() {
+            return;
+        }
+        let failed: HashSet<String> = preflight_agents
+            .into_iter()
+            .chain(self.source_read_issues.iter().map(|read| read.agent))
+            .filter(|agent| crate::ingest::registry::partial_read_agent(agent))
+            .map(str::to_owned)
+            .collect();
+        for agent in failed {
+            if !self.unpublished_agents.contains(&agent) && !published(&agent) {
+                self.unpublished_agents.insert(agent);
+            }
+        }
+    }
+
+    /// An inventory rebuilt from a cache an older generation wrote.
+    fn legacy_cache_inventory(&self) -> bool {
+        self.published_from_cache && self.legacy_generation
+    }
+
     /// The token databases the published generation may hold material of; see
     /// [`Self::token_namespaces`]. `None` when that record is missing or describes another one.
     pub fn set_published_token_namespaces(
@@ -2787,7 +2816,8 @@ impl IngestCache {
         self.published_from_cache
             && crate::ingest::registry::token_prefix(agent, scope).is_none()
             && (crate::ingest::registry::whole_store_agent(agent)
-                || (self.legacy_generation && crate::ingest::registry::partial_read_agent(agent)))
+                || (self.legacy_cache_inventory()
+                    && crate::ingest::registry::partial_read_agent(agent)))
     }
 
     /// Whether this cache holds conversations with rows or events of the token store database
@@ -2821,13 +2851,18 @@ impl IngestCache {
                 .is_none_or(|published| published.iter().any(recorded))
     }
 
-    /// A scope with nothing at stake: its agent has nothing published, and it is a whole store
-    /// or a token database this cache holds no conversation of, so no publication drops a row.
+    /// A scope with nothing at stake: its agent has nothing published, and it is a whole store,
+    /// a source an older generation's inventory is silent on, or a token database this cache
+    /// holds no conversation of, so no publication drops a row.
     fn unpublished_scope(&self, agent: &str, scope: &Path) -> bool {
         self.unpublished_agents.contains(agent)
             && match crate::ingest::registry::token_prefix(agent, scope) {
                 Some(_) => !self.holds_token_entries(agent, scope),
-                None => crate::ingest::registry::whole_store_agent(agent),
+                None => {
+                    crate::ingest::registry::whole_store_agent(agent)
+                        || (self.legacy_cache_inventory()
+                            && crate::ingest::registry::partial_read_agent(agent))
+                }
             }
     }
 
@@ -5722,6 +5757,57 @@ mod tests {
             MaterialVerdict::Retained
         );
         assert!(!cache.unreadable_scope_covered("claude", transcript));
+    }
+
+    #[test]
+    fn an_older_generation_admits_a_partial_read_agent_only_past_an_unpublished_generation() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let store = Path::new("/fixture/.local/share/opencode");
+        let project = Path::new("/fixture/.claude/projects/locked");
+        let legacy = || {
+            let mut cache = IngestCache::cold();
+            cache.legacy_generation = true;
+            cache.set_published_material_from_cache();
+            cache
+        };
+
+        // The release may have published this store's rows uncached: silent until proven.
+        let mut published = legacy();
+        assert_eq!(
+            published.published_material_under("opencode", store),
+            MaterialVerdict::Unknown
+        );
+        published.admit_unpublished_partial_read_agents(["opencode"], |_| true);
+        assert_eq!(
+            published.published_material_under("opencode", store),
+            MaterialVerdict::Unknown
+        );
+        assert!(!published.unreadable_scope_covered("opencode", store));
+
+        let mut unpublished = legacy();
+        let mut read = Vec::new();
+        unpublished.admit_unpublished_partial_read_agents(["opencode", "claude"], |agent| {
+            read.push(agent.to_owned());
+            false
+        });
+        assert_eq!(read, ["opencode"], "only a silenced agent pays the read");
+        assert_eq!(
+            unpublished.published_material_under("opencode", store),
+            MaterialVerdict::Retained
+        );
+        assert!(unpublished.unreadable_scope_covered("opencode", store));
+        assert_eq!(
+            unpublished.published_material_under("claude", project),
+            MaterialVerdict::Retained
+        );
+
+        // A current inventory is never silent, so nothing is read or admitted.
+        let mut current = IngestCache::cold();
+        current.set_published_material_from_cache();
+        current.admit_unpublished_partial_read_agents(["opencode"], |_| unreachable!());
+        assert!(current.unpublished_agents.is_empty());
     }
 
     #[test]

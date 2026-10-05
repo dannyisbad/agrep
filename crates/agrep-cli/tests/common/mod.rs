@@ -310,17 +310,36 @@ pub fn copy_dir(src: &Path, dst: &Path) {
 /// first index. None where a privileged runner ignores the mode bits.
 #[cfg(unix)]
 pub fn lock_claude_project(home: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = home.join(".claude").join("projects").join("proj-locked");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("locked.jsonl"), b"{}\n").unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read_dir(&dir).is_ok() {
-        unlock_dir(&dir);
+    lock_dir(&dir)
+}
+
+/// Plant an opencode store under `home` whose data directory no pass can read, as if locked
+/// before the first index. None where a privileged runner ignores the mode bits.
+#[cfg(unix)]
+pub fn lock_opencode_store(home: &Path) -> Option<PathBuf> {
+    let dir = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&dir).unwrap();
+    let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql")).unwrap();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute_batch(&seed).unwrap();
+    conn.close().unwrap();
+    lock_dir(&dir)
+}
+
+/// Make `dir` unreadable; None (and `dir` readable again) where the mode bits are ignored.
+#[cfg(unix)]
+pub fn lock_dir(dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(dir).is_ok() {
+        unlock_dir(dir);
         return None;
     }
-    Some(dir)
+    Some(dir.to_path_buf())
 }
 
 #[cfg(unix)]

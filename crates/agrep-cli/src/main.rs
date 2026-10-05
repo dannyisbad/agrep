@@ -3795,20 +3795,24 @@ fn runtime_source_issue_value(
     })
 }
 
-fn first_source_issue_label(
+/// The first issue `settled`/`read_settled` cannot publish past, or the first issue at all when
+/// every one is settled (the pass was held back for another reason).
+fn blocking_source_issue_label(
     issues: &[ingest::registry::SourceIssue],
     runtime_issues: &[agrep_core::ingest_cache::SourceReadIssue],
+    settled: impl Fn(&ingest::registry::SourceIssue) -> bool,
+    read_settled: impl Fn(&agrep_core::ingest_cache::SourceReadIssue) -> bool,
 ) -> Option<String> {
-    if let Some(issue) = issues.first() {
-        return Some(format!(
+    let label = |issue: &ingest::registry::SourceIssue| {
+        format!(
             "agent {}: {} ({}: {})",
             issue.agent(),
             issue.path(),
             issue.kind(),
             issue.reason()
-        ));
-    }
-    runtime_issues.first().map(|issue| {
+        )
+    };
+    let read_label = |issue: &agrep_core::ingest_cache::SourceReadIssue| {
         format!(
             "agent {}: {} ({}: {})",
             issue.agent,
@@ -3816,7 +3820,19 @@ fn first_source_issue_label(
             issue.kind,
             issue.reason
         )
-    })
+    };
+    issues
+        .iter()
+        .find(|issue| !settled(issue))
+        .map(label)
+        .or_else(|| {
+            runtime_issues
+                .iter()
+                .find(|issue| !read_settled(issue))
+                .map(read_label)
+        })
+        .or_else(|| issues.first().map(label))
+        .or_else(|| runtime_issues.first().map(read_label))
 }
 
 /// Source defects the snapshot itself serializes and a retry cannot heal: only the user can
@@ -5593,15 +5609,36 @@ fn index_cmd_locked(
     let session_aliases = session_aliases(&pcache, &msgs);
     lap!("ingest+dedupe");
     // A whole store holds last-good rows only in its snapshot; when no snapshot covers a failed
-    // read, the published generation itself is read for its agent, but only then.
+    // read, the published generation itself is read for its agent, but only then. So is it for
+    // an adapter an older generation's cache-derived inventory is silent on.
     if published_legible {
         pcache.admit_unpublished_whole_store_agents(|agent| {
             cache::published_agent_material(&data, agent)
         });
+        pcache.admit_unpublished_partial_read_agents(
+            source_issues.iter().map(|issue| issue.agent()),
+            |agent| cache::published_agent_material(&data, agent),
+        );
     }
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
         && source_preflight_error.is_none();
+    // Only a positive Retained verdict may publish past an unreadable scope.
+    let preflight_issue_settled = |issue: &ingest::registry::SourceIssue| {
+        durable_source_issue(issue.kind())
+            && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
+                == agrep_core::ingest_cache::MaterialVerdict::Retained
+    };
+    let read_issue_settled = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        source_issues
+            .iter()
+            .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
+            // Only a deterministic parse failure ("source-read-failed") may ride the
+            // covered lane: guard-synthesized absence issues ("source-read-incomplete")
+            // keep the two-stable-observation deletion protocol.
+            || (read.kind == "source-read-failed"
+                && pcache.unreadable_scope_covered(read.agent, &read.path))
+    };
     // A parse failure is stably unreadable like a stat failure PROVIDED the guarded
     // snapshot serves the scope's last-good rows or the inventory proves it empty:
     // one broken store degrades to disclosed staleness, never a frozen index.
@@ -5609,22 +5646,11 @@ fn index_cmd_locked(
         && source_preflight_error.is_none()
         && (!source_issues.is_empty() || !pcache.source_read_issues().is_empty())
         && source_before.is_some()
-        && source_issues.iter().all(|issue| {
-            durable_source_issue(issue.kind())
-                // Only a positive Retained verdict may publish past an unreadable scope.
-                && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
-                    == agrep_core::ingest_cache::MaterialVerdict::Retained
-        })
-        && pcache.source_read_issues().iter().all(|read| {
-            source_issues
-                .iter()
-                .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
-                // Only a deterministic parse failure ("source-read-failed") may ride the
-                // covered lane: guard-synthesized absence issues ("source-read-incomplete")
-                // keep the two-stable-observation deletion protocol.
-                || (read.kind == "source-read-failed"
-                    && pcache.unreadable_scope_covered(read.agent, &read.path))
-        });
+        && source_issues.iter().all(preflight_issue_settled)
+        && pcache.source_read_issues().iter().all(read_issue_settled);
+    let read_issue_served = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        pcache.unread_scope_served(read.agent, &read.path)
+    };
     // This pass read every source, so its verdict is the whole truth about
     // their health. Publication can still be declined for reasons that say
     // nothing about readability, and a record no pass retires outlives its bug.
@@ -5647,9 +5673,14 @@ fn index_cmd_locked(
     // on source health; every other incomplete output keeps the fail-closed retry.
     if !pcache.output_complete() && !stable_unreadable {
         let detail = source_detail_suffix(
-            first_source_issue_label(&source_issues, pcache.source_read_issues())
-                .or_else(|| source_preflight_error.clone())
-                .as_deref(),
+            blocking_source_issue_label(
+                &source_issues,
+                pcache.source_read_issues(),
+                preflight_issue_settled,
+                read_issue_settled,
+            )
+            .or_else(|| source_preflight_error.clone())
+            .as_deref(),
         );
         // The tail names only satisfiable levers: retries and --full both re-read sources,
         // so a durably unreadable scope with no cache witness recovers only with its access.
@@ -5681,15 +5712,8 @@ fn index_cmd_locked(
     let repair_served = repair_events
         && pcache.decoded_last_good_base()
         && source_preflight_error.is_none()
-        && source_issues.iter().all(|issue| {
-            durable_source_issue(issue.kind())
-                && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
-                    == agrep_core::ingest_cache::MaterialVerdict::Retained
-        })
-        && pcache
-            .source_read_issues()
-            .iter()
-            .all(|read| pcache.unread_scope_served(read.agent, &read.path));
+        && source_issues.iter().all(preflight_issue_settled)
+        && pcache.source_read_issues().iter().all(read_issue_served);
     // Incremental retries may publish cache-merged healthy sessions while the pending marker
     // forces another attempt; a complete pass has no safe partial fallback. A stably
     // unreadable source is a disclosed fact, not a retryable condition, so it may publish.
@@ -5700,11 +5724,24 @@ fn index_cmd_locked(
         && !stable_unreadable
         && !(repair_served && cache::event_store_consistent(&edir, &run_agents)?)
     {
-        let detail = source_detail_suffix(
-            first_source_issue_label(&source_issues, pcache.source_read_issues())
-                .or_else(|| source_preflight_error.clone())
-                .as_deref(),
-        );
+        // Name the scope that holds the pass back, not merely the first one it saw.
+        let detail = if repair_events {
+            blocking_source_issue_label(
+                &source_issues,
+                pcache.source_read_issues(),
+                preflight_issue_settled,
+                read_issue_served,
+            )
+        } else {
+            blocking_source_issue_label(
+                &source_issues,
+                pcache.source_read_issues(),
+                preflight_issue_settled,
+                read_issue_settled,
+            )
+        };
+        let detail =
+            source_detail_suffix(detail.or_else(|| source_preflight_error.clone()).as_deref());
         // "will retry" is a promise; it is only made when a retry can differ. A durably
         // unreadable scope recovers exactly when its access does, and the tail says so.
         let recovery = if durable_blocked {
