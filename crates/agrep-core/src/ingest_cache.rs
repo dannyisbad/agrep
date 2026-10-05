@@ -554,7 +554,8 @@ pub struct IngestCache {
     published_from_cache: bool,
     /// Decoded from an older cache generation, whose builds published partial reads uncached.
     legacy_generation: bool,
-    /// Agents the verified published generation holds no row or event of.
+    /// Agents no publication can drop anything of: the verified published generation holds no
+    /// row or event of theirs, or this pass serves every one of them it holds.
     unpublished_agents: HashSet<String>,
     /// Agents whose snapshot this pass seeded from a read that missed part of their store: not
     /// yet published, it vouches for nothing the read missed.
@@ -2751,6 +2752,55 @@ impl IngestCache {
         }
     }
 
+    /// Whole stores whose failed read seeded a snapshot this pass: a read of the published
+    /// generation, `published`, admits one whose every row and event session the seed serves.
+    /// A failed unit yields neither, so whatever the seed serves of a session came whole.
+    pub fn admit_fully_served_whole_store_agents(
+        &mut self,
+        mut published: impl FnMut(&str) -> Option<crate::cache::PublishedAgentRows>,
+    ) {
+        let seeded: Vec<String> = self
+            .seeded_snapshots
+            .iter()
+            .filter(|agent| !self.unpublished_agents.contains(*agent))
+            .filter(|agent| crate::ingest::registry::whole_store_agent(agent))
+            .filter(|agent| !crate::ingest::registry::partial_read_agent(agent))
+            .cloned()
+            .collect();
+        for agent in seeded {
+            let Some(seed) = self.entries.get(&format!("\x00snapshot\x00{agent}")) else {
+                continue;
+            };
+            let turns: HashSet<(&str, u32)> = seed
+                .msgs
+                .iter()
+                .map(|message| (message.session.as_ref(), message.turn))
+                .collect();
+            let sessions: HashSet<&str> = turns.iter().map(|(session, _)| *session).collect();
+            let event_sessions: HashSet<&str> = seed
+                .event_keys
+                .iter()
+                .map(|key| key.session.as_str())
+                .collect();
+            let served = published(&agent).is_some_and(|rows| {
+                rows.turns
+                    .iter()
+                    .all(|(session, turn)| turns.contains(&(session.as_str(), *turn)))
+                    && rows
+                        .sessions
+                        .iter()
+                        .all(|session| sessions.contains(session.as_str()))
+                    && rows
+                        .event_sessions
+                        .iter()
+                        .all(|session| event_sessions.contains(session.as_str()))
+            });
+            if served {
+                self.unpublished_agents.insert(agent);
+            }
+        }
+    }
+
     /// An inventory rebuilt from a cache an older generation wrote.
     fn legacy_cache_inventory(&self) -> bool {
         self.published_from_cache && self.legacy_generation
@@ -2851,9 +2901,9 @@ impl IngestCache {
                 .is_none_or(|published| published.iter().any(recorded))
     }
 
-    /// A scope with nothing at stake: its agent has nothing published, and it is a whole store,
-    /// a source an older generation's inventory is silent on, or a token database this cache
-    /// holds no conversation of, so no publication drops a row.
+    /// A scope with nothing at stake: no publication can drop anything of its agent, and it is a
+    /// whole store, a source an older generation's inventory is silent on, or a token database
+    /// this cache holds no conversation of.
     fn unpublished_scope(&self, agent: &str, scope: &Path) -> bool {
         self.unpublished_agents.contains(agent)
             && match crate::ingest::registry::token_prefix(agent, scope) {

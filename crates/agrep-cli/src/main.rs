@@ -5615,6 +5615,9 @@ fn index_cmd_locked(
         pcache.admit_unpublished_whole_store_agents(|agent| {
             cache::published_agent_material(&data, agent)
         });
+        pcache.admit_fully_served_whole_store_agents(|agent| {
+            cache::published_agent_rows(&data, agent)
+        });
         pcache.admit_unpublished_partial_read_agents(
             source_issues.iter().map(|issue| issue.agent()),
             |agent| cache::published_agent_material(&data, agent),
@@ -5704,8 +5707,15 @@ fn index_cmd_locked(
         );
     }
     // A pass complete only because a decoded base awaits reparse serves that base's rows as a
-    // warm pass does, so it publishes as one: an unreparsable entry would otherwise pin it.
-    let reparse_upgrade = !full && !repair_events && pcache.decoded_last_good_base();
+    // warm pass does, so it publishes as one: an unreparsable entry would otherwise pin it. A
+    // scope that base cannot serve has no warm fallback: an older build may never have cached it.
+    let reparse_upgrade = !full
+        && !repair_events
+        && pcache.decoded_last_good_base()
+        && source_issues.iter().all(|issue| {
+            pcache.published_material_under(issue.agent(), Path::new(issue.path()))
+                == agrep_core::ingest_cache::MaterialVerdict::Retained
+        });
     // Event repair after a crash may do the same only where the decoded base served every scope
     // it could not read and the crash left the event store consistent: the unread entries keep
     // their events and their reparse flag, so their next good read rebuilds those events.
@@ -5724,8 +5734,9 @@ fn index_cmd_locked(
         && !stable_unreadable
         && !(repair_served && cache::event_store_consistent(&edir, &run_agents)?)
     {
-        // Name the scope that holds the pass back, not merely the first one it saw.
-        let detail = if repair_events {
+        // Name the scope that holds the pass back, not merely the first one it saw: the repair
+        // lane's served test only where that lane failed on an issue.
+        let detail = if repair_events && !repair_served {
             blocking_source_issue_label(
                 &source_issues,
                 pcache.source_read_issues(),

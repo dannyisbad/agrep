@@ -4077,6 +4077,82 @@ pub fn published_agent_material(data: &Path, agent: &str) -> bool {
     !unnamed().unwrap_or(false)
 }
 
+/// What the published generation in `data` holds of one agent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PublishedAgentRows {
+    /// `(session, turn)` of every message row.
+    pub turns: HashSet<(String, u32)>,
+    /// Every session with a session row.
+    pub sessions: HashSet<String>,
+    /// Every session with stored events.
+    pub event_sessions: HashSet<String>,
+}
+
+/// Every row and event session of `agent` the published generation in `data` holds; None when
+/// any of them cannot be read whole or named. The caller must have verified those files the way
+/// [`published_agent_material`] requires.
+pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRows> {
+    #[derive(Deserialize)]
+    struct Row {
+        agent: String,
+        session: String,
+        turn: Option<u32>,
+    }
+    let read = || -> anyhow::Result<PublishedAgentRows> {
+        let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
+        let mut rows = PublishedAgentRows::default();
+        for name in ["sessions.jsonl", "messages.jsonl"] {
+            let path = data.join(name);
+            anyhow::ensure!(
+                fs::symlink_metadata(&path)?.is_file(),
+                "{} is not a regular file",
+                path.display()
+            );
+            let file = std::io::BufReader::new(fs::File::open(&path)?);
+            for line in std::io::BufRead::lines(file) {
+                let line = line?;
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let row: Row = serde_json::from_str(&line)?;
+                if row.agent != agent {
+                    continue;
+                }
+                match (name, row.turn) {
+                    ("messages.jsonl", Some(turn)) => rows.turns.insert((row.session, turn)),
+                    ("messages.jsonl", None) => anyhow::bail!("a message row without a turn"),
+                    _ => rows.sessions.insert(row.session),
+                };
+            }
+        }
+        let events = data.join("events");
+        if let Some(connection) = open_existing_event_store(&events)? {
+            let mut statement =
+                connection.prepare("SELECT session FROM event_sessions WHERE agent = ?1")?;
+            for session in statement.query_map([agent], |row| row.get::<_, String>(0))? {
+                rows.event_sessions.insert(session?);
+            }
+        }
+        // Older generations stored events one file per session, named after a lossy prefix.
+        let prefix = format!("{}-", readable_name(agent, 20));
+        match fs::read_dir(&events) {
+            Ok(entries) => {
+                for entry in entries {
+                    let name = entry?.file_name();
+                    anyhow::ensure!(
+                        name.to_str().is_some_and(|name| !name.starts_with(&prefix)),
+                        "an event file of {agent} outside the event store"
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(rows)
+    };
+    read().ok()
+}
+
 /// Whether the regular file at `path` contains `needle`, read in bounded chunks.
 fn file_contains(path: &Path, needle: &[u8]) -> anyhow::Result<bool> {
     let metadata = fs::symlink_metadata(path)?;

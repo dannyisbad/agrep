@@ -44,7 +44,9 @@ fn age_to_release_0_3_2(data: &Path, snapshot: Snapshot) {
     let published = data.join(".source_snapshot.bin");
     match snapshot {
         Snapshot::Published => assert!(published.exists()),
-        Snapshot::Withheld => fs::remove_file(published).unwrap(),
+        Snapshot::Withheld => {
+            let _ = fs::remove_file(published);
+        }
         Snapshot::Pending => fs::rename(published, data.join(".ingest_pending.bin")).unwrap(),
     }
     if !matches!(snapshot, Snapshot::Published) {
@@ -70,6 +72,19 @@ fn append_line(chat: &Path, minute: u32, text: &str) {
     let mut body = fs::read_to_string(chat).unwrap_or_default();
     body.push_str(&format!("{row}\n"));
     fs::write(chat, body).unwrap();
+}
+
+/// Remove every event-completeness proof, as a crash between event writes and their proof does.
+fn strip_event_proofs(data: &Path) {
+    for proof in fs::read_dir(data).unwrap().flatten() {
+        if proof
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".events_complete")
+        {
+            fs::remove_file(proof.path()).unwrap();
+        }
+    }
 }
 
 fn issue_kinds(data: &Path, agent: &str, path: &Path) -> Vec<String> {
@@ -281,15 +296,7 @@ fn upgrade_settles_beside_a_store_release_never_read(start: UpgradeStart, store:
         assert_eq!(&cache[12..20], b"AGRPCB01", "the cache was not re-encoded");
     }
     if !matches!(start, UpgradeStart::AsReleased) {
-        for proof in fs::read_dir(&data).unwrap().flatten() {
-            if proof
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".events_complete")
-            {
-                fs::remove_file(proof.path()).unwrap();
-            }
-        }
+        strip_event_proofs(&data);
     }
     assert!(
         !data.join(".source_snapshot.bin").exists(),
@@ -364,8 +371,12 @@ const OPENCODE_TEXT: &str = "convert config to yaml";
 
 /// Index `home`'s opencode store at `db`, with a text part caught mid-write, as release 0.3.2
 /// would have: the partial read publishes the rest of the database without caching it, and the
-/// snapshot is held back. Returns the data dir, the database parked aside.
-fn release_dir_with_uncached_opencode_rows(home: &Path, db: &Path) -> (PathBuf, PathBuf) {
+/// snapshot ends up as `snapshot`. Returns the data dir, the database parked aside.
+fn release_dir_with_uncached_opencode_rows(
+    home: &Path,
+    db: &Path,
+    snapshot: Snapshot,
+) -> (PathBuf, PathBuf) {
     rusqlite::Connection::open(db)
         .unwrap()
         .execute(
@@ -387,7 +398,7 @@ fn release_dir_with_uncached_opencode_rows(home: &Path, db: &Path) -> (PathBuf, 
     )
     .unwrap();
     let _ = fs::remove_dir_all(&scratch);
-    age_to_release_0_3_2(&data, Snapshot::Withheld);
+    age_to_release_0_3_2(&data, snapshot);
     (data, parked)
 }
 
@@ -399,7 +410,7 @@ fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
     let home = opencode_home();
     copy_dir(&fixture_home("claude"), &home);
     let db = home.join(".local/share/opencode/opencode.db");
-    let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db);
+    let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db, Snapshot::Withheld);
 
     fs::write(&db, b"not a database at all\n").unwrap();
     let failed = ingest_output("all", &home, &data, false);
@@ -420,6 +431,50 @@ fn upgrade_keeps_rows_release_published_from_a_partial_read_it_never_cached() {
     let _ = fs::remove_dir_all(&data);
 }
 
+/// The release published a partial opencode read without caching it. Once the store's directory
+/// cannot be listed, nothing the upgrade decoded serves those rows, whatever the release did with
+/// its snapshot: every pass keeps them until access returns, and then the index heals.
+#[cfg(unix)]
+#[test]
+fn upgrade_keeps_uncached_opencode_rows_behind_a_store_directory_it_cannot_list() {
+    for snapshot in [Snapshot::Published, Snapshot::Withheld, Snapshot::Pending] {
+        let home = opencode_home();
+        copy_dir(&fixture_home("claude"), &home);
+        let store = home.join(".local/share/opencode");
+        let db = store.join("opencode.db");
+        let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db, snapshot);
+        fs::rename(&parked, &db).unwrap();
+        let Some(locked) = lock_dir(&store) else {
+            let _ = fs::remove_dir_all(&home);
+            let _ = fs::remove_dir_all(&data);
+            return;
+        };
+        let passes: Vec<_> = (1..=3)
+            .map(|_| {
+                let code = ingest_output("all", &home, &data, false).status.code();
+                (normalize(&data).contains(OPENCODE_TEXT), code)
+            })
+            .collect();
+        unlock_dir(&locked);
+        for (pass, (kept, code)) in passes.into_iter().enumerate() {
+            assert!(
+                kept,
+                "{snapshot:?} snapshot, pass {} dropped rows the release published (exit {code:?})",
+                pass + 1
+            );
+        }
+        for pass in 1..=2 {
+            assert_published(
+                &ingest_output("all", &home, &data, false),
+                &format!("{snapshot:?} snapshot, healed pass {pass}"),
+            );
+            assert!(normalize(&data).contains(OPENCODE_TEXT));
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
 /// An upgrade held back by one scope past others it could publish past names that scope: here
 /// the opencode store whose rows the release published uncached, not the foreign crush database
 /// listed before it. Its rows stay published, and access to the store heals the index.
@@ -436,17 +491,9 @@ fn upgrade_refusal_names_the_store_that_holds_it_back() {
         .unwrap()
         .execute_batch(&seed)
         .unwrap();
-    let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db);
+    let (data, parked) = release_dir_with_uncached_opencode_rows(&home, &db, Snapshot::Withheld);
     fs::rename(&parked, &db).unwrap();
-    for proof in fs::read_dir(&data).unwrap().flatten() {
-        if proof
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".events_complete")
-        {
-            fs::remove_file(proof.path()).unwrap();
-        }
-    }
+    strip_event_proofs(&data);
     let Some(locked) = lock_dir(&store) else {
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&data);
@@ -464,6 +511,59 @@ fn upgrade_refusal_names_the_store_that_holds_it_back() {
 
     assert_published(&ingest_output("all", &home, &data, false), "healed pass");
     assert!(normalize(&data).contains(OPENCODE_TEXT));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A repair pass the corrupted event store holds back, though its decoded base served every scope
+/// it could not read, names the scope it could not publish past: the unreadable transcript, not
+/// the foreign crush database the release never read and the pass settles past.
+#[cfg(unix)]
+#[test]
+fn repair_refusal_over_an_inconsistent_event_store_names_the_unreadable_transcript() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, foreign) = crush_upgrade_home();
+    fs::write(&foreign, b"plain text where crush keeps its database\n").unwrap();
+    let transcript = home.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl");
+    let data = temp_dir("release-upgrade-repair-label-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    age_to_release_0_3_2(&data, Snapshot::Published);
+    strip_event_proofs(&data);
+    let (name, mut payload) = event_rows(&data)
+        .into_iter()
+        .find(|(name, _)| name.starts_with("claude-"))
+        .unwrap();
+    payload.push(b'\n');
+    rusqlite::Connection::open(
+        data.join("events")
+            .join(agrep_core::cache::EVENT_STORE_NAME),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE event_sessions SET payload=?1 WHERE name=?2",
+        rusqlite::params![payload, name],
+    )
+    .unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&transcript).is_ok() {
+        // Privileged runners ignore the mode bits; there is no denial to observe.
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+        return;
+    }
+    let held = ingest_output("all", &home, &data, false);
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o644)).unwrap();
+    let stderr = String::from_utf8_lossy(&held.stderr);
+    assert!(!held.status.success(), "{stderr}");
+    assert!(stderr.contains("event repair observed"), "{stderr}");
+    let blocking = format!("agent claude: {}", transcript.display());
+    assert!(stderr.contains(&blocking), "{stderr}");
+    assert!(!stderr.contains("agent crush"), "{stderr}");
+
+    assert_published(&ingest_output("all", &home, &data, false), "healed pass");
+    assert!(normalize(&data).contains(CLAUDE_TEXT));
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
 }
@@ -562,4 +662,123 @@ fn upgrade_publishes_beside_kimi_sessions_deleted_under_a_kept_config() {
         );
         let _ = fs::remove_dir_all(&home);
     }
+}
+
+const CLINE_TEXT: &str = "build a cli flag parser";
+const CLINE_SECOND_TEXT: &str = "build a yaml config loader";
+const CLINE_SECOND_TASK: &str = "1767348200000";
+
+const CLINE_TORN: &str = r#"[{"role":"user","ts":1767348100000,"content":[{"type":"te"#;
+
+fn cline_task(home: &Path, id: &str) -> PathBuf {
+    home.join(".cline/data/tasks")
+        .join(id)
+        .join("api_conversation_history.json")
+}
+
+/// A claude + cline home whose task 1767348100000 was torn before release 0.3.2 indexed it, and
+/// its data dir as the release left it: the two readable tasks' rows published, no cline snapshot
+/// and the source snapshot withheld. Returns the home, its data dir and the planted claude chat.
+fn release_dir_beside_a_torn_whole_store_task() -> (PathBuf, PathBuf, PathBuf) {
+    let home = temp_dir("release-upgrade-cline-home");
+    copy_dir(&fixture_home("claude"), &home);
+    copy_dir(&fixture_home("cline"), &home);
+    let first = fs::read_to_string(cline_task(&home, "1767348000000")).unwrap();
+    let second = cline_task(&home, CLINE_SECOND_TASK);
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::write(&second, first.replace(CLINE_TEXT, CLINE_SECOND_TEXT)).unwrap();
+    let torn = cline_task(&home, "1767348100000");
+    fs::create_dir_all(torn.parent().unwrap()).unwrap();
+    fs::write(&torn, CLINE_TORN).unwrap();
+    let history: Vec<_> = ["1767348000000", CLINE_SECOND_TASK, "1767348100000"]
+        .into_iter()
+        .map(|id| {
+            serde_json::json!({"id": id, "cwdOnTaskInitialization": "/work/delta",
+                               "modelId": "claude-fable-5"})
+        })
+        .collect();
+    fs::write(
+        home.join(".cline/data/state/taskHistory.json"),
+        serde_json::Value::from(history).to_string(),
+    )
+    .unwrap();
+    let chat = plant_chat(&home);
+    let data = temp_dir("release-upgrade-cline-data");
+    assert_published(&ingest_output("all", &home, &data, false), "first index");
+    let published = normalize(&data);
+    assert!(published.contains(CLINE_TEXT) && published.contains(CLINE_SECOND_TEXT));
+    // The release's cache: every other source, and no cline snapshot.
+    let parked = home.join(".cline.parked");
+    fs::rename(home.join(".cline"), &parked).unwrap();
+    let scratch = temp_dir("release-upgrade-cline-scratch");
+    assert_published(&ingest_output("all", &home, &scratch, false), "cache donor");
+    fs::copy(
+        scratch.join(".ingest_cache.bin"),
+        data.join(".ingest_cache.bin"),
+    )
+    .unwrap();
+    let _ = fs::remove_dir_all(&scratch);
+    fs::rename(&parked, home.join(".cline")).unwrap();
+    age_to_release_0_3_2(&data, Snapshot::Withheld);
+    (home, data, chat)
+}
+
+/// Read whole, the rows the release published are all the upgrade's cline read serves again: no
+/// publication drops one, so every pass publishes beside the torn task, repair passes included.
+#[test]
+fn upgrade_publishes_beside_a_whole_store_task_torn_before_release_read_it() {
+    for proofs_lost in [false, true] {
+        let (home, data, chat) = release_dir_beside_a_torn_whole_store_task();
+        if proofs_lost {
+            strip_event_proofs(&data);
+        }
+        let torn = cline_task(&home, "1767348100000");
+        for minute in [1, 2, 3] {
+            let churn = format!("upgrade churn {minute}");
+            append_line(&chat, minute, &churn);
+            let context = format!("proofs lost: {proofs_lost}, pass {minute} after the upgrade");
+            assert_published(&ingest_output("all", &home, &data, false), &context);
+            let published = normalize(&data);
+            assert!(
+                published.contains(&churn),
+                "{context}: churn was not published"
+            );
+            assert!(
+                published.contains(CLINE_TEXT) && published.contains(CLINE_SECOND_TEXT),
+                "{context}: cline rows were dropped"
+            );
+            assert!(
+                issue_kinds(&data, "cline", &torn).contains(&"source-invalid".to_owned()),
+                "{context}: the torn task was not disclosed"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}
+
+/// Once a task the release published tears too, the upgrade's read serves none of its rows: no
+/// pass may publish without them, and the first whole read of that task heals the index.
+#[test]
+fn upgrade_keeps_whole_store_rows_release_published_once_their_task_tears() {
+    let (home, data, chat) = release_dir_beside_a_torn_whole_store_task();
+    let published_task = cline_task(&home, CLINE_SECOND_TASK);
+    let body = fs::read(&published_task).unwrap();
+    fs::write(&published_task, CLINE_TORN).unwrap();
+    for minute in [1, 2] {
+        append_line(&chat, minute, &format!("upgrade churn {minute}"));
+        let output = ingest_output("all", &home, &data, false);
+        assert!(
+            normalize(&data).contains(CLINE_SECOND_TEXT),
+            "pass {minute} dropped rows the release published (exit {:?})",
+            output.status.code()
+        );
+    }
+    fs::write(&published_task, body).unwrap();
+    append_line(&chat, 3, "upgrade churn 3");
+    assert_published(&ingest_output("all", &home, &data, false), "healed pass");
+    let published = normalize(&data);
+    assert!(published.contains(CLINE_SECOND_TEXT) && published.contains("upgrade churn 3"));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
 }
