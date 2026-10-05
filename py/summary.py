@@ -22,6 +22,7 @@ never reopens a finished family.
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as _dt
 import heapq
 import json
@@ -142,7 +143,8 @@ _AGENT_RETURNED_RE = re.compile(r"(?<![\w-])agentId: (\S+) \((?:use SendMessage|
 # the closing tag proves the cap left the number whole
 _AGENT_DURATION_RE = re.compile(r"<usage>[^<]*?\bduration_ms: (\d+)</usage>")
 # a SendMessage that resumed a stopped agent and waited returns its result inline: 2.1.199 says
-# `ran to completion. Result:`, 2.1.289 `Resumed agent <first 7 of the id, or its name>. Result:`
+# `ran to completion. Result:`, 2.1.240 on `Resumed agent <first 7 of the id, or its name>.
+# Result:`, and 2.1.289 by default `Resumed agent. Its final report follows`
 _INLINE_HANDBACK_RE = re.compile(r"\bResumed agent(?: (\S+?))?\. (?:Result:|Its final report "
                                  r"follows)|\bran to completion\. Result:")
 _PLAIN_AGENT_ID_RE = re.compile(r"a[0-9a-f]{16}")
@@ -189,6 +191,8 @@ class _Chat:
     # the family's other Claude chats: Claude keys its task list by session id, and subagents
     # run under the root's session, so they all edit one list
     task_kin: list[_Chat] = field(default_factory=list, repr=False, compare=False)
+    # derived from events and kin once both are set; see _agent_index
+    agent_index: _AgentIndex | None = field(default=None, repr=False, compare=False)
 
     def last_turn(self) -> _Turn | None:
         return max(self.turns, key=lambda row: (row.turn, row.ts)) if self.turns else None
@@ -1350,38 +1354,100 @@ def _finished_run(event: dict, side: _Chat) -> bool:
     return _claude_agent_id(side) in _AGENT_RETURNED_RE.findall(str(event.get("output") or ""))
 
 
+class _AgentIndex:
+    """What one chat's hand-back proofs read again and again, kept once its events and kin are set:
+    its activity moments and its named agent calls, and, with it as the holder, the family's named
+    calls and each of its messages' target and blocked-on run."""
+
+    def __init__(self) -> None:
+        self.moments: list[int] | None = None
+        self.launches: dict[str, list[tuple[int, str]]] | None = None
+        self.family: set[str] | None = None
+        self.named: dict[str, tuple[list[int], list[str]]] | None = None
+        self.memo: dict[tuple[str, int], tuple[dict, object]] = {}
+
+
+def _agent_index(chat: _Chat) -> _AgentIndex:
+    if chat.agent_index is None:
+        chat.agent_index = _AgentIndex()
+    return chat.agent_index
+
+
+def _memo(holder: _Chat, kind: str, event: dict, compute):
+    """`compute()` once per holder and event; the entry keeps the event, so its id stays its own."""
+    memo = _agent_index(holder).memo
+    hit = memo.get((kind, id(event)))
+    if hit is None or hit[0] is not event:
+        hit = (event, compute())
+        memo[(kind, id(event))] = hit
+    return hit[1]
+
+
 def _family(holder: _Chat) -> set[str]:
-    return {holder.session, *(kin.session for kin in holder.task_kin)}
+    index = _agent_index(holder)
+    if index.family is None:
+        index.family = {holder.session, *(kin.session for kin in holder.task_kin)}
+    return index.family
+
+
+def _named_launches(chat: _Chat) -> dict[str, list[tuple[int, str]]]:
+    """The chat's agent calls that named the agent and say which agent they ran, as name ->
+    [(ts, agent session)] in event order: the stored link, else the agentId line of the result."""
+    index = _agent_index(chat)
+    if index.launches is None:
+        index.launches = {}
+        for event in chat.events:
+            name = _fact(event, "name") if event.get("kind") == "subagent_start" else ""
+            if not name:
+                continue
+            child = str(event.get("child") or "")
+            named = _AGENT_RETURNED_RE.search(str(event.get("output") or ""))
+            if child or named:
+                index.launches.setdefault(name, []).append(
+                    (int(event.get("ts") or 0), child or _AGENT_SESSION_PREFIX + named.group(1)))
+    return index.launches
 
 
 def _named_agent(holder: _Chat, name: str, before: int) -> str:
     """The agent session the family's latest call that gave an agent `name` launched, up to
-    `before`: its stored link, else the agentId line of its result. "" when none says."""
-    calls = sorted((event for chat in (holder, *holder.task_kin) for event in chat.events
-                    if event.get("kind") == "subagent_start" and _fact(event, "name") == name
-                    and int(event.get("ts") or 0) <= before),
-                   key=lambda event: -int(event.get("ts") or 0))
-    for event in calls:
-        child = str(event.get("child") or "")
-        named = _AGENT_RETURNED_RE.search(str(event.get("output") or ""))
-        if child or named:
-            return child or _AGENT_SESSION_PREFIX + named.group(1)
-    return ""
+    `before`: its stored link, else the agentId line of its result. "" when none says. At equal
+    times the holder's own call wins, then its kin's in order."""
+    index = _agent_index(holder)
+    if index.named is None:
+        rows: dict[str, list[tuple[int, int, str]]] = {}
+        order = 0
+        for chat in (holder, *holder.task_kin):
+            for given, launches in _named_launches(chat).items():
+                for ts, session in launches:
+                    rows.setdefault(given, []).append((ts, -order, session))
+                    order += 1
+        index.named = {}
+        for given, calls in rows.items():
+            # sorted by time; at one time the first-seen call sorts last, where the bisect lands
+            calls.sort()
+            index.named[given] = ([ts for ts, _rank, _session in calls],
+                                  [session for _ts, _rank, session in calls])
+    found = index.named.get(name)
+    at = bisect.bisect_right(found[0], before) - 1 if found is not None else -1
+    return found[1][at] if at >= 0 else ""
 
 
 def _message_target(holder: _Chat, event: dict) -> str:
     """The agent session a SendMessage reached: the agent its result resumed, else its recipient,
     a name read through the family call that gave it. "" when no recipient was kept."""
-    child = str(event.get("child") or "")
-    if child:
-        return child
-    to = _fact(event, "to")
-    if not to:
-        recipient = _SEND_TO_RE.search(str(event.get("input") or ""))
-        to = recipient.group(1) if recipient else ""
-    if not to:
-        return ""
-    return _named_agent(holder, to, int(event.get("ts") or 0)) or _AGENT_SESSION_PREFIX + to
+    def resolve() -> str:
+        child = str(event.get("child") or "")
+        if child:
+            return child
+        to = _fact(event, "to")
+        if not to:
+            recipient = _SEND_TO_RE.search(str(event.get("input") or ""))
+            to = recipient.group(1) if recipient else ""
+        if not to:
+            return ""
+        return _named_agent(holder, to, int(event.get("ts") or 0)) or _AGENT_SESSION_PREFIX + to
+
+    return _memo(holder, "target", event, resolve)
 
 
 def _addresses(holder: _Chat, event: dict, side: _Chat) -> bool:
@@ -1418,9 +1484,12 @@ def _engagements(holder: _Chat, side: _Chat) -> list[dict]:
 
 
 def _side_moments(side: _Chat) -> list[int]:
-    return [moment for moment in (*(row.ts for row in side.turns),
-                                  *(int(event.get("ts") or 0) for event in _activity(side)))
-            if moment > 0]
+    index = _agent_index(side)
+    if index.moments is None:
+        index.moments = [moment for moment in (
+            *(row.ts for row in side.turns),
+            *(int(event.get("ts") or 0) for event in _activity(side))) if moment > 0]
+    return index.moments
 
 
 def _returned(event: dict) -> int | None:
@@ -1470,18 +1539,23 @@ def _blocked_on(holder: _Chat, event: dict, side: _Chat) -> bool:
     """An inline hand-back neither its stored target nor its text ties to a family agent: the
     call held its chat until the run ended, so the run is the one agent active, and only active,
     from the call until it returned (else until the chat went on)."""
-    if _message_target(holder, event) in _family(holder) or any(
-            _addresses(holder, event, kin) for kin in holder.task_kin):
-        return False
-    called = int(event.get("ts") or 0)
-    resumed = _returned(event) or min(
-        (moment for moment in _side_moments(holder) if moment > called), default=None)
-    if resumed is None:
-        return False
-    active = [kin for kin in holder.task_kin
-              if any(called < moment <= resumed for moment in _side_moments(kin))]
-    return (len(active) == 1 and active[0] is side
-            and all(moment <= resumed for moment in _side_moments(side) if moment > called))
+    def blocked_run() -> _Chat | None:
+        if _message_target(holder, event) in _family(holder) or any(
+                _addresses(holder, event, kin) for kin in holder.task_kin):
+            return None
+        called = int(event.get("ts") or 0)
+        resumed = _returned(event) or min(
+            (moment for moment in _side_moments(holder) if moment > called), default=None)
+        if resumed is None:
+            return None
+        active = [kin for kin in holder.task_kin
+                  if any(called < moment <= resumed for moment in _side_moments(kin))]
+        if len(active) != 1 or any(moment > resumed for moment in _side_moments(active[0])
+                                   if moment > called):
+            return None
+        return active[0]
+
+    return _memo(holder, "blocked", event, blocked_run) is side
 
 
 def _agent_returned(root: _Chat, side: _Chat) -> bool:

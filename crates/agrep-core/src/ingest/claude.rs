@@ -333,7 +333,8 @@ fn apply_agent_outcome(event: &mut Event, raw: &RawValue) {
         }
         text(outcome.agent_id)
     } else {
-        // 2.1.240 on returns an inline result as `inlineHandback`; 2.1.199 said so in `message`
+        // 2.1.289 marks an inline result with `inlineHandback` and 2.1.199 in `message`; 2.1.240's
+        // `Resumed agent <id or name>. Result:` is left to summary's reading of the display text
         let inline = outcome.inline_handback.is_some()
             || text(outcome.message)
                 .is_some_and(|message| message.contains("ran to completion. Result:"));

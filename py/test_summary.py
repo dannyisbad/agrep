@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -826,6 +827,59 @@ class SummaryTests(unittest.TestCase):
         root = chat("r", [0], [returned, message])
         root.task_kin, side.task_kin = [side], [root]
         self.assertTrue(summary._addresses(root, message, side))
+
+    def test_a_large_agent_family_classifies_in_linear_time(self) -> None:
+        # 60 sync agents of 400 calls, 200 messages to them by id or by name, and one background
+        # agent still running: each message's target resolves once, not once per side chat
+        import summary
+
+        def chat(session: str, turn_ts: int, events: list[dict],
+                 reply: str = "Done.") -> summary._Chat:
+            out = summary._Chat(session=session, agent="claude", project="p", root="r",
+                                side=session != "r", first_ts=0, last_ts=0, first_text="go")
+            out.turns = [summary._Turn(turn=0, ts=turn_ts, who="user", text="go", digest=None)]
+            out.replies = {0: reply} if reply else {}
+            out.events = events
+            return out
+
+        clock, launches, sides = 1_800_000_000_000, [], []
+        for n in range(60):
+            launches.append({"kind": "subagent_start", "name": "Agent", "ts": clock, "ok": True,
+                             "output": "[Subagent hand-back] …", "child": f"agent-a{n:016x}",
+                             "meta": f"name=w{n} status=completed returned={clock + 6_000}"})
+            sides.append(chat(f"agent-a{n:016x}", clock + 1, [
+                {"kind": "tool", "name": "Read", "ts": clock + 2 + i, "ok": True}
+                for i in range(400)]))
+            clock += 7_000
+        messages = []
+        for n in range(200):
+            to = f"a{n % 60:016x}" if n % 2 else f"w{n % 60}"
+            messages.append({"kind": "tool", "name": "SendMessage", "ts": clock, "ok": True,
+                             "output": json.dumps({"success": True, "message": "queued"}),
+                             "meta": f"to={to} returned={clock + 1}"})
+            clock += 1_000
+        busy = {"kind": "subagent_start", "name": "Agent", "ts": clock, "ok": True,
+                "child": "agent-a" + "f" * 16, "meta": f"status=async_launched returned={clock}"}
+        sides.append(chat("agent-a" + "f" * 16, clock + 1,
+                          [{"kind": "tool", "name": "Bash", "ts": clock + 60_000}], reply=""))
+        root = chat("r", clock - 10_000_000, [*launches, *messages, busy])
+        for member in (root, *sides):
+            member.task_kin = [other for other in (root, *sides) if other is not member]
+
+        class Handles:
+            def session(self, session: str) -> str:
+                return session
+
+            def turn(self, chat_: summary._Chat, turn: int) -> str:
+                return f"{chat_.session}:{turn}"
+
+        started = time.perf_counter()
+        item = summary._pending_item(root, sides, Handles())
+        elapsed = time.perf_counter() - started
+        self.assertEqual((item["status"], item["evidence_session"]),
+                         ("agent_work_incomplete", "agent-a" + "f" * 16))
+        # well under 0.1 s here; one rescan of the family per message per side took seconds
+        self.assertLess(elapsed, 2.0)
 
     def test_capped_cursor_merge_leaves_the_list_unknown(self) -> None:
         # the merge closing items 9 and 10 was cut by the event cap: they are neither open nor done
