@@ -249,6 +249,14 @@ class InvariantDetectionTests(unittest.TestCase):
             self.assertEqual(check.counts["container_named_folder_labels"], {"codex": 1})
             check = invariants.check_project_labels(sessions, book)
             self.assertEqual(check.counts["generic_container_labels"], {"codex": 1})
+            claude = Path(temp) / "claude.jsonl"
+            claude.write_text(json.dumps(
+                {"type": "user", "sessionId": "c1", "cwd": "/Users/u/Desktop/projects/amber/t"}) + "\n",
+                encoding="utf-8")
+            book[str(claude)] = {"agent": "claude"}
+            check = invariants.check_project_labels(
+                [{"agent": "claude", "session": "c1", "project": "t"}], book)
+            self.assertEqual(check.counts["generic_container_labels"], {"claude": 1})
 
     def test_family_closure_rejects_an_alias_claimed_twice(self) -> None:
         with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as temp:

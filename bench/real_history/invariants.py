@@ -308,8 +308,9 @@ def check_project_labels(sessions: list[dict], book: dict[str, dict] | None = No
             cwds = _session_cwds(row["agent"], row["session"], book) if book is not None else []
             if cwds and all(scrub.project_root(cwd) is None for cwd in cwds):
                 bare[row["agent"]] += 1
-            elif cwds and all(_named_in_place(cwd, leaf) for cwd in cwds):
-                # A folder the user named like a container (Codex Desktop's ~/Documents/Codex/<date>/t).
+            elif row["agent"] == "codex" and cwds and all(_named_in_place(cwd, leaf) for cwd in cwds):
+                # Codex labels the cwd's own folder, so a folder named like a container is its label;
+                # Claude names the first repo root, so its leaf labels stay mislabels.
                 named[row["agent"]] += 1
             else:
                 generic[row["agent"]] += 1
