@@ -32,7 +32,7 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo test
-        run: cargo test --workspace --locked --release
+        run: cargo test --workspace --locked --release --no-fail-fast
 
   python:
     name: selftest ${{ matrix.os }} py${{ matrix.python }}
