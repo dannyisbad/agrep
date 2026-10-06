@@ -4111,22 +4111,20 @@ pub fn text_digest(text: &str) -> TextDigest {
     key
 }
 
-/// The identity of the files [`published_agent_rows`] reads, which differs once a pass replaces
-/// either; None when either is no regular file.
+/// The identity of the published messages.jsonl, which differs once a pass replaces it; None when
+/// it is no regular file. The rows a record stands in for are that file's own.
 pub fn published_generation_seal(data: &Path) -> Option<GenerationSeal> {
     use sha2::Digest as _;
+    let seal = file_identity_seal(&data.join("messages.jsonl")).ok()?;
     let mut hasher = sha2::Sha256::new();
-    for name in ["sessions.jsonl", "messages.jsonl"] {
-        let seal = file_identity_seal(&data.join(name)).ok()?;
-        for field in [
-            seal.device,
-            seal.inode,
-            seal.size,
-            seal.modified_ns,
-            seal.changed_ns,
-        ] {
-            hasher.update(field.to_le_bytes());
-        }
+    for field in [
+        seal.device,
+        seal.inode,
+        seal.size,
+        seal.modified_ns,
+        seal.changed_ns,
+    ] {
+        hasher.update(field.to_le_bytes());
     }
     let mut seal = [0; 16];
     seal.copy_from_slice(&hasher.finalize()[..16]);
@@ -7035,6 +7033,26 @@ mod tests {
         assert_eq!(rows["child"]["parent"], "shared");
         assert_eq!(rows["root-c"]["alias"], "first-name");
         assert!(!rows.contains_key("unindexed"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn the_generation_seal_follows_the_published_rows_not_the_session_index() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-generation-seal"));
+        fs::create_dir_all(&root).unwrap();
+        let replace = |name: &str, body: &str| {
+            let staged = root.join(format!("{name}.staged"));
+            fs::write(&staged, body).unwrap();
+            fs::rename(&staged, root.join(name)).unwrap();
+        };
+        replace("sessions.jsonl", "{\"session\":\"a\"}\n");
+        replace("messages.jsonl", "{\"text\":\"a\"}\n");
+        let sealed = published_generation_seal(&root).unwrap();
+        // A pass killed after replacing only sessions.jsonl leaves the old rows published.
+        replace("sessions.jsonl", "{\"session\":\"b\"}\n");
+        assert_eq!(published_generation_seal(&root), Some(sealed));
+        replace("messages.jsonl", "{\"text\":\"b\"}\n");
+        assert_ne!(published_generation_seal(&root), Some(sealed));
         fs::remove_dir_all(root).ok();
     }
 }

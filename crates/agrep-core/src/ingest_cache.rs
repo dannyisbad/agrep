@@ -631,19 +631,28 @@ struct ReleasedRows {
     sessions: HashSet<String>,
 }
 
-/// Reserved keys stage [`ReleasedRows`] with the cache, each naming the generation it counts
-/// against. Their entries name no source and hold no rows or events, so nothing else reads them.
-const RELEASED_ROW_KEY: &str = "\0released-row\0";
-const RELEASED_SESSION_KEY: &str = "\0released-session\0";
-
-fn released_key(key: &str) -> bool {
-    key.starts_with(RELEASED_ROW_KEY) || key.starts_with(RELEASED_SESSION_KEY)
+/// Every agent's [`ReleasedRows`] against `seal`'s generation, sorted so equal records pack equal.
+#[derive(Deserialize, Serialize)]
+struct PackedReleased {
+    seal: String,
+    agents: std::collections::BTreeMap<String, PackedAgent>,
 }
 
-fn released_entry(count: usize) -> Entry {
+/// One agent's rows as `(session, timestamp, digest, count)`, then its sessions gone whole.
+type PackedAgent = (Vec<(String, i64, String, usize)>, Vec<String>);
+
+/// One reserved key packs every record staged with the cache, so the base's entry count stays its
+/// count of sources. Every key under `\0released` is a record, and only this pass's survives it.
+const RELEASED_KEY: &str = "\0released\0";
+
+fn released_key(key: &str) -> bool {
+    key.starts_with("\0released")
+}
+
+fn released_entry() -> Entry {
     Entry {
         mtime: 0,
-        size: count as u64,
+        size: 0,
         identity: None,
         msgs: Vec::new(),
         event_keys: Vec::new(),
@@ -667,42 +676,57 @@ fn parse_hex16(text: &str) -> Option<[u8; 16]> {
     Some(bytes)
 }
 
-/// The [`ReleasedRows`] of each agent `entries` record against the generation `seal` names.
+/// The record key of `released`, against the generation `seal` names; None when it records nothing.
+fn pack_released(seal: &str, released: &HashMap<String, ReleasedRows>) -> Option<String> {
+    let mut agents = std::collections::BTreeMap::new();
+    for (agent, records) in released {
+        if records.rows.is_empty() && records.sessions.is_empty() {
+            continue;
+        }
+        let rows = records.rows.iter();
+        let mut rows: Vec<_> = rows
+            .map(|((session, ts, digest), count)| (session.clone(), *ts, hex16(digest), *count))
+            .collect();
+        rows.sort_unstable();
+        let mut sessions: Vec<String> = records.sessions.iter().cloned().collect();
+        sessions.sort_unstable();
+        agents.insert(agent.clone(), (rows, sessions));
+    }
+    if agents.is_empty() {
+        return None;
+    }
+    let packed = PackedReleased {
+        seal: seal.to_owned(),
+        agents,
+    };
+    serde_json::to_string(&packed)
+        .ok()
+        .map(|json| format!("{RELEASED_KEY}{json}"))
+}
+
+/// The [`ReleasedRows`] of each agent `entries` record against the generation `seal` names; none
+/// unless exactly one record names it.
 fn recorded_released_rows(
     entries: &HashMap<String, Entry>,
     seal: &str,
 ) -> HashMap<String, ReleasedRows> {
+    let mut packs = entries
+        .keys()
+        .filter_map(|key| key.strip_prefix(RELEASED_KEY))
+        .filter_map(|json| serde_json::from_str::<PackedReleased>(json).ok())
+        .filter(|packed| packed.seal == seal);
+    let (Some(packed), None) = (packs.next(), packs.next()) else {
+        return HashMap::new();
+    };
     let mut released: HashMap<String, ReleasedRows> = HashMap::new();
-    for (key, entry) in entries {
-        if let Some(record) = key.strip_prefix(RELEASED_ROW_KEY) {
-            let mut fields = record.splitn(5, '\0');
-            let mut field = || fields.next();
-            let (Some(sealed), Some(agent), Some(ts), Some(digest), Some(session)) =
-                (field(), field(), field(), field(), field())
-            else {
-                continue;
-            };
-            let (Ok(ts), Some(digest), Ok(count)) = (
-                ts.parse::<i64>(),
-                parse_hex16(digest),
-                usize::try_from(entry.size),
-            ) else {
-                continue;
-            };
-            if sealed == seal && count > 0 {
-                let rows = &mut released.entry(agent.to_owned()).or_default().rows;
-                rows.insert((session.to_owned(), ts, digest), count);
-            }
-        } else if let Some(record) = key.strip_prefix(RELEASED_SESSION_KEY) {
-            let mut fields = record.splitn(3, '\0');
-            let mut field = || fields.next();
-            if let (Some(sealed), Some(agent), Some(session)) = (field(), field(), field()) {
-                if sealed == seal {
-                    let sessions = &mut released.entry(agent.to_owned()).or_default().sessions;
-                    sessions.insert(session.to_owned());
-                }
+    for (agent, (rows, sessions)) in packed.agents {
+        let records = released.entry(agent).or_default();
+        for (session, ts, digest, count) in rows {
+            if let Some(digest) = parse_hex16(&digest).filter(|_| count > 0) {
+                *records.rows.entry((session, ts, digest)).or_default() += count;
             }
         }
+        records.sessions.extend(sessions);
     }
     released
 }
@@ -3322,7 +3346,8 @@ impl IngestCache {
     /// between the cache commit and that generation's replacement leaves the cache short of rows
     /// still published. Records against any other generation go.
     pub fn record_released_rows(&mut self) {
-        let mut records: HashMap<String, usize> = HashMap::new();
+        let mut released: HashMap<String, ReleasedRows> = HashMap::new();
+        let mut sealed = None;
         if let Some(seal) = self.published_seal.as_ref().map(hex16) {
             let changed = self.changed_entries();
             let mut agents: HashSet<&str> = self.released.keys().map(String::as_str).collect();
@@ -3338,39 +3363,30 @@ impl IngestCache {
             {
                 let touched = Self::touched_sessions(agent, &changed);
                 let rows = self.cached_rows(agent, &changed, |session| touched.contains(session));
-                let released = self
+                let record = self
                     .released_rows(agent, &changed, &touched, &rows)
                     .record();
-                for ((session, ts, digest), count) in released.rows {
-                    let digest = hex16(&digest);
-                    let key =
-                        format!("{RELEASED_ROW_KEY}{seal}\0{agent}\0{ts}\0{digest}\0{session}");
-                    records.insert(key, count);
-                }
-                for session in released.sessions {
-                    records.insert(
-                        format!("{RELEASED_SESSION_KEY}{seal}\0{agent}\0{session}"),
-                        1,
-                    );
-                }
+                released.insert(agent.to_owned(), record);
             }
+            sealed = Some(seal);
         }
+        let record = sealed.and_then(|seal| pack_released(&seal, &released));
         let stale: Vec<String> = self
             .entries
             .keys()
-            .filter(|key| released_key(key) && !records.contains_key(*key))
+            .filter(|key| released_key(key) && Some(*key) != record.as_ref())
             .cloned()
             .collect();
         for key in stale {
             self.remove_entry(&key);
         }
-        for (key, count) in records {
+        if let Some(key) = record {
             let staged = self
                 .entries
                 .get(&key)
-                .is_some_and(|entry| entry.size == count as u64 && !entry.legacy_needs_reparse);
+                .is_some_and(|entry| !entry.legacy_needs_reparse);
             if !staged {
-                self.put_entry(key, released_entry(count));
+                self.put_entry(key, released_entry());
             }
         }
     }
@@ -7020,9 +7036,11 @@ mod tests {
         });
         assert_eq!(verdict(&deleted, sealed, 1), MaterialVerdict::Retained);
         assert_eq!(verdict(&deleted, [2; 16], 1), MaterialVerdict::Drops);
-        // The records serve nothing: no row, event, source or published material.
+        // The records serve nothing: no row, event, source or published material. However many
+        // rows a pass saw go, they take one entry, so the base's entry count stays its sources.
         let mut records = IngestCache::cold();
         records.entries = deleted;
+        assert_eq!(records.entries.len(), 1);
         assert!(records.entries.keys().all(|key| super::released_key(key)));
         assert!(records.session_sources().is_empty() && records.live_event_files().is_empty());
         records.set_published_material_from_cache();
@@ -7031,17 +7049,20 @@ mod tests {
 
     #[test]
     fn a_released_record_leaves_a_cache_awaiting_its_whole_reparse() {
-        let record = format!(
-            "{}{}\0claude\0session",
-            super::RELEASED_SESSION_KEY,
-            super::hex16(&[1; 16])
-        );
+        let released = HashMap::from([(
+            "claude".to_owned(),
+            super::ReleasedRows {
+                rows: HashMap::new(),
+                sessions: HashSet::from(["session".to_owned()]),
+            },
+        )]);
+        let record = super::pack_released(&super::hex16(&[1; 16]), &released).unwrap();
         let entries = HashMap::from([
             (
                 "\0snapshot\0cline".to_owned(),
                 cached_entry(&[test_message("a row awaiting reparse")]),
             ),
-            (record, super::released_entry(1)),
+            (record, super::released_entry()),
         ]);
         let payload = bincode::serialize(&super::CacheFileRef {
             version: CACHE_VERSION,
