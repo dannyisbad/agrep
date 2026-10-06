@@ -207,6 +207,8 @@ class DataDirBoundaryTests(unittest.TestCase):
                 "AGREP_DATA_DIR": str(configured),
                 "AGREP_DATA_DIR_SOURCE": "env",
                 "AGREP_CLI": str(PY_DIR.parent / "cli.py"),
+                # The patch is process-local; a resident server would secure the dir with the real one.
+                "AGREP_NO_RESIDENT": "1",
             }
             completed = subprocess.run(
                 [sys.executable, "-c", script], env=env,
@@ -243,6 +245,7 @@ class DataDirBoundaryTests(unittest.TestCase):
                 "AGREP_DATA_DIR_SOURCE": "env",
                 "AGREP_CLI": str(PY_DIR.parent / "cli.py"),
                 "VANISHED": str(vanished),
+                "AGREP_NO_RESIDENT": "1",
             }
             completed = subprocess.run(
                 [sys.executable, "-c", script], cwd=root, env=env,
