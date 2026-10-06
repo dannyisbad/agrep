@@ -680,6 +680,7 @@ jobs:
         if: steps.release-state.outputs.state == 'published'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -989,16 +990,17 @@ jobs:
       - name: verify the live draft and expose it
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir live
           gh release download "$GITHUB_REF_NAME" --dir live
           diff --recursive --brief sealed/assets live
-          release=$(gh api \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
-          draft=$(jq -r '.draft' <<<"$release")
-          prerelease=$(jq -r '.prerelease' <<<"$release")
+          # The releases/tags endpoint never returns a draft; gh release view does.
+          release=$(gh release view "$GITHUB_REF_NAME" --json isDraft,isPrerelease)
+          draft=$(jq -r '.isDraft' <<<"$release")
+          prerelease=$(jq -r '.isPrerelease' <<<"$release")
           expected_prerelease=false
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             expected_prerelease=true
