@@ -756,6 +756,8 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
         with path.open("ab") as stream:
             stream.write(b"\nsuccessor-build\n")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        # A never-seen binary's first macOS exec waits on system assessment, holding off SIGSTOP.
+        subprocess.run([path, "--version"], capture_output=True, timeout=120, check=True)
         return path
 
     @staticmethod
