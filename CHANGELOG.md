@@ -1,6 +1,256 @@
 # Changelog
 
+## 0.4.0 — 2026-10-06
+
+### Agent coverage
+
+- Gemini CLI's current sessions are indexed. The adapter reads the JSONL
+  store (`~/.gemini/tmp/<hash>/chats/session-*.jsonl`) beside the legacy
+  `session-*.json`; a `.json` that `/chat resume` migrated into a `.jsonl`
+  sibling is superseded, so it is no longer parsed, served or counted, and
+  `why` judges the chat by the `.jsonl` Gemini reads. Prompts recorded as
+  part lists index, the text the person typed is kept over the expanded
+  `@file` request, and tool results, the environment preamble, hook context
+  and IDE editor context are not the human. `write_todos` items reach
+  `summary pending`.
+- A Gemini CLI chat reads as the conversation the person had, not as the
+  model's context after the CLI rewrote it. Gemini re-records every kept turn
+  under new ids whenever its context changes - compression (automatic or
+  `/compress`), tool-output masking, truncation, `/chat resume` - so a chat
+  gained a copy of itself on each rewrite. Copies now pair to the turns they
+  repeat, also when the CLI coalesced consecutive turns into one, and a
+  compression's `<state_snapshot>` becomes a recap row. An aborted or failed
+  request's rollback and a `/rewind` undo the prompt together with its
+  answers, a declined tool's rollback keeps the prompt, the CLI's own info,
+  warning and error notices and audio/video attachments never pair as turns,
+  and a patched model turn keeps its tool calls beside the reply it recorded.
+  A session its own rollbacks emptied publishes as empty instead of serving
+  rows the file undid. Verified against sessions written by gemini-cli's own
+  recorder (the current and the earlier checkpoint shape); hostile files -
+  one id removed per rewrite behind a long history, a `/rewind` to every
+  prompt - parse in linear time where they took minutes.
+- Codex compactions reach the search database as the empty recap rows the
+  rollout writes, so `postcompact`, the caller's live window and `summary`
+  find the boundary on both read paths. The rows are never search documents:
+  a regex that matches the empty string does not hit them and they do not
+  count toward term weights. A handle printed for the reply Codex wrote after
+  a compaction opens its turn instead of being refused as `out of range`, and
+  a turn that lies between indexed turns now reads `turn N is missing from
+  the index`. Databases built before this converge on their next refresh.
+- Claude Code's API-error rows (`API Error: 529 ...`, usage limits, `Prompt
+  is too long`), `<task-notification>` rows - including those queued while
+  the root chat was busy - and compactions are recorded as structural events
+  of their turn, never as prompts or tool calls; Codex compactions carry the
+  same marker. `around` prints each in place (`✗ API Error: ...`, `context
+  compacted`, `background task completed`) and counts them apart from tool
+  calls in its omission footers (`2 compactions, 1 API error omitted`); the
+  error text stays in the reply for search. A notification's task id links
+  the background subagent's transcript, so `summary` sees that hand-back.
+- Claude Code `Task`/`Agent` and `SendMessage` results are linked to the
+  subagent transcript they name (`agent-<id>.jsonl`) from the stored result
+  rather than from its display text, with the call's status and whether a
+  resumed agent handed its report back inline, across the 2.1.199, 2.1.240
+  and 2.1.289 shapes. A framed long report or an inline resume therefore
+  hands back through the stored link even when the text rules cannot read
+  it; events without stored results keep the text rules.
+
+### Search
+
+- Flag corrections name the flag they rewrite: `agrep: unrecognized
+  arguments: --limit 2; --limit is -n N here; run: agrep search lantern -n
+  2`, and a flag that does not apply says so (`--lexical is implied: chats
+  matches keywords only`). A rewrite that would change what was asked is
+  refused instead of run: an explicit value for the target's own spelling
+  wins over a renamed count whichever order they were typed (`deadlock --hits
+  3 -n 4` runs recall with `--hits 3`), `pack` with several queries is never
+  rewritten into one search that would join them, and a `--` after the query
+  gets a plain usage error rather than a command whose tokens would be
+  refused.
+- `agrep summary` stops reporting finished chats as pending work. A side
+  chat that handed its result back before the root replied, a trailing
+  compaction recap, a `Next steps:` section that does not end the reply, and
+  `- None` bullets under a remaining-work heading no longer reopen a chat;
+  explicit completion always wins over an open-looking bullet. A punctuated
+  list keeps its high confidence instead of a glued-bullet caveat. A recap is
+  activity for the time estimate but never a turn, so turn counts drop by
+  one per compaction. A side chat whose parent is not indexed heads a family
+  of its own and says so (`[side chat; parent not indexed]`). Turns come from
+  the published transcripts when the search database lags, and `--until`
+  alone selects the seven days before it.
+- `summary` reads each agent's own todo, compaction and hand-back shapes:
+  Claude Code's `TodoWrite` and its `TaskCreate`/`TaskUpdate`/`TaskList`
+  tools (one list shared by a root and its subagents; the store written last
+  decides after a resume across the switch), Cursor's `todo_write` merges by
+  id, omp's op-based todo replayed into the current list, Codex
+  `update_plan`, Gemini `write_todos`, opencode `todowrite`, and Kimi's
+  earlier `In Progress` spelling. A capped todo list recovers its complete
+  items or is reported as unknown (`todo list capped at index time`), never
+  as a wrong answer. A pi/omp subagent's terminal `yield`, a delegation
+  result carrying the side chat's reply (omp's task envelope, Codex's nested
+  JSON, a short completed Codex result) and a Claude agent result ending in
+  its `agentId:` line are hand-backs; a timed-out Codex wait is not. A
+  hand-back counts only for the run and batch it closed, so an agent resumed
+  or messaged later (`SendMessage`, `Resumed agent ... Result:`) is open
+  again until that run returns, and nested subagents count once the root is
+  past them.
+- `summary pending` reports a chat parked on a question tool
+  (`AskUserQuestion`, `ExitPlanMode`, omp `ask`, Codex `request_user_input`,
+  opencode `question`) as waiting on you and shows the question itself,
+  never raw JSON; a Claude turn that ended on an exact API-error or
+  usage-limit row is unfinished work, while a finished reply that merely
+  quotes an error is not.
+
+### Post-compact recovery
+
+- `agrep postcompact` for Codex finds the boundary from the stored recap row
+  on both read paths, with or without `--boundary-ms`. The reply Codex or
+  Claude wrote after a compaction files under that recap's own turn, so the
+  next boundary's window opens there and replays it while the recap text
+  itself stays out; the first boundary still stops before its own reply, and
+  a reply-only window never reports the recap's placeholder as the model.
+
+### Caller identity and self-exclusion
+
+- A Codex caller's live window starts at its own compaction now that the
+  recap row is stored. `summary` applies the window before it folds recaps,
+  so a withheld recap is never counted as activity or served as a reply.
+
+### Status, doctor and setup
+
+- `agrep why` answers what `agrep search` would serve, so the two never
+  disagree about a chat. While the search database is still building,
+  missing, busy under a writer's lock, of another schema, published by
+  another build or unreadable, searches scan the transcripts directly; a
+  chat they publish is `indexed` and the evidence line says why (`search
+  scans messages.jsonl directly`), pointing at `agrep doctor` when the
+  database is damaged. A database behind the transcripts is compared row by
+  row, and the verdict names what differs and from which source (`3 rows
+  messages.jsonl publishes not stored`, `2 stored tool rows the event store
+  no longer publishes`); a dead writer's hot journal is read the way search
+  reads it. A chat whose transcript vanished but which the lagging database
+  still serves is reported from those stored rows, resolved by id, project
+  or first line as `resume` would, and a chat that moves between the two
+  reads is reported, not crashed. A torn `sessions.jsonl` falls back to the
+  rows `messages.jsonl` derives, a missing one is `missing`, not torn.
+  Ambiguous references name where the candidates came from and how many,
+  a bare word never names a file in the working directory, and a relative
+  path or a symlink alias finds the file it names.
+- `agrep why` covers crush, Cursor and the whole-store agents. A crush or
+  Cursor database path, a Kimi, Cline or Antigravity session directory and
+  files inside it resolve the chat they belong to (Kimi subagent files to
+  the child chat); a conversation deleted from a live database is reported
+  as deleted, an emptied database too, and one conversation's bad row
+  leaves its siblings indexed. A moved store-wide key is a caveat, never a
+  verdict against an untouched chat; a store the census no longer discovers
+  is not called deleted; an unregistered store of several chats and a
+  database the census cannot read are `unprovable`, not ambiguous. Whether
+  the last index saw a file is read from that index's own store walk, never
+  from the file's age: a transcript moved or restored with its mtime intact,
+  or a file added to an indexed session directory, waits for the next index;
+  a file older than the last index that it never tallied is `discovered but
+  not parsed`, and a deleted transcript path answers like its chat id. `why`
+  is read-only: it no longer retires the removed explorer descriptor, and a
+  damaged event store it reads never wakes the daemon.
+- An explicit `agrep index` (also `--full`) after an upgrade retires the
+  previous build's wire-incompatible freshness daemon itself, as the daemon
+  spawn does, instead of declining the first post-upgrade run as fenced.
+  This build's own compatible daemon is left running, and a hostile or
+  unverifiable claim stays fenced and the index still declines.
+- A search-index refresh that did not publish says why on stderr: which meta
+  values (`stamp, build_id`) did not match this build, that a query failure
+  still marks the database for rebuild, or that it could not be opened.
+- `agrep doctor`'s staging-orphan census counts the Rust ingest's event-proof
+  temporaries, freshness-daemon owner tombs and token-material staging files
+  the way the native sweep reaps them: listed once the pid that wrote them is
+  dead, left alone while it lives.
+- On Windows, a routine `agrep audit` refuses an oversized SQLite family by
+  its size before taking any change proof. The proof can hash the whole file
+  there, so the refusal used to come only after reading every byte it was
+  refusing to copy.
+- A `.server` descriptor left by the removed web explorer and written with
+  CRLF line endings is retired. The cleanup compared the bytes on disk with
+  a newline-translated copy, never matched, and left the dead file behind.
+
+### Index integrity and ownership
+
+- A parser panic on one source costs that source, never the run. A worker
+  panic used to abort every agent's publication on each run that met the
+  hostile file; it is now caught per source in every lane, reported once as
+  a source issue whose reason quotes no store text (unwrapped errors,
+  sliced strings and printed byte buffers are withheld), the source keeps its
+  last-good rows, other agents' changes publish, the first-search row stream
+  stays parseable, and the source is reparsed once a fixed build ships. A
+  whole-store session that panics with no last-good rows keeps the published
+  generation until it parses again; a store that never published a row
+  cannot freeze the others, warm or cold, even through a torn publication.
+- A deleted agent store no longer blocks every index. Two consecutive clean
+  absence observations retire its rows even while other stores change
+  between runs and the parse cache was lost; deleting one root of a
+  multi-root store (pi's `~/.pi` beside `~/.omp`) converges the same way
+  while the sibling root keeps its rows, a denied root never counts as
+  absent, and a denial under a sibling cannot veto a real deletion. Files
+  behind a directory link whose target is gone (a Codex day directory moved
+  onto a drive that unmounted) are unreadable, not deleted: nothing drops the
+  prompts only that rollout holds, the issue stays disclosed, and remounting
+  leaves them in place.
+- A file rewritten in the very clock tick the scan began, keeping its size,
+  mtime and ctime, is re-verified on the next run instead of being trusted
+  on its stat key. Linux stamps files from a coarse clock, so such rewrites
+  could stay unindexed; stamps safely older than the scan are trusted at
+  once, so a quiet store re-reads nothing.
+- A crush or Cursor database another program owns (foreign tables, an empty
+  or partial schema, a file SQLite rejects) or that cannot be read is
+  disclosed and no longer blocks every other agent's index, on a first index
+  and after a good generation. Conversations already indexed stay published
+  behind it; with no cache left to serve them the pass still refuses rather
+  than publishing without them, but a database that never held a
+  conversation has nothing to lose and never holds a pass. Publications now
+  record which databases they served from, so a complete pass (`--full`, or
+  the first over an upgraded cache) beside a durably unreadable database
+  keeps its rows and publishes the other agents' changes, conversations
+  published while a snapshot was held back survive a lost cache, and a
+  sibling database failing the census cannot unpublish another's rows.
+- Upgrading from 0.3.2 over a data dir it published beside a source it could
+  not read - a foreign or unreadable crush database, an unreadable
+  transcript, Kimi sessions deleted under a kept config, a Cline task torn
+  before the release read it, a directory that can no longer be listed but
+  whose files published nothing - publishes on the first pass, keeps that
+  release's rows and discloses the source, and every later pass runs warm;
+  so does a first index that streamed rows or was killed before its
+  snapshot, and an upgrade from a build that kept no bound record. Where
+  rows the release published can no longer be read at all (a task that tore
+  after it, an opencode database it read partially and never cached that
+  now fails or sits in a directory that cannot be listed), no pass publishes
+  without them, the refusal names that store rather than the first issue it
+  saw, and regaining access heals the index. A torn Cline task index never
+  replaces the published rows' project attribution with the fallback one,
+  and a session deleted beside a symlinked opencode channel database
+  publishes as the deletion it is.
+- A freshness-daemon owner record left empty or torn by a writer killed
+  between creating and writing it no longer holds the index read-only for
+  good: past the publication grace the next pass reclaims it and publishes.
+  A record naming a live process stays a real lock at any age, and the
+  native writer's own temporary claim is staged and linked into place, so it
+  is never seen partial.
+- A published row is held only by an identical row, one for one. opencode
+  release channels sharing session ids, or a Codex session resumed in a
+  second rollout and renumbered across both, can no longer let one
+  database's or rollout's rows stand in for another's behind a lock, with or
+  without a parse cache and under `--full`. A pass killed between its cache
+  commit and the replacement of the published generation publishes what it
+  saw go - a rewound or deleted rollout - on the next pass.
+
+### Performance
+
+- `agrep summary` classifies a large Claude agent family in linear time:
+  each chat's hand-back proofs are computed once instead of being re-derived
+  per side chat.
+- On macOS, ending an orphaned resident child whose process group is already
+  exiting no longer fails on the `EPERM` the kernel answers for such a group.
+
 ## 0.3.2 — 2026-09-29
+
+Never published; these changes ship in 0.4.0.
 
 ### Agent coverage
 
