@@ -359,7 +359,7 @@ fn gemini_resume_then_compress_keeps_indexed_turns_and_forgets_the_retired_json(
     let session = "b1b1b1b1-0301-4000-8000-000000000301";
     let home = temp_dir("gemini-compress-home");
     copy_dir(&fixture_home("gemini_compress"), &home);
-    let chats = home.join(".gemini/tmp/hash7777synthetic/chats");
+    let chats = join_native(&home, ".gemini/tmp/hash7777synthetic/chats");
     let legacy = chats.join("session-2026-03-01T10-00-b1b1b1b1.json");
     let jsonl = chats.join("session-2026-03-01T10-00-b1b1b1b1.jsonl");
     let parked = home.join("parked.jsonl");

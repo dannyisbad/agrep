@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -261,7 +262,7 @@ class InvariantDetectionTests(unittest.TestCase):
     def test_family_closure_rejects_an_alias_claimed_twice(self) -> None:
         with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as temp:
             corpus = Path(temp) / "corpus.db"
-            with sqlite3.connect(corpus) as db:
+            with contextlib.closing(sqlite3.connect(corpus)) as db, db:
                 db.execute("CREATE TABLE session_family(session TEXT PRIMARY KEY, root TEXT, side INTEGER)")
                 db.executemany("INSERT INTO session_family VALUES(?,?,?)",
                                [("a", "a", 0), ("b", "b", 0), ("x", "a", 0)])

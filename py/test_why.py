@@ -57,12 +57,14 @@ def _rust_bin() -> Path:
     return Path(os.environ.get("AGREP_RS_BIN") or dist.ingest_bin())
 
 
-def _dead_explorer_descriptor() -> str:
-    """A `.server` record in the shape legacy_cleanup retires: its owner pid has exited."""
+def _dead_explorer_descriptor() -> tuple[str, subprocess.Popen[bytes]]:
+    """A `.server` record in the shape legacy_cleanup retires, and its exited owner.
+
+    Keep the owner referenced: its open handle stops Windows handing the pid to the next process."""
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait(timeout=30)
     return json.dumps({"pid": child.pid, "port": 1, "mode": "explorer",
-                       "process_start": "unknown"}) + "\n"
+                       "process_start": "unknown"}) + "\n", child
 
 
 def _native(relative: str) -> str:
@@ -557,7 +559,7 @@ class WhyCliReadOnlyTests(unittest.TestCase):
             self.descriptor.unlink()
 
     def plant(self) -> None:
-        self.record = _dead_explorer_descriptor()
+        self.record, self.dead_owner = _dead_explorer_descriptor()
         self.descriptor.write_text(self.record, encoding="utf-8")
         self.snapshot = self.sandbox.data_snapshot()
 

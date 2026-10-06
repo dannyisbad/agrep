@@ -19,6 +19,13 @@ pub fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
+/// `base` joined with the `/`-separated `rel` one component at a time, spelled as discovery
+/// spells it: Windows paths compare as strings in source keys and health issues.
+pub fn join_native(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 pub fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

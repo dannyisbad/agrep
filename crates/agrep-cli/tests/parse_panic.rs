@@ -13,6 +13,10 @@ const PANIC_TARGET: &str = "AGREP_TEST_PARSE_PANIC";
 const INJECTED_TEXT: &str = "injected transcript excerpt";
 const CODEX_ROLLOUT: &str =
     "2026/01/02/rollout-2026-01-02T10-00-00-22222222-2222-4222-8222-222222222222.jsonl";
+
+fn codex_rollout(home: &Path) -> PathBuf {
+    join_native(&join_native(home, ".codex/sessions"), CODEX_ROLLOUT)
+}
 /// The panicking build, and the release that fixed its parser.
 const BUILD: &str = "a1a1a1a1a1a1a1a1a1a1";
 const FIXED_BUILD: &str = "b2b2b2b2b2b2b2b2b2b2";
@@ -122,8 +126,8 @@ fn claude_codex_home(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     let home = temp_dir(tag);
     copy_dir(&fixture_home("claude"), &home);
     copy_dir(&fixture_home("codex"), &home);
-    let claude = home.join(".claude/projects/proj-alpha/sess-claude-0001.jsonl");
-    let codex = home.join(".codex/sessions").join(CODEX_ROLLOUT);
+    let claude = join_native(&home, ".claude/projects/proj-alpha/sess-claude-0001.jsonl");
+    let codex = codex_rollout(&home);
     (home, claude, codex)
 }
 
@@ -261,8 +265,8 @@ fn emit_rows_stream_stays_parseable_through_a_parser_panic() {
 fn token_lane_panic_keeps_each_conversation_last_good() {
     let home = crush_home();
     copy_dir(&fixture_home("codex"), &home);
-    let crush = home.join(".local/share/crush/crush.db");
-    let codex = home.join(".codex/sessions").join(CODEX_ROLLOUT);
+    let crush = join_native(&home, ".local/share/crush/crush.db");
+    let codex = codex_rollout(&home);
     let data = temp_dir("parse-panic-token-data");
     assert_published(&index(&home, &data, None), "first index");
     let indexed = messages(&data);
@@ -305,10 +309,10 @@ fn whole_store_home(tag: &str, agent: &str, sibling: bool) -> (PathBuf, PathBuf,
     let home = temp_dir(tag);
     copy_dir(&fixture_home(agent), &home);
     copy_dir(&fixture_home("codex"), &home);
-    let codex = home.join(".codex/sessions").join(CODEX_ROLLOUT);
+    let codex = codex_rollout(&home);
     let (session, target) = match agent {
         "kimi" => {
-            let session = fs::read_dir(home.join(".kimi/sessions"))
+            let session = fs::read_dir(join_native(&home, ".kimi/sessions"))
                 .unwrap()
                 .flatten()
                 .next()
@@ -322,7 +326,7 @@ fn whole_store_home(tag: &str, agent: &str, sibling: bool) -> (PathBuf, PathBuf,
             (session, target)
         }
         "antigravity" => {
-            let brain = home.join(".gemini/antigravity-cli/brain");
+            let brain = join_native(&home, ".gemini/antigravity-cli/brain");
             let session = brain.join("33333333-3333-4333-8333-333333333333");
             if sibling {
                 copy_dir(
@@ -330,7 +334,7 @@ fn whole_store_home(tag: &str, agent: &str, sibling: bool) -> (PathBuf, PathBuf,
                     &brain.join("66666666-6666-4666-8666-666666666666"),
                 );
             }
-            let target = session.join(".system_generated/logs/transcript.jsonl");
+            let target = join_native(&session, ".system_generated/logs/transcript.jsonl");
             (session, target)
         }
         _ => unreachable!("not a whole-store fixture: {agent}"),
