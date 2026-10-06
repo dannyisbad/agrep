@@ -1052,8 +1052,10 @@ def cmd_index(a) -> int:
     import indexd_runtime
     if getattr(a, "full", False):
         print("=== indexing transcripts ===", flush=True)
-        # cold-cache reparse of every store file (also reseeds the intake book)
+        # cold-cache reparse of every store file (also reseeds the intake book);
+        # an upgrade's predecessor daemon is retired first, as build_index does
         ingest = common.ingest_bin()
+        indexd_runtime.retire_displaceable_indexd_owner()
         r = subprocess.run(
             [str(ingest), "index", "--agent", "all", "--full"],
             cwd=str(ROOT),

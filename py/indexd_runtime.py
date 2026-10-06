@@ -1090,6 +1090,11 @@ def build_index(
     if quiet and common.WIN:
         kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     ingest = common.ingest_bin()
+    if require_search_index:
+        # An upgrade's predecessor daemon fences the Rust ingest read-only
+        # until something retires it; the explicit index does so itself, as
+        # the daemon spawn does, instead of declining the first post-upgrade run.
+        retire_displaceable_indexd_owner()
     # Callers normally prove the binary exists. The missing-path branch preserves
     # launch failure semantics without inventing an identity; every real executable
     # is bound to its exact Python+Rust build before launch.
@@ -3525,6 +3530,29 @@ def live_indexer_claim() -> bool:
                 or inspected.state in _INDEXD_RECLAIMABLE_STATES)
 
 
+def retire_displaceable_indexd_owner() -> bool:
+    """Retire the one live owner this build may displace.
+
+    The daemon spawn and the explicit index share this verdict: only an exact,
+    topology-verified predecessor (wire-incompatible, or certifying another
+    world) is terminated, and only over derived stores a writer of this build
+    may act on. Hostile and unverifiable claims stay fenced, and this build's
+    own compatible daemon is never touched - an explicit ingest coexists with
+    it through the owner token `rust_writer_env` hands the Rust writer.
+    True only when such an owner was retired and derived writes are permitted
+    afterwards; False leaves whatever fence remains for the caller to name.
+    """
+    ownership = derived_writer_mutation_info()
+    inspected = _inspect_indexd_owner(settle_child=False)
+    if (not derived_writer_launchable(ownership)
+            or inspected.state not in _INDEXD_RETIRABLE_EXACT_STATES):
+        return False
+    inspected = _settle_indexd_owner(
+        allow_retire=True, retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
+    return (inspected.state is _IndexdOwnerState.ABSENT
+            and derived_writes_permitted())
+
+
 class RepairKick(NamedTuple):
     """One verdict every surface shares: is repair in flight, and if not, the
     single cause. Emitter and checker, one artifact - a lane that renders a
@@ -5221,19 +5249,10 @@ def _spawn_indexd() -> _IndexdSpawnResult:
         return _IndexdSpawnResult.BLOCKED
     if removal_fence.background_removal_active():
         return _IndexdSpawnResult.BLOCKED
-    if not derived_writes_permitted():
-        # Only an exact topology-verified incompatible daemon is retireable;
-        # hostile or unverifiable claims remain fenced before the spawn guard.
-        ownership = derived_writer_mutation_info()
-        inspected = _inspect_indexd_owner(settle_child=False)
-        if (not derived_writer_launchable(ownership)
-                or inspected.state not in _INDEXD_RETIRABLE_EXACT_STATES):
-            return _IndexdSpawnResult.BLOCKED
-        inspected = _settle_indexd_owner(
-            allow_retire=True, retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
-        if (inspected.state is not _IndexdOwnerState.ABSENT
-                or not derived_writes_permitted()):
-            return _IndexdSpawnResult.BLOCKED
+    if (not derived_writes_permitted()
+            and not retire_displaceable_indexd_owner()):
+        # hostile or unverifiable claims remain fenced before the spawn guard
+        return _IndexdSpawnResult.BLOCKED
     _clear_own_spawn_guard()
     script = common.PY_DIR / "indexd.py"
     if not script.exists():
