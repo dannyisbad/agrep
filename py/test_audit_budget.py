@@ -905,6 +905,9 @@ class AuditBudgetTests(unittest.TestCase):
                 with database.open("wb") as stream:
                     stream.write(header)
                     stream.truncate(size)
+                    # Time the refusal, not write-back of the fixture's own zero fill.
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 started = time.monotonic()
                 with mock.patch.object(audit.common, "DATA_DIR", root), \
                         mock.patch.object(
