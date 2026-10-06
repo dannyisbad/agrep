@@ -910,7 +910,11 @@ class AuditBudgetTests(unittest.TestCase):
                         mock.patch.object(
                             audit.events, "open_sqlite_snapshot",
                             side_effect=AssertionError(
-                                "an unbounded snapshot was opened")):
+                                "an unbounded snapshot was opened")), \
+                        mock.patch.object(
+                            audit.fileops, "change_sensitive_file_identity",
+                            side_effect=AssertionError(
+                                "a size refusal proved file content")):
                     with self.assertRaisesRegex(
                             audit.AuditRoutineBudget, phrase):
                         audit._indexed_agents(
