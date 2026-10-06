@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import random
@@ -72,7 +73,7 @@ def artifact_hashes(data: Path) -> dict[str, str]:
     store = data / "events" / ".store.sqlite3"
     if store.is_file():
         digest = hashlib.sha256()
-        with sqlite3.connect(f"file:{store}?mode=ro", uri=True) as connection:
+        with contextlib.closing(sqlite3.connect(f"file:{store}?mode=ro", uri=True)) as connection:
             for row in connection.execute(
                     "SELECT name, agent, session, hash, n_events, payload FROM event_sessions "
                     "ORDER BY name"):
@@ -231,7 +232,7 @@ def check_family_closure(messages: list[dict], sessions: list[dict], corpus: Pat
     alias_counter = Counter(row["alias"] for row in sessions if row.get("alias"))
     problems["alias_claimed_twice"] = sum(1 for n in alias_counter.values() if n > 1)
     problems["alias_names_indexed_session"] = sum(1 for alias in aliases if alias in index_sessions)
-    with sqlite3.connect(f"file:{corpus}?mode=ro", uri=True) as connection:
+    with contextlib.closing(sqlite3.connect(f"file:{corpus}?mode=ro", uri=True)) as connection:
         family = {session: (root, side) for session, root, side in connection.execute(
             "SELECT session, root, side FROM session_family")}
     counts["family_rows"] = len(family)
@@ -359,7 +360,7 @@ def check_handle_round_trip(runner, messages: list[dict], sessions: list[dict], 
     by_key = {(row["session"], row["turn"]): row for row in messages}
     published: dict[tuple[str, int], set[str]] = defaultdict(set)
     if corpus is not None:
-        with sqlite3.connect(f"file:{corpus}?mode=ro", uri=True) as connection:
+        with contextlib.closing(sqlite3.connect(f"file:{corpus}?mode=ro", uri=True)) as connection:
             for session, turn, text in connection.execute("SELECT session, turn, text FROM msgs"):
                 published[(session, turn)].add(content_digest(text or ""))
     chats = runner.cli(["chats", "--json", "-n", str(max(sample * 4, 50))])
