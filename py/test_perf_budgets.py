@@ -671,7 +671,7 @@ class PerfBudgets(unittest.TestCase):
         self.assertLess(secs, BUDGET_RECALL_S)
         self.assertIn(f"@{SESSION[:8]}:", probe.stdout)
 
-        secs, miss = _wall(lambda: self._cli(
+        secs, miss = _median_wall(lambda: self._cli(
             "recall", "zzqxv no prior context", "--probe"))
         self.assertEqual(miss.returncode, 2, miss.stderr[-400:])
         self.assertLess(secs, BUDGET_RECALL_S)
