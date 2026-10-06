@@ -1,6 +1,7 @@
 //! Upgrading over a data dir release 0.3.2 published beside a source it could not read (its parse
 //! cache awaiting a reparse, maybe no published source snapshot): every pass publishes churn, keeps
 //! that release's rows and discloses the source, and every pass after the first runs warm.
+#![cfg(not(windows))] // Each test forges a 0.3.2 cache from an uncompressed base; Windows compresses it.
 
 mod common;
 

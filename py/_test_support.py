@@ -80,13 +80,19 @@ def isolate_data_dir() -> Path:
 def wait_for_next_ctime_tick(path: Path) -> None:
     """Linux stamps ctime from the coarse tick clock; a rewrite in the same tick
     as ``path``'s last change keeps its identity."""
+    if os.name == "nt":
+        # Windows stat ctime is creation time; change identities there are the USN or a content proof.
+        return
     before = os.stat(path).st_ctime_ns
     probe = Path(f"{path}.ctime-probe")
+    deadline = time.monotonic() + 5.0
     try:
         while True:
             probe.write_bytes(b"tick")
             if probe.stat().st_ctime_ns > before:
                 return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"ctime never advanced past {path} within 5 s")
             time.sleep(0.001)
     finally:
         probe.unlink(missing_ok=True)

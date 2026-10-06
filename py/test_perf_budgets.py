@@ -1369,6 +1369,9 @@ class FreshnessDisclosureBlackBox(_IsolatedBlackBox, unittest.TestCase):
             "timestamp": "2026-07-25T14:00:00.000Z",
             "message": {"role": "user", "content": "live burst zephyr"},
         }) + "\n", encoding="utf-8")
+        # A census observed in the last 5 s may be reused (docs/OUTPUT_CONTRACTS.md); this step
+        # asserts what a reader sees once that window has passed.
+        (self.data / ".store-census.json").unlink(missing_ok=True)
         caller_env = {**self._env(), "CLAUDE_CODE_SESSION_ID": caller}
         caller_env.pop("CODEX_THREAD_ID", None)
         res = subprocess.run(

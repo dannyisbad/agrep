@@ -531,6 +531,7 @@ fn complete_pass_beside_a_foreign_crush_store_keeps_its_rows_and_publishes_churn
 /// Leaves `data` as a pre-record build would: ownerless, its parse cache the bare v25 payload the
 /// takeover tests forge, and the record `absent`, `stale` (bound to another generation, as after a
 /// downgrade and an upgrade) or `damaged`.
+#[cfg(not(windows))] // Windows compresses the cache base, so its payload cannot be lifted out.
 fn age_data_dir_to_v25(data: &Path, record: &str) {
     assert!(!data.join(".ingest_cache.bin.journal").exists());
     let cache = data.join(".ingest_cache.bin");
@@ -561,6 +562,7 @@ fn age_data_dir_to_v25(data: &Path, record: &str) {
 /// Upgrading over a v25 data dir whose generation has no bound record must not hold any pass,
 /// the first included, beside a crush database that never held a conversation or beside
 /// absent stores: the decoded cache names the databases that generation published from.
+#[cfg(not(windows))]
 #[test]
 fn upgrade_without_a_bound_record_publishes_beside_a_never_populated_foreign_database() {
     for record in ["absent", "stale", "damaged"] {
