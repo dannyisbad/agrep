@@ -267,27 +267,31 @@ def _source_cwd(adapter: str, path: Path) -> str | None:
     return None
 
 
-def _bare_container_cwd(agent: str, session: str, book: dict[str, dict]) -> bool:
-    """True when every source file of the session starts in a container with no repository below."""
-    seen = False
+def _session_cwds(agent: str, session: str, book: dict[str, dict]) -> list[str]:
+    """The starting cwd of every source file the session publishes from."""
+    cwds = []
     for path, entry in book.items():
         if entry.get("agent") != agent or path.startswith("\0") or not Path(path).is_file():
             continue
         if session not in shapes.source_session_ids(agent, Path(path)):
             continue
         cwd = _source_cwd(agent, Path(path))
-        if cwd is None:
-            continue
-        seen = True
-        if scrub.project_root(cwd) is not None:
-            return False
-    return seen
+        if cwd is not None:
+            cwds.append(cwd)
+    return cwds
+
+
+def _named_in_place(cwd: str, leaf: str) -> bool:
+    """True when the cwd's own folder is named `leaf` and its path never uses that name as a container."""
+    name = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    return name == leaf and leaf not in scrub.container_segments(cwd)
 
 
 def check_project_labels(sessions: list[dict], book: dict[str, dict] | None = None) -> Check:
     """Name-form labels are never a container unless the session's own cwd was that bare container."""
     generic: Counter = Counter()
     bare: Counter = Counter()
+    named: Counter = Counter()
     empty = 0
     labels: Counter = Counter()
     for row in sessions:
@@ -301,13 +305,18 @@ def check_project_labels(sessions: list[dict], book: dict[str, dict] | None = No
             continue
         leaf = label.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
         if leaf in GENERIC_CONTAINERS or label.lower() in GENERIC_CONTAINERS:
-            if book is not None and _bare_container_cwd(row["agent"], row["session"], book):
+            cwds = _session_cwds(row["agent"], row["session"], book) if book is not None else []
+            if cwds and all(scrub.project_root(cwd) is None for cwd in cwds):
                 bare[row["agent"]] += 1
+            elif cwds and all(_named_in_place(cwd, leaf) for cwd in cwds):
+                # A folder the user named like a container (Codex Desktop's ~/Documents/Codex/<date>/t).
+                named[row["agent"]] += 1
             else:
                 generic[row["agent"]] += 1
     return Check("project_labels", not generic and empty == 0,
                  {"sessions_per_agent": dict(labels), "generic_container_labels": dict(generic),
-                  "bare_container_cwd_labels": dict(bare), "empty_labels": empty})
+                  "bare_container_cwd_labels": dict(bare),
+                  "container_named_folder_labels": dict(named), "empty_labels": empty})
 
 
 def check_per_adapter_bounds(messages: list[dict], book: dict[str, dict]) -> Check:

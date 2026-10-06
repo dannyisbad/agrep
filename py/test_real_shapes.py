@@ -230,6 +230,26 @@ class InvariantDetectionTests(unittest.TestCase):
             [{"agent": "pi", "project": "/home/u/Desktop/projects"},
              {"agent": "claude", "project": "amber"}]).ok)
 
+    def test_a_folder_named_like_a_container_is_its_own_label(self) -> None:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as temp:
+            book: dict[str, dict] = {}
+            sessions = []
+            for session, cwd, label in (
+                    ("01a10e65-7175-76a2-a9a0-881d2e8f05db",
+                     "/Users/u/Documents/Codex/2026-10-05/t", "t"),
+                    ("02b20e65-7175-76a2-a9a0-881d2e8f05db",
+                     "/Users/u/projects/amber/src", "projects")):
+                path = Path(temp) / f"rollout-2026-10-05T16-28-11-{session}.jsonl"
+                meta = {"type": "session_meta", "payload": {"id": session, "cwd": cwd}}
+                path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+                book[str(path)] = {"agent": "codex"}
+                sessions.append({"agent": "codex", "session": session, "project": label})
+            check = invariants.check_project_labels(sessions[:1], book)
+            self.assertTrue(check.ok, check.counts)
+            self.assertEqual(check.counts["container_named_folder_labels"], {"codex": 1})
+            check = invariants.check_project_labels(sessions, book)
+            self.assertEqual(check.counts["generic_container_labels"], {"codex": 1})
+
     def test_family_closure_rejects_an_alias_claimed_twice(self) -> None:
         with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as temp:
             corpus = Path(temp) / "corpus.db"

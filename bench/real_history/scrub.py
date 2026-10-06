@@ -326,14 +326,15 @@ def _epoch_kind(value) -> str | None:
     return None
 
 
-def project_root(path: str) -> str | None:
-    """Port of the Claude adapter's project bucket: first non-container segment, or None."""
+def _container_walk(path: str) -> tuple[set[str], str | None]:
+    """The lowercased segments walked past as containers, and the first non-container segment."""
     normalized = path.replace("\\", "/")
     segments = [segment for segment in normalized.split("/") if segment]
     if normalized.startswith("//"):
         segments = segments[2:]
     skip_next = False
     after_folders = 0
+    containers: set[str] = set()
     for segment in segments:
         lowered = segment.lower()
         if lowered.endswith(":") or skip_next:
@@ -341,17 +342,31 @@ def project_root(path: str) -> str | None:
             continue
         if after_folders:
             after_folders -= 1
+            containers.add(lowered)
             continue
         if lowered in HOME_CONTAINERS:
+            containers.add(lowered)
             skip_next = True
             continue
         if lowered == "folders":
+            containers.add(lowered)
             after_folders = 3
             continue
         if lowered in CONTAINER_SEGMENTS:
+            containers.add(lowered)
             continue
-        return segment
-    return None
+        return containers, segment
+    return containers, None
+
+
+def project_root(path: str) -> str | None:
+    """Port of the Claude adapter's project bucket: first non-container segment, or None."""
+    return _container_walk(path)[1]
+
+
+def container_segments(path: str) -> set[str]:
+    """The lowercased segments of `path` that project_root walks past as containers."""
+    return _container_walk(path)[0]
 
 
 class Scrubber:
