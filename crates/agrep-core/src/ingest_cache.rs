@@ -1025,6 +1025,8 @@ fn coarse_clock_tick_ns() -> Option<i64> {
     if unsafe { clock_getres(CLOCK_REALTIME_COARSE, &mut resolution) } != 0 {
         return None;
     }
+    // c_long is i64 on 64-bit Linux, where clippy calls this a no-op, but i32 on 32-bit targets.
+    #[allow(clippy::useless_conversion)]
     let tick = i64::from(resolution.tv_sec)
         .saturating_mul(1_000_000_000)
         .saturating_add(i64::from(resolution.tv_nsec));
