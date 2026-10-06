@@ -756,8 +756,6 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
         with path.open("ab") as stream:
             stream.write(b"\nsuccessor-build\n")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
-        # A never-seen binary's first macOS exec waits on system assessment, holding off SIGSTOP.
-        subprocess.run([path, "--version"], capture_output=True, timeout=120, check=True)
         return path
 
     @staticmethod
@@ -781,11 +779,12 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                 state.update(candidate=pid, observed_start=observed_start)
                 if observed_start != birth:
                     continue
-                try:
-                    os.kill(pid, signal.SIGSTOP)
-                except OSError:
-                    continue
                 while not found.is_set() and common.process_start_identity(pid) == birth:
+                    # macOS drops a stop that lands inside the target's execve into the successor.
+                    try:
+                        os.kill(pid, signal.SIGSTOP)
+                    except OSError:
+                        break
                     try:
                         status = subprocess.run(
                             ["/bin/ps", "-p", str(pid), "-o", "stat="],
