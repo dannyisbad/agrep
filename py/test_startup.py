@@ -42,6 +42,7 @@ runpy.run_module("agrep", run_name="__main__")
                 "AGREP_HOME": str(root / "home"),
                 "AGREP_DATA_DIR": str(root / "data"),
                 "AGREP_NO_DAEMON": "1",
+                "AGREP_NO_RESIDENT": "1",
                 "AGREP_NO_SEM_WORKER": "1",
                 "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "py"))),
             })
