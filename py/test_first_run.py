@@ -218,6 +218,10 @@ class FirstRunIntegrationTests(unittest.TestCase):
                 self.assertEqual(rc, 2, stderr)
                 self.assertTrue(stderr.strip(), "first-use loser exited silently")
                 self.assertRegex(stderr.lower(), r"index|publish|retry")
+            # First-use search hands the FTS build to indexd, which may land it after the searches return.
+            deadline = time.monotonic() + 60.0
+            while not (data / "corpus.db").is_file() and time.monotonic() < deadline:
+                time.sleep(0.1)
             self._assert_publication(data, term)
 
     @unittest.skipIf(sys.platform == "win32", "POSIX signal delivery")
