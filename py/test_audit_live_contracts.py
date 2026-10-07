@@ -243,6 +243,22 @@ class AuditFailClosedTests(unittest.TestCase):
                     self.assertIn("zero source files discovered",
                                   payload["gap_details"][0])
 
+    def test_a_deleted_store_with_no_indexed_rows_leaves_only_an_orphaned_tally(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rollout.jsonl"
+            path.write_text("{}\n", encoding="utf-8")
+            deleted = str(Path(td) / "opencode" / "opencode.db")
+            book = {
+                str(path): _entry("codex", path),
+                deleted: {"agent": "opencode", "key": "s:1:1", "seen": 3, "rows": 2,
+                          "agent_rows": 1, "events": 0, "errors": 0, "skips": {}},
+            }
+            rc, payload = self._run(book, [("codex", str(path))])
+        self.assertEqual(payload["problems"], [])
+        self.assertEqual(payload["gaps"], 0)
+        self.assertEqual(payload["orphaned_tallies"], 1)
+        self.assertEqual(rc, 0)
+
     def test_unreadable_tallied_path_is_not_reported_as_deleted(self):
         book = {"/denied/rollout.jsonl": {
             "agent": "codex", "key": "s:1:1", "seen": 1, "rows": 1,

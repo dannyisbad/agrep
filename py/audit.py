@@ -1660,16 +1660,17 @@ def main(argv: list[str] | None = None) -> int:
         if not work_available("orphaned-tally join"):
             validation_complete = False
             break
-        for _key, entry in keyed_entries:
-            agent = str(entry.get("agent") or "")
-            if agent:
-                book_agents.add(agent)
+        agents_here = {str(entry.get("agent") or "") for _key, entry in keyed_entries} - {""}
         if path in seen_paths:
+            book_agents.update(agents_here)
             continue
         state, detail = _path_state(path)
         if state == "missing":
+            # A deleted store's tallies stay behind; they count here, not as that agent's evidence.
             orphan_count += 1
-        elif state == "unreadable":
+            continue
+        book_agents.update(agents_here)
+        if state == "unreadable":
             problems.append(f"cannot stat tallied source {path}: {detail}")
         else:
             agents = sorted({str(entry.get("agent") or "")
