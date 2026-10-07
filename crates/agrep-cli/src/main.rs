@@ -4259,10 +4259,10 @@ fn published_token_inventory(
         .then(|| cache.token_namespaces())
 }
 
-/// The published source snapshot is an inventory of what the published generation holds only
-/// beside the messages.jsonl it was sealed with, by the identity the released-row record uses.
-/// A kill or a held publication leaves it older than the rows: silence there proves nothing.
-fn source_snapshot_current(data: &Path, generation: Option<&cache::GenerationSeal>) -> bool {
+/// Whether the published source snapshot is sealed to the published messages.jsonl, by the identity
+/// the released-row record uses. A pass that replaced the rows and died before its snapshot, or
+/// held it, leaves them unsealed.
+fn source_snapshot_sealed(data: &Path, generation: Option<&cache::GenerationSeal>) -> bool {
     let Some(generation) = generation else {
         return false;
     };
@@ -4275,12 +4275,18 @@ fn source_snapshot_current(data: &Path, generation: Option<&cache::GenerationSea
         })
 }
 
-/// Bind the source snapshot just published to the published messages.jsonl. Written after the
-/// snapshot, so a kill between the two leaves a seal no later pass matches.
+/// Bind the published source snapshot to the published messages.jsonl. Written after the snapshot,
+/// so a kill between the two leaves a seal no later pass matches; a seal already in place costs a read.
 fn seal_source_snapshot(data: &Path) -> anyhow::Result<()> {
     let seal_path = data.join(SOURCE_SNAPSHOT_SEAL_FILE);
     match cache::published_generation_seal(data) {
-        Some(seal) => cache::write_bytes_atomic(&seal_path, generation_seal_hex(&seal).as_bytes()),
+        Some(seal) => {
+            let hex = generation_seal_hex(&seal);
+            if regular_file_has_bytes(&seal_path, hex.as_bytes())? {
+                return Ok(());
+            }
+            cache::write_bytes_atomic(&seal_path, hex.as_bytes())
+        }
         None => cache::remove_if_exists(&seal_path),
     }
 }
@@ -5420,6 +5426,8 @@ fn index_cmd_locked(
         }
         // The published generation stands as the pass that published it disclosed it; no
         // refused attempt intervened, since one leaves the pending marker that bars this lane.
+        // Its snapshot is current, whatever outran its seal (a kill before it, an older build).
+        seal_source_snapshot(&data)?;
         lap!("source-check");
         println!(
             "  unchanged since last index ({} messages); skipped ingest + writes ({:.0}ms)",
@@ -5619,11 +5627,11 @@ fn index_cmd_locked(
     pcache.set_repair_expectations(expected_agents, expected_paths);
     // The publication guard's own inventory, independent of the deletion machinery above so --full
     // still converges real deletions: what the published generation contained, or a proven-empty set
-    // when nothing was published. A snapshot sealed beside older rows inventories an older generation.
+    // when nothing was published. A snapshot an unfinished publication outran inventories older rows.
     let generation = cache::published_generation_seal(&data);
     let published_inventory = published_source
         .as_deref()
-        .filter(|_| source_snapshot_current(&data, generation.as_ref()));
+        .filter(|_| pending_source.is_none() || source_snapshot_sealed(&data, generation.as_ref()));
     if let Some(published) = published_inventory {
         let (_, paths) = ingest::registry::source_snapshot_expectations(published);
         pcache.set_published_material(paths);
