@@ -2466,19 +2466,22 @@ def _normalized_load() -> float:
     return 0.0 if value is None else value
 
 
-def _governor_deferral(*, ignore_battery: bool = False) -> "str | None":
+def _governor_deferral(
+        *, ignore_battery: bool = False, ignore_load: bool = False) -> "str | None":
     """Why this background pass should yield, or None to proceed.
 
     Semantic indexing is deferrable-forever work: keyword search never depends
     on it and the next incremental pass resumes exactly where this one stopped,
     so a busy or battery-strapped machine wins. AGREP_EMBED_ANYWAY=1 bypasses.
-    A bounded stale bootstrap may ignore battery, but not memory or load.
+    A bounded stale bootstrap may ignore battery, and an explicit `doctor --fix`
+    battery and load, but nothing ignores memory pressure.
     """
     if os.environ.get("AGREP_EMBED_ANYWAY", "").lower() not in ("", "0", "false", "no", "off"):
         return None
     battery_probe = (lambda: (False, None)) if ignore_battery else _battery_state
+    load_probe = (lambda: None) if ignore_load else _normalized_load
     deferral = surface.observed_semantic_deferral(
-        common.available_memory_fraction, battery_probe, _normalized_load)
+        common.available_memory_fraction, battery_probe, load_probe)
     return deferral.runtime_reason if deferral else None
 
 
@@ -2566,7 +2569,10 @@ def main() -> int:
     if args.background and not args.refs_only:
         ignore_battery = os.environ.get(
             "AGREP_EMBED_IGNORE_BATTERY", "").lower() in ("1", "true", "yes", "on")
-        deferral = _governor_deferral(ignore_battery=ignore_battery)
+        ignore_load = os.environ.get(
+            "AGREP_EMBED_IGNORE_LOAD", "").lower() in ("1", "true", "yes", "on")
+        deferral = _governor_deferral(
+            ignore_battery=ignore_battery, ignore_load=ignore_load)
         if deferral:
             common.log(f"embedding deferred: {deferral}")
             return 0

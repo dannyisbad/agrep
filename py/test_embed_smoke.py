@@ -360,7 +360,7 @@ class EmbedSmokeTests(unittest.TestCase):
             mock.patch.object(common, "log") as log,
         ):
             self.assertEqual(embed.main(), 0)
-        gate.assert_called_once_with(ignore_battery=False)
+        gate.assert_called_once_with(ignore_battery=False, ignore_load=False)
         claim.assert_not_called()
         log.assert_called_once_with("embedding deferred: on battery (10%)")
 
@@ -377,10 +377,52 @@ class EmbedSmokeTests(unittest.TestCase):
             mock.patch.object(common, "log") as log,
         ):
             self.assertEqual(embed.main(), 0)
-        gate.assert_called_once_with(ignore_battery=True)
+        gate.assert_called_once_with(ignore_battery=True, ignore_load=False)
         claim.assert_not_called()
         log.assert_called_once_with(
             "embedding deferred: memory pressure (10% available)")
+
+    def test_doctor_fix_build_runs_under_cpu_load_but_yields_to_memory_pressure(self) -> None:
+        import semantic
+
+        class Proceeded(Exception):
+            pass
+
+        def child_env(**overrides) -> dict:
+            with (mock.patch.object(semantic, "runtime_dependencies_available",
+                                    return_value=True),
+                  mock.patch.object(semantic, "embedding_coherence",
+                                    return_value={"state": "stale"}),
+                  mock.patch.object(semantic, "embed_running", return_value=False),
+                  mock.patch.object(semantic, "read_embed_state", return_value={}),
+                  mock.patch("embedder.ensure_model"),
+                  mock.patch.object(semantic, "_needs_unverified_bundle_rebuild",
+                                    return_value=False),
+                  mock.patch.object(semantic.subprocess, "Popen") as popen):
+                self.assertEqual(semantic.ensure_fresh_async(
+                    max_new=100, **overrides)["state"], "running")
+            return popen.call_args.kwargs["env"]
+
+        def run_child(env: dict, *, memory: float) -> bool:
+            with (mock.patch.object(sys, "argv", ["embed.py", "--background"]),
+                  mock.patch.dict(os.environ, env, clear=True),
+                  mock.patch.object(embed, "_mutation_refusal_reason", return_value=None),
+                  mock.patch.object(embed, "_normalized_load", return_value=30.0),
+                  mock.patch.object(embed, "_battery_state", return_value=(False, None)),
+                  mock.patch.object(common, "available_memory_fraction",
+                                    return_value=memory),
+                  mock.patch.object(embed, "_acquire_claim", side_effect=Proceeded),
+                  mock.patch.object(common, "log")):
+                try:
+                    self.assertEqual(embed.main(), 0)
+                except Proceeded:
+                    return True
+            return False
+
+        explicit = child_env(ignore_battery=True, ignore_load=True)
+        self.assertTrue(run_child(explicit, memory=0.9))
+        self.assertFalse(run_child(explicit, memory=0.01))
+        self.assertFalse(run_child(child_env(), memory=0.9))
 
     def test_cold_cli_smoke_is_one_line_and_preserves_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

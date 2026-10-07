@@ -876,6 +876,57 @@ class DoctorObservationSharingTests(unittest.TestCase):
             f"`{doctor._cli_command('doctor', '--fix')}`", rendered)
         self.assertNotIn("search or status", rendered)
 
+    def test_routine_fix_starts_the_semantic_build_the_stale_row_promises(self) -> None:
+        current_drift = indexd_runtime.DriftReport("current")
+        readiness = {
+            "state": "missing", "detail": "database does not exist",
+            "integrity": doctor._integrity_not_verified(),
+        }
+        with tempfile.TemporaryDirectory(prefix="agrep-doctor-fix-") as td:
+            root = Path(td)
+            (root / "sessions.jsonl").write_text("", encoding="utf-8")
+            with (
+                mock.patch.object(doctor.common, "DATA_DIR", root),
+                mock.patch.object(doctor, "_data_footprint", return_value={
+                    "state": "complete", "complete": True,
+                    "files": 1, "bytes": 0, "archive_bytes": 0, "breakdown": "",
+                }),
+                mock.patch.object(doctor, "_orphan_inventory", return_value={
+                    "state": "complete", "complete": True, "count": 0, "bytes": 0,
+                }),
+                mock.patch.object(doctor, "_index_summary_state",
+                                  return_value={"state": "never-built"}),
+                mock.patch.object(doctor.indexd_runtime, "observe_store_drift",
+                                  return_value=([], current_drift)),
+                mock.patch.object(doctor.common, "detected_stores", return_value=[]),
+                mock.patch.object(doctor, "_corpus_db_readiness", return_value=readiness),
+                mock.patch.object(doctor, "_archive_probe", return_value={
+                    "state": "disabled", "detail": "disabled",
+                    "last_pass": {"age_s": None, "fresh": False},
+                }),
+                mock.patch.object(doctor.indexd_runtime, "indexd_resource_status",
+                                  return_value={"running": False}),
+                mock.patch.object(doctor.indexd_runtime, "indexd_failing", return_value=(0, "")),
+                mock.patch.object(doctor.indexd_runtime, "indexing_failure", return_value=None),
+                mock.patch.object(corpusdb, "search_generation_health",
+                                  return_value={"state": "ready"}),
+                mock.patch.object(doctor, "_store_counts", return_value=[]),
+                mock.patch.object(doctor.install_lag, "installed_master_lag",
+                                  return_value={"state": "current"}),
+                mock.patch.multiple(
+                    doctor.common,
+                    battery_state=lambda: (False, 100),
+                    available_memory_fraction=lambda: 1.0,
+                    host_cpu_fraction=lambda: 30.0),
+                mock.patch.object(semantic, "ensure_fresh_async",
+                                  return_value={"state": "running"}) as ensure,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                doctor.report(fix_actions=True)
+        ensure.assert_called_once_with(
+            max_new=semantic.SEMANTIC_REFRESH_MAX_NEW,
+            ignore_battery=True, ignore_load=True)
+
     def test_archive_probe_reuses_the_shared_footprint_byte_count(self) -> None:
         import archive
 
