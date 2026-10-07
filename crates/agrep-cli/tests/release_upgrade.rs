@@ -813,41 +813,6 @@ fn crash_repair_publishes_a_deletion_beside_an_unlistable_directory_listing_a_fi
 #[cfg(unix)]
 const SPLIT_SESSION: &str = "55555555-5555-4555-8555-555555555555";
 
-/// Write a codex rollout of `session` under `sessions/2026/01/<day>`, a prompt a minute from
-/// `hour`, each answered.
-#[cfg(unix)]
-fn codex_rollout(home: &Path, day: &str, session: &str, hour: u32, prompts: &[&str]) -> PathBuf {
-    let dir = home.join(".codex/sessions/2026/01").join(day);
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!(
-        "rollout-2026-01-{day}T{hour:02}-00-00-{session}.jsonl"
-    ));
-    let mut lines = vec![
-        serde_json::json!({"type": "session_meta",
-                           "payload": {"id": session, "cwd": "/work/split", "source": "cli"}}),
-        serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.5-codex"}}),
-    ];
-    for (minute, prompt) in prompts.iter().enumerate() {
-        let ts = format!("2026-01-{day}T{hour:02}:{minute:02}:00.000Z");
-        let message = |role: &str, kind: &str, text: String| {
-            serde_json::json!({"type": "response_item", "timestamp": ts,
-                               "payload": {"type": "message", "role": role,
-                                           "content": [{"type": kind, "text": text}]}})
-        };
-        lines.push(message("user", "input_text", (*prompt).to_owned()));
-        lines.push(serde_json::json!({"type": "event_msg", "timestamp": ts,
-                                      "payload": {"type": "user_message", "message": prompt}}));
-        lines.push(message(
-            "assistant",
-            "output_text",
-            format!("done: {prompt}"),
-        ));
-    }
-    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
-    fs::write(&path, body).unwrap();
-    path
-}
-
 /// How the passes beside a day directory turned into a link begin.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]

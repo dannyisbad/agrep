@@ -356,6 +356,46 @@ pub fn unlock_dir(dir: &Path) {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Write a codex rollout of `session` under `.codex/sessions/2026/01/<day>`, a prompt a minute
+/// from `hour`, each answered.
+pub fn codex_rollout(
+    home: &Path,
+    day: &str,
+    session: &str,
+    hour: u32,
+    prompts: &[&str],
+) -> PathBuf {
+    let dir = join_native(home, ".codex/sessions/2026/01").join(day);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!(
+        "rollout-2026-01-{day}T{hour:02}-00-00-{session}.jsonl"
+    ));
+    let mut lines = vec![
+        serde_json::json!({"type": "session_meta",
+                           "payload": {"id": session, "cwd": "/work/split", "source": "cli"}}),
+        serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.5-codex"}}),
+    ];
+    for (minute, prompt) in prompts.iter().enumerate() {
+        let ts = format!("2026-01-{day}T{hour:02}:{minute:02}:00.000Z");
+        let message = |role: &str, kind: &str, text: String| {
+            serde_json::json!({"type": "response_item", "timestamp": ts,
+                               "payload": {"type": "message", "role": role,
+                                           "content": [{"type": kind, "text": text}]}})
+        };
+        lines.push(message("user", "input_text", (*prompt).to_owned()));
+        lines.push(serde_json::json!({"type": "event_msg", "timestamp": ts,
+                                      "payload": {"type": "user_message", "message": prompt}}));
+        lines.push(message(
+            "assistant",
+            "output_text",
+            format!("done: {prompt}"),
+        ));
+    }
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    fs::write(&path, body).unwrap();
+    path
+}
+
 /// A data dir with no recorded source inventory beside `locked`, a directory no pass ever read,
 /// settles within `passes` churned passes: its source snapshot publishes, an unchanged pass takes
 /// the shortcut, and `--full` and the event repair a crash forces both publish.
