@@ -1,4 +1,4 @@
 exit: 0
 --- stdout ---
-agrep 0.4.0 distribution <BUILD> runtime <BUILD> native <BUILD> writer <BUILD>
+agrep 0.4.1 distribution <BUILD> runtime <BUILD> native <BUILD> writer <BUILD>
 --- stderr ---
