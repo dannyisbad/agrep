@@ -174,6 +174,7 @@ _RUST_STAGING_ARTIFACTS = frozenset({
     ".source-health.json",
     ".source_absence_pending",
     ".source_snapshot.bin",
+    ".source_snapshot.seal",
     ".token_material.json",
     "boundary_stats.json",
     "corpus.db",

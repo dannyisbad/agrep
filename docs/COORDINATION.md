@@ -124,9 +124,12 @@ serialized and disclosed on source health, and an emit-rows handoff whose
 published-bytes residue is proven current is retired by the next run's all-hit
 shortcut. `.source_snapshot.bin` is the validated source generation
 and is committed last, after messages, replies, sessions, events, cache, and
-derived proofs. A first-use reader accepts the generation only when the pending
-marker is absent and the nonempty regular snapshot's identity and metadata stay
-stable across the coupled derived-publication health check.
+derived proofs; `.source_snapshot.seal` follows it, naming the identity of the
+messages.jsonl it inventories, and a snapshot whose seal names other rows is
+not consulted as that generation's inventory. A first-use reader accepts the
+generation only when the pending marker is absent and the nonempty regular
+snapshot's identity and metadata stay stable across the coupled
+derived-publication health check.
 
 Family metadata stays staged while events and cache are updated. It is
 published with the derived proofs immediately before `.ingest.sig`. Family
