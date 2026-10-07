@@ -964,11 +964,12 @@ jobs:
         with:
           artifact-ids: ${{ needs.seal-npm-packages.outputs.artifact-id }}
           path: sealed
+      # npm took 10-15 minutes to serve both 0.4.0 and 0.4.1 after a successful publish.
       - name: require both live npm integrities
         run: >-
           python bench/npm_release.py
           --dist-dir sealed --version "${GITHUB_REF_NAME#v}"
-          --require-complete --wait-seconds 120
+          --require-complete --wait-seconds 1800
 
   finalize-release:
     name: publish the verified GitHub release
