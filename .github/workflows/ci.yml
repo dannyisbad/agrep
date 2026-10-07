@@ -12,6 +12,8 @@ on:
 jobs:
   rust:
     name: cargo test ${{ matrix.os }}
+    # The private repo's commits are tested by their public mirror, so every job runs only here.
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -36,6 +38,7 @@ jobs:
 
   python:
     name: selftest ${{ matrix.os }} py${{ matrix.python }}
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -114,6 +117,7 @@ jobs:
 
   linux-installed-wheel-perf:
     name: Linux x64 py3.12 installed-wheel full-exit budgets
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -186,6 +190,7 @@ jobs:
 
   previous-release-upgrade:
     name: PyPI release to candidate upgrade (Python 3.12)
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -207,6 +212,7 @@ jobs:
 
   windows-gate:
     name: Windows release gate (Python 3.13, narrow hosted-runner slack)
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -407,6 +413,7 @@ jobs:
 
   core-only:
     name: core-only setup ${{ matrix.name }}
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -535,6 +542,7 @@ jobs:
 
   sync:
     name: version + docs sync
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -551,6 +559,7 @@ jobs:
 
   degrade:
     name: no-binary install + fetch
+    if: github.repository == 'dannyisbad/agrep'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

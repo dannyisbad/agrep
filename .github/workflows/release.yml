@@ -28,7 +28,9 @@ concurrency:
 
 jobs:
   release-preflight:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.recover_v030 }}
+    if: >-
+      ${{ github.repository == 'dannyisbad/agrep'
+          && (github.event_name != 'workflow_dispatch' || !inputs.recover_v030) }}
     name: release identity preflight
     runs-on: ubuntu-latest
     permissions:
