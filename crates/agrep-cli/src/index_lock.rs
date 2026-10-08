@@ -77,6 +77,12 @@ pub(crate) fn current_process_start_identity() -> Option<String> {
     process_start_identity(std::process::id())
 }
 
+pub(crate) fn process_is_exact_live(pid: u32, start: &str) -> bool {
+    !["", "None", "unknown"].contains(&start)
+        && process_liveness(pid) == Liveness::Alive
+        && process_start_identity(pid).as_deref() == Some(start)
+}
+
 pub(crate) fn observe_live_holder(path: &Path, label: &str) -> io::Result<Option<LiveHolder>> {
     let observed = match snapshot(path) {
         Ok(observed) => observed,

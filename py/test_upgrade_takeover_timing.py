@@ -34,8 +34,8 @@ import ownerfile  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 PY_DIR = ROOT / "py"
 CLI = ROOT / "cli.py"
-RELEASE_BIN = ROOT / "target" / "release" / (
-    "agrep-rs.exe" if os.name == "nt" else "agrep-rs")
+RELEASE_BIN = Path(os.environ.get("AGREP_RS_BIN") or ROOT / "target" / "release" / (
+    "agrep-rs.exe" if os.name == "nt" else "agrep-rs"))
 OLD_BUILD = "a" * 20
 OLD_TEXT = "old takeover snapshot needle"
 NEW_TEXT = "slow successor publication needle"
@@ -839,6 +839,115 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
         if any(row.get("kind") == "agrep-meta" for row in records[1:]):
             raise AssertionError("search JSON emitted multiple agrep-meta records")
         return records[1:]
+
+    def _explicit_index_during_adoption(
+            self, *, expires: bool, current_database: bool = False) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-explicit-adoption-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            data.mkdir()
+            self._sources(home, OLD_TEXT, 1, 1)
+            env = self._env(home, data, RELEASE_BIN)
+            env.pop("AGREP_DEBUG")
+            env.update(AGREP_NO_FETCH="1", AGREP_NO_SEM_WORKER="1", AGREP_NO_RESIDENT="1")
+            initial = subprocess.run(
+                [sys.executable, str(CLI), "index"], cwd=ROOT,
+                env={**env, "AGREP_NO_DAEMON": "1"},
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
+            if not current_database:
+                (data / "corpus.db").unlink()
+            writer = self._owner_build(data)
+            published = (data / "messages.jsonl").read_bytes()
+            self._sources(home, NEW_TEXT, 2, 1)
+            daemon = foreground = None
+            daemon_log = root / "daemon.log"
+            try:
+                with mock.patch.object(index_lock, "INDEX_LOCK_PATH", data / ".index.lock"), \
+                        index_lock.IndexLock("adoption-barrier"), \
+                        daemon_log.open("w") as log:
+                    daemon = subprocess.Popen(
+                        [sys.executable, str(PY_DIR / "indexd.py")],
+                        cwd=ROOT, env=env, stdout=log, stderr=log, start_new_session=True)
+                    claim_path = data / ".indexd.lock"
+                    self._wait_for(
+                        claim_path.is_file, 10, "daemon did not acquire its adoption claim")
+                    claim = dict(field.split("=", 1) for field in claim_path.read_text().split())
+                    self.assertEqual(claim["state"], "derived-adoption")
+                    self.assertEqual(claim["writer"], writer)
+                    self.assertIs(
+                        ownerfile.classify_process(
+                            int(claim["pid"]), claim["start"], pid_alive=common.pid_alive,
+                            process_start=common.process_start_identity),
+                        ownerfile.ProcessOwner.EXACT_LIVE)
+                    daemon_record = (data / ".indexd.v2.lock").read_text()
+                    self.assertIn(f"pid={daemon.pid} ", daemon_record)
+                    self.assertIn(f"writer={writer} ", daemon_record)
+                    self.assertEqual((data / "messages.jsonl").read_bytes(), published)
+                    command = [sys.executable, str(CLI), "index"]
+                    if expires:
+                        command = [
+                            sys.executable, "-c",
+                            "import indexd_runtime,runpy,sys; "
+                            "indexd_runtime._UPGRADE_SETTLEMENT_WAIT_S=0.15; "
+                            f"sys.argv=[{str(CLI)!r},'index']; "
+                            f"runpy.run_path({str(CLI)!r},run_name='__main__')"]
+                    foreground = subprocess.Popen(
+                        command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True)
+                    if expires:
+                        stdout, stderr = foreground.communicate(timeout=15)
+                        self.assertEqual(foreground.returncode, 1, stdout + stderr)
+                        self.assertIn(
+                            f"freshness daemon is still adopting the index (pid {claim['pid']})",
+                            stderr)
+                        self.assertEqual(stderr.count(
+                            "waiting for the freshness daemon to finish adopting the index"), 1, stderr)
+                        self.assertIn("finishes on its own", stderr)
+                        self.assertNotIn("legacy or ambiguous", stderr)
+                        self.assertNotIn("nothing is building", stderr)
+                        self.assertTrue(common.pid_alive(int(claim["pid"])))
+                        self.assertEqual((data / "messages.jsonl").read_bytes(), published)
+                        self.assertEqual(
+                            dict(field.split("=", 1) for field in claim_path.read_text().split()),
+                            claim)
+                        return
+                    try:
+                        stdout, stderr = foreground.communicate(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    else:
+                        self.fail(
+                            f"explicit index did not wait: exit={foreground.returncode}\n"
+                            f"stdout={stdout}\nstderr={stderr}")
+                stdout, stderr = foreground.communicate(timeout=30)
+                self.assertEqual(foreground.returncode, 0, stdout + stderr)
+                self.assertEqual(stderr.count(
+                    "waiting for the freshness daemon to finish adopting the index"), 1, stderr)
+                self.assertNotIn("legacy or ambiguous", stderr)
+                self.assertNotIn("nothing is building", stderr)
+                self.assertIn(NEW_TEXT, (data / "messages.jsonl").read_text())
+            finally:
+                if foreground is not None:
+                    if foreground.poll() is None:
+                        foreground.kill()
+                    foreground.communicate(timeout=5)
+                if daemon is not None:
+                    daemon.terminate()
+                    try:
+                        daemon.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(daemon.pid, signal.SIGKILL)
+                        daemon.wait(timeout=5)
+
+    def test_explicit_index_waits_for_live_same_build_adoption(self) -> None:
+        self._explicit_index_during_adoption(expires=False)
+
+    def test_explicit_index_adoption_wait_budget_expires_honestly(self) -> None:
+        self._explicit_index_during_adoption(expires=True)
+
+    def test_explicit_index_waits_even_when_the_published_database_is_current(self) -> None:
+        self._explicit_index_during_adoption(expires=False, current_database=True)
 
     def test_successor_publishes_rebuilt_cache_before_daemon_start(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agrep-rebuilt-adoption-") as raw:

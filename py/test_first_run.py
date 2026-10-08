@@ -21,9 +21,9 @@ sys.path.insert(0, str(ROOT / "py"))
 import proc as process_utils  # noqa: E402
 
 CLI = ROOT / "cli.py"
-RELEASE_BIN = ROOT / "target" / "release" / (
+RELEASE_BIN = Path(os.environ.get("AGREP_RS_BIN") or ROOT / "target" / "release" / (
     "agrep-rs.exe" if sys.platform == "win32" else "agrep-rs"
-)
+))
 SESSION = "88888888-8888-4888-8888-888888888888"
 
 
