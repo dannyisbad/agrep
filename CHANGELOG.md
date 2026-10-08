@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.2 — 2026-10-07
+
+### Status, doctor and setup
+
+- `agrep doctor --fix` starts the semantic build that doctor's stale or
+  missing embeddings rows recommend, with or without `--deep`. A routine
+  `--fix` never checked whether embeddings needed it, and the build a deep
+  `--fix` started stood down whenever the machine was busy. Asking for it is
+  now enough: only memory pressure defers that build, while automatic
+  background builds still yield to CPU load and battery.
+
+### Index integrity and ownership
+
+- An explicit `agrep index` that runs while the freshness daemon is
+  publishing, as it does right after an upgrade, waits for that pass (up to
+  three minutes) and then indexes. It used to exit 1 at once, calling the
+  daemon's own claim legacy or ambiguous ownership and saying nothing was
+  building the search database. If the wait runs out, it says which pass is
+  still running.
+
 ## 0.4.1 — 2026-10-07
 
 ### Index integrity and ownership
