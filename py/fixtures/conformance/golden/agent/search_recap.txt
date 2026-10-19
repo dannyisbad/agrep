@@ -1,0 +1,5 @@
+exit: 0
+--- stdout ---
+@33333333:1.9a25 pi/user cedar 17h Preserve the saffron recap after compaction.
+@33333333:2.3b09 pi/recap cedar 17h Saffron recap: the copper lantern review is c…
+--- stderr ---

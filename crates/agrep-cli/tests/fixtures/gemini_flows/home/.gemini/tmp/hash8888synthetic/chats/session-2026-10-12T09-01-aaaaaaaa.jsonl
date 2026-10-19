@@ -1,0 +1,29 @@
+{"sessionId":"aaaaaaaa-202a-4000-8000-aaaaaaaaaaaa","projectHash":"5977ed138e03ee60522707b46b900e574c01992e76057f3a40fc6483c30f465a","startTime":"2026-10-12T09:01:00.000Z","lastUpdated":"2026-10-12T09:01:00.000Z","kind":"main"}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-10-12T09:01:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}]}
+{"$set":{"lastUpdated":"2026-10-12T09:01:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000001","timestamp":"2026-10-12T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}
+{"$set":{"lastUpdated":"2026-10-12T09:02:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000002","timestamp":"2026-10-12T09:03:00.000Z","type":"gemini","content":"ok alpaca","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-12T09:03:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000003","timestamp":"2026-10-12T09:04:00.000Z","type":"user","content":[{"text":"bison"}]}
+{"$set":{"lastUpdated":"2026-10-12T09:04:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000004","timestamp":"2026-10-12T09:05:00.000Z","type":"gemini","content":"I will search for bison.","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-12T09:05:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000005","timestamp":"2026-10-12T09:05:00.000Z","type":"info","content":"Request cancelled."}
+{"$set":{"lastUpdated":"2026-10-12T09:05:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000006","timestamp":"2026-10-12T09:05:00.000Z","type":"gemini","content":"","toolCalls":[{"id":"grep-bison","name":"grep_search","args":{"pattern":"bison"},"result":[{"functionResponse":{"id":"grep-bison","name":"grep_search","response":{"output":"[Operation Cancelled] Reason: User cancelled the operation."}}}],"status":"cancelled","timestamp":"2026-10-12T09:05:00.000Z","displayName":"grep_search","description":"grep_search tool","renderOutputAsMarkdown":false}],"thoughts":[],"model":"gemini-2.5-pro"}
+{"id":"aaaaaaaa-0000-4000-8000-000000000007","timestamp":"2026-10-12T09:05:00.000Z","type":"user","content":[{"functionResponse":{"id":"grep-bison","name":"grep_search","response":{"output":"[Operation Cancelled] Reason: User cancelled the operation."}}}]}
+{"$set":{"lastUpdated":"2026-10-12T09:05:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000009","timestamp":"2026-10-12T09:06:00.000Z","type":"user","content":[{"text":"cheetah"}]}
+{"$set":{"lastUpdated":"2026-10-12T09:06:00.000Z"}}
+{"$patch":{"updates":[{"id":"aaaaaaaa-0000-4000-8000-000000000002","content":[{"text":"ok alpaca"}]},{"id":"aaaaaaaa-0000-4000-8000-000000000004","content":[{"text":"I will search for bison."},{"functionCall":{"id":"grep-bison","name":"grep_search","args":{"pattern":"bison"}}}]}],"removeIds":["aaaaaaaa-0000-4000-8000-000000000005","aaaaaaaa-0000-4000-8000-000000000006","aaaaaaaa-0000-4000-8000-000000000009"]}}
+{"$set":{"lastUpdated":"2026-10-12T09:07:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000010","timestamp":"2026-10-12T09:07:00.000Z","type":"error","content":"[API Error: The model is overloaded. Please try again later.]"}
+{"$set":{"lastUpdated":"2026-10-12T09:07:00.000Z"}}
+{"$rewindTo":"aaaaaaaa-0000-4000-8000-000000000003"}
+{"$patch":{"removeIds":["d04923d38bb0f6017037e74183378ef4"]}}
+{"$set":{"lastUpdated":"2026-10-12T09:08:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000011","timestamp":"2026-10-12T09:09:00.000Z","type":"user","content":[{"text":"dingo"}]}
+{"$set":{"lastUpdated":"2026-10-12T09:09:00.000Z"}}
+{"id":"aaaaaaaa-0000-4000-8000-000000000012","timestamp":"2026-10-12T09:10:00.000Z","type":"gemini","content":"ok dingo","thoughts":[],"tokens":null,"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-10-12T09:10:00.000Z"}}

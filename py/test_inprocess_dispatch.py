@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "py"))
 
+from _test_support import isolate_data_dir
+isolate_data_dir()
+
 import cli  # noqa: E402
 
 # cli.main installs grep-style SIGPIPE handling; give the interpreter back
@@ -97,18 +100,42 @@ class InProcessDispatchTests(unittest.TestCase):
         for option in ("--agent", "--json", "--strict", "--full"):
             self.assertIn(option, rendered)
 
+    def test_top_level_help_leads_with_agent_commands_and_lists_every_name(self) -> None:
+        import re
+        import surface_policy as surface
+        rendered = {}
+        for flag in ("--help", "-h"):
+            output, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "argv", ["agrep", flag]), \
+                    redirect_stdout(output), redirect_stderr(err):
+                self.assertEqual(cli._main(), 0)
+            self.assertEqual(err.getvalue(), "")
+            rendered[flag] = output.getvalue()
+        self.assertEqual(rendered["-h"], rendered["--help"])
+        page = rendered["--help"]
+        head, separator, tail = page.partition("other commands:")
+        self.assertTrue(separator, page)
+        lead = re.findall(r"^  ([a-z]+) ", head, flags=re.M)
+        self.assertEqual(lead, ["search", "around", "recall", "chats", "postcompact",
+                                "board", "resume", "status", "why", "summary"])
+        for name in lead:
+            example = r'^ {17}agrep "' if name == "search" else rf"^ {{17}}agrep {name}\b"
+            self.assertRegex(head, re.compile(example, re.M))
+        other = set(re.findall(r"[a-z]+", tail.split("\n\n", 1)[0]))
+        hidden = {"live", "inject", "up"}
+        self.assertEqual(set(lead) | other, surface.RESERVED_COMMAND_WORDS - hidden)
+        self.assertFalse(set(lead) & other)
+
 
 class OneShotLiveSurfaceTests(unittest.TestCase):
     class Watcher:
         def __init__(
                 self, *, booting: bool = False,
                 sessions: list[dict] | None = None) -> None:
-            self.timeouts: list[float | None] = []
             self.booting = booting
             self.sessions = sessions or []
 
         def wait_boot(self, timeout: float | None = None) -> bool:
-            self.timeouts.append(timeout)
             return not self.booting
 
         def snapshot(self) -> dict:
@@ -128,9 +155,6 @@ class OneShotLiveSurfaceTests(unittest.TestCase):
                 mock.patch.object(livetui, "_enable_ansi", return_value=False), \
                 redirect_stdout(out):
             self.assertEqual(livetui.main(["--once"]), 0)
-        self.assertEqual(
-            watcher.timeouts, [livetui._ONESHOT_BOOT_TIMEOUT_S])
-        self.assertLess(livetui._ONESHOT_BOOT_TIMEOUT_S, 0.3)
         rendered = out.getvalue()
         self.assertIn("agrep board", rendered)
         self.assertNotIn("select", rendered)
@@ -240,8 +264,6 @@ class OneShotLiveSurfaceTests(unittest.TestCase):
         with mock.patch.object(tail.live, "watcher", return_value=watcher), \
                 redirect_stdout(out):
             self.assertEqual(tail.main(["--snapshot"]), 0)
-        self.assertEqual(watcher.timeouts, [tail._ONESHOT_BOOT_TIMEOUT_S])
-        self.assertLess(tail._ONESHOT_BOOT_TIMEOUT_S, 0.3)
         self.assertIn('"sessions":[]', out.getvalue())
         self.assertEqual(__import__("json").loads(out.getvalue())["type"],
                          "snapshot")

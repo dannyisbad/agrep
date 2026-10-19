@@ -1000,6 +1000,18 @@ time.sleep(30)
         self.assertEqual(found, [("antigravity", transcript, False)])
         self.assertEqual(archive.capture()["full"], 1)
 
+    def test_gemini_jsonl_sessions_are_archived_beside_legacy_json(self) -> None:
+        chats = self.home / ".gemini" / "tmp" / "project-hash" / "chats"
+        chats.mkdir(parents=True)
+        legacy = chats / "session-2026-03-10T08-00-abcd1234.json"
+        current = chats / "session-2026-03-10T08-00-abcd1234.jsonl"
+        legacy.write_text("{}", encoding="utf-8")
+        current.write_text('{"sessionId":"s","projectHash":"h"}\n', encoding="utf-8")
+        archive.ROOTS = [root for root in self.saved["ROOTS"] if root[0] == "gemini"]
+        found = {(agent, path) for agent, path, _ in archive._discovered_sources()}
+        self.assertEqual(found, {("gemini", legacy), ("gemini", current)})
+        self.assertEqual(archive.capture()["full"], 2)
+
     def test_kimi_session_depth_and_subagents_are_archived(self) -> None:
         session = "01234567-89ab-cdef-0123-456789abcdef"
         root = self.home / ".kimi" / "sessions" / "project-hash" / session

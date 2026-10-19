@@ -1,0 +1,9 @@
+exit: 0
+--- stdout ---
+@33333333 pi cedar 17h 4t  Review the cedar lantern plan with a sidecar advisor. · agrep around @33333333:3.7b29
+@55555555 codex cedar 1d 4t  Audit the copper lantern deployment manifest for cedar. · agrep around @55555555:3.95fb
+@11111111 claude cedar 2d 8t  Please map the copper lantern launch checklist for cedar. · agrep around @11111111:7.4ef4
+@22222222 pi maple 4d 3t  Check the maple lantern against the glacier inventory. · agrep around @22222222:2.23c2
+@66666666 claude birch 6d 3t  The birch lantern uses a silver compass instead of a copper switch. · agrep around @66666666:2.4b25
+--- stderr ---
+showing 5 of 5 matching chats, newest first (side chats hidden; --side shows them)

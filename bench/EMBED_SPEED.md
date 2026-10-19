@@ -113,7 +113,7 @@ snapshot; the task text and passages are not committed.
 | mean top-10 overlap | 94.5% |
 | mean / p99 absolute score delta | 0.001736 / 0.005578 |
 | 0.82 floor disagreement | 0.1172% |
-| 0.84 strong-band disagreement | 0.0% |
+| 0.84 strong-band disagreement (see `SEMANTIC_SCALE.md` for the calibration levels) | 0.0% |
 
 The int8 model passes this precision check. The remaining semantic-quality gate
 is the frozen answerability evaluation, not a score-only proxy.

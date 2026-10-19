@@ -19,6 +19,13 @@ pub fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
+/// `base` joined with the `/`-separated `rel` one component at a time, spelled as discovery
+/// spells it: Windows paths compare as strings in source keys and health issues.
+pub fn join_native(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 pub fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -304,4 +311,106 @@ pub fn copy_dir(src: &Path, dst: &Path) {
             fs::copy(&from, &to).unwrap();
         }
     }
+}
+
+/// Plant a claude project directory under `home` that no pass can read, as if locked before the
+/// first index. None where a privileged runner ignores the mode bits.
+#[cfg(unix)]
+pub fn lock_claude_project(home: &Path) -> Option<PathBuf> {
+    let dir = home.join(".claude").join("projects").join("proj-locked");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("locked.jsonl"), b"{}\n").unwrap();
+    lock_dir(&dir)
+}
+
+/// Plant an opencode store under `home` whose data directory no pass can read, as if locked
+/// before the first index. None where a privileged runner ignores the mode bits.
+#[cfg(unix)]
+pub fn lock_opencode_store(home: &Path) -> Option<PathBuf> {
+    let dir = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&dir).unwrap();
+    let seed = fs::read_to_string(fixtures_dir().join("opencode").join("seed.sql")).unwrap();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute_batch(&seed).unwrap();
+    conn.close().unwrap();
+    lock_dir(&dir)
+}
+
+/// Make `dir` unreadable; None (and `dir` readable again) where the mode bits are ignored.
+#[cfg(unix)]
+pub fn lock_dir(dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(dir).is_ok() {
+        unlock_dir(dir);
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
+#[cfg(unix)]
+pub fn unlock_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A data dir with no recorded source inventory beside `locked`, a directory no pass ever read,
+/// settles within `passes` churned passes: its source snapshot publishes, an unchanged pass takes
+/// the shortcut, and `--full` and the event repair a crash forces both publish.
+pub fn assert_settles_beside_a_never_read_dir(
+    home: &Path,
+    data: &Path,
+    locked: &Path,
+    passes: u32,
+    mut churn: impl FnMut(u32) -> String,
+) {
+    let mut minute = 0;
+    let mut publishes = |full: bool, context: &str| {
+        minute += 1;
+        let text = churn(minute);
+        let output = ingest_output("all", home, data, full);
+        assert!(
+            output.status.success(),
+            "{context}: exit {:?}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(normalize(data).contains(&text), "{context}: {text} froze");
+    };
+    for pass in 1..=passes {
+        publishes(false, &format!("pass {pass}"));
+    }
+    assert!(
+        data.join(".source_snapshot.bin").exists() && !data.join(".ingest_pending.bin").exists(),
+        "no source snapshot after {passes} pass(es)"
+    );
+    let health: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join(".source-health.json")).unwrap()).unwrap();
+    assert!(
+        health["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["kind"] == "permission-denied"
+                && issue["path"]
+                    .as_str()
+                    .is_some_and(|path| Path::new(path).starts_with(locked))
+        }),
+        "{health}"
+    );
+    let unchanged = ingest_output("all", home, data, false);
+    assert!(
+        String::from_utf8_lossy(&unchanged.stdout).contains("unchanged since last index"),
+        "an unchanged pass did not take the shortcut"
+    );
+    publishes(true, "--full");
+    for proof in fs::read_dir(data).unwrap().flatten() {
+        if proof
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".events_complete")
+        {
+            fs::remove_file(proof.path()).unwrap();
+        }
+    }
+    publishes(false, "event repair after a crash");
 }

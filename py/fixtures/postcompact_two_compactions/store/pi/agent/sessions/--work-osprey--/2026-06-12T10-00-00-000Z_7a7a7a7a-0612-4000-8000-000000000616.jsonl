@@ -1,0 +1,7 @@
+{"type":"session","id":"7a7a7a7a-0612-4000-8000-000000000616","version":3,"cwd":"/work/osprey","timestamp":"2026-06-12T10:00:00.000Z"}
+{"type":"message","id":"pi-0","parentId":null,"timestamp":"2026-06-12T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Reindex the osprey catalog."}]}}
+{"type":"message","id":"pi-1","parentId":"pi-0","timestamp":"2026-06-12T10:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Reindexing the osprey catalog now."}],"model":"gpt-5"}}
+{"type":"compaction","id":"pi-2","parentId":"pi-1","timestamp":"2026-06-12T10:20:00.000Z","summary":"Summary: the osprey catalog reindex is running.","tokensBefore":170000}
+{"type":"message","id":"pi-3","parentId":"pi-2","timestamp":"2026-06-12T10:21:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The osprey catalog is reindexed; the plover shard is stale."}],"model":"gpt-5"}}
+{"type":"compaction","id":"pi-4","parentId":"pi-3","timestamp":"2026-06-12T10:40:00.000Z","summary":"Summary: the plover shard is stale.","tokensBefore":170000}
+{"type":"message","id":"pi-5","parentId":"pi-4","timestamp":"2026-06-12T10:41:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The plover shard is refreshed after the second compaction."}],"model":"gpt-5"}}

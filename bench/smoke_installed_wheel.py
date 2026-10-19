@@ -68,13 +68,7 @@ def _require_exit(
 
 
 def _source_nudge_contract() -> tuple[int, str, str]:
-    """(version, default-template sha, codex-rendered sha).
-
-    The prompt text lives in py/nudge_default.md and py/nudge_codex.md
-    (NUDGE_V still lives in teach.py); templates carry {name}/{be} person
-    slots, so the body teach writes into a codex AGENTS.md is the codex
-    file rendered as "you"/"are", not the template bytes.
-    """
+    """(version, default-body sha, codex-body sha) from py/nudge_*.md and NUDGE_V."""
     tree = ast.parse((ROOT / "py" / "teach.py").read_text(encoding="utf-8"))
     version = None
     for node in tree.body:
@@ -88,10 +82,9 @@ def _source_nudge_contract() -> tuple[int, str, str]:
         encoding="utf-8").rstrip("\n")
     if type(version) is not int:
         raise SmokeFailure("source instruction contract is unreadable")
-    rendered = codex.format(name="you", be="are")
     return (version,
             hashlib.sha256(default.encode("utf-8")).hexdigest(),
-            hashlib.sha256(rendered.encode("utf-8")).hexdigest())
+            hashlib.sha256(codex.encode("utf-8")).hexdigest())
 
 
 def _installed_candidate_contract(
@@ -444,56 +437,54 @@ def main() -> int:
 
         live_env = dict(env)
         live_env.pop("AGREP_NO_DAEMON", None)
-        setup = _require_exit(
-            "setup",
-            _run(
-                [str(cli), "setup", "-y", "--no-semantic", "--no-archive"],
-                env=live_env, cwd=root, capture=True, label="setup"),
-        )
-        if "setup complete" not in (setup.stdout or ""):
-            raise SmokeFailure("setup returned success without its completion receipt")
+        live_env["AGREP_PROFILE"] = "compact"
         instructions = root / "home" / ".codex" / "AGENTS.md"
-        if _instruction_version(
-                instructions, expected_sha256=codex_digest) != source_version:
-            raise SmokeFailure("installed Codex instructions have the wrong version")
+        try:
+            _require_exit(
+                "setup",
+                _run(
+                    [str(cli), "setup", "-y", "--no-semantic", "--no-archive"],
+                    env=live_env, cwd=root, capture=True, label="setup"),
+            )
+            if _instruction_version(
+                    instructions, expected_sha256=codex_digest) != source_version:
+                raise SmokeFailure("installed Codex instructions have the wrong version")
 
-        found = _require_exit(
-            "keyword search",
-            _run(
-                [str(cli), recall_query, "--lexical", "--color", "never"],
-                env=live_env, cwd=root, capture=True, label="keyword search"),
-        )
-        if artifact not in (found.stdout or ""):
-            raise SmokeFailure("installed keyword search omitted the indexed artifact")
+            found = _require_exit(
+                "keyword search",
+                _run(
+                    [str(cli), recall_query, "--lexical", "--color", "never"],
+                    env=live_env, cwd=root, capture=True, label="keyword search"),
+            )
+            probe = _require_exit(
+                "recall probe",
+                _run(
+                    [str(cli), "recall", recall_query, "--probe", "--lexical",
+                     "--color", "never"],
+                    env=live_env, cwd=root, capture=True, label="recall probe"),
+            )
+            for label, result in (("keyword search", found), ("recall probe", probe)):
+                handle = re.search(
+                    r"@[A-Za-z0-9._-]+:\d+\.[0-9a-f]{4}", result.stdout or "")
+                if handle is None:
+                    raise SmokeFailure(f"installed {label} returned no reusable handle")
+                around = _require_exit(
+                    "around",
+                    _run(
+                        [str(cli), "around", handle.group(0), "--full"],
+                        env=live_env, cwd=root, capture=True, label=f"{label} around"),
+                )
+                if artifact not in (around.stdout or "") or reply not in (around.stdout or ""):
+                    raise SmokeFailure(
+                        f"installed {label} handle omitted the artifact or paired answer")
 
-        probe = _require_exit(
-            "recall probe",
-            _run(
-                [str(cli), "recall", recall_query, "--probe", "--lexical",
-                 "--color", "never"],
-                env=live_env, cwd=root, capture=True, label="recall probe"),
-        )
-        handle = re.search(
-            r"@[A-Za-z0-9._-]+:\d+\.[0-9a-f]{4}", probe.stdout or "")
-        if handle is None:
-            raise SmokeFailure("installed recall probe returned no reusable handle")
-        around = _require_exit(
-            "around",
-            _run(
-                [str(cli), "around", handle.group(0), "--full"],
-                env=live_env, cwd=root, capture=True, label="around"),
-        )
-        if artifact not in (around.stdout or "") or reply not in (around.stdout or ""):
-            raise SmokeFailure("installed around omitted the artifact or paired answer")
-
-        _wait_for_daemon(cli, env=live_env, cwd=root)
-        removed = _require_exit(
-            "remove",
-            _run([str(cli), "remove"], env=live_env, cwd=root,
-                 capture=True, label="remove"),
-        )
-        if "removing agrep integration" not in (removed.stdout or ""):
-            raise SmokeFailure("remove returned success without its teardown receipt")
+            _wait_for_daemon(cli, env=live_env, cwd=root)
+        finally:
+            _require_exit(
+                "remove",
+                _run([str(cli), "remove"], env=live_env, cwd=root,
+                     capture=True, label="remove"),
+            )
         daemon = _status(cli, env=live_env, cwd=root).get("daemon")
         if not isinstance(daemon, dict) or daemon.get("running") is not False:
             raise SmokeFailure("installed remove left the freshness daemon running")

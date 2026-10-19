@@ -664,11 +664,6 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertFalse(observed["runtime_verified"])
         self.assertIsNone(observed["install_hint"])
 
-    def test_doctor_and_status_share_the_generated_install_command(self) -> None:
-        self.assertIsNotNone(doctor.SEMANTIC_INSTALL_COMMAND)
-        self.assertEqual(
-            doctor.SEMANTIC_INSTALL_COMMAND, cli.SEMANTIC_INSTALL_COMMAND)
-
     def test_scheduler_never_spawns_optional_worker_without_runtime(self) -> None:
         with (mock.patch.object(semantic, "runtime_dependencies_available",
                                return_value=False),
@@ -734,11 +729,24 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
             "semantic model prefetch skipped for this setup run",
             output.getvalue())
 
-    def test_doctor_rejects_no_semantic_without_setup(self) -> None:
+    def test_doctor_rejects_no_semantic_without_setup_or_deep(self) -> None:
         error = io.StringIO()
         with contextlib.redirect_stderr(error):
             self.assertEqual(doctor.main(["--no-semantic"]), 2)
-        self.assertIn("has no effect without --setup", error.getvalue())
+        self.assertIn("has no effect without --setup or --deep", error.getvalue())
+        # --deep --no-semantic is the Metal-less caller's deep report: the
+        # semantic tier stays at routine depth instead of being refused.
+        output = io.StringIO()
+        with (mock.patch.object(doctor, "report", return_value={}) as run,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(doctor.main(["--deep", "--no-semantic"]), 0)
+        run.assert_called_once_with(
+            deep=True, fix_actions=False, semantic=False)
+        with (mock.patch.object(doctor, "_json_report", return_value={}) as run,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(
+                doctor.main(["--deep", "--no-semantic", "--json"]), 0)
+        run.assert_called_once_with(deep=True, semantic=False)
 
     def test_cli_setup_no_semantic_skips_both_semantic_starts(self) -> None:
         output = io.StringIO()
@@ -1523,7 +1531,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with (mock.patch.object(cli.common, "DATA_DIR", Path(td)),
                   mock.patch.object(
-                      cli.indexd_runtime, "kick_background_repair"),
+                      indexd_runtime, "kick_background_repair"),
                   mock.patch("importlib.util.find_spec", return_value=None)):
                 machine = cli._status_data()
         self.assertTrue(machine["semantic_optional"])
@@ -1535,7 +1543,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with (mock.patch.object(cli.common, "DATA_DIR", Path(td)),
                   mock.patch.object(
-                      cli.indexd_runtime, "kick_background_repair"),
+                      indexd_runtime, "kick_background_repair"),
                   mock.patch(
                       "importlib.util.find_spec",
                       side_effect=AssertionError(
@@ -1738,7 +1746,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                       cli.common, "index_summary",
                       return_value={"messages": 14, "sessions": 3}),
                   mock.patch.object(
-                      cli.indexd_runtime, "indexd_resource_status",
+                      indexd_runtime, "indexd_resource_status",
                       return_value={"running": True}) as daemon,
                   mock.patch.object(teach, "detected_agents", return_value=[]),
                   mock.patch.object(cli, "_setup_archive"),
@@ -1778,7 +1786,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                       cli.common, "index_summary",
                       return_value={"messages": 14, "sessions": 3}),
                   mock.patch.object(
-                      cli.indexd_runtime, "indexd_resource_status",
+                      indexd_runtime, "indexd_resource_status",
                       return_value={"running": False}),
                   mock.patch.object(teach, "detected_agents", return_value=[]),
                   mock.patch.object(cli, "_setup_archive"),

@@ -19,6 +19,10 @@
 //! sessions like advisor sidecars); unknown records and roles are skipped, not
 //! failed on. Sidecars receive `synthetic: true` user-role mirrors of the
 //! watched session's transcript; those are sidechain copies, never user rows.
+//! A sidecar assistant left anchorless by those skips is the sidecar's own
+//! voice (advisor advisories): its text is indexed as its own row.
+//! A sidechat container is keyed off the root's filename, not its header, so a root whose
+//! header id was rewritten keeps the filename id as a session alias (`session_alias`).
 
 use std::collections::HashMap;
 use std::fs;
@@ -187,10 +191,28 @@ fn parse_with_limits(
     gzip_compressed_max_bytes: u64,
     gzip_decompressed_max_bytes: u64,
 ) -> Parsed {
-    let side = parent.is_some();
-    let parent = parent.unwrap_or_default();
     // seen = JSONL records, matching every other line-oriented adapter
     let tally = crate::intake::file(agent, path);
+    parse_with_tally(
+        agent,
+        path,
+        parent,
+        gzip_compressed_max_bytes,
+        gzip_decompressed_max_bytes,
+        tally,
+    )
+}
+
+fn parse_with_tally(
+    agent: &'static str,
+    path: &Path,
+    parent: Option<String>,
+    gzip_compressed_max_bytes: u64,
+    gzip_decompressed_max_bytes: u64,
+    tally: std::sync::Arc<crate::intake::Tally>,
+) -> Parsed {
+    let side = parent.is_some();
+    let parent = parent.unwrap_or_default();
     let data = match read_session_with_limits(
         path,
         gzip_compressed_max_bytes,
@@ -259,6 +281,7 @@ fn parse_with_limits(
     let mut recap_turns: Vec<u32> = Vec::new();
     let mut turn = 0u32;
     let mut model = String::new();
+    let mut mirrored_anchor = false;
     for &index in &branch {
         let record = &records[index];
         tally.seen();
@@ -325,9 +348,11 @@ fn parse_with_limits(
                         .and_then(|s| s.as_bool())
                         .unwrap_or(false)
                     {
+                        mirrored_anchor = true;
                         tally.skip(crate::intake::Skip::Sidechain);
                         continue;
                     }
+                    mirrored_anchor = false;
                     let text = text_of(message.get("content"));
                     if text.trim().is_empty() {
                         tally.skip(crate::intake::Skip::EmptyText);
@@ -359,18 +384,44 @@ fn parse_with_limits(
                         }
                     }
                     let reply = text_of(message.get("content"));
-                    if let Some(last) = out.last_mut() {
-                        if !reply.trim().is_empty() {
-                            let chars = crate::ingest::append_capped(
-                                &mut last.reply,
-                                &reply,
-                                crate::ingest::REPLY_CAP,
-                            );
-                            last.reply_chars += chars;
+                    // A sidecar assistant whose anchor was skipped as a synthetic
+                    // mirror has no prompt row to reply to: that text is the
+                    // sidecar's own voice (advisor advisories) and becomes a row.
+                    if side && mirrored_anchor {
+                        if reply.trim().is_empty() {
+                            tally.skip(crate::intake::Skip::EmptyText);
+                        } else {
+                            tally.row();
+                            out.push(crate::model::RawMessage {
+                                agent,
+                                project: project.clone(),
+                                session: session.clone(),
+                                ts,
+                                turn,
+                                text: reply,
+                                model: model.clone(),
+                                reply: String::new(),
+                                reply_chars: 0,
+                                side,
+                                parent: parent.clone(),
+                            });
+                            turn += 1;
                         }
-                        if last.model.is_empty() {
-                            last.model = model.clone();
+                    } else {
+                        if let Some(last) = out.last_mut() {
+                            if !reply.trim().is_empty() {
+                                let chars = crate::ingest::append_capped(
+                                    &mut last.reply,
+                                    &reply,
+                                    crate::ingest::REPLY_CAP,
+                                );
+                                last.reply_chars += chars;
+                            }
+                            if last.model.is_empty() {
+                                last.model = model.clone();
+                            }
                         }
+                        tally.agent_row();
                     }
                     for (call_ordinal, block) in message
                         .get("content")
@@ -413,9 +464,9 @@ fn parse_with_limits(
                             ok,
                             call_id,
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
-                    tally.agent_row();
                 } else if is_role(message, "bashExecution") {
                     // pi runs a bash command as its own role, not a toolCall:
                     // no content, the command and output are message fields.
@@ -457,6 +508,7 @@ fn parse_with_limits(
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("{agent}:bash:{}", record.ordinal)),
                         child_session: String::new(),
+                        meta: String::new(),
                     });
                     tally.agent_row();
                 } else {
@@ -508,6 +560,49 @@ fn side_parent(path: &Path) -> Option<String> {
         side_parent_in(&sessions_root(home_dir), path)
             .or_else(|| side_parent_in(&archived_sessions_root(home_dir), path))
     })
+}
+
+/// `YYYY-MM-DDTHH-MM-SS-mmmZ`, the prefix pi gives every session file it creates.
+fn is_session_stamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 24
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 | 13 | 16 | 19 => *byte == b'-',
+            10 => *byte == b'T',
+            23 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// The id a slug-level `<timestamp>_<id>.jsonl[.gz]` filename carries; the sidechat container
+/// is keyed off this name, so it outlives a header edit. Nested sidecars are named freely.
+fn session_file_id<'p>(root: &Path, path: &'p Path) -> Option<&'p str> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = relative.components();
+    let std::path::Component::Normal(_slug) = parts.next()? else {
+        return None;
+    };
+    let std::path::Component::Normal(file) = parts.next()? else {
+        return None;
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let file = file.to_str()?;
+    let stem = file
+        .strip_suffix(".jsonl.gz")
+        .or_else(|| file.strip_suffix(".jsonl"))?;
+    let (stamp, id) = stem.rsplit_once('_')?;
+    (is_session_stamp(stamp) && !id.is_empty()).then_some(id)
+}
+
+fn session_alias(path: &Path, session: &str) -> Option<String> {
+    PI_HOMES
+        .iter()
+        .flat_map(|home_dir| [sessions_root(home_dir), archived_sessions_root(home_dir)])
+        .find_map(|root| session_file_id(&root, path))
+        .filter(|id| *id != session)
+        .map(str::to_owned)
 }
 
 fn parse_pi(path: &Path) -> Parsed {
@@ -678,15 +773,20 @@ impl crate::ingest::registry::Adapter for Pi {
     fn store_content(&self, path: &Path) -> bool {
         is_session_file(path)
     }
+    fn session_alias(&self, path: &Path, session: &str) -> Option<String> {
+        session_alias(path, session)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        active_branch, parse_with, parse_with_limits, session_files, side_parent_in, Record,
+        active_branch, parse_with, parse_with_limits, parse_with_tally, session_file_id,
+        session_files, side_parent_in, Record, GZIP_COMPRESSED_MAX_BYTES,
+        GZIP_DECOMPRESSED_MAX_BYTES,
     };
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn records(lines: &[&str]) -> Vec<Record> {
         lines
@@ -735,13 +835,12 @@ mod tests {
     }
 
     fn write(body: &str) -> PathBuf {
+        // Parallel tests share the pid and macOS clocks tick in microseconds.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "agrep-pi-{}-{}.jsonl",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, body).unwrap();
         path
@@ -841,10 +940,10 @@ mod tests {
     }
 
     #[test]
-    fn an_advisor_sidecar_of_mirrors_yields_no_user_rows() {
-        // An advisor sidecar is a child-dir stream of synthetic user-role
-        // mirrors of the watched session (a runaway once re-broadcast 24.8M of
-        // them). Its tool events survive; its mirrors never become rows.
+    fn an_advisor_sidecar_indexes_its_own_voice_but_never_the_mirrors() {
+        // A sidecar's user side is all synthetic mirrors, so its assistant records
+        // are anchorless: text-bearing ones become the sidecar's own rows, pure-
+        // thinking ones emit nothing, and tool events survive as events.
         let root = std::env::temp_dir().join(format!(
             "agrep-omp-advisor-{}-{}",
             std::process::id(),
@@ -869,26 +968,66 @@ mod tests {
                 "\n",
                 r####"{"type":"message","id":"m2","parentId":"m1","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**agent**:\nhello\n"}]}}"####,
                 "\n",
-                r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"assistant","content":[{"type":"text","text":"advice"},{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"a.rs"}}]}}"#,
+                r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"assistant","model":"pi-1","content":[{"type":"text","text":"advice"},{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"a.rs"}}]}}"#,
                 "\n",
                 r#"{"type":"message","id":"m4","parentId":"m3","message":{"role":"toolResult","toolCallId":"tc1","content":[{"type":"text","text":"fn main() {}"}]}}"#,
+                "\n",
+                r#"{"type":"message","id":"m5","parentId":"m4","message":{"role":"assistant","content":[{"type":"thinking","thinking":"weighing options"}]}}"#,
+                "\n",
+                r####"{"type":"message","id":"m6","parentId":"m5","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**agent**:\nmore\n"}]}}"####,
+                "\n",
+                r#"{"type":"message","id":"m7","parentId":"m6","message":{"role":"assistant","content":[{"type":"text","text":"ship the advisory"}]}}"#,
                 "\n",
             ),
         )
         .unwrap();
         let parent = side_parent_in(&sessions, &child);
-        assert_eq!(parent.as_deref(), Some("01a012ef-8a55-7000-b9ca-8ab44ce2a383"));
-        let (messages, events, outcome) = parse_with("pi", &child, parent);
+        assert_eq!(
+            parent.as_deref(),
+            Some("01a012ef-8a55-7000-b9ca-8ab44ce2a383")
+        );
+        let tally = std::sync::Arc::new(crate::intake::Tally::default());
+        let (messages, events, outcome) = parse_with_tally(
+            "pi",
+            &child,
+            parent,
+            GZIP_COMPRESSED_MAX_BYTES,
+            GZIP_DECOMPRESSED_MAX_BYTES,
+            std::sync::Arc::clone(&tally),
+        );
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
+        let texts: Vec<&str> = messages.iter().map(|m| &*m.text).collect();
+        assert_eq!(texts, vec!["advice", "ship the advisory"]);
+        for (expected_turn, message) in messages.iter().enumerate() {
+            assert!(message.side);
+            assert_eq!(&*message.parent, "01a012ef-8a55-7000-b9ca-8ab44ce2a383");
+            assert_eq!(&*message.who, "user");
+            assert_eq!(message.turn, expected_turn as u32);
+            assert!(message.reply.is_empty());
+        }
+        assert_eq!(&*messages[0].model, "pi-1");
         assert!(
-            messages.is_empty(),
-            "mirror records must not become user rows: {:?}",
-            messages.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+            !texts.iter().any(|t| t.contains("Session update")),
+            "a synthetic mirror leaked into the row lane"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("weighing options")),
+            "reasoning leaked"
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "read");
         assert_eq!(events[0].output, "fn main() {}");
+        // seen == the 8 physical lines; 3 mirrors sidechain, 1 pure-thinking
+        // assistant empty-text, header meta, toolResult non-human, 2 rows.
+        assert_eq!(
+            tally.test_record_counts(crate::intake::Skip::Sidechain),
+            (8, 2, 0, 3, 0)
+        );
+        assert_eq!(
+            tally.test_record_counts(crate::intake::Skip::EmptyText),
+            (8, 2, 0, 1, 0)
+        );
     }
 
     #[test]
@@ -925,6 +1064,49 @@ mod tests {
         assert!(messages[0].side);
         assert_eq!(&*messages[0].parent, "019fe852-b0ad-7000-b68f-f054af8dff14");
     }
+
+    #[test]
+    fn a_root_filename_id_is_the_id_its_sidechat_container_hands_to_children() {
+        let sessions = Path::new("/work/fixture/sessions");
+        let container = "2026-04-05T06-07-08-000Z_file-id";
+        let slug = sessions.join("project");
+        let root = slug.join(format!("{container}.jsonl"));
+        let child = slug.join(container).join("worker.jsonl");
+        assert_eq!(
+            session_file_id(sessions, &root),
+            side_parent_in(sessions, &child).as_deref()
+        );
+        assert_eq!(
+            session_file_id(sessions, &slug.join(format!("{container}.jsonl.gz"))),
+            Some("file-id")
+        );
+    }
+
+    #[test]
+    fn only_stamped_slug_level_filenames_carry_an_id() {
+        let sessions = Path::new("/work/fixture/sessions");
+        let slug = sessions.join("project");
+        let container = "2026-04-05T06-07-08-000Z_file-id";
+        for named in [
+            slug.join(container).join("__advisor.jsonl"),
+            slug.join(container).join("worker.jsonl"),
+            slug.join(container).join(format!("{container}.jsonl")),
+            slug.join("session.jsonl.gz"),
+            slug.join("my_notes.jsonl"),
+            slug.join("2026-04-05_file-id.jsonl"),
+            slug.join("2026-04-05T06-07-08-000Z_.jsonl"),
+            slug.join(format!("{container}.pre-surgery.jsonl.bak")),
+            Path::new("/elsewhere").join(format!("{container}.jsonl")),
+        ] {
+            assert_eq!(
+                session_file_id(sessions, &named),
+                None,
+                "{}",
+                named.display()
+            );
+        }
+    }
+
     #[test]
     fn cold_archive_sessions_and_nested_sidecars_remain_discoverable() {
         let root = std::env::temp_dir().join(format!(

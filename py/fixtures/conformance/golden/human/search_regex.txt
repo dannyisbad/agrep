@@ -1,0 +1,9 @@
+exit: 0
+--- stdout ---
+55555555-5555-4555-8555-555555555555	codex	cedar	1	user	Use beacon-blue to identify the isolated worker queue.
+11111111-1111-4111-8111-111111111111	claude	cedar	4	user	Record beacon-blue after the queue is drained.
+55555555-5555-4555-8555-555555555555	codex	cedar	1	agent	beacon-blue identifies the worker queue; keychain is not a whole-word key.
+66666666-6666-4666-8666-666666666666	claude	birch	1	user	Keep beacon-red behind the birch safety partition.
+11111111-1111-4111-8111-111111111111	claude	cedar	4	agent	The drained queue leaves beacon-blue ready for review.
+11111111-1111-4111-8111-111111111111	claude	cedar	1	agent	The whole word key belongs beside beacon-red in the notes.
+--- stderr ---

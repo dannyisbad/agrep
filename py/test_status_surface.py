@@ -25,25 +25,120 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import cli
-import dist
-import surface_policy as surface
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
+import cli  # noqa: E402
+import dist  # noqa: E402
+import indexd_runtime  # noqa: E402
+import surface_policy as surface  # noqa: E402
 
 
-class IndexOutputTests(unittest.TestCase):
-    def test_index_has_one_owned_slow_timing_line(self) -> None:
-        stdout = io.StringIO()
-        with mock.patch.object(
-                cli.indexd_runtime, "build_index", return_value=True), \
-                mock.patch.object(cli.common, "lap") as lap, \
-                contextlib.redirect_stdout(stdout):
-            self.assertTrue(cli._index())
-        self.assertIn("=== indexing transcripts ===", stdout.getvalue())
-        self.assertNotRegex(stdout.getvalue(), r"(?m)^\s*\([0-9.]+s\)$")
-        lap.assert_called_once_with("index")
+
+class IdentityRecordTests(unittest.TestCase):
+    def test_reader_preserves_files_and_replaced_binary_invalidates_record(self) -> None:
+        runtime = indexd_runtime
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "agrep-rs"
+            binary.write_bytes(b"fixture ingest binary bytes")
+            with mock.patch.object(runtime.common, "DATA_DIR", root), \
+                    mock.patch.object(runtime, "_BINARY_DIGEST_CACHE", None), \
+                    mock.patch.object(
+                        runtime.common, "data_dir_readonly",
+                        return_value=False):
+                self.assertIsNone(runtime.recorded_binary_identity(binary))
+                writer = runtime.derived_writer_build_id(
+                    binary, require_binary=True)
+                self.assertIsNone(runtime.recorded_binary_identity(binary))
+                self.assertEqual(set(root.iterdir()), {binary})
+                with mock.patch.object(
+                        runtime, "derived_writer_mutation_info",
+                        return_value=runtime.DerivedMutationInfo("current", writer, "")):
+                    runtime.record_binary_identity(binary)
+                recorded = runtime.recorded_binary_identity(binary)
+                self.assertEqual(
+                    recorded, (writer, dist.native_binary_build_id(binary)))
+                # a replaced binary must never inherit the old record
+                binary.write_bytes(b"different ingest binary bytes")
+                self.assertIsNone(runtime.recorded_binary_identity(binary))
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # the fallback tests below model a box with no identity record
+        no_record = mock.patch.object(
+            indexd_runtime, "recorded_binary_identity", return_value=None)
+        no_record.start()
+        self.addCleanup(no_record.stop)
+
+    def test_recorded_identity_answers_without_a_hashing_child(self) -> None:
+        with (mock.patch.object(
+                  indexd_runtime, "recorded_binary_identity",
+                  return_value=("a" * 20, "b" * 20)),
+              mock.patch.object(
+                  cli, "_bounded_binary_identity",
+                  side_effect=AssertionError("spawned a hashing child"))):
+            identity = cli._build_identity(timeout_s=0.0)
+        self.assertEqual(identity["writer_build_id"], "a" * 20)
+        self.assertEqual(identity["writer_build_state"], "verified")
+        self.assertEqual(identity["native_binary_build_id"], "b" * 20)
+        self.assertEqual(identity["native_binary_build_state"], "verified")
+
+    def test_unverified_identity_defers_ownership_verdicts(self) -> None:
+        identity = {
+            "runtime_build_id": "e" * 20,
+            "writer_build_id": None,
+            "writer_build_state": "unavailable",
+            "writer_build_detail": "TimeoutError: fixture deadline",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "corpus.db").write_bytes(b"not consulted")
+            with (
+                mock.patch.object(cli.common, "DATA_DIR", root),
+                mock.patch.object(
+                    cli.common, "MESSAGES_PATH", root / "messages.jsonl"),
+                mock.patch.object(
+                    cli.common, "data_dir_source", return_value="fixture"),
+                mock.patch.object(
+                    cli.common, "data_dir_warnings", return_value=[]),
+                mock.patch.object(
+                    cli.settings, "setting_observation",
+                    return_value={"state": "verified", "value": "auto",
+                                  "source": "default"}),
+                mock.patch.object(
+                    indexd_runtime, "indexd_resource_status",
+                    side_effect=AssertionError("judged daemon compatibility")),
+                mock.patch.object(
+                    indexd_runtime, "observe_store_drift",
+                    return_value=([], indexd_runtime.DriftReport("current"))),
+                mock.patch.object(
+                    indexd_runtime, "indexing_failure", return_value=None),
+                mock.patch.object(
+                    indexd_runtime, "machine_freshness",
+                    return_value={"state": "no-known-failure"}),
+                mock.patch.object(
+                    cli.common, "index_summary",
+                    return_value={"sessions": 1, "messages": 2, "agents": [],
+                                  "per_agent": []}),
+                mock.patch.object(
+                    cli.common, "detected_stores", return_value=[]),
+                mock.patch("doctor._corpus_db_readiness",
+                           side_effect=AssertionError("judged ownership")),
+            ):
+                observed = cli._status_core(
+                    deadline=time.monotonic() + 1.0, identity=identity)
+        self.assertIsNone(observed["search_index_ready"])
+        self.assertEqual(observed["search_index_state"], "status-deferred")
+        self.assertEqual(observed["index_state"], "not-verified")
+        self.assertEqual(observed["daemon"]["state"], "status-deferred")
+        self.assertFalse(observed["daemon"].get("blocked"))
+        details = observed["diagnostics"]["details"]
+        for label in ("daemon resource observation",
+                      "search database readiness"):
+            self.assertIn("TimeoutError: fixture deadline", details[label])
+
     def test_native_identity_depends_only_on_exact_binary_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -57,7 +152,7 @@ class BuildIdentityTests(unittest.TestCase):
                 dist.native_binary_build_id(first),
                 dist.native_binary_build_id(second))
             with mock.patch.object(
-                    cli.indexd_runtime, "INDEXD_BUILD_ID", "f" * 20):
+                    indexd_runtime, "INDEXD_BUILD_ID", "f" * 20):
                 self.assertEqual(dist.native_binary_build_id(first), expected)
             second.write_bytes(b"different native bytes")
             self.assertNotEqual(
@@ -125,9 +220,7 @@ class BuildIdentityTests(unittest.TestCase):
                 side_effect=AssertionError("help hashed native")) as native, \
                 mock.patch.object(sys, "argv", ["agrep", "--help"]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit) as stopped:
-                cli._main()
-        self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(cli._main(), 0)
         native.assert_not_called()
 
     def test_status_json_carries_portable_native_identity(self) -> None:
@@ -240,7 +333,7 @@ class BuildIdentityTests(unittest.TestCase):
         with (mock.patch.object(
                   cli.common, "distribution_build_id", return_value="d" * 20),
               mock.patch.object(
-                  cli.indexd_runtime, "INDEXD_BUILD_ID", "a" * 20),
+                  indexd_runtime, "INDEXD_BUILD_ID", "a" * 20),
               mock.patch.object(
                   cli, "_bounded_binary_identity", return_value={
                       "native_binary_build_id": "c" * 20,
@@ -286,7 +379,7 @@ class BuildIdentityTests(unittest.TestCase):
 
         started = time.monotonic()
         with mock.patch.object(
-                cli.indexd_runtime, "derived_writer_build_id",
+                indexd_runtime, "derived_writer_build_id",
                 side_effect=slow_writer), self.assertRaises(TimeoutError):
             cli._bounded_binary_identity(
                 cli.common.ingest_bin(), timeout_s=0.01)
@@ -300,7 +393,7 @@ class BuildIdentityTests(unittest.TestCase):
 
         started = time.monotonic()
         with mock.patch.object(
-                cli.indexd_runtime, "derived_writer_build_id",
+                indexd_runtime, "derived_writer_build_id",
                 return_value="a" * 20), mock.patch.object(
                     cli.dist, "native_binary_build_id",
                     side_effect=slow_native):
@@ -316,7 +409,7 @@ class BuildIdentityTests(unittest.TestCase):
     @unittest.skipIf(cli.WIN, "fork-only worker patch fixture")
     def test_malformed_native_identity_does_not_erase_writer_identity(self) -> None:
         with mock.patch.object(
-                cli.indexd_runtime, "derived_writer_build_id",
+                indexd_runtime, "derived_writer_build_id",
                 return_value="a" * 20), mock.patch.object(
                     cli.dist, "native_binary_build_id", return_value="bad"):
             identity = cli._bounded_binary_identity(
@@ -332,16 +425,14 @@ class BuildIdentityTests(unittest.TestCase):
                 side_effect=AssertionError("help hashed the binary")) as binary, \
                 mock.patch.object(sys, "argv", ["agrep", "--help"]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit) as stopped:
-                cli._main()
-        self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(cli._main(), 0)
         binary.assert_not_called()
 
         output = io.StringIO()
         with (mock.patch.object(
                   cli.common, "distribution_build_id", return_value="e" * 20),
               mock.patch.object(
-                  cli.indexd_runtime, "INDEXD_BUILD_ID", "c" * 20),
+                  indexd_runtime, "INDEXD_BUILD_ID", "c" * 20),
               mock.patch.object(
                   cli, "_bounded_binary_identity", return_value={
                       "native_binary_build_id": "b" * 20,
@@ -389,7 +480,7 @@ class BuildIdentityTests(unittest.TestCase):
 
         def core(**_kwargs):
             with self.assertRaises(OSError):
-                cli.indexd_runtime.derived_writer_build_id(
+                indexd_runtime.derived_writer_build_id(
                     cli.common.ingest_bin(), require_binary=True)
             return {"diagnostics": {
                 "tier": "routine", "state": "complete",
@@ -400,7 +491,7 @@ class BuildIdentityTests(unittest.TestCase):
         with (mock.patch.object(cli, "_status_core", side_effect=core),
               mock.patch.object(cli, "_status_semantic", return_value=semantic),
               mock.patch.object(cli, "_build_identity", return_value=identity),
-              mock.patch.object(cli.indexd_runtime, "_ingest_binary_digest",
+              mock.patch.object(indexd_runtime, "_ingest_binary_digest",
                                 side_effect=AssertionError("writer rehashed")),
               mock.patch.object(cli, "_kick_repair_if_damaged")):
             payload = cli._status_data()
@@ -514,7 +605,7 @@ class StatusDegradedStateTests(unittest.TestCase):
             index_built=False, index_state="never-built",
             search_index_ready=False, search_index_state="missing",
             search_index_defect=None,
-            _repair=cli.indexd_runtime.RepairKick(False, "no-binary"))
+            _repair=indexd_runtime.RepairKick(False, "no-binary"))
         self.assertOneCommandLine(rendered, "agrep setup")
 
     def test_specific_search_damage_owns_the_one_remedy_line(self) -> None:
@@ -543,7 +634,7 @@ class StatusDegradedStateTests(unittest.TestCase):
     def test_active_repair_keeps_search_index_damage_quiet(self) -> None:
         rendered = render(
             search_index_ready=False, search_index_state="stale",
-            _repair=cli.indexd_runtime.RepairKick(True, ""))
+            _repair=indexd_runtime.RepairKick(True, ""))
         self.assertEqual(self.problem_lines(rendered), [])
 
     def test_another_running_version_is_not_silently_rendered_as_healthy(self) -> None:
@@ -559,7 +650,7 @@ class StatusDegradedStateTests(unittest.TestCase):
             index_state="owned-elsewhere", search_index_ready=False,
             search_index_state="owned-elsewhere",
             daemon={"running": False, "blocked": True, "state": "incompatible"},
-            _repair=cli.indexd_runtime.RepairKick(True, ""))
+            _repair=indexd_runtime.RepairKick(True, ""))
         self.assertEqual(self.problem_lines(rendered), [])
 
     def test_summary_movement_does_not_hide_concluded_search_damage(self) -> None:
@@ -575,7 +666,7 @@ class StatusDegradedStateTests(unittest.TestCase):
                     search_index_ready=None, search_index_state="unavailable",
                     search_index_defect=defect,
                     daemon={"running": True},
-                    _repair=cli.indexd_runtime.RepairKick(False, "spawn-failed"))
+                    _repair=indexd_runtime.RepairKick(False, "spawn-failed"))
                 self.assertOneCommandLine(rendered, command)
 
     def test_concluded_search_index_damage_is_actionable(self) -> None:
@@ -657,8 +748,6 @@ class IndexingAdviceTests(unittest.TestCase):
 
 
 class CrashBoundaryTests(unittest.TestCase):
-    """An unhandled exception is a user surface too: no class names, no
-    internal message, always a command."""
 
     def line(self, exc: BaseException) -> str:
         return surface.crash_advice_line(exc, "agrep")
@@ -682,17 +771,14 @@ class CrashBoundaryTests(unittest.TestCase):
         self.assertIn(
             "`agrep index --full`", self.line(sqlite3.DatabaseError("x")))
 
-    def test_no_exception_class_or_internal_message_reaches_the_line(self) -> None:
-        for exc in (RuntimeError("event generation changed during bulk read"),
-                    ValueError("__internal_marker__"),
-                    OSError("__internal_marker__")):
-            line = self.line(exc)
-            self.assertNotIn("__internal_marker__", line)
-            self.assertNotIn(type(exc).__name__, line)
-            self.assertFalse(re.search(r"\b[A-Za-z]+Error\b", line), line)
-
-    def test_an_unknown_failure_still_routes_somewhere(self) -> None:
-        self.assertIn("`agrep doctor`", self.line(ValueError("surprise")))
+    def test_unknown_failure_retains_its_cause_without_terminal_controls(self) -> None:
+        line = self.line(AttributeError(
+            "module 'session_context' has no attribute 'open_sqlite_snapshot'\n\x1b[2J"))
+        self.assertIn("AttributeError", line)
+        self.assertIn("open_sqlite_snapshot", line)
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\x1b", line)
+        self.assertNotIn("`agrep doctor`", line)
 
 
 if __name__ == "__main__":

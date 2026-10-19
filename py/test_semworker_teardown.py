@@ -36,6 +36,32 @@ def _owner(
         semworker._WorkerOwnerState.EXACT, record, snapshot)
 
 
+class StaleNamespaceReapTests(unittest.TestCase):
+    def test_reaper_removes_only_idle_empty_sibling_namespaces(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            prefix = f"agrep-semantic-v{semworker._COORDINATION_NAMESPACE_VERSION}-1-"
+            live = base / f"{prefix}live"
+            stale, fresh, busy, other = (
+                base / f"{prefix}stale", base / f"{prefix}fresh",
+                base / f"{prefix}busy", base / "agrep-caller-v1-1")
+            for d in (live, stale, fresh, busy, other):
+                d.mkdir(mode=0o700)
+            (busy / "worker.lock").write_text("{}", encoding="utf-8")
+            old = time.time() - 2 * semworker._STALE_NAMESPACE_S
+            for d in (live, stale, busy, other):
+                os.utime(d, (old, old))
+            with mock.patch.object(semworker, "_coordination_base_path",
+                                   return_value=base), \
+                    mock.patch.object(semworker, "_ephemeral_coordination_dir",
+                                      return_value=live):
+                removed = semworker.reap_stale_coordination_dirs()
+            self.assertEqual(removed, 1)
+            self.assertFalse(stale.exists())
+            for kept in (live, fresh, busy, other):
+                self.assertTrue(kept.exists(), kept.name)
+
+
 class SemanticWorkerTeardownUnitTests(unittest.TestCase):
     def tearDown(self) -> None:
         for path in (
@@ -43,6 +69,86 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                 semworker.worker_lock_path(),
                 semworker.start_claim_path()):
             path.unlink(missing_ok=True)
+
+    def test_stop_drains_a_spawn_whose_launcher_claim_was_released(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, \
+                mock.patch.object(common, "DATA_DIR", Path(raw)), \
+                mock.patch.object(
+                    semworker, "_ephemeral_coordination_dir", return_value=Path(raw)), \
+                mock.patch.object(
+                    semworker, "_worker_coordination_refusal_reason", return_value=None), \
+                mock.patch.object(
+                    semworker, "loopback_bind_status", return_value={"bindable": True}):
+            claim = semworker._acquire_start_claim()
+            self.assertIsNotNone(claim)
+            popen = subprocess.Popen
+
+            def slow_start(_command, **kwargs):
+                return popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+
+            process = None
+            try:
+                with mock.patch.object(semworker.subprocess, "Popen", side_effect=slow_start):
+                    process = semworker._spawn_worker(claim)
+                semworker._release_start_claim(claim)
+                result = semworker.stop_worker_and_wait(grace_s=1.0, fallback_s=1.0)
+                self.assertTrue(result["ok"], result)
+                self.assertIsNotNone(
+                    process.poll(), "teardown succeeded while its startup child retained the log")
+                (Path(raw) / "semantic-worker.log").unlink()
+            finally:
+                claim.close()
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
+
+    def test_unknown_birth_lookup_does_not_kill_a_starting_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, \
+                mock.patch.object(common, "DATA_DIR", Path(raw)), \
+                mock.patch.object(
+                    semworker, "_ephemeral_coordination_dir", return_value=Path(raw)), \
+                mock.patch.object(
+                    semworker, "_worker_coordination_refusal_reason", return_value=None), \
+                mock.patch.object(
+                    semworker, "loopback_bind_status", return_value={"bindable": True}):
+            claim = semworker._acquire_start_claim()
+            popen = subprocess.Popen
+            process = None
+            try:
+                with mock.patch.object(
+                        semworker.subprocess, "Popen",
+                        side_effect=lambda _cmd, **kw: popen(
+                            [sys.executable, "-c", "import time; time.sleep(0.2)"], **kw)), \
+                        mock.patch.object(common, "process_start_identity", return_value=None):
+                    process = semworker._spawn_worker(claim)
+                self.assertIsNone(process.poll())
+                semworker._release_start_claim(claim)
+                result = semworker.stop_worker_and_wait(grace_s=1.0, fallback_s=1.0)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(process.poll(), 0)
+            finally:
+                claim.close()
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_expired_malformed_launch_record_does_not_block_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, \
+                mock.patch.object(common, "DATA_DIR", Path(raw)), \
+                mock.patch.object(
+                    semworker, "_ephemeral_coordination_dir", return_value=Path(raw)), \
+                mock.patch.object(
+                    semworker, "_worker_coordination_refusal_reason", return_value=None):
+            path = semworker._launch_child_path("a" * 32)
+            path.write_bytes(b'{"pid":')
+            self.assertFalse(semworker.stop_worker_and_wait(0.0, 0.0)["ok"])
+            self.assertTrue(path.exists())
+            expired = time.time() - semworker.START_CLAIM_GRACE_S - 1.0
+            os.utime(path, (expired, expired))
+            self.assertTrue(semworker.stop_worker_and_wait(0.0, 0.0)["ok"])
+            self.assertFalse(path.exists())
 
     def test_unverifiable_stop_wait_neither_succeeds_nor_signals(self) -> None:
         rec = {"pid": 41, "process_start": "birth"}

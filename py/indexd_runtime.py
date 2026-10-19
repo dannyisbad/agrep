@@ -207,7 +207,11 @@ _INDEXD_REFRESH_EXPECTED_WRITER = os.environ.pop(
     _INDEXD_REFRESH_EXPECTED_WRITER_ENV, "")
 _BINARY_DIGEST_LOCK = threading.Lock()
 _BINARY_DIGEST_CACHE: tuple[
-    tuple[str, fileops.FileIdentity], bytes] | None = None
+    tuple[str, fileops.FileIdentity], tuple[bytes, str]] | None = None
+_BINARY_IDENTITY_NAME = ".binary-identity.json"
+_BINARY_IDENTITY_MAX_BYTES = 4096
+_BINARY_IDENTITY_VERSION = 1
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]+$")
 
 
 class DerivedOwnerInfo(NamedTuple):
@@ -304,6 +308,96 @@ def _fenced_reason(exc: OSError) -> str:
     return str(getattr(info, "reason", "") or exc) or type(exc).__name__
 
 
+def _binary_identity_path() -> Path:
+    return common.DATA_DIR / _BINARY_IDENTITY_NAME
+
+
+def record_binary_identity(binary: Path) -> None:
+    """Persist a verified binary identity only after a writable publication."""
+    if _data_dir_readonly():
+        return
+    with _BINARY_DIGEST_LOCK:
+        cached = _BINARY_DIGEST_CACHE
+    if cached is None:
+        return
+    key, (md5_digest, sha256_hex) = cached
+    try:
+        resolved = binary.resolve(strict=True)
+        if key != (os.fspath(resolved), fileops.file_identity(resolved)):
+            return
+    except OSError:
+        return
+    build_id = _writer_build_id_from_digest(md5_digest)
+    if not derived_writer_mutation_info(build_id).writable:
+        return
+    if _recorded_binary_digests(key) == (md5_digest, sha256_hex):
+        return
+    path = _binary_identity_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "version": _BINARY_IDENTITY_VERSION, "binary": key[0],
+        "identity": list(key[1]), "md5": md5_digest.hex(),
+        "sha256": sha256_hex,
+    }
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        common.replace_with_retry(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _recorded_binary_digests(
+        key: tuple[str, fileops.FileIdentity]) -> tuple[bytes, str] | None:
+    try:
+        observed = ownerfile.snapshot(
+            _binary_identity_path(), max_bytes=_BINARY_IDENTITY_MAX_BYTES)
+        record = json.loads(
+            observed.raw.decode("utf-8"),
+            object_pairs_hook=_unique_json_object)
+    except (OSError, RecursionError, UnicodeError, ValueError):
+        return None
+    if (not isinstance(record, dict)
+            or set(record) != {"version", "binary", "identity", "md5", "sha256"}
+            or record["version"] != _BINARY_IDENTITY_VERSION
+            or record["binary"] != key[0]
+            or record["identity"] != list(key[1])
+            or not isinstance(record["md5"], str)
+            or len(record["md5"]) != 32
+            or _HEX_DIGEST_RE.fullmatch(record["md5"]) is None
+            or not isinstance(record["sha256"], str)
+            or len(record["sha256"]) != 64
+            or _HEX_DIGEST_RE.fullmatch(record["sha256"]) is None):
+        return None
+    return bytes.fromhex(record["md5"]), record["sha256"]
+
+
+def _writer_build_id_from_digest(binary_digest: bytes) -> str:
+    digest = hashlib.md5()
+    digest.update(b"agrep-derived-writer-v2\0")
+    digest.update(INDEXD_BUILD_ID.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(binary_digest)
+    return digest.hexdigest()[:20]
+
+
+def recorded_binary_identity(binary: Path) -> tuple[str, str] | None:
+    """(writer, native) build ids recorded by an earlier in-process hash of
+    exactly this binary generation; diagnostics only - writers hash the bytes."""
+    try:
+        resolved = Path(binary).resolve(strict=True)
+        key = (os.fspath(resolved), fileops.file_identity(resolved))
+    except OSError:
+        return None
+    recorded = _recorded_binary_digests(key)
+    if recorded is None:
+        return None
+    md5_digest, sha256_hex = recorded
+    return _writer_build_id_from_digest(md5_digest), sha256_hex[:20]
+
+
 def _ingest_binary_digest(path: Path | None = None) -> bytes:
     """Hash one stable resolved executable, caching by its exact change identity."""
     global _BINARY_DIGEST_CACHE
@@ -313,7 +407,7 @@ def _ingest_binary_digest(path: Path | None = None) -> bytes:
     key = (os.fspath(binary), before)
     with _BINARY_DIGEST_LOCK:
         if _BINARY_DIGEST_CACHE is not None and _BINARY_DIGEST_CACHE[0] == key:
-            return _BINARY_DIGEST_CACHE[1]
+            return _BINARY_DIGEST_CACHE[1][0]
     flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
              | getattr(os, "O_NONBLOCK", 0)
              | getattr(os, "O_NOFOLLOW", 0))
@@ -322,8 +416,10 @@ def _ingest_binary_digest(path: Path | None = None) -> bytes:
         if fileops.file_identity_fd(fd) != before:
             raise OSError(f"ingest binary changed before hashing: {binary}")
         digest = hashlib.md5()
+        native = hashlib.sha256()
         for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
             digest.update(chunk)
+            native.update(chunk)
         value = digest.digest()
         if (fileops.file_identity_fd(fd) != before
                 or fileops.file_identity(binary) != before):
@@ -331,7 +427,7 @@ def _ingest_binary_digest(path: Path | None = None) -> bytes:
     finally:
         os.close(fd)
     with _BINARY_DIGEST_LOCK:
-        _BINARY_DIGEST_CACHE = (key, value)
+        _BINARY_DIGEST_CACHE = (key, (value, native.hexdigest()))
     return value
 
 
@@ -378,12 +474,7 @@ def derived_writer_build_id(
             if require_binary:
                 raise
             binary_digest = b"unavailable"
-    digest = hashlib.md5()
-    digest.update(b"agrep-derived-writer-v2\0")
-    digest.update(INDEXD_BUILD_ID.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(binary_digest)
-    return digest.hexdigest()[:20]
+    return _writer_build_id_from_digest(binary_digest)
 
 
 def assert_python_runtime_unchanged() -> None:
@@ -669,14 +760,7 @@ def derived_mutation_info(
 def derived_writer_mutation_info(
         current_build_id: str | None = None, *,
         allow_legacy_adoption: bool = False) -> DerivedMutationInfo:
-    """Extend the low owner/cache fence through the derived DB publication.
-
-    corpusdb owns SQLite-format probing, so writer entrypoints call it lazily
-    without a module cycle. Explicit DB ownership always wins. Only callers
-    launching the Rust ingest may opt into ownerless legacy adoption; semantic
-    and daemon coordination writers require a current family (or a truly empty
-    store with nothing yet to own).
-    """
+    """Extend the owner/cache fence through the DB, reserving unanchored adoption for Rust."""
     current = current_build_id or derived_writer_build_id()
     low = derived_mutation_info(current)
     if not low.writable:
@@ -701,7 +785,9 @@ def derived_writer_mutation_info(
                 str(db_error)
                 if db_error else "corpus.db ownership cannot be verified")
         if (allow_legacy_adoption
-                and db_state in {"absent", "unowned"}):
+                and (db_state in {"absent", "unowned"}
+                     or (low.state == "absent"
+                         and db_state == "owned" and db_owner == current))):
             return low
         # A truly empty store has no family to conflict with. Once any legacy
         # derived publication exists, only the Rust adoption path may establish
@@ -777,27 +863,31 @@ def refresh_search_index(quiet: bool = True) -> bool | None:
                 "on a large history) …" if not db_path.exists() else
                 "refreshing the search db …")
         db = corpusdb.connect(quiet=True)
+        reason = "the search database could not be opened"
         if db:
             try:
                 meta = dict(db.execute(
                     "SELECT key, value FROM meta WHERE key IN "
                     "('stamp', 'schema', 'fts_triggers', 'build_id')"))
-                current = (
-                    meta.get("stamp") == corpusdb._stamp()
-                    and meta.get("schema") == corpusdb._SCHEMA
-                    and meta.get("fts_triggers") == corpusdb._TRIGGER_SCHEMA
-                    and meta.get("build_id") == derived_writer_build_id(
-                        require_binary=True)
-                )
+                expected = {
+                    "stamp": corpusdb._stamp(),
+                    "schema": corpusdb._SCHEMA,
+                    "fts_triggers": corpusdb._TRIGGER_SCHEMA,
+                    "build_id": derived_writer_build_id(require_binary=True),
+                }
             finally:
                 db.close()
-            if current and not corpusdb.query_rebuild_required():
+            stale = [key for key, value in expected.items() if meta.get(key) != value]
+            if not stale and not corpusdb.query_rebuild_required():
                 return True
+            reason = (f"{', '.join(stale)} in its meta table did not match this build" if stale
+                      else "a query failure still marks it for rebuild")
         # A foreign owner is a deliberate read-only outcome, not a failed
         # refresh. AutoIndexer must clear its retry streak instead of escalating
         # a correctly fenced build to --full.
         if not corpusdb._derived_write_ownership(for_write=True).writable:
             return True
+        common.log(f"search-index refresh did not publish a current database: {reason}")
         return False
     except Exception as exc:  # noqa: BLE001
         common.log(f"search-index refresh failed: {type(exc).__name__}: {exc}")
@@ -1000,6 +1090,11 @@ def build_index(
     if quiet and common.WIN:
         kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     ingest = common.ingest_bin()
+    if require_search_index:
+        # An upgrade's predecessor daemon fences the Rust ingest read-only
+        # until something retires it; the explicit index does so itself, as
+        # the daemon spawn does, instead of declining the first post-upgrade run.
+        retire_displaceable_indexd_owner()
     # Callers normally prove the binary exists. The missing-path branch preserves
     # launch failure semantics without inventing an identity; every real executable
     # is bound to its exact Python+Rust build before launch.
@@ -1016,10 +1111,10 @@ def build_index(
         f"ingest exec: {' '.join(cmd)} (cwd={common.REPO_ROOT})", ">")
     common._close_event_reader()
     t = time.time()
-    census_before, unreadable_before = _census_map(
-        _store_census(timeout_s=30.0))
+    census_rows = _store_census(timeout_s=30.0)
+    census_before, unreadable_before = _census_map(census_rows)
     digests_before = (
-        _store_digests(census_before, _store_paths_census(timeout_s=30.0))
+        _publication_store_digests(census_rows, census_before)
         if census_before is not None else {})
     before = common.MESSAGES_PATH.stat().st_size if common.MESSAGES_PATH.exists() else 0
     r = subprocess.run(cmd, cwd=str(common.REPO_ROOT), **kw)
@@ -1059,6 +1154,7 @@ def build_index(
         if r.returncode != 0 or explicit_index_declined():
             # a declined ingest published nothing for the census below to vouch for
             return False
+    record_binary_identity(ingest)
     if census_before is not None and not unreadable_before:
         # The pre-pass census under-claims what the ingest consumed, so a
         # green verdict from this record can never cover unconsumed changes.
@@ -1229,6 +1325,124 @@ def serve_search_index_request(
             path, before, tombstone=True, require_stable_mtime=True)
     except OSError:
         pass
+    return True
+
+
+_RECOVERY_REQUEST_DIR = ".recovery_requests"
+_RECOVERY_REQUEST_MAX_BYTES = 1024
+
+
+def request_recovery_refresh() -> ownerfile.Handle | None:
+    """Queue source ingest and FTS publication without entering either writer."""
+    if (os.environ.get("AGREP_NO_DAEMON") or _data_dir_readonly()
+            or removal_fence.background_removal_active()):
+        return None
+    token = secrets.token_hex(16)
+    directory = common.DATA_DIR / _RECOVERY_REQUEST_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return ownerfile.create_exclusive(
+            directory / f"{token}.json",
+            json.dumps({
+                "version": 1, "token": token, "pid": os.getpid(),
+                "process_start": common.process_start_identity(os.getpid()),
+            }).encode())
+    except OSError:
+        return None
+
+
+def _read_recovery_request(path: Path) -> tuple[ownerfile.Snapshot, dict] | None:
+    try:
+        observed = ownerfile.snapshot(path, max_bytes=_RECOVERY_REQUEST_MAX_BYTES)
+        record = json.loads(observed.raw)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or not isinstance(record.get("token"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", record["token"]) is None
+            or type(record.get("pid")) is not int or record["pid"] <= 0):
+        return None
+    return observed, record
+
+
+def recovery_refresh_complete(request: ownerfile.Handle) -> bool:
+    entry = _read_recovery_request(request.path.with_suffix(".done"))
+    return entry is not None and entry[0].raw == request.snapshot.raw
+
+
+def release_recovery_request(request: ownerfile.Handle) -> None:
+    try:
+        request.release(tombstone=True, require_stable_mtime=True)
+        path = request.path.with_suffix(".done")
+        entry = _read_recovery_request(path)
+        if entry is not None and entry[0].raw == request.snapshot.raw:
+            ownerfile.remove_exact(path, entry[0], require_stable_mtime=True)
+    except OSError:
+        pass
+    finally:
+        request.close()
+
+
+def serve_recovery_requests(ingest: Callable[[], bool]) -> bool:
+    """Acknowledge only requests captured before a successful source/FTS pass."""
+    directory = common.DATA_DIR / _RECOVERY_REQUEST_DIR
+    pending, expired = [], []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if path.suffix not in {".json", ".done"}:
+                    continue
+                request = _read_recovery_request(path)
+                if request is None:
+                    continue
+                observed, record = request
+                if path.stem != record["token"]:
+                    continue
+                owner = ownerfile.classify_process(
+                    record["pid"], record.get("process_start"),
+                    pid_alive=common.pid_alive,
+                    process_start=common.process_start_identity)
+                if owner in {ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED}:
+                    expired.append((path, observed))
+                    continue
+                if path.suffix == ".done":
+                    continue
+                pending.append((path, observed, record))
+                if len(pending) == 64:
+                    break
+    except OSError:
+        return False
+    if not pending and not expired:
+        return False
+    if not derived_writes_permitted():
+        return False
+    for path, observed in expired:
+        try:
+            ownerfile.remove_exact(path, observed, require_stable_mtime=True)
+        except OSError:
+            pass
+    if not pending:
+        return False
+    if not ingest():
+        return True
+    for path, observed, record in pending:
+        receipt = path.with_suffix(".done")
+        try:
+            published = ownerfile.create_exclusive(receipt, observed.raw).snapshot
+        except FileExistsError:
+            existing = _read_recovery_request(receipt)
+            if existing is None or existing[1] != record:
+                continue
+            published = existing[0]
+        except OSError:
+            continue
+        try:
+            if not ownerfile.remove_exact(path, observed, require_stable_mtime=True):
+                ownerfile.remove_exact(
+                    receipt, published, require_stable_mtime=True)
+        except OSError:
+            pass
     return True
 
 
@@ -3316,6 +3530,29 @@ def live_indexer_claim() -> bool:
                 or inspected.state in _INDEXD_RECLAIMABLE_STATES)
 
 
+def retire_displaceable_indexd_owner() -> bool:
+    """Retire the one live owner this build may displace.
+
+    The daemon spawn and the explicit index share this verdict: only an exact,
+    topology-verified predecessor (wire-incompatible, or certifying another
+    world) is terminated, and only over derived stores a writer of this build
+    may act on. Hostile and unverifiable claims stay fenced, and this build's
+    own compatible daemon is never touched - an explicit ingest coexists with
+    it through the owner token `rust_writer_env` hands the Rust writer.
+    True only when such an owner was retired and derived writes are permitted
+    afterwards; False leaves whatever fence remains for the caller to name.
+    """
+    ownership = derived_writer_mutation_info()
+    inspected = _inspect_indexd_owner(settle_child=False)
+    if (not derived_writer_launchable(ownership)
+            or inspected.state not in _INDEXD_RETIRABLE_EXACT_STATES):
+        return False
+    inspected = _settle_indexd_owner(
+        allow_retire=True, retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
+    return (inspected.state is _IndexdOwnerState.ABSENT
+            and derived_writes_permitted())
+
+
 class RepairKick(NamedTuple):
     """One verdict every surface shares: is repair in flight, and if not, the
     single cause. Emitter and checker, one artifact - a lane that renders a
@@ -3466,6 +3703,18 @@ _VERIFIED_CURRENT_MAX_BYTES = 64 * 1024
 _DRIFT_PROBE_TIMEOUT_S = 0.45
 _DRIFT_REAP_WAIT_S = 0.02
 _DRIFT_CACHE_TTL_S = 5.0
+CENSUS_REUSE_S = _DRIFT_CACHE_TTL_S
+CENSUS_WARM_WINDOW_S = 120.0
+CENSUS_REFRESH_AFTER_S = 3.0
+CENSUS_WARM_MAX_BACKOFF_S = 60.0
+_CENSUS_CLOCK_SLACK_S = 0.25
+_CENSUS_WARM_RETRY = {"at": 0.0, "delay": CENSUS_REFRESH_AFTER_S}
+_STORE_CENSUS_MAX_BYTES = 1024 * 1024
+_CENSUS_STORES_PREFIX = '{"version":1,"stores":'
+_STORE_DISCOVERY_ENV = (
+    "HOME", "AGREP_HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
+    "LOCALAPPDATA", "APPDATA", "CLINE_DIR", "OPENCODE_DB", "CRUSH_GLOBAL_DATA",
+)
 _DRIFT_PROBE = threading.local()
 _DRIFT_CACHE = threading.local()
 # The daemon's designed catch-up horizon (QUIET_S settle + the MAX_STALE_S
@@ -3498,6 +3747,14 @@ class DriftReport(NamedTuple):
 
 _UNOBSERVED_STORES = object()
 _UNOBSERVED_DRIFT = object()
+
+
+class _StoreCensus(NamedTuple):
+    observed_at: float
+    observed_mono: float
+    key: dict
+    rows: list
+    digests: dict[str, str]
 
 
 def _census_popen_kw() -> dict:
@@ -3628,6 +3885,7 @@ def _drift_probe_after_fork_child() -> None:
             proc.returncode = 0
         _DRIFT_PROBE_LIVE.clear()
         _DRIFT_CACHE.value = None
+        _DRIFT_PROBE.observation = None
     finally:
         _DRIFT_PROBE_LOCK.release()
 
@@ -3639,42 +3897,41 @@ if hasattr(os, "register_at_fork"):  # POSIX only
         after_in_child=_drift_probe_after_fork_child)
 
 
-def _arm_drift_probe() -> None:
+def _arm_drift_probe(*, reuse: bool = True) -> None:
     """Start the census concurrently with the query it will be judged against."""
     if getattr(_DRIFT_PROBE, "proc", None) is not None:
         return
+    if reuse and _read_store_census_cache() is not None:
+        return
+    _start_census_probe()
+
+
+def _start_census_probe() -> None:
     ingest = common.ingest_bin()
+    _DRIFT_PROBE.proc = None
+    _DRIFT_PROBE.observation = None
+    _discard_paths_probe()
     if not ingest.exists():
         return
+    _DRIFT_PROBE.key = _store_census_key()
+    _DRIFT_PROBE.observed_at = time.time()
+    _DRIFT_PROBE.observed_mono = time.monotonic()
     try:
         proc = subprocess.Popen(
-            [str(ingest), "stores"], **_census_popen_kw())
+            [str(ingest), "stores", "--census"], **_census_popen_kw())
     except OSError:
         _DRIFT_PROBE.proc = None
         return
     _track_drift_probe(proc)
     _DRIFT_PROBE.proc = proc
     _DRIFT_PROBE.armed_at = time.monotonic()
-    record = _read_verified_record()
-    if record is not None and record.digests:
-        # The record carries change-sensitive store identities; arm the
-        # registry-owned member listing so the verdict can re-derive them
-        # without paying the child's wall time on the render path.
-        _discard_paths_probe()
-        try:
-            paths_proc = subprocess.Popen(
-                [str(ingest), "stores", "--paths"], **_census_popen_kw())
-        except OSError:
-            return
-        _track_drift_probe(paths_proc)
-        _DRIFT_PROBE.paths_proc = paths_proc
 
 
 def arm_store_census() -> None:
     """Diagnostic arming hook (doctor): start the census child early so its
     wall time overlaps the caller's other probes instead of following them -
     the same overlap the search path buys inside ensure_index."""
-    _arm_drift_probe()
+    _arm_drift_probe(reuse=False)
 
 
 def _discard_paths_probe() -> None:
@@ -3706,6 +3963,10 @@ def _consume_paths_probe(
         rows = json.loads(out)
     except (RecursionError, TypeError, ValueError):
         return None
+    return _group_store_paths(rows)
+
+
+def _group_store_paths(rows: object) -> dict[str, list[str]] | None:
     if not isinstance(rows, list):
         return None
     grouped: dict[str, list[str]] = {}
@@ -3768,38 +4029,120 @@ def _store_digests(
     return out
 
 
-def _store_census(timeout_s: float = _DRIFT_PROBE_TIMEOUT_S) -> list | None:
-    """Rows from `agrep-rs stores`, or None when the census cannot be trusted."""
-    proc = getattr(_DRIFT_PROBE, "proc", None)
-    _DRIFT_PROBE.proc = None
-    if proc is not None and (
-            time.monotonic() - getattr(_DRIFT_PROBE, "armed_at", 0.0) > 30.0):
-        # A probe left over from an earlier search in a long-lived process
-        # would answer for a stale moment; a fresh census replaces it.
-        _kill_drift_probe(proc)
-        proc = None
-    if proc is None:
-        ingest = common.ingest_bin()
-        if not ingest.exists():
-            return None
-        try:
-            proc = subprocess.Popen([str(ingest), "stores"], **_census_popen_kw())
-        except OSError:
-            return None
-        _track_drift_probe(proc)
+def _read_census_probe(
+        proc: subprocess.Popen, timeout_s: float) -> tuple[bool, object]:
     try:
         out, _ = proc.communicate(timeout=timeout_s)
     except (subprocess.TimeoutExpired, OSError, TypeError, ValueError):
         _kill_drift_probe(proc)
-        return None
+        return False, None
     _untrack_drift_probe(proc)
     if proc.returncode != 0:
-        return None
+        return True, None
+    if len(out) > _PATHS_PROBE_MAX_BYTES:
+        return True, _census_stores_only(out)
     try:
-        rows = json.loads(out)
+        return True, json.loads(out, object_pairs_hook=_unique_json_object)
     except (RecursionError, TypeError, ValueError):
+        return True, None
+
+
+def _census_stores_only(out: str) -> dict | None:
+    """An oversized census keeps its leading store rows; only member digests drop."""
+    if not out.startswith(_CENSUS_STORES_PREFIX):
         return None
-    return rows if isinstance(rows, list) else None
+    end = out.find('],"paths":[', len(_CENSUS_STORES_PREFIX))
+    if end < 0:
+        return None
+    text = out[len(_CENSUS_STORES_PREFIX):end + 1]
+    try:
+        rows, consumed = json.JSONDecoder(
+            object_pairs_hook=_unique_json_object).raw_decode(text)
+    except (RecursionError, ValueError):
+        return None
+    if consumed != len(text) or not isinstance(rows, list):
+        return None
+    return {"version": 1, "stores": rows, "paths": None}
+
+
+def _legacy_store_census(
+        deadline: float) -> tuple[list | None, dict[str, list[str]] | None]:
+    ingest = common.ingest_bin()
+    try:
+        proc = subprocess.Popen([str(ingest), "stores"], **_census_popen_kw())
+    except OSError:
+        return None, None
+    _track_drift_probe(proc)
+    try:
+        paths_proc = subprocess.Popen(
+            [str(ingest), "stores", "--paths"], **_census_popen_kw())
+    except OSError:
+        paths_proc = None
+    if paths_proc is not None:
+        _track_drift_probe(paths_proc)
+        _DRIFT_PROBE.paths_proc = paths_proc
+    _completed, rows = _read_census_probe(
+        proc, max(0.0, deadline - time.monotonic()))
+    if not isinstance(rows, list) or _census_map(rows)[0] is None:
+        _discard_paths_probe()
+        return None, None
+    paths = _consume_paths_probe(
+        timeout_s=max(0.0, deadline - time.monotonic()))
+    return rows, paths
+
+
+def _store_census(
+        timeout_s: float = _DRIFT_PROBE_TIMEOUT_S, *, persist: bool = True) -> list | None:
+    """Take a live observation; diagnostic and publication proofs never reuse it."""
+    _DRIFT_PROBE.observation = None
+    proc = getattr(_DRIFT_PROBE, "proc", None)
+    if proc is not None and (
+            time.monotonic() - getattr(_DRIFT_PROBE, "armed_at", 0.0) > 30.0):
+        _kill_drift_probe(proc)
+        proc = None
+    if proc is None:
+        _start_census_probe()
+        proc = getattr(_DRIFT_PROBE, "proc", None)
+    _DRIFT_PROBE.proc = None
+    if proc is None:
+        return None
+    deadline = time.monotonic() + timeout_s
+    completed, payload = _read_census_probe(proc, timeout_s)
+    if not completed:
+        return None
+    rows, paths = None, None
+    if (isinstance(payload, dict) and type(payload.get("version")) is int
+            and payload["version"] == 1):
+        rows = payload.get("stores")
+        # A null listing is the oversized census: rows stand, digests claim nothing.
+        paths = ({} if payload.get("paths") is None
+                 else _group_store_paths(payload.get("paths")))
+    if (not isinstance(rows, list) or _census_map(rows)[0] is None
+            or paths is None):
+        rows, paths = _legacy_store_census(deadline)
+    live, _unreadable = _census_map(rows)
+    if live is None:
+        return None
+    observation = _StoreCensus(
+        _DRIFT_PROBE.observed_at, _DRIFT_PROBE.observed_mono, _DRIFT_PROBE.key,
+        rows, _store_digests(live, paths))
+    _DRIFT_PROBE.observation = observation
+    if persist:
+        _write_store_census_cache(observation)
+    return rows
+
+
+def _observed_census(rows: list | None) -> _StoreCensus | None:
+    observation = getattr(_DRIFT_PROBE, "observation", None)
+    return observation if observation is not None and observation.rows is rows else None
+
+
+def _publication_store_digests(
+        rows: list | None, live: dict[str, tuple[int, int]]) -> dict[str, str]:
+    observation = _observed_census(rows)
+    if observation is not None:
+        return observation.digests
+    return _store_digests(live, _store_paths_census(timeout_s=30.0))
 
 
 def _census_map(
@@ -3964,6 +4307,128 @@ def _drift_cache_key() -> tuple[
     )
 
 
+def _store_census_key() -> dict:
+    publication = _drift_cache_key()
+    ingest = common.ingest_bin()
+    try:
+        identity = fileops.file_identity(ingest.resolve(strict=True))
+    except (OSError, RuntimeError):
+        identity = None
+    environment = {name: os.environ.get(name) for name in _STORE_DISCOVERY_ENV}
+    # The Rust walk resolves relative roots, including a missing home, against cwd.
+    cwd = None
+    if (any(value and not os.path.isabs(value) for value in environment.values())
+            or not any(environment.get(name) for name in ("HOME", "USERPROFILE", "AGREP_HOME"))):
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            identity = None
+    return {
+        "publication": [publication[0], *[
+            list(value) if value is not None else None
+            for value in publication[1:]]],
+        "ingest": [os.fspath(ingest), list(identity) if identity is not None else None],
+        "environment": environment,
+        "cwd": cwd,
+    }
+
+
+def _read_store_census_cache(now: float | None = None) -> _StoreCensus | None:
+    now = time.time() if now is None else now
+    try:
+        snapshot = ownerfile.snapshot(
+            common.DATA_DIR / ".store-census.json", max_bytes=_STORE_CENSUS_MAX_BYTES)
+        payload = json.loads(
+            snapshot.raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        if (not isinstance(payload, dict) or type(payload.get("version")) is not int
+                or payload["version"] != 1):
+            return None
+        observed_at = payload.get("observed_at")
+        observed_mono = payload.get("observed_mono")
+        key = _store_census_key()
+        if (any(type(value) not in (int, float) or not math.isfinite(value)
+                for value in (observed_at, observed_mono))
+                or not 0.0 <= now - observed_at <= CENSUS_REUSE_S
+                # A wall-clock step since the observation shows as disagreeing ages.
+                or abs((time.monotonic() - observed_mono) - (now - observed_at))
+                > _CENSUS_CLOCK_SLACK_S
+                or key["ingest"][1] is None or payload.get("key") != key):
+            return None
+        rows, digests = payload.get("rows"), payload.get("digests")
+        if not isinstance(rows, list):
+            return None
+        live, _unreadable = _census_map(rows)
+        if (live is None or not isinstance(digests, dict)
+                or any(name not in live or live[name][0] > _STORE_DIGEST_MAX_FILES
+                       or not isinstance(value, str) or not _DIGEST_HEX_RE.fullmatch(value)
+                       for name, value in digests.items())):
+            return None
+        return _StoreCensus(
+            float(observed_at), float(observed_mono), payload["key"], rows, digests)
+    except (OSError, OverflowError, RecursionError, UnicodeError, ValueError):
+        return None
+
+
+def _write_store_census_cache(observation: _StoreCensus) -> None:
+    if (_data_dir_readonly() or observation.key["ingest"][1] is None
+            or observation.key != _store_census_key()):
+        return
+    path = common.DATA_DIR / ".store-census.json"
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    payload = {
+        "version": 1, "observed_at": observation.observed_at,
+        "observed_mono": observation.observed_mono, "key": observation.key,
+        "rows": observation.rows, "digests": observation.digests,
+    }
+    try:
+        raw = json.dumps(payload).encode("utf-8")
+        if len(raw) > _STORE_CENSUS_MAX_BYTES:
+            return
+        tmp.write_bytes(raw)
+        # One attempt: Windows reader-lock retries would stall the query being optimized.
+        common.replace_with_retry(tmp, path, attempts=1)
+    except OSError:
+        pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def warm_store_census() -> None:
+    """Keep active readers' observations warm without changing freshness proof."""
+    try:
+        if _data_dir_readonly():
+            return
+        now = time.time()
+        try:
+            last_search = SEARCH_BEAT_PATH.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if not 0.0 <= now - last_search <= CENSUS_WARM_WINDOW_S:
+            return
+        cached = _read_store_census_cache(now)
+        if cached is not None and now - cached.observed_at < CENSUS_REFRESH_AFTER_S:
+            return
+        if time.monotonic() < _CENSUS_WARM_RETRY["at"]:
+            return
+        if not derived_writer_mutation_info().writable:
+            return
+        warmed = _store_census() is not None and _read_store_census_cache() is not None
+        if not warmed:
+            common.dbg("store census warming failed: census unavailable", "!")
+    except Exception as exc:  # noqa: BLE001 -- housekeeping cannot wound the daemon
+        warmed = False
+        common.dbg(f"store census warming failed: {exc}", "!")
+    if warmed:
+        _CENSUS_WARM_RETRY.update(at=0.0, delay=CENSUS_REFRESH_AFTER_S)
+    else:
+        _CENSUS_WARM_RETRY["at"] = time.monotonic() + _CENSUS_WARM_RETRY["delay"]
+        _CENSUS_WARM_RETRY["delay"] = min(
+            _CENSUS_WARM_RETRY["delay"] * 2, CENSUS_WARM_MAX_BACKOFF_S)
+
+
 def stamp_verified_current() -> bool:
     """Cheap compare-and-restamp for an idle daemon (and its idle-exit): prove
     the sources did not move, so a later daemonless search can answer green."""
@@ -3971,10 +4436,11 @@ def stamp_verified_current() -> bool:
     if streak:
         return False
     sig_before = _signal_identity()
-    live, unreadable = _census_map(_store_census(timeout_s=30.0))
+    rows = _store_census(timeout_s=30.0)
+    live, unreadable = _census_map(rows)
     if live is None or unreadable:
         return False
-    digests = _store_digests(live, _store_paths_census(timeout_s=30.0))
+    digests = _publication_store_digests(rows, live)
     record = _read_verified_record()
     if record is not None and live == record.census:
         if any(name in digests and digests[name] != recorded
@@ -4010,8 +4476,11 @@ def _drift_report(now: float | None = None) -> DriftReport:
     if (cached is not None and cached[0] == key
             and time.monotonic() - cached[1] < _DRIFT_CACHE_TTL_S):
         return cached[2]
+    _DRIFT_PROBE.basis_mono = None
     report = _compute_drift_report(now)
-    _DRIFT_CACHE.value = (key, time.monotonic(), report)
+    # Expiry counts from the census observation, which may be a reused one.
+    basis = getattr(_DRIFT_PROBE, "basis_mono", None)
+    _DRIFT_CACHE.value = (key, time.monotonic() if basis is None else basis, report)
     return report
 
 
@@ -4025,8 +4494,15 @@ def _compute_drift_report(
         # Nothing published: the first-run story owns this surface.
         return DriftReport("current")
     now = time.time() if now is None else now
+    observation = None
     if store_rows is _UNOBSERVED_STORES:
-        store_rows = _store_census()
+        if getattr(_DRIFT_PROBE, "proc", None) is None:
+            observation = _read_store_census_cache(now)
+        store_rows = observation.rows if observation is not None else _store_census()
+    if observation is None:
+        observation = _observed_census(store_rows)
+    if observation is not None:
+        _DRIFT_PROBE.basis_mono = observation.observed_mono
     live, unreadable = _census_map(store_rows)
     if live is None:
         return DriftReport(
@@ -4053,7 +4529,8 @@ def _compute_drift_report(
         return _record_drift(
             live, record.ts, record.census, now,
             recorded_digests=record.digests,
-            live_digests=_live_store_digests(record.digests, live))
+            live_digests=(observation.digests if observation is not None
+                          else _live_store_digests(record.digests, live)))
     try:
         sig_mtime = (common.DATA_DIR / ".ingest.sig").stat().st_mtime
     except FileNotFoundError:
@@ -4076,8 +4553,10 @@ def _compute_drift_report(
 def observe_store_drift(
         *, timeout_s: float = _DRIFT_PROBE_TIMEOUT_S,
 ) -> tuple[list | None, DriftReport]:
-    """Observe source rows once and derive drift from that exact census."""
-    rows = _store_census(timeout_s=timeout_s)
+    """Observe source rows once and derive drift from that exact census.
+
+    Doctor and status observe without persisting, so diagnostics leave the data dir untouched."""
+    rows = _store_census(timeout_s=timeout_s, persist=False)
     return rows, _compute_drift_report(store_rows=rows)
 
 
@@ -4507,8 +4986,7 @@ def freshness_story() -> surface.FreshnessStory:
             "unverified", code=deferred.code,
             detail=_bounded_freshness_reason(deferred.reason),
             converging=_daemon_will_converge())
-    return surface.FreshnessStory(
-        "current", absorbed_drift=bool(getattr(drift, "absorbed", 0)))
+    return surface.FreshnessStory("current")
 
 
 def agent_freshness_notice(environ: Mapping[str, str] | None = None) -> str:
@@ -4771,19 +5249,10 @@ def _spawn_indexd() -> _IndexdSpawnResult:
         return _IndexdSpawnResult.BLOCKED
     if removal_fence.background_removal_active():
         return _IndexdSpawnResult.BLOCKED
-    if not derived_writes_permitted():
-        # Only an exact topology-verified incompatible daemon is retireable;
-        # hostile or unverifiable claims remain fenced before the spawn guard.
-        ownership = derived_writer_mutation_info()
-        inspected = _inspect_indexd_owner(settle_child=False)
-        if (not derived_writer_launchable(ownership)
-                or inspected.state not in _INDEXD_RETIRABLE_EXACT_STATES):
-            return _IndexdSpawnResult.BLOCKED
-        inspected = _settle_indexd_owner(
-            allow_retire=True, retire_budget_s=_INDEXD_ACQUIRE_WAIT_S)
-        if (inspected.state is not _IndexdOwnerState.ABSENT
-                or not derived_writes_permitted()):
-            return _IndexdSpawnResult.BLOCKED
+    if (not derived_writes_permitted()
+            and not retire_displaceable_indexd_owner()):
+        # hostile or unverifiable claims remain fenced before the spawn guard
+        return _IndexdSpawnResult.BLOCKED
     _clear_own_spawn_guard()
     script = common.PY_DIR / "indexd.py"
     if not script.exists():
@@ -5028,14 +5497,13 @@ def _maybe_freshen() -> None:
     spawned = _reclassify_indexd_spawn_failure(_spawn_indexd())
     # Materialized JSONL is the nonblocking fallback while the daemon publishes FTS.
     # Mark this process too, or a second first-run search would rebuild FTS inline.
-    if (spawned in {
+    if spawned in {
             _IndexdSpawnResult.READY,
             _IndexdSpawnResult.IN_FLIGHT,
-    }
-            and common.MESSAGES_PATH.exists()):
+    }:
         _set_fts_delegated(True)
         defer_foreground_refresh(REFRESH_DELEGATED_REASON)
-        common.dbg("freshen: serving published messages while the new daemon catches up")
+        common.dbg("freshen: background publication requested")
         return
     if spawned is _IndexdSpawnResult.BLOCKED:
         if common.MESSAGES_PATH.exists():
@@ -5052,27 +5520,21 @@ def _maybe_freshen() -> None:
         defer_foreground_refresh("the background indexer failed to start")
         return
 
-    # ensure_index calls this function only after observing messages.jsonl. Reaching
-    # an inline build here would redefine an existing publication as a first run.
     defer_foreground_refresh("background refresh is unavailable")
 
 
-def ensure_index(auto: bool = True, *, quiet: bool = False) -> bool:
-    """Make sure data/messages.jsonl exists and is reasonably fresh, building it on
-    first use (and re-ingesting stale indexes) when we can.
-
-    Returns True when the materialized corpus is present (already there, or freshly
-    ingested), False when it's missing and we couldn't build it. The CLI's keyword
-    paths call this so a fresh clone's first `agrep <pattern>` indexes itself instead
-    of dead-ending on "no index yet", and so a later search picks up new sessions
-    instead of serving a stale snapshot. `auto=False` (the --no-auto flag) skips both
-    the build and the freshen: script-friendly, no daemon spawn, no surprise ingest.
-    `quiet=True` keeps the first build's child output off structured stdout.
-    """
+def ensure_index(
+        auto: bool = True, *, quiet: bool = False,
+        background_only: bool = False) -> bool:
+    """Ensure a corpus exists; background-only readers never start an inline build."""
     _clear_freshen_failure()
     common.dbg(
         f"ensure_index(auto={auto}): "
         f"messages.jsonl exists={common.MESSAGES_PATH.exists()}")
+    if auto and background_only:
+        _arm_drift_probe()
+        _maybe_freshen()
+        return common.MESSAGES_PATH.exists()
     if common.MESSAGES_PATH.exists():
         if auto:
             # The census answers "did the sources drift?" at render time;

@@ -90,11 +90,17 @@ class TerminalSafetyTests(unittest.TestCase):
         with mock.patch.object(console, "WIN", False):
             self.assertEqual(
                 shlex.split(around._expand_command(session, 7)),
+                ["agrep", "around", session, "7", "-C", "0", "--max-chars", "0"])
+            self.assertEqual(
+                shlex.split(around._forensic_command(session, 7, 0)),
                 ["agrep", "around", session, "7", "-C", "0", "--full"])
         with mock.patch.object(console, "WIN", True):
             self.assertEqual(
                 around._expand_command(session, 7),
-                "agrep around <session> <turn> -C 0 --full")
+                "agrep around <session> <turn> -C 0 --max-chars 0")
+            self.assertEqual(
+                around._forensic_command(session, 7, 0),
+                "agrep around <session> <turn> -C <N> --full")
 
     def test_translate_path_matches_slow_reference(self):
         alphabet = (
@@ -235,7 +241,7 @@ class TerminalSafetyTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("usage: agrep board", proc.stdout)
-        self.assertNotIn("grep your cross-agent chat history", proc.stdout)
+        self.assertNotIn("search everything your AI agents have done", proc.stdout)
 
     def test_audit_and_archive_quote_store_paths_and_errors(self):
         danger = "bad\x1b]52;c;payload\x07\r\u202eforge"

@@ -12,6 +12,8 @@ import contextlib
 import io
 import json
 import re
+import shlex
+import sqlite3
 import sys
 import unittest
 from unittest import mock
@@ -26,6 +28,7 @@ isolate_data_dir()
 import around  # noqa: E402
 import common  # noqa: E402
 import compact  # noqa: E402
+import corpusdb  # noqa: E402
 import recall  # noqa: E402
 
 
@@ -130,7 +133,7 @@ class _TTYBuffer(io.StringIO):
 
 def _run_recall(argv, run_query=None, agent_context=False, windows=None,
                 stderr_tty=False, self_scope_has_rows=None,
-                self_scope_has_matches=None):
+                self_scope_has_matches=None, prog="recall"):
     stdout = io.StringIO()
     stderr = _TTYBuffer() if stderr_tty else io.StringIO()
     query = run_query or (
@@ -167,8 +170,204 @@ def _run_recall(argv, run_query=None, agent_context=False, windows=None,
                               side_effect=lambda pairs, *a, **k: pairs), \
             contextlib.redirect_stdout(stdout), \
             contextlib.redirect_stderr(stderr):
-        rc = recall.main(argv)
+        rc = recall.main(argv, prog=prog)
     return rc, stdout.getvalue(), stderr.getvalue()
+
+
+class RecallCapSpeakerTests(unittest.TestCase):
+    def _assert_cap_commands(self, who, json_output, budget):
+        text = "needle " + "source " * 3_000 + "SOURCE_TAIL"
+        reply = "needle " + "answer " * 3_000 + "ANSWER_TAIL"
+        hit = {
+            **_hits()[0], "who": who,
+            "content_digest": compact.content_digest(text),
+        }
+        window = {
+            "session": STRONG, "center": 3, "first_turn": 3,
+            "last_turn": 3, "agent": "codex", "project": "agrep",
+            "events": [], "turns": [{
+                "turn": 3, "ts": 1, "who": who,
+                "text": text, "reply": reply,
+            }],
+        }
+        rc, capped, err = _run_recall(
+            ["needle", "--lexical", "--hits", "1", "--budget", str(budget),
+             "--color", "never", *(["--json"] if json_output else [])],
+            run_query=lambda *_a, **_k: _result([dict(hit)]),
+            windows=lambda requests: [window for _ in requests])
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(capped.encode("utf-8")), budget)
+        if json_output:
+            rows = json.loads(capped)["hits"][0]["window"]
+            messages = [(row["who"], row["text"]) for row in rows
+                        if row["kind"] == "msg"]
+            for row in rows:
+                if row["kind"] != "msg":
+                    continue
+                retained = row["text"].split(" [+")[0]
+                source = reply if row["who"] == "agent" else text
+                self.assertEqual(
+                    len(retained) + row["omitted_chars"], len(source))
+        else:
+            messages = re.findall(r"^ +3 (\w+): (.+)$", capped, re.M)
+        self.assertEqual({role for role, _ in messages}, {who, "agent"})
+        for role, message in messages:
+            command = re.search(
+                r"\[(?:\+[\d,]+ chars - |snippet - open: )(agrep around [^\]]+)\]",
+                message)
+            self.assertIsNotNone(command, message)
+            out = io.StringIO()
+            with mock.patch.object(
+                    around.indexd_runtime, "ensure_index", return_value=True), \
+                    mock.patch.object(
+                        around.explore, "resolve_session", return_value=[STRONG]), \
+                    mock.patch.object(
+                        around.explore, "_session_index", return_value={STRONG: {}}), \
+                    mock.patch.object(
+                        around.explore, "get_window", return_value=window), \
+                    mock.patch.object(
+                        around.session_context, "indexed_family_roots",
+                        return_value={STRONG: STRONG}), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = around.main(
+                    [*shlex.split(command[1])[2:], "--json", "--no-auto"])
+            self.assertEqual(rc, 0, out.getvalue())
+            recovered = {
+                row["who"]: row["text"]
+                for row in map(json.loads, out.getvalue().splitlines())
+                if row.get("kind") == "msg"
+            }
+            self.assertEqual(
+                recovered.get(role), reply if role == "agent" else text)
+
+    def test_cap_commands_recover_nondefault_speakers_and_agent_replies(self):
+        for who in ("recap", "control", "harness", "synthetic", "subagent"):
+            for json_output in (False, True):
+                with self.subTest(who=who, json=json_output):
+                    self._assert_cap_commands(
+                        who, json_output, 4096 if json_output else 7000)
+
+    def test_budget_shrinking_retains_runnable_cap_commands(self):
+        self._assert_cap_commands("user", False, 4096)
+
+
+class RecallMissRetriesCoverage(unittest.TestCase):
+    """A multi-term page with no strong independent row - empty, or filled
+    only by meaning rows or weak scatter - hands the shown page to the
+    coverage lane, the way search does; --lexical and -s never run it."""
+
+    QUERY = "vncpass source environment bryan vncbox 203.0.113.9 7255"
+
+    def _run(self, argv):
+        calls = []
+
+        def emit(q, fkw, hits, self_policy, **_kw):
+            calls.append((q, hits))
+            common.log("~coverage top row matched 5/7 terms - dropped: a, b")
+            return True
+
+        with mock.patch.object(recall.search, "_emit_overspec_block",
+                               side_effect=emit), \
+                mock.patch.object(recall.common, "index_summary",
+                                  return_value={"sessions": 12}):
+            rc, out, err = _run_recall(
+                argv, run_query=lambda *_a, **_k: _result([]))
+        return rc, err, calls
+
+
+    def test_explicit_lane_zero_page_never_retries(self):
+        for flag in ("--lexical", "-s"):
+            with self.subTest(flag=flag):
+                rc, err, calls = self._run(
+                    ["alpha beta gamma delta epsilon zeta", flag,
+                     "--budget", "0"])
+                self.assertEqual(rc, 1)
+                self.assertEqual(calls, [])
+                self.assertNotIn("~coverage", err)
+
+    def _corpus(self) -> sqlite3.Connection:
+        db = sqlite3.connect(":memory:")
+        db.executescript(corpusdb._SCHEMA_SQL)
+        db.executemany(corpusdb._INS, [
+            ("evidence", 149, 50, "pi", "solo", "", "", "", "tool",
+             "vncpass=hunter bryan vncbox 203.0.113.9 7255 connected"),
+            *[(f"chatter-{n}", 0, n, "claude", "solo", "", "", "", "user",
+               "source the environment before the build")
+              for n in range(20)],
+        ])
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        return db
+
+    def _run_real_lane(self, page_hit):
+        def query(_q, mode="keyword", **kwargs):
+            if mode == "semantic":
+                return {**_result([page_hit] if "sem_score" in page_hit
+                                  else []),
+                        "engine": "semantic", "mode": "semantic"}
+            if kwargs.get("who") == "tool" or "sem_score" in page_hit:
+                return _result([])
+            return _result([page_hit])
+
+        with mock.patch.object(recall.search, "corpusdb") as fake:
+            fake.connect.side_effect = lambda **_kw: self._corpus()
+            fake.coverage_rank = corpusdb.coverage_rank
+            fake.term_session_df = corpusdb.term_session_df
+            return _run_recall(
+                [self.QUERY, "--budget", "0", "--project", "solo", "--no-self"],
+                run_query=query)
+
+    def test_coverage_hint_does_not_add_hits_to_the_requested_page(self):
+        meaning = {"session": "meaning", "turn": 2, "ts": 1, "who": "agent",
+                   "agent": "pi", "project": "solo", "sem_score": 0.8962,
+                   "score": 0.8962, "snippet": "server rejected the password",
+                   "content_digest": compact.content_digest("rejected")}
+        rc, out, err = self._run_real_lane(meaning)
+        self.assertEqual(rc, 0)
+        self.assertIn("@meaning:2", out)
+        self.assertNotIn("@evidence", out)
+        self.assertIn("@evidence:149.", err)
+        self.assertEqual(
+            shlex.split(err[err.index("agrep "):].splitlines()[0]),
+            ["agrep", "--project=solo", "--no-self", "--coverage", "--",
+             self.QUERY])
+
+    def test_empty_pack_surfaces_recovered_evidence_for_each_query(self):
+        other_query = "calendar deadline hearing timestamp filing docket missingtoken"
+
+        def corpus(**_kwargs):
+            db = self._corpus()
+            text = "calendar deadline hearing timestamp filing docket"
+            db.execute(corpusdb._INS_DIGEST, (
+                "calendar", 4, 85, "pi", "solo", "", "", "", "agent",
+                text, compact.content_digest(text)))
+            db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+            return db
+
+        with mock.patch.object(recall.search, "corpusdb") as fake:
+            fake.connect.side_effect = corpus
+            fake.coverage_rank = corpusdb.coverage_rank
+            fake.term_session_df = corpusdb.term_session_df
+            rc, out, err = _run_recall(
+                [self.QUERY, other_query, "--budget", "0",
+                 "--project", "solo", "--no-self"],
+                run_query=lambda *_a, **_kw: _result([]), prog="pack")
+        self.assertEqual(rc, 1)
+        self.assertNotIn("@evidence", out)
+        self.assertNotIn("@calendar", out)
+        self.assertIn("@evidence:149.", err)
+        self.assertIn("@calendar:4.", err)
+
+    def test_strong_pack_runs_no_coverage_lane(self):
+        strong = {"session": "evidence", "turn": 149, "ts": 1, "who": "tool",
+                  "agent": "pi", "project": "solo", "score": 2.0,
+                  "matched": "phrase", "_boundary_class": "aligned",
+                  "snippet": "vncpass=hunter bryan vncbox",
+                  "content_digest": compact.content_digest("vncpass")}
+        rc, out, err = self._run_real_lane(strong)
+        self.assertEqual(rc, 0)
+        self.assertIn("@evidence:149", out)
+        self.assertNotIn("coverage", err)
 
 
 class RecallSelfScopeTests(unittest.TestCase):
@@ -504,7 +703,7 @@ class AroundHandleDefaultTests(unittest.TestCase):
         self.assertEqual(self._radius(["@01990000:5", "-C", "2"]), 2)
 
     def test_around_marker_dimming_is_color_gated(self):
-        text = "x [+1,234 chars - agrep around s 1 -C 0 --full] y"
+        text = "x [+1,234 chars - agrep around s 1 -C 0 --max-chars 0] y"
         self.assertIn("\x1b[2m[+1,234 chars", around._dim_markers(text, True))
         self.assertEqual(around._dim_markers(text, False), text)
 

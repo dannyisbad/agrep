@@ -407,6 +407,7 @@ class AutoIndexer(threading.Thread):
         self._repair_streak = 0
         self._last_repair_run = 0.0
         self._last_verify_stamp = time.monotonic()
+        self._last_census_check = 0.0
         self._fail_streak, last_error, last_attempt = (
             indexd_runtime.indexd_failure_state())
         self._pending_streak = 0
@@ -600,11 +601,18 @@ class AutoIndexer(threading.Thread):
             return
         self._operational.set()
         # A watcher cannot report source changes that predate this daemon generation.
-        if INGEST.exists():
+        if INGEST.exists() and not self._serve_recovery_requests(startup=True):
             self._index(startup=True)
-        while self._ownership_survives():
-            if self._stop_requested.wait(timeout=CHECK_S):
+        next_check = time.monotonic()
+        while not self._stop_requested.is_set():
+            if self._stop_requested.wait(timeout=min(CHECK_S, 0.1)):
                 return
+            self._serve_recovery_requests()
+            now = time.monotonic()
+            self._maybe_warm_store_census(now)
+            if now < next_check:
+                continue
+            next_check = now + CHECK_S
             if not self._ownership_survives():
                 return
             self._run_housekeeping(time.monotonic())
@@ -614,6 +622,24 @@ class AutoIndexer(threading.Thread):
             else:
                 self._maybe_verify_current(time.monotonic())
             self._serve_index_request()
+
+    def _maybe_warm_store_census(self, now: float) -> None:
+        if now - self._last_census_check < 1.0:
+            return
+        self._last_census_check = now
+        indexd_runtime.warm_store_census()
+
+    def _serve_recovery_requests(self, *, startup: bool = False) -> bool:
+        if (self._retry_needed
+                and time.time() - self.state["last_run"]
+                < _retry_gap(max(self._fail_streak, self._pending_streak))):
+            return False
+        try:
+            return indexd_runtime.serve_recovery_requests(
+                lambda: self._index(startup=startup))
+        except Exception as exc:  # noqa: BLE001 -- the queue must survive a failed pass
+            common.dbg(f"recovery refresh failed: {exc}", "!")
+            return False
 
     def _serve_index_request(self) -> None:
         """Run a search-index build an explicit `agrep index` queued here.
@@ -909,16 +935,16 @@ class AutoIndexer(threading.Thread):
             return False
         return (now - activity) >= QUIET_S or gap >= MAX_STALE_S
 
-    def _index(self, *, startup: bool = False) -> None:
+    def _index(self, *, startup: bool = False) -> bool:
         if not self._ownership_survives():
-            return
+            return False
         # the permitted fence, not raw writable: a dead foreign anchor is
         # reaped here by the ingest's successor takeover
         if not indexd_runtime.derived_writes_permitted():
-            return
+            return False
         with self._lock:
             if self.state["phase"] == "indexing":
-                return
+                return False
             self.state["phase"] = "indexing"
         # stamp up front so activity arriving mid-ingest still counts as "new" next cycle
         self._last_index_wall = time.time()
@@ -1039,7 +1065,7 @@ class AutoIndexer(threading.Thread):
             err = f"indexing timed out after {timeout}s"
         except ownerfile.OwnershipLost:
             self.stop()
-            return
+            return False
         except Exception as e:  # noqa: BLE001 -- surface anything to the status chip
             err = f"{type(e).__name__}: {e}"
         finally:
@@ -1088,6 +1114,8 @@ class AutoIndexer(threading.Thread):
                 f"{streak_before} -> {streak}"
                 + ("" if not err
                    else "; the next escalation requires a success first"))
+        # A receipt proves this pass completed, not that every source was readable.
+        return not err and not pending
 
     def _run_post_index_hooks(self) -> None:
         with self._lock:

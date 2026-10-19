@@ -1,0 +1,30 @@
+exit: 0
+--- stdout ---
+33333333-3333-4333-8333-333333333333	pi	cedar	3	user	Confirm the copper lantern handoff after the recap.
+33333333-3333-4333-8333-333333333333	pi	cedar	0	user	Review the cedar lantern plan with a sidecar advisor.
+55555555-5555-4555-8555-555555555555	codex	cedar	3	user	Summarize the codex lantern decision for the release lead.
+55555555-5555-4555-8555-555555555555	codex	cedar	0	user	Audit the copper lantern deployment manifest for cedar.
+11111111-1111-4111-8111-111111111111	claude	cedar	6	user	Is the lantern inventory complete for the night shift?
+11111111-1111-4111-8111-111111111111	claude	cedar	3	user	Check violet checkpoint before the copper lantern release.
+11111111-1111-4111-8111-111111111111	claude	cedar	0	user	Please map the copper lantern launch checklist for cedar.
+22222222-2222-4222-8222-222222222222	pi	maple	2	user	Keep the maple lantern review separate from cedar.
+22222222-2222-4222-8222-222222222222	pi	maple	0	user	Check the maple lantern against the glacier inventory.
+33333333-3333-4333-8333-333333333333	pi	cedar	3	agent	The copper lantern handoff retains the rollback plan.
+33333333-3333-4333-8333-333333333333	pi	cedar	0	agent	The sidecar advisor will inspect the cedar lantern rollback plan.
+55555555-5555-4555-8555-555555555555	codex	cedar	3	agent	The codex lantern decision keeps the west dock closed until sunrise.
+55555555-5555-4555-8555-555555555555	codex	cedar	0	agent	The copper lantern manifest names the amber gate and west dock.
+66666666-6666-4666-8666-666666666666	claude	birch	2	user	End the birch lantern review with a clean handoff.
+66666666-6666-4666-8666-666666666666	claude	birch	0	user	The birch lantern uses a silver compass instead of a copper switch.
+11111111-1111-4111-8111-111111111111	claude	cedar	7	agent	The final cedar handoff keeps the copper lantern by the east door.
+11111111-1111-4111-8111-111111111111	claude	cedar	6	agent	The lantern inventory contains three sealed crates.
+11111111-1111-4111-8111-111111111111	claude	cedar	3	agent	Violet checkpoint is clear; the copper lantern release can proceed.
+11111111-1111-4111-8111-111111111111	claude	cedar	0	agent	The cedar copper lantern checklist begins with the amber gate.
+22222222-2222-4222-8222-222222222222	pi	maple	2	agent	The maple lantern review remains independent.
+22222222-2222-4222-8222-222222222222	pi	maple	0	agent	The maple lantern inventory has a turquoise latch.
+66666666-6666-4666-8666-666666666666	claude	birch	2	agent	The birch lantern handoff has no outstanding repairs.
+66666666-6666-4666-8666-666666666666	claude	birch	0	agent	A silver compass is reserved for the birch lantern.
+33333333-3333-4333-8333-333333333333	pi	cedar	2	recap	Saffron recap: the copper lantern review is complete; preserve the rollback plan and turquoise latch.
+55555555-5555-4555-8555-555555555555	codex	cedar	2	tool	exec_command: cat manifest.txt toolproof-codex: copper lantern manifest verified
+11111111-1111-4111-8111-111111111111	claude	cedar	2	tool	Read: inventory.txt toolproof-cedar: three copper lantern crates status: sealed
+22222222-2222-4222-8222-222222222222	pi	maple	1	tool	bash: cat inventory.txt toolproof-maple: turquoise latch present lantern count: 2
+--- stderr ---

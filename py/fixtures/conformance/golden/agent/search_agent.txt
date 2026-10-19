@@ -1,0 +1,7 @@
+exit: 0
+--- stdout ---
+@55555555:3.a301 codex/user cedar 1d Summarize the codex lantern decision for the release lead.
+@55555555:0.b9d2 codex/user cedar 1d Audit the copper lantern deployment manifest for cedar.
+@55555555:2.8f2b~<EVENT>:55-62 codex/tool cedar 1d …est.txt toolproof-codex: copper lantern manifest verified
+--- stderr ---
+5 matches · more: agrep --more m.<TOKEN>

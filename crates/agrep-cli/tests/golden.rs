@@ -113,6 +113,304 @@ fn golden_gemini() {
     check("gemini", &fixture_home("gemini"));
 }
 
+/// Current Gemini CLI: `session-*.jsonl` records (last write per id, `$rewindTo`, `$patch`),
+/// Part[] prompts, and a resumed legacy `.json` superseded by its `.jsonl` sibling.
+#[test]
+fn golden_gemini_jsonl() {
+    check_fixture("gemini", "gemini_jsonl", &fixture_home("gemini_jsonl"));
+}
+
+fn gemini_turns(data: &Path, session: &str) -> Vec<(u64, String)> {
+    let mut turns: Vec<(u64, String)> = sorted_lines(&data.join("messages.jsonl"))
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["session"] == session)
+        .map(|row| {
+            let text = row["text"].as_str().unwrap().to_string();
+            (row["turn"].as_u64().unwrap(), text)
+        })
+        .collect();
+    turns.sort();
+    turns
+}
+
+/// Resuming migrates `X.json` into `X.jsonl` and leaves the `.json` behind. A warm cache must
+/// retire the `.json` instead of serving both, keep the session id, follow appends to the
+/// `.jsonl`, and serve the `.json` again once the `.jsonl` is gone.
+#[test]
+fn gemini_resume_migration_retires_the_legacy_json_warm() {
+    use std::io::Write;
+    let session = "77777777-7777-4777-8777-777777777777";
+    let home = temp_dir("gemini-migrate-home");
+    copy_dir(&fixture_home("gemini_jsonl"), &home);
+    let jsonl = home
+        .join(".gemini/tmp/hash6666synthetic/chats")
+        .join("session-2026-03-10T08-00-77777777.jsonl");
+    let parked = home.join("parked.jsonl");
+    fs::rename(&jsonl, &parked).unwrap();
+    let data = temp_dir("gemini-migrate-data");
+    let first = (0, "add retries to the fetch client".to_string());
+
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(gemini_turns(&data, session), vec![first.clone()]);
+
+    fs::rename(&parked, &jsonl).unwrap();
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(
+        gemini_turns(&data, session),
+        vec![
+            first.clone(),
+            (1, "cap the retry backoff at 30s".to_string())
+        ]
+    );
+
+    let mut file = fs::OpenOptions::new().append(true).open(&jsonl).unwrap();
+    writeln!(file, r#"{{"$rewindTo":"m3"}}"#).unwrap();
+    writeln!(
+        file,
+        r#"{{"id":"m5","timestamp":"2026-04-22T10:05:00.000Z","type":"user","content":[{{"text":"cap the retry backoff at 10s"}}]}}"#
+    )
+    .unwrap();
+    drop(file);
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(
+        gemini_turns(&data, session),
+        vec![
+            first.clone(),
+            (1, "cap the retry backoff at 10s".to_string())
+        ]
+    );
+
+    fs::remove_file(&jsonl).unwrap();
+    ingest_into("gemini", &home, &data, false);
+    assert_eq!(gemini_turns(&data, session), vec![first]);
+    check_intake_identity(&data);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// Sessions written by upstream's own recorder (fb972b2 and the August 361b0bb), compressed
+/// mid-way: every compressed-away turn stays at its turn and the `<state_snapshot>` is a recap.
+#[test]
+fn golden_gemini_compress() {
+    check_fixture(
+        "gemini",
+        "gemini_compress",
+        &fixture_home("gemini_compress"),
+    );
+}
+
+fn session_rows(data: &Path, session: &str) -> Vec<serde_json::Value> {
+    let mut rows: Vec<serde_json::Value> = sorted_lines(&data.join("messages.jsonl"))
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["session"] == session)
+        .collect();
+    rows.sort_by_key(|row| row["turn"].as_u64());
+    rows
+}
+
+fn intake_ids(data: &Path) -> Vec<String> {
+    let book: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join("intake_stats.json")).unwrap()).unwrap();
+    book["files"].as_object().unwrap().keys().cloned().collect()
+}
+
+/// Every flow that rewrites a Gemini session file, recorded by upstream's own recorders (current
+/// fb972b2 and the `$set.messages` 361b0bb, each with and without `getHistory()` coalescing) in
+/// tests/fixtures/gemini_flows. `expected.json` holds the conversation a person had: what upstream
+/// resumes, plus turns a context rewrite (compression, masking, truncation, `/chat resume`) took
+/// out of the model's view. Rewound and rolled-back turns are gone, with their tool events where a
+/// flow pins them, and every recording of one flow reads the same.
+#[test]
+fn gemini_flows_read_as_the_conversation_a_person_had() {
+    let fixture = fixtures_dir().join("gemini_flows");
+    let expected: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.join("expected.json")).unwrap()).unwrap();
+    let data = temp_dir("gemini-flows");
+    ingest_into("gemini", &fixture.join("home"), &data, true);
+    check_intake_identity(&data);
+    let replies: std::collections::HashMap<String, String> =
+        sorted_lines(&data.join("replies.jsonl"))
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["reply"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+    let calls = gemini_event_ids(&data);
+    let mut failures = Vec::new();
+    for (session, case) in expected.as_object().unwrap() {
+        let rows = session_rows(&data, session);
+        let got: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let reply = replies
+                    .get(row["id"].as_str().unwrap())
+                    .cloned()
+                    .unwrap_or_default();
+                serde_json::json!([row["who"], row["text"], reply])
+            })
+            .collect();
+        let turns: Vec<u64> = rows
+            .iter()
+            .map(|row| row["turn"].as_u64().unwrap())
+            .collect();
+        if serde_json::Value::Array(got.clone()) != case["rows"]
+            || turns != (0..rows.len() as u64).collect::<Vec<_>>()
+        {
+            failures.push(format!("{}: got {got:?} turns {turns:?}", case["flow"]));
+        }
+        let mut events = calls.get(session).cloned().unwrap_or_default();
+        events.sort_unstable();
+        if case
+            .get("events")
+            .is_some_and(|pinned| *pinned != serde_json::json!(events))
+        {
+            failures.push(format!("{}: events {events:?}", case["flow"]));
+        }
+    }
+    let _ = fs::remove_dir_all(&data);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Each session's tool event call ids, as the event store holds them.
+fn gemini_event_ids(data: &Path) -> std::collections::HashMap<String, Vec<String>> {
+    let mut calls: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (name, body) in event_rows(data) {
+        let session = name
+            .trim_start_matches("gemini-")
+            .split("--")
+            .next()
+            .unwrap_or("");
+        let ids = String::from_utf8_lossy(&body)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|event| event["call_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        calls.entry(session.to_string()).or_default().extend(ids);
+    }
+    calls
+}
+
+/// A session indexed while under way, then again, warm, once everything in it was undone (a
+/// rewind to its first prompt, or Esc rolling back its only one): the file grew by its own undo
+/// records, so the later runs publish the session empty instead of keeping what the first did.
+#[test]
+fn gemini_sessions_undone_after_a_warm_index_publish_nothing() {
+    let fixture = fixtures_dir().join("gemini_flows");
+    let expected: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.join("expected.json")).unwrap()).unwrap();
+    let chats = Path::new(".gemini/tmp/hash8888synthetic/chats");
+    let home = temp_dir("gemini-undone-home");
+    fs::create_dir_all(home.join(chats)).unwrap();
+    let data = temp_dir("gemini-undone");
+    let mut cases = Vec::new();
+    for entry in fs::read_dir(fixture.join("home").join(chats)).unwrap() {
+        let path = entry.unwrap().path();
+        let body = fs::read(&path).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(body.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let session = meta["sessionId"].as_str().unwrap().to_string();
+        let case = &expected[session.as_str()];
+        if let Some(midway) = case.get("midway").and_then(serde_json::Value::as_u64) {
+            let target = home.join(chats).join(path.file_name().unwrap());
+            fs::write(&target, &body[..midway as usize]).unwrap();
+            cases.push((session, case["flow"].to_string(), target, body));
+        }
+    }
+    assert_eq!(cases.len(), 12);
+    ingest_into("gemini", &home, &data, false);
+    for (session, flow, _, _) in &cases {
+        assert!(
+            !session_rows(&data, session).is_empty(),
+            "{flow} published nothing midway"
+        );
+    }
+    for (_, _, target, body) in &cases {
+        fs::write(target, body).unwrap();
+    }
+    let mut failures = Vec::new();
+    for run in ["after the undo", "on the next run"] {
+        ingest_into("gemini", &home, &data, false);
+        let calls = gemini_event_ids(&data);
+        for (session, flow, _, _) in &cases {
+            let rows = session_rows(&data, session).len();
+            let events = calls.get(session).map_or(0, Vec::len);
+            if rows + events > 0 {
+                failures.push(format!("{flow} {run}: {rows} rows, {events} events"));
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&data);
+    let _ = fs::remove_dir_all(&home);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A legacy `.json` indexed before Gemini CLI resumed it (migrating it into a `.jsonl`) and then
+/// compressed the chat: the indexed turns keep their rows and handles, and the retired `.json`
+/// leaves the intake book so audit stops reporting it as an undiscovered source.
+#[test]
+fn gemini_resume_then_compress_keeps_indexed_turns_and_forgets_the_retired_json() {
+    let session = "b1b1b1b1-0301-4000-8000-000000000301";
+    let home = temp_dir("gemini-compress-home");
+    copy_dir(&fixture_home("gemini_compress"), &home);
+    let chats = join_native(&home, ".gemini/tmp/hash7777synthetic/chats");
+    let legacy = chats.join("session-2026-03-01T10-00-b1b1b1b1.json");
+    let jsonl = chats.join("session-2026-03-01T10-00-b1b1b1b1.jsonl");
+    let parked = home.join("parked.jsonl");
+    fs::rename(&jsonl, &parked).unwrap();
+    let data = temp_dir("gemini-compress-data");
+
+    ingest_into("gemini", &home, &data, false);
+    let before = session_rows(&data, session);
+    assert_eq!(before.len(), 3);
+    let legacy_id = legacy.to_string_lossy().to_string();
+    assert!(intake_ids(&data).contains(&legacy_id));
+
+    fs::rename(&parked, &jsonl).unwrap();
+    for full in [false, true] {
+        ingest_into("gemini", &home, &data, full);
+        let book = intake_ids(&data);
+        assert!(
+            !book.contains(&legacy_id),
+            "retired .json still tallied (full={full})"
+        );
+        assert!(book.contains(&jsonl.to_string_lossy().to_string()));
+        let after = session_rows(&data, session);
+        assert_eq!(after[..3], before[..], "indexed turns moved (full={full})");
+        let shape: Vec<(u64, &str, &str)> = after
+            .iter()
+            .map(|row| {
+                let text = row["text"].as_str().unwrap().lines().next().unwrap_or("");
+                (
+                    row["turn"].as_u64().unwrap(),
+                    row["who"].as_str().unwrap(),
+                    text,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, "user", "audit the falcon parser"),
+                (1, "user", "audit the gecko lexer"),
+                (2, "user", "audit the heron emitter"),
+                (3, "user", "audit the ibis printer"),
+                (4, "recap", "<state_snapshot>"),
+                (5, "user", "audit the jackal linker"),
+            ]
+        );
+    }
+    check_intake_identity(&data);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
 #[test]
 fn golden_crush() {
     let home = crush_home();

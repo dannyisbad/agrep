@@ -166,19 +166,19 @@ fn user_dir() -> Option<std::path::PathBuf> {
     user_dir_checked().ok().flatten()
 }
 
-/// Open Cursor without write authority; failures retain the last-good token generation.
-fn open_ro(path: &std::path::Path) -> Option<crate::ingest::ReadOnlyConnection> {
-    match crate::ingest::open_sqlite_ro(path) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!(
-                "  ! cursor: cannot open {}: {}",
-                crate::ingest::terminal_safe(path.display()),
-                crate::ingest::terminal_safe(&e)
-            );
-            None
-        }
-    }
+/// Open Cursor without write authority; failures retain the last-good token generation. The
+/// error is the issue kind of a defect no retry heals, or None for one a retry may clear.
+fn open_ro(
+    path: &std::path::Path,
+) -> Result<crate::ingest::ReadOnlyConnection, Option<&'static str>> {
+    crate::ingest::open_sqlite_ro(path).map_err(|e| {
+        eprintln!(
+            "  ! cursor: cannot open {}: {}",
+            crate::ingest::terminal_safe(path.display()),
+            crate::ingest::terminal_safe(&e)
+        );
+        crate::ingest::sqlite_open_defect(path, &e)
+    })
 }
 
 /// A row value's bytes. The column is declared BLOB but the stored class varies (TEXT in
@@ -711,6 +711,7 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
             // bubbleId is Cursor's durable row identity when toolFormerData omits its correlation id.
             .unwrap_or_else(|| format!("cursor:{bubble_id}")),
         child_session: String::new(),
+        meta: String::new(),
     }
 }
 
@@ -884,9 +885,18 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
     let db_path = user
         .as_ref()
         .map(|u| u.join("globalStorage").join("state.vscdb"));
-    let conn = user
-        .as_ref()
-        .and_then(|u| open_ro(&u.join("globalStorage").join("state.vscdb")));
+    let opened = db_path.as_deref().map(open_ro);
+    // A database with a defect no retry heals, where nothing was ever published, lists no
+    // conversation and keeps its cache, like a schema-absent one, instead of failing closed.
+    let durably_blind = db_path
+        .as_deref()
+        .zip(opened.as_ref())
+        .is_some_and(|(path, opened)| {
+            matches!(opened, Err(Some(_)))
+                && cache.published_material_under("cursor", path)
+                    == crate::ingest_cache::MaterialVerdict::Retained
+        });
+    let conn = opened.and_then(Result::ok);
     let projects = match (&conn, &user) {
         (Some(conn), Some(user)) => match workspace_projects_if_conversations(conn, user) {
             Ok(projects) => Some(projects),
@@ -947,15 +957,21 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
     }
     // An unenumerable store lists no conversation, so its list may not be read as the whole
     // set: already-indexed conversations are preserved instead of pruned as deleted.
-    let unenumerable = snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.schema_absent);
+    let unenumerable = durably_blind
+        || snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.schema_absent);
     let has_readable_source = snapshot.is_some();
-    let tokens = snapshot.map(|snapshot| snapshot.sessions);
+    let tokens = if durably_blind {
+        Some(Vec::new())
+    } else {
+        snapshot.map(|snapshot| snapshot.sessions)
+    };
     let token_by_session: HashMap<String, String> =
         tokens.as_ref().into_iter().flatten().cloned().collect();
     let empty_projects = HashMap::new();
     let projects = projects.as_ref().unwrap_or(&empty_projects);
+    let panics = std::cell::RefCell::new(Vec::new());
     let pass = cache.collect_token_cached_keyed_partial(
         "cursor",
         tokens.map(|tokens| {
@@ -967,20 +983,33 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
         &[],
         unenumerable,
         has_readable_source,
-        |_, sid| match &conn {
-            _ if sid == SCHEMA_ABSENT_SESSION => (Vec::new(), Vec::new(), true),
-            Some(c) => parse_session(
-                c,
-                db_path
-                    .as_deref()
-                    .expect("open connection has a database path"),
-                projects,
-                sid,
-                token_by_session.get(sid).map(String::as_str).unwrap_or(""),
-            ),
-            None => (Vec::new(), Vec::new(), false),
+        |_, sid| {
+            use crate::ingest_cache::ReadOutcome;
+            if sid == SCHEMA_ABSENT_SESSION {
+                return (Vec::new(), Vec::new(), ReadOutcome::Complete);
+            }
+            let Some(c) = &conn else {
+                return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+            };
+            let path = db_path
+                .as_deref()
+                .expect("open connection has a database path");
+            let token = token_by_session.get(sid).map(String::as_str).unwrap_or("");
+            match crate::ingest::parse_guard::isolate("cursor", path, || {
+                parse_session(c, path, projects, sid, token)
+            }) {
+                Ok((messages, events, true)) => (messages, events, ReadOutcome::Complete),
+                Ok((messages, events, false)) => (messages, events, ReadOutcome::Invalid),
+                Err(panic) => {
+                    panics.borrow_mut().push((path.to_path_buf(), panic.reason));
+                    (Vec::new(), Vec::new(), ReadOutcome::Skipped)
+                }
+            }
         },
     );
+    for (path, reason) in panics.into_inner() {
+        cache.record_source_read_issue("cursor", &path, "source-read-failed", reason);
+    }
     (pass.messages, pass.events)
 }
 
@@ -1018,10 +1047,12 @@ fn tokens_at(
     let conn = match crate::ingest::open_sqlite_ro(&path) {
         Ok(conn) => conn,
         Err(error) => {
-            return TokenAvailability::Unreadable(vec![TokenReadIssue::new(
-                &path,
-                format!("cannot open {}: {error}", path.display()),
-            )]);
+            let reason = format!("cannot open {}: {error}", path.display());
+            let issue = match crate::ingest::sqlite_open_defect(&path, &error) {
+                Some(kind) => TokenReadIssue::with_kind(&path, kind, reason),
+                None => TokenReadIssue::new(&path, reason),
+            };
+            return TokenAvailability::Unreadable(vec![issue]);
         }
     };
     let projects = match workspace_projects_if_conversations(&conn, &user) {
@@ -1075,6 +1106,10 @@ impl crate::ingest::registry::Adapter for Cursor {
     }
     fn intake_tokens(&self) -> crate::ingest::registry::TokenAvailability {
         intake_tokens_at(user_dir_checked())
+    }
+    fn token_prefix(&self, database: &std::path::Path) -> Option<String> {
+        // One database holds every conversation, so its ids carry no database namespace.
+        (database.file_name() == Some(std::ffi::OsStr::new("state.vscdb"))).then(String::new)
     }
     fn runtime_issue_root(&self) -> std::path::PathBuf {
         let user =

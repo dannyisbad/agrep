@@ -623,6 +623,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             ok,
             call_id: r.call_id.unwrap_or(r.p_id),
             child_session: String::new(),
+            meta: String::new(),
         });
     }
 
@@ -672,6 +673,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
                         ok: None,
                         call_id: child.clone(),
                         child_session: child,
+                        meta: String::new(),
                     });
                 }
             }
@@ -757,6 +759,9 @@ impl crate::ingest::registry::Adapter for Opencode {
     }
     fn collect(&self, cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
         collect(cache)
+    }
+    fn may_read_partially(&self) -> bool {
+        true
     }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
         let dirs = data_dirs_at(&crate::ingest::home());

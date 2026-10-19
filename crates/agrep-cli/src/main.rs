@@ -219,6 +219,8 @@ const ROOT_STAGING_ARTIFACTS: &[&str] = &[
     ".derived-owner.json",
     ".derived_generation.json",
     ".harness_prefixes.snapshot",
+    ".indexd.lock",
+    ".indexd.v2.lock",
     ".ingest.sig",
     ".ingest_cache.bin",
     ".ingest_cache.bin.journal",
@@ -226,6 +228,7 @@ const ROOT_STAGING_ARTIFACTS: &[&str] = &[
     ".source_absence_pending",
     ".source-health.json",
     ".source_snapshot.bin",
+    ".token_material.json",
     "boundary_stats.json",
     "corpus.db",
     "event_stats.json",
@@ -1062,22 +1065,9 @@ impl AdoptionClaim {
         };
         for name in [".indexd.lock", ".indexd.v2.lock"] {
             let path = data.join(name);
-            match fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    if let Err(error) = file.write_all(&raw).and_then(|()| file.sync_all()) {
-                        let _ = fs::remove_file(&path);
-                        return Err(format!(
-                            "cannot publish derived-adoption claim {}: {error}",
-                            path.display()
-                        ));
-                    }
-                    claim.files.push((path, raw.clone()));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            match publish_claim_record(&path, &raw, nanos) {
+                Ok(true) => claim.files.push((path, raw.clone())),
+                Ok(false) => {}
                 Err(error) => {
                     return Err(format!(
                         "cannot publish derived-adoption claim {}: {error}",
@@ -1092,6 +1082,44 @@ impl AdoptionClaim {
         }
         Ok(claim)
     }
+}
+
+/// Install `raw` at `path` whole or not at all; false when a record is already there. Staged under
+/// a name the staging sweep reaps once its writer dies, it is linked into place, never over a
+/// record. A store without hard links takes it in place, the window a stale-record reclaim covers.
+fn publish_claim_record(path: &Path, raw: &[u8], nanos: u128) -> std::io::Result<bool> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staged = path.with_file_name(format!("{name}.tmp.{}.{nanos}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staged)?;
+    let written = file.write_all(raw).and_then(|()| file.sync_all());
+    drop(file);
+    let linked = written.and_then(|()| fs::hard_link(&staged, path));
+    let _ = fs::remove_file(&staged);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => write_claim_record_in_place(path, raw),
+    }
+}
+
+fn write_claim_record_in_place(path: &Path, raw: &[u8]) -> std::io::Result<bool> {
+    let mut file = match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = file.write_all(raw).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(true)
 }
 
 impl Drop for AdoptionClaim {
@@ -1207,13 +1235,8 @@ fn reclaim_cold_rollback_journal(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Successor takeover for the upgrade-day family: the derived stores name another build, but
-/// no live writer holds them (the caller verified the daemon fence, reclaimed any cold rollback
-/// journal, and holds both daemon-lock generations plus the index lock). Everything discarded here is a derivation of the
-/// build-neutral published transcripts; only a record that provably names another build
-/// authorizes a discard, and any uncertain probe aborts fail-closed. The run then proceeds
-/// through the ordinary adoption corner, which publishes this build's ownership on success.
-fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), String> {
+/// Requires verified daemon-generation fences and the index lock.
+fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<bool, String> {
     use agrep_core::ingest_cache::CacheOwnerProbe;
 
     let current = agrep_core::ingest_cache::current_cache_writer_build_id();
@@ -1244,11 +1267,21 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
         }
         Ok::<(), String>(())
     };
+    let mut cache_discarded = false;
     let cache_story = match cache_probe {
         CacheOwnerProbe::Missing => String::from("parse cache absent"),
-        CacheOwnerProbe::LegacyUnowned => String::from("legacy parse cache kept"),
         CacheOwnerProbe::Current { build_id } if build_id == current => {
             String::from("parse cache already current")
+        }
+        CacheOwnerProbe::LegacyUnowned => {
+            let adopted = agrep_core::ingest_cache::adopt_foreign_cache(&cache_path).map_err(
+                |error| {
+                    format!(
+                        "{reason}; takeover declined: legacy parse cache could not be migrated: {error}"
+                    )
+                },
+            )?;
+            format!("legacy parse cache verified and adopted ({adopted} sources)")
         }
         CacheOwnerProbe::Current { .. } | CacheOwnerProbe::Foreign { .. } => {
             match agrep_core::ingest_cache::adopt_foreign_cache(&cache_path) {
@@ -1260,6 +1293,7 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
                         remove_derived_artifact(path)
                             .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
                     }
+                    cache_discarded = true;
                     String::from("foreign parse cache discarded")
                 }
             }
@@ -1306,7 +1340,7 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
         publish_retained_corpus_owner(data, candidate)
             .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
     } else {
-        remove_derived_artifact(&data.join(DERIVED_OWNER_FILE))
+        write_derived_owner(data, current)
             .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
     }
     match derived_write_ownership(data) {
@@ -1316,7 +1350,7 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<(), Str
                  {corpus_story}, published transcripts kept",
                 agrep_core::ingest::terminal_safe(reason)
             );
-            Ok(())
+            Ok(cache_discarded)
         }
         DerivedWriteOwnership::Foreign(detail)
         | DerivedWriteOwnership::Refused(detail)
@@ -2265,9 +2299,16 @@ fn publish_derived_owner(data: &Path) -> anyhow::Result<()> {
         }
         DerivedWriteOwnership::Adoption => {}
     }
+    write_derived_owner(
+        data,
+        agrep_core::ingest_cache::current_cache_writer_build_id(),
+    )
+}
+
+fn write_derived_owner(data: &Path, build_id: String) -> anyhow::Result<()> {
     let record = DerivedOwnerRecord {
         version: DERIVED_OWNER_VERSION,
-        build_id: agrep_core::ingest_cache::current_cache_writer_build_id(),
+        build_id,
         legacy_corpus_db: if data.join("corpus.db").exists() {
             Some(derived_file_proof(data, "corpus.db")?)
         } else {
@@ -2328,7 +2369,7 @@ fn consume_retained_corpus_owner(data: &Path) -> anyhow::Result<()> {
 
 fn staging_temp_owner(name: &str) -> Option<u32> {
     let (base, raw_suffix) = name.rsplit_once(".tmp.")?;
-    if !ROOT_STAGING_ARTIFACTS.contains(&base) {
+    if !ROOT_STAGING_ARTIFACTS.contains(&base) && !event_proof_name(base) {
         return None;
     }
     let suffix = if base == "corpus.db" {
@@ -2351,6 +2392,30 @@ fn staging_temp_owner(name: &str) -> Option<u32> {
     Some(pid)
 }
 
+/// `.events_complete.<agent>.json`, the event proof each agent's publication stages.
+fn event_proof_name(name: &str) -> bool {
+    name.strip_prefix(".events_complete.")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|agent| {
+            !agent.is_empty()
+                && agent.len() <= 64
+                && agent
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+}
+
+/// The reaper pid of `.<owner>.owner-reap-<pid>-<hex>`, a tomb a reclaim of a freshness-daemon
+/// owner record moves it to. Nothing reads such a tomb back, so one whose reaper died is litter.
+fn owner_tomb_reaper(name: &str) -> Option<u32> {
+    let (owner, rest) = name.strip_prefix('.')?.split_once(".owner-reap-")?;
+    let (pid, token) = rest.split_once('-')?;
+    let hex = !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    (daemon_owner_name(owner) && hex && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| pid.parse().ok())
+        .flatten()
+}
+
 fn sweep_staging_temps_with<F>(data: &Path, mut pid_alive: F) -> std::io::Result<(u64, u64)>
 where
     F: FnMut(u32) -> Option<bool>,
@@ -2370,7 +2435,10 @@ where
             Err(_) => continue,
         };
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(staging_temp_owner) else {
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| staging_temp_owner(name).or_else(|| owner_tomb_reaper(name)))
+        else {
             continue;
         };
         let metadata = match fs::symlink_metadata(entry.path()) {
@@ -2476,6 +2544,9 @@ enum Cmd {
         /// and content predicates.
         #[arg(long)]
         paths: bool,
+        /// Emit {"version":1,"stores":[...],"paths":[...]} from one census.
+        #[arg(long, conflicts_with_all = ["paths", "tokens", "audit", "agent"])]
+        census: bool,
         /// Emit exact live token-store fingerprints keyed like intake tallies.
         #[arg(long, hide = true)]
         tokens: bool,
@@ -2486,6 +2557,14 @@ enum Cmd {
         /// Limit the hidden audit boundary to one registered adapter.
         #[arg(long, hide = true, requires = "audit")]
         agent: Option<String>,
+    },
+    /// Read-only `{"version":1,...}` source projection for `agrep why`: discovered sources,
+    /// issues, parse-cache file->session claims, and per-file intake tallies.
+    #[command(name = "why-source", hide = true)]
+    WhySource {
+        /// Restrict the projection to these exact source paths (repeatable).
+        #[arg(long)]
+        path: Vec<PathBuf>,
     },
     /// Evaluate one query over a JSON batch on stdin and return in-order boundary scores.
     BoundaryRank {
@@ -2564,10 +2643,12 @@ fn run() -> anyhow::Result<()> {
         Cmd::Detect => detect_cmd(),
         Cmd::Stores {
             paths,
+            census,
             tokens,
             audit,
             agent,
-        } => stores_cmd(paths, tokens, audit, agent.as_deref().unwrap_or("all")),
+        } => stores_cmd(paths, census, tokens, audit, agent.as_deref().unwrap_or("all")),
+        Cmd::WhySource { path } => why_source_cmd(&path),
         Cmd::BoundaryRank { serve } => boundary_rank_cmd(serve),
         Cmd::FallbackEventScan => fallback_event_scan_cmd(),
         Cmd::SemanticQ8Build {
@@ -3272,9 +3353,8 @@ fn serialize_store_audit_payload(
     Ok(encoded)
 }
 
-/// Store presence + newest mtime per registered adapter (registry::stores), or - with
-/// --paths - every content file each adapter would discover (the audit census input).
-fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Result<()> {
+/// Store summaries and content paths share one registry walk and one durable-health read.
+fn stores_cmd(paths: bool, census: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Result<()> {
     if audit {
         let payload = collect_store_audit_payload(agent)?;
         let encoded = serialize_store_audit_payload(&payload, STORE_AUDIT_OUTPUT_MAX_BYTES)?;
@@ -3330,15 +3410,16 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
             "reason": error.to_string(),
         })],
     };
-    if paths {
-        let mut items = Vec::new();
-        for diagnostic in ingest::registry::store_diagnostics() {
-            items.extend(diagnostic.paths().map(|path| {
+    let diagnostics = ingest::registry::store_diagnostics();
+    let mut path_items = Vec::new();
+    if paths || census {
+        for diagnostic in &diagnostics {
+            path_items.extend(diagnostic.paths().map(|path| {
                 serde_json::json!({
                     "name": diagnostic.name(), "path": path, "state": "available"
                 })
             }));
-            items.extend(diagnostic.issues().iter().map(|issue| {
+            path_items.extend(diagnostic.issues().iter().map(|issue| {
                 serde_json::json!({
                     "name": diagnostic.name(),
                     "path": issue.path(),
@@ -3348,7 +3429,7 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
                 })
             }));
         }
-        items.extend(durable_issues.iter().map(|issue| {
+        path_items.extend(durable_issues.iter().map(|issue| {
             serde_json::json!({
                 "name": issue.get("agent").and_then(|value| value.as_str()).unwrap_or("all"),
                 "path": issue.get("path").and_then(|value| value.as_str()).unwrap_or(""),
@@ -3357,11 +3438,13 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
                 "reason": issue.get("reason").and_then(|value| value.as_str()).unwrap_or("read failed"),
             })
         }));
-        println!("{}", serde_json::to_string(&items)?);
+    }
+    if paths {
+        println!("{}", serde_json::to_string(&path_items)?);
         return Ok(());
     }
-    let mut items: Vec<serde_json::Value> = ingest::registry::store_diagnostics()
-        .into_iter()
+    let mut items: Vec<serde_json::Value> = diagnostics
+        .iter()
         .map(|diagnostic| {
             let issues: Vec<_> = diagnostic
                 .issues()
@@ -3386,7 +3469,22 @@ fn stores_cmd(paths: bool, tokens: bool, audit: bool, agent: &str) -> anyhow::Re
         })
         .collect();
     apply_durable_store_issues(&mut items, durable_issues);
-    println!("{}", serde_json::to_string(&items)?);
+    if census {
+        #[derive(serde::Serialize)]
+        struct CensusOutput {
+            version: u32,
+            stores: Vec<serde_json::Value>,
+            paths: Vec<serde_json::Value>,
+        }
+        let payload = CensusOutput {
+            version: 1,
+            stores: items,
+            paths: path_items,
+        };
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        println!("{}", serde_json::to_string(&items)?);
+    }
     Ok(())
 }
 
@@ -3461,6 +3559,218 @@ fn source_health_records(data: &Path) -> anyhow::Result<Vec<serde_json::Value>> 
     Ok(records)
 }
 
+const WHY_SOURCE_VERSION: u32 = 1;
+
+fn fingerprint_label(fingerprint: ingest::registry::Fingerprint) -> &'static str {
+    match fingerprint {
+        ingest::registry::Fingerprint::Stat => "stat",
+        ingest::registry::Fingerprint::Token => "token",
+        ingest::registry::Fingerprint::Always => "always",
+    }
+}
+
+/// Read-only projection behind `agrep why`: it decodes the parse cache and intake book in
+/// place and never stages, publishes, or probes ownership, so no build may be refused here.
+fn why_source_cmd(only: &[PathBuf]) -> anyhow::Result<()> {
+    let data = data_dir()?;
+    let selected = |path: &str| only.is_empty() || only.iter().any(|p| p.as_os_str() == path);
+    let adapters: Vec<_> = ingest::registry::ADAPTERS
+        .iter()
+        .map(|adapter| {
+            serde_json::json!({
+                "name": adapter.name(),
+                "fingerprint": fingerprint_label(adapter.fingerprint()),
+                "roots": adapter.store_roots(),
+            })
+        })
+        .collect();
+    let detected: Vec<_> = ingest::registry::DETECTED
+        .iter()
+        .map(|detector| {
+            serde_json::json!({
+                "name": detector.name,
+                "root": (detector.root)(),
+                "count": (detector.probe)(),
+            })
+        })
+        .collect();
+
+    let mut sources = Vec::new();
+    let mut issues = Vec::new();
+    for diagnostic in ingest::registry::store_diagnostics() {
+        for path in diagnostic.paths() {
+            if !selected(path) {
+                continue;
+            }
+            sources.push(serde_json::json!({
+                "agent": diagnostic.name(),
+                "path": path,
+                "stat_key": agrep_core::intake::stat_key(Path::new(path)),
+            }));
+        }
+        for issue in diagnostic.issues() {
+            if !selected(issue.path()) {
+                continue;
+            }
+            issues.push(serde_json::json!({
+                "agent": issue.agent(),
+                "path": issue.path(),
+                "kind": issue.kind(),
+                "reason": issue.reason(),
+                "durable": false,
+            }));
+        }
+    }
+    let health_path = data.join(SOURCE_HEALTH_FILE);
+    match source_health_records(&data) {
+        Ok(records) => {
+            for record in records {
+                let path = record.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+                if !selected(path) {
+                    continue;
+                }
+                issues.push(serde_json::json!({
+                    "agent": record.get("agent").and_then(serde_json::Value::as_str).unwrap_or("all"),
+                    "path": path,
+                    "kind": record.get("kind").and_then(serde_json::Value::as_str).unwrap_or("source-read-failed"),
+                    "reason": record.get("reason").and_then(serde_json::Value::as_str).unwrap_or("read failed"),
+                    "durable": true,
+                }));
+            }
+        }
+        Err(error) => issues.push(serde_json::json!({
+            "agent": "all",
+            "path": health_path.to_string_lossy(),
+            "kind": "health-record-unreadable",
+            "reason": error.to_string(),
+            "durable": true,
+        })),
+    }
+
+    let mut tokens = Vec::new();
+    let mut live_tokens: HashMap<String, String> = HashMap::new();
+    for adapter in ingest::registry::ADAPTERS {
+        if adapter.fingerprint() != ingest::registry::Fingerprint::Token {
+            continue;
+        }
+        match adapter.intake_tokens() {
+            ingest::registry::TokenAvailability::Data(rows) => {
+                for (id, key) in rows {
+                    let path = agrep_core::intake::parse_token_id(&id).map(|(path, _)| path);
+                    if !path.as_deref().is_some_and(&selected) {
+                        continue;
+                    }
+                    tokens.push(serde_json::json!({
+                        "agent": adapter.name(), "id": id, "key": key, "state": "token",
+                    }));
+                    live_tokens.insert(id, key);
+                }
+            }
+            ingest::registry::TokenAvailability::Empty => {}
+            ingest::registry::TokenAvailability::Unreadable(unreadable) => {
+                for issue in unreadable {
+                    issues.push(serde_json::json!({
+                        "agent": adapter.name(),
+                        "path": issue.path,
+                        "kind": "token-census-unreadable",
+                        "reason": issue.reason,
+                        "durable": false,
+                    }));
+                }
+            }
+        }
+    }
+
+    let cache_path = data.join(".ingest_cache.bin");
+    let cache = match agrep_core::ingest_cache::session_sources_at(&cache_path) {
+        Ok(claims) => {
+            let sessions: Vec<_> = claims
+                .into_iter()
+                .filter(|(path, _, _)| selected(&path.to_string_lossy()))
+                .map(|(path, agent, session)| {
+                    let alias = ingest::registry::session_alias(agent, &path, &session);
+                    serde_json::json!({
+                        "path": path, "agent": agent, "session": session, "alias": alias,
+                    })
+                })
+                .collect();
+            serde_json::json!({"state": "ok", "sessions": sessions})
+        }
+        Err(refusal) => serde_json::json!({
+            "state": if refusal == agrep_core::ingest_cache::CacheDecodeRefusal::MissingFile {
+                "missing"
+            } else {
+                "unreadable"
+            },
+            "reason": refusal.label(),
+            "sessions": [],
+        }),
+    };
+
+    let book_path = data.join("intake_stats.json");
+    let intake = match agrep_core::intake::read_book(&book_path) {
+        Ok(None) => serde_json::json!({"state": "missing", "files": []}),
+        Ok(Some(book)) => {
+            let mut files = Vec::new();
+            for (id, entry) in book {
+                let token = agrep_core::intake::parse_token_id(&id);
+                let (path, session) = match &token {
+                    Some((path, session)) => (path.as_str(), Some(session.as_str())),
+                    None => (id.as_str(), None),
+                };
+                if !selected(path) {
+                    continue;
+                }
+                let current_key = if token.is_some() {
+                    live_tokens.get(&id).cloned()
+                } else {
+                    fs::metadata(path)
+                        .is_ok()
+                        .then(|| agrep_core::intake::stat_key(Path::new(path)))
+                };
+                let fresh = current_key.as_deref().map(|key| key == entry.key);
+                files.push(serde_json::json!({
+                    "id": id,
+                    "path": path,
+                    "session": session,
+                    "agent": entry.agent,
+                    "key": entry.key,
+                    "current_key": current_key,
+                    "fresh": fresh,
+                    "seen": entry.seen,
+                    "rows": entry.rows,
+                    "agent_rows": entry.agent_rows,
+                    "events": entry.events,
+                    "skips": entry.skips,
+                    "errors": entry.errors,
+                    "first_error": entry.first_error,
+                }));
+            }
+            serde_json::json!({"state": "ok", "files": files})
+        }
+        Err(error) => serde_json::json!({
+            "state": "unreadable", "reason": error.to_string(), "files": [],
+        }),
+    };
+
+    let payload = serde_json::json!({
+        "version": WHY_SOURCE_VERSION,
+        "home": ingest::home(),
+        "data_dir": data,
+        "adapters": adapters,
+        "detected": detected,
+        "sources": sources,
+        "issues": issues,
+        "tokens": tokens,
+        "cache": cache,
+        "intake": intake,
+    });
+    let mut encoded = serde_json::to_vec(&payload)?;
+    encoded.push(b'\n');
+    std::io::stdout().lock().write_all(&encoded)?;
+    Ok(())
+}
+
 fn write_source_health(data: &Path, mut records: Vec<serde_json::Value>) -> anyhow::Result<()> {
     records.sort_by_cached_key(|record| serde_json::to_string(record).unwrap_or_default());
     records.dedup();
@@ -3515,6 +3825,19 @@ fn publish_source_unreadable(
     write_source_health(data, records)
 }
 
+/// Disclose `runtime_issues` beside every record already on source health.
+fn add_source_read_issues(
+    data: &Path,
+    runtime_issues: &[agrep_core::ingest_cache::SourceReadIssue],
+) -> anyhow::Result<()> {
+    if runtime_issues.is_empty() {
+        return Ok(());
+    }
+    let mut records = source_health_records(data)?;
+    records.extend(runtime_issues.iter().map(runtime_source_issue_value));
+    write_source_health(data, records)
+}
+
 fn runtime_source_issue_value(
     issue: &agrep_core::ingest_cache::SourceReadIssue,
 ) -> serde_json::Value {
@@ -3526,20 +3849,24 @@ fn runtime_source_issue_value(
     })
 }
 
-fn first_source_issue_label(
+/// The first issue `settled`/`read_settled` cannot publish past, or the first issue at all when
+/// every one is settled (the pass was held back for another reason).
+fn blocking_source_issue_label(
     issues: &[ingest::registry::SourceIssue],
     runtime_issues: &[agrep_core::ingest_cache::SourceReadIssue],
+    settled: impl Fn(&ingest::registry::SourceIssue) -> bool,
+    read_settled: impl Fn(&agrep_core::ingest_cache::SourceReadIssue) -> bool,
 ) -> Option<String> {
-    if let Some(issue) = issues.first() {
-        return Some(format!(
+    let label = |issue: &ingest::registry::SourceIssue| {
+        format!(
             "agent {}: {} ({}: {})",
             issue.agent(),
             issue.path(),
             issue.kind(),
             issue.reason()
-        ));
-    }
-    runtime_issues.first().map(|issue| {
+        )
+    };
+    let read_label = |issue: &agrep_core::ingest_cache::SourceReadIssue| {
         format!(
             "agent {}: {} ({}: {})",
             issue.agent,
@@ -3547,7 +3874,19 @@ fn first_source_issue_label(
             issue.kind,
             issue.reason
         )
-    })
+    };
+    issues
+        .iter()
+        .find(|issue| !settled(issue))
+        .map(label)
+        .or_else(|| {
+            runtime_issues
+                .iter()
+                .find(|issue| !read_settled(issue))
+                .map(read_label)
+        })
+        .or_else(|| issues.first().map(label))
+        .or_else(|| runtime_issues.first().map(read_label))
 }
 
 /// Source defects the snapshot itself serializes and a retry cannot heal: only the user can
@@ -3780,7 +4119,7 @@ fn temporal_backfill(rows: &[(u32, Arc<str>)], turn: u32) -> Option<Arc<str>> {
 /// (commutative) so a run-to-run reordering from the parallel ingest can never masquerade as a
 /// change. Computed straight off the in-memory messages, which is far cheaper than serializing
 /// them - and serializing IS the write cost we're trying to skip when nothing moved.
-fn content_sig(msgs: &[Message]) -> u64 {
+fn content_sig(msgs: &[Message], aliases: &[cache::SessionAlias]) -> u64 {
     fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
         for &b in bytes {
             h ^= b as u64;
@@ -3788,7 +4127,8 @@ fn content_sig(msgs: &[Message]) -> u64 {
         }
         h
     }
-    msgs.par_iter()
+    let messages = msgs
+        .par_iter()
         .map(|m| {
             let mut h: u64 = 0xcbf29ce484222325;
             h = fnv(h, m.agent.as_bytes());
@@ -3807,13 +4147,124 @@ fn content_sig(msgs: &[Message]) -> u64 {
             h = fnv(h, m.parent.as_bytes()); // sessions.jsonl linkage is derived content too
             h
         })
-        .reduce(|| 0u64, |a, b| a.wrapping_add(b))
+        .reduce(|| 0u64, |a, b| a.wrapping_add(b));
+    // an alias rewrites sessions.jsonl rows without touching any message
+    aliases.iter().fold(messages, |sum, claim| {
+        let mut h: u64 = 0xcbf29ce484222325;
+        h = fnv(h, b"alias\0");
+        h = fnv(h, claim.agent.as_bytes());
+        h = fnv(h, b"\0");
+        h = fnv(h, claim.alias.as_bytes());
+        h = fnv(h, b"\0");
+        h = fnv(h, claim.session.as_bytes());
+        sum.wrapping_add(h)
+    })
+}
+
+/// Filename ids the stores assert for indexed sessions, resolved once per generation so
+/// sessions.jsonl, its family proof, and the boundary layout agree on one family.
+fn session_aliases(parse_cache: &IngestCache, msgs: &[Message]) -> Vec<cache::SessionAlias> {
+    let claims = parse_cache
+        .session_sources()
+        .into_iter()
+        .filter_map(|(path, agent, session)| {
+            ingest::registry::session_alias(agent, &path, &session).map(|alias| {
+                cache::SessionAlias {
+                    agent,
+                    alias,
+                    session,
+                }
+            })
+        })
+        .collect();
+    cache::resolve_session_aliases(msgs, claims)
+}
+
+/// `(agent, namespace)` of the token databases a published generation may hold material of,
+/// bound to that generation's `.ingest.sig`. Only an exact signature match is believed.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct TokenMaterialRecord {
+    version: u32,
+    signature: Option<String>,
+    namespaces: Vec<(String, String)>,
+}
+
+fn read_token_material(data: &Path, signature: Option<&str>) -> Option<HashSet<(String, String)>> {
+    let bytes =
+        read_optional_bytes(&data.join(TOKEN_MATERIAL_FILE), TOKEN_MATERIAL_MAX_BYTES).ok()??;
+    let record: TokenMaterialRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.version == TOKEN_MATERIAL_VERSION
+        && record.signature.as_deref().map(str::trim) == signature.map(str::trim))
+    .then(|| record.namespaces.into_iter().collect())
+}
+
+fn write_token_material(
+    data: &Path,
+    signature: Option<&str>,
+    namespaces: &HashSet<(String, String)>,
+) -> anyhow::Result<()> {
+    let mut namespaces: Vec<_> = namespaces.iter().cloned().collect();
+    namespaces.sort();
+    let record = TokenMaterialRecord {
+        version: TOKEN_MATERIAL_VERSION,
+        signature: signature.map(|signature| signature.trim().to_owned()),
+        namespaces,
+    };
+    cache::write_bytes_atomic(
+        &data.join(TOKEN_MATERIAL_FILE),
+        &serde_json::to_vec(&record)?,
+    )
+}
+
+/// Runs after the cache commit and before any derived write. The record keeps the published
+/// signature and gains the next generation's databases, so a crash anywhere up to the post-
+/// marker rewrite leaves a superset of both; an unknown record is removed, never guessed.
+fn stage_token_material(
+    data: &Path,
+    published_signature: Option<&str>,
+    published: Option<&HashSet<(String, String)>>,
+    next: &HashSet<(String, String)>,
+) -> anyhow::Result<()> {
+    match published {
+        Some(published) => write_token_material(
+            data,
+            published_signature,
+            &published.union(next).cloned().collect(),
+        ),
+        None => cache::remove_if_exists(&data.join(TOKEN_MATERIAL_FILE)),
+    }
+}
+
+/// The token databases the published generation may hold material of; None when unknown.
+/// Without a record bound to that generation (a pre-record build published it, or the record
+/// is damaged), its parse cache stands in.
+fn published_token_inventory(
+    data: &Path,
+    prior_generation: bool,
+    signature: Option<&str>,
+    cache: &IngestCache,
+) -> Option<HashSet<(String, String)>> {
+    if !prior_generation {
+        return Some(HashSet::new());
+    }
+    if let Some(recorded) = read_token_material(data, signature) {
+        return Some(recorded);
+    }
+    // Releases since 0.3.0 commit the parse cache before any derived write, and a token entry
+    // with rows leaves it only after a clean census of its database: a decoded cache names every
+    // database the published rows can come from. A cold or discarded cache names nothing.
+    cache
+        .decoded_last_good_base()
+        .then(|| cache.token_namespaces())
 }
 
 const SOURCE_SNAPSHOT_FILE: &str = ".source_snapshot.bin";
 const INGEST_PENDING_FILE: &str = ".ingest_pending.bin";
 const SOURCE_ABSENCE_FILE: &str = ".source_absence_pending";
 const HARNESS_POLICY_SNAPSHOT_FILE: &str = ".harness_prefixes.snapshot";
+const TOKEN_MATERIAL_FILE: &str = ".token_material.json";
+const TOKEN_MATERIAL_VERSION: u32 = 1;
+const TOKEN_MATERIAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DERIVED_PROOF_FILE: &str = ".derived_generation.json";
 const DERIVED_PROOF_VERSION: u32 = 6;
 const LEGACY_DERIVED_PROOF_VERSION: u32 = 4;
@@ -3826,7 +4277,7 @@ const SOURCE_ABSENCE_MAX_BYTES: u64 = 64 * 1024;
 const SOURCE_ABSENCE_HEADER: &str = "agrep-source-absence-v1\n";
 // Any ingest policy change that can alter derived rows must bump this version: a bump
 // voids the source-identical shortcut even when every source file is byte-identical.
-const HARNESS_POLICY_HEADER: &[u8] = b"agrep-harness-policy-v4\0";
+const HARNESS_POLICY_HEADER: &[u8] = b"agrep-harness-policy-v5\0";
 
 /// Load the corpus-local classification policy once per index pass. The exact bytes plus a
 /// format version are part of the all-hit permission slip, while parsing is done from that same
@@ -3853,7 +4304,16 @@ fn harness_policy() -> anyhow::Result<(Vec<u8>, Vec<String>)> {
     Ok((snapshot, prefixes))
 }
 
-fn read_source_absence(path: &Path) -> anyhow::Result<Option<HashSet<String>>> {
+/// Clean-absence observations one preflight recorded: whole agents, and single store roots of an
+/// agent whose other roots still hold sources. Root lines are `agent<TAB>hex(path)`; a build
+/// that predates them reads each as an agent name no adapter has, so it simply ignores them.
+#[derive(Default)]
+struct SourceAbsence {
+    agents: HashSet<String>,
+    roots: HashSet<(String, PathBuf)>,
+}
+
+fn read_source_absence(path: &Path) -> anyhow::Result<Option<SourceAbsence>> {
     let Some(bytes) = read_optional_bytes(path, SOURCE_ABSENCE_MAX_BYTES)? else {
         return Ok(None);
     };
@@ -3863,23 +4323,86 @@ fn read_source_absence(path: &Path) -> anyhow::Result<Option<HashSet<String>>> {
     let Some(rows) = body.strip_prefix(SOURCE_ABSENCE_HEADER) else {
         return Ok(None);
     };
-    Ok(Some(
-        rows.lines()
-            .filter(|agent| !agent.is_empty())
-            .map(str::to_string)
-            .collect(),
-    ))
+    let mut absence = SourceAbsence::default();
+    for row in rows.lines().filter(|row| !row.is_empty()) {
+        match row.split_once('\t') {
+            // An undecodable root is no observation: its rows wait for two fresh ones.
+            Some((agent, hex)) => {
+                if let Some(root) = absence_path_from_hex(hex) {
+                    absence.roots.insert((agent.to_string(), root));
+                }
+            }
+            None => {
+                absence.agents.insert(row.to_string());
+            }
+        }
+    }
+    Ok(Some(absence))
 }
 
-fn write_source_absence(path: &Path, agents: &HashSet<String>) -> anyhow::Result<()> {
-    let mut agents: Vec<_> = agents.iter().collect();
+fn write_source_absence(path: &Path, absence: &SourceAbsence) -> anyhow::Result<()> {
+    let mut agents: Vec<_> = absence.agents.iter().collect();
     agents.sort_unstable();
+    let mut roots: Vec<_> = absence
+        .roots
+        .iter()
+        .map(|(agent, root)| format!("{agent}\t{}", absence_path_hex(root)))
+        .collect();
+    roots.sort_unstable();
     let mut body = SOURCE_ABSENCE_HEADER.as_bytes().to_vec();
-    for agent in agents {
-        body.extend_from_slice(agent.as_bytes());
+    for row in agents.into_iter().chain(roots.iter()) {
+        body.extend_from_slice(row.as_bytes());
         body.push(b'\n');
     }
     cache::write_bytes_atomic(path, &body)
+}
+
+#[cfg(not(windows))]
+fn absence_path_hex(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    let mut hex = String::new();
+    for byte in path.as_os_str().as_bytes() {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+#[cfg(windows)]
+fn absence_path_hex(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::windows::ffi::OsStrExt;
+    let mut hex = String::new();
+    for unit in path.as_os_str().encode_wide() {
+        write!(hex, "{unit:04x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+#[cfg(not(windows))]
+fn absence_path_from_hex(hex: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+}
+
+#[cfg(windows)]
+fn absence_path_from_hex(hex: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    if hex.is_empty() || !hex.len().is_multiple_of(4) || !hex.is_ascii() {
+        return None;
+    }
+    let units = (0..hex.len())
+        .step_by(4)
+        .map(|at| u16::from_str_radix(&hex[at..at + 4], 16).ok())
+        .collect::<Option<Vec<u16>>>()?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
 }
 
 /// Re-read the source snapshot after ingest and return it only when it still matches the
@@ -3944,7 +4467,7 @@ fn validated_source_snapshot(
 }
 
 enum GenerationValidation {
-    Valid((Vec<u8>, Vec<u8>)),
+    Valid(Vec<u8>),
     Unreadable(Vec<ingest::registry::SourceIssue>, String),
     Moved,
 }
@@ -3983,16 +4506,16 @@ fn validated_generation_snapshots(
     if policy != policy_before {
         return GenerationValidation::Moved;
     }
-    GenerationValidation::Valid((source, policy))
+    GenerationValidation::Valid(source)
 }
 
 fn generation_for_publication(
     data: &Path,
     agent: &str,
     validation: GenerationValidation,
-) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+) -> anyhow::Result<Option<Vec<u8>>> {
     match validation {
-        GenerationValidation::Valid(snapshots) => Ok(Some(snapshots)),
+        GenerationValidation::Valid(source) => Ok(Some(source)),
         GenerationValidation::Moved => Ok(None),
         GenerationValidation::Unreadable(issues, reason) => {
             publish_source_unreadable(data, agent, &issues, &[], &reason)?;
@@ -4150,6 +4673,23 @@ fn derived_generation_valid(data: &Path, signature: &str) -> bool {
     derived_generation_valid_with(data, signature, || derived_proof(data, signature))
 }
 
+// Family schemas can evolve without changing message signatures or the outer derived proof.
+fn session_family_meta_current(data: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    struct MetaVersion {
+        version: u32,
+    }
+
+    read_optional_bytes(
+        &data.join(cache::SESSION_FAMILY_META_FILE),
+        DERIVED_PROOF_MAX_BYTES,
+    )
+    .ok()
+    .flatten()
+    .and_then(|bytes| serde_json::from_slice::<MetaVersion>(&bytes).ok())
+    .is_some_and(|meta| meta.version == cache::SESSION_FAMILY_META_VERSION)
+}
+
 fn legacy_derived_generation_valid(data: &Path, signature: &str) -> bool {
     // A current publication with a damaged proof is not an upgrade candidate.
     // The narrow window is the exact v4 six-file publication with no family
@@ -4233,6 +4773,8 @@ struct GenerationPublication<'a> {
     messages: &'a [Message],
     repaired_sessions: &'a HashSet<String>,
     preserve_signal_if_unchanged: bool,
+    /// Family proof bytes bound to `signature`; None keeps the published proof.
+    family_meta: Option<&'a [u8]>,
 }
 
 fn ensure_derived_write_ownership(data: &Path) -> anyhow::Result<()> {
@@ -4283,11 +4825,17 @@ fn publish_generation_markers(publication: GenerationPublication<'_>) -> anyhow:
         messages,
         repaired_sessions,
         preserve_signal_if_unchanged,
+        family_meta,
     } = publication;
     ensure_derived_write_ownership(data)?;
     let started = Instant::now();
     write_changed_sessions(data, complete, parse_cache, messages, repaired_sessions)?;
     let delta_done = started.elapsed();
+    // Readers accept the family proof only while it names the committed signature, so it
+    // lands here, inside the marker commit, and never beside the session rows it describes.
+    if let Some(bytes) = family_meta {
+        cache::write_bytes_atomic(&data.join(cache::SESSION_FAMILY_META_FILE), bytes)?;
+    }
     publish_derived_proof(data, signature)?;
     let proof_done = started.elapsed();
     let signal_written =
@@ -4313,18 +4861,32 @@ struct SourcePublishOutcome {
     pending_promoted: bool,
 }
 
+/// A racy stamp licenses no source-identical shortcut: the parse cache re-verifies that file
+/// next run, so the published generation must not let that run's preflight match it.
+fn withhold_racy_stamps(
+    source: Option<Vec<u8>>,
+    racy: &HashSet<PathBuf>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    source
+        .map(|source| ingest::registry::withhold_racy_stamps(&source, racy))
+        .transpose()
+}
+
 /// Commit the validated source generation last. The snapshot is the permission slip for the
 /// next all-hit shortcut, so it may never precede messages/replies/sessions/events publication.
 /// A failed validation deliberately preserves both the last published snapshot and the pending
 /// preflight: the latter disables the shortcut without throwing away the incremental baseline.
+/// `policy` is the harness policy the generation just published was derived under.
 fn publish_source_snapshot(
-    snapshots: Option<(Vec<u8>, Vec<u8>)>,
+    source: Option<Vec<u8>>,
+    policy: &[u8],
     path: &std::path::Path,
     policy_path: &std::path::Path,
     pending_path: &std::path::Path,
 ) -> anyhow::Result<SourcePublishOutcome> {
     publish_source_snapshot_with(
-        snapshots,
+        source,
+        policy,
         path,
         policy_path,
         pending_path,
@@ -4333,7 +4895,8 @@ fn publish_source_snapshot(
 }
 
 fn publish_source_snapshot_with<F>(
-    snapshots: Option<(Vec<u8>, Vec<u8>)>,
+    source: Option<Vec<u8>>,
+    policy: &[u8],
     path: &Path,
     policy_path: &Path,
     pending_path: &Path,
@@ -4343,13 +4906,15 @@ where
     F: FnOnce(&Path, &Path) -> anyhow::Result<()>,
 {
     let started = Instant::now();
-    let has_snapshots = snapshots.is_some();
+    let has_source = source.is_some();
     let mut outcome = SourcePublishOutcome::default();
-    if let Some((source, policy)) = snapshots {
-        if !regular_file_has_bytes(policy_path, &policy)? {
-            cache::write_bytes_atomic(policy_path, &policy)?;
-            outcome.policy_written = true;
-        }
+    // Recorded whether or not the source snapshot validated: the shortcut still needs that
+    // snapshot, and a policy left unrecorded would mark every later pass a full refresh.
+    if !regular_file_has_bytes(policy_path, policy)? {
+        cache::write_bytes_atomic(policy_path, policy)?;
+        outcome.policy_written = true;
+    }
+    if let Some(source) = source {
         if regular_file_has_bytes(pending_path, &source)? {
             promote(pending_path, path)?;
             outcome.pending_promoted = true;
@@ -4361,14 +4926,12 @@ where
     if std::env::var_os("AGREP_DEBUG").is_some() {
         eprintln!(
             "* [agrep ingest] source policy={} · snapshot={} ({:.1}ms)",
-            if !has_snapshots {
-                "held"
-            } else if outcome.policy_written {
+            if outcome.policy_written {
                 "write"
             } else {
                 "reuse"
             },
-            if !has_snapshots {
+            if !has_source {
                 "held"
             } else if outcome.pending_promoted {
                 "promote"
@@ -4471,7 +5034,7 @@ fn unlocked_warm_skip(data: &Path, agent: &str) -> Option<(usize, u128)> {
     )
     .ok()??;
     let signature = String::from_utf8(sig_snapshot.bytes).ok()?;
-    if !derived_generation_valid(data, &signature) {
+    if !derived_generation_valid(data, &signature) || !session_family_meta_current(data) {
         return None;
     }
     let count = signature.trim().split_once(':')?.0.parse::<usize>().ok()?;
@@ -4634,6 +5197,7 @@ fn index_cmd_locked(
         }};
     }
     let data = data_dir()?;
+    let mut takeover_discarded_cache = false;
     let ownership_current = match derived_write_ownership(&data) {
         DerivedWriteOwnership::Current => {
             if adoption_claim.is_none() {
@@ -4673,10 +5237,13 @@ fn index_cmd_locked(
                 disclose_read_only_ownership(&format!("{reason}; {fence}"));
                 return Ok(());
             }
-            if let Err(refusal) = take_over_foreign_derived_stores(&data, &reason) {
-                disclose_read_only_ownership(&refusal);
-                return Ok(());
-            }
+            takeover_discarded_cache = match take_over_foreign_derived_stores(&data, &reason) {
+                Ok(discarded) => discarded,
+                Err(refusal) => {
+                    disclose_read_only_ownership(&refusal);
+                    return Ok(());
+                }
+            };
             false
         }
         DerivedWriteOwnership::PostAdoptionClobber(reason) => {
@@ -4714,6 +5281,9 @@ fn index_cmd_locked(
         // streamed rows must classify exactly as this run's normalize pass will
         agrep_core::emit::set_harness_prefixes(&harness_prefixes);
     }
+    // Every stat this run takes - preflight and parse cache - happens after this instant, so a
+    // stamp not safely older than it may be shared by a later same-size rewrite (racy-clean).
+    let scan_start = std::time::SystemTime::now();
     let (source_before, source_preflight_error) = if emit_rows {
         (None, None)
     } else {
@@ -4732,17 +5302,6 @@ fn index_cmd_locked(
     let durable_blocked = source_issues
         .iter()
         .any(|issue| durable_source_issue(issue.kind()));
-    if !source_issues.is_empty() || source_preflight_error.is_some() {
-        publish_source_unreadable(
-            &data,
-            agent,
-            &source_issues,
-            &[],
-            source_preflight_error
-                .as_deref()
-                .unwrap_or("a source was unreadable during preflight"),
-        )?;
-    }
     let (previous_sig, previous_sig_mtime) =
         match agrep_core::ingest::registry::read_bounded_regular_file_snapshot(
             &sig_path,
@@ -4770,6 +5329,7 @@ fn index_cmd_locked(
     let derived_valid = previous_sig
         .as_deref()
         .is_some_and(|signature| derived_generation_valid(&data, signature));
+    let family_meta_current = derived_valid && session_family_meta_current(&data);
     let legacy_derived_valid = !derived_valid
         && previous_sig
             .as_deref()
@@ -4803,6 +5363,7 @@ fn index_cmd_locked(
         && !emit_rows
         && ownership_current
         && derived_valid
+        && family_meta_current
         && previous_count.is_some()
         && source_identical
         && events_complete
@@ -4818,9 +5379,8 @@ fn index_cmd_locked(
         if pending_residue {
             cache::remove_if_exists(&pending_path)?;
         }
-        if source_issues.is_empty() {
-            clear_source_health(&data, agent)?;
-        }
+        // The published generation stands as the pass that published it disclosed it; no
+        // refused attempt intervened, since one leaves the pending marker that bars this lane.
         lap!("source-check");
         println!(
             "  unchanged since last index ({} messages); skipped ingest + writes ({:.0}ms)",
@@ -4840,15 +5400,19 @@ fn index_cmd_locked(
         || data.join("sessions.jsonl").exists();
     let repair_events = !full && !events_complete && prior_generation;
     let recover_corrupt_events = agent == "all" && (full || repair_events);
-    // Pending preflight (or a legacy generation with no snapshot) means no stable source
-    // generation was published; retry through the same guarded path. Unlike event repair this
-    // preserves cache hits - its only job is catching sources that moved during the prior pass.
+    // Guard source absence without forcing reparses of retained cache hits.
     let retry_sources = !full
         && !emit_rows
-        && (pending_source.is_some() || (prior_generation && published_source.is_none()));
+        && (takeover_discarded_cache
+            || pending_source.is_some()
+            || (prior_generation && published_source.is_none()));
     let source_before_view = source_before
         .as_deref()
         .and_then(ingest::registry::source_snapshot_view);
+    let racy_sources = source_before_view
+        .as_ref()
+        .map(|snapshot| snapshot.racy_paths(scan_start))
+        .unwrap_or_default();
     // A byte-identical pending/preflight pair is the equivalence publication already trusts:
     // an identical incomplete pair carries the same issue records, so the unreadable subset
     // is a stable disclosed fact and completeness is not required of the second observation.
@@ -4857,33 +5421,43 @@ fn index_cmd_locked(
     // A token store enumerating cleanly to zero conversations is the same deletion-shaped
     // observation as clean ENOENT: present, readable, validly empty. Two agreeing passes
     // confirm either; torn/garbage reads record issues and never enter these sets.
-    let deletion_observed_agents = |snapshot: &ingest::registry::SourceSnapshotView| {
+    let deletion_observed = |snapshot: &ingest::registry::SourceSnapshotView| {
         let mut agents = snapshot.cleanly_absent_agents();
         agents.extend(snapshot.cleanly_empty_token_store_agents());
-        agents
+        SourceAbsence {
+            agents,
+            roots: snapshot.cleanly_absent_roots(),
+        }
     };
-    let current_absent_agents = source_before_view
+    let current_absence = source_before_view
         .as_ref()
-        .map(deletion_observed_agents)
+        .map(deletion_observed)
         .unwrap_or_default();
-    let previous_absent_agents = if emit_rows {
+    let previous_absence = if emit_rows {
         None
     } else {
         read_source_absence(&absence_path)?.or_else(|| {
             pending_source
                 .as_deref()
                 .and_then(ingest::registry::source_snapshot_view)
-                .map(|snapshot| deletion_observed_agents(&snapshot))
+                .map(|snapshot| deletion_observed(&snapshot))
         })
-    };
-    // Adapter-local observations confirm ENOENT even while another adapter stays unreadable.
-    let repeated_absent_agents: HashSet<String> = previous_absent_agents
-        .unwrap_or_default()
+    }
+    .unwrap_or_default();
+    // Adapter-local observations confirm ENOENT even while another adapter stays unreadable,
+    // and root-local ones while the same agent's other roots keep their sources.
+    let repeated_absent_agents: HashSet<String> = previous_absence
+        .agents
         .into_iter()
-        .filter(|agent| current_absent_agents.contains(agent))
+        .filter(|agent| current_absence.agents.contains(agent))
+        .collect();
+    let repeated_absent_roots: HashSet<(String, PathBuf)> = previous_absence
+        .roots
+        .into_iter()
+        .filter(|root| current_absence.roots.contains(root))
         .collect();
     if !emit_rows {
-        write_source_absence(&absence_path, &current_absent_agents)?;
+        write_source_absence(&absence_path, &current_absence)?;
     }
     if repair_events {
         agrep_core::emit::human_line(format_args!(
@@ -4914,6 +5488,19 @@ fn index_cmd_locked(
     {
         cache::write_bytes_atomic(&pending_path, source_before.as_deref().unwrap_or_default())?;
     }
+    // Only now, behind the pending marker: a pass that dies after this disclosure is never
+    // followed by the unchanged-source shortcut, which keeps whatever health it finds.
+    if !source_issues.is_empty() || source_preflight_error.is_some() {
+        publish_source_unreadable(
+            &data,
+            agent,
+            &source_issues,
+            &[],
+            source_preflight_error
+                .as_deref()
+                .unwrap_or("a source was unreadable during preflight"),
+        )?;
+    }
 
     // Event recovery must force parsing without discarding last-good cache rows because event
     // payloads are not serialized. A source-drift retry enables the same absence guards but
@@ -4927,10 +5514,13 @@ fn index_cmd_locked(
         }
         let (cache, refusal) = disclose_cache_refusal(IngestCache::repair(&cache_path));
         if let Some(refusal) = refusal {
-            // An undecodable base is discarded and reparsed; a missing/foreign one keeps the
-            // two-snapshot protocol. The pending marker rotated above when it could, and the
-            // next byte-identical preflight - complete or stably incomplete - completes it.
-            if !refusal.is_undecodable() && !source_identical && !repeated_stable_preflight {
+            let discarded_by_takeover = takeover_discarded_cache
+                && refusal == agrep_core::ingest_cache::CacheDecodeRefusal::MissingFile;
+            if !refusal.is_undecodable()
+                && !discarded_by_takeover
+                && !source_identical
+                && !repeated_stable_preflight
+            {
                 anyhow::bail!(
                     "ingest recovery needs a valid parse cache ({refusal}) or two stable source snapshots; retry{}",
                     if durable_blocked {
@@ -5004,6 +5594,33 @@ fn index_cmd_locked(
         );
     } else if !prior_generation {
         pcache.set_published_material(HashSet::new());
+    } else if pcache.decoded_last_good_base() {
+        // Publication withheld every snapshot (0.3.2 held it beside any source issue, and an
+        // `--emit-rows` pass takes none). Every Stat and token row it published was cached
+        // first, as `published_token_inventory` relies on; whole-store rows need not have been.
+        pcache.set_published_material_from_cache();
+    }
+    let published_token_material =
+        published_token_inventory(&data, prior_generation, previous_sig.as_deref(), &pcache);
+    pcache.set_published_token_namespaces(published_token_material.clone());
+    // Every derived file on disk was renamed into place by a pass whose guards approved it,
+    // so even a publication a crash tore apart is legible: an agent absent from all of them is
+    // absent from both generations they mix. Missing outputs leave nothing to read it from.
+    let published_legible = prior_generation
+        && (derived_valid || (path.is_file() && data.join("sessions.jsonl").is_file()));
+    // A token store the preflight could not fully read is the only kind whose verdicts can turn
+    // on what the published generation holds, so only then is that generation read for it.
+    if published_legible {
+        let unpublished: HashSet<String> = source_issues
+            .iter()
+            .map(|issue| issue.agent())
+            .filter(|agent| ingest::registry::token_store_agent(agent))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|agent| !cache::published_agent_material(&data, agent))
+            .map(str::to_owned)
+            .collect();
+        pcache.set_unpublished_token_agents(unpublished);
     }
     if let Some(snapshot) = source_before_view.as_ref() {
         pcache.set_current_source_snapshot(snapshot);
@@ -5013,6 +5630,10 @@ fn index_cmd_locked(
     if (retry_sources || full) && !repeated_absent_agents.is_empty() {
         pcache.allow_repeated_missing_roots(repeated_absent_agents);
     }
+    if (retry_sources || full) && !repeated_absent_roots.is_empty() {
+        pcache.allow_repeated_missing_store_roots(repeated_absent_roots);
+    }
+    pcache.set_scan_start(scan_start);
     // Event payloads are absent from the parse cache, so repair force-parses every survivor;
     // exact preflight coverage and adapter reads prove individual tombstones.
     if repair_events {
@@ -5034,15 +5655,63 @@ fn index_cmd_locked(
         .filter(|issue| durable_source_issue(issue.kind()))
         .flat_map(|issue| pcache.sessions_under(Path::new(issue.path())))
         .collect();
+    if published_legible {
+        pcache.mark_base_rows(
+            source_issues
+                .iter()
+                .map(|issue| (issue.agent(), Path::new(issue.path()))),
+            cache::published_generation_seal(&data),
+        );
+    }
     lap!("load-cache");
     // a complete parse (cold cache or --full) yields the full event set; a warm run only
     // carries touched sessions' events, so the pulse rollup waits for the next complete run.
     let complete = full || repair_events || !pcache.warm;
     let (msgs, evts, repaired_sessions) = ingest_agent(agent, &mut pcache, &harness_prefixes)?;
+    let session_aliases = session_aliases(&pcache, &msgs);
     lap!("ingest+dedupe");
+    // A whole store holds last-good rows only in its snapshot; when no snapshot covers a failed
+    // read, the published generation itself is read for its agent, but only then. So is it where
+    // an older cache-derived inventory is silent, or a failed per-file read outruns this cache.
+    if published_legible {
+        let issue_scopes = || {
+            source_issues
+                .iter()
+                .map(|issue| (issue.agent(), Path::new(issue.path())))
+        };
+        pcache.admit_unpublished_whole_store_agents(|agent| {
+            cache::published_agent_material(&data, agent)
+        });
+        pcache.admit_fully_served_whole_store_agents(issue_scopes(), |agent| {
+            cache::published_agent_rows(&data, agent)
+        });
+        pcache.admit_unpublished_partial_read_agents(
+            source_issues.iter().map(|issue| issue.agent()),
+            |agent| cache::published_agent_material(&data, agent),
+        );
+        pcache.record_published_rows(issue_scopes(), |agent| {
+            cache::published_agent_rows(&data, agent)
+        });
+    }
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
         && source_preflight_error.is_none();
+    // Only a positive Retained verdict may publish past an unreadable scope.
+    let preflight_issue_settled = |issue: &ingest::registry::SourceIssue| {
+        durable_source_issue(issue.kind())
+            && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
+                == agrep_core::ingest_cache::MaterialVerdict::Retained
+    };
+    let read_issue_settled = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        source_issues
+            .iter()
+            .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
+            // Only a deterministic parse failure ("source-read-failed") may ride the
+            // covered lane: guard-synthesized absence issues ("source-read-incomplete")
+            // keep the two-stable-observation deletion protocol.
+            || (read.kind == "source-read-failed"
+                && pcache.unreadable_scope_covered(read.agent, &read.path))
+    };
     // A parse failure is stably unreadable like a stat failure PROVIDED the guarded
     // snapshot serves the scope's last-good rows or the inventory proves it empty:
     // one broken store degrades to disclosed staleness, never a frozen index.
@@ -5050,26 +5719,19 @@ fn index_cmd_locked(
         && source_preflight_error.is_none()
         && (!source_issues.is_empty() || !pcache.source_read_issues().is_empty())
         && source_before.is_some()
-        && source_issues.iter().all(|issue| {
-            durable_source_issue(issue.kind())
-                // Only a positive Retained verdict may publish past an unreadable scope.
-                && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
-                    == agrep_core::ingest_cache::MaterialVerdict::Retained
-        })
-        && pcache.source_read_issues().iter().all(|read| {
-            source_issues
-                .iter()
-                .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
-                // Only a deterministic parse failure ("source-read-failed") may ride the
-                // covered lane: guard-synthesized absence issues ("source-read-incomplete")
-                // keep the two-stable-observation deletion protocol.
-                || (read.kind == "source-read-failed"
-                    && pcache.unreadable_scope_covered(read.agent, &read.path))
-        });
+        && source_issues.iter().all(preflight_issue_settled)
+        && pcache.source_read_issues().iter().all(read_issue_settled);
+    let read_issue_served = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        pcache.unread_scope_served(read.agent, &read.path)
+    };
     // This pass read every source, so its verdict is the whole truth about
     // their health. Publication can still be declined for reasons that say
     // nothing about readability, and a record no pass retires outlives its bug.
-    if !source_snapshot_safe {
+    if emit_rows {
+        // Without a preflight it saw only what it parsed: it adds what failed to the record
+        // and retires nothing, since the next pass may take the shortcut that keeps it.
+        add_source_read_issues(&data, pcache.source_read_issues())?;
+    } else if !source_snapshot_safe {
         publish_source_unreadable(
             &data,
             agent,
@@ -5084,9 +5746,14 @@ fn index_cmd_locked(
     // on source health; every other incomplete output keeps the fail-closed retry.
     if !pcache.output_complete() && !stable_unreadable {
         let detail = source_detail_suffix(
-            first_source_issue_label(&source_issues, pcache.source_read_issues())
-                .or_else(|| source_preflight_error.clone())
-                .as_deref(),
+            blocking_source_issue_label(
+                &source_issues,
+                pcache.source_read_issues(),
+                preflight_issue_settled,
+                read_issue_settled,
+            )
+            .or_else(|| source_preflight_error.clone())
+            .as_deref(),
         );
         // The tail names only satisfiable levers: retries and --full both re-read sources,
         // so a durably unreadable scope with no cache witness recovers only with its access.
@@ -5109,15 +5776,53 @@ fn index_cmd_locked(
             "complete ingest could not capture a preflight source snapshot; no generation was published"
         );
     }
+    // A pass complete only because a decoded base awaits reparse serves that base's rows as a
+    // warm pass does, so it publishes as one: an unreparsable entry would otherwise pin it. A
+    // scope that base cannot serve has no warm fallback: an older build may never have cached it.
+    let reparse_upgrade = !full
+        && !repair_events
+        && pcache.decoded_last_good_base()
+        && source_issues.iter().all(|issue| {
+            pcache.published_material_under(issue.agent(), Path::new(issue.path()))
+                == agrep_core::ingest_cache::MaterialVerdict::Retained
+        });
+    // Event repair after a crash may do the same only where the decoded base served every scope
+    // it could not read and the crash left the event store consistent: the unread entries keep
+    // their events and their reparse flag, so their next good read rebuilds those events.
+    let repair_served = repair_events
+        && pcache.decoded_last_good_base()
+        && source_preflight_error.is_none()
+        && source_issues.iter().all(preflight_issue_settled)
+        && pcache.source_read_issues().iter().all(read_issue_served);
     // Incremental retries may publish cache-merged healthy sessions while the pending marker
     // forces another attempt; a complete pass has no safe partial fallback. A stably
     // unreadable source is a disclosed fact, not a retryable condition, so it may publish.
-    if prior_generation && complete && !source_snapshot_safe && !stable_unreadable {
-        let detail = source_detail_suffix(
-            first_source_issue_label(&source_issues, pcache.source_read_issues())
-                .or_else(|| source_preflight_error.clone())
-                .as_deref(),
-        );
+    if prior_generation
+        && complete
+        && !reparse_upgrade
+        && !source_snapshot_safe
+        && !stable_unreadable
+        && !(repair_served && cache::event_store_consistent(&edir, &run_agents)?)
+    {
+        // Name the scope that holds the pass back, not merely the first one it saw: the repair
+        // lane's served test only where that lane failed on an issue.
+        let detail = if repair_events && !repair_served {
+            blocking_source_issue_label(
+                &source_issues,
+                pcache.source_read_issues(),
+                preflight_issue_settled,
+                read_issue_served,
+            )
+        } else {
+            blocking_source_issue_label(
+                &source_issues,
+                pcache.source_read_issues(),
+                preflight_issue_settled,
+                read_issue_settled,
+            )
+        };
+        let detail =
+            source_detail_suffix(detail.or_else(|| source_preflight_error.clone()).as_deref());
         // "will retry" is a promise; it is only made when a retry can differ. A durably
         // unreadable scope recovers exactly when its access does, and the tail says so.
         let recovery = if durable_blocked {
@@ -5134,12 +5839,13 @@ fn index_cmd_locked(
             "complete ingest observed an unavailable/incomplete source{detail}; retained the old generation{recovery}"
         );
     }
+    pcache.record_released_rows();
     // Cache serialization and the corpus fingerprint are independent, CPU-heavy walks over
     // different data. Do them together; on the one-file-changed path this hides the complete
     // bincode cache rewrite behind the message hash instead of paying both serially.
     let (cache_stage, sig_line) = rayon::join(
         || pcache.stage_save(&cache_path),
-        || format!("{}:{}\n", msgs.len(), content_sig(&msgs)),
+        || format!("{}:{}\n", msgs.len(), content_sig(&msgs, &session_aliases)),
     );
     // The staged cache stays private until validation; event-proof revocation makes its later
     // commit crash-recoverable even though event payloads are not serialized in the cache.
@@ -5228,12 +5934,16 @@ fn index_cmd_locked(
                     ),
                 "legacy publication changed during its generation-bound upgrade"
             );
-            cache::write_session_family_meta(
-                &msgs,
-                &data.join(cache::SESSION_FAMILY_META_FILE),
-                sig_line.trim(),
-            )?;
         }
+        let family_meta = if legacy_derived_valid || !family_meta_current {
+            Some(cache::session_family_meta_bytes(
+                &msgs,
+                &session_aliases,
+                sig_line.trim(),
+            )?)
+        } else {
+            None
+        };
         // The staged cache commits even when publication is withheld: pending retention
         // forces the retry, and a live-writer pass whose next read fails must serve THIS
         // pass's rows. The clock advances only on a safe or publishing pass.
@@ -5244,6 +5954,13 @@ fn index_cmd_locked(
             &run_agents,
             staged_cache,
             proven_event_delta.is_none(),
+        )?;
+        let committed_token_material = pcache.token_namespaces();
+        stage_token_material(
+            &data,
+            previous_sig.as_deref(),
+            published_token_material.as_ref(),
+            &committed_token_material,
         )?;
         let (event_result, proof_complete) = refresh_events()?;
         let (_n_files, n_events, n_rewritten) = event_result;
@@ -5260,15 +5977,23 @@ fn index_cmd_locked(
             messages: &msgs,
             repaired_sessions: &repaired_sessions,
             preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
+            family_meta: family_meta.as_deref(),
         })?;
         preserve_signal_age(
             &sig_path,
             previous_sig_mtime,
             !(source_snapshot_safe || generation_publishes) && signal_written,
         )?;
+        write_token_material(&data, Some(&sig_line), &committed_token_material)?;
         lap!("write-events");
         let source_published = source_after.is_some();
-        publish_source_snapshot(source_after, &source_path, &policy_path, &pending_path)?;
+        publish_source_snapshot(
+            withhold_racy_stamps(source_after, &racy_sources)?,
+            &policy_before,
+            &source_path,
+            &policy_path,
+            &pending_path,
+        )?;
         if source_published {
             cache::remove_if_exists(&absence_path)?;
         }
@@ -5289,7 +6014,6 @@ fn index_cmd_locked(
     let n = msgs.len();
     let rpath = data.join("replies.jsonl");
     let sessions_path = data.join("sessions.jsonl");
-    let family_meta_path = data.join(cache::SESSION_FAMILY_META_FILE);
 
     // Independent backstop, whatever the guards above concluded: this pass may not shrink the
     // row census of a scope it could not read. Scope-local on purpose - a deletion elsewhere
@@ -5327,16 +6051,27 @@ fn index_cmd_locked(
         staged_cache,
         proven_event_delta.is_none(),
     )?;
+    let committed_token_material = pcache.token_namespaces();
+    stage_token_material(
+        &data,
+        previous_sig.as_deref(),
+        published_token_material.as_ref(),
+        &committed_token_material,
+    )?;
 
     // The final signature remains the cross-file permission slip.
     agrep_core::boundary_stats::write(
         &msgs,
+        &session_aliases,
         &boundary_path,
         &boundary_cache_path,
         sig_line.trim(),
-        previous_sig.as_deref().map(str::trim),
+        if full {
+            None
+        } else {
+            previous_sig.as_deref().map(str::trim)
+        },
         &pcache.touched,
-        full,
     )?;
     lap!("write-boundary-stats");
 
@@ -5345,8 +6080,8 @@ fn index_cmd_locked(
     let sessions_work = || {
         timed!(cache::write_session_index(
             &msgs,
+            &session_aliases,
             &sessions_path,
-            &family_meta_path,
             sig_line.trim(),
         ))
     };
@@ -5367,7 +6102,7 @@ fn index_cmd_locked(
     ) = message_outputs;
     messages_result?;
     replies_result?;
-    let n_sessions = sessions_result?;
+    let (n_sessions, family_meta) = sessions_result?;
     invalidate_turn_enrichment(&data)?;
     let (event_proof_result, events_elapsed) = events_work();
     let (event_result, proof_complete) = event_proof_result?;
@@ -5397,15 +6132,23 @@ fn index_cmd_locked(
         messages: &msgs,
         repaired_sessions: &repaired_sessions,
         preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
+        family_meta: Some(&family_meta),
     })?;
     preserve_signal_age(
         &sig_path,
         previous_sig_mtime,
         !(source_snapshot_safe || generation_publishes) && signal_written,
     )?;
+    write_token_material(&data, Some(&sig_line), &committed_token_material)?;
     lap!("publish-markers");
     let source_published = source_after.is_some();
-    publish_source_snapshot(source_after, &source_path, &policy_path, &pending_path)?;
+    publish_source_snapshot(
+        withhold_racy_stamps(source_after, &racy_sources)?,
+        &policy_before,
+        &source_path,
+        &policy_path,
+        &pending_path,
+    )?;
     if source_published {
         cache::remove_if_exists(&absence_path)?;
     }
@@ -5704,6 +6447,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
+    #[test]
+    fn token_material_record_is_believed_only_for_its_own_signature() {
+        use super::{read_token_material, stage_token_material, write_token_material};
+
+        let data = std::env::temp_dir().join(format!(
+            "agrep-token-material-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let entry = |agent: &str, namespace: &str| (agent.to_string(), namespace.to_string());
+        let published = HashSet::from([entry("crush", "61\0")]);
+        let next = HashSet::from([entry("cursor", "")]);
+        assert_eq!(read_token_material(&data, Some("3:g\n")), None);
+
+        write_token_material(&data, Some("3:g\n"), &published).unwrap();
+        assert_eq!(
+            read_token_material(&data, Some("3:g")),
+            Some(published.clone())
+        );
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        assert_eq!(read_token_material(&data, None), None);
+
+        // Staged before the derived writes: still the published signature, both generations.
+        stage_token_material(&data, Some("3:g"), Some(&published), &next).unwrap();
+        let both: HashSet<_> = published.union(&next).cloned().collect();
+        assert_eq!(read_token_material(&data, Some("3:g")), Some(both));
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        write_token_material(&data, Some("4:h\n"), &next).unwrap();
+        assert_eq!(read_token_material(&data, Some("4:h")), Some(next.clone()));
+
+        // An unknown record is removed rather than extended into a claim.
+        stage_token_material(&data, Some("4:h"), None, &next).unwrap();
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        assert!(!data.join(super::TOKEN_MATERIAL_FILE).exists());
+
+        std::fs::write(data.join(super::TOKEN_MATERIAL_FILE), b"{not json").unwrap();
+        assert_eq!(read_token_material(&data, Some("4:h")), None);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn unbound_record_is_seeded_only_from_a_decoded_parse_cache() {
+        use super::{published_token_inventory, write_token_material, TOKEN_MATERIAL_FILE};
+        use agrep_core::ingest_cache::IngestCache;
+
+        let data = std::env::temp_dir().join(format!(
+            "agrep-token-inventory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let database = data.join("crush.db");
+        let namespace = agrep_core::ingest::registry::token_prefix("crush", &database).unwrap();
+        let cache_path = data.join(".ingest_cache.bin");
+        let mut seed = IngestCache::cold();
+        seed.collect_token_cached(
+            "crush",
+            Some(vec![(format!("{namespace}session"), "v1".into())]),
+            |session| {
+                let message = agrep_core::model::RawMessage {
+                    agent: "crush",
+                    project: "crush".into(),
+                    session: session.into(),
+                    ts: 1,
+                    turn: 0,
+                    text: "cached conversation".into(),
+                    model: String::new(),
+                    reply: String::new(),
+                    reply_chars: 0,
+                    side: false,
+                    parent: String::new(),
+                };
+                (vec![message.freeze()], Vec::new())
+            },
+        );
+        seed.save(&cache_path).unwrap();
+        let decoded = IngestCache::load(&cache_path);
+        assert!(decoded.decoded_last_good_base());
+        let cached = HashSet::from([("crush".to_string(), namespace)]);
+
+        assert_eq!(
+            published_token_inventory(&data, false, None, &IngestCache::cold()),
+            Some(HashSet::new())
+        );
+        assert_eq!(
+            published_token_inventory(&data, true, Some("3:g"), &decoded),
+            Some(cached.clone())
+        );
+        // A cache that decoded nothing proves nothing.
+        let empty = IngestCache::load(&data.join("missing-cache.bin"));
+        assert!(!empty.decoded_last_good_base());
+        for undecoded in [&empty, &IngestCache::cold()] {
+            let inventory = published_token_inventory(&data, true, Some("3:g"), undecoded);
+            assert_eq!(inventory, None);
+        }
+        // A bound record wins; a stale or damaged one is replaced by the decoded cache alone.
+        let recorded = HashSet::from([("cursor".to_string(), String::new())]);
+        write_token_material(&data, Some("3:g"), &recorded).unwrap();
+        assert_eq!(
+            published_token_inventory(&data, true, Some("3:g"), &decoded),
+            Some(recorded)
+        );
+        std::fs::write(data.join(TOKEN_MATERIAL_FILE), b"{not json").unwrap();
+        let damaged = published_token_inventory(&data, true, Some("3:g"), &decoded);
+        assert_eq!(damaged, Some(cached.clone()));
+        write_token_material(&data, Some("3:g"), &HashSet::new()).unwrap();
+        let stale = published_token_inventory(&data, true, Some("4:h"), &decoded);
+        assert_eq!(stale, Some(cached));
+        let stale_unknown = published_token_inventory(&data, true, Some("4:h"), &empty);
+        assert_eq!(stale_unknown, None);
+        std::fs::write(data.join(TOKEN_MATERIAL_FILE), b"{not json").unwrap();
+        let damaged_unknown = published_token_inventory(&data, true, Some("3:g"), &empty);
+        assert_eq!(damaged_unknown, None);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     #[cfg(unix)]
     fn fifo(path: &std::path::Path) {
         let status = std::process::Command::new("mkfifo")
@@ -5756,6 +6622,50 @@ mod tests {
         assert!(unknown.exists());
         assert!(malformed.exists());
         assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dead_writers_event_proof_temps_and_dead_reapers_owner_tombs_are_swept() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-litter-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let swept = [
+            ".events_complete.claude.json.tmp.41.9",
+            "..indexd.lock.owner-reap-41-0123abcd",
+            "..indexd.v2.lock.owner-reap-41-0123456789abcdef",
+        ];
+        let kept = [
+            ".events_complete.claude.json.tmp.42.9",
+            "..indexd.v2.lock.owner-reap-42-0123abcd",
+            "..indexd.v2.lock.owner-reap-43-0123abcd",
+            "..index.lock.owner-reap-41-0123abcd",
+            ".events_complete.json.tmp.41.9",
+            "..indexd.lock.owner-reap-41-not-hex",
+            ".indexd.lock",
+        ];
+        for name in swept.iter().chain(&kept) {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        let result = sweep_staging_temps_with(&root, |pid| match pid {
+            41 => Some(false),
+            42 => Some(true),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(result, (3, 3));
+        for name in swept {
+            assert!(!root.join(name).exists(), "{name} survived");
+        }
+        for name in kept {
+            assert!(root.join(name).exists(), "{name} was swept");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6826,6 +7736,39 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_record_is_published_whole_beside_no_staging_and_never_over_a_record() {
+        let data = std::env::temp_dir().join(format!(
+            "agrep-claim-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let claim = data.join(".indexd.v2.lock");
+        assert!(super::publish_claim_record(&claim, b"first\n", 1).unwrap());
+        assert_eq!(std::fs::read(&claim).unwrap(), b"first\n");
+        assert!(!super::publish_claim_record(&claim, b"second\n", 2).unwrap());
+        assert_eq!(std::fs::read(&claim).unwrap(), b"first\n");
+        let empty = data.join(".indexd.lock");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!super::publish_claim_record(&empty, b"third\n", 3).unwrap());
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+        let names: Vec<_> = std::fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "staging left behind: {names:?}");
+        assert_eq!(
+            staging_temp_owner(&format!(".indexd.v2.lock.tmp.{}.1", std::process::id())),
+            Some(std::process::id()),
+            "the staging sweep cannot reap a dead writer's staged claim"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
     fn dead_adoption_claim_is_reclaimed_before_fencing() {
         let data = std::env::temp_dir().join(format!(
             "agrep-dead-adoption-claim-{}-{}",
@@ -7041,6 +7984,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    /// The marker an older build wrote (agent lines only) keeps its meaning, root lines
+    /// round-trip any path, and a corrupt root line is no observation rather than a wildcard.
+    #[test]
+    fn source_absence_marker_reads_agent_lines_and_round_trips_roots() {
+        let dir = std::env::temp_dir().join(format!(
+            "agrep_source_absence_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(super::SOURCE_ABSENCE_FILE);
+        let legacy = format!("{}cursor\nopencode\n", super::SOURCE_ABSENCE_HEADER);
+        std::fs::write(&marker, legacy).unwrap();
+        let read = super::read_source_absence(&marker).unwrap().unwrap();
+        assert_eq!(read.agents, HashSet::from(["cursor".into(), "opencode".into()]));
+        assert!(read.roots.is_empty());
+
+        let root = dir.join("home").join(".pi agent").join("sessions\tx");
+        let written = super::SourceAbsence {
+            agents: HashSet::from(["kimi".to_string()]),
+            roots: HashSet::from([("pi".to_string(), root)]),
+        };
+        super::write_source_absence(&marker, &written).unwrap();
+        let read = super::read_source_absence(&marker).unwrap().unwrap();
+        assert_eq!(read.agents, written.agents);
+        assert_eq!(read.roots, written.roots);
+
+        let corrupt = format!("{}pi\tzz\npi\t\n", super::SOURCE_ABSENCE_HEADER);
+        std::fs::write(&marker, corrupt).unwrap();
+        let read = super::read_source_absence(&marker).unwrap().unwrap();
+        assert!(read.agents.is_empty() && read.roots.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn ingest_markers_reject_fifos_without_waiting() {
@@ -7242,6 +8222,21 @@ mod tests {
         assert!(agrep_core::ingest::registry::source_audit_snapshot("unknown-adapter").is_err());
     }
 
+    #[test]
+    fn store_census_rejects_conflicting_modes() {
+        assert!(Cli::try_parse_from(["agrep-rs", "stores", "--census"]).is_ok());
+        for flag in ["--paths", "--tokens", "--audit"] {
+            let error = Cli::try_parse_from(["agrep-rs", "stores", "--census", flag])
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        let error = Cli::try_parse_from(["agrep-rs", "stores", "--census", "--agent", "codex"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
     #[cfg(unix)]
     #[test]
     fn store_audit_marks_non_unicode_content_path_incomplete() {
@@ -7429,27 +8424,27 @@ mod tests {
         std::fs::write(&source, b"last-good").unwrap();
         std::fs::write(&pending, b"attempted-preflight").unwrap();
 
+        // A held source snapshot keeps last-good and pending; the policy is still recorded.
         assert_eq!(
-            publish_source_snapshot(None, &source, &policy, &pending).unwrap(),
-            SourcePublishOutcome::default()
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), b"last-good");
-        assert_eq!(std::fs::read(&pending).unwrap(), b"attempted-preflight");
-
-        let outcome = publish_source_snapshot(
-            Some((b"validated".to_vec(), b"policy".to_vec())),
-            &source,
-            &policy,
-            &pending,
-        )
-        .unwrap();
-        assert_eq!(
-            outcome,
+            publish_source_snapshot(None, b"policy", &source, &policy, &pending).unwrap(),
             SourcePublishOutcome {
                 policy_written: true,
                 pending_promoted: false,
             }
         );
+        assert_eq!(std::fs::read(&source).unwrap(), b"last-good");
+        assert_eq!(std::fs::read(&pending).unwrap(), b"attempted-preflight");
+        assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
+
+        let outcome = publish_source_snapshot(
+            Some(b"validated".to_vec()),
+            b"policy",
+            &source,
+            &policy,
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(outcome, SourcePublishOutcome::default());
         assert_eq!(std::fs::read(&source).unwrap(), b"validated");
         assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
         assert_eq!(read_optional_bytes(&pending, 1024).unwrap(), None);
@@ -7476,7 +8471,8 @@ mod tests {
         std::fs::write(&pending, b"validated").unwrap();
 
         let outcome = publish_source_snapshot(
-            Some((b"validated".to_vec(), b"policy".to_vec())),
+            Some(b"validated".to_vec()),
+            b"policy",
             &source,
             &policy,
             &pending,
@@ -7516,7 +8512,8 @@ mod tests {
         let policy_for_check = policy.clone();
 
         let error = publish_source_snapshot_with(
-            Some((b"validated".to_vec(), b"new-policy".to_vec())),
+            Some(b"validated".to_vec()),
+            b"new-policy",
             &source,
             &policy,
             &pending,

@@ -1,0 +1,5 @@
+exit: 0
+--- stdout ---
+33333333-3333-4333-8333-333333333333	pi	cedar	3	user	Confirm the copper lantern handoff after the recap.
+--- stderr ---
+showing 1 of 29 matching rows (3 of them in tool output) · larger page: agrep --classic -n 80 -- lantern

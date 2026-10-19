@@ -111,7 +111,8 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
         self.assertTrue(all(
             len(digest) == 64 and set(digest) <= set("0123456789abcdef")
             for digest in digests))
-        banned = "erin" + "ys"
+        # A synthetic banned token, split so this file never carries it whole.
+        banned = "agrep" + "privacyfixture"
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             leaky = root / "config.py"

@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod gemini;
 pub mod kimi;
 pub mod opencode;
+pub(crate) mod parse_guard;
 pub mod parse_timestamp;
 pub mod pi;
 pub mod registry;
@@ -886,6 +887,31 @@ pub(crate) fn open_sqlite_ro(path: &Path) -> Result<ReadOnlyConnection, rusqlite
     open_sqlite_ro_with_hook(path, || {})
 }
 
+/// The primary result code, including the input errors SQLite reports with a token offset.
+pub(crate) fn sqlite_code(error: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => Some(failure.code),
+        rusqlite::Error::SqlInputError { error, .. } => Some(error.code),
+        _ => None,
+    }
+}
+
+/// The source issue kind of a read-only open failure no retry heals: a file SQLite rejects as
+/// no database, or one the user may not read. None for failures a retry may clear.
+pub(crate) fn sqlite_open_defect(path: &Path, error: &rusqlite::Error) -> Option<&'static str> {
+    if sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase) {
+        return Some("unsupported-file-type");
+    }
+    // The open flattens I/O errors into CANTOPEN; a zero-byte secure probe recovers the
+    // permission case without letting a swapped-in special file block the census.
+    match crate::ingest::registry::regular_file_edge_snapshot(path, 0) {
+        Err(probe) if probe.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some("permission-denied")
+        }
+        _ => None,
+    }
+}
+
 /// Metadata generation for a SQLite database and its committed WAL. The shared-memory file is
 /// lock coordination rather than durable content and must not invalidate warm generations.
 pub(crate) fn sqlite_generation_token(path: &std::path::Path) -> std::io::Result<String> {
@@ -1204,6 +1230,9 @@ mod tests {
         std::fs::write(&path, &seeded).unwrap();
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Each read follows at least one more landed append, so growth under the
+        // reader is guaranteed rather than left to thread scheduling.
+        let (appended, landed) = std::sync::mpsc::channel::<()>();
         let writer = {
             let (path, line, stop) = (path.clone(), line.clone(), stop.clone());
             std::thread::spawn(move || {
@@ -1214,6 +1243,9 @@ mod tests {
                     .unwrap();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     file.write_all(line.as_bytes()).unwrap();
+                    if appended.send(()).is_err() {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
             })
@@ -1222,6 +1254,9 @@ mod tests {
         let mut lengths = Vec::new();
         let mut sample = String::new();
         for _ in 0..20 {
+            landed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the appender must make progress");
             let text = read_lossy(&path).expect("a growing source stays readable");
             assert!(text.len() >= seeded.len());
             lengths.push(text.len());
@@ -1361,6 +1396,7 @@ mod tests {
         let before_metadata = std::fs::symlink_metadata(&path).unwrap();
         let generic_before =
             crate::ingest::registry::metadata_change_token(&path, &before_metadata).unwrap();
+        crate::ingest::registry::wait_for_next_ctime_tick(&path);
         let generation = sqlite_generation_token(&path).unwrap();
         let snapshot = SqliteSnapshot::create_with(&path, |_, _| Ok(false)).unwrap();
         assert_eq!(

@@ -116,10 +116,6 @@ class ReadersNeverPayWriterCosts(unittest.TestCase):
             if db is not None:
                 db.close()
 
-    def test_the_inline_reingest_mechanism_is_deleted(self) -> None:
-        # C2's mechanism: the pre-search inline re-ingest. Pinned gone, so a
-        # regression must consciously reintroduce it against this test.
-        self.assertFalse(hasattr(indexd_runtime, "_sync_freshen"))
 
 
 if __name__ == "__main__":

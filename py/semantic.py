@@ -432,7 +432,8 @@ def _marker_coverage(marker: dict, output: dict) -> dict | None:
 
 
 def embedding_coherence() -> dict:
-    """Whether vector rows were published from the current transcript generation."""
+    """Whether vectors bind to the newest or a queryable committed transcript."""
+    source_race: BaseException | None = None
     try:
         source = source_generation()
     except common.LegacyPublication as exc:
@@ -447,14 +448,18 @@ def embedding_coherence() -> dict:
             ),
             "detail": str(exc),
         }
+    except common.TranscriptPublicationRace as exc:
+        source = None
+        source_race = exc
     except RuntimeError as exc:
         return {"coherent": False, "searchable": False,
                 "state": "unstable-source", "basis": None, "reason": str(exc)}
-    if source is None:
+    if source is None and source_race is None:
         return {"coherent": False, "searchable": False,
                 "state": "missing-source", "basis": None}
     source_mtime = max(
-        (value["mtime_ns"] for value in source["files"].values()), default=0)
+        (value["mtime_ns"] for value in (source or {}).get("files", {}).values()),
+        default=0)
     if integrity_rebuild_requested():
         return {
             "coherent": False, "searchable": False,
@@ -473,6 +478,11 @@ def embedding_coherence() -> dict:
                 "state": "corrupt-embeddings", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     if output is None:
+        if source_race is not None:
+            return {"coherent": False, "searchable": False,
+                    "state": "unstable-source", "basis": None,
+                    "reason": str(source_race),
+                    "source_mtime_ns": source_mtime}
         return {"coherent": False, "searchable": False,
                 "state": "missing-embeddings", "basis": None,
                 "source_mtime_ns": source_mtime}
@@ -496,41 +506,89 @@ def embedding_coherence() -> dict:
             "source_mtime_ns": source_mtime,
         }
     if output.get("segmented"):
+        import segment_query
+        output_source = output.get("source")
+        if source is None:
+            try:
+                queryable_before, newest_before = (
+                    segment_query.semantic_source_status(output_source))
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                return {"coherent": False, "searchable": False,
+                        "state": "unstable-source", "basis": None,
+                        "reason": str(exc), "source_mtime_ns": source_mtime}
+        else:
+            queryable_before = newest_before = output_source == source
         try:
-            source_after = source_generation()
             output_after = output_generation()
         except (OSError, RuntimeError, ValueError, TypeError,
                 json.JSONDecodeError) as exc:
             return {"coherent": False, "searchable": False,
                     "state": "unstable-embeddings", "basis": None,
                     "reason": str(exc), "source_mtime_ns": source_mtime}
-        if source_after != source:
-            return {"coherent": False, "searchable": False,
-                    "state": "unstable-source", "basis": None,
-                    "reason": "transcript generation moved during coherence check",
-                    "source_mtime_ns": source_mtime}
         if output_after != output:
             return {"coherent": False, "searchable": False,
                     "state": "unstable-embeddings", "basis": None,
                     "reason": "embedding generation moved during coherence check",
                     "source_mtime_ns": source_mtime}
-        bound = output.get("source") == source
-        coverage = output.get("coverage") if bound else None
+        if source is None:
+            try:
+                queryable_after, newest_after = (
+                    segment_query.semantic_source_status(output_source))
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                return {"coherent": False, "searchable": False,
+                        "state": "unstable-source", "basis": None,
+                        "reason": str(exc), "source_mtime_ns": source_mtime}
+        else:
+            try:
+                source_after = source_generation()
+            except common.TranscriptPublicationRace:
+                try:
+                    queryable_after, newest_after = (
+                        segment_query.semantic_source_status(output_source))
+                except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                    return {"coherent": False, "searchable": False,
+                            "state": "unstable-source", "basis": None,
+                            "reason": str(exc),
+                            "source_mtime_ns": source_mtime}
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                return {"coherent": False, "searchable": False,
+                        "state": "unstable-source", "basis": None,
+                        "reason": str(exc), "source_mtime_ns": source_mtime}
+            else:
+                queryable_after = newest_after = output_source == source_after
+        queryable = bool(queryable_before and queryable_after)
+        newest = bool(newest_before and newest_after)
+        coverage = output.get("coverage") if queryable else None
         searchable = isinstance(coverage, dict)
-        exact = bool(searchable and coverage.get("complete"))
+        exact = bool(searchable and newest and coverage.get("complete"))
         output_mtime = min(
             (value["mtime_ns"] for value in output["artifacts"].values()), default=0)
-        state = "current" if exact else "partial" if searchable else "stale"
+        if source is None and isinstance(output_source, dict):
+            source_mtime = max(
+                (value["mtime_ns"] for value in
+                 output_source.get("files", {}).values()),
+                default=0)
+        state = ("current" if exact else "partial" if searchable and newest
+                 else "published" if searchable else "stale")
+        basis = ("generation" if exact else
+                 "partial-generation" if searchable and newest else
+                 "published-generation" if searchable else None)
+        source_files = (
+            (source or output_source).get("files", {})
+            if isinstance(source or output_source, dict) else {})
         return {
             "coherent": exact, "searchable": searchable, "state": state,
             "layout": "segments-v2", "migration_pending": False,
-            "basis": ("generation" if exact else
-                      "partial-generation" if searchable else None),
+            "basis": basis, "source_current": newest,
             "coverage": coverage, "source_mtime_ns": source_mtime,
             "embedding_mtime_ns": output_mtime,
-            "source_files": len(source["files"]),
+            "source_files": len(source_files),
             "embedding_files": len(output["artifacts"]),
         }
+    if source is None:
+        return {"coherent": False, "searchable": False,
+                "state": "unstable-source", "basis": None,
+                "reason": str(source_race), "source_mtime_ns": source_mtime}
     try:
         marker = json.loads(generation_marker_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -885,7 +943,7 @@ def lane_change_rebuild(state: dict | None = None) -> dict | None:
 
 def query_readiness(
         coherence: dict | None = None, *, refresh: dict | None = None) -> dict:
-    """Current-generation readiness and bounded background-build progress."""
+    """Queryable-generation readiness and bounded background-build progress."""
     coherence = embedding_coherence() if coherence is None else coherence
     state = str(coherence.get("state") or "unknown")
     searchable = bool(
@@ -909,7 +967,8 @@ def query_readiness(
     return {
         "state": "ready" if searchable else "not-ready",
         "generation_state": state,
-        "current_generation": searchable,
+        "current_generation": bool(
+            searchable and coherence.get("source_current", True)),
         "complete": bool(coherence.get("coherent")),
         "coverage": coherence.get("coverage"),
         "refresh": {
@@ -986,18 +1045,9 @@ def _semantic_refresh_delegate_alive() -> bool:
 
 
 def wait_for_query_recovery(*, timeout_s: float | None = None) -> dict:
-    """Wait for one *proven-converging* current generation, never stale data.
-
-    This is deliberately called only after a semantic request reports a
-    retryable publication/update failure.  A stale segmented generation may
-    launch the same deduplicated background refresh that ``search()`` already
-    requests.  We then poll generation coherence and the corpus publication
-    lock.  Missing, disabled, read-only, profile-mismatched, and corrupt lanes
-    return immediately unless a live writer/embedding owner proves convergence
-    is actually underway.
-    """
-    wait_s = (SEMANTIC_QUERY_RECOVERY_WAIT_S if timeout_s is None
-              else max(0.0, float(timeout_s)))
+    """Wait for one queryable immutable generation, never unbound data."""
+    wait_s = bounded_query_recovery_wait_s(
+        SEMANTIC_QUERY_RECOVERY_WAIT_S if timeout_s is None else timeout_s)
     deadline = time.monotonic() + wait_s
     refresh: dict | None = None
     waited = False
@@ -1008,12 +1058,12 @@ def wait_for_query_recovery(*, timeout_s: float | None = None) -> dict:
         state = str(coherence.get("state") or "unknown")
         searchable = bool(
             coherence.get("searchable", coherence.get("coherent", False)))
-        corpus_active = _query_corpus_update_active()
-        if searchable and not corpus_active:
+        if searchable:
             return {
                 "state": "ready", "waited": waited,
                 "coherence": coherence, "refresh": refresh,
             }
+        corpus_active = _query_corpus_update_active()
 
         # Source movement over an immutable segmented bundle is the safe,
         # incremental rebase case.  Start at most one deduplicated refresher;
@@ -1029,14 +1079,14 @@ def wait_for_query_recovery(*, timeout_s: float | None = None) -> dict:
                 # compatible daemon already owns semantic catch-up: wait on that
                 # proven delegate, same deadline; other failures stay explicit.
                 coherence_after = embedding_coherence()
-                corpus_active = _query_corpus_update_active()
                 searchable_after = bool(coherence_after.get(
                     "searchable", coherence_after.get("coherent", False)))
-                if searchable_after and not corpus_active:
+                if searchable_after:
                     return {
                         "state": "ready", "waited": waited,
                         "coherence": coherence_after, "refresh": refresh,
                     }
+                corpus_active = _query_corpus_update_active()
                 coherence = coherence_after
                 if (isinstance(exc, SemanticRefreshSpawnDenied)
                         and _semantic_refresh_delegate_alive()):
@@ -1058,8 +1108,7 @@ def wait_for_query_recovery(*, timeout_s: float | None = None) -> dict:
             if (refresh.get("state") == "ready"
                     and isinstance(repaired, dict)
                     and repaired.get(
-                        "searchable", repaired.get("coherent", False))
-                    and not _query_corpus_update_active()):
+                        "searchable", repaired.get("coherent", False))):
                 return {
                     "state": "ready", "waited": waited,
                     "coherence": repaired, "refresh": refresh,
@@ -1624,70 +1673,6 @@ def _await_publishing_coherence(initial: dict) -> dict:
         delay = min(delay * 2, SEMANTIC_PUBLICATION_POLL_MAX_S)
 
 
-def _query_corpus_update_active() -> bool:
-    """Observe the corpus publication owner without making it required."""
-    try:
-        import segment_query
-        return bool(segment_query.corpus_update_active())
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
-def wait_for_query_recovery(*, timeout_s: float | None = None) -> dict:
-    """Wait only while verified local state proves convergence is possible.
-
-    This is called after an automatic query has already returned an exactly
-    classified transient. A healthy searchable generation returns immediately;
-    stale or unstable state is polled only while the corpus publisher or the
-    embedding publisher is demonstrably alive. Missing, corrupt, mismatched, or
-    unexplained stale state therefore never becomes a fake success or a fixed
-    sleep on every command.
-    """
-    wait_s = bounded_query_recovery_wait_s(
-        SEMANTIC_QUERY_RECOVERY_WAIT_S if timeout_s is None else timeout_s)
-    deadline = time.monotonic() + wait_s
-    waited = False
-    while True:
-        coherence = embedding_coherence()
-        searchable = bool(
-            coherence.get("searchable", coherence.get("coherent", False)))
-        coverage = coherence.get("coverage")
-        complete_current = bool(
-            searchable
-            and coherence.get("coherent") is True
-            and coherence.get("state") == "current"
-            and isinstance(coverage, dict)
-            and coverage.get("complete") is True
-            and type(coverage.get("indexed")) is int
-            and type(coverage.get("total")) is int
-            and type(coverage.get("pending")) is int
-            and coverage["indexed"] == coverage["total"]
-            and coverage["pending"] == 0)
-        corpus_active = _query_corpus_update_active()
-        # Only a verified complete/current generation bypasses an active publisher.
-        # Partial generations wait; query pinning and one typed reopen still catch
-        # publication that wins after this observation.
-        if searchable and (not corpus_active or complete_current):
-            return {
-                "state": "ready", "waited": waited,
-                "coherence": coherence,
-            }
-        embed_active = embed_running()
-        if not (corpus_active or embed_active):
-            return {
-                "state": "not-converging", "waited": waited,
-                "coherence": coherence,
-            }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            return {
-                "state": "timeout", "waited": waited,
-                "coherence": coherence,
-            }
-        waited = True
-        time.sleep(min(SEMANTIC_QUERY_RECOVERY_POLL_S, remaining))
-
-
 def _reset_transient_semantic_readers() -> None:
     """Drop generation-pinned readers before one typed movement retry."""
     import segment_query
@@ -1765,6 +1750,19 @@ def _legacy_publication_unavailable_payload(coherence: dict, level: str) -> dict
     }
 
 
+def warm_query_model(*, allow_model_download: bool = False) -> None:
+    """Load the lane the STORE was built with (the default would build an ONNX
+    session the first query replaces); unreadable meta warms the default lane."""
+    import embedder
+    try:
+        recorded = common.read_index_meta(
+            common.EMBEDDINGS_PATH.parent / "embeddings.meta")[1]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        recorded = None
+    embedder.get(download=allow_model_download,
+                 lane=embedder.resolve_lane(recorded))
+
+
 def search(query: str, *, level: str = "hybrid", k: int = 10,
            filters: dict | None = None, refresh_if_stale: bool = True,
            timing: bool | None = None,
@@ -1833,17 +1831,7 @@ def search(query: str, *, level: str = "hybrid", k: int = 10,
     k = max(1, min(int(k), SEMANTIC_MAX_RESULTS))
     ask_started = time.perf_counter()
     try:
-        # Warm the lane the STORE was built with (the default would build an
-        # ONNX session the first query replaces); no readable meta yet means
-        # warm the default lane rather than fail the query.
-        try:
-            recorded = common.read_index_meta(
-                common.EMBEDDINGS_PATH.parent / "embeddings.meta")[1]
-        except (OSError, ValueError, TypeError, KeyError,
-                json.JSONDecodeError):
-            recorded = None
-        embedder.get(download=allow_model_download,
-                     lane=embedder.resolve_lane(recorded))
+        warm_query_model(allow_model_download=allow_model_download)
         for attempt in range(2):
             try:
                 if level == "hybrid":

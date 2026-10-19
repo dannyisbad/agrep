@@ -426,51 +426,48 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                     self._expected(base, external_job))
                 log.close.assert_called_once_with()
 
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Job Object contract")
     def test_semantic_worker_uses_background_job_policy(self) -> None:
-        base = 0x08000208
-        nonce = "a" * 32
-        claim = mock.Mock()
-        claim.snapshot.raw = json.dumps({
-            "pid": os.getpid(), "at": time.time(),
-            "process_start": "birth", "nonce": nonce,
-        }, separators=(",", ":")).encode()
-        for external_job in (False, True):
-            with self.subTest(external_job=external_job):
-                log = mock.Mock()
-                process = mock.Mock()
-                with mock.patch.object(common, "WIN", True), \
-                        mock.patch.object(proc, "WIN", True), \
-                        mock.patch.object(
-                            proc, "_DESCENDANT_JOB_HANDLE", None), \
-                        mock.patch.object(
-                            proc, "_DESCENDANT_LIFETIME_BOUND", False), \
-                        mock.patch.object(
-                            proc, "_DESCENDANT_LIFETIME_PID", None), \
-                        mock.patch.object(
-                            proc, "_windows_current_process_in_job",
-                            return_value=external_job), \
-                        mock.patch.object(
-                            proc, "process_start_identity",
-                            return_value=None), \
-                        mock.patch.object(semworker.sys, "platform", "win32"), \
-                        mock.patch.object(
-                            common, "open_bounded_log", return_value=log), \
-                        mock.patch.object(
-                            semworker, "loopback_bind_status",
-                            return_value={"bindable": True, "reason": None}), \
-                        mock.patch.object(
-                            semworker.subprocess, "Popen",
-                            return_value=process) as popen:
-                    returned = semworker._spawn_worker(claim)
-                self.assertIs(returned, process)
-                self.assertEqual(
-                    popen.call_args.kwargs["creationflags"],
-                    self._expected(base, external_job))
-                self.assertEqual(
-                    popen.call_args.kwargs["env"][
-                        semworker._LAUNCH_CLAIM_ENV],
-                    nonce)
-                log.close.assert_called_once_with()
+        with tempfile.TemporaryDirectory(prefix="agrep-worker-job-") as raw:
+            root = Path(raw)
+            marker = root / "launch.json"
+            child = (
+                "import json,os,sys,time;from pathlib import Path;"
+                "Path(sys.argv[1]+'.tmp').write_text(json.dumps("
+                "os.environ.get('AGREP_SEMANTIC_LAUNCH_NONCE')));"
+                "os.replace(sys.argv[1]+'.tmp',sys.argv[1]);time.sleep(30)")
+            parent = (
+                "import common,json,semworker,subprocess,sys\n"
+                "assert common.bind_descendants_to_process_lifetime()\n"
+                "common.DATA_DIR.mkdir(parents=True,exist_ok=True)\n"
+                "claim=semworker._acquire_start_claim();assert claim is not None\n"
+                "popen=subprocess.Popen\n"
+                "def launch(_cmd,**kw):\n"
+                " return popen([sys.executable,'-c',sys.argv[1],sys.argv[2]],**kw)\n"
+                "semworker.subprocess.Popen=launch\n"
+                "worker=semworker._spawn_worker(claim)\n"
+                "print(json.dumps({'pid':worker.pid,"
+                "'birth':common.process_start_identity(worker.pid),"
+                "'nonce':semworker._parse_start_claim(claim.snapshot).nonce}),flush=True)\n")
+            env = dict(os.environ)
+            env.update(AGREP_DATA_DIR=str(root / "data"), AGREP_DATA_DIR_SOURCE="env",
+                       AGREP_HOME=str(root / "home"))
+            result = subprocess.run(
+                [sys.executable, "-c", parent, child, str(marker)],
+                cwd=Path(__file__).resolve().parent, env=env,
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            record = json.loads(result.stdout.strip().splitlines()[-1])
+            try:
+                deadline = time.monotonic() + 5.0
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(common.pid_alive(record["pid"]))
+                self.assertEqual(json.loads(marker.read_text()), record["nonce"])
+            finally:
+                self.assertTrue(common.terminate_exact_process_tree(
+                    record["pid"], record["birth"], wait_s=5.0))
 
     def test_indexd_uses_background_job_policy(self) -> None:
         base = 0x00000208
@@ -545,6 +542,8 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                     teach.subprocess, "Popen") as popen, \
                 mock.patch.object(teach, "_pythonw", return_value="pythonw.exe"), \
                 mock.patch.object(
+                    teach, "_retire_legacy_windows_sentinel", return_value=True), \
+                mock.patch.object(
                     teach, "sentinel_armed", return_value=True):
             self.assertTrue(teach._sentinel_install_win([]))
         self.assertEqual(
@@ -571,6 +570,8 @@ class WindowsSpawnPolicyTests(unittest.TestCase):
                     teach.subprocess, "Popen",
                     side_effect=PermissionError("job denies breakaway")) as popen, \
                 mock.patch.object(teach, "_pythonw", return_value="pythonw.exe"), \
+                mock.patch.object(
+                    teach, "_retire_legacy_windows_sentinel", return_value=True), \
                 mock.patch.object(
                     teach, "sentinel_armed", return_value=True):
             self.assertFalse(teach._sentinel_install_win([]))

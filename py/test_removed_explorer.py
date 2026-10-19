@@ -63,6 +63,14 @@ class RemovedExplorerTests(unittest.TestCase):
         stop.assert_not_called()
         self.assertFalse(path.exists())
 
+    def test_dead_owner_descriptor_written_with_crlf_is_cleaned(self) -> None:
+        path = legacy_cleanup.DATA_DIR / ".server"
+        path.write_bytes(json.dumps({"pid": 123, "port": 8732, "mode": "explorer",
+                                     "process_start": "unknown"}).encode() + b"\r\n")
+        with mock.patch.object(legacy_cleanup, "pid_alive", return_value=False):
+            legacy_cleanup.retire_removed_explorer()
+        self.assertFalse(path.exists())
+
     def test_legacy_owner_needs_command_and_http_fingerprints(self) -> None:
         path = legacy_cleanup.DATA_DIR / ".server"
         body = json.dumps({"pid": 123, "port": 8732})
@@ -162,7 +170,7 @@ class RemovedExplorerTests(unittest.TestCase):
                 public = "serve" if verb == "serve" else "ui"
                 self.assertIn(f"agrep {public}", proc.stdout)
 
-    def test_top_level_usage_lists_both_explorer_commands(self) -> None:
+    def test_top_level_help_lists_both_explorer_commands(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "cli.py"), "--help"],
@@ -172,10 +180,8 @@ class RemovedExplorerTests(unittest.TestCase):
                 }, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=15)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        usage = "\n".join(proc.stdout.splitlines()[:4])
-        self.assertIn("ui", usage)
-        self.assertIn("serve", usage)
-        self.assertIn("live              tail, board, ui, serve, run", proc.stdout)
+        listed = proc.stdout.split("other commands:", 1)[1].split("\n\n", 1)[0]
+        self.assertLessEqual({"ui", "serve"}, {word.strip(",") for word in listed.split()})
 
     def test_explorer_verbs_never_fall_through_to_search(self) -> None:
         sys.path.insert(0, str(ROOT))

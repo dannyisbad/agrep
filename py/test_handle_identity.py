@@ -10,6 +10,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -150,6 +155,8 @@ class RenderedHandleIdentity(unittest.TestCase):
         head = search._chat_head(
             self._hit(), 1, False, session_index=index)
         self.assertIn(f"@abcdef01:7.{self.DIGEST}", head)
+        # -l rows carry the head row's age, so --sort time is readable
+        self.assertRegex(head, r"\[@abcdef01:7\.[0-9a-f]{4} · 1 hit · \d+[mhdy]\]$")
         output = io.StringIO()
         with mock.patch.object(
                 search.common, "indexed_session_prefix_candidates",
@@ -561,6 +568,334 @@ class RecallRescueAndDisclosureParity(DirectHandleConsumers):
             f"@abcdef01:5.{digest}", {5: window}, extra=("--json",))
         self.assertEqual(rc, 0)
         self.assertNotIn("served", json.loads(out))
+
+
+class HandleWidthUnderFamilyIndexLag(unittest.TestCase):
+    """A drifting store must not flip handles between prefix and full id."""
+
+    def test_stamp_behind_index_keeps_prefix_handles_and_discloses_once(
+            self) -> None:
+        import sqlite3
+        import tempfile
+        import session_context
+        import surface_policy as surface
+
+        session = "abcdef01-2345-6789-abcd-ef0123456789"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = sqlite3.connect(root / "corpus.db")
+            db.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE session_family(
+                    session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                    side INTEGER NOT NULL CHECK(side IN (0, 1))
+                ) WITHOUT ROWID;
+            """)
+            db.execute("INSERT INTO meta VALUES('family_stamp', 'published')")
+            db.execute("INSERT INTO session_family VALUES(?, ?, 0)",
+                       (session, session))
+            db.commit()
+            db.close()
+            err = io.StringIO()
+            with mock.patch.object(session_context, "DATA_DIR", root), \
+                    mock.patch.object(
+                        session_context, "_FAMILY_INDEX_BEHIND", False), \
+                    mock.patch.object(
+                        search, "_FAMILY_INDEX_BEHIND_ANNOUNCED", False), \
+                    mock.patch.object(
+                        session_context, "session_family_source_stamp",
+                        return_value="the store moved on"), \
+                    contextlib.redirect_stderr(err):
+                hit = {"session": session, "turn": 7, "who": "user",
+                       "text": "claimed", "ts": 1_750_000_000_000}
+                row = search.public_rows([hit], result_handles=True)[0]
+                search._note_family_index_behind()
+                search._note_family_index_behind()
+        # last published index still shortens the id
+        self.assertTrue(row["handle"].startswith("@abcdef01:7."))
+        self.assertEqual(err.getvalue().count(surface.FAMILY_INDEX_BEHIND_LINE), 1)
+
+
+class PrintedHandleReopens(unittest.TestCase):
+    """A handle search prints names a row the index holds; around must show
+    that row. The event window has to attribute events the way the corpus
+    indexed them, and a cited row is shown whatever its speaker."""
+
+    SESSION = "abcdef012345"
+    TIMELINE = [{"turn": 0, "ts": 1_000}, {"turn": 1, "ts": 2_000}]
+    TURNS = [
+        {"turn": 0, "ts": 1_000, "who": "user", "text": "first prompt", "reply": ""},
+        {"turn": 1, "ts": 2_000, "who": "user", "text": "second prompt", "reply": ""},
+    ]
+    NEEDLE = "DEEP_NEEDLE"
+    # the match sits well past the first few hundred chars of the event
+    EARLY_EVENT = {"ts": 500, "kind": "tool", "name": "exec_command",
+                   "input": "cargo test", "ok": True,
+                   "output": "routine line\n" * 40 + NEEDLE + " decisive evidence"}
+    LATER_EVENTS = [
+        {"ts": 1_500, "kind": "tool", "name": "exec_command", "input": "ls", "output": "a"},
+        {"ts": 2_500, "kind": "tool", "name": "exec_command", "input": "pwd", "output": "b"},
+    ]
+
+    def _event_store(self, stack: contextlib.ExitStack) -> bytes:
+        import tempfile
+        import events
+        import explore
+
+        td = stack.enter_context(tempfile.TemporaryDirectory())
+        stack.enter_context(mock.patch.object(explore.common, "DATA_DIR", Path(td)))
+        stack.enter_context(mock.patch.object(events, "EVENTS_DIR", Path(td) / "events"))
+        (Path(td) / "events").mkdir()
+        explore._event_checkpoints.cache_clear()
+        stack.callback(explore._event_checkpoints.cache_clear)
+        payload = "".join(json.dumps(row) + "\n" for row in
+                          (self.EARLY_EVENT, *self.LATER_EVENTS)).encode()
+        explore.common.event_path_candidates("codex", self.SESSION)[0].write_bytes(payload)
+        return payload
+
+    def _around(self, handle: str, window, family_roots) -> tuple[int, list[dict], str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(around.common, "MESSAGES_PATH", Path(__file__)), \
+                mock.patch.object(around.explore, "resolve_session",
+                                  return_value=[self.SESSION]), \
+                mock.patch.object(around.explore, "get_window", side_effect=window), \
+                mock.patch.object(around.explore, "_session_index",
+                                  return_value={self.SESSION: {}}), \
+                mock.patch.object(around.session_context, "indexed_family_roots",
+                                  return_value=family_roots), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = around.main([handle, "--json", "--no-auto"])
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        return rc, rows, stderr.getvalue()
+
+    def test_window_attributes_pre_prompt_events_like_the_index(self) -> None:
+        import events
+        import explore
+
+        with contextlib.ExitStack() as stack:
+            payload = self._event_store(stack)
+            marks = [(row["ts"], row["turn"]) for row in self.TIMELINE]
+            indexed = [(row["ts"], row["turn"])
+                       for row in events.tool_rows_from_payload(payload, marks)]
+            first = explore._events_for_turns(
+                "codex", self.SESSION, self.TURNS[:1], self.TIMELINE)
+            second = explore._events_for_turns(
+                "codex", self.SESSION, self.TURNS[1:], self.TIMELINE)
+        self.assertEqual(indexed, [(500, 0), (1_500, 0), (2_500, 1)])
+        self.assertEqual([(row["ts"], row["turn"]) for row in first],
+                         [(500, 0), (1_500, 0)])
+        self.assertEqual([(row["ts"], row["turn"]) for row in second], [(2_500, 1)])
+
+    def test_tool_handle_for_an_event_before_its_prompt_reopens(self) -> None:
+        import common
+        import events
+        import explore
+
+        with contextlib.ExitStack() as stack:
+            payload = self._event_store(stack)
+            marks = [(row["ts"], row["turn"]) for row in self.TIMELINE]
+            row = events.tool_rows_from_payload(payload, marks)[0]
+            start = row["text"].index(self.NEEDLE)
+            hit = {"session": self.SESSION, "turn": row["turn"], "ts": row["ts"],
+                   "agent": "codex", "project": "agrep", "who": "tool",
+                   "snippet": self.NEEDLE,
+                   "content_digest": compact.content_digest(row["text"]),
+                   "_match_span": (start, start + len(self.NEEDLE)),
+                   "_event_identity": common.tool_event_identity(
+                       self.SESSION, row["turn"], row["ts"], row["text"])}
+            with mock.patch.object(
+                    search.common, "indexed_session_prefix_candidates",
+                    return_value=compact.session_prefix_index((self.SESSION,))):
+                handle = search.public_rows([hit], result_handles=True)[0]["handle"]
+
+            def window(session: str, center: int, radius: int) -> dict:
+                turns = [turn for turn in self.TURNS
+                         if abs(turn["turn"] - center) <= radius]
+                return {"session": self.SESSION, "center": center,
+                        "first_turn": 0, "last_turn": 1, "agent": "codex",
+                        "project": "agrep", "concept": "", "title": "",
+                        "turns": turns,
+                        "events": explore._events_for_turns(
+                            "codex", self.SESSION, turns, self.TIMELINE)}
+
+            rc, rows, stderr = self._around(
+                handle, window, {self.SESSION: self.SESSION})
+        self.assertEqual((rc, stderr), (0, ""), rows[:1])
+        shown = [row for row in rows if row.get("kind") == "tool"]
+        self.assertEqual([(row["turn"], row["ts"]) for row in shown], [(0, 500)])
+        self.assertIn(self.NEEDLE, shown[0].get("match_preview", ""))
+
+    def test_cited_recap_row_is_shown_and_positional_default_still_hides_it(
+            self) -> None:
+        recap = "summary of the earlier conversation"
+        turns = [{"turn": 2, "ts": 3_000, "who": "recap", "text": recap, "reply": ""}]
+        hit = {"session": self.SESSION, "turn": 2, "ts": 3_000, "agent": "pi",
+               "project": "agrep", "who": "recap", "snippet": recap,
+               "content_digest": compact.content_digest(recap)}
+        with mock.patch.object(
+                search.common, "indexed_session_prefix_candidates",
+                return_value=compact.session_prefix_index((self.SESSION,))):
+            handle = search.public_rows([hit], result_handles=True)[0]["handle"]
+
+        def window(session: str, center: int, radius: int) -> dict:
+            return {"session": self.SESSION, "center": 2, "first_turn": 2,
+                    "last_turn": 2, "agent": "pi", "project": "agrep",
+                    "concept": "", "title": "", "turns": turns, "events": []}
+
+        roots = {self.SESSION: self.SESSION}
+        rc, rows, stderr = self._around(handle, window, roots)
+        self.assertEqual((rc, stderr), (0, ""), rows[:1])
+        self.assertEqual([(row["who"], row["text"]) for row in rows
+                          if row.get("kind") == "msg"], [("recap", recap)])
+        rc, rows, _stderr = self._around(f"{self.SESSION}:2", window, roots)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(rows[0].get("miss", {}).get("code"), "no-speaker-match")
+
+
+FIXTURE_STORE = Path(__file__).resolve().parent / "fixtures" / "handle_identity" / "store"
+COMPACTED_CODEX = "7a7a7a7a-0510-4000-8000-000000000510"
+FIRST_PROMPT = "Port the kilo parser to the new grammar."
+MID_REPLY = "The kilo parser passes every zephyrine grammar rule after compaction."
+LAST_REPLY = "The kilo grammar notes are published with quillwort examples."
+
+
+class ReplyOnlyTurnWindow(unittest.TestCase):
+    """codex writes a compaction as an empty recap row. The search db stores no
+    empty text, so the reply after it is the turn's only row there; the window
+    still has to open that turn the way the published transcript does."""
+
+    def test_reply_only_turn_is_on_the_timeline_as_its_recap(self) -> None:
+        import corpusdb
+        import explore
+
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE msgs(id INTEGER PRIMARY KEY, session TEXT, turn INTEGER, "
+                   "ts INTEGER, agent TEXT, project TEXT, concept TEXT, model TEXT, "
+                   "model_source TEXT, who TEXT, text TEXT)")
+        rows = [(0, 100, "gpt-5", "explicit", "user", FIRST_PROMPT),
+                (0, 100, "gpt-5", "explicit", "agent", "three rules still fail"),
+                (0, 150, "", "tool", "tool", "shell_command: make kilo-parse"),
+                (1, 200, "<recap>", "recap", "agent", MID_REPLY),
+                (1, 250, "", "tool", "tool", "shell_command: make kilo-parse"),
+                (2, 300, "gpt-5", "explicit", "user", "Document the kilo grammar."),
+                (2, 300, "gpt-5", "explicit", "agent", "drafted"),
+                (3, 400, "<recap>", "recap", "agent", LAST_REPLY)]
+        db.executemany(
+            "INSERT INTO msgs(session, turn, ts, agent, project, concept, model, "
+            "model_source, who, text) VALUES(?, ?, ?, 'codex', 'kilo', '', ?, ?, ?, ?)",
+            [(COMPACTED_CODEX, *row) for row in rows])
+
+        context = corpusdb.session_context(db, COMPACTED_CODEX)
+        self.assertEqual(context["timeline"], [{"turn": turn, "ts": ts} for turn, ts in
+                                               ((0, 100), (1, 200), (2, 300), (3, 400))])
+        self.assertEqual((context["first_turn"], context["last_turn"], context["n_turns"]),
+                         (0, 3, 4))
+        merged = explore._merge_transcript_rows(
+            corpusdb.session_rows(db, COMPACTED_CODEX, lo=1, hi=1))
+        self.assertEqual(merged, [{"turn": 1, "ts": 200, "agent": "codex", "project": "kilo",
+                                   "who": "recap", "text": "", "reply": MID_REPLY}])
+
+
+class CompactedCodexHandlesReopen(unittest.TestCase):
+    """Black-box: the real ingest indexes a codex rollout whose compactions are each
+    followed by a reply. The handles search and chats print for those replies open
+    in around, on the search db and on the published transcript alike."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        binary = Path(os.environ.get("AGREP_RS_BIN") or repo / "target" / "release" / (
+            "agrep-rs.exe" if os.name == "nt" else "agrep-rs"))
+        if not binary.is_file():
+            raise unittest.SkipTest("release ingest binary is required")
+        temp = tempfile.TemporaryDirectory(prefix="agrep-reply-only-")
+        cls.addClassCleanup(temp.cleanup)
+        cls.root = Path(temp.name)
+        home, cls.data = cls.root / "home", cls.root / "data"
+        for source in FIXTURE_STORE.rglob("*.jsonl"):
+            relative = source.relative_to(FIXTURE_STORE)
+            target = home / ("." + relative.parts[0]) / Path(*relative.parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        cls.data.mkdir()
+        (cls.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
+        cls.env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("AGREP_") and key != "PYTHONPATH"}
+        cls.env.update({
+            "HOME": str(home), "USERPROFILE": str(home), "AGREP_HOME": str(home),
+            "AGREP_DATA_DIR": str(cls.data), "AGREP_RS_BIN": str(binary),
+            "AGREP_MODEL_DIR": str(cls.root / "models"), "AGREP_NO_FETCH": "1",
+            "AGREP_NO_DAEMON": "1", "AGREP_NO_SEM_WORKER": "1", "AGREP_NO_RESIDENT": "1",
+            "AGREP_CALLER_PUBLICATION_DIR": str(cls.root / "callers"),
+            "APPDATA": str(cls.root / "appdata"),
+            "LOCALAPPDATA": str(cls.root / "localappdata"),
+            "XDG_CONFIG_HOME": str(cls.root / "config"),
+            "XDG_DATA_HOME": str(cls.root / "share"),
+            "CODEX_HOME": str(home / ".codex"), "CLINE_DIR": str(cls.root / "cline"),
+            "CRUSH_GLOBAL_DATA": str(cls.root / "crush"), "OPENCODE_DB": "",
+        })
+        cls.cli = [sys.executable, str(repo / "cli.py")]
+        indexed = cls._run(["index"])
+        if indexed.returncode or not (cls.data / "corpus.db").is_file():
+            raise AssertionError(f"fixture indexing failed:\n{indexed.stdout}{indexed.stderr}")
+
+    @classmethod
+    def _run(cls, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*cls.cli, *argv], cwd=cls.root, env=cls.env, capture_output=True,
+            text=True, encoding="utf-8", timeout=120, check=False)
+
+    def _rows(self, argv: list[str]) -> list[dict]:
+        result = self._run([*argv, "--json", "--no-auto"])
+        self.assertEqual(result.returncode, 0, f"{argv}\n{result.stdout}{result.stderr}")
+        return [row for row in map(json.loads, result.stdout.splitlines())
+                if row.get("kind") != "agrep-meta"]
+
+    @staticmethod
+    def _shape(row: dict) -> tuple:
+        return (row["kind"], row["turn"], row.get("who", row.get("name")),
+                row.get("text", row.get("input")))
+
+    def _printed_handles(self) -> list[tuple[str, tuple]]:
+        """Each handle a search or chats printed, with the row it cites."""
+        agent_hit, = self._rows(["zephyrine"])
+        tool_hit, = self._rows(["all rules pass"])
+        first_hit, = [row for row in self._rows(["Port the kilo parser"])
+                      if (row["turn"], row["who"]) == (0, "user")]
+        chat, = [row for row in self._rows(["chats"]) if row["session"] == COMPACTED_CODEX]
+        self.assertEqual((agent_hit["turn"], agent_hit["who"]), (1, "agent"))
+        self.assertEqual((tool_hit["turn"], tool_hit["who"]), (1, "tool"))
+        self.assertEqual(chat["last_turn"], 3)
+        return [(agent_hit["handle"], ("msg", 1, "agent", MID_REPLY)),
+                (tool_hit["handle"], ("tool", 1, "shell_command", "make kilo-parse")),
+                (chat["latest_handle"], ("msg", 3, "agent", LAST_REPLY)),
+                (first_hit["handle"], ("msg", 0, "user", FIRST_PROMPT))]
+
+    def _opened(self, handle: str, cited: tuple) -> list[dict]:
+        rows = self._rows(["around", handle])
+        self.assertIn(cited, [self._shape(row) for row in rows], handle)
+        self.assertEqual({row["turn"] for row in rows}, {cited[1]}, handle)
+        return self._rows(["around", handle, "--full"])
+
+    def test_printed_handles_open_their_turn_on_both_read_paths(self) -> None:
+        handles = self._printed_handles()
+        indexed = {handle: self._opened(handle, cited) for handle, cited in handles}
+        mid = [(row["kind"], row["turn"], row.get("name")) for row in indexed[handles[0][0]]]
+        self.assertIn(("control", 1, "compacted"), mid)
+        self.assertIn(("tool", 1, "shell_command"), mid)
+        first = [(row["kind"], row["turn"]) for row in indexed[handles[-1][0]]]
+        self.assertEqual(first, [("msg", 0), ("msg", 0), ("tool", 0)],
+                         "a later compaction's events stay off the earlier turn")
+
+        corpus = self.data / "corpus.db"
+        aside = self.data / "corpus.db.aside"
+        corpus.rename(aside)
+        self.addCleanup(aside.rename, corpus)
+        published = {handle: self._opened(handle, cited) for handle, cited in handles}
+        self.assertFalse(corpus.exists(), "the transcript path rebuilt the search db")
+        self.assertEqual(published, indexed)
 
 
 if __name__ == "__main__":

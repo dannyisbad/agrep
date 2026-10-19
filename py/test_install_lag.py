@@ -271,13 +271,97 @@ class InstallLagTests(unittest.TestCase):
         distribution = _Distribution(
             self.site, "agrep-0.2.0.dist-info/direct_url.json")
         distribution.files = []
-        with mock.patch.object(install_lag, "_git_revision") as revision:
+        with mock.patch.object(install_lag, "_git_revision") as revision, \
+                mock.patch.dict(os.environ, {"AGREP_SOURCE_DIR": ""}):
             result = install_lag.installed_master_lag(
                 now=20 * DAY, module_path=self.module,
                 distribution=distribution)
         self.assertEqual(result["state"], "unavailable")
         self.assertIn("no unique local-source provenance", result["detail"])
+        self.assertEqual(result["reason"], "no-local-source-provenance")
         revision.assert_not_called()
+
+    def _changelog(self, *entries: str, release: str = "0.2.0 — 2026-01-01") -> None:
+        body = "# Changelog\n\n## Unreleased\n\n" + "".join(
+            f"- {entry}\n" for entry in entries) + f"\n## {release}\n\n- old\n"
+        (self.source / "CHANGELOG.md").write_text(body, encoding="utf-8")
+
+    def test_a_wheel_install_compares_against_the_named_checkout(self) -> None:
+        distribution = _Distribution(
+            self.site, "agrep-0.2.0.dist-info/direct_url.json")
+        distribution.files = []
+        self._changelog(
+            "Semantic search chunks long rows instead of embedding only "
+            "their opening bytes. The embedder truncates at its window.",
+            "Advisor sidecars index their own voice.")
+        with mock.patch.dict(
+                os.environ, {"AGREP_SOURCE_DIR": os.fspath(self.source)}):
+            current = install_lag.installed_master_lag(
+                now=20 * DAY, module_path=self.module,
+                distribution=distribution)
+            self.source_payload.write_text("changed payload\n", encoding="utf-8")
+            lagging = install_lag.installed_master_lag(
+                now=20 * DAY, module_path=self.module,
+                distribution=distribution)
+        self.assertEqual(current["state"], "current")
+        self.assertIn("matches the AGREP_SOURCE_DIR checkout exactly",
+                      current["detail"])
+        self.assertEqual(lagging["state"], "lagging")
+        self.assertEqual(lagging["remedy"], "replace-installed-tool")
+        self.assertEqual(lagging["source"], os.fspath(self.source.resolve()))
+        self.assertIn("differs from the AGREP_SOURCE_DIR checkout",
+                      lagging["detail"])
+        self.assertIn("lists 2 unreleased changes since 0.2.0 — 2026-01-01",
+                      lagging["detail"])
+        self.assertIn('newest: "Semantic search chunks long rows instead of '
+                      'embedding only their opening bytes."', lagging["detail"])
+        self.assertNotIn("The embedder truncates", lagging["detail"])
+        self.assertEqual(lagging["unreleased"]["count"], 2)
+
+    def test_a_named_checkout_must_be_absolute_and_verified(self) -> None:
+        distribution = _Distribution(
+            self.site, "agrep-0.2.0.dist-info/direct_url.json")
+        distribution.files = []
+        bogus = self.root / "elsewhere"
+        bogus.mkdir()
+        for value in ("relative/path", os.fspath(bogus),
+                      os.fspath(self.root / "missing")):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"AGREP_SOURCE_DIR": value}):
+                result = install_lag.installed_master_lag(
+                    now=20 * DAY, module_path=self.module,
+                    distribution=distribution)
+            self.assertEqual(result["state"], "unavailable")
+            self.assertEqual(result["reason"], "no-local-source-provenance")
+
+    def test_changelog_unreleased_reads_count_headline_and_release(self) -> None:
+        self._changelog("First entry only.", "Second", "Third one")
+        summary = install_lag.changelog_unreleased(self.source)
+        self.assertEqual(summary, {
+            "count": 3, "newest": "First entry only.",
+            "since": "0.2.0 — 2026-01-01"})
+        (self.source / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## 0.2.0\n\n- released\n", encoding="utf-8")
+        self.assertIsNone(install_lag.changelog_unreleased(self.source))
+        (self.source / "CHANGELOG.md").unlink()
+        self.assertIsNone(install_lag.changelog_unreleased(self.source))
+
+    def test_a_source_checkout_reports_its_own_unreleased_tail(self) -> None:
+        self._changelog("Newest change.", "Older change.")
+        (self.source / "py" / "install_lag.py").write_text(
+            "# checkout runtime\n", encoding="utf-8")
+        with mock.patch.object(install_lag, "_git_revision") as revision:
+            result = install_lag.installed_master_lag(
+                now=20 * DAY,
+                module_path=self.source / "py" / "install_lag.py",
+                distribution=self.distribution)
+        revision.assert_not_called()
+        self.assertEqual(result["state"], "not-installed")
+        self.assertEqual(result["unreleased"]["count"], 2)
+        self.assertEqual(result["unreleased"]["newest"], "Newest change.")
+        self.assertEqual(result["source"], os.fspath(self.source.resolve()))
+        self.assertIn("running from a source checkout; the checkout lists "
+                      "2 unreleased changes", result["detail"])
 
     def test_remote_direct_url_never_triggers_git_or_network(self) -> None:
         self._payload(

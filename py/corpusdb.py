@@ -32,17 +32,19 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Mapping, NamedTuple
+from typing import Callable, Iterable, Mapping, NamedTuple
 
+import boundary_rank
 import common
 import compact
 import fileops
 import index_lock
 import indexd_runtime
+import regex_guard
 import surface_policy as surface
 
 DB_PATH = common.DATA_DIR / "corpus.db"
@@ -50,6 +52,9 @@ BOUNDARY_STATS_PATH = common.DATA_DIR / "boundary_stats.json"
 INGEST_SIG_PATH = common.DATA_DIR / ".ingest.sig"
 _SCHEMA = "15"  # 15: structural side-session provenance in family relations
 _TRIGGER_SCHEMA = "4"  # 4: FTS triggers consume the normalized text sidecar
+# 1: codex's empty-text recap rows are indexed. A database lacking this meta value predates
+# the shape and converges through one full parse and signature diff on its next refresh.
+_ROW_SHAPE = "1"
 # The compact event generation moves only after its DB transaction commits.
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json",
             "concept_pair.manifest.json", "events/.generation", "settings.json",
@@ -553,8 +558,9 @@ def _derived_write_ownership(
         current_build = indexd_runtime.derived_writer_build_id(
             require_binary=True)
     except OSError as exc:
+        # nobody's ownership is proven here: this build cannot even name itself
         return _DerivedWriteOwnership(
-            "refused",
+            "unavailable",
             "derived writer identity is unavailable because the ingest "
             f"binary cannot be verified ({exc})")
     anchor = indexd_runtime.derived_owner_info(current_build)
@@ -1698,6 +1704,9 @@ class _SessionFamilySnapshot:
     source_stamp: str | None
     sessions: frozenset[str]
     parents: Mapping[str, str]
+    # filename id -> indexed session; each alias gets a session_family row rooted at the
+    # session it names (so family joins see it) and the map itself lands in meta
+    aliases: Mapping[str, str] = field(default_factory=dict)
 
 
 def _read_session_families() -> _SessionFamilySnapshot:
@@ -1714,7 +1723,27 @@ def _read_session_families() -> _SessionFamilySnapshot:
         census.proof.stamp,
         census.sessions,
         census.parents,
+        census.aliases,
     )
+
+
+def _session_family_rows(
+        snapshot: _SessionFamilySnapshot, sessions: Iterable[str],
+        memo: dict[str, str],
+) -> Iterable[tuple[str, str, int]]:
+    for session in sessions:
+        if session in snapshot.aliases:
+            yield (
+                session,
+                common.family_root(snapshot.aliases[session], snapshot.parents, memo),
+                0,
+            )
+        else:
+            yield (
+                session,
+                common.family_root(session, snapshot.parents, memo),
+                int(session in snapshot.parents),
+            )
 
 
 def _replace_session_families(
@@ -1726,22 +1755,29 @@ def _replace_session_families(
         raise _SourceMoved("session-family publication is invalid")
     extras = {
         str(session) for session in known_sessions if session
-    } | set(snapshot.parents.values())
+    } | set(snapshot.parents.values()) | set(snapshot.aliases)
     extras.difference_update(snapshot.sessions)
     memo: dict[str, str] = {}
     db.execute("DELETE FROM session_family")
     db.executemany(
         "INSERT INTO session_family(session, root, side) VALUES(?, ?, ?)",
-        (
-            (session, common.family_root(session, snapshot.parents, memo),
-             int(session in snapshot.parents))
-            for session in chain(snapshot.sessions, sorted(extras))
-        ),
+        _session_family_rows(
+            snapshot, chain(snapshot.sessions, sorted(extras)), memo),
     )
-    db.execute(
-        "INSERT INTO meta(key, value) VALUES('family_stamp', ?) "
+    _publish_family_meta(db, snapshot)
+
+
+def _publish_family_meta(
+        db: sqlite3.Connection, snapshot: _SessionFamilySnapshot) -> None:
+    db.executemany(
+        "INSERT INTO meta(key, value) VALUES(?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (snapshot.source_stamp or "",),
+        (
+            ("family_stamp", snapshot.source_stamp or ""),
+            (common.FAMILY_ALIASES_META_KEY, json.dumps(
+                dict(sorted(snapshot.aliases.items())),
+                separators=(",", ":"), sort_keys=True)),
+        ),
     )
 
 
@@ -1753,7 +1789,7 @@ def _reconcile_session_families(
     """Apply a family publication without rewriting unchanged sidecar rows."""
     if snapshot.source_stamp is None:
         raise _SourceMoved("session-family publication is invalid")
-    extras = set(snapshot.parents.values())
+    extras = set(snapshot.parents.values()) | set(snapshot.aliases)
     extras.difference_update(snapshot.sessions)
     changed_set = changed if isinstance(changed, set) else set()
     affected = set(changed_set)
@@ -1781,15 +1817,16 @@ def _reconcile_session_families(
     memo: dict[str, str] = {}
 
     def rows(sessions):
-        for session in sessions:
-            if session in snapshot.sessions or session in extras:
-                yield (
-                    session,
-                    common.family_root(session, snapshot.parents, memo),
-                    int(session in snapshot.parents),
-                )
+        yield from _session_family_rows(
+            snapshot,
+            (session for session in sessions
+             if session in snapshot.sessions or session in extras),
+            memo,
+        )
 
-    full = changed == "*" or not changed_set
+    # a new or retired alias re-roots children whose own rows never changed
+    full = (changed == "*" or not changed_set
+            or common._indexed_aliases_in_db(db) != dict(snapshot.aliases))
     wanted = chain(snapshot.sessions, extras) if full else chain(affected, extras)
     db.executemany(
         "INSERT INTO session_family(session,root,side) VALUES(?,?,?) "
@@ -1813,11 +1850,7 @@ def _reconcile_session_families(
         if actual != expected:
             raise _SourceMoved(
                 "session-family reconciliation did not publish every session")
-    db.execute(
-        "INSERT INTO meta(key,value) VALUES('family_stamp',?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (snapshot.source_stamp,),
-    )
+    _publish_family_meta(db, snapshot)
 
 
 def boundary_token_stats(db: sqlite3.Connection,
@@ -1962,10 +1995,11 @@ def _open(path, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
 
 def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
     """Parse the materialized corpus into per-session row lists - the exact rows the msgs
-    table holds (one per user turn, one per agent reply), mirroring explore's fallback so
-    every engine reports identical hits. Shared by the full build and the incremental update
-    so both index byte-identical content. The session concept rides in each row, so a concept
-    relabel changes that session's fingerprint and re-indexes it like any other content move.
+    table holds (one per user turn, one per agent reply, plus codex's empty-text compaction
+    recaps), mirroring explore's fallback so every engine reports identical hits. Shared by
+    the full build and the incremental update so both index byte-identical content. The
+    session concept rides in each row, so a concept relabel changes that session's
+    fingerprint and re-indexes it like any other content move.
 
     `only` restricts the (expensive) JSON parse to a small set of session ids: each line's
     session is pulled out with one cheap `find` (the Rust writer emits compact JSON, so the
@@ -2061,8 +2095,10 @@ def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
                     o.get("project", ""), concept.get(s, ""), model, model_source)
             rows = by.setdefault(s, [])
             t = o.get("text", "") or ""
-            if t:
-                who = o.get("who", "user")
+            who = o.get("who", "user")
+            # codex writes each compaction as an empty recap row; postcompact and the caller's
+            # live window resolve the boundary by it. No other empty-text row is a document.
+            if t or who == "recap":
                 rows.append((*base, who, t, _digest(o, t, "messages.jsonl")))
             r, r_digest = reps.get(o.get("id", ""), ("", ""))
             if r:
@@ -2197,6 +2233,7 @@ def _build(dst, expected_stamp: str | None = None) -> None:
         db.execute("INSERT INTO meta VALUES('stamp', ?)", (expected_stamp,))
         db.execute("INSERT INTO meta VALUES('schema', ?)", (_SCHEMA,))
         db.execute("INSERT INTO meta VALUES('fts_triggers', ?)", (_TRIGGER_SCHEMA,))
+        db.execute("INSERT INTO meta VALUES('row_shape', ?)", (_ROW_SHAPE,))
         db.execute(
             "INSERT INTO meta VALUES('build_id', ?)",
             (indexd_runtime.derived_writer_build_id(
@@ -2460,9 +2497,10 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
     Changed sessions are reparsed, but their stored rows are reconciled as multisets:
     unchanged rows keep their rowids and never fire FTS triggers. A ``*`` or oversized
     named delta performs one full corpus parse, then uses the same signature/row diff.
-    Concept-source moves full-scan and signature-diff all sessions because the Rust
-    delta does not name relabels. Returns None only when a clean bulk rebuild is
-    required (cold/schema/tools-setting/invalid).
+    Concept-source moves, and a database whose ``row_shape`` predates ``_ROW_SHAPE``,
+    full-scan and signature-diff all sessions because the Rust delta names neither.
+    Returns None only when a clean bulk rebuild is required
+    (cold/schema/tools-setting/invalid).
     """
     if _protected_derived_target(DB_PATH):
         return None
@@ -2477,8 +2515,8 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         db.execute("PRAGMA synchronous=NORMAL")
         db.execute("PRAGMA cache_size=-65536")
         meta = dict(db.execute(
-            "SELECT key, value FROM meta "
-            "WHERE key IN ('schema', 'stamp', 'family_stamp', 'build_id')"))
+            "SELECT key, value FROM meta WHERE key IN "
+            "('schema', 'stamp', 'family_stamp', 'build_id', 'row_shape')"))
         current_build = indexd_runtime.derived_writer_build_id(
             require_binary=True)
         if (meta.get("schema") != _SCHEMA
@@ -2506,16 +2544,17 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
                 "corpusdb incremental unavailable: sessions.jsonl missing")
             return None
         concept_scan = _concepts_moved(old_stamp, stamp)
+        row_shape_moved = meta.get("row_shape") != _ROW_SHAPE
         changed = _read_changed()
-        if concept_scan:
-            # A manifest/name/assignment publication can relabel any session and has
-            # no changed-session marker. One parse plus signatures is still far cheaper
-            # than rebuilding both FTS tables, and unchanged rows never fire triggers.
+        if concept_scan or row_shape_moved:
+            # A manifest/name/assignment publication can relabel any session, an older row shape
+            # can differ in any session, and neither names one. One parse plus signatures is still
+            # far cheaper than rebuilding both FTS tables, and unchanged rows never fire triggers.
             by = _scan()
             current = set(by)
             targets = set(by) | set(old)
             full_scan = True
-            mode = "concept"
+            mode = "concept" if concept_scan else "row-shape"
         else:
             current = set(family_snapshot.sessions)
             if changed != "*" and not isinstance(changed, set):
@@ -2563,10 +2602,10 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         if _stamp() != stamp:
             raise _SourceMoved("corpus sources moved during incremental scan")
         db.execute("UPDATE meta SET value = ? WHERE key = 'stamp'", (stamp,))
-        db.execute(
-            "INSERT INTO meta(key, value) VALUES('build_id', ?) "
+        db.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (current_build,))
+            (("build_id", current_build), ("row_shape", _ROW_SHAPE)))
         db.commit()
         _consume_changed()  # applied -> clear the delta
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -2596,6 +2635,34 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
                 pass
 
 
+def _publication_compatible(
+        meta: Mapping[str, object], expected_build_id: str | None) -> bool:
+    """The gate every stale reader applies before serving a published database: the current
+    schema, plus the writer build the lane requires (None in the foreign-publication lane)."""
+    return bool(
+        meta.get("schema") == _SCHEMA
+        and (expected_build_id is None
+             or meta.get("build_id") == expected_build_id))
+
+
+def protected_read_lane() -> bool:
+    """connect()'s read-only branch (AGREP_DATA_READONLY names this data dir): the published
+    database is served as it stands, so neither a stale stamp, a queued build nor the rebuild
+    marker sends the reader to the direct scan. `why` mirrors the lane through this predicate."""
+    return indexd_runtime._data_dir_readonly()
+
+
+def interactive_snapshot_lane(
+        stored_stamp: object, stamp: str, *,
+        build_pending: Callable[[], bool]) -> str:
+    """What the interactive reader serves from a schema-compatible published database: "current"
+    or "stale" from corpus.db, "scan" (messages.jsonl) when it is behind and a build is queued.
+    `build_pending` is read only when the stamp is behind, so a current snapshot costs no read."""
+    if stored_stamp is not None and _stamps_equal(str(stored_stamp), stamp):
+        return "current"
+    return "scan" if build_pending() else "stale"
+
+
 def _stale_db(
         busy_timeout_ms: int = 5000, *,
         expected_build_id: str | None = None,
@@ -2611,9 +2678,7 @@ def _stale_db(
         meta = dict(db.execute(
             "SELECT key, value FROM meta "
             "WHERE key IN ('schema', 'build_id')"))
-        if (meta.get("schema") == _SCHEMA
-                and (expected_build_id is None
-                     or meta.get("build_id") == expected_build_id)):
+        if _publication_compatible(meta, expected_build_id):
             db._source_build_id = meta.get("build_id")
             return db
         db.close()
@@ -2653,9 +2718,7 @@ def _foreign_stale_db(
         meta = dict(db.execute(
             "SELECT key, value FROM meta "
             "WHERE key IN ('schema', 'build_id')"))
-        if (meta.get("schema") == _SCHEMA
-                and (expected_build_id is None
-                     or meta.get("build_id") == expected_build_id)
+        if (_publication_compatible(meta, expected_build_id)
                 and (expected_identity is None
                      or db._source_identity == expected_identity)):
             db._source_build_id = meta.get("build_id")
@@ -2769,18 +2832,22 @@ def _interactive_snapshot(
                 _CONTENDED_READER_WAIT_MS,
                 expected_build_id=expected_build_id)
         )
-    current = False
+    stored_stamp = None
     if db is not None:
         try:
             row = db.execute(
                 "SELECT value FROM meta WHERE key = 'stamp'").fetchone()
-            current = bool(row and _stamps_equal(str(row[0]), stamp))
+            stored_stamp = row[0] if row else None
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             try:
                 db.close()
             except sqlite3.DatabaseError:
                 pass
             db = None
+    lane = "scan" if db is None else interactive_snapshot_lane(
+        stored_stamp, stamp,
+        build_pending=indexd_runtime.search_index_build_pending)
+    current = lane == "current"
     if db is not None:
         db._retained_snapshot = retained_replacement
         db._source_stamp_current = current
@@ -2795,7 +2862,7 @@ def _interactive_snapshot(
         common.dbg(
             "corpusdb: published db matches the source stamp -> read without maintenance")
         return db
-    if db is not None and indexd_runtime.search_index_build_pending():
+    if db is not None and lane == "scan":
         # `agrep index` returns promising the scan serves until the search
         # database lands. A snapshot whose stamp predates the rows just
         # published answers from exactly the generation that promise skipped.
@@ -3187,7 +3254,7 @@ def connect(quiet: bool = False, allow_stale: bool = False,
     whatever published db exists, never refresh, never sweep - a dev-tree process
     must not rewrite a data dir owned by the installed daemon (mixed-version
     writers tear each other's caches)."""
-    protected_read = indexd_runtime._data_dir_readonly()
+    protected_read = protected_read_lane()
     if (read_only or protected_read or allow_stale) \
             and _query_failure_matches_current():
         return None
@@ -3403,6 +3470,8 @@ def _register_functions(db: sqlite3.Connection) -> None:
             (actual or "").lower().startswith((needle or "").lower()))),
         ("agrep_equal_ci", lambda actual, needle: int(
             (actual or "").lower() == (needle or "").lower())),
+        ("agrep_project_match", lambda actual, needle: int(
+            surface.project_label_matches(actual, needle))),
     )
     for name, function in functions:
         if name not in installed:
@@ -3419,8 +3488,11 @@ def _filter_sql(flt: dict | None) -> tuple[list[str], list]:
         where.append("agrep_contains_ci(agent, ?)")
         params.append(flt["agent"])
     if flt.get("project"):
-        where.append("agrep_contains_ci(project, ?)")
+        where.append("agrep_project_match(project, ?)")
         params.append(flt["project"])
+    if flt.get("exclude_project"):
+        where.append("NOT agrep_project_match(project, ?)")
+        params.append(flt["exclude_project"])
     if flt.get("chat"):  # 8-char id prefix or full session uuid
         where.append("agrep_starts_ci(session, ?)")
         params.append(flt["chat"])
@@ -4058,11 +4130,7 @@ class ShortKeywordCandidateStream:
                     break
             text = row[_TEXT]
             lowered = text.lower() if text.isascii() else None
-            if lowered is None:
-                span = common.insensitive_span(text, self._query)
-            else:
-                start = lowered.find(self._query)
-                span = None if start < 0 else (start, start + len(self._query))
+            span = common.insensitive_span(text, self._query, lowered)
             if span is not None:
                 self._observed_total += 1
                 self._observed_chats.add(row[0])
@@ -4392,13 +4460,15 @@ def score_ceiling_candidates(
             heapq.heappush(heap, (-value, serial, tuple(row), cursor))
             serial += 1
         while heap:
-            neg_value, _serial, row, cursor = heapq.heappop(heap)
+            neg_value, _serial, row, cursor = heap[0]
             yield -neg_value, row
             successor = cursor.fetchone()
             if successor is not None:
                 value = ceiling(successor)
-                heapq.heappush(heap, (-value, serial, tuple(successor), cursor))
+                heapq.heapreplace(heap, (-value, serial, tuple(successor), cursor))
                 serial += 1
+            else:
+                heapq.heappop(heap)
     finally:
         for cursor in cursors:
             cursor.close()
@@ -4476,7 +4546,7 @@ def count_tokens(q: str) -> list[str]:
     if not toks:
         return []
     return ([q.strip().lower()] if len(toks) == 1 else
-            list(dict.fromkeys(t.lower() for t in toks)))
+            list(dict.fromkeys(boundary_rank.term_anchor(t) for t in toks)))
 
 
 def count_rides_the_index(q: str) -> bool:
@@ -4495,17 +4565,26 @@ def keyword_count(db: sqlite3.Connection, q: str,
     ``cap`` stops the count once that many rows are confirmed: the answer then
     carries ``exact`` False and its numbers are floors of the result set (never
     of the scan). An uncapped count is always exact."""
+    raw_toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
     lows = count_tokens(q)
     if not lows:
         return {"total": 0, "chats": 0, "tool_hits": 0, "exact": True}
-    raw_toks = [token for token in re.split(r"[\s\-_]+", q.strip()) if token]
+    term_specs = []
+    seen_variants: set[tuple[str, ...]] = set()
+    for token in raw_toks:
+        variants = ((token.lower(),) if len(raw_toks) == 1
+                    else boundary_rank.term_variants(token))
+        if variants not in seen_variants:
+            seen_variants.add(variants)
+            term_specs.append((token, variants))
     _register_functions(db)
     where, params = _candidate_where(lows, flt)
     ceiling = None if cap is None else max(1, int(cap))
     direct = all(
-        token.isascii() and token.isalnum() and len(token) >= 3
+        variants == (token.lower(),)
+        and token.isascii() and token.isalnum() and len(token) >= 3
         and not _needs_re_i_rare(token)
-        for token in lows
+        for token, variants in term_specs
     )
     if direct:
         rows = "SELECT session, who FROM msgs" + where
@@ -4527,7 +4606,9 @@ def keyword_count(db: sqlite3.Connection, q: str,
     for session, who, text in db.execute(select, params):
         matched = (common.insensitive_span(text, needle) is not None
                    if needle is not None else
-                   all(common.insensitive_span(text, token) is not None for token in lows))
+                   all(common.insensitive_span(
+                       text, token, variants=variants) is not None
+                       for token, variants in term_specs))
         if not matched:
             continue
         total += 1
@@ -4575,6 +4656,19 @@ def keyword(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None, *,
     return _pack(hits, k, position_order)
 
 
+def _document_count(db: sqlite3.Connection, *, prose_only: bool = False) -> int:
+    """Rows a text lane can match, the idf population the JSONL scan counts too.
+
+    An empty recap row marks a compaction and holds no text, so it is no document. The
+    subtraction walks only recap rows, through the speaker index.
+    """
+    total = db.execute("SELECT count(*) FROM msgs" +
+                       (" WHERE who <> 'tool'" if prose_only else "")).fetchone()[0]
+    empty = db.execute(
+        "SELECT count(*) FROM msgs WHERE who = 'recap' AND text = ''").fetchone()[0]
+    return int(total or 0) - int(empty or 0)
+
+
 def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> dict:
     """Scored-OR over content terms - the last-resort tier for natural-language
     queries where even bag-of-words AND finds nothing (evidence rarely holds every
@@ -4588,8 +4682,7 @@ def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> 
         return {"hits": [], "total": 0, "chats": 0}
     fts_table = _fts_table(flt)
     prose_only = fts_table == "msgs_prose_fts"
-    n_docs = db.execute("SELECT count(*) FROM msgs" +
-                        (" WHERE who <> 'tool'" if prose_only else "")).fetchone()[0] or 1
+    n_docs = _document_count(db, prose_only=prose_only) or 1
     idf: dict[str, float] = {}
     for t in toks:
         if len(t) >= 3:
@@ -4670,7 +4763,7 @@ def coverage_rank(db: sqlite3.Connection, q: str, k: int,
         return []
     echo_pat = re.compile(r"[\W_]*".join(re.escape(t) for t in raw), re.I)
     fts_table = _fts_table(flt)
-    n_docs = db.execute("SELECT count(*) FROM msgs").fetchone()[0] or 1
+    n_docs = _document_count(db) or 1
     idf: dict[str, float] = {}
     for t in toks:
         if len(t) >= 3:
@@ -4735,26 +4828,24 @@ def keyword_terms(db: sqlite3.Connection, q: str, k: int, flt: dict | None = Non
         return {"phrase": keyword(db, q, k, flt, position_order=position_order),
                 "terms": {"hits": [], "total": 0, "chats": 0}}
     lows = [t.lower() for t in toks]
+    variant_groups = [boundary_rank.term_variants(token) for token in toks]
+    anchors = [boundary_rank.term_anchor(token) for token in toks]
     pat = re.compile(r"[\W_]*".join(re.escape(t) for t in toks), re.I)
     min_phrase_chars = sum(len(t) for t in toks)
     phrase_hits: list[dict] = []
     term_hits: list[dict] = []
-    # Hot at corpus scale: the precomputed lowered tokens feed the span fast
-    # path directly, and a phrase twin of an all-terms row copies its dict
-    # (same fields, same digest) instead of re-deriving both from the raw row.
     search = pat.search
-    span_map = common.original_span_for_lowered
-    fallback_span = common.insensitive_span
-    token_pairs = list(dict.fromkeys(zip(toks, lows)))
-    for row_key, row in enumerate(_candidates(db, toks, flt)):
+    token_specs = list(dict.fromkeys(
+        (token, low, variants)
+        for token, low, variants in zip(toks, lows, variant_groups)))
+    for row_key, row in enumerate(_candidates(db, anchors, flt)):
         text = row[_TEXT]
         low = text.lower()
         spans = []
         complete = True
-        for token, token_low in token_pairs:
-            start = low.find(token_low)
-            span = (span_map(text, low, start, start + len(token_low))
-                    if start >= 0 else fallback_span(text, token, low))
+        for token, _token_low, variants in token_specs:
+            span = common.insensitive_span(
+                text, token, low, variants=variants)
             if span is None:
                 complete = False
                 break
@@ -4795,12 +4886,9 @@ def word(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None, *,
     return _pack(hits, k, position_order)
 
 
-def _required_literal(pattern: str) -> str | None:
-    """Longest ASCII literal every match must contain, or None. Only top-level
-    LITERAL runs count: alternations, classes, groups, and repeats break the run,
-    so `TODO|FIXME` correctly yields None (no single literal is required) while
-    `memory leak.*free` yields "memory leak". Sound = may return None when a
-    literal exists, never returns one a match could lack."""
+def _required_literals(pattern: str) -> list[str]:
+    """ASCII literal runs every match must contain. Groups, alternations and
+    repeats break a run; only mandatory top-level literals narrow candidates."""
     try:
         import re._parser as sre  # 3.11+
     except ImportError:  # 3.10
@@ -4808,8 +4896,9 @@ def _required_literal(pattern: str) -> str | None:
     try:
         seq = sre.parse(pattern)
     except Exception:  # noqa: BLE001 -- bad pattern; let re.compile report it
-        return None
-    best, run = "", ""
+        return []
+    literals: list[str] = []
+    run = ""
     for op, arg in seq:
         name = str(op)
         if name == "LITERAL" and isinstance(arg, int) and 0x20 <= arg < 0x7F:
@@ -4817,9 +4906,12 @@ def _required_literal(pattern: str) -> str | None:
         elif name == "AT":  # zero-width anchor (\b, ^, $): transparent
             continue
         else:
-            best, run = max(best, run, key=len), ""
-    best = max(best, run, key=len)
-    return best if len(best) >= 3 else None
+            if len(run) >= 3:
+                literals.append(run)
+            run = ""
+    if len(run) >= 3:
+        literals.append(run)
+    return literals
 
 
 def regex(db: sqlite3.Connection, pattern: str, k: int, flt: dict | None = None, *,
@@ -4827,20 +4919,23 @@ def regex(db: sqlite3.Connection, pattern: str, k: int, flt: dict | None = None,
     """Regex can't use the index directly, but when the pattern demands a literal
     (most real ones do) the trigram FTS narrows candidates first; otherwise stream
     the table, which still skips the JSONL parse paid by the fallback."""
-    _register_functions(db)
-    rx = re.compile(pattern, re.I)
+    rx = regex_guard.compile(pattern, re.I)
+    search = rx.search
     hits = []
-    lit = _required_literal(pattern)
-    if lit:
-        cur = _candidates(db, [lit.lower()], flt)
+    literals = _required_literals(pattern)
+    if literals:
+        cur = _candidates(db, [literal.lower() for literal in literals], flt)
     else:
+        _register_functions(db)
         fw, fp = _filter_sql(flt)
+        # An empty recap row is a compaction boundary, not a document: a pattern that
+        # matches the empty string must not turn it into a hit (the JSONL scan skips it too).
         cur = db.execute(
             "SELECT session, agent, project, concept, model, model_source, "
-            "turn, ts, who, text, content_digest FROM msgs"
-            + (" WHERE " + " AND ".join(fw) if fw else ""), fp)
+            "turn, ts, who, text, content_digest FROM msgs WHERE "
+            + " AND ".join(["text <> ''", *fw]), fp)
     for row in cur:
-        m = rx.search(row[_TEXT])
+        m = search(row[_TEXT])
         if m:
             hits.append(_hit(row, m.start(), m.end()))
     return _pack(hits, k, position_order)
@@ -4950,25 +5045,30 @@ def session_term_turns(
 def session_context(db: sqlite3.Connection, session: str) -> dict | None:
     """Small structural metadata needed to build any window in ``session``.
 
-    The timeline contains one ``(turn, ts)`` pair per prompt/control/recap row and
-    deliberately carries no message or tool text. Keeping it separate means a
-    bounded window can clamp sparse turn numbers and attribute timestamped events
-    correctly without loading the full transcript. ``explore`` caches this compact
-    result across expansion windows.
+    The timeline contains one ``(turn, ts)`` pair per prompt/control/recap row, plus
+    one per reply-only turn at its reply's timestamp, and deliberately carries no
+    message or tool text. Keeping it separate means a bounded window can clamp
+    sparse turn numbers and attribute timestamped events correctly without loading
+    the full transcript. ``explore`` caches this compact result across expansion
+    windows.
     """
     rows = list(db.execute(
-        "SELECT turn, ts, agent, project FROM msgs "
-        "WHERE session = ? AND who <> 'tool' AND who <> 'agent' "
-        "ORDER BY turn, id", (session,)))
-    if not rows:
-        # Defensive support for an old/partial corpus containing reply-only turns.
-        rows = list(db.execute(
-            "SELECT turn, ts, agent, project FROM msgs "
-            "WHERE session = ? AND who = 'agent' ORDER BY turn, id", (session,)))
+        "SELECT turn, ts, agent, project, who = 'agent' FROM msgs "
+        "WHERE session = ? AND who <> 'tool' ORDER BY turn, id", (session,)))
     if not rows:
         return None
 
-    timeline = [{"turn": int(r[0]), "ts": int(r[1] or 0)} for r in rows]
+    opened = {int(r[0]) for r in rows if not r[4]}
+    timeline = []
+    for turn, ts, _agent, _project, reply in rows:
+        turn = int(turn)
+        if reply:
+            # A database built before _scan kept codex's empty recap row lacks that row, but
+            # the reply keeps its turn and ts, so the turn still opens and owns its events.
+            if turn in opened:
+                continue
+            opened.add(turn)
+        timeline.append({"turn": turn, "ts": int(ts or 0)})
     turns = [r["turn"] for r in timeline]
     agent = next((r[2] for r in rows if r[2]), "")
     project = next((r[3] for r in rows if r[3]), "")

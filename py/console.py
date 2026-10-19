@@ -14,6 +14,7 @@ import re
 import sys
 import time
 
+import boundary_rank
 from proc import WIN
 import surface_policy as surface
 
@@ -187,16 +188,34 @@ def original_span_for_lowered(
     return lowered_span_to_original(text, start, end)
 
 
-def insensitive_span(text: str, token: str,
-                     lowered: str | None = None) -> tuple[int, int] | None:
-    """Find one Python re.I substring while preserving original offsets."""
+def insensitive_span(
+        text: str, token: str, lowered: str | None = None,
+        variants: tuple[str, ...] | None = None) -> tuple[int, int] | None:
+    """Prefer an aligned occurrence while preserving Python re.I matching."""
     low = text.lower() if lowered is None else lowered
-    query = token.lower()
-    start = low.find(query)
-    if start >= 0:
-        return original_span_for_lowered(text, low, start, start + len(query))
-    match = re.search(re.escape(token), text, re.I)
-    return match.span() if match is not None else None
+    spellings = variants or (token,)
+    first = None
+    best = None
+    best_quality = -1.0
+    for spelling in spellings:
+        query = spelling.lower()
+        start = low.find(query)
+        while start >= 0:
+            span = original_span_for_lowered(text, low, start, start + len(query))
+            if first is None:
+                first = span
+            quality = boundary_rank._ascii_quality(text, span)
+            if quality > best_quality:
+                best, best_quality = span, quality
+                if quality == 1.0:
+                    return span
+            start = low.find(query, start + 1)
+    if first is None:
+        match = re.search(re.escape(token), text, re.I)
+        if match is not None:
+            first = match.span()
+            best = first
+    return best or first
 
 
 def literal_word_pattern(value: str) -> re.Pattern:

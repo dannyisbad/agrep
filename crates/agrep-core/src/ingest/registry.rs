@@ -46,13 +46,25 @@ pub enum TokenAvailability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenReadIssue {
     pub path: PathBuf,
+    pub kind: &'static str,
     pub reason: String,
 }
 
 impl TokenReadIssue {
+    /// A census failure a retry may clear; the publication guard keeps its fail-closed retry.
     pub fn new(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
+        Self::with_kind(path, "source-unreadable", reason)
+    }
+
+    /// `kind` is the snapshot issue kind, so an adapter can name a durable defect as one.
+    pub fn with_kind(
+        path: impl Into<PathBuf>,
+        kind: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
+            kind,
             reason: reason.into(),
         }
     }
@@ -121,6 +133,17 @@ pub trait Adapter: Sync {
             Vec::new(),
         )
     }
+    /// Whether a read of one of this adapter's sources can come back `ReadOutcome::Partial`.
+    /// Cache generations older than the current one published such reads without caching them.
+    fn may_read_partially(&self) -> bool {
+        false
+    }
+    /// Whether a failed read of `path` costs a whole-store read exactly the rows of the units
+    /// beneath it. A path every unit draws on (an index or registry) may change what the rest
+    /// yield, so the default claims nothing.
+    fn unit_scoped_read_issue(&self, _path: &std::path::Path) -> bool {
+        false
+    }
     /// Where this adapter's store lives (dirs or files; absent candidates are fine).
     /// The doctor freshness canary stats these: store activity the parser never turns
     /// into messages is adapter drift, and this is what makes it visible.
@@ -130,6 +153,11 @@ pub trait Adapter: Sync {
     /// and a canary that fires on those trains everyone to ignore it.
     fn store_content(&self, _path: &std::path::Path) -> bool {
         true
+    }
+    /// The id the store's own filename gives `session`'s transcript at `path`, when it differs
+    /// from the header id the rows carry; publication resolves both to one family.
+    fn session_alias(&self, _path: &Path, _session: &str) -> Option<String> {
+        None
     }
     /// Inputs whose unchanged state permits skipping this adapter altogether. Usually these
     /// are the same as the doctor/audit roots, but an adapter may add attribution metadata
@@ -150,6 +178,16 @@ pub trait Adapter: Sync {
     /// Exact live tokens keyed the same way as `intake_stats.json` entries.
     fn intake_tokens(&self) -> TokenAvailability {
         self.freshness_tokens()
+    }
+    /// For `Fingerprint::Token` stores: the prefix every freshness token id and parse-cache id of
+    /// `database`'s conversations starts with. None keeps a listed database counted as material.
+    fn token_prefix(&self, _database: &Path) -> Option<String> {
+        None
+    }
+    /// The inverse of [`Self::token_prefix`]: the database part of a parse-cache id, equal to
+    /// `token_prefix` of the database that conversation came from. "" spans every database.
+    fn token_namespace<'a>(&self, _cache_id: &'a str) -> &'a str {
+        ""
     }
     /// Actionable adapter root used only when a guarded collector cannot name a finer path.
     fn runtime_issue_root(&self) -> PathBuf {
@@ -174,6 +212,32 @@ pub static ADAPTERS: &[&dyn Adapter] = &[
     &crate::ingest::cursor::Cursor,
     &crate::ingest::pi::Pi,
 ];
+
+/// [`Adapter::session_alias`] for the adapter that owns `agent`'s rows.
+pub fn session_alias(agent: &str, path: &Path, session: &str) -> Option<String> {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent)
+        .and_then(|adapter| adapter.session_alias(path, session))
+}
+
+/// [`Adapter::token_prefix`] of `agent`'s store, when it is a `Fingerprint::Token` adapter.
+pub fn token_prefix(agent: &str, database: &Path) -> Option<String> {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
+        .and_then(|adapter| adapter.token_prefix(database))
+}
+
+/// [`Adapter::token_namespace`] of a cache id of `agent`; "" (every database) when no token
+/// adapter claims the agent.
+pub fn token_namespace(agent: &str, cache_id: &str) -> String {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
+        .map(|adapter| adapter.token_namespace(cache_id).to_owned())
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ChangeToken {
@@ -321,6 +385,28 @@ pub fn metadata_change_token(
         secs.rotate_left(17) ^ metadata.ctime_nsec() as u64,
     ))
 }
+
+/// Linux stamps ctime from the coarse tick clock, so a change in the same tick as the
+/// last one keeps its token. Tests that need a visible change wait for the next tick.
+#[cfg(all(test, unix))]
+pub(crate) fn wait_for_next_ctime_tick(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).unwrap();
+    let before = (metadata.ctime(), metadata.ctime_nsec());
+    let probe = path.with_extension("ctime-probe");
+    loop {
+        fs::write(&probe, b"tick").unwrap();
+        let probed = fs::metadata(&probe).unwrap();
+        if (probed.ctime(), probed.ctime_nsec()) > before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = fs::remove_file(&probe);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn wait_for_next_ctime_tick(_path: &Path) {}
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1750,6 +1836,75 @@ impl SourceSnapshotView {
             .collect()
     }
 
+    /// Store roots of Stat adapters under which the walk found no source: the per-root form of
+    /// [`Self::cleanly_absent_agents`]. An issue blocks every root it may scope - its own, any
+    /// root beneath it, or all of them when it lies outside each - so a sibling's denial cannot.
+    pub fn cleanly_absent_roots(&self) -> HashSet<(String, PathBuf)> {
+        if self.snapshot.snapshot_version != SOURCE_SNAPSHOT_VERSION {
+            return HashSet::new();
+        }
+        let mut absent = HashSet::new();
+        for adapter in &self.snapshot.adapters {
+            let Some(owner) = ADAPTERS.iter().find(|candidate| {
+                candidate.name() == adapter.agent && candidate.fingerprint() == Fingerprint::Stat
+            }) else {
+                continue;
+            };
+            if !adapter.complete && adapter.issues.is_empty() {
+                continue;
+            }
+            let roots = owner.store_roots();
+            let issue_paths: Vec<PathBuf> = adapter
+                .issues
+                .iter()
+                .map(|issue| PathBuf::from(issue.path()))
+                .collect();
+            let within = |path: &Path, root: &Path| relative_path(path, root).is_some();
+            for root in &roots {
+                let blocked = issue_paths.iter().any(|issue| {
+                    within(issue, root)
+                        || within(root, issue)
+                        || !roots.iter().any(|other| within(issue, other))
+                });
+                if !blocked
+                    && !adapter
+                        .files
+                        .iter()
+                        .any(|source| within(&source.path, root))
+                {
+                    absent.insert((adapter.agent.clone(), root.clone()));
+                }
+            }
+        }
+        absent
+    }
+
+    /// Stat-keyed files whose stamp a same-size rewrite could still reproduce after a preflight
+    /// that began at `scan_start`. Token and Always stores carry content identity instead.
+    pub fn racy_paths(&self, scan_start: std::time::SystemTime) -> HashSet<PathBuf> {
+        let Some(start_ns) = crate::ingest_cache::epoch_ns(scan_start) else {
+            return HashSet::new();
+        };
+        let now_ns =
+            crate::ingest_cache::epoch_ns(std::time::SystemTime::now()).unwrap_or(i64::MAX);
+        self.snapshot
+            .adapters
+            .iter()
+            .filter(|adapter| {
+                ADAPTERS.iter().any(|candidate| {
+                    candidate.name() == adapter.agent
+                        && candidate.fingerprint() == Fingerprint::Stat
+                })
+            })
+            .flat_map(|adapter| &adapter.files)
+            .filter(|source| {
+                source.content_hash.is_none()
+                    && crate::ingest_cache::racy_stamp(source_mtime_ns(source), start_ns, now_ns)
+            })
+            .map(|source| source.path.clone())
+            .collect()
+    }
+
     pub(crate) fn expectations(&self) -> (HashSet<String>, HashSet<PathBuf>) {
         let mut agents = HashSet::new();
         let mut paths = HashSet::new();
@@ -1757,13 +1912,7 @@ impl SourceSnapshotView {
             if !adapter.files.is_empty() || !adapter.tokens.is_empty() {
                 agents.insert(adapter.agent.clone());
             }
-            paths.extend(
-                adapter
-                    .files
-                    .iter()
-                    .filter(|source| !is_sqlite_sidecar(&source.path))
-                    .map(|source| source.path.clone()),
-            );
+            paths.extend(listed_sources(adapter).map(|source| source.path.clone()));
         }
         (agents, paths)
     }
@@ -1793,14 +1942,10 @@ impl SourceSnapshotView {
             .iter()
             .flat_map(|adapter| &adapter.files)
             .map(|source| {
-                let mtime_ns = i64::try_from(
-                    u128::from(source.mtime_secs) * 1_000_000_000 + u128::from(source.mtime_nanos),
-                )
-                .unwrap_or(i64::MAX);
                 (
                     source.path.clone(),
                     SourceStatStamp {
-                        mtime_ns,
+                        mtime_ns: source_mtime_ns(source),
                         len: source.len,
                         change_token: source.change_token.clone(),
                         #[cfg(windows)]
@@ -1813,10 +1958,35 @@ impl SourceSnapshotView {
     }
 }
 
+fn source_mtime_ns(source: &SourceFile) -> i64 {
+    i64::try_from(u128::from(source.mtime_secs) * 1_000_000_000 + u128::from(source.mtime_nanos))
+        .unwrap_or(i64::MAX)
+}
+
 pub fn source_snapshot_view(bytes: &[u8]) -> Option<SourceSnapshotView> {
     bincode::deserialize::<SourceSnapshot>(bytes)
         .ok()
         .map(|snapshot| SourceSnapshotView { snapshot })
+}
+
+/// Publication form of a preflight whose `racy` stamps are not yet trustworthy: each gets an
+/// impossible sub-second value, so no later preflight matches it byte-for-byte and skips the
+/// re-verification. Paths, issues and completeness - everything guards read - are unchanged.
+pub fn withhold_racy_stamps(bytes: &[u8], racy: &HashSet<PathBuf>) -> anyhow::Result<Vec<u8>> {
+    if racy.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    let mut snapshot: SourceSnapshot = bincode::deserialize(bytes)
+        .context("decode the source snapshot to withhold racy stamps")?;
+    for source in snapshot
+        .adapters
+        .iter_mut()
+        .flat_map(|adapter| adapter.files.iter_mut())
+        .filter(|source| racy.contains(&source.path))
+    {
+        source.mtime_nanos = u32::MAX;
+    }
+    Ok(bincode::serialize(&snapshot)?)
 }
 
 /// A collision-resistant identifier for the exact opaque snapshot bytes.
@@ -1856,6 +2026,37 @@ pub fn source_snapshot_expectations(bytes: &[u8]) -> (HashSet<String>, HashSet<P
         return (HashSet::new(), HashSet::new());
     };
     snapshot.expectations()
+}
+
+/// Whether `agent` names a registered `Fingerprint::Token` adapter.
+pub fn token_store_agent(agent: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Token)
+}
+
+/// Whether `agent` names a registered `Fingerprint::Always` adapter, whose last-good rows live
+/// only in its whole-store snapshot.
+pub fn whole_store_agent(agent: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.fingerprint() == Fingerprint::Always)
+}
+
+/// Whether `agent` names a registered adapter whose reads may come back partial; see
+/// [`Adapter::may_read_partially`].
+pub fn partial_read_agent(agent: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.may_read_partially())
+}
+
+/// Whether `agent`'s adapter scopes a failed read of `path` to the units beneath it; see
+/// [`Adapter::unit_scoped_read_issue`].
+pub fn unit_scoped_read_issue(agent: &str, path: &Path) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.name() == agent && adapter.unit_scoped_read_issue(path))
 }
 
 /// Exact current preflight coverage consumed by the ingest collectors. Stat paths let the cache
@@ -1978,7 +2179,7 @@ fn sqlite_snapshot_directory(_path: &Path) -> bool {
     false
 }
 
-fn walk_regular_sources(
+fn walk_regular_sources<const CENSUS: bool>(
     adapter: &dyn Adapter,
     path: &Path,
     accepts: impl Fn(&Path) -> bool,
@@ -2051,7 +2252,19 @@ fn walk_regular_sources(
             match entry {
                 Ok(entry) => {
                     let path = entry.path();
+                    // File types come from directory entries on Unix. Census-only filtering
+                    // avoids statting auxiliary files without skipping links or special files.
+                    let accepted =
+                        CENSUS && cfg!(unix) && entry.file_type().is_ok_and(|kind| kind.is_file());
+                    if accepted && !accepts(&path) {
+                        continue;
+                    }
                     match entry.metadata() {
+                        Ok(metadata)
+                            if accepted && metadata.is_file() && !metadata_is_link(&metadata) =>
+                        {
+                            candidates.push(SourceCandidate { path, metadata });
+                        }
                         Ok(metadata) => pending.push((path, Some(metadata))),
                         Err(error) => {
                             crate::ingest::warn_source_skip(adapter.name(), &path, &error);
@@ -2068,7 +2281,9 @@ fn walk_regular_sources(
             }
         }
     }
-    candidates.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    if !CENSUS {
+        candidates.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    }
     SourceWalk {
         candidates,
         issues,
@@ -2085,7 +2300,7 @@ fn walk_sources(
 ) -> (bool, Vec<SourceIssue>, SourceSnapshotTiming) {
     // Discovery (notably Codex's YYYY/MM/DD tree) has no depth ceiling. Store roots
     // never follow symlinks, so transcript-shaped files outside them stay out of scope.
-    let walked = walk_regular_sources(adapter, path, |path| adapter.freshness_content(path));
+    let walked = walk_regular_sources::<false>(adapter, path, |path| adapter.freshness_content(path));
     let candidate_count = walked.candidates.len();
     let mut complete = walked.complete;
     let mut issues = walked.issues;
@@ -2145,6 +2360,21 @@ fn is_sqlite_sidecar(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+        })
+}
+
+/// The content files `adapter` listed. A database the token census could not enumerate is named
+/// by an issue, so it reads as unobserved: its stamp proves a file, never published conversations.
+fn listed_sources(adapter: &AdapterSource) -> impl Iterator<Item = &SourceFile> {
+    adapter
+        .files
+        .iter()
+        .filter(|source| !is_sqlite_sidecar(&source.path))
+        .filter(|source| {
+            !adapter
+                .issues
+                .iter()
+                .any(|issue| Path::new(issue.path()) == source.path)
         })
 }
 
@@ -2209,7 +2439,7 @@ fn adapter_source_with_timing(
                     issues.push(SourceIssue::new(
                         adapter.name(),
                         &issue.path,
-                        "source-unreadable",
+                        issue.kind,
                         issue.reason,
                     ));
                 }
@@ -2315,16 +2545,20 @@ pub struct Detector {
     pub name: &'static str,
     /// Count of session-looking entries under home(), or 0 when the store is absent.
     pub probe: fn() -> usize,
+    /// The directory the probe inspects, so a diagnostic can place a path under it.
+    pub root: fn() -> PathBuf,
 }
 
 pub static DETECTED: &[Detector] = &[
     Detector {
         name: "copilot",
         probe: probe_copilot,
+        root: copilot_root,
     },
     Detector {
         name: "qwen",
         probe: probe_qwen,
+        root: qwen_root,
     },
 ];
 
@@ -2389,7 +2623,7 @@ impl StoreDiagnostic {
 
 pub fn store_diagnostics() -> Vec<StoreDiagnostic> {
     ADAPTERS
-        .iter()
+        .par_iter()
         .filter_map(|adapter| store_diagnostic(*adapter))
         .collect()
 }
@@ -2448,11 +2682,12 @@ struct StoreCensus {
 }
 
 fn store_census(adapter: &dyn Adapter) -> StoreCensus {
-    let mut files = HashMap::new();
+    let mut files = Vec::new();
     let mut issues = Vec::new();
     for root in adapter.store_roots() {
-        let walked = walk_regular_sources(adapter, &root, |path| adapter.store_content(path));
+        let walked = walk_regular_sources::<true>(adapter, &root, |path| adapter.store_content(path));
         issues.extend(walked.issues);
+        files.reserve(walked.candidates.len());
         for candidate in walked.candidates {
             let modified = candidate
                 .metadata
@@ -2461,14 +2696,18 @@ fn store_census(adapter: &dyn Adapter) -> StoreCensus {
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
-            files
-                .entry(candidate.path)
-                .and_modify(|current: &mut u64| *current = (*current).max(modified))
-                .or_insert(modified);
+            files.push((candidate.path, modified));
         }
     }
-    let mut files: Vec<_> = files.into_iter().collect();
     files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    files.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            earlier.1 = earlier.1.max(later.1);
+            true
+        } else {
+            false
+        }
+    });
     issues.sort();
     issues.dedup();
     StoreCensus { files, issues }
@@ -2496,15 +2735,23 @@ fn count_subdirs(dir: &std::path::Path) -> usize {
 
 /// GitHub Copilot CLI: ~/.copilot/session-state/<uuid>/ - one dir per session. Location is
 /// confirmed (GitHub Docs); the per-event events.jsonl schema is not, so this stays a stub.
+fn copilot_root() -> PathBuf {
+    crate::ingest::home().join(".copilot").join("session-state")
+}
+
 fn probe_copilot() -> usize {
-    count_subdirs(&crate::ingest::home().join(".copilot").join("session-state"))
+    count_subdirs(&copilot_root())
 }
 
 /// qwen-code: ~/.qwen/tmp/<projectHash>/chats/*.json (root confirmed from QwenLM/qwen-code
 /// packages/core/src/config/storage.ts: QWEN_DIR=".qwen", tmp dir, chats/). A gemini-cli fork,
 /// so the shape likely matches the gemini adapter - but not yet confirmed against a real store.
+fn qwen_root() -> PathBuf {
+    crate::ingest::home().join(".qwen").join("tmp")
+}
+
 fn probe_qwen() -> usize {
-    let tmp = crate::ingest::home().join(".qwen").join("tmp");
+    let tmp = qwen_root();
     let mut n = 0;
     if !std::fs::symlink_metadata(&tmp)
         .map(|meta| meta.is_dir() && !metadata_is_link(&meta))
@@ -2582,7 +2829,7 @@ pub fn runtime_issue_roots(agent: &str) -> Vec<(String, PathBuf)> {
         .unwrap_or_else(|_| vec![(agent.to_string(), crate::ingest::home())])
 }
 
-fn canonical_message_cmp(left: &Message, right: &Message) -> std::cmp::Ordering {
+pub(crate) fn canonical_message_cmp(left: &Message, right: &Message) -> std::cmp::Ordering {
     left.reply_chars
         .cmp(&right.reply_chars)
         .then_with(|| left.reply.len().cmp(&right.reply.len()))
@@ -2748,6 +2995,10 @@ fn hash_event_identity(event: &Event) -> u64 {
     add(event.output.as_bytes());
     add(&[event.ok.map(u8::from).unwrap_or(2)]);
     add(event.child_session.as_bytes());
+    // only when set, so identities minted before the field existed stay byte-stable
+    if !event.meta.is_empty() {
+        add(event.meta.as_bytes());
+    }
     h
 }
 
@@ -3202,6 +3453,39 @@ mod tests {
         assert_registry_contract(&registry_contract());
     }
 
+    /// An adapter whose parser can return `ReadOutcome::Partial` must say so: the inventory an
+    /// older cache stands in for proves its sources empty otherwise, and rows could drop.
+    #[test]
+    fn every_adapter_that_can_read_partially_declares_it() {
+        let sources = [
+            ("antigravity", include_str!("antigravity.rs")),
+            ("claude", include_str!("claude.rs")),
+            ("cline", include_str!("cline.rs")),
+            ("codex", include_str!("codex.rs")),
+            ("crush", include_str!("crush.rs")),
+            ("cursor", include_str!("cursor.rs")),
+            ("gemini", include_str!("gemini.rs")),
+            ("kimi", include_str!("kimi.rs")),
+            ("opencode", include_str!("opencode.rs")),
+            ("pi", include_str!("pi.rs")),
+        ];
+        for adapter in ADAPTERS {
+            let (_, source) = sources
+                .iter()
+                .find(|(name, _)| *name == adapter.name())
+                .unwrap_or_else(|| panic!("no source listed for adapter {}", adapter.name()));
+            if source.contains("ReadOutcome::Partial") {
+                assert!(
+                    adapter.may_read_partially(),
+                    "{} can read partially but does not declare it",
+                    adapter.name()
+                );
+            }
+        }
+        assert!(partial_read_agent("opencode"));
+        assert!(!partial_read_agent("claude"));
+    }
+
     fn assert_invalid_registry_value(value: serde_json::Value) {
         let contract: RegistryContract = serde_json::from_value(value).unwrap();
         assert!(std::panic::catch_unwind(|| assert_registry_contract(&contract)).is_err());
@@ -3289,6 +3573,7 @@ mod tests {
             ok: None,
             call_id: call_id.into(),
             child_session: String::new(),
+            meta: String::new(),
         }
     }
 
@@ -3988,6 +4273,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn store_census_deduplicates_roots_without_losing_special_file_issues() {
+        use std::os::unix::fs::symlink;
+
+        struct CensusAdapter(Vec<PathBuf>);
+        impl Adapter for CensusAdapter {
+            fn name(&self) -> &'static str {
+                "census-test"
+            }
+            fn fingerprint(&self) -> Fingerprint {
+                Fingerprint::Stat
+            }
+            fn collect(&self, _cache: &mut IngestCache) -> (Vec<Message>, Vec<Event>) {
+                panic!("a store census must not parse transcripts")
+            }
+            fn store_roots(&self) -> Vec<PathBuf> {
+                self.0.clone()
+            }
+            fn store_content(&self, path: &Path) -> bool {
+                path.extension().is_some_and(|extension| extension == "jsonl")
+            }
+        }
+
+        let root = snapshot_root("census-overlapping-roots");
+        let nested = root.join("nested");
+        let hidden = root.join(".agrep-sqlite-123-abcd-0");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&hidden).unwrap();
+        let first = root.join("a.jsonl");
+        let second = nested.join("b.jsonl");
+        fs::write(&first, b"not parsed").unwrap();
+        fs::write(&second, b"not parsed").unwrap();
+        fs::write(hidden.join("private.jsonl"), b"private snapshot").unwrap();
+        fs::write(nested.join("auxiliary.json"), b"not content").unwrap();
+        let link = root.join("link.txt");
+        symlink(&second, &link).unwrap();
+        let special = root.join("special.jsonl");
+        fifo(&special);
+        fifo(&root.join("auxiliary.pipe"));
+        let adapter = CensusAdapter(vec![
+            nested,
+            root.clone(),
+            second.clone(),
+            root.join("absent"),
+        ]);
+        let diagnostic = store_diagnostic(&adapter).unwrap();
+        assert_eq!(
+            diagnostic.paths().collect::<Vec<_>>(),
+            [first.to_str().unwrap(), second.to_str().unwrap()]
+        );
+        assert_eq!(diagnostic.state(), "source-unreadable");
+        assert_eq!(
+            diagnostic
+                .issues()
+                .iter()
+                .map(|issue| (issue.path(), issue.kind()))
+                .collect::<Vec<_>>(),
+            [
+                (link.to_str().unwrap(), "unsupported-link"),
+                (special.to_str().unwrap(), "unsupported-file-type"),
+            ]
+        );
+        let expected_mtime = fs::metadata(&first)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .max(fs::metadata(&second).unwrap().modified().unwrap())
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(diagnostic.newest_mtime_ms(), expected_mtime);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bounded_readers_reject_fifos_and_regular_to_fifo_swaps() {
         let root = snapshot_root("bounded-fifo");
         let _ = fs::remove_dir_all(&root);
@@ -4300,6 +4660,7 @@ mod tests {
             tokens: TokenAvailability::Empty,
         };
         let before = adapter_source(&adapter).unwrap();
+        wait_for_next_ctime_tick(&source);
 
         fs::write(&source, b"after!").unwrap();
         let file = fs::OpenOptions::new().write(true).open(&source).unwrap();
@@ -4807,5 +5168,27 @@ mod tests {
         assert!(!empty.contains("crush"));
         // the ENOENT set is unchanged: a present store is not absent
         assert!(!view.cleanly_absent_agents().contains("cursor"));
+    }
+
+    #[test]
+    fn token_namespace_inverts_token_prefix_per_database() {
+        let first = PathBuf::from("/fixture/first/crush.db");
+        let second = PathBuf::from("/fixture/second/crush.db");
+        let first_prefix = token_prefix("crush", &first).unwrap();
+        let second_prefix = token_prefix("crush", &second).unwrap();
+        for session in ["sc1", "id\0with-nul", ""] {
+            let id = format!("{first_prefix}{session}");
+            assert_eq!(token_namespace("crush", &id), first_prefix);
+            assert!(!token_namespace("crush", &id).starts_with(&second_prefix));
+            assert!(!second_prefix.starts_with(&token_namespace("crush", &id)));
+        }
+        // An id without a namespace spans every database rather than none.
+        assert_eq!(token_namespace("crush", "bare-session"), "");
+        let cursor = PathBuf::from("/fixture/User/globalStorage/state.vscdb");
+        assert_eq!(token_prefix("cursor", &cursor).as_deref(), Some(""));
+        assert_eq!(token_namespace("cursor", "composer-id"), "");
+        assert_eq!(token_namespace("claude", "anything"), "");
+        assert!(token_store_agent("crush") && token_store_agent("cursor"));
+        assert!(!token_store_agent("claude"));
     }
 }

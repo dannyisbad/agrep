@@ -1,0 +1,13 @@
+exit: 0
+--- stdout ---
+@33333333:3.3bfd pi/user cedar 17h Confirm the copper lantern handoff after the recap.
+@55555555:3.a301 codex/user cedar 1d Summarize the codex lantern decision for the release lead.
+@11111111:6.063c claude/user cedar 2d Is the lantern inventory complete for the nigh…
+@22222222:2.adc8 pi/user maple 4d Keep the maple lantern review separate from cedar.
+@33333333:0.1afe pi/user cedar 17h Review the cedar lantern plan with a sidecar advisor.
+@55555555:0.b9d2 codex/user cedar 1d Audit the copper lantern deployment manifest for cedar.
+@11111111:3.0c42 claude/user cedar 2d …et checkpoint before the copper lantern release.
+@11111111:0.e8d0 claude/user cedar 2d Please map the copper lantern launch checklist for cedar.
+@22222222:0.b42e pi/user maple 4d Check the maple lantern against the glacier inventory.
+--- stderr ---
+excluded 2 hits from the current window

@@ -41,10 +41,10 @@ allowlist fell from four rows to one.
   `embedder.profile_string` suffixes only the Metal lane, which leaves every
   pre-lane store byte-valid and re-embeds nothing; `resolve_lane` conforms to
   the lane already on disk instead of re-deciding per process; and
-  `_start_metal_lane` refuses to open below a 0.995 cosine floor against the
-  ONNX vectors for a fixed short-and-long probe set, because a pooling
-  mismatch scores about 0.77 while shared-weight arithmetic drift measured
-  0.99875. Pinned in `py/test_mlx_embed.py`. See `py/README.md` for the
+  `_start_metal_lane` refuses to open below the 0.97 cosine floor against
+  ONNX int8 vectors for a fixed short-and-long probe set. Passing that guard
+  does not guarantee identical rankings near a score threshold; stores keep
+  their lane identity. Pinned in `py/test_mlx_embed.py`. See `py/README.md` for the
   operational contract.
 - **Semantic process split**: the meaning lane is three processes, not one
   module, and the split is deliberate: a one-shot agent command must not pay
@@ -65,34 +65,96 @@ allowlist fell from four rows to one.
   A transport failure after a request is sent is terminal for that attempt:
   the caller falls back to keyword rather than stacking a second in-process
   inference.
+- **Store census**: every keyword verdict compares the live stores against
+  the published generation. `agrep-rs stores --census` prints
+  `{"version":1,"stores":[...],"paths":[...]}` from one adapter walk and one
+  source-health read; both arrays are byte-identical to separate `stores` and
+  `stores --paths` runs, and the flag refuses `--paths`, `--tokens`, `--audit`
+  and `--agent` with exit 2 (`crates/agrep-cli/tests/store_census.rs`). One
+  observation is kept in the data dir's `.store-census.json`, and another
+  process reuses it only while its key matches exactly (data dir, the three
+  publication identities, ingest binary path and target identity, every
+  discovery variable the Rust walk reads, and the working directory when a
+  root is relative) and its wall and monotonic ages agree within 0.25 s and
+  stay within 5 s. The verdict itself is always recomputed on the reader's
+  clock. Doctor, the verified-current stamp and postcompact's absence proof
+  never reuse an observation, and doctor and status never persist one, so
+  diagnostics leave the data dir untouched. A census over the 8 MiB output
+  cap keeps its store rows and drops member digests rather than walking
+  again. While searches are active the daemon refreshes observations older
+  than 3 s, backing off exponentially to 60 s after a failure. Pinned in
+  `py/test_store_census_cache.py`.
+- **Resident CLI**: `py/resident.py` is a POSIX fork server that removes
+  interpreter and import cost from bounded read commands (search, chats,
+  around, recall, bare status, `--version`, `--help`). The client passes its
+  stdio descriptors over a uid-private Unix socket with `SCM_RIGHTS`; the
+  server forks one child per command and refuses the request before forking
+  unless the kernel's peer pid (`SO_PEERCRED`, macOS `LOCAL_PEERPID`) equals
+  the pid the client claims, because the child resolves caller self-exclusion
+  from that pid's ancestry. Any failure before the server acknowledges the
+  command, including a refusal, runs the ordinary in-process path, and a child
+  cannot write before the client's go byte, so a fallback never follows
+  partial output. Children run with the client's environment plus the changes
+  preloading made to the server's, so Rust children inherit what a direct
+  run's would. Exit statuses match direct execution, including death by a
+  signal; job-control stops reach the child, and a child whose server dies is
+  ended rather than orphaned. Endpoints are keyed by interpreter, flags, code
+  and manifest stamps, ingest binary and import-time environment, so changed
+  code never reaches an old server. The first miss runs normally while one
+  detached server starts, unless the socket path cannot fit AF_UNIX or the
+  idle setting is invalid; `AGREP_NO_RESIDENT=1` disables the path,
+  `AGREP_RESIDENT_IDLE_S` (default 600) bounds idle life, and `agrep remove`
+  stops every endpoint, reclaiming a stop marker left by an interrupted
+  remove. Pinned in `py/test_resident.py`; resident and direct
+  execution produce identical conformance matrices for a human caller and a
+  published agent caller in `py/test_cli_conformance.py`.
 - **Teaching surface**: the taught block text lives in `py/nudge_default.md`
-  and `py/nudge_codex.md`, not in `py/teach.py`. Selftest hash-pins the default
-  block against its version number, so changing that file without bumping the
-  version fails; it also asserts both blocks still name every command they
-  route to. The demo-line byte-compare against live probe output binds only
-  when a block carries a demo line, and the current lean blocks carry none, so
-  the codex block's text is asserted by route coverage rather than by hash.
+  and `py/nudge_codex.md`, not in `py/teach.py`. Both blocks address the agent
+  in the second person and carry no template slots, so every non-codex target
+  receives the same bytes. Selftest hash-pins the default block against its
+  version number, so changing that file without bumping the version fails; it
+  also asserts both blocks still name every command they route to, and that
+  the outgoing version's body digests were moved into
+  `teach._PRIOR_BLOCK_DIGESTS`, the provenance record that tells a shipped
+  block from an edited one. The demo-line byte-compare against live probe
+  output binds only when a block carries a demo line, and the current lean
+  blocks carry none, so the codex block's text is asserted by route coverage
+  rather than by hash.
 - **Artifacts installed outside the repo**: two surface classes write into
   files agrep does not own: taught blocks, and compaction integrations that
   point a resumed agent at `agrep postcompact` (`py/hookinstall.py`: Claude
   `PreCompact`, Codex compact-only `SessionStart`, and a shared pi/oh-my-pi
-  extension). The pi-family extension also exports the exact live session ID
-  and adds recovery instructions through the native compaction-summary context.
+  extension). The pi-family extension also names the live session two ways -
+  an environment export for harnesses whose tool shells inherit a live
+  environment, and a per-process `{pid, sessions[]}` publication
+  (`docs/COORDINATION.md`) that `session_context.calling_identity` finds by
+  walking its own parent chain, because oh-my-pi's tool shells carry a
+  pre-session environment snapshot - and adds recovery instructions through
+  the native compaction-summary context.
   Every artifact obeys preserve-and-disclose: a drifted artifact is reported,
   never repaired by a background snapshot-and-replace, because that pattern
   erases an edit made between the snapshot and the write. A taught block is
-  versioned by its marker; hook and extension ownership is decided by hashing
-  installed bytes against payloads agrep has shipped. A match may be upgraded;
-  anything else is the user's and is left alone. A pre-existing integration is
-  never displaced, removal takes out only agrep-owned entries, and an
-  unparseable settings file or unreadable extension root is treated as the
-  user's. Pinned in `py/test_teach_safety.py`, `py/test_hookinstall.py`, and the
-  executable lifecycle contract in `py/test_pi_omp_extension.py`.
+  versioned by its marker and its body is hashed against the shipped digests:
+  an older block is `drifted` (explicit setup upgrades it, and says
+  `replacing an edited vN block` when its body was not shipped text), a
+  same-version block with a foreign body is `edited` (reported, kept until a
+  newer setup replaces it), and a newer block is preserved. Hook and extension
+  ownership is decided by hashing installed bytes against payloads agrep has
+  shipped. A match may be upgraded; anything else is the user's and is left
+  alone. A pre-existing integration is never displaced, removal takes out only
+  agrep-owned entries, and an unparseable settings file or unreadable
+  extension root is treated as the user's. Pinned in `py/test_teach_safety.py`,
+  `py/test_hookinstall.py`, and the executable lifecycle contract in
+  `py/test_pi_omp_extension.py`.
 - **Test worlds**: `test_*.py` are hermetic units; `selftest.py` is the
   installed-reality gate (real binary, daemons, HOME, generated-surface
   pins). Every contract belongs to exactly one world; selftest stays one
   flat zero-fan-in file by design. If its wall-clock ever bottlenecks
   commits, parallelize the runner's schedule rather than splitting the file.
+  `py/test_cli_conformance.py` is the black-box CLI contract: real
+  subprocesses against claude, codex, pi and omp fixture stores, with goldens
+  for a human shell and for a published agent caller whose session is excluded.
+  `AGREP_UPDATE_CONFORMANCE=1` re-records them; a nondeterministic run refuses.
 
 ## `common.py` and its owners
 

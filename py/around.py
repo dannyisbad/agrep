@@ -3,7 +3,9 @@
     agrep around 11111111 144          # ±4 turns, root/main prose by default
     agrep around @11111111:144         # a precise handle: the named turn alone (-C 0)
     agrep around 11111111:144 --context 10   # wider window, colon form pastes from --json
-    agrep around 11111111 144 --full         # uncap indexed messages (deep read: -C 0)
+    agrep around 11111111 --whole --who user # the entire chat as the user's turns (-C all)
+    agrep around 11111111 144 -C 0 --max-chars 0  # one turn with its text uncapped
+    agrep around 11111111 144 --full         # same-window forensic stream, uncapped
     agrep around 11111111 144 --json   # one object per message/event, for piping
 
 Search tells you WHICH session touched a thing; around tells you WHAT happened -
@@ -11,10 +13,12 @@ the local story of a hit (error, attempts, fix) for a few KB instead of a whole
 transcript. A pasted @session:turn handle names one exact turn, never a nearby
 clamped turn, and defaults to -C 0; the positional session+turn form keeps the
 ±4 radius. Digest-bound handles are role-aware: a prose handle omits generic
-event noise, while a tool handle retains only its exact cited event. Positional
+event noise but always shows the row it cites (a recap or control row too),
+while a tool handle retains only its exact cited event. Positional
 and bare-session exploration also defaults to root/main prose; ``--who tool`` or
 ``--tool-output N`` explicitly opts into tools. ``--full`` restores the
-same-window forensic stream. Source truncation is labeled.
+same-window forensic stream. Message-cap commands retain nondefault speakers
+with ``--who`` and lift only the text cap. Source truncation is labeled.
 """
 
 from __future__ import annotations
@@ -54,10 +58,14 @@ def _stdout_print(value: object = "") -> None:
 
 def _warn_if_oversized(argv: list[str] | None) -> None:
     """One stderr line when a window ran large; silent for bounded pulls."""
-    if _stdout_bytes < _PULL_WARN_BYTES or "--no-tools" in (argv or []):
+    argv = list(argv or [])
+    whole = "--whole" in argv or "all" in argv
+    if _stdout_bytes < _PULL_WARN_BYTES or "--no-tools" in argv or (
+            whole and "--who" in argv):
         return
-    print(f"large pull: ~{_stdout_bytes // 1024}KB rendered - "
-          "`--no-tools` keeps the conversation only",
+    cheaper = ("`--who user` keeps the user's turns only" if whole
+               else "`--no-tools` keeps the conversation only")
+    print(f"large pull: ~{_stdout_bytes // 1024}KB rendered - {cheaper}",
           file=sys.stderr)
 
 
@@ -65,10 +73,19 @@ def _color_on(when: str) -> bool:
     return common.color_enabled(sys.stdout, when)
 
 
-def _expand_command(target: str, turn: int) -> str:
+def _expand_command(target: str, turn: int, who: str = "user") -> str:
+    """Lift one message's cap without hiding its speaker or opening the forensic stream."""
+    speaker = ("--who", who) if who not in ("user", "agent") else ()
     return console.shell_command(
-        "agrep", "around", target, turn, "-C", 0, "--full",
-        fallback="agrep around <session> <turn> -C 0 --full")
+        "agrep", "around", target, turn, "-C", 0, "--max-chars", 0, *speaker,
+        fallback="agrep around <session> <turn> -C 0 --max-chars 0"
+                 + (" --who <speaker>" if speaker else ""))
+
+
+def _forensic_command(target: str, turn: int, context: int) -> str:
+    return console.shell_command(
+        "agrep", "around", target, turn, "-C", context, "--full",
+        fallback="agrep around <session> <turn> -C <N> --full")
 
 
 class _DigestRescue(NamedTuple):
@@ -247,11 +264,23 @@ def _stale_handle_reason(detail: str | None = None) -> str:
 
 
 _LATEST_TURN = (1 << 63) - 1
+# A radius no indexed chat reaches; the window it requests is the whole chat.
+_WHOLE_RADIUS = 1 << 31
+
+
+def _context_arg(value: str) -> int | str:
+    if value.strip().lower() == "all":
+        return "all"
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer or 'all', got {value!r}") from None
 
 
 def _parse_target(args_session: str, args_turn: str | None,
                   json_output: bool) -> tuple[str, int]:
-    """Accept `around <session> <turn>` and `around <session>:<turn>` (the colon form
+    """Accept `around <session> [turn]` and `around <session>:<turn>` (the colon form
     pastes straight from a --json hit's fields). Exit 2 on an unparseable turn."""
     s = args_session
     if ((s.strip().startswith("@") and ":" in s)
@@ -266,9 +295,8 @@ def _parse_target(args_session: str, args_turn: str | None,
                 json_output, "bad-target",
                 "a result handle already includes its turn"))
         return parsed
-    # A printed bare @prefix addresses that chat's latest indexed turn. An
-    # unprefixed session remains positional and therefore still needs a turn.
-    bare_session_handle = s.strip().startswith("@") and args_turn is None
+    # A session with no turn, @-prefixed or not, addresses that chat's latest
+    # indexed turn; a colon form still names its turn explicitly.
     try:
         s = compact.normalize_session_arg(s)
     except compact.CompactError as exc:
@@ -278,12 +306,7 @@ def _parse_target(args_session: str, args_turn: str | None,
         s, _, t = s.rpartition(":")
         args_turn = t
     if args_turn is None:
-        if bare_session_handle:
-            return s, _LATEST_TURN
-        raise SystemExit(_fail(
-            json_output, "bad-target",
-            "need a turn: `agrep around <session> <turn>` "
-            "(turns come from `agrep <pattern> --json`)."))
+        return s, _LATEST_TURN
     try:
         return s, int(args_turn)
     except ValueError:
@@ -330,11 +353,61 @@ def _reply_loss_marker(turn: dict) -> str:
     return f" [source truncated at ingest; original reply {chars:,} chars]"
 
 
+# structural control events the ingest records; each is its own line, never a tool call
+_MARKERS = frozenset({"api_error", "compacted", "task_notification"})
+
+
+def _is_marker(event: dict) -> bool:
+    return event.get("kind") == "control" and event.get("name") in _MARKERS
+
+
+# what a disclosure calls each marker kind, in the order it lists them
+_MARKER_NOUNS = (("api_error", "API error"), ("compacted", "compaction"),
+                 ("task_notification", "task notification"))
+
+
+def _marker_counts(events: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        if _is_marker(event):
+            counts[event["name"]] = counts.get(event["name"], 0) + 1
+    return counts
+
+
+def _marker_phrases(counts: dict[str, int]) -> list[str]:
+    """'2 compactions', '1 API error': marker counts named apart from tool calls."""
+    return [f"{counts[name]:,} {noun}{'' if counts[name] == 1 else 's'}"
+            for name, noun in _MARKER_NOUNS if counts.get(name)]
+
+
+def _marker_line(e: dict, color: bool) -> str:
+    name = e.get("name")
+    raw = " ".join(str(e.get("input") or "").split())
+    if name == "api_error":
+        text = common.terminal_safe(raw)
+        text = text[:120] + "…" if len(text) > 120 else text
+        label = "" if text.lower().startswith("api error") else "API error: "
+        body = f"{surface.GLYPHS.failure} {label}{text}".rstrip(" :")
+    elif name == "compacted":
+        body = f"{surface.GLYPHS.unknown} context compacted"
+    else:
+        status = next((value for key, _sep, value in (part.partition("=") for part in raw.split())
+                       if key == "status" and value), "")
+        body = (f"{surface.GLYPHS.child_result} background task "
+                f"{common.terminal_safe(status) or 'notification'}")
+    if color:
+        tone = _C["bad"] if name == "api_error" else _C["d"]
+        return f"  {tone}{body}{_C['r']}"
+    return f"  {body}"
+
+
 def _tool_line(
         e: dict, color: bool, out_cap: int, *,
         match_span: tuple[int, int] | None = None,
         match_preview: str | None = None,
 ) -> str:
+    if _is_marker(e):
+        return _marker_line(e, color)
     inp = common.terminal_safe(" ".join((e.get("input") or "").split()))
     if len(inp) > 120:
         inp = inp[:120] + "…"
@@ -482,7 +555,28 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
                 expand: str, *, collapse: bool, session: str = "",
                 selected_event_identity: str | None = None,
                 selected_match_span: tuple[int, int] | None = None) -> list[str]:
-    """Keep decisive tool evidence visible while bounding pathological tails."""
+    """Keep decisive tool evidence visible while bounding pathological tails. Markers (an API
+    error, a compaction, a background task's notice) are lines of their own, in place, and never
+    count among the tool calls; any collapse summary follows the last tool event."""
+    position = {id(event): index for index, event in enumerate(events)}
+    tools = [event for event in events if not _is_marker(event)]
+    rows = _tool_rows(tools, color, tool_output, expand, collapse=collapse, session=session,
+                      selected_event_identity=selected_event_identity,
+                      selected_match_span=selected_match_span)
+    summary_at = max((position[id(event)] for event in tools), default=-1) + 0.5
+    placed = [(summary_at if event is None else position[id(event)], line)
+              for event, line in rows]
+    placed += [(position[id(event)], _marker_line(event, color))
+               for event in events if _is_marker(event)]
+    placed.sort(key=lambda row: row[0])
+    return [line for _at, line in placed]
+
+
+def _tool_rows(events: list[dict], color: bool, tool_output: int,
+               expand: str, *, collapse: bool, session: str,
+               selected_event_identity: str | None,
+               selected_match_span: tuple[int, int] | None) -> list[tuple[dict | None, str]]:
+    """(event, line) per rendered tool event; None marks a collapse summary."""
     selected: dict[int, _SelectedToolMatch] = {}
     for event in events:
         match = _selected_tool_match(
@@ -490,34 +584,27 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
         if match.selected:
             selected[id(event)] = match
             break
+
+    def line(event: dict) -> tuple[dict, str]:
+        return event, _tool_line(
+            event, color, tool_output,
+            match_span=(selected[id(event)].output_span if id(event) in selected else None),
+            match_preview=(selected[id(event)].preview if id(event) in selected else None))
+
     plain = [e for e in events
              if e["kind"] not in ("subagent_start", "subagent_result")
              and e.get("ok") is True and id(e) not in selected]
     if not collapse or tool_output > 0:
-        return [_tool_line(
-            e, color, tool_output,
-            match_span=(selected[id(e)].output_span if id(e) in selected else None),
-            match_preview=(selected[id(e)].preview if id(e) in selected else None))
-                for e in events]
+        return [line(e) for e in events]
     if len(plain) < _TOOL_RUN_MIN and len(events) <= _TOOL_DETAIL_MAX:
-        return [_tool_line(
-            e, color, tool_output,
-            match_span=(selected[id(e)].output_span if id(e) in selected else None),
-            match_preview=(selected[id(e)].preview if id(e) in selected else None))
-                for e in events]
+        return [line(e) for e in events]
 
     plain_ids = {id(event) for event in plain}
     details = [event for event in events if id(event) not in plain_ids]
     if (len(plain) >= _TOOL_RUN_MIN
             and len(details) + 1 <= _TOOL_DETAIL_MAX):
-        lines = [_tool_line(
-            event, color, tool_output,
-            match_span=(selected[id(event)].output_span
-                        if id(event) in selected else None),
-            match_preview=(selected[id(event)].preview
-                           if id(event) in selected else None))
-                 for event in details]
-        lines.append(_tool_run_summary(plain, color, expand))
+        lines = [line(event) for event in details]
+        lines.append((None, _tool_run_summary(plain, color, expand)))
         return lines
 
     groups: list[dict] = []
@@ -558,16 +645,12 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
     chosen.extend(_spread_tool_groups(other, slots))
     chosen.sort(key=lambda group: group["index"])
 
-    lines = [_tool_line(
-        group["event"], color, tool_output,
-        match_span=(selected[id(group["event"])].output_span
-                    if id(group["event"]) in selected else None),
-        match_preview=(selected[id(group["event"])].preview
-                       if id(group["event"]) in selected else None))
-             for group in chosen]
-    for line_index, group in enumerate(chosen):
+    lines: list[tuple[dict | None, str]] = []
+    for group in chosen:
+        event, text = line(group["event"])
         if group["count"] > 1:
-            lines[line_index] += f" [\u00d7{group['count']:,} identical]"
+            text += f" [\u00d7{group['count']:,} identical]"
+        lines.append((event, text))
 
     collapsed = len(events) - len(chosen)
     collapsed_failed = sum(
@@ -575,12 +658,12 @@ def _tool_block(events: list[dict], color: bool, tool_output: int,
         for group in groups if group["event"].get("ok") is False)
     if (len(plain) >= _TOOL_RUN_MIN
             and collapsed == len(plain) and not collapsed_failed):
-        lines.append(_tool_run_summary(plain, color, expand))
+        lines.append((None, _tool_run_summary(plain, color, expand)))
     else:
         failed = f" ({collapsed_failed:,} failed)" if collapsed_failed else ""
         body = (f"{surface.GLYPHS.tool} {collapsed:,} tool event details "
                 f"collapsed{failed} - {expand} shows each")
-        lines.append(f"  {_C['d']}{body}{_C['r']}" if color else f"  {body}")
+        lines.append((None, f"  {_C['d']}{body}{_C['r']}" if color else f"  {body}"))
     return lines
 
 
@@ -596,10 +679,15 @@ def _around_scope(
         message_cap_state: str,
         render_truncated_rows: int,
         prose_available: dict[str, int],
-        prose_shown: dict[str, int], events_shown: int,
+        prose_shown: dict[str, int], shown_events: list[dict],
 ) -> dict:
-    """Stable, answer-free disclosure for the rows the renderer did and did not show."""
-    event_total = len(window.get("events") or ())
+    """Stable, answer-free disclosure for the rows the renderer did and did not show. Markers
+    count apart from the tool calls they sit among."""
+    events = list(window.get("events") or ())
+    markers_available = _marker_counts(events)
+    markers_shown = _marker_counts(shown_events)
+    tools_available = len(events) - sum(markers_available.values())
+    tools_shown = len(shown_events) - sum(markers_shown.values())
     return {
         "policy": policy,
         "session": str(window.get("session") or ""),
@@ -618,9 +706,15 @@ def _around_scope(
         "counts_state": "exact",
         "tools": {
             "mode": tool_mode,
-            "available": event_total,
-            "shown": int(events_shown),
-            "hidden": max(0, event_total - int(events_shown)),
+            "available": tools_available,
+            "shown": tools_shown,
+            "hidden": max(0, tools_available - tools_shown),
+        },
+        "markers": {
+            "available_by_name": markers_available,
+            "shown_by_name": markers_shown,
+            "hidden": max(
+                0, sum(markers_available.values()) - sum(markers_shown.values())),
         },
         "prose": {
             "available_by_role": prose_available,
@@ -681,32 +775,38 @@ def _main(argv: list[str] | None = None) -> int:
         allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-               "  agrep around 11111111 144            ±4 turns, root/main prose\n"
-               "  agrep around 11111111:144 --context 10  wider window (colon form ok)\n"
-               "  agrep around 11111111 144 -C 0 --full  same-window forensic stream\n"
+               "  agrep around 11111111 144            show that turn and four on either side\n"
+               "  agrep around 11111111:144 --context 10  a wider window\n"
+               "  agrep around 11111111 --whole        the entire conversation\n"
+               "  agrep around 11111111 --whole --who user  every user turn: a compact transcript\n"
+               "  agrep around 11111111 144 -C all     the same whole chat, centered for --json\n"
+               "  agrep around 11111111 144 -C 0 --max-chars 0  one turn, its text uncapped\n"
+               "  agrep around 11111111 144 -C 0 --full  include tool events and full text\n"
                "  agrep around 11111111 144 --tool-output 800  include tool results\n"
-               "  agrep around @11111111              latest indexed turn in that chat\n"
+               "  agrep around 11111111              latest indexed turn (same as @11111111)\n"
                "  agrep around @11111111:144          compact result handle: that turn only\n"
                "  agrep around 11111111 144 --json     one object per message/event\n"
                "\nsession ids and turns come from `agrep <pattern> --json`.\n"
                "exit: 0 shown, 1 no selected messages/events, "
                "2 bad target / no index.")
-    ap.add_argument("session", help="session id, bare @session for its latest turn, "
+    ap.add_argument("session", help="session id or @session (alone: its latest turn), "
                                     "session:turn, or a compact @session:turn handle")
-    ap.add_argument("turn", nargs="?", help="turn number to center on")
+    ap.add_argument("turn", nargs="?", help="turn number to center on "
+                                            "(default: the latest indexed turn)")
     ap.add_argument("-C", "--context", "--radius",
-                    dest="context", type=int, default=None, metavar="N",
+                    dest="context", type=_context_arg, default=None, metavar="N",
                     help="turns before and after the center turn (default 4; "
                          "a precise @session:turn handle defaults to 0 - "
-                         "just the named turn)")
+                         "just the named turn); `all` reads the whole chat")
+    ap.add_argument("--whole", action="store_true",
+                    help="read every turn (same as -C all); "
+                         "combine with --who user for just the user's messages")
     ap.add_argument("--max-chars", type=int, default=4000, metavar="M",
                     help="per-message text cap (default 4000; exact delegated "
                          "prose may use the ingest cap; 0 = uncapped)")
     ap.add_argument("--full", action="store_true",
-                    help="show the same-window forensic stream and uncap indexed "
-                         "message text (ingest and tool-result caps still "
-                         "apply); can be enormous - for deliberate forensics "
-                         "rather than routine reading")
+                    help="include tool events and remove the display text cap; "
+                         "source and tool-result limits still apply")
     ap.add_argument("--no-tools", action="store_true", help="hide tool-call lines")
     ap.add_argument("--tool-output", type=int, default=0, metavar="N",
                     help="include raw multiline tool results, capped at N chars "
@@ -719,19 +819,27 @@ def _main(argv: list[str] | None = None) -> int:
                     help=surface.NO_AUTO_HELP)
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     args = surface.parse_args_with_presence(ap, argv)
-    # an option a surface renders inert is refused, never dropped: --full
-    # swallowed an explicit --max-chars and --no-tools an explicit --tool-output
-    gated = surface.option_gate_error(args, surface.AROUND_OPTION_GATES)
+    # Explicit caps and tool output must not disappear behind display modes.
+    gated = surface.option_gate_error(
+        args, surface.AROUND_OPTION_GATES,
+        argv=argv if argv is not None else sys.argv[1:],
+        prog=("agrep", "around"), parser=ap)
     if gated:
         ap.error(gated)
 
     is_handle = compact.is_result_handle(args.session)
-    latest_session = (str(args.session).strip().startswith("@")
-                      and not is_handle and args.turn is None
-                      and ":" not in str(args.session))
+    whole = bool(args.whole) or args.context == "all"
+    if whole and isinstance(args.context, int):
+        ap.error("--whole reads the whole chat; drop -C N (or write -C all)")
+    if whole:
+        args.whole = True
+        args.context = None
+    latest_session = (not is_handle and args.turn is None
+                      and ":" not in str(args.session)
+                      and (str(args.session).strip().startswith("@") or not whole))
     if args.context is not None and args.context < 0:
         ap.error("--context must be 0 or greater")
-    if args.context is None:
+    if args.context is None and not whole:
         # a handle addresses one exact turn; radius is for exploratory reads
         args.context = 0 if is_handle else 4
     if args.max_chars < 0:
@@ -797,19 +905,20 @@ def _main(argv: list[str] | None = None) -> int:
         return rc
     common.lap("resolve")
 
-    w = explore.get_window(cands[0], center, args.context)
+    window_radius = _WHOLE_RADIUS if whole else args.context
+    w = explore.get_window(cands[0], center, window_radius)
     common.lap("window")
     if "error" in w:
         return _fail(args.json, "window-unavailable",
                      common.terminal_safe(w["error"]))
-    if latest_session:
+    if latest_session or (whole and center == _LATEST_TURN):
         center = int(w["center"])
     elif w["center"] != center:
         if is_handle:
             return _fail(
                 args.json, "stale-handle",
                 _stale_handle_reason(
-                    f"turn {center} is out of range "
+                    f"{surface.turn_not_served(center, w['first_turn'], w['last_turn'])} "
                     f"(chat has turns {w['first_turn']}-{w['last_turn']})"),
                 requested_turn=center,
                 first_turn=w["first_turn"], last_turn=w["last_turn"])
@@ -846,7 +955,7 @@ def _main(argv: list[str] | None = None) -> int:
         if found != center:
             _serve(notes, args.json, "content_moved", requested=center,
                    served=found)
-            w = explore.get_window(cands[0], found, args.context)
+            w = explore.get_window(cands[0], found, window_radius)
             if "error" in w:
                 return _fail(args.json, "window-unavailable",
                              common.terminal_safe(w["error"]))
@@ -948,6 +1057,13 @@ def _main(argv: list[str] | None = None) -> int:
             # The digest verifies content, not root/child authority. Without
             # a generation-bound family role, keep the exact turn inclusive.
             return True
+        if (is_handle and handle_digest is not None
+                and handle_event_identity is None
+                and int(turn.get("turn", -1)) == int(w["center"])
+                and compact.content_digest(text) == handle_digest):
+            # The handle cites this exact row (recap, control, ...); its speaker
+            # never hides what the citation verified.
+            return True
         if session_role == "delegated":
             return who in ("user", "agent", "subagent")
         return who in ("user", "agent")
@@ -975,7 +1091,7 @@ def _main(argv: list[str] | None = None) -> int:
             f"no {role} messages or events in turns {first_turn}-{last_turn} "
             f"of {target}")
         if args.who is None:
-            reason += "; use --full for the same-window forensic stream"
+            reason += "; use --full to include tool events"
         return _miss(
             args.json, "no-speaker-match", reason,
             checked=not args.no_auto,
@@ -996,15 +1112,20 @@ def _main(argv: list[str] | None = None) -> int:
                 prose_shown[who] = prose_shown.get(who, 0) + 1
                 if cap and len(text) > cap:
                     render_truncated_rows += 1
-    events_shown = sum(len(events) for events in events_by_turn.values())
+    shown_events = [event for events in events_by_turn.values() for event in events]
     selected_record_role = (
         "none" if not is_handle else
         "tool" if handle_event_identity is not None else
         "legacy_unbound" if handle_digest is None else
         "prose_turn_inclusive")
+    if whole:
+        # the radius the whole chat actually spans, so the record stays numeric
+        args.context = max(
+            int(w["center"]) - int(w["first_turn"]),
+            int(w["last_turn"]) - int(w["center"]))
+    span_argv = ["--whole"] if whole else ["-C", str(args.context)]
     expansion_argv = [
-        "agrep", "around", target, str(int(w["center"])),
-        "-C", str(args.context), "--full",
+        "agrep", "around", target, str(int(w["center"])), *span_argv, "--full",
     ]
     scope = _around_scope(
         w,
@@ -1015,7 +1136,8 @@ def _main(argv: list[str] | None = None) -> int:
             "bounded_inclusive"),
         tool_mode=tool_mode,
         context=args.context,
-        selection_order=("newest_tail" if latest_session else
+        selection_order=("whole_chat" if whole else
+                         "newest_tail" if latest_session else
                          "requested_center"),
         session_role=session_role,
         selected_record_role=selected_record_role,
@@ -1029,7 +1151,7 @@ def _main(argv: list[str] | None = None) -> int:
         render_truncated_rows=render_truncated_rows,
         prose_available=prose_available,
         prose_shown=prose_shown,
-        events_shown=events_shown,
+        shown_events=shown_events,
     )
 
     if args.json:
@@ -1045,7 +1167,7 @@ def _main(argv: list[str] | None = None) -> int:
             for who, text in ((t["who"], t["text"]), ("agent", t["reply"])):
                 if not prose_selected(t, who, text):
                     continue
-                expand = _expand_command(target, t["turn"])
+                expand = _expand_command(target, t["turn"], who)
                 capped, omitted = cap_prose(t, who, text, expand)
                 row = {"kind": "msg", "session": w["session"],
                        "project": w["project"], "turn": t["turn"],
@@ -1093,35 +1215,33 @@ def _main(argv: list[str] | None = None) -> int:
 
     hidden_tools = int(scope["tools"]["hidden"])
     hidden_prose = int(scope["prose"]["hidden"])
-    if hidden_tools or hidden_prose or session_role != "root_main" or latest_session:
-        if scope["policy"] == "root_prose" and session_role == "root_main":
-            scope_label = "root/main prose default"
-        elif scope["policy"] == "root_prose" and session_role == "unknown":
-            scope_label = "root/main prose default; session lineage unverified"
-        elif session_role == "delegated":
-            scope_label = (
-                "selected delegated session; secondary/provisional, root adoption "
-                "unresolved")
-        elif session_role == "unknown":
-            scope_label = "selected session role unverified; bounded inclusive scope"
-        else:
-            scope_label = "role-aware root/main scope"
-        parts = [scope_label]
-        if latest_session:
-            parts.append("newest tail selected; chronological render")
-        if selected_delegated_prose_uncapped:
-            parts.append(
-                "selected turn prose uncapped; ingest safety cap still applies")
+    markers = scope["markers"]
+    hidden_markers = _marker_phrases({
+        name: count - int(markers["shown_by_name"].get(name, 0))
+        for name, count in markers["available_by_name"].items()})
+    hidden = bool(hidden_tools or hidden_prose or hidden_markers)
+    parts = []
+    if session_role == "delegated":
+        parts.append("subagent conversation")
+    elif session_role == "unknown":
+        parts.append("conversation role unverified")
+    if hidden or parts:
         if hidden_tools:
-            parts.append(f"{hidden_tools:,} unselected tool/workflow events hidden")
+            parts.append(f"{hidden_tools:,} tool events omitted")
+        if hidden_markers:
+            parts.append(f"{', '.join(hidden_markers)} omitted")
         if hidden_prose:
-            parts.append(f"{hidden_prose:,} non-selected prose rows hidden")
-        expand_scope = console.shell_command(
-            "agrep", "around", target, int(w["center"]), "-C", args.context,
-            "--full", fallback="agrep around <session> <turn> -C <N> --full")
-        if hidden_tools or hidden_prose:
-            parts.append("same-window forensic view: " + expand_scope)
-        line = "scope: " + " · ".join(parts)
+            parts.append(f"{hidden_prose:,} messages omitted")
+        span_args = ("--whole",) if whole else ("-C", args.context)
+        if args.who is not None and hidden:
+            parts.append(console.shell_command(
+                "agrep", "around", target, int(w["center"]), *span_args,
+                fallback="agrep around <session> <turn> -C <N>"))
+        elif hidden:
+            parts.append(console.shell_command(
+                "agrep", "around", target, int(w["center"]), *span_args,
+                "--full", fallback="agrep around <session> <turn> -C <N> --full"))
+        line = " · ".join(parts)
         _stdout_print(f"{_C['d']}{line}{_C['r']}" if color else line)
 
     for t in turns:
@@ -1132,8 +1252,8 @@ def _main(argv: list[str] | None = None) -> int:
         else:
             _stdout_print(
                 f"── turn {t['turn']} " + "─" * 40 + f" {_ts_label(t['ts'])}")
-        expand = _expand_command(target, t["turn"])
         if prose_selected(t, t["who"], t["text"]):
+            expand = _expand_command(target, t["turn"], t["who"])
             tag = common.terminal_safe(t["who"])
             source = " ".join(t["text"].split()) if cap else t["text"]
             body, _ = cap_prose(t, t["who"], source, expand)
@@ -1142,13 +1262,14 @@ def _main(argv: list[str] | None = None) -> int:
                 f"{_C['y']}{tag}:{_C['r']} {body}" if color else f"{tag}: {body}")
         selected_events = (events_by_turn.get(t["turn"], [])
                            if _who_selected(args.who, "tool") else [])
-        for line in _tool_block(selected_events, color,
-                                args.tool_output, expand,
+        for line in _tool_block(selected_events, color, args.tool_output,
+                                _forensic_command(target, t["turn"], 0),
                                 collapse=not args.full, session=w["session"],
                                 selected_event_identity=handle_event_identity,
                                 selected_match_span=handle_match_span):
             _stdout_print(line)
         if prose_selected(t, "agent", t["reply"]):
+            expand = _expand_command(target, t["turn"], "agent")
             body, _ = cap_prose(t, "agent", t["reply"], expand)
             body = common.terminal_safe(body, multiline=True)
             body += _reply_loss_marker(t)
