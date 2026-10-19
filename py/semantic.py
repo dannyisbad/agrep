@@ -1286,6 +1286,7 @@ def _background_refresh_disabled() -> dict | None:
 def ensure_fresh_async(max_new: int | None = None, *,
                        spawn_env: dict[str, str] | None = None,
                        ignore_battery: bool = False,
+                       ignore_load: bool = False,
                        force_full: bool = False,
                        allow_model_download: bool = False) -> dict:
     """Spawn one detached embed.py when the lane is stale. Idempotent and cheap:
@@ -1365,8 +1366,11 @@ def ensure_fresh_async(max_new: int | None = None, *,
     logf = common.open_bounded_log("semantic-embed.log")
     child_env = dict(os.environ)
     child_env.pop("AGREP_EMBED_IGNORE_BATTERY", None)
+    child_env.pop("AGREP_EMBED_IGNORE_LOAD", None)
     if ignore_battery:
         child_env["AGREP_EMBED_IGNORE_BATTERY"] = "1"
+    if ignore_load:
+        child_env["AGREP_EMBED_IGNORE_LOAD"] = "1"
     if spawn_env:
         # Keep the scheduling surface deliberately closed: callers may choose
         # resource policy, never arbitrary child configuration.

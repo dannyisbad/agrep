@@ -24,6 +24,15 @@ owner before source reparsing. The daemon retains its lifetime ownership while
 an incompatible cache is reconstructed. This handoff does not certify source
 freshness; source and event publication retain their normal postflight checks.
 
+An explicit `agrep index` waits up to three minutes for a same-writer
+`derived-adoption` claim whose PID and process-start identity are still exact
+and live. A companion daemon record must match the caller's authorized
+generation; legacy, foreign, malformed, or unverifiable owners do not qualify.
+The Rust child reports one wait line and retries exclusive claim acquisition
+without holding either writer lock. Expiry returns exit 1 and names the ongoing
+adoption, which continues independently. Read-only Rust callers retain exit 0;
+no waiting caller borrows the incumbent's claim or bypasses the writer fence.
+
 When that invocation discards an incompatible, foreign-owned parse cache, it
 reconstructs the cache in the same ingest. The resulting missing cache does not
 require a second invocation merely to repeat a source snapshot. Reconstruction

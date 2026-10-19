@@ -3346,16 +3346,18 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             str(embeddings_observation.get("detail")
                 or "setting state is unavailable"),
         )
-    if (fix_actions and smart["available"] and smart["embeddings"] != "current"
+    # A routine probe leaves availability unknown (None); the refresh itself refuses a missing runtime.
+    if (fix_actions and smart["available"] is not False and smart["embeddings"] != "current"
             and not smart["embed_running"]
             and not embeddings_off
             and (common.DATA_DIR / "sessions.jsonl").exists()):
-        # the diagnostic surface self-heals like bare `agrep`: viewing a stale
-        # lane starts the repair its row describes (spawn is deduped/backed-off)
+        # viewing a stale lane starts the repair its row describes (deduped/backed-off); --fix is
+        # the consent that row asks for, so only memory pressure defers the build
         try:
             import semantic
             kicked = semantic.ensure_fresh_async(
-                max_new=semantic.SEMANTIC_REFRESH_MAX_NEW)
+                max_new=semantic.SEMANTIC_REFRESH_MAX_NEW,
+                ignore_battery=True, ignore_load=True)
             if kicked.get("state") == "running":
                 smart = {**smart, "embed_running": True,
                          "embed_job": "running"}

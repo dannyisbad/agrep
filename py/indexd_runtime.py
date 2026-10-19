@@ -199,6 +199,7 @@ _INGEST_CACHE_OWNER_VERSION = 4
 _BUILD_ID_RE = re.compile(r"^[0-9a-f]{20}$")
 _DERIVED_ADOPTION_OWNER_TOKEN_ENV = (
     "AGREP_DERIVED_ADOPTION_OWNER_TOKEN")
+_DERIVED_ADOPTION_WAIT_MS_ENV = "AGREP_DERIVED_ADOPTION_WAIT_MS"
 _DERIVED_WRITER_IDENTITY_BLOCKED_ENV = (
     "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED")
 _PYTHON_RUNTIME_BUILD_ID_ENV = "AGREP_PYTHON_RUNTIME_BUILD_ID"
@@ -511,6 +512,7 @@ def rust_writer_env(binary: Path | None = None) -> dict[str, str]:
     env[_PYTHON_RUNTIME_BUILD_ID_ENV] = INDEXD_BUILD_ID
     env.pop(_DERIVED_WRITER_IDENTITY_BLOCKED_ENV, None)
     env.pop(_DERIVED_ADOPTION_OWNER_TOKEN_ENV, None)
+    env.pop(_DERIVED_ADOPTION_WAIT_MS_ENV, None)
     env.pop(_INDEXD_REFRESH_EXPECTED_WRITER_ENV, None)
     inspect_owner = globals().get("_inspect_indexd_owner")
     if callable(inspect_owner):
@@ -964,10 +966,9 @@ def _same_build_adoption_claim(build_id: str) -> bool:
     return found
 
 
-# How long an explicit index waits for a live daemon of this exact build to
-# adopt the derived stores after an upgrade; the takeover lands with the
-# daemon's first publication pass, observed in the tens of seconds.
-_UPGRADE_SETTLEMENT_WAIT_S = 45.0
+# Explicit writers wait before claiming either writer lock; adoption can take
+# minutes on an existing corpus even when its durable writer ID already matches.
+_UPGRADE_SETTLEMENT_WAIT_S = 180.0
 
 
 def _await_upgrade_settlement(timeout_s: float) -> bool:
@@ -1101,6 +1102,9 @@ def build_index(
     try:
         kw["env"] = (
             rust_writer_env(ingest) if ingest.exists() else dict(os.environ))
+        if require_search_index:
+            kw["env"][_DERIVED_ADOPTION_WAIT_MS_ENV] = str(
+                max(0, int(_UPGRADE_SETTLEMENT_WAIT_S * 1000)))
     except OSError as fenced:
         # An unreadable ownership anchor is a local condition with a cause to
         # name, never an unexpected error for the caller's crash handler.
