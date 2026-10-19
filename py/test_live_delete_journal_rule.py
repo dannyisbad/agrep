@@ -110,34 +110,51 @@ class LiveDeleteJournalRule(unittest.TestCase):
 
     def test_short_exclusive_commit_waits_for_sqlite_instead_of_cloning(
             self) -> None:
+        # Handshake, not timing: the writer holds its exclusive transaction until the
+        # reader's first open has captured the pre-commit identity, then commits, so the
+        # reader always meets a publication moving under its open and must never clone.
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "corpus.db"
             _database(path)
             script = "\n".join((
-                "import sqlite3, sys, time",
+                "import sqlite3, sys",
                 "db = sqlite3.connect(sys.argv[1], timeout=0)",
-                # no fsync: the bounded wait measures the lock handoff, not the disk
+                # no fsync: the wait measures the lock handoff, not the disk
                 "db.execute('PRAGMA synchronous=OFF')",
                 "db.execute('BEGIN EXCLUSIVE')",
                 f"db.execute(\"UPDATE meta SET value='{BUILD_B}' "
                 "WHERE key='build_id'\")",
                 "print('ready', flush=True)",
-                "time.sleep(0.05)",
+                "sys.stdin.readline()",
                 "db.commit()",
                 "db.close()",
             ))
             writer = subprocess.Popen(
                 [sys.executable, "-c", script, str(path)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
             self.assertEqual(writer.stdout.readline().strip(), "ready")
-            started = time.monotonic()
+            real_identity = corpusdb._sqlite_file_identity
+            released = []
+
+            def identity_then_release(target):
+                identity = real_identity(target)
+                if not released:
+                    released.append(identity)
+                    writer.stdin.write("commit\n")
+                    writer.stdin.flush()
+                return identity
+
             try:
                 with mock.patch.object(
                         corpusdb, "_open", wraps=corpusdb._open) as opened, \
                         mock.patch.object(
+                        corpusdb, "_sqlite_file_identity",
+                        side_effect=identity_then_release), \
+                        mock.patch.object(
                         corpusdb, "_connect_read_alias",
                         side_effect=AssertionError("live contention cloned")):
-                    reader = corpusdb._connect_read_snapshot(path, 0.25)
+                    reader = corpusdb._connect_read_snapshot(path, 10.0)
                 try:
                     self.assertEqual(
                         reader.execute(
@@ -151,13 +168,13 @@ class LiveDeleteJournalRule(unittest.TestCase):
                         reader._source_identity,
                         corpusdb._sqlite_file_identity(path),
                     )
+                    self.assertNotEqual(reader._source_identity, released[0])
                 finally:
                     reader.close()
             finally:
                 _writer_stdout, writer_stderr = writer.communicate(timeout=2.0)
             self.assertEqual(writer.returncode, 0, writer_stderr)
             self.assertEqual(opened.call_count, 2)
-            self.assertLess(time.monotonic() - started, 1.0)
 
     def test_live_exclusive_timeout_never_enters_dead_journal_recovery(
             self) -> None:

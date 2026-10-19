@@ -77,6 +77,9 @@ fn source_tail(file: &str) -> &str {
         .map_or(file, |(index, _)| &file[index + 1..])
 }
 
+/// Every [`ParserPanic::reason`] starts with it: a read issue so worded failed to a parser bug.
+pub(crate) const PANIC_REASON_PREFIX: &str = "parser panicked";
+
 fn panic_reason(payload: &(dyn Any + Send), site: Option<&str>) -> String {
     let message = payload
         .downcast_ref::<&str>()
@@ -84,8 +87,8 @@ fn panic_reason(payload: &(dyn Any + Send), site: Option<&str>) -> String {
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .map_or_else(|| "a non-string payload".to_owned(), withhold_operands);
     match site {
-        Some(site) => format!("parser panicked at {site}: {message}"),
-        None => format!("parser panicked: {message}"),
+        Some(site) => format!("{PANIC_REASON_PREFIX} at {site}: {message}"),
+        None => format!("{PANIC_REASON_PREFIX}: {message}"),
     }
 }
 

@@ -1664,7 +1664,7 @@ fn dead_foreign_owner_takeover_converges_in_one_invocation() {
             )
             .unwrap();
         for (key, value) in [
-            ("schema", "15"),
+            ("schema", "17"),
             ("stamp", "takeover-torture-stamp"),
             ("fts_triggers", "4"),
         ] {
@@ -1946,6 +1946,755 @@ fn live_daemon_descriptor_fences_first_adoption_unless_exactly_authorized() {
     let _ = fs::remove_dir_all(authorized);
     let _ = fs::remove_dir_all(identity_fenced);
     let _ = fs::remove_dir_all(home);
+}
+
+/// Several explicit indexers of one build racing with no daemon can each win one of the two
+/// claim records; a waiting indexer must treat that split, and a claim released between its
+/// scan and its read, as something to wait out rather than a refusal.
+#[test]
+fn concurrent_waiting_indexers_never_settle_for_a_read_only_refusal() {
+    let home = temp_dir("concurrent-waiters-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("concurrent-waiters-data");
+    let build = "bbbbbbbbbbbbbbbbbbbb";
+    let spawn = |waiting: bool| {
+        let mut command = Command::new(BIN);
+        command.args(["index", "--agent", "claude"]);
+        command.env("AGREP_HOME", &home);
+        command.env("AGREP_DATA_DIR", &data);
+        command.env("AGREP_RUNTIME_BUILD_ID", build);
+        if waiting {
+            command.env("AGREP_DERIVED_ADOPTION_WAIT_MS", "30000");
+        } else {
+            command.env_remove("AGREP_DERIVED_ADOPTION_WAIT_MS");
+        }
+        for key in [
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "AGREP_RS_BIN",
+            "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
+            "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+        ] {
+            command.env_remove(key);
+        }
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn racing agrep-rs")
+    };
+    let seeded = spawn(false).wait_with_output().unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    assert!(data.join("messages.jsonl").is_file());
+
+    for wave in 0..8 {
+        let racers: Vec<_> = (0..3).map(|_| spawn(true)).collect();
+        let background = spawn(false);
+        for racer in racers {
+            let output = racer.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "wave {wave}: {stderr}");
+            assert!(
+                !stderr.contains("serving the published snapshot read-only")
+                    && !stderr.contains("legacy or ambiguous"),
+                "wave {wave}: a waiting indexer settled for a refusal: {stderr}"
+            );
+        }
+        // A background freshen keeps its read-only contract; only its exit status is bound.
+        let output = background.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "wave {wave}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!data.join(".indexd.lock").exists());
+    assert!(!data.join(".indexd.v2.lock").exists());
+
+    let _ = fs::remove_dir_all(data);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A local failure to publish the claim (here: an unwritable data dir) is this writer's own
+/// error. An explicit index must report it at once and fail, never retry it against the wait
+/// budget as if another indexer held the claim; a background pass keeps its read-only exit.
+#[cfg(unix)]
+#[test]
+fn an_unwritable_data_dir_fails_an_explicit_index_at_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_dir("unwritable-data-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("unwritable-data-data");
+    let run = |budget: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command.args(["index", "--agent", "claude"]);
+        command.env("AGREP_HOME", &home);
+        command.env("AGREP_DATA_DIR", &data);
+        command.env("AGREP_RUNTIME_BUILD_ID", "bbbbbbbbbbbbbbbbbbbb");
+        match budget {
+            Some(budget) => command.env("AGREP_DERIVED_ADOPTION_WAIT_MS", budget),
+            None => command.env_remove("AGREP_DERIVED_ADOPTION_WAIT_MS"),
+        };
+        for key in [
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "AGREP_RS_BIN",
+            "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
+            "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+        ] {
+            command.env_remove(key);
+        }
+        let started = std::time::Instant::now();
+        let output = command.output().expect("spawn agrep-rs");
+        (output, started.elapsed())
+    };
+    let (seeded, _) = run(None);
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(data.join("probe"), b"").is_ok() {
+        // permissions are not enforced for this user (root); nothing to prove here
+        let _ = fs::remove_file(data.join("probe"));
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&data);
+        let _ = fs::remove_dir_all(&home);
+        return;
+    }
+
+    let (explicit, elapsed) = run(Some("10000"));
+    let stderr = String::from_utf8_lossy(&explicit.stderr);
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!explicit.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("cannot publish derived-adoption claim")
+            && stderr.contains("Permission denied"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("kept claiming") && !stderr.contains("wait budget"),
+        "{stderr}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+    let (background, _) = run(None);
+    let stderr = String::from_utf8_lossy(&background.stderr);
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(background.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("cannot publish derived-adoption claim")
+            && stderr.contains("serving the published snapshot read-only"),
+        "{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(data);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A peer's claim records can vanish between the fence's directory scan and its read (the peer
+/// released, or reaped a dead record). With a wait budget that is never a verdict: the explicit
+/// index must rescan, find the live peer, wait for it, and then index. `AGREP_TEST_OWNER_VANISH`
+/// (test builds only) makes every record read as vanished during the listed fence evaluations;
+/// 1-3 are the waiter's pre-check, the claim's pre-fence, and the rescan: the two consulted hits
+/// that used to turn into a read-only disclosure, plus the pre-check that precedes them.
+#[test]
+fn records_vanishing_between_scan_and_read_never_settle_an_explicit_index_read_only() {
+    use std::io::{BufRead, BufReader};
+
+    let home = temp_dir("vanishing-records-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("vanishing-records-data");
+    let command = |waiting: bool| {
+        let mut command = Command::new(BIN);
+        command.args(["index", "--agent", "claude"]);
+        command.env("AGREP_HOME", &home);
+        command.env("AGREP_DATA_DIR", &data);
+        command.env("AGREP_RUNTIME_BUILD_ID", "bbbbbbbbbbbbbbbbbbbb");
+        if waiting {
+            command.env("AGREP_DERIVED_ADOPTION_WAIT_MS", "30000");
+            command.env("AGREP_TEST_OWNER_VANISH", "1,2,3");
+        } else {
+            command.env_remove("AGREP_DERIVED_ADOPTION_WAIT_MS");
+            command.env_remove("AGREP_TEST_OWNER_VANISH");
+        }
+        for key in [
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "AGREP_RS_BIN",
+            "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
+            "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+        ] {
+            command.env_remove(key);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+    };
+    let seeded = command(false).output().unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    // A live lock holder parks the peer inside its settled claim, before its locked section.
+    let mut holder = Command::new(BIN)
+        .args(["index-lock-contract", "hold", "--path"])
+        .arg(data.join(".index.lock"))
+        .args(["--label", "vanish-barrier", "--timeout-ms", "1000"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(holder.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert!(ready.contains(r#""ready":true"#), "{ready}");
+    let peer = command(false).spawn().unwrap();
+    let peer_claim = format!("state=derived-adoption pid={} ", peer.id());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !fs::read_to_string(data.join(".indexd.lock"))
+        .is_ok_and(|raw| raw.starts_with(&peer_claim))
+        || !fs::read_to_string(data.join(".indexd.v2.lock"))
+            .is_ok_and(|raw| raw.starts_with(&peer_claim))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer never settled its claim"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let mut explicit = command(true).stdout(Stdio::null()).spawn().unwrap();
+    let mut lines = BufReader::new(explicit.stderr.take().unwrap()).lines();
+    let mut stderr = String::new();
+    let wait_line = format!("waiting for another agrep indexer (pid {})", peer.id());
+    let waited = loop {
+        match lines.next() {
+            Some(Ok(line)) => {
+                stderr.push_str(&line);
+                stderr.push('\n');
+                if line.starts_with(&wait_line) {
+                    break true;
+                }
+            }
+            _ => break false,
+        }
+    };
+    // Only once the waiter is parked behind the peer does the peer get to finish.
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+    for line in lines.map_while(Result::ok) {
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    let peer_output = peer.wait_with_output().unwrap();
+    let explicit_status = explicit.wait().unwrap();
+    assert!(
+        waited,
+        "the explicit index never waited for the peer:\n{stderr}"
+    );
+    assert!(
+        peer_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&peer_output.stderr)
+    );
+    assert!(explicit_status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("serving the published snapshot read-only")
+            && !stderr.contains("legacy or ambiguous")
+            && !stderr.contains("disappeared"),
+        "{stderr}"
+    );
+    assert!(!data.join(".indexd.lock").exists());
+    assert!(!data.join(".indexd.v2.lock").exists());
+
+    let _ = fs::remove_dir_all(data);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A reaper judges a record dead, then removes it; a live owner can swap its record into the
+/// slot in between. The removal re-checks the slot under the directory mutex, so the live
+/// record is left exactly where it is, nothing is moved aside, and no tomb appears. Driven by
+/// `AGREP_TEST_PARK` (test builds only), which parks the reaper after its judgement.
+#[cfg(unix)]
+#[test]
+fn a_live_record_swapped_in_after_the_reapers_judgement_is_never_removed() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = temp_dir("reap-gap-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("reap-gap-data");
+    let gates = temp_dir("reap-gap-gates");
+    let build = "bbbbbbbbbbbbbbbbbbbb";
+    let command = |gated: bool| {
+        let mut command = Command::new(BIN);
+        command.args(["index", "--agent", "claude"]);
+        command.env("AGREP_HOME", &home);
+        command.env("AGREP_DATA_DIR", &data);
+        command.env("AGREP_RUNTIME_BUILD_ID", build);
+        if gated {
+            command.env("AGREP_TEST_PARK", &gates);
+        } else {
+            command.env_remove("AGREP_TEST_PARK");
+        }
+        for key in [
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "AGREP_RS_BIN",
+            "AGREP_DERIVED_ADOPTION_WAIT_MS",
+            "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
+            "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+        ] {
+            command.env_remove(key);
+        }
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        command
+    };
+    let seeded = command(false).output().unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    // A dead claimer's record is what the reaper sets out to reclaim.
+    let owner = data.join(".indexd.v2.lock");
+    fs::write(
+        &owner,
+        format!(
+            "state=derived-adoption pid=2147483647 start=fixture writer={build} token={}\n",
+            "a".repeat(32)
+        ),
+    )
+    .unwrap();
+    let reaper = command(true).spawn().unwrap();
+    wait_until("the reaper never reached its removal", || {
+        gates.join("mutex").exists()
+    });
+    // A live owner takes the slot between the reaper's judgement and its removal.
+    let pid = std::process::id();
+    let live = format!(
+        "pid={pid} start=unknown protocol=2 package=x build=y writer={build} \
+         group={pid} token={} time=1\n",
+        "e".repeat(32)
+    );
+    fs::write(&owner, &live).unwrap();
+    let live_inode = fs::metadata(&owner).unwrap().ino();
+    fs::write(gates.join("mutex.go"), b"").unwrap();
+    let reaper_output = reaper.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&reaper_output.stderr);
+    assert!(reaper_output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("serving the published snapshot read-only"),
+        "{stderr}"
+    );
+
+    assert_eq!(fs::read_to_string(&owner).unwrap(), live);
+    assert_eq!(fs::metadata(&owner).unwrap().ino(), live_inode);
+    assert!(!gates.join("rename").exists(), "a removal went ahead");
+    let litter: Vec<_> = fs::read_dir(&data)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".owner-reap-"))
+        .collect();
+    assert!(litter.is_empty(), "{litter:?}");
+    assert!(data.join(".owner-mutex").is_file());
+    assert!(!data.join(".indexd.lock").exists());
+
+    let _ = fs::remove_dir_all(gates);
+    let _ = fs::remove_dir_all(data);
+    let _ = fs::remove_dir_all(home);
+}
+
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `index-lock-contract hold` with the reap gate: a holder that parks after judging a dead
+/// `.index.lock` reclaimable, so a peer can reap and acquire first.
+fn start_gated_holder(data: &Path, label: &str, gates: Option<&Path>) -> std::process::Child {
+    let mut command = Command::new(BIN);
+    command
+        .args(["index-lock-contract", "hold", "--path"])
+        .arg(data.join(".index.lock"))
+        .args(["--label", label, "--timeout-ms", "20000"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match gates {
+        Some(gates) => command.env("AGREP_TEST_PARK", gates),
+        None => command.env_remove("AGREP_TEST_PARK"),
+    };
+    command.spawn().unwrap()
+}
+
+fn holder_ready(child: &mut std::process::Child) -> bool {
+    use std::io::{BufRead, BufReader};
+
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    ready.contains(r#""ready":true"#)
+}
+
+/// Two `.index.lock` holders never coexist. The reviewer's interleaving: reaper R judges a dead
+/// record reclaimable and parks; L reaps it and acquires; R resumes and must not remove L's
+/// record; G must wait for L. Each holder's record is intact while it is ready, and the lock
+/// changes hands only through a release.
+#[test]
+fn index_lock_holders_never_coexist_across_a_parked_reap() {
+    let data = temp_dir("holders-never-coexist");
+    let gates = temp_dir("holders-never-coexist-gates");
+    let path = data.join(".index.lock");
+    fs::write(
+        &path,
+        b"pid=2147483647 start=fixture token=00000000000000000000000000000000 label=dead time=1\n",
+    )
+    .unwrap();
+    // Only the judgement gap is under test: the reaper's own later release runs through.
+    fs::write(gates.join("rename.go"), b"").unwrap();
+    fs::write(gates.join("restore.go"), b"").unwrap();
+
+    let mut reaper = start_gated_holder(&data, "reaper", Some(&gates));
+    wait_until("the parked holder never judged the dead record", || {
+        gates.join("mutex").exists()
+    });
+    let mut first = start_gated_holder(&data, "first", None);
+    assert!(holder_ready(&mut first));
+    let first_record = fs::read(&path).unwrap();
+    assert!(first_record.windows(11).any(|w| w == b"label=first"));
+
+    fs::write(gates.join("mutex.go"), b"").unwrap();
+    let mut second = start_gated_holder(&data, "second", None);
+    // The parked reaper and the newcomer both wait on the first holder; its record stays.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert_eq!(fs::read(&path).unwrap(), first_record);
+    assert!(reaper.try_wait().unwrap().is_none());
+    assert!(second.try_wait().unwrap().is_none());
+
+    drop(first.stdin.take());
+    assert!(first.wait().unwrap().success());
+    let holder_label = |path: &Path| -> Option<String> {
+        let raw = fs::read_to_string(path).ok()?;
+        raw.split_ascii_whitespace()
+            .find_map(|part| part.strip_prefix("label="))
+            .map(str::to_owned)
+    };
+    let mut order: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let mut label = None;
+        wait_until("no waiter took over the released lock", || {
+            label = holder_label(&path).filter(|label| !order.contains(label));
+            label.is_some()
+        });
+        let label = label.unwrap();
+        let winner = match label.as_str() {
+            "reaper" => &mut reaper,
+            "second" => &mut second,
+            other => panic!("an unknown holder {other} took the lock"),
+        };
+        assert!(holder_ready(winner), "{label} never reported ready");
+        order.push(label);
+        drop(winner.stdin.take());
+        assert!(winner.wait().unwrap().success());
+    }
+    assert_eq!(order.len(), 2, "both waiters must hold the lock in turn");
+    wait_until("the released lock lingered", || !path.exists());
+    assert!(!fs::read_dir(&data).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".owner-reap-")));
+
+    let _ = fs::remove_dir_all(gates);
+    let _ = fs::remove_dir_all(data);
+}
+
+/// The unchanged-source lane rewrites the signature, clears the markers and seals the snapshot
+/// after a source pass that can take seconds. A holder displaced during that pass must refuse
+/// rather than revert what the displacer published. Parked at `warm-lane` (test builds only).
+#[test]
+fn a_displaced_holder_never_rewrites_the_signature_from_the_warm_lane() {
+    let home = temp_dir("warm-lane-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("warm-lane-data");
+    let gates = temp_dir("warm-lane-gates");
+    let command = |gated: bool| {
+        let mut command = Command::new(BIN);
+        command.args(["index", "--agent", "claude"]);
+        command.env("AGREP_HOME", &home);
+        command.env("AGREP_DATA_DIR", &data);
+        command.env("AGREP_RUNTIME_BUILD_ID", "bbbbbbbbbbbbbbbbbbbb");
+        if gated {
+            command.env("AGREP_TEST_PARK", &gates);
+        } else {
+            command.env_remove("AGREP_TEST_PARK");
+        }
+        for key in [
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "AGREP_RS_BIN",
+            "AGREP_DERIVED_ADOPTION_WAIT_MS",
+            "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
+            "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+        ] {
+            command.env_remove(key);
+        }
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        command
+    };
+    let seeded = command(false).output().unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let sig_path = data.join(".ingest.sig");
+    let published = fs::read(&sig_path).unwrap();
+
+    let warm = command(true).spawn().unwrap();
+    wait_until("the warm lane never parked", || {
+        gates.join("warm-lane").exists()
+    });
+    // Another writer displaces the parked holder and publishes its own signature.
+    let lock = data.join(".index.lock");
+    fs::remove_file(&lock).unwrap();
+    fs::write(
+        &lock,
+        b"pid=2147483647 start=fixture token=11111111111111111111111111111111 label=other time=1\n",
+    )
+    .unwrap();
+    let displacer_sig = b"999:displacer\n";
+    fs::write(&sig_path, displacer_sig).unwrap();
+    fs::write(gates.join("warm-lane.go"), b"").unwrap();
+    let output = warm.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("was displaced while held"), "{stderr}");
+    assert_eq!(fs::read(&sig_path).unwrap(), displacer_sig);
+    assert_ne!(published, displacer_sig.to_vec());
+    assert_eq!(
+        fs::read(&lock).unwrap(),
+        b"pid=2147483647 start=fixture token=11111111111111111111111111111111 label=other time=1\n"
+    );
+
+    let _ = fs::remove_dir_all(gates);
+    let _ = fs::remove_dir_all(data);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A changed-source pass whose event proof cannot be completed after the event commit must fail
+/// before any staged derived file is renamed over the published one. Parked at `event-proof`
+/// (test builds only), where a damaged row makes `publish_events_complete` report incomplete.
+#[test]
+fn an_incomplete_event_proof_promotes_no_derived_file() {
+    let home = temp_dir("event-proof-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("event-proof-data");
+    let gates = temp_dir("event-proof-gates");
+    let command = |gated: bool| {
+        let mut command = Command::new(BIN);
+        command.args(["index", "--agent", "claude"]);
+        command.env("AGREP_HOME", &home);
+        command.env("AGREP_DATA_DIR", &data);
+        if gated {
+            command.env("AGREP_TEST_PARK", &gates);
+        } else {
+            command.env_remove("AGREP_TEST_PARK");
+        }
+        for key in [
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "AGREP_RS_BIN",
+        ] {
+            command.env_remove(key);
+        }
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        command
+    };
+    let seeded = command(false).output().unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let derived = [
+        "messages.jsonl",
+        "replies.jsonl",
+        "sessions.jsonl",
+        "boundary_stats.json",
+        ".boundary_stats.bin",
+    ];
+    let published: Vec<Vec<u8>> = derived
+        .iter()
+        .map(|name| fs::read(data.join(name)).unwrap())
+        .collect();
+    // A new tool call, so the pass rewrites the event store instead of reusing its proof.
+    let transcript = join_native(&home, ".claude/projects/proj-alpha/sess-claude-0001.jsonl");
+    let session = "11111111-1111-4111-8111-111111111111";
+    let rows = [
+        serde_json::json!({
+            "type": "user", "userType": "external", "sessionId": session,
+            "timestamp": "2026-01-02T10:09:00.000Z", "cwd": "/work/alpha",
+            "message": {"role": "user", "content": "a prompt the failed pass must not publish"},
+        }),
+        serde_json::json!({
+            "type": "assistant", "sessionId": session,
+            "timestamp": "2026-01-02T10:09:05.000Z", "cwd": "/work/alpha",
+            "message": {"role": "assistant", "model": "claude-fable-5", "content": [
+                {"type": "tool_use", "id": "toolu_proof", "name": "Bash",
+                 "input": {"command": "cargo test"}}]},
+        }),
+        serde_json::json!({
+            "type": "user", "userType": "external", "sessionId": session,
+            "timestamp": "2026-01-02T10:09:10.000Z", "cwd": "/work/alpha",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_proof",
+                 "content": "all passed", "is_error": false}]},
+        }),
+    ];
+    let mut body = fs::read_to_string(&transcript).unwrap();
+    for row in rows {
+        body.push_str(&format!("{row}\n"));
+    }
+    fs::write(&transcript, body).unwrap();
+
+    // Only the event-proof gate parks; the index-lock release gates pass straight through.
+    for step in ["mutex", "rename", "restore"] {
+        fs::write(gates.join(format!("{step}.go")), b"").unwrap();
+    }
+
+    let pass = command(true).spawn().unwrap();
+    wait_until("the event write never parked", || {
+        gates.join("event-proof").exists()
+    });
+    let store = data
+        .join("events")
+        .join(agrep_core::cache::EVENT_STORE_NAME);
+    let damaged = rusqlite::Connection::open(&store)
+        .unwrap()
+        .execute(
+            "UPDATE event_sessions SET payload = CAST(payload || X'0a' AS BLOB) \
+             WHERE name = (SELECT min(name) FROM event_sessions)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(damaged, 1);
+    fs::write(gates.join("event-proof.go"), b"").unwrap();
+    let output = pass.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("event publication remained incomplete"),
+        "{stderr}"
+    );
+    for (name, before) in derived.iter().zip(&published) {
+        assert!(
+            fs::read(data.join(name)).unwrap() == *before,
+            "{name} was promoted by a pass whose event proof stayed incomplete"
+        );
+    }
+
+    let _ = fs::remove_dir_all(gates);
+    let _ = fs::remove_dir_all(data);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Under the mutex a removal renames the record aside and unlinks the tomb, so the slot is free
+/// at once: Windows keeps a record a reader still holds open delete-pending, which would refuse
+/// an exclusive create. A newcomer that takes the slot in that window is never disturbed.
+#[test]
+fn a_release_frees_the_slot_before_its_tomb_is_unlinked() {
+    let data = temp_dir("release-renames-aside");
+    let gates = temp_dir("release-renames-aside-gates");
+    let path = data.join(".index.lock");
+    // A release honours the mutex an earlier reap minted; it never mints one itself.
+    fs::write(data.join(".owner-mutex"), b"").unwrap();
+    fs::write(gates.join("mutex.go"), b"").unwrap();
+    fs::write(gates.join("rename.go"), b"").unwrap();
+    let mut holder = start_gated_holder(&data, "holder", Some(&gates));
+    assert!(holder_ready(&mut holder));
+    let record = fs::read(&path).unwrap();
+    drop(holder.stdin.take());
+    wait_until("the release never renamed the record aside", || {
+        gates.join("restore").exists()
+    });
+    let tombs = || -> Vec<PathBuf> {
+        fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry.to_string_lossy().contains(".owner-reap-"))
+            .collect()
+    };
+    assert!(!path.exists());
+    let parked = tombs();
+    assert_eq!(parked.len(), 1, "{parked:?}");
+    assert_eq!(fs::read(&parked[0]).unwrap(), record);
+    let sidecar = fs::File::open(data.join(".owner-mutex")).unwrap();
+    assert!(matches!(
+        sidecar.try_lock(),
+        Err(fs::TryLockError::WouldBlock)
+    ));
+
+    let mut newcomer = start_gated_holder(&data, "newcomer", None);
+    assert!(holder_ready(&mut newcomer));
+    let newcomer_record = fs::read(&path).unwrap();
+    assert!(newcomer_record.windows(14).any(|w| w == b"label=newcomer"));
+    fs::write(gates.join("restore.go"), b"").unwrap();
+    let released = holder.wait_with_output().unwrap();
+    assert!(
+        released.status.success(),
+        "{}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+    assert_eq!(fs::read(&path).unwrap(), newcomer_record);
+    assert!(tombs().is_empty());
+    drop(newcomer.stdin.take());
+    assert!(newcomer.wait().unwrap().success());
+    assert!(!path.exists());
+
+    let _ = fs::remove_dir_all(gates);
+    let _ = fs::remove_dir_all(data);
 }
 
 fn install_cli_owned_cold_cache(data: &Path, agent: &str) {
@@ -3006,6 +3755,61 @@ fn harness_policy_change_invalidates_source_shortcut() {
     let warm = ingest_output("claude", &home, &data, false);
     assert!(warm.status.success());
     assert!(String::from_utf8_lossy(&warm.stdout).contains("skipped ingest + writes"));
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A project name alone never reclassifies the user's own turns: `control_plane` is an
+/// ordinary project until the corpus-local policy names it with a `project:` line.
+#[test]
+fn project_names_classify_as_harness_only_through_the_policy() {
+    let home = temp_dir("harness-project-home");
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("harness-project-data");
+    let policy = data.join("harness_prefixes.txt");
+    let session = "77777777-7777-4777-8777-777777777777";
+    let prompt = "rotate the etcd certificates before friday";
+    let project = home.join(".claude").join("projects").join("-home-u-code-control-plane");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join(format!("{session}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"userType\":\"external\",\"sessionId\":\"{session}\",\
+             \"timestamp\":\"2026-01-02T10:00:00.000Z\",\"cwd\":\"/Users/runner/code/control_plane\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"{prompt}\"}}}}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\
+             \"timestamp\":\"2026-01-02T10:00:05.000Z\",\"cwd\":\"/Users/runner/code/control_plane\",\
+             \"message\":{{\"role\":\"assistant\",\"model\":\"claude-fable-5\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"renewing them now\"}}]}}}}\n"
+        ),
+    )
+    .unwrap();
+    let row_who = |data: &Path| -> String {
+        fs::read_to_string(data.join("messages.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row.get("text").and_then(|value| value.as_str()) == Some(prompt))
+            .and_then(|row| row.get("who").and_then(|v| v.as_str()).map(str::to_string))
+            .expect("control_plane prompt row")
+    };
+
+    ingest_into("claude", &home, &data, false);
+    assert_eq!(row_who(&data), "user");
+
+    fs::write(&policy, "# benchmark projects\nproject:control_\n").unwrap();
+    let configured = ingest_output("claude", &home, &data, false);
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    assert_eq!(row_who(&data), "harness");
+
+    fs::remove_file(&policy).unwrap();
+    assert!(ingest_output("claude", &home, &data, false).status.success());
+    assert_eq!(row_who(&data), "user");
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
@@ -4731,12 +5535,16 @@ fn denied_scope_with_lost_cache_names_only_satisfiable_recovery_and_heals_on_res
             stderr.contains("retained the old generation"),
             "{label} refusal changed shape:\n{stderr}"
         );
+        // Fixing the source, or the explicit rebuild's consent to leave it out, are the levers;
+        // neither a retry nor a bare `--full` reads a denied scope.
         assert!(
-            stderr.contains("readable again"),
-            "{label} refusal hides the one real lever:\n{stderr}"
+            stderr.contains(
+                "fix or remove it in claude, or run `agrep reindex --full` to rebuild without it"
+            ),
+            "{label} refusal hides the real levers:\n{stderr}"
         );
         assert!(
-            !stderr.contains("--full") && !stderr.contains("will retry"),
+            !stderr.contains("will retry") && !stderr.contains("`agrep index --full`"),
             "{label} refusal advertises a lever this state cannot satisfy:\n{stderr}"
         );
         assert_eq!(msg_keys(&data), baseline, "{label} mutated the generation");
@@ -4889,8 +5697,10 @@ fn cacheless_event_repair_accepts_a_stable_incomplete_pair_and_refuses_honestly(
         !second_err.contains("parse cache"),
         "a stable incomplete pair was not accepted as the second observation:\n{second_err}"
     );
+    // The denied project is all the history there is: a rebuild without it would publish an
+    // empty generation, so access is the one lever named.
     assert!(
-        second_err.contains("readable again"),
+        second_err.contains("readable again") && !second_err.contains("--full"),
         "the surviving refusal lost the real lever:\n{second_err}"
     );
     assert_eq!(msg_keys(&data), baseline);

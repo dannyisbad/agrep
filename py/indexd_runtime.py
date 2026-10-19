@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Callable, Mapping, NamedTuple
 
 import common
+import derived_anchor
 import events
 import fileops
 from hookless import locators
+import index_lock
 import ownerfile
 import removal_fence
 import surface_policy as surface
@@ -187,10 +189,10 @@ _INDEXD_HEARTBEAT_STALE_S = 15.0
 _INDEXD_RESPONSE_GRACE_S = 7.0
 _INDEXD_RESPONSE_MAX_BYTES = 4096
 _SOURCE_HEALTH_MAX_BYTES = 1024 * 1024
-DERIVED_OWNER_PATH = common.DATA_DIR / ".derived-owner.json"
+DERIVED_OWNER_PATH = common.DATA_DIR / derived_anchor.OWNER_NAME
 INGEST_CACHE_PATH = common.DATA_DIR / ".ingest_cache.bin"
-_DERIVED_OWNER_VERSION = 1
-_DERIVED_OWNER_MAX_BYTES = 4096
+_DERIVED_OWNER_VERSION = derived_anchor.OWNER_VERSION
+_DERIVED_OWNER_MAX_BYTES = derived_anchor.OWNER_MAX_BYTES
 _INGEST_CACHE_OWNER_BYTES = 44
 _INGEST_CACHE_BASE_MAGIC = b"AGRPCB01"
 _INGEST_CACHE_OWNER_OFFSET = 24
@@ -236,6 +238,9 @@ class DerivedMutationInfo(NamedTuple):
     # a rollback journal, not an owner, is what stopped the probe: no Python
     # writer may proceed, and only the lock-holding Rust writer can adjudicate it
     journal_blocked: bool = False
+    # a store sidecar this user cannot read and write stopped it: no writer, Python or Rust, may
+    # proceed until its owner or mode is fixed, yet the derived stores are still ours
+    sidecar_blocked: bool = False
 
     @property
     def writable(self) -> bool:
@@ -303,10 +308,35 @@ class DerivedWriteFenced(OSError):
         self.info = info
 
 
-def _fenced_reason(exc: OSError) -> str:
+def fenced_reason(exc: OSError) -> str:
     """Name a refused writer launch in the ownership vocabulary, always."""
     info = getattr(exc, "info", None)
     return str(getattr(info, "reason", "") or exc) or type(exc).__name__
+
+
+newer_anchor_version = derived_anchor.newer_version
+
+
+def newer_anchor_reason(version: int, fmt: int | None = None) -> str:
+    detail = f"ownership record version {version}"
+    if fmt is not None:
+        detail += f", format {fmt}"
+    return (
+        f"the data dir was written by a newer agrep ({detail}); this agrep "
+        "serves it read-only; upgrade, or point AGREP_DATA_DIR elsewhere")
+
+
+def newer_anchor() -> tuple[int, int | None] | None:
+    """(version, format) when the ownership anchor on disk was written by a
+    newer agrep, else None. The one bounded read every surface that names
+    the cause shares; a missing or undecodable anchor is simply not newer."""
+    return derived_anchor.newer_anchor(DERIVED_OWNER_PATH)
+
+
+def newer_anchor_fence() -> str | None:
+    """The newer-agrep reason when that is what fences this build, else None."""
+    newer = newer_anchor()
+    return None if newer is None else newer_anchor_reason(*newer)
 
 
 def _binary_identity_path() -> Path:
@@ -490,23 +520,51 @@ def assert_python_runtime_unchanged() -> None:
             "restart this process before writing derived stores")
 
 
-def rust_writer_env(binary: Path | None = None) -> dict[str, str]:
-    """Prepare one child environment immediately before a Rust writer launch."""
+def event_store_sidecar_refusal() -> DerivedMutationInfo | None:
+    """The refusal an event-store sidecar this user cannot read and write imposes on a pass."""
+    # Every pass writes the event store; only the Rust writer does, so only its launch waits.
+    blocked = index_lock.inaccessible_sidecars(
+        common.DATA_DIR / "events" / common.EVENT_STORE_NAME, "event store")
+    if not blocked:
+        return None
+    import source_health
+    return DerivedMutationInfo(
+        "unavailable", None, source_health.inaccessible_sidecar_line(blocked[0]),
+        sidecar_blocked=True)
+
+
+def writer_launch_refusal(
+        binary: Path | None = None) -> DerivedMutationInfo | None:
+    """The verdict that refuses a Rust writer launch here, or None when one
+    may launch. `rust_writer_env` raises it; an explicit index or setup
+    reports it as a decline before anything is launched."""
     if _data_dir_readonly():
-        raise DerivedWriteFenced(DerivedMutationInfo(
+        return DerivedMutationInfo(
             "unavailable", None,
             "AGREP_DATA_READONLY protects this data directory from writer "
-            "preparation"))
+            "preparation")
     try:
         assert_python_runtime_unchanged()
         build_id = derived_writer_build_id(binary, require_binary=True)
     except OSError as exc:
-        raise DerivedWriteFenced(
-            DerivedMutationInfo("unavailable", None, str(exc))) from exc
+        return DerivedMutationInfo("unavailable", None, str(exc))
     ownership = derived_writer_mutation_info(
         build_id, allow_legacy_adoption=True)
     if not derived_writer_launchable(ownership):
-        raise DerivedWriteFenced(ownership)
+        return ownership
+    return event_store_sidecar_refusal()
+
+
+def rust_writer_env(binary: Path | None = None) -> dict[str, str]:
+    """Prepare one child environment immediately before a Rust writer launch."""
+    refusal = writer_launch_refusal(binary)
+    if refusal is not None:
+        raise DerivedWriteFenced(refusal)
+    try:
+        build_id = derived_writer_build_id(binary, require_binary=True)
+    except OSError as exc:
+        raise DerivedWriteFenced(
+            DerivedMutationInfo("unavailable", None, str(exc))) from exc
     env = dict(os.environ)
     env["AGREP_RUNTIME_BUILD_ID"] = build_id
     env[_PYTHON_RUNTIME_BUILD_ID_ENV] = INDEXD_BUILD_ID
@@ -534,6 +592,15 @@ def rust_writer_env(binary: Path | None = None) -> dict[str, str]:
     return env
 
 
+def explicit_rust_writer_env(binary: Path | None = None) -> dict[str, str]:
+    """`rust_writer_env` for a foreground explicit index: the child waits out a
+    live same-build writer instead of declining; background launches never wait."""
+    env = rust_writer_env(binary)
+    env[_DERIVED_ADOPTION_WAIT_MS_ENV] = str(
+        max(0, int(_UPGRADE_SETTLEMENT_WAIT_S * 1000)))
+    return env
+
+
 # A frozen direct Rust launch inherits the exact Python half; the executable
 # binds its own bytes at process start. Final combined IDs are launch-scoped and
 # must never leak from a parent process into a different binary.
@@ -541,6 +608,7 @@ os.environ[_PYTHON_RUNTIME_BUILD_ID_ENV] = INDEXD_BUILD_ID
 os.environ.pop("AGREP_RUNTIME_BUILD_ID", None)
 os.environ.pop(_DERIVED_WRITER_IDENTITY_BLOCKED_ENV, None)
 os.environ.pop(_DERIVED_ADOPTION_OWNER_TOKEN_ENV, None)
+os.environ.pop(_DERIVED_ADOPTION_WAIT_MS_ENV, None)
 
 
 def _valid_change_token(value: object) -> bool:
@@ -620,6 +688,10 @@ def derived_owner_info(
             "unavailable", None, None,
             f"derived-store ownership record {DERIVED_OWNER_PATH} "
             f"is unreadable: {exc}")
+    newer = newer_anchor_version(record)
+    if newer is not None:
+        return DerivedOwnerInfo(
+            "unavailable", None, None, newer_anchor_reason(*newer))
     allowed = {
         "version", "build_id", "legacy_corpus_db", "retained_corpus_db"}
     if (not isinstance(record, dict)
@@ -821,7 +893,15 @@ def derived_writer_mutation_info(
     # corpusdb's structured state is authoritative. Do not reverse-classify
     # its human disclosure text to invent a more specific owner/state here.
     return DerivedMutationInfo(
-        "unavailable", None, reason, journal_blocked=ownership.journal_blocked)
+        "unavailable", None, reason, journal_blocked=ownership.journal_blocked,
+        sidecar_blocked=getattr(ownership, "sidecar_blocked", False))
+
+
+# Lower layers (the Metal weight adoption in mlx_embed) ask common for this
+# verdict instead of importing upward; resolved at call time so test seams
+# that patch derived_writer_mutation_info keep working.
+common.derived_writes_permitted = (
+    lambda: derived_writer_mutation_info().writable)
 
 
 def explicit_index_declined() -> bool:
@@ -833,7 +913,7 @@ def explicit_index_declined() -> bool:
     prints an elapsed time over work that did not happen. The cause is the ingest's
     line to say and it already said it; this one adds only the verdict.
     """
-    if derived_writer_mutation_info().writable:
+    if derived_writer_mutation_settled().writable:
         return False
     common.log("indexing declined; nothing was rebuilt")
     return True
@@ -995,6 +1075,27 @@ def _await_upgrade_settlement(timeout_s: float) -> bool:
         time.sleep(min(0.5, remaining))
 
 
+def explicit_ingest_published(rerun: Callable[[], int]) -> bool:
+    """After an explicit ingest exited 0: whether this build's derived stores are its own.
+
+    An upgrade's takeover republishes under the new writer within one daemon
+    pass, and that daemon's follow-up work can hold corpus.db for a beat; an
+    explicit index landing inside either window waits for the settlement and
+    reruns the ingest instead of failing a healthy box. False when it declined.
+    One passing probe is the verdict: the daemon's follow-up work on the
+    publication just made must not turn a second probe into a decline."""
+    if derived_writer_mutation_settled().writable:
+        return True
+    if _await_upgrade_settlement(_UPGRADE_SETTLEMENT_WAIT_S):
+        returncode = rerun()
+        common.dbg(
+            f"ingest rerun after writer settlement: rc={returncode}",
+            "<" if returncode == 0 else "!")
+        if returncode != 0:
+            return False
+    return not explicit_index_declined()
+
+
 def _await_first_publication(build_id: str, *, timeout_s: float) -> bool:
     """Wait briefly for the same-build cold writer instead of racing its empty state."""
     deadline = time.monotonic() + max(0.0, timeout_s)
@@ -1101,16 +1202,18 @@ def build_index(
     # is bound to its exact Python+Rust build before launch.
     try:
         kw["env"] = (
-            rust_writer_env(ingest) if ingest.exists() else dict(os.environ))
-        if require_search_index:
-            kw["env"][_DERIVED_ADOPTION_WAIT_MS_ENV] = str(
-                max(0, int(_UPGRADE_SETTLEMENT_WAIT_S * 1000)))
+            (explicit_rust_writer_env(ingest) if require_search_index
+             else rust_writer_env(ingest))
+            if ingest.exists() else dict(os.environ))
     except OSError as fenced:
         # An unreadable ownership anchor is a local condition with a cause to
         # name, never an unexpected error for the caller's crash handler.
-        common.log(f"indexing declined; {_fenced_reason(fenced)}")
+        common.log(f"indexing declined; {fenced_reason(fenced)}")
         return False
     cmd = [str(ingest), "index", "--agent", "all"]
+    if require_search_index:
+        # An explicit index is the remedy surfaces name for a failed read: it retries it.
+        cmd.append("--retry-failed-sources")
     common.dbg(
         f"ingest exec: {' '.join(cmd)} (cwd={common.REPO_ROOT})", ">")
     common._close_event_reader()
@@ -1146,23 +1249,16 @@ def build_index(
                 f"indexing failed with exit {r.returncode}"
                 f"{_captured_ingest_failure(r)}")
         return False
-    if require_search_index and not derived_writer_mutation_info().writable:
-        # An upgrade's takeover republishes under the new writer within one
-        # daemon pass; an explicit index landing inside that window waits for
-        # the settlement and reruns the ingest instead of failing a healthy box.
-        if _await_upgrade_settlement(_UPGRADE_SETTLEMENT_WAIT_S):
-            r = subprocess.run(cmd, cwd=str(common.REPO_ROOT), **kw)
-            common.dbg(
-                f"ingest rerun after writer settlement: rc={r.returncode}",
-                "<" if r.returncode == 0 else "!")
-        if r.returncode != 0 or explicit_index_declined():
-            # a declined ingest published nothing for the census below to vouch for
-            return False
+    if require_search_index and not explicit_ingest_published(
+            lambda: subprocess.run(cmd, cwd=str(common.REPO_ROOT), **kw).returncode):
+        # a declined ingest published nothing for the census below to vouch for
+        return False
     record_binary_identity(ingest)
-    if census_before is not None and not unreadable_before:
-        # The pre-pass census under-claims what the ingest consumed, so a
-        # green verdict from this record can never cover unconsumed changes.
-        # An unreadable store means the census cannot vouch: no record.
+    if (census_before is not None and not unreadable_before
+            and _source_health_failure() is None):
+        # The pre-pass census under-claims what the ingest consumed, so a green verdict
+        # from this record never covers unconsumed changes. A store unreadable to that
+        # census, or whose read failed after it, cannot be vouched for: no record.
         record_verified_current(census_before, wall=t, digests=digests_before)
     streak, _ = indexd_failing()
     if streak:
@@ -1538,8 +1634,7 @@ def _run_search_index_build(
             "the background search-index build could not be queued and the "
             "inline refresh failed")
     if spawned is _IndexdSpawnResult.BLOCKED:
-        _set_freshen_failure(
-            "blocked-owner", "the freshness owner is blocked")
+        _set_freshen_failure("blocked-owner", blocked_owner_detail())
         return surface.IndexBuildOutcome.BLOCKED
     if not allow_inline_fallback and request_search_index_build():
         common.dbg(
@@ -2890,7 +2985,7 @@ def indexd_resource_status(
                if responsiveness == "unprobed" else {}),
         }
     ownership = derived_writer_mutation_info()
-    if not ownership.writable:
+    if not ownership.writable and not ownership.sidecar_blocked:
         return {
             "running": False,
             "blocked": True,
@@ -3032,7 +3127,7 @@ def heartbeat_indexd_owner(owner: ownerfile.Handle) -> None:
     """Refresh the diagnostic heartbeat only while exact ownership survives."""
     if _data_dir_readonly():
         return
-    if not derived_writes_permitted():
+    if not derived_ownership_held():
         raise ownerfile.OwnershipLost(
             derived_writer_mutation_info().reason)
     owner.touch()
@@ -3043,7 +3138,7 @@ def publish_indexd_ready(owner: ownerfile.Handle) -> ownerfile.Handle:
     if _data_dir_readonly():
         raise PermissionError(
             "AGREP_DATA_READONLY protects this data directory")
-    if not derived_writes_permitted():
+    if not derived_ownership_held():
         raise ownerfile.OwnershipLost(
             derived_writer_mutation_info().reason)
     owner_snapshot = owner.verify()
@@ -3289,6 +3384,15 @@ def _set_freshen_failure(code: str, reason: str) -> None:
     _FRESHEN_FAILURE.value = surface.FreshnessFailure(code, reason)
 
 
+def blocked_owner_detail() -> str:
+    """The blocked-owner hedge. The marker clause stays first so the corpus-loss
+    escalation still recognises it; a newer anchor, the one fence the reader can
+    end, is named after it (one anchor read; the fence was just read to refuse)."""
+    detail = surface.BLOCKED_OWNER_STALE_MARKER
+    fence = newer_anchor_fence()
+    return detail if fence is None else f"{detail}: {fence}"
+
+
 # The ownership-refusal code every emitter and checker shares: corpusdb
 # discloses it, _daemon_will_converge refuses to promise convergence on it.
 DERIVED_STORE_OWNER_CODE = surface.DERIVED_STORE_OWNER_CODE
@@ -3519,6 +3623,12 @@ def derived_writes_permitted() -> bool:
     return derived_writer_launchable(info) and not live_indexer_claim()
 
 
+def derived_ownership_held() -> bool:
+    """Whether this build still owns the derived stores, even while a sidecar it cannot read and
+    write keeps every writer waiting. That file is not lost ownership, so a daemon keeps running."""
+    return derived_writes_permitted() or derived_writer_mutation_info().sidecar_blocked
+
+
 def live_indexer_claim() -> bool:
     """True only while a LIVE process verifiably holds the indexer here.
 
@@ -3563,6 +3673,9 @@ class RepairKick(NamedTuple):
     decline and the freshness story that hedges on it can never disagree."""
     in_flight: bool
     cause: str
+    # the cause in the reader's words when the code alone cannot carry it
+    # (a newer anchor names its version and the remedy); "" otherwise
+    detail: str = ""
 
 
 def _automatic_refresh_disabled() -> bool:
@@ -3603,9 +3716,17 @@ def kick_background_repair() -> RepairKick:
             return RepairKick(False, "no-daemon")
         if not common.ingest_bin().exists():
             return RepairKick(False, "no-binary")
+        import source_health
+        if source_health.store_sidecars_blocked():
+            # no pass can use that file, so neither a running daemon nor a new one repairs it
+            return RepairKick(False, "sidecar-blocked")
         if freshener_alive():
             return RepairKick(True, "")  # already hot; it will reach the damage
         if not derived_writes_permitted():
+            fence = newer_anchor_fence()
+            if fence is not None:
+                # the one fence the reader can end: upgrade, or point elsewhere
+                return RepairKick(False, "newer-anchor", fence)
             # An exact incompatible daemon is an upgrade predecessor, not an
             # indefinite fence. _spawn_indexd performs the process-identity
             # checked handoff; every hostile/unverifiable claim stays closed.
@@ -4709,13 +4830,35 @@ def _source_health_failure() -> surface.FreshnessFailure | None:
     if not isinstance(record, dict) or record.get("code") != "source-unreadable":
         return surface.FreshnessFailure(
             "source-unreadable", "the source health record is malformed")
-    issues = record.get("issues")
-    issue = issues[0] if isinstance(issues, list) and issues else None
-    if not isinstance(issue, dict):
+    issues = record.get("issues") if isinstance(record.get("issues"), list) else []
+    # A record the last pass refused to publish over holds every agent back, not only its own.
+    holding = next((item for item in issues if isinstance(item, dict)
+                    and item.get("blocks_publication") is True), None)
+    issue = holding or next((item for item in issues if isinstance(item, dict)
+                             and not surface.attribution_only_issue(item)), None)
+    if issue is None:
+        # Every record is an attribution gap: each chat is indexed and drift alone decides
+        # freshness. Doctor's agent-stores line and why carry the provisional note.
+        if any(isinstance(item, dict) for item in issues):
+            return None
         return surface.FreshnessFailure(
             "source-unreadable", "an agent-history source could not be read")
     source_path = str(issue.get("path") or "an agent-history source")
     reason = str(issue.get("reason") or "read failed")
+    # A record carrying a conversation names the chat that failed inside its store.
+    session = issue.get("session")
+    if isinstance(session, str) and session:
+        source_path += f" ({issue.get('agent') or 'agent'} conversation {session})"
+    if holding is not None:
+        if holding.get("rebuild") is False:
+            return surface.FreshnessFailure(
+                "unreadable-holds-everything",
+                f"{source_path} could not be read ({reason}) and is all the index holds")
+        # This build cannot run the rebuild a newer agrep's data dir needs; that agrep can.
+        return surface.FreshnessFailure(
+            "unreadable-holds-newer-owner" if newer_anchor() is not None
+            else "unreadable-holds-index",
+            f"{source_path} could not be read ({reason}) and holds the index back")
     return surface.FreshnessFailure(
         "source-unreadable", f"{source_path} could not be read ({reason})")
 
@@ -4835,6 +4978,9 @@ def machine_freshness(
         out = surface.publication_freshness_disclosure()
     else:
         out = surface.freshness_disclosure(failure)
+        if failure is not None and failure.code in surface.FRESHNESS_UNVERIFIED_CODES:
+            # the census could not vouch: nothing was checked, whatever the caller consulted
+            checked = False
     if failure is not None:
         out["reason"] = _bounded_freshness_reason(failure.reason)
     if checked is not None:
@@ -4922,6 +5068,10 @@ def rebuild_promise() -> str:
     renders the remedy itself (one owner; no census spawned here)."""
     if getattr(_FOREGROUND_SNAPSHOT, "failure", None) is not None:
         return ""
+    import source_health
+    blocked = source_health.sidecar_block_remedy()
+    if blocked:
+        return f"; {blocked}"
     if _daemon_will_converge():
         return "; the daemon rebuilds in the background"
     return f"; {surface.REMEDIES['index-behind-manual'].text}"
@@ -4941,6 +5091,15 @@ def _ownership_fault_healing(code: str) -> bool:
 
 def freshness_story() -> surface.FreshnessStory:
     """The single freshness authority behind every display surface (D3)."""
+    import source_health
+    blocked = source_health.store_sidecars_blocked()
+    if blocked:
+        # No pass runs, so no failure is recorded: readers name the block, then any hold.
+        held = source_health.held_publication_remedy(newer_owner=newer_anchor() is not None)
+        return surface.FreshnessStory(
+            "unverified", code="sidecar-blocked",
+            detail=source_health.inaccessible_sidecar_line(blocked[0])
+            + (f"; {held}" if held else ""))
     failure = indexing_failure()
     if failure is not None:
         if failure.code == "consecutive-failures":
@@ -5514,8 +5673,7 @@ def _maybe_freshen() -> None:
             _set_fts_delegated(True)
         defer_foreground_refresh("background refresh is safely fenced")
         common.dbg("freshen: protected work prevents an inline refresh", "!")
-        _set_freshen_failure(
-            "blocked-owner", "the freshness owner is blocked")
+        _set_freshen_failure("blocked-owner", blocked_owner_detail())
         return
     if spawned is _IndexdSpawnResult.FAILED:
         common.dbg(

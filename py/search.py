@@ -685,11 +685,19 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     if (not resident.get("running")
             and not resident.get("protected")):
         import embedder
+        import semantic
         cached = embedder.model_cached()
         embeddings_off = common.setting("embeddings") == "off"
         bootstrap_disabled = (
             not cached and not embeddings_off and _semantic_bootstrap_disabled())
-        if cached:
+        lane_pending = (
+            semantic.lane_weights_pending() if cached and not embeddings_off
+            and not allow_model_download else None)
+        if cached and lane_pending:
+            launch_detail = (
+                "Metal weights not downloaded yet; building on the CPU lane "
+                "(`agrep doctor --fix` downloads them)")
+        elif cached:
             refusal = semworker._worker_coordination_refusal_reason()
             launch_detail = (
                 "starting the semantic worker ..." if refusal is None else
@@ -730,6 +738,10 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
         data = semworker.search_worker(
             q, level=sem_level, k=fetch_k, filters=wire_filters,
             **worker_timeout)
+    except semworker.ResidentSemanticNamespaceBlocked as exc:
+        # A planted or unsafe coordination namespace clears only by hand:
+        # neither the resident nor the in-process fallback may use it.
+        return _semantic_runtime_unavailable(q, requested, who, str(exc))
     except semworker.ResidentSemanticProtocolMismatch:
         # No inference ran, so one in-process attempt is safe;
         # the stale resident exits without a lease refresh.
@@ -807,7 +819,11 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                     q, requested, who,
                     "bounded local semantic fallback returned an invalid result")
         else:
-            owner = semworker.acquire_inprocess_owner()
+            try:
+                owner = semworker.acquire_inprocess_owner()
+            except semworker.ResidentSemanticNamespaceBlocked as exc:
+                return _semantic_runtime_unavailable(
+                    q, requested, who, str(exc))
             if owner is None:
                 status = semworker.resident_status()
                 state = str(status.get("owner_state") or "unavailable")
@@ -1019,19 +1035,21 @@ def _semantic_result_incomplete(
 def _parse_when(s: str) -> int:
     """A --since/--until value -> epoch ms (the unit hits store ts in). Accepts a
     relative age (`90s` `30m` `24h` `7d` `2w` = that long ago) or an absolute local
-    `YYYY-MM-DD`, optionally with ` HH:MM[:SS]`."""
-    s = s.strip().lower()
-    m = re.fullmatch(r"(\d+)\s*([smhdw])", s)
+    `YYYY-MM-DD`, optionally with ` HH:MM[:SS]` or ISO's `THH:MM[:SS]`."""
+    raw = s.strip()
+    m = re.fullmatch(r"(\d+)\s*([smhdw])", raw.lower())
     if m:
         per = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
         return int((time.time() - int(m.group(1)) * per) * 1000)
     import datetime
+    absolute = re.sub(r"^(\d{4}-\d{2}-\d{2})[Tt](?=\d)", r"\1 ", raw)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return int(datetime.datetime.strptime(s, fmt).timestamp() * 1000)
+            return int(datetime.datetime.strptime(absolute, fmt).timestamp() * 1000)
         except ValueError:
             pass
-    common.log(f"bad time {s!r} - use 7d / 24h / 2w / 30m or YYYY-MM-DD")
+    common.log(f"bad time '{terminal_safe(raw)}' - use 7d / 24h / 2w / 30m, "
+               "YYYY-MM-DD or YYYY-MM-DDTHH:MM")
     raise SystemExit(2)
 
 
@@ -2766,6 +2784,8 @@ def _bounded_keyword_rows(db, q: str, limit: int, flt: dict,
         pending.clear()
 
     def queue_for_boundary(hit: dict, is_phrase: bool) -> None:
+        hit["_query_echo_checked"] = q
+        hit["_query_echo_match"] = is_phrase
         bucket = phrase_best if is_phrase else term_best
         worst = phrase_worst if is_phrase else term_worst
         if len(bucket) >= limit and worst is not None:
@@ -3390,6 +3410,8 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 )
                 for row, start, end in thin_phrase:
                     hit = corpusdb._hit(row, start, end)
+                    hit["_query_echo_checked"] = q
+                    hit["_query_echo_match"] = True
                     session = row[0]
                     carried_root = thin_roots.get(session, session)
                     if ((caller_root and carried_root == caller_root)
@@ -3484,6 +3506,8 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
 
             if phrase_match:
                 hit = corpusdb._hit(row, start, end)
+                hit["_query_echo_checked"] = q
+                hit["_query_echo_match"] = True
                 pending.append((hit, family, True))
                 phrase_count += 1
                 phrase_sessions.add(session)
@@ -3495,6 +3519,8 @@ def _bounded_keyword_sessions(db, q: str, limit: int, flt: dict,
                 if not (session_view_rank and phrase_match):
                     hit = corpusdb._spans_hit(row, term_spans)
                     hit["matched"] = "all-terms"
+                    hit["_query_echo_checked"] = q
+                    hit["_query_echo_match"] = phrase_match
                     pending.append((hit, family, False))
                 term_count += 1
                 term_sessions.add(session)
@@ -3576,9 +3602,10 @@ class LaneResult:
     semantic_truncated: bool = False
     index_missing: bool = False
     rank_now_ms: float | None = None
-    # tool rows were excluded from this lane (FTS build owned elsewhere):
-    # every renderer must see the narrowing, not re-derive the window
+    # tool rows were excluded from this lane (FTS build owned elsewhere, or an
+    # unreadable event store): every renderer must see the narrowing and its reason
     tools_excluded: bool = False
+    tools_excluded_reason: str = surface.TOOLS_PENDING_ERROR_CODE
 
 
 class RegexTimeoutError(RuntimeError):
@@ -4099,10 +4126,15 @@ def _semantic_local_fallback_child_main() -> int:
             **request, "timing": False,
         })
         owner_deadline = time.monotonic() + owner_wait_s
+        blocked_reason = None
         while owner is None:
             if not parent_is_live():
                 break
-            owner = semworker.acquire_inprocess_owner()
+            try:
+                owner = semworker.acquire_inprocess_owner()
+            except semworker.ResidentSemanticNamespaceBlocked as exc:
+                blocked_reason = str(exc)
+                break
             if (owner is not None
                     or semworker.removal_fence.background_removal_active()
                     or time.monotonic() >= owner_deadline):
@@ -4112,7 +4144,7 @@ def _semantic_local_fallback_child_main() -> int:
         if owner is None:
             envelope = {
                 "ok": False,
-                "reason": (
+                "reason": blocked_reason or (
                     "a safe in-process owner could not be acquired before "
                     "the fallback deadline"),
             }
@@ -4794,6 +4826,17 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
             result.tools_excluded = True
         flt["include_tools"] = include_tools
         flt["_tool_lane_enabled"] = False
+    if (tool_lane_requested and not search_index_pending
+            and not common.event_store_readable()):
+        # Tool rows come from the event store alone in this lane: serve prose, disclosed.
+        result.tools_excluded = True
+        result.tools_excluded_reason = surface.EVENTS_UNAVAILABLE_ERROR_CODE
+        if tool_lane_only():
+            result.engine = "none"
+            return result
+        include_tools = False
+        flt["include_tools"] = include_tools
+        flt["_tool_lane_enabled"] = False
     native = None
     native_checked = False
     if db is None and not search_index_pending and _native_event_shape(spec):
@@ -4829,7 +4872,12 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
         # in a sentence (law 1), and the scan serves silently while it runs
         # (law 3). A held foreign claim is the one cause worth a line (law 5).
         kick = indexd_runtime.kick_background_repair()
-        if kick.cause in ("held-foreign-owner", "owner-unverifiable"):
+        if kick.cause == "newer-anchor":
+            _announce_slow_lane(
+                "db-unusable",
+                f"{kick.detail} - scanning sources this query"
+                f"{_scan_lever_tail(spec)}")
+        elif kick.cause in ("held-foreign-owner", "owner-unverifiable"):
             _announce_slow_lane(
                 "db-unusable",
                 "the search index is held by another agrep - scanning "
@@ -5182,6 +5230,7 @@ def _finalize_query(spec: QuerySpec, result: LaneResult) -> dict:
         # a lane that excluded tool rows measured a narrowed corpus: its
         # total is a floor, and every surface downstream sees the narrowing
         out["tools_excluded"] = True
+        out["tools_excluded_reason"] = result.tools_excluded_reason
         out["totals_exact"] = False
     return out
 
@@ -5692,7 +5741,8 @@ def _start_compact_page(
         total_floor: int | None = None,
         total_uncounted: bool = False,
         chat_scoped: bool = False,
-        explicit_tool_filter: bool = False):
+        explicit_tool_filter: bool = False,
+        count_floor: bool = False):
     hits = _collapse_identical(hits)
     roots = _family_roots_for_hits(hits)
     hits = _near_fold(hits, roots)
@@ -5773,7 +5823,8 @@ def _start_compact_page(
         tool_rescue_page=tool_rescue_page,
         deeper_covered=_DEEPER_SKIP_ROWS,
         total_floor=total_floor,
-        total_uncounted=total_uncounted, chat_scoped=chat_scoped)
+        total_uncounted=total_uncounted, chat_scoped=chat_scoped,
+        count_floor=count_floor)
 
 
 def _search_argv_base(
@@ -5959,7 +6010,7 @@ def _compact_summary(page) -> None:
         continuation = f"agrep --deeper {page.handle}"
         action_label = "broader rerun (may repeat)"
     argv = page.deeper_argv or ()
-    exhaustible = (not page.more_unknown
+    exhaustible = (not page.count_floor and not page.more_unknown
                    and not ("-s" in argv or "--hybrid" in argv))
     floor = None if page.total_uncounted else page.floor
     common.log(surface.compact_completeness_line(
@@ -6387,6 +6438,14 @@ def _emit_overspec_block(q: str, fkw: dict, hits: list[dict], self_policy, *,
 
 def _mark_query_echoes(q: str, hits: list[dict]) -> None:
     """Mark full-query quotations on the exact indexed result rows."""
+    unresolved = []
+    for hit in hits:
+        if hit.get("_query_echo_checked") == q:
+            if hit.get("_query_echo_match"):
+                hit["_query_echo"] = True
+        else:
+            unresolved.append(hit)
+    hits = unresolved
     if not hits:
         return
     echo_pat = _hl_regex(q, False)
@@ -6401,29 +6460,42 @@ def _mark_query_echoes(q: str, hits: list[dict]) -> None:
     if db is None:
         return
     try:
-        flags = []
-        for hit in hits:
-            where = "session = ? AND turn IS ? AND who IS ?"
-            params = [hit.get("session"), hit.get("turn"), hit.get("who")]
-            if type(hit.get("ts")) is int:
-                where += " AND ts = ?"
-                params.append(hit["ts"])
-            echo = False
-            for ts, text, digest in db.execute(
-                    "SELECT ts, text, content_digest FROM msgs WHERE " + where,
-                    params):
-                expected_digest = hit.get("content_digest")
-                if (expected_digest is not None
-                        and expected_digest != (digest or compact.content_digest(text))):
+        requests = [
+            [ordinal, hit.get("session"), hit.get("turn"), hit.get("who"),
+             hit["ts"] if type(hit.get("ts")) is int else None]
+            for ordinal, hit in enumerate(hits)]
+        flags = [False] * len(hits)
+        resolved = set()
+        digests = {}
+        rows = db.execute(
+            "SELECT json_extract(r.value, '$[0]'), m.id, m.ts, m.text, "
+            "m.content_digest FROM json_each(?) r JOIN msgs m ON "
+            "m.session = json_extract(r.value, '$[1]') "
+            "AND m.turn IS json_extract(r.value, '$[2]') "
+            "AND m.who IS json_extract(r.value, '$[3]') "
+            "AND (json_extract(r.value, '$[4]') IS NULL "
+            "OR m.ts = json_extract(r.value, '$[4]')) "
+            "ORDER BY r.key, m.id",
+            (json.dumps(requests, separators=(",", ":")),))
+        for ordinal, row_id, ts, text, digest in rows:
+            if ordinal in resolved:
+                continue
+            hit = hits[ordinal]
+            expected_digest = hit.get("content_digest")
+            if expected_digest is not None:
+                if not digest:
+                    digest = digests.get(row_id)
+                    if digest is None:
+                        digest = digests[row_id] = compact.content_digest(text)
+                if expected_digest != digest:
                     continue
-                identity = hit.get("_event_identity")
-                if (identity is not None
-                        and common.tool_event_identity(
-                            hit.get("session"), hit.get("turn"), ts, text) != identity):
-                    continue
-                echo = echo_pat.search(text) is not None
-                break
-            flags.append(echo)
+            identity = hit.get("_event_identity")
+            if (identity is not None
+                    and common.tool_event_identity(
+                        hit.get("session"), hit.get("turn"), ts, text) != identity):
+                continue
+            flags[ordinal] = echo_pat.search(text) is not None
+            resolved.add(ordinal)
     except sqlite3.DatabaseError as exc:
         corpusdb.record_query_database_error(exc, db)
         return
@@ -6941,7 +7013,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                "  agrep -w leak                      whole word only\n"
                "  agrep -E \"TODO|FIXME\" --who agent  regex, agent replies only\n"
                "  agrep oom --who user,agent         several speakers, comma list\n"
-               "  agrep oom --no-who subagent        hide side-chat turns\n"
+               "  agrep oom --no-side                hide side chats (spawned subagents)\n"
                "  agrep fixture --no-meta            drop tooling-about-history rows\n"
                "  agrep -l auth                      which chats mention it\n"
                "  agrep -c oom                       just the count\n"
@@ -7857,7 +7929,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             if importlib.util.find_spec("onnxruntime") is not None:
                 common.log("0 exact hits - semantic search would run here but is "
                            f"{surface.SEMANTIC_LANE_POLICY.warming} "
-                           "(bare `agrep` shows progress)")
+                           "(run `agrep doctor` to see progress)")
     if self_policy is not None:
         measured_modes = []
         if not args.semantic or not sem_used:
@@ -7930,6 +8002,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 f"{console.shell_command('agrep', q, '--lexical')}")
         else:
             common.log("no confident meaning match, and no prose match either")
+    tools_gap = res.get("tools_excluded_reason", surface.TOOLS_PENDING_ERROR_CODE)
     semantic_evidence = secondary_semantic_result or res
     if ((sem_used or semantic_lane_participated) and not porcelain_zero
             and not hits and not res.get("tools_excluded") and not args.json
@@ -7958,9 +8031,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             common.log(_weak_semantic_neighbors_notice(q))
         elif res.get("tools_excluded"):
             # the zero's scope claim forfeits: this lane searched prose only
-            common.log(surface.TOOL_QUERY_PENDING_LINE
+            common.log(surface.tool_query_gap_line(tools_gap)
                        if args.who_filter == "tool"
-                       else surface.tools_pending_zero_line(mode))
+                       else surface.tools_gap_zero_line(mode, tools_gap))
         else:
             common.log(display_policy.matcher_empty_line(
                 mode, _indexed_message_total()))
@@ -8015,7 +8088,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         action_unavailable_reason=action_unavailable,
         no_exhaustive_form=(None if exhaustible
                             else surface.SEMANTIC_NO_EXHAUSTIVE_FORM),
-        tool_rows=int(res.get("tool_hits") or 0))
+        # A lane that excluded tool rows never counted them: no number, not a zero.
+        tool_rows=(None if res.get("tools_excluded")
+                   else int(res.get("tool_hits") or 0)))
 
     # highlight pattern mirrors the search mode (none for semantic chat titles)
     pat = (None if mode == "regex" and not sem_used
@@ -8025,14 +8100,14 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
 
     if (res.get("tools_excluded") and hits and not args.json
             and not args.count and not args.count_by_tier):
-        common.log(surface.SCAN_TOOLS_PENDING_LINE)
+        common.log(surface.tools_gap_line(tools_gap))
 
     if args.count:
         print(f">={n_total}" if not result_totals_exact else f"{n_total}")
         if completeness["total_basis"] == "floor":
             # the ">=" on stdout says the number is short; only stderr has room
             # to say why, and a piped caller reading it must not need a tty
-            common.log(surface.count_floor_tools_pending(n_total)
+            common.log(surface.count_floor_tools_gap(n_total, tools_gap)
                        if res.get("tools_excluded") else
                        f">={n_total} is a floor, not the total - the counting "
                        "lane stopped early on this query")
@@ -8046,8 +8121,7 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 common.log("keyword (related terms; no exact match)")
     elif args.count_by_tier:
         if res.get("tools_excluded"):
-            common.log("tier counts are unavailable while tool output is "
-                       "still indexing")
+            common.log(surface.tier_counts_gap_line(tools_gap))
         else:
             tiers = _count_tiers(hits)
             fields = [f"{name}={value}" for name, value in tiers.items()]
@@ -8072,8 +8146,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
         if res.get("tools_excluded"):
             # the same narrowing every other surface reads: the lane served
             # prose only, so the totals beside it are floors of the corpus
-            machine_fields = {**machine_fields, "tools_excluded": {
-                "reason": surface.TOOLS_PENDING_ERROR_CODE}}
+            machine_fields = {**machine_fields,
+                              "tools_excluded": surface.tools_excluded_record(tools_gap)}
         if hits:
             self_family = current_family
             if self_family is None and common.in_agent_context():
@@ -8115,9 +8189,9 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 meta["error"] = {"code": "index-missing",
                                  "remedy": "agrep index"}
             elif res.get("tools_excluded") and args.who_filter == "tool":
-                # a tool-only query in the build window ran nothing at all
-                meta["error"] = {"code": surface.TOOLS_PENDING_ERROR_CODE,
-                                 "reason": surface.TOOL_QUERY_PENDING_LINE}
+                # a tool-only query on a prose-only scan ran nothing at all
+                meta["error"] = {"code": tools_gap,
+                                 "reason": surface.tool_query_gap_line(tools_gap)}
             if args.semantic:
                 meta["semantic"] = (
                     semantic_status or res.get("semantic_status"))
@@ -8158,7 +8232,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
                 total_uncounted=total_uncounted,
                 chat_scoped=bool(args.chat),
                 total_floor=total_floor,
-                explicit_tool_filter=args.who_filter == "tool")
+                explicit_tool_filter=args.who_filter == "tool",
+                count_floor=bool(res.get("tools_excluded")))
         except (OSError, compact.CompactError) as exc:
             # Classic output is complete and correct, so falling back is not
             # the reader's situation (law 3); the invariant that broke is a
@@ -8354,7 +8429,8 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             _emit_main_overspec_block()
     elif more_exist and not args.json and not args.count and not args.count_by_tier:
         # piped consumers get no tty footer; disclose the cut without touching stdout
-        common.log(surface.completeness_line(completeness))
+        common.log(surface.completeness_line(
+            completeness, count_exact=not res.get("tools_excluded")))
     _note_self_exclusion()
     _note_freshness()
     if res.get("tools_excluded") and (args.count or args.count_by_tier):

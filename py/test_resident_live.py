@@ -1,6 +1,9 @@
 """Resident live-state IPC is bounded and generation exact."""
 
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import contextlib
 import io

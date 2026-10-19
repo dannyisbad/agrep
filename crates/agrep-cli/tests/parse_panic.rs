@@ -541,3 +541,96 @@ fn a_torn_publication_still_admits_a_never_indexed_panicking_store() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&data);
 }
+
+/// What the cursor fixture's attribution can lose: nothing, its per-workspace source, or the
+/// global store's own `composerHeaders` (a schema drift records the gap on the store itself).
+#[derive(Clone, Copy, Debug)]
+enum AttributionGap {
+    None,
+    Workspace,
+    HeaderDrift,
+}
+
+fn open_attribution_gap(home: &Path, gap: AttributionGap) {
+    let user = join_native(home, ".config/Cursor/User");
+    match gap {
+        AttributionGap::None => {}
+        AttributionGap::Workspace => fs::write(
+            user.join("workspaceStorage/aaaa0001bbbb0002cccc0003dddd0004/workspace.json"),
+            b"{ not json",
+        )
+        .unwrap(),
+        AttributionGap::HeaderDrift => {
+            let global =
+                rusqlite::Connection::open(user.join("globalStorage/state.vscdb")).unwrap();
+            global
+                .execute_batch(
+                    "DROP TABLE IF EXISTS composerHeaders; \
+                     CREATE TABLE composerHeaders(composerId TEXT);",
+                )
+                .unwrap();
+            global.close().unwrap();
+        }
+    }
+}
+
+/// An attribution gap settles only itself. A parse that fails on a cursor conversation while the
+/// workspace source, or the global store's own header table, is unreadable is a lost row like any
+/// other: the pass refuses, cold or warm, and keeps the published rows.
+#[test]
+fn token_lane_panic_is_never_settled_by_an_attribution_gap() {
+    for gap in [
+        AttributionGap::None,
+        AttributionGap::Workspace,
+        AttributionGap::HeaderDrift,
+    ] {
+        let home = cursor_home();
+        copy_dir(&fixture_home("codex"), &home);
+        let global = join_native(&home, ".config/Cursor/User/globalStorage/state.vscdb");
+        let codex = codex_rollout(&home);
+        let data = temp_dir("parse-panic-cursor-gap-data");
+        assert_published(&index(&home, &data, None), &format!("{gap:?}: first index"));
+        let before = messages(&data);
+        let cursor_rows = |published: &str| -> Vec<String> {
+            published
+                .lines()
+                .filter(|row| row.contains("\"agent\":\"cursor\""))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert!(!cursor_rows(&before).is_empty());
+        open_attribution_gap(&home, gap);
+
+        for (step, extra) in [("cold --full", &["--full"][..]), ("lost cache", &[][..])] {
+            if extra.is_empty() {
+                fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+                append_codex_turn(&codex, "codex churn");
+            }
+            let output = run(&home, &data, BUILD, Some(&global), extra);
+            assert!(
+                !output.status.success(),
+                "{gap:?}: {step}: a panicking cursor parse published past the gap:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("retained the old generation"),
+                "{gap:?}: {step}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                cursor_rows(&messages(&data)),
+                cursor_rows(&before),
+                "{gap:?}: {step}: cursor rows dropped"
+            );
+        }
+
+        // The parser fixed, the gap alone publishes: every cursor row kept, codex churn in.
+        let healed = run(&home, &data, FIXED_BUILD, None, &[]);
+        assert_published(&healed, &format!("{gap:?}: healed pass"));
+        let published = messages(&data);
+        assert_eq!(cursor_rows(&published), cursor_rows(&before), "{gap:?}");
+        assert!(published.contains("codex churn"), "{gap:?}");
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
+}

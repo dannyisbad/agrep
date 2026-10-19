@@ -10,13 +10,18 @@ remove() completely. Patching path constants per-test is the pattern that
 once let remove() reach the developer's real settings.
 """
 
+
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import copy
 import contextlib
 import hashlib
 import json
 import io
+import os
 import shlex
 import tempfile
 import unittest
@@ -27,6 +32,32 @@ from types import SimpleNamespace
 import hookinstall
 import cli
 import teach
+
+
+class InstallReceiptTests(unittest.TestCase):
+    def test_fresh_install_receipt(self) -> None:
+        self.assertEqual(
+            hookinstall._install_receipt(
+                "pi", "post-compact extension", "none", "ours"),
+            "  pi: post-compact extension installed (fires on compaction only)")
+
+    def test_changed_owned_bytes_receipt(self) -> None:
+        self.assertEqual(
+            hookinstall._install_receipt(
+                "pi", "post-compact extension", "ours", "ours", changed=True),
+            "  pi: post-compact extension updated")
+
+    def test_owned_bytes_unchanged_receipt(self) -> None:
+        self.assertEqual(
+            hookinstall._install_receipt(
+                "pi", "post-compact extension", "ours", "ours"),
+            "  pi: post-compact extension already installed, unchanged")
+
+    def test_unreadable_before_receipt(self) -> None:
+        self.assertEqual(
+            hookinstall._install_receipt(
+                "pi", "post-compact extension", "unreadable", "unreadable"),
+            "  pi: post-compact extension NOT installed - the config is unreadable")
 
 
 class ClaudeHookTests(unittest.TestCase):
@@ -253,7 +284,7 @@ class CodexHookTests(unittest.TestCase):
     def test_symlinked_hooks_json_is_never_classified_or_removed_as_ours(
             self) -> None:
         backing = self.paths[0].parent / "user-hooks.json"
-        body = hookinstall._codex_hook_payload()
+        body = hookinstall._codex_hook_payload(self.paths[0])
         backing.write_text(body, encoding="utf-8")
         try:
             self.paths[0].symlink_to(backing)
@@ -288,7 +319,7 @@ class CodexHookTests(unittest.TestCase):
         with mock.patch.object(
                 hookinstall, "_codex_python", return_value=python), \
                 mock.patch.object(hookinstall.console, "WIN", False):
-            current = json.loads(hookinstall._codex_hook_payload())
+            current = json.loads(hookinstall._codex_hook_payload(self.paths[0]))
             legacy = copy.deepcopy(current)
             legacy["hooks"]["SessionStart"][0]["hooks"][0]["command"] = (
                 f"{python} "
@@ -300,19 +331,33 @@ class CodexHookTests(unittest.TestCase):
             self.assertTrue(hookinstall.install_codex_hooks(warn=False))
             self.assertEqual(
                 self.paths[0].read_text(encoding="utf-8"),
-                hookinstall._codex_hook_payload())
+                hookinstall._codex_hook_payload(self.paths[0]))
+            self.paths[0].write_text(raw, encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(hookinstall.install(warn=True), 0)
+            self.assertIn(
+                "codex: SessionStart/compact hook upgraded to the current launcher",
+                output.getvalue())
 
-    def test_codex_command_quotes_spaced_interpreter_as_one_argv_token(
+    def test_codex_command_is_a_launcher_quoting_a_spaced_interpreter(
             self) -> None:
         python = "/opt/Python Builds/$release;stable/bin/python"
         with mock.patch.object(
                 hookinstall, "_codex_python", return_value=python), \
                 mock.patch.object(hookinstall.console, "WIN", False):
-            value = json.loads(hookinstall._codex_hook_payload())
+            value = json.loads(hookinstall._codex_hook_payload(self.paths[0]))
+            self.assertTrue(hookinstall.install_codex_hooks(warn=False))
         command = value["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-        self.assertEqual(
-            shlex.split(command),
-            [python, str(hookinstall.CODEX_PAYLOAD)])
+        launcher = hookinstall.codex_launcher_path(self.paths[0])
+        # the command itself is shell-agnostic: a plain `/bin/sh <file>`
+        self.assertEqual(shlex.split(command), ["/bin/sh", str(launcher)])
+        self.assertEqual(hookinstall._codex_command_operands(command),
+                         ("launcher", "/bin/sh", str(launcher)))
+        text = launcher.read_text(encoding="utf-8")
+        self.assertIn(f"p={shlex.quote(python)}\n", text)
+        self.assertIn('[ -x "$p" ] || p=python3\n', text)
+        self.assertTrue(os.access(launcher, os.X_OK))
 
     def test_user_hooks_json_is_never_overwritten(self) -> None:
         user = json.dumps({"hooks": {"SessionStart": [
@@ -426,6 +471,20 @@ class PiOmpExtensionTests(unittest.TestCase):
         for path in self.paths.values():
             self.assertEqual(path.read_bytes(), self.shipped)
 
+    def test_prior_payload_receipt_reports_updated(self) -> None:
+        stale = b"previous agrep pi extension\n"
+        for path in self.paths.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(stale)
+        digest = hashlib.sha256(stale).hexdigest()
+        with mock.patch.object(
+                hookinstall, "PRIOR_PI_EXTENSION_HASHES",
+                frozenset({digest})):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(hookinstall.install(warn=True), 0)
+        self.assertIn("pi: post-compact extension updated", output.getvalue())
+
     def test_known_prior_payload_hashes_remain_upgradeable(self) -> None:
         self.assertEqual(hookinstall.PRIOR_PI_EXTENSION_HASHES, frozenset({
             "34c99ac023bca77e457359c36bc57f698e364e49aece0100c3135a4fe22ea55b",
@@ -433,6 +492,7 @@ class PiOmpExtensionTests(unittest.TestCase):
             "4b26c969f97e57607fc8d8d21666442ac162dcdcf3d083ae6a2a9c72050b656f",
             "7f9fd2e3910ffa76c9b928aa14a98651f3809fdb55a0ac37c71bfc2e9efde114",
             "6cfdf55fd59ba3834f9557804b79da19930ea14e803b267a5cf04e2690033a94",
+            "f87f3fa065e74d4954fda4d9cc6473615e8023c44781808de42efa86e0a6fc9f",
         }))
         # the shipped payload is a new version, never one already pinned
         self.assertNotIn(

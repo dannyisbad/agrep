@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -17,7 +18,64 @@ sys.path.insert(0, str(ROOT / "py"))
 from _test_support import isolate_data_dir  # noqa: E402
 
 isolate_data_dir()
+import around  # noqa: E402
 import recall  # noqa: E402
+
+
+def _tail_marker(text: str) -> int:
+    match = re.search(r" \[\+([\d,]+) chars - agrep around [^\]]*\]$", text)
+    return int(match.group(1).replace(",", "")) if match else -1
+
+
+class ShrinkMarkerTests(unittest.TestCase):
+    """A re-shrunk row's embedded marker counts everything hidden, matching omitted_chars."""
+
+    def _capped_row(self, text: str, cap: int) -> dict:
+        capped, omitted = around._cap(text, cap, around._expand_command("w", 0, "user"))
+        return {"kind": "msg", "session": "w", "turn": 0, "who": "user",
+                "text": capped, "omitted_chars": omitted}
+
+    def test_anchored_shrink_marker_counts_the_whole_omission(self) -> None:
+        anchors = recall._anchor_patterns("longprobe")
+        # the match leads: the shrink keeps the head and re-caps the tail
+        row = self._capped_row("longprobe " + "filler words here " * 4000, 1500)
+        self.assertTrue(recall._shrink_row(row, anchors=anchors))
+        self.assertGreater(row["omitted_chars"], 70_000)
+        self.assertEqual(_tail_marker(row["text"]), row["omitted_chars"])
+        # the match sits past the head: the shrink slides to it and keeps both markers
+        row = self._capped_row(
+            "preface " * 175 + "longprobe " + "filler words here " * 4000, 2500)
+        self.assertTrue(recall._shrink_row(row, anchors=anchors))
+        self.assertRegex(row["text"], r"^\[\+[\d,]+ chars - agrep around ")
+        self.assertIn("longprobe", row["text"])
+        self.assertEqual(_tail_marker(row["text"]), row["omitted_chars"])
+
+    def test_multi_window_shrink_gaps_add_up_to_the_omission(self) -> None:
+        anchors = recall._anchor_patterns("probe")
+        row = self._capped_row(("probe " + "x " * 300) * 3 + "y " * 3000, 2400)
+        self.assertTrue(recall._shrink_row(row, anchors=anchors))
+        self.assertIn("[snippet - open: agrep around", row["text"])
+        gaps = [int(gap.replace(",", ""))
+                for gap in re.findall(r"\[([\d,]+) chars\]", row["text"])]
+        self.assertEqual(sum(gaps), row["omitted_chars"])
+
+    def test_json_fit_markers_match_omitted_chars(self) -> None:
+        text = "longprobe " + "prompt filler " * 5000
+        reply = "answer filler " * 4000
+        obj = {"query": "longprobe", "engine": "fixture", "hits": [{
+            "session": "w", "turn": 0, "window": [
+                {"kind": "msg", "session": "w", "turn": 0, "ts": 1, "who": "user",
+                 "text": text, "omitted_chars": 0},
+                {"kind": "msg", "session": "w", "turn": 0, "ts": 1, "who": "agent",
+                 "text": reply, "omitted_chars": 0},
+            ]}]}
+        rendered = recall._fit_json_payload(
+            obj, 4096, hit_anchors=[recall._anchor_patterns("longprobe")])
+        rows = json.loads(rendered)["hits"][0]["window"]
+        for row in rows:
+            with self.subTest(who=row["who"]):
+                self.assertGreater(row["omitted_chars"], 40_000)
+                self.assertEqual(_tail_marker(row["text"]), row["omitted_chars"])
 
 
 class RecallBudgetPriorityTests(unittest.TestCase):

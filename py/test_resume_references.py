@@ -209,5 +209,135 @@ class ResumeReferenceTests(unittest.TestCase):
                 self.assertEqual(resume.main([SESSION]), status)
 
 
+SIDE = "agent-ahostile01"
+
+
+def _side_row(session: str = SIDE, *, parent: str = SESSION, last_ts: int = 9) -> dict:
+    return {**_row(session, first_text="[subagent task] probe the module",
+                   last_ts=last_ts), "parent": parent}
+
+
+class SideChatResumeTests(unittest.TestCase):
+    """A side chat is not a resumable transcript; it resumes the chat that spawned it."""
+
+    _run = ResumeReferenceTests._run
+
+    def test_side_chat_handle_resumes_its_root_parent(self) -> None:
+        rows = [_side_row(), _row(last_ts=1)]
+        for query in (SIDE, f"@{SIDE}:0.1895", "agent-ah"):
+            with self.subTest(query=query):
+                rc, _out, err, _live, launch, _prompt = self._run([query], rows)
+                self.assertEqual(rc, 0, err)
+                launch.assert_called_once_with("claude", SESSION)
+                self.assertIn("side chat", err)
+                self.assertIn("spawned by 01a06003", err)
+
+    def test_nested_side_chats_climb_to_the_root(self) -> None:
+        rows = [_side_row("agent-grandchild", parent="agent-child"),
+                _side_row("agent-child"), _row()]
+        rc, _out, err, _live, launch, _prompt = self._run(["agent-grandchild"], rows)
+        self.assertEqual(rc, 0, err)
+        launch.assert_called_once_with("claude", SESSION)
+
+    def test_side_chat_without_an_indexed_parent_refuses_and_names_it(self) -> None:
+        rc, _out, err, _live, launch, _prompt = self._run(
+            [SIDE], [_side_row(parent="deadbeef-missing")])
+        self.assertEqual(rc, 1)
+        launch.assert_not_called()
+        self.assertIn("deadbeef-missing", err)
+        self.assertIn("side chat", err)
+        self.assertIn("isn't indexed", err)
+
+    def test_a_looping_parent_chain_is_named_as_a_loop(self) -> None:
+        rows = [_side_row("agent-one", parent="agent-two"),
+                _side_row("agent-two", parent="agent-one")]
+        rc, _out, err, _live, launch, _prompt = self._run(["agent-one"], rows)
+        self.assertEqual(rc, 1)
+        launch.assert_not_called()
+        self.assertIn("loops back to agent-one", err)
+        self.assertNotIn("isn't indexed", err)
+
+    def test_side_chat_resume_follows_each_agents_layout(self) -> None:
+        # codex side threads are rollouts with their own thread ids: resumed directly.
+        # pi/omp nest side chats as <slug>/<stamp>_<parent>/<name>.jsonl, which `-r`
+        # cannot address: they resume through the root like Claude's subagents.
+        side_id = "019a-side-thread"
+        for agent, expect_launch in (("codex", side_id), ("pi", SESSION)):
+            with self.subTest(agent=agent):
+                side = {**_side_row(side_id), "agent": agent}
+                parent = {**_row(), "agent": agent}
+                rc, _out, err, _live, launch, _prompt = self._run(
+                    [side_id], [side, parent])
+                self.assertEqual(rc, 0, err)
+                launch.assert_called_once_with(agent, expect_launch)
+                self.assertEqual("spawned by" in err, expect_launch == SESSION)
+        # a top-level pi session (no parent) is its own <stamp>_<id>.jsonl: direct
+        top = {**_row("019b-top-level", first_text="plain pi chat"), "agent": "pi"}
+        rc, _out, err, _live, launch, _prompt = self._run(["019b-top-level"], [top])
+        self.assertEqual(rc, 0, err)
+        launch.assert_called_once_with("pi", "019b-top-level")
+
+    def test_live_only_side_chat_resumes_its_indexed_parent(self) -> None:
+        live_side = _side_row("agent-live-child")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(resume, "_sessions", return_value=[_row()]), \
+                mock.patch.object(resume, "_live_match",
+                                  return_value=([live_side], True)), \
+                mock.patch.object(resume.native, "resume_in_place", return_value=0) as launch, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = resume.main(["agent-live-child"])
+        self.assertEqual(rc, 0, err.getvalue())
+        launch.assert_called_once_with("claude", SESSION)
+
+    def test_listings_and_pickers_offer_root_chats_only(self) -> None:
+        rows = [_side_row(), _row(last_ts=1)]
+        rc, out, err, _live, launch, _prompt = self._run(["--list"], rows)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("agent-ah", out)
+        self.assertIn("01a06003", out)
+
+        rc, _out, err, _live, launch, prompt = self._run([], rows, tty=True, selection="1")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("agent-ah", err)
+        launch.assert_called_once_with("claude", SESSION)
+
+        # a project label or first-line substring never picks the side chat
+        for query in ("solo-finder", "probe the module"):
+            with self.subTest(query=query):
+                rc, _out, err, _live, launch, _prompt = self._run([query], rows)
+                self.assertEqual(rc, 0 if query == "solo-finder" else 1, err)
+                if query == "solo-finder":
+                    launch.assert_called_once_with("claude", SESSION)
+                else:
+                    launch.assert_not_called()
+
+    def test_n_zero_lists_every_session_like_sibling_surfaces(self) -> None:
+        rows = [_row(f"chat-{i:03d}", last_ts=i) for i in range(20)]
+        rc, out, err, _live, _launch, _prompt = self._run(["--list", "-n", "0"], rows)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(out.splitlines()), 20)
+        rc, out, _err, _live, _launch, _prompt = self._run(["zzzznope", "-n", "0"], rows)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(out.splitlines()), 20)
+        rc, out, _err, _live, _launch, _prompt = self._run(["--list"], rows)
+        self.assertEqual(len(out.splitlines()), 15)
+
+    def test_help_documents_the_missing_cli_exit(self) -> None:
+        rc, out, _err, _live, _launch, _prompt = self._run(["--help"], [])
+        self.assertEqual(rc, 0)
+        flat = " ".join(out.split())
+        self.assertIn("127 the agent's CLI isn't on PATH", flat)
+        self.assertIn("0 = all", flat)
+
+    def test_unresumable_claude_id_leaves_no_project_folder_behind(self) -> None:
+        import tempfile
+        native = resume.native
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(native, "HOME", td):
+            cwd = str(Path(td) / "work")
+            native._claude_link_session("agent-nothing-to-link", cwd)
+            self.assertFalse((Path(td) / ".claude").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

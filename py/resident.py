@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
-PROTOCOL = 2
+PROTOCOL = 3
 RESIDENT_KEY_ENV = (
     "AGREP_HOME", "AGREP_DATA_DIR", "AGREP_DATA_DIR_SOURCE", "AGREP_DATA_READONLY",
     "AGREP_RS_BIN", "AGREP_DEBUG", "AGREP_T0", "AGREP_DERIVED_JOURNAL_SETTLE_S",
@@ -19,8 +19,8 @@ RESIDENT_KEY_ENV = (
     "AGREP_SEM_QUERY_RECOVERY_WAIT_S", "AGREP_SEM_QUERY_RECOVERY_POLL_S",
     "AGREP_SEM_INTEGRITY_MIN_DROPS", "AGREP_RESIDENT_IDLE_S",
     "AGREP_CALLER_PUBLICATION_DIR", "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
-    "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED", "AGREP_FAMILY_PUBLICATION_WAIT_S",
-    "AGREP_RUNTIME_BUILD_ID",
+    "AGREP_DERIVED_ADOPTION_WAIT_MS", "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+    "AGREP_FAMILY_PUBLICATION_WAIT_S", "AGREP_RUNTIME_BUILD_ID",
     "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP", "PATH", "PYTHONPATH", "PYTHONHOME",
     "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONCOERCECLOCALE", "PYTHONUNBUFFERED",
@@ -39,8 +39,22 @@ _COMMANDS = frozenset((
 _READ_COMMANDS = frozenset(("search", "chats", "around", "recall", "summary", "why"))
 _MAX_REQUEST = 4 * 1024 * 1024
 _SUN_PATH_MAX = 104 if sys.platform == "darwin" else 108
-# Result kinds: the command returned a code, the child exited without one, or a signal ended it.
-_REPORTED, _EXITED, _SIGNALED = 0, 1, 2
+# One round each way: the server waits this long for the request, then for the go byte; the
+# client for the acknowledgement, which includes a fork that on a loaded host outlasts the
+# quarter second given to connect, hello and greeting. Only a greeting server earns it.
+_REQUEST_DEADLINE_S = 2.0
+# A command opens with a hello byte and sends its request, with the client's descriptors,
+# only once the server has greeted: a wedged server never greets and never holds those
+# descriptors. A STOP carries no hello and gets its plain OK, whatever the server's version.
+_HELLO, _GREETING = b"H", b"A"
+# How long a remove waits for every server to be gone. A server mid-preload holds its lock
+# and cannot be asked to stop until it is past the preload, where it sees the marker and
+# exits by itself; on a loaded host that preload is what the budget has to cover.
+_STOP_BUDGET_S = 10.0
+# Result kinds: the command returned a code, the child exited without one, a signal ended it,
+# or the server closed the child's gate before the go byte, so nothing ran and the client
+# runs the command itself.
+_REPORTED, _EXITED, _SIGNALED, _DECLINED = 0, 1, 2, 3
 
 
 def eligible(argv: list[str]) -> bool:
@@ -347,6 +361,10 @@ def try_run(argv: list[str] | None = None) -> int | None:
             return None
         if not _peer_ok(connection):
             return None
+        connection.sendall(_HELLO)
+        if _recv_exact(connection, 1) != _GREETING:
+            return None
+        connection.settimeout(_REQUEST_DEADLINE_S)
         streams = [(stream.encoding, stream.errors,
                     getattr(stream, "line_buffering", False),
                     getattr(stream, "write_through", False))
@@ -368,13 +386,20 @@ def try_run(argv: list[str] | None = None) -> int | None:
         pid = int.from_bytes(reply[1:], "big")
         for signum, handler in _client_handlers(pid).items():
             handlers[signum] = signal.signal(signum, handler)
-        connection.sendall(b"G")
+        try:
+            connection.sendall(b"G")
+        except OSError:
+            # The server may have closed the gate first; its declined verdict is
+            # still readable, and a vanished server reads as a disconnect below.
+            pass
         connection.settimeout(None)
         reply = _recv_exact(connection, 6)
         if reply[:1] != b"R":
             raise OSError("invalid resident result")
         code = int.from_bytes(reply[1:5], "big")
         kind = reply[5]
+        if kind == _DECLINED:
+            return None
         if kind == _SIGNALED:
             if not 0 < code < signal.NSIG:
                 raise OSError("invalid resident signal")
@@ -585,7 +610,7 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                         continue
                     last_connection = time.monotonic()
                     state = {"socket": connection, "body": bytearray(), "fds": [],
-                             "deadline": last_connection + 2, "pid": None}
+                             "deadline": last_connection + _REQUEST_DEADLINE_S, "pid": None}
                     clients[connection.fileno()] = state
                     selector.register(connection, selectors.EVENT_READ, state)
                     continue
@@ -598,7 +623,9 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                     _, status = os.waitpid(pid, 0)
                     children.pop(pid, None)
                     kind = _REPORTED
-                    if len(result) != 4:
+                    if state.get("declined"):
+                        kind, result = _DECLINED, (0).to_bytes(4, "big")
+                    elif len(result) != 4:
                         if os.WIFSIGNALED(status):
                             kind, code = _SIGNALED, os.WTERMSIG(status)
                         else:
@@ -637,6 +664,16 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                         connection.sendall(b"OK")
                         close_client(state)
                         return
+                    if not state.get("greeted"):
+                        if body[:1] == _HELLO:
+                            state["greeted"] = True
+                            del body[:1]
+                            connection.sendall(_GREETING)
+                        elif body[:1] != b"S":
+                            close_client(state)
+                            continue
+                        else:
+                            continue
                     if len(body) < 4:
                         continue
                     size = int.from_bytes(body[:4], "big")
@@ -648,6 +685,12 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                     request = marshal.loads(body[4:])
                     if (len(state["fds"]) != 3 or not _valid_request(request)
                             or _peer_pid(connection) != request[4]):
+                        close_client(state)
+                        continue
+                    # A request that completed past its deadline is declined whole: the
+                    # client falls back inline rather than committing to a child whose
+                    # gate the same iteration would close.
+                    if time.monotonic() > state["deadline"]:
                         close_client(state)
                         continue
                     gate_read, gate_write = os.pipe()
@@ -670,6 +713,9 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                     children[pid] = state
                     selector.register(result_read, selectors.EVENT_READ, state)
                     connection.sendall(b"P" + pid.to_bytes(4, "big"))
+                    # the go byte gets its own round from here, not the remainder of the
+                    # request's, which a slow fork may already have spent
+                    state["deadline"] = time.monotonic() + _REQUEST_DEADLINE_S
                 except (OSError, ValueError, EOFError, TypeError):
                     if state["pid"] is not None:
                         lose_client(state)
@@ -682,6 +728,7 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
                         close_client(state)
                     elif "gate" in state:
                         os.close(state.pop("gate"))
+                        state["declined"] = True
                 if now > state.get("kill_at", now):
                     del state["kill_at"]
                     _kill_group(state["pid"], signal.SIGKILL)
@@ -692,6 +739,12 @@ def _serve_loop(listener, entry, guard: int, path: str, stamp: tuple, idle: floa
             except ProcessLookupError:
                 pass
         for state in list(clients.values()):
+            if state["pid"] is not None and state.get("gate") is not None:
+                try:
+                    state["socket"].sendall(
+                        b"R" + (0).to_bytes(4, "big") + bytes([_DECLINED]))
+                except OSError:
+                    pass
             close_client(state)
         deadline = time.monotonic() + 1
         for pid, state in children.items():
@@ -736,6 +789,8 @@ def serve(path: str, guard: int) -> None:
         if os.stat(path + ".lock").st_ino != os.fstat(guard).st_ino:
             return
         if not _endpoint_usable(path) or path != socket_path():
+            return
+        if _stopping_marker_active(_directory(create=False)):
             return
         idle = _idle_seconds()
         # Import reads only keyed variables; without the spawner's others, every import-time
@@ -795,7 +850,7 @@ def stop_servers() -> dict:
     if holder is None:
         return {"ok": False, "stopped": []}
     try:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + _STOP_BUDGET_S
         while True:
             busy = False
             with os.scandir(directory) as entries:

@@ -35,6 +35,17 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def color_override() -> bool | None:
+    """The environment's verdict on colour: NO_COLOR set and non-empty (no-color.org)
+    disables it, FORCE_COLOR set and non-empty forces it, otherwise the stream decides.
+    console.color_enabled applies this first; the hookless layer cannot import it."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return None
+
+
 def dbg(msg: str, sign: str = "*") -> None:
     """Trace one line to stderr when AGREP_DEBUG is on. No-op otherwise."""
     if not DEBUG:
@@ -42,7 +53,8 @@ def dbg(msg: str, sign: str = "*") -> None:
     ms = (time.time() - _DBG_T0) * 1000.0
     line = f"{sign} [agrep +{ms:8.1f}ms] {msg}"
     try:
-        if sys.stderr.isatty():
+        override = color_override()
+        if override if override is not None else sys.stderr.isatty():
             line = f"\033[2m{line}\033[0m"  # dim, like curl's verbose chatter
     except Exception:  # noqa: BLE001 -- isatty on an odd stream; just print plain
         pass

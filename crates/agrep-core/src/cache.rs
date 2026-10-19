@@ -3,13 +3,14 @@
 //! `write_messages` emits compact JSON Lines with stable `agent:session:turn` identifiers. The
 //! Python search layer imports those rows and joins optional enrichment by the same identifier.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 #[cfg(windows)]
 use std::io;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use rayon::prelude::*;
@@ -100,7 +101,52 @@ pub fn promote_file_atomic(tmp: &Path, path: &Path) -> anyhow::Result<()> {
     replace_file(tmp, path)
 }
 
-fn write_atomic_buffered<F>(path: &Path, capacity: usize, f: F) -> anyhow::Result<()>
+/// A derived file written in full beside its destination but not yet published there; one
+/// dropped without `promote` removes its staged copy.
+#[must_use]
+pub struct StagedFile {
+    tmp: Option<PathBuf>,
+    path: PathBuf,
+}
+
+impl StagedFile {
+    /// Refuse a destination the replacing rename cannot take, before anything it must follow
+    /// commits: a directory is the one target a rename of a regular file always fails on.
+    pub fn check_destination(&self) -> anyhow::Result<()> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.is_dir() => anyhow::bail!(
+                "cannot publish {}: a directory is in the way",
+                self.path.display()
+            ),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("cannot inspect {}", self.path.display()))
+            }
+        }
+    }
+
+    pub fn promote(mut self) -> anyhow::Result<()> {
+        let Some(tmp) = self.tmp.take() else {
+            return Ok(());
+        };
+        let result = replace_file(&tmp, &self.path);
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Some(tmp) = self.tmp.take() {
+            let _ = fs::remove_file(tmp);
+        }
+    }
+}
+
+fn stage_atomic_buffered<F>(path: &Path, capacity: usize, f: F) -> anyhow::Result<StagedFile>
 where
     F: FnOnce(&mut BufWriter<fs::File>) -> anyhow::Result<()>,
 {
@@ -110,18 +156,23 @@ where
         }
     }
     let tmp = tmp_path(path);
-    let result = (|| {
-        {
-            let mut w = BufWriter::with_capacity(capacity, fs::File::create(&tmp)?);
-            f(&mut w)?;
-            w.flush()?;
-        }
-        replace_file(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    let staged = StagedFile {
+        tmp: Some(tmp.clone()),
+        path: path.to_path_buf(),
+    };
+    {
+        let mut w = BufWriter::with_capacity(capacity, fs::File::create(&tmp)?);
+        f(&mut w)?;
+        w.flush()?;
     }
-    result
+    Ok(staged)
+}
+
+fn write_atomic_buffered<F>(path: &Path, capacity: usize, f: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut BufWriter<fs::File>) -> anyhow::Result<()>,
+{
+    stage_atomic_buffered(path, capacity, f)?.promote()
 }
 
 fn write_atomic<F>(path: &Path, f: F) -> anyhow::Result<()>
@@ -134,7 +185,11 @@ where
 /// Bound each write so Windows content filters cannot turn a materialized byte buffer into one
 /// pathological filesystem request; replacement still publishes the whole file atomically.
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    write_atomic_buffered(path, 32 * 1024, |w| {
+    stage_bytes_atomic(path, bytes)?.promote()
+}
+
+pub fn stage_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<StagedFile> {
+    stage_atomic_buffered(path, 32 * 1024, |w| {
         for chunk in bytes.chunks(256 * 1024) {
             w.write_all(chunk)?;
         }
@@ -192,7 +247,9 @@ impl<'a> Record<'a> {
 }
 
 /// Reply text plus ingest-cap provenance stays outside messages.jsonl so hot
-/// embed and affect reads remain lean.
+/// embed and affect reads remain lean. `reply_breaks` holds the offsets (Unicode scalar
+/// values) of the spaces that join the reply's blocks; past the cap `reply_end` holds the
+/// latest block's tail and `reply_end_cut` says that tail is itself cut (`model::ReplyShape`).
 #[derive(Serialize)]
 struct ReplyRecord<'a> {
     id: String,
@@ -200,15 +257,31 @@ struct ReplyRecord<'a> {
     content_digest: String,
     reply_chars: usize,
     reply_truncated: bool,
+    #[serde(skip_serializing_if = "<[u32]>::is_empty")]
+    reply_breaks: &'a [u32],
+    /// Per join: 1 work between the blocks, 0 none, 2 unknown (`model::WORKED_*`).
+    #[serde(skip_serializing_if = "<[u8]>::is_empty")]
+    reply_worked: &'a [u8],
+    /// The join before the first block, when recorded (absent: unknown).
+    #[serde(skip_serializing_if = "is_unknown_join")]
+    reply_lead: u8,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reply_end: &'a str,
+    #[serde(skip_serializing_if = "is_false")]
+    reply_end_cut: bool,
 }
 
 /// Write `msgs` as JSON Lines to `path` (creating parent dirs as needed). One compact JSON object
 /// per line: `{id, agent, project, session, ts, turn, text}`. Overwrites any existing file.
 pub fn write_messages(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
+    stage_messages(msgs, path)?.promote()
+}
+
+pub fn stage_messages(msgs: &[Message], path: &Path) -> anyhow::Result<StagedFile> {
     // Large corpus rows otherwise cycle the standard 8KiB buffer thousands of times. This
     // writer is one of only two concurrent large publications, so 256KiB costs little memory
     // and materially reduces write syscalls on both APFS and Windows filesystems.
-    write_atomic_buffered(path, 256 * 1024, |w| {
+    stage_atomic_buffered(path, 256 * 1024, |w| {
         // Chunked rendering bounds temporary storage and preserves row order.
         for batch in msgs.chunks(256) {
             let lines: Vec<serde_json::Result<Vec<u8>>> = batch
@@ -227,7 +300,11 @@ pub fn write_messages(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
 /// Write the agent replies as JSON Lines to `path`, skipping turns with no
 /// captured reply. Same stable `id` as `messages.jsonl`, so the detail view joins on it.
 pub fn write_replies(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
-    write_atomic_buffered(path, 256 * 1024, |w| {
+    stage_replies(msgs, path)?.promote()
+}
+
+pub fn stage_replies(msgs: &[Message], path: &Path) -> anyhow::Result<StagedFile> {
+    stage_atomic_buffered(path, 256 * 1024, |w| {
         for batch in msgs.chunks(256) {
             let lines: Vec<serde_json::Result<Option<Vec<u8>>>> = batch
                 .par_iter()
@@ -241,6 +318,11 @@ pub fn write_replies(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
                         content_digest: content_digest(&m.reply),
                         reply_chars: m.reply_chars,
                         reply_truncated: m.reply_chars > crate::ingest::REPLY_CAP,
+                        reply_breaks: &m.reply_shape.breaks,
+                        reply_worked: &m.reply_shape.worked,
+                        reply_lead: m.reply_shape.lead,
+                        reply_end: &m.reply_shape.end,
+                        reply_end_cut: m.reply_shape.end_cut,
                     })
                     .map(Some)
                 })
@@ -501,9 +583,20 @@ pub fn write_session_index(
     path: &Path,
     ingest_signature: &str,
 ) -> anyhow::Result<(usize, Vec<u8>)> {
+    let (count, family_meta, staged) = stage_session_index(msgs, aliases, path, ingest_signature)?;
+    staged.promote()?;
+    Ok((count, family_meta))
+}
+
+pub fn stage_session_index(
+    msgs: &[Message],
+    aliases: &[SessionAlias],
+    path: &Path,
+    ingest_signature: &str,
+) -> anyhow::Result<(usize, Vec<u8>, StagedFile)> {
     let by = aggregate_sessions(msgs, aliases);
     let family_meta = session_family_aggregate_bytes(&by, ingest_signature)?;
-    write_atomic(path, |w| {
+    let staged = stage_atomic_buffered(path, 8 * 1024, |w| {
         for (session, a) in &by {
             let rec = SessionRecord {
                 session,
@@ -525,7 +618,7 @@ pub fn write_session_index(
         }
         Ok(())
     })?;
-    Ok((by.len(), family_meta))
+    Ok((by.len(), family_meta, staged))
 }
 
 /// One event row inside a per-session file. The file name already carries agent+session,
@@ -554,10 +647,16 @@ struct EventRecord<'a> {
     child: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     meta: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    state: &'a str,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_unknown_join(value: &u8) -> bool {
+    *value == crate::model::WORKED_UNKNOWN
 }
 
 fn readable_name(s: &str, limit: usize) -> String {
@@ -1136,16 +1235,8 @@ fn open_event_identity_file(path: &Path) -> anyhow::Result<fs::File> {
     );
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0x20_000 | 0x800);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0x100 | 0x4);
-    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    crate::ingest::registry::nofollow_read_options(&mut options);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -1890,15 +1981,17 @@ fn open_event_store(dir: &Path) -> anyhow::Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    connection.busy_timeout(Duration::from_secs(5))?;
+    configure_event_writer(&connection)?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     anyhow::ensure!(
         (0..=EVENT_STORE_VERSION).contains(&version),
         "unsupported event store version {version}"
     );
     validate_event_store_migration_schema(&connection, version)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    // DELETE mode throughout: a publication is read directly by read-only and sandboxed readers
+    // (no `-shm` to create), and a rollback journal is as atomic per transaction as a WAL.
+    switch_event_store_to_delete_mode(&connection)?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
     connection.execute_batch(
         "PRAGMA foreign_keys=ON;
          CREATE TABLE IF NOT EXISTS event_sessions (
@@ -1944,6 +2037,161 @@ fn open_event_store(dir: &Path) -> anyhow::Result<Connection> {
     Ok(connection)
 }
 
+/// How long the journal-mode switch keeps retrying. It takes EXCLUSIVE without consulting the
+/// busy handler, so an older build's WAL reader, even idle, fails it at once.
+const EVENT_MODE_SWITCH_WAIT: Duration = Duration::from_secs(2);
+const EVENT_MODE_SWITCH_STEP: Duration = Duration::from_millis(50);
+/// The writer's page cache in KiB. Dirty pages past ~90% of it spill into the store before the
+/// commit, taking EXCLUSIVE and locking readers out until then; a 25.3 MB payload rewrite spilled
+/// at 24 MiB and not at 28 MiB, so 32 MiB keeps the largest real one in. Larger writes spill.
+const EVENT_WRITER_CACHE_KIB: i64 = 32_768;
+/// How long one write attempt may wait on readers, from its first busy wait (a spill or the
+/// commit) on. The waiting writer holds PENDING, which locks new readers out.
+const EVENT_ATTEMPT_BUSY_WAIT: Duration = Duration::from_secs(1);
+const EVENT_BUSY_STEP: Duration = Duration::from_millis(10);
+/// Bounds every busy wait of one write, all attempts together; past it the write fails unchanged.
+const EVENT_WRITE_BUSY_DEADLINE: Duration = Duration::from_secs(30);
+const EVENT_WRITE_BUSY_BACKOFF: Duration = Duration::from_millis(250);
+const EVENT_WRITE_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct EventBusyBudget {
+    first_wait: Option<Instant>,
+    exhausted: bool,
+    write_deadline: Option<Instant>,
+}
+
+thread_local! {
+    // SQLite's busy handler is a bare fn; the writer's connection is used on one thread only.
+    static EVENT_BUSY_BUDGET: Cell<EventBusyBudget> = const {
+        Cell::new(EventBusyBudget {
+            first_wait: None,
+            exhausted: false,
+            write_deadline: None,
+        })
+    };
+}
+
+/// Give a fresh writer connection its own attempt budget, its cache, and its busy policy.
+fn configure_event_writer(connection: &Connection) -> rusqlite::Result<()> {
+    EVENT_BUSY_BUDGET.with(|cell| {
+        cell.set(EventBusyBudget {
+            first_wait: None,
+            exhausted: false,
+            ..cell.get()
+        })
+    });
+    connection.busy_handler(Some(event_writer_busy))?;
+    // A spill whose wait gave up swallows the busy error and keeps PENDING: end the attempt at
+    // its next statement (a step shorter than the period would never be checked).
+    connection.progress_handler(1, Some(event_writer_gave_up));
+    connection.pragma_update(None, "cache_size", -EVENT_WRITER_CACHE_KIB)
+}
+
+fn event_writer_busy(_count: i32) -> bool {
+    EVENT_BUSY_BUDGET.with(|cell| {
+        let mut budget = cell.get();
+        let now = Instant::now();
+        let first = *budget.first_wait.get_or_insert(now);
+        let attempt_deadline = first + EVENT_ATTEMPT_BUSY_WAIT;
+        let deadline = budget
+            .write_deadline
+            .map_or(attempt_deadline, |write| write.min(attempt_deadline));
+        budget.exhausted |= now >= deadline;
+        cell.set(budget);
+        if budget.exhausted {
+            return false;
+        }
+        std::thread::sleep(EVENT_BUSY_STEP.min(deadline - now));
+        true
+    })
+}
+
+fn event_writer_gave_up() -> bool {
+    EVENT_BUSY_BUDGET.with(|cell| cell.get().exhausted)
+}
+
+/// Installs the deadline of one whole write on this thread, restoring the prior one on drop.
+struct EventWriteDeadline(Option<Instant>);
+
+impl EventWriteDeadline {
+    fn start(deadline: Instant) -> Self {
+        EVENT_BUSY_BUDGET.with(|cell| {
+            let mut budget = cell.get();
+            let prior = budget.write_deadline.replace(deadline);
+            cell.set(budget);
+            Self(prior)
+        })
+    }
+}
+
+impl Drop for EventWriteDeadline {
+    fn drop(&mut self) {
+        EVENT_BUSY_BUDGET.with(|cell| {
+            let mut budget = cell.get();
+            budget.write_deadline = self.0;
+            cell.set(budget);
+        });
+    }
+}
+
+fn sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn event_store_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(sqlite_busy)
+    })
+}
+
+/// A write that gave way to a reader: busy, or ended by the progress handler once its busy
+/// budget ran out (only the writer's own handler interrupts).
+fn event_write_gave_way(error: &anyhow::Error) -> bool {
+    event_store_busy(error)
+        || error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.code == ErrorCode::OperationInterrupted
+            )
+        })
+}
+
+fn journal_mode(connection: &Connection) -> rusqlite::Result<String> {
+    connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+}
+
+/// Switch an inherited WAL-mode store to DELETE (checkpointing its WAL) and prove the mode.
+/// `journal_mode=DELETE` bypasses the busy handler and can return the old mode without an
+/// error while another connection still owns a WAL-era shared lock, so retry either outcome.
+fn switch_event_store_to_delete_mode(connection: &Connection) -> anyhow::Result<()> {
+    let deadline = Instant::now() + EVENT_MODE_SWITCH_WAIT;
+    loop {
+        let switched: rusqlite::Result<String> =
+            connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0));
+        match switched {
+            Ok(mode) if mode.eq_ignore_ascii_case("delete") => return Ok(()),
+            Ok(_mode) if Instant::now() < deadline => {
+                std::thread::sleep(EVENT_MODE_SWITCH_STEP);
+            }
+            Ok(mode) => anyhow::bail!("event store stayed in {mode} journal mode"),
+            Err(error) if sqlite_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(EVENT_MODE_SWITCH_STEP);
+            }
+            Err(error) => {
+                return Err(error).context("cannot switch the event store to DELETE journal mode")
+            }
+        }
+    }
+}
+
 fn event_store_is_corrupt(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if cause.downcast_ref::<EventStoreStructuralError>().is_some() {
@@ -1965,6 +2213,38 @@ fn event_store_is_corrupt(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Close the writer and clear the sidecars an earlier WAL-mode build left, so a reader -
+/// read-only, sandboxed, unable to create `-shm` - opens the publication directly instead of
+/// copying it. Removal is licensed only by this connection's own successful switch to DELETE.
+fn settle_event_store(dir: &Path, connection: Connection) -> anyhow::Result<()> {
+    let mode = journal_mode(&connection)?;
+    anyhow::ensure!(
+        mode.eq_ignore_ascii_case("delete"),
+        "event store is in {mode} journal mode after its write; its sidecars stay"
+    );
+    drop(connection);
+    for suffix in ["-wal", "-shm"] {
+        remove_sidecar_best_effort(&dir.join(format!("{EVENT_STORE_NAME}{suffix}")));
+    }
+    Ok(())
+}
+
+/// A stale sidecar beside a DELETE-mode store is ignored by SQLite and only costs a reader
+/// the snapshot copy, so after the commit a removal that keeps failing (Windows sharing
+/// violations) is reported, not fatal: the next pass removes it.
+fn remove_sidecar_best_effort(path: &Path) {
+    for attempt in 0..8 {
+        match remove_if_exists(path) {
+            Ok(()) => return,
+            Err(_) if attempt < 7 => std::thread::sleep(Duration::from_millis(25 * (attempt + 1))),
+            Err(error) => eprintln!(
+                "  ! could not remove stale event store sidecar {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
 fn seal_rebuilt_event_store(dir: &Path) -> anyhow::Result<()> {
     let connection = open_event_store(dir).with_context(|| {
         format!(
@@ -1977,12 +2257,7 @@ fn seal_rebuilt_event_store(dir: &Path) -> anyhow::Result<()> {
         quick_check == "ok",
         "rebuilt event store failed quick_check"
     );
-    connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-    connection.pragma_update(None, "journal_mode", "DELETE")?;
-    drop(connection);
-    remove_if_exists(&dir.join(format!("{EVENT_STORE_NAME}-wal")))?;
-    remove_if_exists(&dir.join(format!("{EVENT_STORE_NAME}-shm")))?;
-    remove_if_exists(&dir.join(format!("{EVENT_STORE_NAME}-journal")))
+    settle_event_store(dir, connection)
 }
 
 fn restore_quarantined_event_store(moved: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
@@ -2027,7 +2302,7 @@ where
             restore_quarantined_event_store(&moved)?;
             return Err(error).with_context(|| {
                 format!(
-                    "cannot quarantine corrupt event store {}",
+                    "cannot quarantine corrupt event store {} (another process may hold it open)",
                     original.display()
                 )
             });
@@ -2047,13 +2322,6 @@ where
         });
     }
     Ok(moved)
-}
-
-fn publish_rebuilt_event_store(
-    dir: &Path,
-    rebuilt_dir: &Path,
-) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
-    publish_rebuilt_event_store_with(dir, rebuilt_dir, replace_file)
 }
 
 fn remove_event_quarantines(moved: &[(PathBuf, PathBuf)]) {
@@ -2078,6 +2346,7 @@ fn finalize_rebuilt_event_store(
     let connection = open_event_store(dir)
         .with_context(|| format!("cannot reopen rebuilt event store {}", store_path.display()))?;
     write_event_stats_from_store(&connection, stats_path)?;
+    settle_event_store(dir, connection)?;
     write_bytes_atomic(&dir.join(EVENT_GENERATION_NAME), generation)
 }
 
@@ -2489,7 +2758,24 @@ fn publish_event_proof(
         stats_hash_b: inventory.stats_root_b,
         canaries,
     };
-    write_bytes_atomic(&event_proof_path(dir, &agent), &serde_json::to_vec(&proof)?)?;
+    // Readers refuse a proof stamped inside the store's racy window, so restage until the proof's
+    // own stamp is past it. A window beyond the cap (whole-second stamps) leaves readers validating.
+    let path = event_proof_path(dir, &agent);
+    let body = serde_json::to_vec(&proof)?;
+    let settle_deadline = Instant::now() + EVENT_PROOF_SETTLE_LIMIT;
+    let staged = loop {
+        let staged = stage_bytes_atomic(&path, &body)?;
+        let racy = match staged.tmp.as_deref().map(file_identity_seal) {
+            Some(Ok(seal)) => event_seal_racy(&proof.store, proof.wal.as_ref(), seal.modified_ns),
+            _ => false,
+        };
+        if !racy || Instant::now() >= settle_deadline {
+            break staged;
+        }
+        drop(staged);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    staged.promote()?;
     remove_if_exists(&event_cursor_path(dir, &agent))
 }
 
@@ -2717,22 +3003,44 @@ fn event_agent_is_path_safe(agent: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
+const EVENT_PROOF_SETTLE_LIMIT: Duration = Duration::from_millis(100);
+
+/// Whether a same-size rewrite could still share a sealed stamp when a proof was stamped
+/// `observed_ns`, as `racy_stamp` judges a scan start.
+fn event_seal_racy(
+    store: &FileIdentitySeal,
+    wal: Option<&FileIdentitySeal>,
+    observed_ns: u64,
+) -> bool {
+    let observed = i64::try_from(observed_ns).unwrap_or(i64::MAX);
+    let now = crate::ingest_cache::epoch_ns(SystemTime::now()).unwrap_or(i64::MAX);
+    std::iter::once(store)
+        .chain(wal)
+        .flat_map(|seal| [seal.modified_ns, seal.changed_ns])
+        .any(|stamp| {
+            let stamp = i64::try_from(stamp).unwrap_or(i64::MAX);
+            crate::ingest_cache::racy_stamp(stamp, observed, now)
+        })
+}
+
 fn proof_authorizes_event_state(
     dir: &Path,
     agent: &str,
     state: &EventState,
     connection: &Connection,
 ) -> bool {
-    let proof = read_event_proof_file(dir, agent).ok();
-    let Some(proof) = proof else {
+    let Ok((seal, _, proof)) = read_event_proof_snapshot(dir, agent) else {
         return false;
     };
+    // A same-size rewrite in the seal's timestamp tick keeps the sealed identity (Linux ctime is
+    // coarse), so a proof written within that racy window cannot vouch for rows a scan skips.
     proof.version == EVENT_PROOF_VERSION
         && proof.agents == [agent]
         && proof.store == state.store
         && proof.wal == state.wal
         && proof.generation == state.generation
         && proof.generation_value == state.generation_value
+        && !event_seal_racy(&state.store, state.wal.as_ref(), seal.modified_ns)
         && event_inventory(connection, agent)
             .ok()
             .is_some_and(|inventory| event_proof_matches_inventory(&proof, inventory))
@@ -2753,17 +3061,7 @@ fn complete_event_aggregate(aggregate: &mut EventAgentAggregate) {
 
 fn event_scan_open_failure(error: anyhow::Error) -> VerifiedEventScanError {
     let detail = error.to_string();
-    let transient = error.chain().any(|cause| {
-        cause
-            .downcast_ref::<rusqlite::Error>()
-            .is_some_and(|sqlite| match sqlite {
-                rusqlite::Error::SqliteFailure(failure, _) => matches!(
-                    failure.code,
-                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
-                ),
-                _ => false,
-            })
-    });
+    let transient = event_store_busy(&error);
     let kind = if transient {
         VerifiedEventScanFailure::GenerationMoved
     } else if detail.contains("unsupported event store version") {
@@ -3416,6 +3714,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
             call_id: &event.call_id,
             child: &event.child_session,
             meta: &event.meta,
+            state: &event.state,
         };
         serde_json::to_writer(&mut bytes, &record)?;
         bytes.push(b'\n');
@@ -3613,7 +3912,8 @@ fn check_event_delta_matches_proven_store(
 }
 
 /// Compare an incremental delta after `events_complete` proved the current store.
-/// Any mismatch or read uncertainty returns `None` for the normal writer.
+/// Any mismatch or read uncertainty returns `None` for the normal writer. So does a published
+/// store still in WAL journal mode (an earlier build's): the writer settles it on this pass.
 pub fn event_delta_matches_proven_store(
     events: &[Event],
     dir: &Path,
@@ -3621,9 +3921,24 @@ pub fn event_delta_matches_proven_store(
     agents: &[&str],
     prune_files: &HashSet<String>,
 ) -> Option<(usize, usize, usize)> {
+    if !event_store_settled(dir) {
+        return None;
+    }
     check_event_delta_matches_proven_store(events, dir, keep, agents, prune_files)
         .ok()
         .flatten()
+}
+
+/// Whether the published store is a checkpointed DELETE-mode database with no WAL sidecars.
+fn event_store_settled(dir: &Path) -> bool {
+    let mut header = [0_u8; 20];
+    let readable = fs::File::open(event_store_path(dir))
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok();
+    readable
+        && &header[18..20] == b"\x01\x01"
+        && !dir.join(format!("{EVENT_STORE_NAME}-wal")).exists()
+        && !dir.join(format!("{EVENT_STORE_NAME}-shm")).exists()
 }
 
 /// Write canonically sorted per-session JSON Lines blobs to the transactional event store.
@@ -3846,6 +4161,8 @@ fn write_events_with_authority(
         &dir.parent().unwrap_or(dir).join("event_stats.json"),
     )?;
     let n_files = event_row_count(&connection)?;
+    // Settle before the marker and proof: both seal the store's identity as published.
+    settle_event_store(dir, connection)?;
     let generation_path = dir.join(EVENT_GENERATION_NAME);
     let published_generation = read_regular_file(&generation_path).ok();
     if published_generation.as_deref() != Some(generation.as_bytes()) || store_changed {
@@ -3937,17 +4254,42 @@ pub fn write_events_recovering_authorized(
             store_path.display()
         );
     }
-    let error = match write_events_with_authority(
-        events,
-        dir,
-        keep,
-        agents,
-        full_prune,
-        prune_files,
-        authority,
-    ) {
-        Ok(result) => return Ok(result),
-        Err(error) => error,
+    // A reader outlasting an attempt's busy budget ends it, rolled back whole and releasing
+    // PENDING; a failed pass here forces a full reparse, so the write is retried to a deadline.
+    let error = {
+        let deadline = Instant::now() + EVENT_WRITE_BUSY_DEADLINE;
+        let _deadline = EventWriteDeadline::start(deadline);
+        let mut attempt = 0;
+        loop {
+            match write_events_with_authority(
+                events,
+                dir,
+                keep,
+                agents,
+                full_prune,
+                prune_files,
+                authority,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(error) if event_write_gave_way(&error) => {
+                    attempt += 1;
+                    let backoff =
+                        (EVENT_WRITE_BUSY_BACKOFF * attempt).min(EVENT_WRITE_BUSY_BACKOFF_MAX);
+                    if Instant::now() + backoff >= deadline {
+                        break error.context(format!(
+                            "a reader held the event store past the {} s write deadline; \
+                             the next index pass retries",
+                            EVENT_WRITE_BUSY_DEADLINE.as_secs()
+                        ));
+                    }
+                    eprintln!(
+                        "  ! event store busy (a reader holds it); retrying the event write ({attempt})"
+                    );
+                    std::thread::sleep(backoff);
+                }
+                Err(error) => break error,
+            }
+        }
     };
     if !event_store_is_corrupt(&error) {
         return Err(error)
@@ -3959,7 +4301,22 @@ pub fn write_events_recovering_authorized(
             store_path.display()
         );
     }
+    rebuild_corrupt_event_store(events, dir, keep, agents, replace_file)
+}
 
+fn rebuild_corrupt_event_store<F>(
+    events: &[Event],
+    dir: &Path,
+    keep: &HashSet<String>,
+    agents: &[&str],
+    replace: F,
+) -> anyhow::Result<(usize, usize, usize)>
+where
+    F: FnMut(&Path, &Path) -> anyhow::Result<()>,
+{
+    // A corrupt store vouches for nothing: if the rebuild cannot be published (on Windows a
+    // reader's handle blocks the rename), the next pass finds it unproven and rebuilds again.
+    invalidate_events_complete(dir, agents)?;
     let rebuild_root = tmp_path(&dir.join(".store-rebuild"));
     let rebuilt_dir = rebuild_root.join("events");
     let result: anyhow::Result<(usize, usize, usize)> = (|| {
@@ -3974,7 +4331,7 @@ pub fn write_events_recovering_authorized(
         )?;
         seal_rebuilt_event_store(&rebuilt_dir)?;
         let generation = read_regular_file(&rebuilt_dir.join(EVENT_GENERATION_NAME))?;
-        let quarantines = publish_rebuilt_event_store(dir, &rebuilt_dir)?;
+        let quarantines = publish_rebuilt_event_store_with(dir, &rebuilt_dir, replace)?;
         let post_publish = finalize_rebuilt_event_store(
             dir,
             &generation,
@@ -3995,8 +4352,8 @@ pub fn write_events_recovering_authorized(
     let _ = fs::remove_dir_all(&rebuild_root);
     result.with_context(|| {
         format!(
-            "cannot rebuild corrupt event store {}",
-            store_path.display()
+            "cannot rebuild corrupt event store {}; the next index pass retries the rebuild",
+            event_store_path(dir).display()
         )
     })
 }
@@ -4133,6 +4490,57 @@ pub fn published_generation_seal(data: &Path) -> Option<GenerationSeal> {
 
 /// See [`published_generation_seal`].
 pub type GenerationSeal = [u8; 16];
+
+/// The project the published generation's `messages.jsonl` gives each session of `agent`, by
+/// its lowest-numbered turn (its first row where none is numbered); None when the file cannot
+/// be read whole. Only that file matters: events and session rows carry no attribution.
+pub fn published_session_projects(data: &Path, agent: &str) -> Option<HashMap<String, String>> {
+    #[derive(Deserialize)]
+    struct Row {
+        agent: String,
+        session: String,
+        turn: Option<u32>,
+        #[serde(default)]
+        project: String,
+    }
+    let read = || -> anyhow::Result<HashMap<String, String>> {
+        let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
+        let path = data.join("messages.jsonl");
+        anyhow::ensure!(
+            fs::symlink_metadata(&path)?.is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+        let mut projects: HashMap<String, (Option<u32>, String)> = HashMap::new();
+        let file = std::io::BufReader::new(fs::File::open(&path)?);
+        for line in std::io::BufRead::lines(file) {
+            let line = line?;
+            if !line.contains(&needle) {
+                continue;
+            }
+            let row: Row = serde_json::from_str(&line)?;
+            if row.agent != agent {
+                continue;
+            }
+            let earlier =
+                projects
+                    .get(&row.session)
+                    .is_some_and(|(known, _)| match (known, row.turn) {
+                        (_, None) => true,
+                        (Some(known), Some(turn)) => *known <= turn,
+                        (None, Some(_)) => false,
+                    });
+            if !earlier {
+                projects.insert(row.session, (row.turn, row.project));
+            }
+        }
+        Ok(projects
+            .into_iter()
+            .map(|(session, (_, project))| (session, project))
+            .collect())
+    };
+    read().ok()
+}
 
 /// Every row and event session of `agent` the published generation in `data` holds; None when
 /// any of them cannot be read whole or named. The caller must have verified those files the way
@@ -4294,6 +4702,7 @@ mod tests {
             call_id: "call-1".into(),
             child_session: String::new(),
             meta: String::new(),
+            state: String::new(),
         }
     }
 
@@ -4715,6 +5124,495 @@ mod tests {
         );
         fs::remove_dir_all(root).ok();
     }
+
+    /// Every publication lane leaves the store checkpointed in DELETE journal mode with no WAL
+    /// sidecars, so a read-only reader opens it directly; the proofs taken after settling still
+    /// verify, and the next writer's WAL transaction settles again.
+    #[test]
+    fn every_publication_leaves_a_checkpointed_delete_mode_store() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-settled"));
+        let dir = root.join("events");
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        let assert_settled = |context: &str| {
+            assert!(
+                event_store_settled(&dir),
+                "{context}: the published store is not a checkpointed DELETE-mode database"
+            );
+            assert!(
+                !dir.join(format!("{EVENT_STORE_NAME}-journal")).exists(),
+                "{context}: -journal sidecar left beside the published store"
+            );
+            assert!(
+                events_complete(&dir, &["codex"]).unwrap(),
+                "{context}: the settled store does not verify"
+            );
+        };
+
+        // Cold full write, then an incremental write, then a full rebuild publication.
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_settled("full write");
+        let mut changed = test_event();
+        changed.output = "changed".into();
+        write_events(&[changed], &dir, &keep, &["codex"], false, &HashSet::new()).unwrap();
+        // An incremental write hands proof publication to its caller, as the ingest does.
+        assert!(publish_events_complete(&dir, &["codex"]).unwrap());
+        assert_settled("incremental write");
+        let rebuilt = root.join("rebuilt");
+        write_events(
+            &[test_event()],
+            &rebuilt,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        seal_rebuilt_event_store(&rebuilt).unwrap();
+        let generation = fs::read(rebuilt.join(EVENT_GENERATION_NAME)).unwrap();
+        let quarantines = publish_rebuilt_event_store_with(&dir, &rebuilt, replace_file).unwrap();
+        finalize_rebuilt_event_store(&dir, &generation, &root.join("event_stats.json")).unwrap();
+        remove_event_quarantines(&quarantines);
+        assert!(publish_events_complete(&dir, &["codex"]).unwrap());
+        assert_settled("rebuild publication");
+
+        // A store an earlier build left in WAL mode: the unchanged-delta shortcut declines it,
+        // and the writer's pass, changing no row, settles it and re-proves it.
+        {
+            let connection = open_event_store(&dir).unwrap();
+            connection
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                .unwrap();
+            drop(connection);
+        }
+        assert!(!event_store_settled(&dir), "the WAL store reads as settled");
+        assert!(publish_events_complete(&dir, &["codex"]).unwrap());
+        assert!(
+            event_delta_matches_proven_store(
+                &[test_event()],
+                &dir,
+                &keep,
+                &["codex"],
+                &HashSet::new()
+            )
+            .is_none(),
+            "an unsettled store took the unchanged shortcut"
+        );
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(publish_events_complete(&dir, &["codex"]).unwrap());
+        assert_settled("migration of a WAL store on an unchanged pass");
+        assert!(event_delta_matches_proven_store(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            &HashSet::new()
+        )
+        .is_some());
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The WAL->DELETE switch takes EXCLUSIVE without the busy handler: an idle older-build
+    /// reader fails it at once. The open retries briefly, so a reader on its way out does not
+    /// fail the pass (and force a full repair); one that stays does, closed.
+    #[test]
+    fn the_journal_mode_switch_waits_briefly_for_an_old_wal_reader_to_leave() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-mode-switch"));
+        let dir = root.join("events");
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let wal_mode = |dir: &Path| {
+            let connection = Connection::open(event_store_path(dir)).unwrap();
+            connection
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                .unwrap();
+            drop(connection);
+        };
+        let old_reader = |dir: &Path| {
+            let reader = Connection::open_with_flags(
+                event_store_path(dir),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            reader
+                .query_row("SELECT count(*) FROM event_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            reader
+        };
+
+        // A reader that leaves within the retry window: the switch succeeds after it.
+        wal_mode(&dir);
+        let reader = old_reader(&dir);
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(reader);
+        });
+        let started = Instant::now();
+        let connection = open_event_store(&dir).expect("the switch retried past the reader");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(journal_mode(&connection).unwrap(), "delete");
+        leaving.join().unwrap();
+        drop(connection);
+
+        // A reader that stays: the open fails closed inside the bounded wait.
+        wal_mode(&dir);
+        let reader = old_reader(&dir);
+        let started = Instant::now();
+        let error = open_event_store(&dir).expect_err("an idle WAL reader still blocks the switch");
+        assert!(error.to_string().contains("journal mode"), "{error:#}");
+        assert!(started.elapsed() < EVENT_MODE_SWITCH_WAIT + Duration::from_secs(2));
+        assert_eq!(
+            fs::read(event_store_path(&dir)).unwrap()[18..20],
+            [2, 2],
+            "the failed switch must leave the WAL store as it was"
+        );
+        drop(reader);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Sidecar removal is licensed by the writer's own switch to DELETE: a connection still
+    /// in WAL mode must not unlink the WAL that holds its committed frames.
+    #[test]
+    fn settle_refuses_to_unlink_sidecars_of_a_connection_not_in_delete_mode() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-settle-guard"));
+        let dir = root.join("events");
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let connection = Connection::open(event_store_path(&dir)).unwrap();
+        connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        let mut stats: Vec<u8> = connection
+            .query_row("SELECT stats FROM event_sessions LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        stats.push(b' ');
+        connection
+            .execute("UPDATE event_sessions SET stats=?1", params![stats])
+            .unwrap();
+        let wal = dir.join(format!("{EVENT_STORE_NAME}-wal"));
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+        let error = settle_event_store(&dir, connection).expect_err("settle must refuse");
+        assert!(error.to_string().contains("wal journal mode"), "{error:#}");
+        // The next writer settles the store properly; SQLite may clean the WAL when the
+        // refused connection is dropped, independently of this guard.
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(event_store_settled(&dir));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A reader holding SHARED past an attempt's busy budget ends that attempt, rolled back so
+    /// PENDING is released; the write retries instead of failing the pass (a full reparse), and
+    /// new readers are locked out about 1 s per attempt, not for the reader's whole hold.
+    #[test]
+    fn the_event_write_retries_past_a_reader_and_lets_new_readers_in_between() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-busy-retry"));
+        let dir = root.join("events");
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let store = event_store_path(&dir);
+        let reader = Connection::open_with_flags(&store, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM event_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let hold = Duration::from_millis(4_000);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            reader.execute_batch("ROLLBACK").unwrap();
+            drop(reader);
+        });
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prober = {
+            let done = std::sync::Arc::clone(&done);
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let mut last_read = Instant::now();
+                let mut longest = Duration::ZERO;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let read =
+                        Connection::open_with_flags(&store, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                            .and_then(|fresh| {
+                                fresh.busy_timeout(Duration::ZERO)?;
+                                fresh.query_row("SELECT count(*) FROM event_sessions", [], |row| {
+                                    row.get::<_, i64>(0)
+                                })
+                            });
+                    if read.is_ok() {
+                        longest = longest.max(last_read.elapsed());
+                        last_read = Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                longest.max(last_read.elapsed())
+            })
+        };
+        let mut changed = test_event();
+        changed.output = "after the reader".into();
+        let started = Instant::now();
+        write_events_recovering(
+            &[changed],
+            &dir,
+            &keep,
+            &["codex"],
+            false,
+            &HashSet::new(),
+            false,
+        )
+        .expect("the retried write commits once the reader leaves");
+        let elapsed = started.elapsed();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let lockout = prober.join().unwrap();
+        holder.join().unwrap();
+        assert!(elapsed >= hold - Duration::from_millis(100), "{elapsed:?}");
+        assert!(
+            lockout < Duration::from_millis(1_700),
+            "new readers were locked out for {lockout:?} at a stretch"
+        );
+        let stored =
+            String::from_utf8(stored_event_body(&dir, &event_fname("codex", "session-1"))).unwrap();
+        assert!(stored.contains("after the reader"), "{stored}");
+        assert!(event_store_settled(&dir));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A write whose dirty pages fit the writer's cache holds only RESERVED until its commit,
+    /// so readers keep reading the prior commit; one past SQLite's 2 MB default cache spilled,
+    /// taking EXCLUSIVE and locking every reader out from the spill to the commit.
+    #[test]
+    fn a_write_that_fits_the_writer_cache_leaves_readers_unblocked_until_its_commit() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-cache-fit"));
+        let dir = root.join("events");
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let prior: i64 = Connection::open(event_store_path(&dir))
+            .unwrap()
+            .query_row("SELECT length(payload) FROM event_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut writer = open_event_store(&dir).unwrap();
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        // The largest real session payload is about 25 MB.
+        transaction
+            .execute(
+                "UPDATE event_sessions SET payload=randomblob(?1)",
+                [26_i64 << 20],
+            )
+            .unwrap();
+        let reader =
+            Connection::open_with_flags(event_store_path(&dir), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        let seen: i64 = reader
+            .query_row("SELECT length(payload) FROM event_sessions", [], |row| {
+                row.get(0)
+            })
+            .expect("a reader is not locked out before the commit");
+        assert_eq!(seen, prior);
+        drop(reader);
+        transaction.commit().unwrap();
+        drop(writer);
+        assert_eq!(
+            stored_event_body(&dir, &event_fname("codex", "session-1")).len(),
+            26 << 20
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Every busy wait of one attempt - each spill of an outgrown cache and the commit - shares
+    /// one 1 s budget; past it the attempt ends, rolled back, instead of waiting out each
+    /// statement in turn (5 s apiece before) for as long as a reader holds the store.
+    #[test]
+    fn one_budget_bounds_the_spill_and_commit_waits_of_an_attempt() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-busy-budget"));
+        let dir = root.join("events");
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        write_events(
+            &[test_event()],
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let store = event_store_path(&dir);
+        let reader = Connection::open_with_flags(&store, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let prior: i64 = reader
+            .query_row("SELECT length(payload) FROM event_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut writer = open_event_store(&dir).unwrap();
+        let started = Instant::now();
+        let attempt = (|| {
+            let transaction = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // More dirty pages than the writer's cache holds: it must spill, and cannot.
+            transaction.execute(
+                "UPDATE event_sessions SET payload=zeroblob(?1)",
+                [48_i64 << 20],
+            )?;
+            transaction.execute(
+                "UPDATE event_meta SET value=value WHERE key='generation'",
+                [],
+            )?;
+            transaction.commit()
+        })();
+        let elapsed = started.elapsed();
+        let error = attempt.expect_err("a held reader must end the attempt");
+        assert!(
+            matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(failure, _) if matches!(
+                    failure.code,
+                    ErrorCode::DatabaseBusy
+                        | ErrorCode::DatabaseLocked
+                        | ErrorCode::OperationInterrupted
+                )
+            ),
+            "{error}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        drop(writer);
+        let fresh = Connection::open_with_flags(&store, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        fresh.busy_timeout(Duration::ZERO).unwrap();
+        let after: i64 = fresh
+            .query_row("SELECT length(payload) FROM event_sessions", [], |row| {
+                row.get(0)
+            })
+            .expect("the ended attempt released its locks");
+        assert_eq!(after, prior);
+        reader.execute_batch("ROLLBACK").unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A rebuild whose publication fails (on Windows a reader's handle blocks the rename)
+    /// says so and leaves the corrupt store unproven, so the next pass rebuilds it.
+    #[test]
+    fn an_unpublishable_rebuild_is_disclosed_and_retried_by_the_next_pass() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-held-rebuild"));
+        let dir = root.join("events");
+        let event = test_event();
+        let keep = HashSet::from([event_fname("codex", "session-1")]);
+        write_events(
+            std::slice::from_ref(&event),
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(event_proof_path(&dir, "codex").exists());
+        let store = event_store_path(&dir);
+        let corrupt = vec![0x5a_u8; 8192];
+        fs::write(&store, &corrupt).unwrap();
+
+        let error = rebuild_corrupt_event_store(
+            std::slice::from_ref(&event),
+            &dir,
+            &keep,
+            &["codex"],
+            |source, destination| {
+                if source == store.as_path() {
+                    anyhow::bail!("sharing violation (simulated held reader handle)");
+                }
+                replace_file(source, destination)
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("may hold it open"), "{message}");
+        assert!(message.contains("next index pass retries"), "{message}");
+        assert!(!event_proof_path(&dir, "codex").exists());
+        assert_eq!(fs::read(&store).unwrap(), corrupt);
+        assert!(!fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.contains(".corrupt.") || name.starts_with(".store-rebuild")
+            }));
+
+        write_events_recovering(
+            std::slice::from_ref(&event),
+            &dir,
+            &keep,
+            &["codex"],
+            true,
+            &HashSet::new(),
+            true,
+        )
+        .expect("the next pass rebuilds the store");
+        assert!(event_row_exists(&dir, &event_fname("codex", "session-1")));
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn partial_first_event_store_publishes_complete() {
         let root = tmp_path(&std::env::temp_dir().join("agrep-event-partial-first"));
@@ -5538,6 +6436,84 @@ mod tests {
         .unwrap_err();
         assert_eq!(visits, 1);
         assert_eq!(error.kind, VerifiedEventScanFailure::GenerationMoved);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    fn write_one_proven_event(label: &str) -> (PathBuf, PathBuf) {
+        let root = tmp_path(&std::env::temp_dir().join(label));
+        let dir = root.join("events");
+        let event = test_event();
+        write_events(
+            std::slice::from_ref(&event),
+            &dir,
+            &HashSet::from([event_fname(event.agent, &event.session)]),
+            &["codex"],
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+        (root, dir)
+    }
+
+    #[cfg(not(windows))]
+    fn set_modified_ns(path: &Path, nanos: u64) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_nanos(nanos))
+            .unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_proof_stamped_inside_the_store_racy_window_grants_no_trust() {
+        let (root, dir) = write_one_proven_event("agrep-event-racy-proof");
+        assert!(events_complete(&dir, &["codex"]).unwrap());
+        let generation = fs::read(dir.join(EVENT_GENERATION_NAME)).unwrap();
+        let store = file_identity_seal(&event_store_path(&dir)).unwrap();
+        let proof_path = event_proof_path(&dir, "codex");
+
+        set_modified_ns(&proof_path, store.changed_ns);
+        let error =
+            scan_verified_event_generation_candidates(&dir, &generation, &["codex"], |_| {})
+                .unwrap_err();
+        assert_eq!(error.kind, VerifiedEventScanFailure::MissingOrUnsupported);
+        let summary =
+            scan_verified_event_generation(&dir, &generation, &["codex"], |_| {}).unwrap();
+        assert!(!summary.trusted_proofs);
+
+        set_modified_ns(
+            &proof_path,
+            store.changed_ns.max(store.modified_ns) + 3_000_000_000,
+        );
+        let summary =
+            scan_verified_event_generation_candidates(&dir, &generation, &["codex"], |_| {})
+                .unwrap();
+        assert!(summary.trusted_proofs);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proof_publication_waits_out_a_racy_store_stamp() {
+        let (root, dir) = write_one_proven_event("agrep-event-racy-publication");
+        let store_path = event_store_path(&dir);
+        let pending = SystemTime::now() + Duration::from_millis(40);
+        let pending_ns = pending.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        set_modified_ns(&store_path, pending_ns);
+        assert!(publish_events_complete(&dir, &["codex"]).unwrap());
+
+        let store = file_identity_seal(&store_path).unwrap();
+        let proof = file_identity_seal(&event_proof_path(&dir, "codex")).unwrap();
+        assert_eq!(store.modified_ns, pending_ns);
+        assert!(proof.modified_ns > store.modified_ns);
+        let generation = fs::read(dir.join(EVENT_GENERATION_NAME)).unwrap();
+        let summary =
+            scan_verified_event_generation_candidates(&dir, &generation, &["codex"], |_| {})
+                .unwrap();
+        assert!(summary.trusted_proofs);
         fs::remove_dir_all(root).ok();
     }
 
@@ -6527,7 +7503,7 @@ mod tests {
             )
             .unwrap();
         }
-        let error = publish_rebuilt_event_store(&dir, &rebuilt).unwrap_err();
+        let error = publish_rebuilt_event_store_with(&dir, &rebuilt, replace_file).unwrap_err();
         assert!(error.to_string().contains("prior store restored"));
         for suffix in ["", "-wal", "-shm", "-journal"] {
             assert_eq!(
@@ -6598,7 +7574,7 @@ mod tests {
         write_events(&[event], &rebuilt, &keep, &["codex"], true, &HashSet::new()).unwrap();
         seal_rebuilt_event_store(&rebuilt).unwrap();
         let generation = fs::read(rebuilt.join(EVENT_GENERATION_NAME)).unwrap();
-        let quarantines = publish_rebuilt_event_store(&dir, &rebuilt).unwrap();
+        let quarantines = publish_rebuilt_event_store_with(&dir, &rebuilt, replace_file).unwrap();
         let bad_stats_path = root.join("stats-is-a-directory");
         fs::create_dir(&bad_stats_path).unwrap();
 
@@ -6700,6 +7676,7 @@ mod tests {
                 reply_chars: 9,
                 side: false,
                 parent: "".into(),
+                reply_shape: Default::default(),
             },
             Message {
                 agent: "opencode",
@@ -6715,6 +7692,7 @@ mod tests {
                 reply_chars: crate::ingest::REPLY_CAP + 7,
                 side: false,
                 parent: "".into(),
+                reply_shape: Default::default(),
             },
         ];
         let mut path = std::env::temp_dir();
@@ -6788,6 +7766,7 @@ mod tests {
             reply_chars: 0,
             side: true,
             parent: "root".into(),
+            reply_shape: Default::default(),
         }];
         let (_, meta) = write_session_index(&messages, &[], &sessions, "1:first").unwrap();
         let first: serde_json::Value = serde_json::from_slice(&meta).unwrap();
@@ -6830,6 +7809,7 @@ mod tests {
             reply_chars: 0,
             side: false,
             parent: "".into(),
+            reply_shape: Default::default(),
         }];
         let sessions = root.join("sessions.jsonl");
         let (count, proof) = write_session_index(&messages, &[], &sessions, "1:order").unwrap();
@@ -6870,6 +7850,7 @@ mod tests {
             reply_chars: 0,
             side: true,
             parent: parent.into(),
+            reply_shape: Default::default(),
         };
         let first_sessions = root.join("first.jsonl");
         let first = vec![message(""), message("root")];
@@ -6913,6 +7894,7 @@ mod tests {
             reply_chars: 0,
             side: true,
             parent: parent.into(),
+            reply_shape: Default::default(),
         };
         let sessions = root.join("sessions.jsonl");
         let messages = vec![message("root-a"), message("root-b")];
@@ -6939,6 +7921,7 @@ mod tests {
             reply_chars: 0,
             side: !parent.is_empty(),
             parent: parent.into(),
+            reply_shape: Default::default(),
         }
     }
 

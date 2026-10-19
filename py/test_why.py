@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -26,6 +27,8 @@ import dist  # noqa: E402
 
 FIXTURES = ROOT / "py" / "fixtures" / "why" / "store"
 CLAUDE = "11111111-1111-4111-8111-111111111111"
+CLAUDE_NEW = "99999999-1111-4111-8111-111111111111"
+CLAUDE_LATER = "99999999-2222-4222-8222-222222222222"
 CLAUDE_TWIN = "11111111-2222-4222-8222-222222222222"
 PI_ALIAS = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 PI_HEADER = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -190,6 +193,21 @@ def _cursor_store(path: Path, turns: list[tuple[str, str]]) -> None:
         db.close()
 
 
+def _cursor_add(path: Path, session: str, text: str) -> None:
+    """A second user turn appended to an existing cursor conversation."""
+    db = sqlite3.connect(str(path))
+    try:
+        with db:
+            db.execute("UPDATE cursorDiskKV SET value = ? WHERE key = ?",
+                       (json.dumps({"createdAt": 946684800000, "fullConversationHeadersOnly": [
+                           {"bubbleId": "u", "type": 1}, {"bubbleId": "v", "type": 1}]}),
+                        f"composerData:{session}"))
+            db.execute("INSERT INTO cursorDiskKV VALUES (?, ?)",
+                       (f"bubbleId:{session}:v", json.dumps({"type": 1, "text": text})))
+    finally:
+        db.close()
+
+
 def _gemini_session(path: Path, session: str, texts: list[str]) -> None:
     """A gemini chat of user turns: a legacy `.json` record, or the `.jsonl` log resuming writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,11 +267,17 @@ def _append_claude_turn(path: Path, home: Path, text: str, stamp: str, *,
             "message": {"role": "user", "content": text}}) + "\n")
 
 
+# Process-listing and command budgets are safety nets against a hang, never a
+# measurement: a saturated host stretches `ps -A`, a cold index and a why run.
+_PROCESS_LISTING_TIMEOUT_S = 60
+_COMMAND_TIMEOUT_S = 300
+
+
 def _processes_mentioning(marker: str) -> set[int]:
     listing = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "command="],
                              env={"PATH": "/usr/bin:/bin"}, capture_output=True,
                              text=True, encoding="utf-8", errors="replace",
-                             timeout=5, check=False)
+                             timeout=_PROCESS_LISTING_TIMEOUT_S, check=False)
     return {int(line.split(None, 1)[0]) for line in listing.stdout.splitlines()
             if marker in line and int(line.split(None, 1)[0]) != os.getpid()}
 
@@ -313,7 +337,7 @@ class Sandbox:
             return json.dumps(str(self.home.joinpath(*parts)))[1:-1]
         return re.sub(r"\{\{home\}\}((?:/[^\"/\\]+)*)", native, text)
 
-    def spawn(self, command: list[str], *, timeout: float = 60,
+    def spawn(self, command: list[str], *, timeout: float = _COMMAND_TIMEOUT_S,
               env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(command, cwd=self.home, env=self.env if env is None else env,
                               input="", capture_output=True, text=True, encoding="utf-8",
@@ -344,7 +368,7 @@ class Sandbox:
         result = subprocess.run([sys.executable, str(ROOT / "py" / "why.py"), *argv],
                                 cwd=cwd or self.home, env=self.env if env is None else env,
                                 input="", capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=60, check=False)
+                                errors="replace", timeout=_COMMAND_TIMEOUT_S, check=False)
         after = self.data_snapshot()
         if after != before:
             raise AssertionError(f"why {argv} wrote the data dir:\n{result.stdout}{result.stderr}")
@@ -584,11 +608,13 @@ class WhyCliReadOnlyTests(unittest.TestCase):
     def test_served_why_leaves_the_descriptor_alone(self) -> None:
         # Socket paths stop at 104 bytes, which a deep TMPDIR (macOS /var/folders) exceeds.
         runtime = Path(tempfile.mkdtemp(prefix="agw-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, runtime, ignore_errors=True)
+        self.addCleanup(_kill_processes_mentioning, str(runtime))
         env = {key: value for key, value in self.sandbox.env.items() if key != "AGREP_NO_RESIDENT"}
         env["XDG_RUNTIME_DIR"] = str(runtime)
         client = [sys.executable, "-c", RESIDENT_CLIENT]
         try:
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + _COMMAND_TIMEOUT_S
             while True:
                 warm = self.sandbox.spawn([*client, "--version"], env=env)
                 if warm.returncode != NOT_SERVED:
@@ -607,8 +633,6 @@ class WhyCliReadOnlyTests(unittest.TestCase):
             stop = self.sandbox.spawn(
                 [sys.executable, "-c", "import json,resident;print(json.dumps(resident.stop_servers()))"],
                 env=env)
-            _kill_processes_mentioning(str(runtime))
-            shutil.rmtree(runtime, ignore_errors=True)
         self.assertEqual(json.loads(stop.stdout).get("ok"), True, stop.stdout + stop.stderr)
 
 
@@ -1063,10 +1087,10 @@ class WhyMutationVerdictTests(_VerdictAssertions):
         finally:
             db.close()
         payload = self.assert_verdict("indexed", CLAUDE, env=env)
-        self.assertEqual(payload["evidence"]["corpus"]["scan_reason"], "schema 14, this build reads 15")
+        self.assertEqual(payload["evidence"]["corpus"]["scan_reason"], "schema 14, this build reads 17")
         self.assertNotIn("rows", payload["evidence"]["corpus"])
         self.assertEqual(payload["evidence"]["lines"][1],
-                         "corpus.db: schema 14, this build reads 15; search scans messages.jsonl "
+                         "corpus.db: schema 14, this build reads 17; search scans messages.jsonl "
                          "directly (5 rows published for this chat)")
 
     @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
@@ -1099,7 +1123,8 @@ class WhyMutationVerdictTests(_VerdictAssertions):
                  "db.execute('BEGIN IMMEDIATE'); db.execute(\"UPDATE msgs SET text = text || ' torn'\"); "
                  "os._exit(0)")
         crashed = subprocess.run([sys.executable, "-c", crash, str(self.sandbox.data / "corpus.db")],
-                                 capture_output=True, text=True, timeout=60, check=False)
+                                 capture_output=True, text=True, timeout=_COMMAND_TIMEOUT_S,
+                                 check=False)
         self.assertEqual(crashed.returncode, 0, crashed.stderr)
         journal = self.sandbox.data / "corpus.db-journal"
         self.assertTrue(journal.exists() and journal.stat().st_size > 0, "no hot journal was left")
@@ -2046,37 +2071,565 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
             unlisted, "intake_stats.json: 2 conversations parsed from it: projchat-one, projchat-two"])
         self.assertEqual(payload["candidates"], [])
 
-    def test_blind_token_census_proves_no_chat_current_or_absent(self) -> None:
-        """crush lists no conversation of any database while one cannot be read: the census shows
-        neither that a healthy database's chat is unchanged nor that an unknown one is not in it."""
+    def test_unreadable_sibling_database_scopes_the_census_to_itself(self) -> None:
+        """The census lists each crush database it opens: a chat in a healthy database is judged on
+        its own token while a sibling database is unreadable, and a conversation that database no
+        longer lists was deleted; a reference nothing lists stays unprovable, as the unreadable
+        database may hold it."""
         crush = self.crush_path()
         _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
         store, _ = self.crush_project("elm", [("elmchat-one", 1000, "hazel invoice question")])
         self.sandbox.index()
         store.write_bytes(b"not a crush database")
         self.sandbox.index()
-        self.assert_verdict("source-unreadable", "elmchat-one",
-                            next_action="make the file readable, then agrep index")
+        unreadable = "make the file readable, then agrep index"
+        for reference in ("elmchat-one", str(store)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("source-unreadable", reference, next_action=unreadable)
+                self.assertEqual(payload["evidence"]["issue"]["path"], str(store))
+        for reference in ("crushchat-one", str(crush)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("indexed", reference)
+                self.assertIsNone(payload["evidence"]["issue"])
+                self.assertIsNone(payload["evidence"]["census_issue"])
+        blind = f"store census: token-census-unreadable on {self.sandbox.display(store)} - "
+        for reference in ("crushchat-none", "quince"):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("not-provable", reference, next_action="agrep index")
+                self.assertTrue(payload["evidence"]["lines"][0].startswith(blind), payload)
+                self.assertIn(f"could not read {self.sandbox.display(store)}", payload["summary"])
         _crush_add(crush, "crushchat-new", 3000, "quince new question")
         _crush_add(crush, "crushchat-one", 4000, "maple follow-up question", new_session=False)
         self.assert_no_hits("maple")
-        blind = f"store census: token-census-unreadable on {self.sandbox.display(store)} - "
-        for round_, references in enumerate((("crushchat-one", str(crush), "crushchat-new"),
-                                             ("crushchat-one", "crushchat-new"))):
-            for reference in references:
-                with self.subTest(reference=reference, round=round_):
-                    payload = self.assert_verdict("not-provable", reference, next_action="agrep index")
-                    self.assertTrue(any(line.startswith(blind) for line in payload["evidence"]["lines"]),
-                                    payload)
-            self.sandbox.index()
+        for reference in ("crushchat-one", "crushchat-new", str(crush)):
+            with self.subTest(reference=reference):
+                self.assert_verdict("written-after-last-index", reference, next_action="agrep index")
+        self.sandbox.index()
         for query, session in (("maple", "crushchat-one"), ("quince", "crushchat-new")):
             self.assertIn(session, self.sandbox.cli("search", query, "--json").stdout)
+            self.assertIsNone(self.assert_verdict("indexed", session)["evidence"]["census_issue"])
+        self.assert_verdict("source-unreadable", "elmchat-one", next_action=unreadable)
+        _crush_exec(crush, "DELETE FROM messages WHERE session_id = 'crushchat-new'",
+                    "DELETE FROM sessions WHERE id = 'crushchat-new'")
+        self.sandbox.index()
+        self.assert_no_hits("quince")
+        payload = self.assert_verdict("source-not-discovered", "crushchat-new")
+        self.assertEqual(payload["summary"], "not indexed: crush conversation crushchat-new was deleted "
+                                             f"from {self.sandbox.display(crush)} after an index parsed it")
         store.unlink()
         _crush_store(store, [("elmchat-one", 1000, "hazel invoice question")])
         self.sandbox.index()
-        for session in ("crushchat-one", "crushchat-new", "elmchat-one"):
+        for session in ("crushchat-one", "elmchat-one"):
             with self.subTest(session=session):
                 self.assert_verdict("indexed", session)
+        self.assert_verdict("source-not-discovered", "crushchat-new")
+
+    def test_unreadable_registry_scopes_the_census_to_the_databases_it_names(self) -> None:
+        """A projects.json crush cannot read leaves the global database it still opens listed: that
+        database's chats are judged on their tokens, while a chat in a database only the registry
+        names, and a reference nothing lists, stay unprovable."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        store, registry = self.crush_project("elm", [("elmchat-one", 1000, "hazel invoice question")])
+        self.sandbox.index()
+        registry.write_text("{broken", encoding="utf-8")
+        self.sandbox.index()
+        self.assertIn("elmchat-one", self.sandbox.cli("search", "hazel", "--json").stdout)
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["census_issue"])
+        blind = f"store census: token-census-unreadable on {self.sandbox.display(registry)} - "
+        for reference in ("elmchat-one", str(store)):
+            with self.subTest(reference=reference):
+                payload = self.assert_verdict("not-provable", reference, next_action="agrep index")
+                self.assertEqual(payload["evidence"]["census_issue"]["path"], str(registry))
+                self.assertTrue(payload["evidence"]["lines"][1].startswith(blind), payload)
+        payload = self.assert_verdict("not-provable", "crushchat-none", next_action="agrep index")
+        self.assertTrue(payload["evidence"]["lines"][0].startswith(blind), payload)
+        _crush_add(crush, "crushchat-one", 4000, "maple follow-up question", new_session=False)
+        self.assert_verdict("written-after-last-index", "crushchat-one", next_action="agrep index")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_uninspectable_data_dir_keeps_its_database_unreadable_not_deleted(self) -> None:
+        """A registered data dir (or ~/.crush) nobody may search hides its database from a stat: the
+        index keeps every chat it published from it, why calls them unreadable rather than deleted,
+        and its siblings are judged on their own tokens."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        store, _ = self.crush_project("elm", [("elmchat-one", 1000, "hazel invoice question")])
+        old = self.sandbox.home / ".crush" / "crush.db"
+        _crush_store(old, [("oldchat-one", 1000, "quince old question")])
+        self.sandbox.index()
+        unreadable = "make the file readable, then agrep index"
+        for denied, session, query in ((store.parent, "elmchat-one", "hazel"),
+                                       (old.parent, "oldchat-one", "quince")):
+            denied.chmod(0)
+            try:
+                self.sandbox.index()
+                self.sandbox.index()
+                with self.subTest(denied=denied.name):
+                    self.assertIn(session, self.sandbox.cli("search", query, "--json").stdout)
+                    payload = self.assert_verdict("source-unreadable", session, next_action=unreadable)
+                    self.assertEqual(payload["evidence"]["issue"]["path"], str(denied / "crush.db"))
+                    self.assertIn("sessions.jsonl still serves the last good parse (1 message)",
+                                  payload["evidence"]["lines"])
+                    self.assert_verdict("source-unreadable", str(denied / "crush.db"),
+                                        next_action=unreadable)
+                    for sibling in ("crushchat-one", "elmchat-one", "oldchat-one"):
+                        if sibling != session:
+                            self.assertIsNone(self.assert_verdict("indexed", sibling)["evidence"]["issue"])
+                    payload = self.assert_verdict("not-provable", "crushchat-none", next_action="agrep index")
+                    self.assertIn(f"could not read {self.sandbox.display(denied / 'crush.db')}",
+                                  payload["summary"])
+            finally:
+                denied.chmod(0o700)
+            self.sandbox.index()
+            self.assert_verdict("indexed", session)
+
+    def test_corrupt_cursor_workspace_keeps_published_projects_and_publishes_new_chats(self) -> None:
+        """A workspace source cursor cannot read leaves attribution where it stood: a chat whose
+        project an index published keeps it (its rows untouched, updates to it still published
+        under it), a chat that never had one carries "cursor", and why calls each indexed naming
+        the pending source; repair relabels only what the source changes, duplicating nothing."""
+        path = self.cursor_path()
+        _cursor_store(path, [("cursor-chat-mapped", "walnut ledger question"),
+                             ("cursor-chat-legacy", "hazel invoice question"),
+                             ("cursor-chat-loose", "quince loose question")])
+        workspaces = path.parent.parent / "workspaceStorage"
+        for name, folder in (("mappedws", "mapped-project"), ("legacyws", "legacy-project")):
+            (workspaces / name).mkdir(parents=True)
+            (workspaces / name / "workspace.json").write_text(
+                json.dumps({"folder": f"file:///work/{folder}"}), encoding="utf-8")
+        mapped_json = workspaces / "mappedws" / "workspace.json"
+        legacy = workspaces / "legacyws" / "state.vscdb"
+
+        def legacy_maps(*composers: str) -> None:
+            legacy.unlink(missing_ok=True)
+            db = sqlite3.connect(str(legacy))
+            try:
+                with db:
+                    db.execute("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT)")
+                    db.execute("INSERT INTO ItemTable VALUES ('composer.composerData', ?)",
+                               (json.dumps({"allComposers": [{"composerId": c} for c in composers]}),))
+            finally:
+                db.close()
+
+        def projects() -> dict[str, str]:
+            rows = (self.sandbox.data / "sessions.jsonl").read_text(encoding="utf-8").splitlines()
+            return {r["session"]: r["project"] for r in map(json.loads, rows) if r.get("agent") == "cursor"}
+
+        legacy_maps("cursor-chat-legacy")
+        db = sqlite3.connect(str(path))
+        try:
+            with db:
+                db.execute("INSERT INTO composerHeaders VALUES ('cursor-chat-mapped', 'mappedws')")
+                db.execute("INSERT INTO composerHeaders VALUES ('cursor-chat-loose', NULL)")
+        finally:
+            db.close()
+        self.sandbox.index()
+        expected = {"cursor-chat-mapped": "mapped-project", "cursor-chat-legacy": "legacy-project",
+                    "cursor-chat-loose": "cursor"}
+        self.assertEqual(projects(), expected)
+        messages_before = (self.sandbox.data / "messages.jsonl").read_bytes()
+        # Both attribution sources break at once: the header-mapped chat's workspace.json and the
+        # legacy chat's workspace database.
+        mapped_json.write_text("{not json", encoding="utf-8")
+        legacy.write_bytes(b"not a sqlite database")
+        self.sandbox.index()
+        self.assertEqual(projects(), expected)
+        self.assertEqual((self.sandbox.data / "messages.jsonl").read_bytes(), messages_before)
+        # The gap's record is no store member: the pass that wrote it leaves the index current,
+        # not "1 store changed" until another index.
+        (self.sandbox.data / ".store-census.json").unlink(missing_ok=True)
+        self.assertNotIn("store changed", self.sandbox.cli("search", "question").stderr)
+        status = json.loads(self.sandbox.cli("status", "--json").stdout)
+        self.assertNotEqual(status["freshness"].get("code"), "index-behind", status["freshness"])
+        self.assertFalse(status["freshness"].get("may_be_stale"), status["freshness"])
+        self.sandbox.index()
+        self.assertEqual((self.sandbox.data / "messages.jsonl").read_bytes(), messages_before)
+        for project, session in (("mapped-project", "cursor-chat-mapped"),
+                                 ("legacy-project", "cursor-chat-legacy")):
+            self.assertIn(session, self.sandbox.cli("search", "question", "--project", project,
+                                                    "--json").stdout)
+        # The census names the first unreadable source in workspace order: legacyws before mappedws.
+        for session, project in (("cursor-chat-mapped", "mapped-project"),
+                                 ("cursor-chat-legacy", "legacy-project"),
+                                 ("cursor-chat-loose", "cursor")):
+            with self.subTest(session=session):
+                payload = self.assert_verdict("indexed", session)
+                self.assertEqual(payload["evidence"]["index_row"]["project"], project)
+                self.assertEqual(payload["evidence"]["provisional_issue"]["path"], str(legacy))
+                self.assertTrue(payload["evidence"]["lines"][1].startswith(
+                    f"store census: project {project!r} is provisional until "
+                    f"{self.sandbox.display(legacy)} is readable"), payload)
+        self.assert_verdict("source-not-discovered", "cursor-chat-none")
+        # Without the parse cache the census cannot tell which project each pending chat kept, so it
+        # lists no token for them: unprovable naming the source, never "written after".
+        cache_file = self.sandbox.data / ".ingest_cache.bin"
+        cache_bytes = cache_file.read_bytes()
+        cache_file.unlink()
+        for session in ("cursor-chat-mapped", "cursor-chat-legacy", "cursor-chat-loose"):
+            with self.subTest(session=session, cache="missing"):
+                payload = self.assert_verdict("not-provable", session,
+                                              next_action="make the file readable, then agrep index")
+                self.assertEqual(payload["evidence"]["census_issue"]["path"], str(legacy))
+                self.assertIn("cannot say which project", payload["evidence"]["census_issue"]["reason"])
+        # A missing cache plus the gap must not freeze the index: other agents' new chats publish,
+        # --full publishes, and cursor's chats keep their rows and projects unrelabelled.
+        other = self.sandbox.home / ".claude" / "projects" / "-projects-cedar" / f"{CLAUDE_NEW}.jsonl"
+        other.write_text(other.with_name(f"{CLAUDE}.jsonl").read_text(encoding="utf-8")
+                         .replace(CLAUDE, CLAUDE_NEW).replace("lantern", "pomegranate"), encoding="utf-8")
+        for mode in ((), ("--full",)):
+            with self.subTest(mode=mode, cache="missing"):
+                result = self.sandbox.cli("index", *mode)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(CLAUDE_NEW, self.sandbox.cli("search", "pomegranate", "--json").stdout)
+                self.assertEqual(projects(), expected)
+                for query, session in (("walnut", "cursor-chat-mapped"), ("hazel", "cursor-chat-legacy")):
+                    self.assertIn(session, self.sandbox.cli("search", query, "--json").stdout)
+        self.assert_verdict("indexed", "cursor-chat-mapped")
+        # Every chat is indexed, so the gap is no freshness failure: search stays quiet, and
+        # real drift (a new chat) still reports index-behind rather than the gap. Doctor's
+        # agent-stores line carries the provisional note, never "store unreadable".
+        notice = self.sandbox.cli("search", "pomegranate").stderr
+        self.assertNotIn("provisional", notice)
+        self.assertNotIn("could not be read", notice)
+        status = json.loads(self.sandbox.cli("status", "--json").stdout)
+        self.assertFalse(status.get("freshness", {}).get("failing"), status)
+        later = other.with_name(f"{CLAUDE_LATER}.jsonl")
+        later.write_text(other.read_text(encoding="utf-8").replace(CLAUDE_NEW, CLAUDE_LATER)
+                         .replace("pomegranate", "quince"), encoding="utf-8")
+        # the search above cached a current census for a few seconds; observe the new chat now
+        (self.sandbox.data / ".store-census.json").unlink(missing_ok=True)
+        notice = self.sandbox.cli("search", "pomegranate").stderr
+        self.assertIn("serving the last-good index (1 store changed)", notice)
+        self.assertNotIn("provisional", notice)
+        self.assertNotIn("could not be read", notice)
+        status = json.loads(self.sandbox.cli("status", "--json").stdout)
+        self.assertEqual(status["freshness"].get("code"), "index-behind", status["freshness"])
+        self.sandbox.index()
+        doctor = self.sandbox.cli("doctor").stdout + self.sandbox.cli("doctor").stderr
+        self.assertIn("cursor projects provisional until", doctor)
+        self.assertNotIn("store unreadable", doctor)
+        # A chat updated during the gap publishes its new turn under the project it keeps.
+        _cursor_add(path, "cursor-chat-mapped", "maple follow-up question")
+        self.assert_verdict("written-after-last-index", "cursor-chat-mapped", next_action="agrep index")
+        _cursor_store(path, [("cursor-chat-new", "pecan new question")])
+        self.assert_verdict("written-after-last-index", "cursor-chat-new", next_action="agrep index")
+        self.sandbox.index()
+        self.assertIn("cursor-chat-mapped", self.sandbox.cli("search", "maple", "--project",
+                                                            "mapped-project", "--json").stdout)
+        self.assertIn("cursor-chat-new", self.sandbox.cli("search", "pecan", "--json").stdout)
+        payload = self.assert_verdict("indexed", "cursor-chat-mapped")
+        self.assertEqual(payload["evidence"]["corpus"]["rows"], 2)
+        payload = self.assert_verdict("indexed", "cursor-chat-new")
+        self.assertEqual(payload["evidence"]["index_row"]["project"], "cursor")
+        self.assertEqual(payload["evidence"]["provisional_issue"]["path"], str(legacy))
+        mapped_json.write_text(json.dumps({"folder": "file:///work/mapped-project"}), encoding="utf-8")
+        legacy_maps("cursor-chat-legacy", "cursor-chat-new")
+        self.sandbox.index()
+        expected.update({"cursor-chat-new": "legacy-project"})
+        self.assertEqual(projects(), expected)
+        for session, rows in (("cursor-chat-mapped", 2), ("cursor-chat-legacy", 1),
+                              ("cursor-chat-loose", 1), ("cursor-chat-new", 1)):
+            with self.subTest(session=session):
+                payload = self.assert_verdict("indexed", session)
+                self.assertIsNone(payload["evidence"].get("provisional_issue"))
+                self.assertEqual(payload["evidence"]["corpus"]["rows"], rows)
+        hits = json.loads(self.sandbox.cli("search", "pecan", "--json").stdout.splitlines()[0])
+        self.assertEqual(hits["completeness"]["shown"], 1)
+        # A recorded gap for a store that then vanishes whole has nothing to describe: the census
+        # stays trusted, so a new chat elsewhere still reads index-behind.
+        legacy.write_bytes(b"not a sqlite database")
+        self.sandbox.index()
+        shutil.rmtree(self.sandbox.home / ".config" / "Cursor")
+        other.write_text(other.read_text(encoding="utf-8").replace("pomegranate", "persimmon"),
+                         encoding="utf-8")
+        (self.sandbox.data / ".store-census.json").unlink(missing_ok=True)
+        status = json.loads(self.sandbox.cli("status", "--json").stdout)
+        self.assertEqual(status["freshness"].get("code"), "index-behind", status["freshness"])
+        self.assertIn("serving the last-good index", self.sandbox.cli("search", "persimmon").stderr)
+
+    def test_panicking_parse_of_a_grown_token_chat_names_the_failure_not_a_reindex(self) -> None:
+        """A token chat that grew and whose parse then panicked keeps its last good tally, so it
+        looks merely changed; the record the index wrote names that conversation, and indexing
+        again cannot mend a panic: why names the record and the build update that can. A sibling
+        written through the store's WAL since (the file's times unmoved) was never tried and stays
+        written after the last index; a record naming no conversation is charged to none."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question"),
+                             ("crushchat-two", 1000, "hazel sibling question")])
+        self.sandbox.index()
+        _crush_add(crush, "crushchat-one", 2000, "walnut follow-up", new_session=False)
+        # The record a panicking index leaves (its shape is pinned by parse_panic.rs and
+        # crush.rs); the shipped binary carries no panic hook, so that index is simulated.
+        reason = "parser panicked at src/intake.rs:286: called `Result::unwrap()` on an `Err` value: …"
+        health = self.sandbox.data / ".source-health.json"
+
+        def record(session: str | None) -> None:
+            issue = {"agent": "crush", "kind": "source-read-failed", "path": str(crush), "reason": reason}
+            if session:
+                issue["session"] = session
+            health.write_text(json.dumps({"code": "source-unreadable", "issues": [issue]}),
+                              encoding="utf-8")
+
+        record("crushchat-one")
+        update = "update agrep (a parser fix ships in a new build), then agrep index"
+        payload = self.assert_verdict("source-unreadable", "crushchat-one", next_action=update)
+        self.assertIn("the last index could not parse the transcript", payload["summary"])
+        self.assertIn("parser panicked at", payload["summary"])
+        self.assertEqual(payload["evidence"]["issue"]["reason"], reason)
+        self.assertIn(".source-health.json: source-read-failed on", payload["evidence"]["lines"][1])
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-two")["evidence"]["issue"])
+        # The sibling grows through the WAL while a writer holds the store open: the main file's
+        # times do not move, yet it was never tried.
+        held = sqlite3.connect(str(crush))
+        try:
+            held.execute("PRAGMA journal_mode=WAL")
+            held.execute("PRAGMA wal_autocheckpoint=0")
+            with held:
+                held.execute("INSERT INTO messages VALUES ('two-m2', 'crushchat-two', 'user', ?, "
+                             "'', 3000, 3000)",
+                             (json.dumps([{"type": "text", "data": {"text": "hazel again"}}]),))
+                held.execute("UPDATE sessions SET updated_at = 3000 WHERE id = 'crushchat-two'")
+            self.assertTrue(crush.with_name("crush.db-wal").stat().st_size > 0)
+            self.assert_verdict("written-after-last-index", "crushchat-two", next_action="agrep index")
+            self.assert_verdict("source-unreadable", "crushchat-one", next_action=update)
+            # A record naming no conversation (an older writer, a failure before any session
+            # was known) is charged to no chat; the store-level verdict carries it.
+            record(None)
+            self.assert_verdict("written-after-last-index", "crushchat-one", next_action="agrep index")
+            self.assert_verdict("written-after-last-index", "crushchat-two", next_action="agrep index")
+        finally:
+            held.close()
+        # A build that parses it (here: no panic) clears the record and indexes both chats.
+        self.sandbox.index()
+        self.assertFalse(health.exists())
+        self.assert_verdict("indexed", "crushchat-one")
+        self.assert_verdict("indexed", "crushchat-two")
+        self.assertIn("crushchat-two", self.sandbox.cli("search", "again", "--json").stdout)
+
+    def test_a_bad_row_record_names_only_its_conversation(self) -> None:
+        """The index records a conversation's unreadable row against that conversation; a sibling
+        written through the WAL since reads as written after the last index, never as the failure."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question"),
+                             ("crushchat-two", 2000, "hazel invoice question")])
+        self.sandbox.index()
+        _crush_exec(crush, "INSERT INTO messages VALUES "
+                           "('bad', 'crushchat-one', 'user', '{not json', '', 3000, 3000)",
+                    "UPDATE sessions SET updated_at = 3000 WHERE id = 'crushchat-one'")
+        self.sandbox.index()
+        issues = json.loads((self.sandbox.data / ".source-health.json").read_text(encoding="utf-8"))["issues"]
+        self.assertEqual([(i["kind"], i.get("session")) for i in issues],
+                         [("source-read-failed", "crushchat-one")], issues)
+        self.assert_verdict("source-unreadable", "crushchat-one",
+                            next_action="make the file readable, then agrep index")
+        held = sqlite3.connect(str(crush))
+        try:
+            held.execute("PRAGMA journal_mode=WAL")
+            held.execute("PRAGMA wal_autocheckpoint=0")
+            with held:
+                held.execute("INSERT INTO messages VALUES ('two-m2', 'crushchat-two', 'user', ?, "
+                             "'', 4000, 4000)",
+                             (json.dumps([{"type": "text", "data": {"text": "hazel again"}}]),))
+                held.execute("UPDATE sessions SET updated_at = 4000 WHERE id = 'crushchat-two'")
+            payload = self.assert_verdict("written-after-last-index", "crushchat-two",
+                                          next_action="agrep index")
+            self.assertIsNone(payload["evidence"]["issue"])
+        finally:
+            held.close()
+
+    def test_a_bad_cursor_bubble_record_names_only_its_composer(self) -> None:
+        """A composer whose bubble no longer parses is recorded against that composer: why names
+        the parse failure and the readable remedy for it, and its sibling stays indexed."""
+        cursor = self.cursor_path()
+        _cursor_store(cursor, [("cursor-chat-one", "walnut ledger question"),
+                               ("cursor-chat-two", "hazel invoice question")])
+        self.sandbox.index()
+        _cursor_add(cursor, "cursor-chat-one", "walnut follow-up question")
+        _crush_exec(cursor, "UPDATE cursorDiskKV SET value = '{not json' "
+                            "WHERE key = 'bubbleId:cursor-chat-one:v'")
+        self.sandbox.index()
+        issues = json.loads((self.sandbox.data / ".source-health.json").read_text(encoding="utf-8"))["issues"]
+        self.assertEqual([(i["kind"], i.get("session")) for i in issues],
+                         [("source-read-failed", "cursor-chat-one")], issues)
+        payload = self.assert_verdict("source-unreadable", "cursor-chat-one",
+                                      next_action="make the file readable, then agrep index")
+        self.assertEqual(payload["evidence"]["issue"]["session"], "cursor-chat-one")
+        self.assertIn(".source-health.json: source-read-failed on", payload["evidence"]["lines"][1])
+        self.assertIn("did not parse completely", payload["evidence"]["lines"][1])
+        self.assertIsNone(self.assert_verdict("indexed", "cursor-chat-two")["evidence"]["issue"])
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_uninspectable_database_scopes_nothing_beyond_itself(self) -> None:
+        """An issue on one uninspectable database never reaches a chat of another store the census
+        no longer discovers: that chat is judged as an undiscovered store's, as with every database
+        readable."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        elm, registry = self.crush_project("elm", [("elmchat-one", 1000, "hazel invoice question")])
+        oak = self.sandbox.home / "projects" / "oak" / ".crush" / "crush.db"
+        _crush_store(oak, [("oakchat-one", 1000, "quince oak question")])
+        registry.write_text(json.dumps({"projects": [
+            {"path": str(elm.parent.parent), "data_dir": str(elm.parent)},
+            {"path": str(oak.parent.parent), "data_dir": str(oak.parent)}]}), encoding="utf-8")
+        self.sandbox.index()
+        shutil.rmtree(oak.parent.parent)
+        before = self.assert_verdict("indexed", "oakchat-one")
+        elm.parent.chmod(0)
+        try:
+            payload = self.assert_verdict("indexed", "oakchat-one")
+            self.assertIsNone(payload["evidence"]["census_issue"])
+            self.assertEqual(payload["evidence"]["lines"], before["evidence"]["lines"])
+            self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["census_issue"])
+            self.assert_verdict("source-unreadable", "elmchat-one",
+                                next_action="make the file readable, then agrep index")
+            self.sandbox.index()
+            self.sandbox.index()
+            self.assert_no_hits("quince")
+            self.assertIn("hazel", self.sandbox.cli("search", "hazel", "--json").stdout)
+            payload = self.assert_verdict("source-not-discovered", "oakchat-one")
+            self.assertEqual(payload["evidence"]["lines"][0],
+                             f"filesystem: no file at {self.sandbox.display(oak)}")
+        finally:
+            elm.parent.chmod(0o700)
+
+    def test_database_behind_a_file_is_absent_not_unreadable(self) -> None:
+        """A registered database whose grandparent became a regular file (its project path now
+        stats ENOTDIR) cannot exist: crush treats it as deleted, so the index converges, --full
+        publishes, and why calls its chats deleted."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        store, _ = self.crush_project("elm", [("elmchat-one", 1000, "hazel invoice question")])
+        self.sandbox.index()
+        projects = store.parent.parent.parent
+        shutil.rmtree(projects)
+        projects.write_bytes(b"a file where the projects directory was")
+        self.sandbox.index()
+        self.sandbox.index()
+        full = self.sandbox.cli("index", "--full")
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        self.assert_no_hits("hazel")
+        self.assertIn("crushchat-one", self.sandbox.cli("search", "walnut", "--json").stdout)
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["issue"])
+        payload = self.assert_verdict("source-not-discovered", "elmchat-one")
+        self.assertEqual(payload["evidence"]["lines"][0],
+                         f"filesystem: no file at {self.sandbox.display(store)}")
+        self.assertFalse((self.sandbox.data / ".source-health.json").exists())
+
+    def test_registered_database_that_disappears_waits_for_a_second_observation(self) -> None:
+        """A registered crush database whose volume unmounts (or whose project moved) keeps its chats
+        on the first pass, why calls them unprovable rather than deleted, and a volume that returns
+        leaves them untouched; one that stays gone clears on the second pass, and under --full."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        volume = self.sandbox.home / "Volumes" / "ext"
+        store = volume / "elm" / ".crush" / "crush.db"
+        _crush_store(store, [("elmchat-one", 1000, "hazel invoice question")])
+        registry = crush.with_name("projects.json")
+        registry.write_text(json.dumps({"projects": [{"path": str(volume / "elm"),
+                                                      "data_dir": str(store.parent)}]}), encoding="utf-8")
+        self.sandbox.index()
+        parked = self.sandbox.home / "parked"
+        shutil.move(str(volume), str(parked))
+        self.sandbox.index()
+        self.assertIn("elmchat-one", self.sandbox.cli("search", "hazel", "--json").stdout)
+        for reference in ("elmchat-one", str(store)):
+            with self.subTest(reference=reference, pass_="first"):
+                payload = self.assert_verdict(
+                    "not-provable", reference,
+                    next_action="mount or restore the store, then agrep index")
+                self.assertEqual(payload["evidence"]["issue"]["kind"], "source-root-unavailable")
+                # The second index prunes whatever is still absent: never promise it tells
+                # an unmounted volume from a removed one.
+                self.assertIn("mount it before the next index", payload["summary"])
+                self.assertNotIn("confirms whether", payload["summary"])
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["issue"])
+        # The volume comes back before the second observation: nothing was pruned or reparsed.
+        shutil.move(str(parked), str(volume))
+        self.sandbox.index()
+        self.assertIn("elmchat-one", self.sandbox.cli("search", "hazel", "--json").stdout)
+        self.assert_verdict("indexed", "elmchat-one")
+        # Gone for two consecutive observations: the removal is confirmed.
+        shutil.move(str(volume), str(parked))
+        self.sandbox.index()
+        self.assertIn("elmchat-one", self.sandbox.cli("search", "hazel", "--json").stdout)
+        self.sandbox.index()
+        self.assert_no_hits("hazel")
+        self.assert_verdict("source-not-discovered", "elmchat-one")
+        self.assertFalse((self.sandbox.data / ".source-health.json").exists())
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["issue"])
+        # A genuinely deleted project also clears under --full.
+        shutil.move(str(parked), str(volume))
+        self.sandbox.index()
+        self.assert_verdict("indexed", "elmchat-one")
+        shutil.rmtree(volume)
+        full = self.sandbox.cli("index", "--full")
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        self.assert_no_hits("hazel")
+        self.assert_verdict("source-not-discovered", "elmchat-one")
+
+    def test_stat_store_behind_a_file_converges_to_deleted_on_plain_passes(self) -> None:
+        """A claude store whose directory became a regular file cannot exist: the cache lane and the
+        preflight agree it is gone, so two plain passes prune its chats, why calls them deleted, no
+        health record names them, and the pi chats beside it stay indexed."""
+        self.sandbox.index()
+        self.assert_verdict("indexed", CLAUDE)
+        self.assertIn(CLAUDE, self.sandbox.cli("search", "lantern", "--json").stdout)
+        claude = self.sandbox.home / ".claude"
+        shutil.rmtree(claude)
+        claude.write_bytes(b"a file where the claude store was")
+        self.sandbox.index()
+        self.sandbox.index()
+        self.assertNotIn(CLAUDE, self.sandbox.cli("search", "lantern", "--json").stdout)
+        payload = self.assert_verdict("source-not-discovered", CLAUDE)
+        self.assertNotIn("make the file readable", payload.get("next_action") or "")
+        self.assertFalse((self.sandbox.data / ".source-health.json").exists())
+        self.assert_verdict("indexed-under-alias", PI_ALIAS)
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges here")
+    def test_store_behind_a_looping_or_mispointed_link_is_unreadable_not_deleted(self) -> None:
+        """Registered crush projects under `~/code -> ~/data/code` keep their chats when the link
+        turns into a loop or points at a file: the data is intact behind a misconfigured link, so
+        the index retains the rows, --full is refused, and why calls the chats unreadable."""
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        real = self.sandbox.home / "data" / "code"
+        link = self.sandbox.home / "code"
+        store = real / "elm" / ".crush" / "crush.db"
+        _crush_store(store, [("elmchat-one", 1000, "hazel invoice question")])
+        link.symlink_to(real)
+        registry = crush.with_name("projects.json")
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(json.dumps({"projects": [{"path": str(link / "elm"),
+                                                      "data_dir": str(link / "elm" / ".crush")}]}),
+                            encoding="utf-8")
+        self.sandbox.index()
+        self.assert_verdict("indexed", "elmchat-one")
+        linked = link / "elm" / ".crush" / "crush.db"
+        unreadable = "make the file readable, then agrep index"
+        for label, target in (("loop", self.sandbox.home / "code-loop"), ("file", registry)):
+            link.unlink()
+            if label == "loop":
+                target.symlink_to(link)
+            link.symlink_to(target)
+            try:
+                self.sandbox.index()
+                self.sandbox.index()
+                full = self.sandbox.cli("index", "--full")
+                with self.subTest(label=label):
+                    self.assertEqual(full.returncode, 1, full.stdout + full.stderr)
+                    self.assertIn("retained the old generation", full.stdout + full.stderr)
+                    self.assertIn("elmchat-one", self.sandbox.cli("search", "hazel", "--json").stdout)
+                    payload = self.assert_verdict("source-unreadable", "elmchat-one", next_action=unreadable)
+                    self.assertEqual(payload["evidence"]["issue"]["path"], str(linked))
+                    self.assertIsNone(self.assert_verdict("indexed", "crushchat-one")["evidence"]["issue"])
+            finally:
+                link.unlink()
+                if label == "loop":
+                    target.unlink()
+                link.symlink_to(real)
+            self.sandbox.index()
+            self.assert_verdict("indexed", "elmchat-one")
 
     def test_resumed_gemini_chat_is_judged_by_the_jsonl_gemini_reads(self) -> None:
         """Resuming a legacy gemini `X.json` copies it into `X.jsonl`, which carries the chat from then
@@ -2135,6 +2688,922 @@ class WhyUnclaimedStoreTests(_VerdictAssertions):
                     self.assertEqual(payload["summary"], f"not indexed: opencode no longer reads "
                                                          f"{self.sandbox.display(store)}, which an index "
                                                          "parsed before")
+
+
+class PartialPublicationTests(_VerdictAssertions):
+    """One conversation or store the index cannot read never holds the rest of the history back,
+    and nothing calls it current: why, doctor, status and the census name it, no verified-current
+    record vouches for it, and an explicit index (or any index after it changes) reads it again."""
+
+    UNREADABLE = "make the file readable, then agrep index"
+
+    def setUp(self) -> None:
+        self.sandbox = Sandbox()
+
+    def tearDown(self) -> None:
+        self.sandbox.close()
+
+    def cursor_path(self) -> Path:
+        return self.sandbox.home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+    def crush_path(self) -> Path:
+        return self.sandbox.home / ".local" / "share" / "crush" / "crush.db"
+
+    def opencode_path(self) -> Path:
+        return self.sandbox.home / ".local" / "share" / "opencode" / "opencode.db"
+
+    def hit_sessions(self, query: str) -> set[str]:
+        search = self.sandbox.cli("search", query, "--json")
+        return {row["session"] for row in map(json.loads, search.stdout.splitlines())
+                if "session" in row}
+
+    def health(self) -> list[tuple[str, str, str | None]]:
+        path = self.sandbox.data / ".source-health.json"
+        if not path.exists():
+            return []
+        return [(issue["agent"], issue["path"], issue.get("session"))
+                for issue in json.loads(path.read_text(encoding="utf-8"))["issues"]]
+
+    def published_agents(self) -> set[str]:
+        lines = (self.sandbox.data / "messages.jsonl").read_text(encoding="utf-8").splitlines()
+        return {json.loads(line)["agent"] for line in lines}
+
+    def census_state(self, agent: str) -> str:
+        census = self.sandbox.spawn([str(_rust_bin()), "stores", "--census"])
+        self.assertEqual(census.returncode, 0, census.stderr)
+        return next(row["state"] for row in json.loads(census.stdout)["stores"] if row["name"] == agent)
+
+    def assert_named(self, agent: str, store: Path, session: str | None) -> None:
+        """status and doctor name the failed store, and the conversation where one failed; the
+        store census and the verified-current record never call it current."""
+        named = f"{agent} conversation {session} at {store}" if session else f"{agent} at {store}"
+        for command in ("status", "doctor"):
+            with self.subTest(command=command):
+                shown = self.sandbox.cli(command)
+                self.assertIn(f"store unreadable: {named}", shown.stdout, shown.stdout + shown.stderr)
+        freshness = json.loads(self.sandbox.cli("status", "--json").stdout)["freshness"]
+        self.assertEqual(freshness.get("code"), "source-unreadable", freshness)
+        self.assertIn(str(store), freshness["reason"])
+        if session:
+            self.assertIn(f"{agent} conversation {session}", freshness["reason"])
+        self.assertEqual(self.census_state(agent), "source-unreadable")
+        self.assertFalse((self.sandbox.data / "verified-current.json").exists())
+
+    _AUTOMATIC_PASS = (
+        "import subprocess, sys, common, indexd_runtime\n"
+        "binary = common.ingest_bin()\n"
+        "run = subprocess.run([str(binary), 'index', '--agent', 'all'], capture_output=True,\n"
+        "                     text=True, env=indexd_runtime.rust_writer_env(binary))\n"
+        "sys.stdout.write(run.stdout)\n"
+        "sys.stderr.write(run.stderr)\n"
+        "sys.exit(run.returncode)\n")
+
+    def automatic_pass(self) -> str:
+        """The daemon's pass: the Rust ingest under the writer identity Python gives it, with no
+        retry flag. Returns its stdout."""
+        result = self.sandbox.spawn([sys.executable, "-c", self._AUTOMATIC_PASS])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    _FIRST_PUBLICATION = (
+        "import common, indexd_runtime\n"
+        "env = indexd_runtime.rust_writer_env(common.ingest_bin())\n"
+        "print(indexd_runtime._first_publication_committed(env['AGREP_RUNTIME_BUILD_ID']))\n")
+
+    def assert_settled_beside_the_failure(self) -> None:
+        """A failed chat is disclosed staleness, as a failed store is: the first publication
+        commits, an unchanged automatic pass takes the shortcut and keeps the record, and an
+        explicit index reads the chat again."""
+        committed = self.sandbox.spawn([sys.executable, "-c", self._FIRST_PUBLICATION])
+        self.assertEqual(committed.stdout.strip(), "True", committed.stderr)
+        health = (self.sandbox.data / ".source-health.json").read_bytes()
+        self.assertIn("unchanged since last index", self.automatic_pass())
+        self.assertEqual((self.sandbox.data / ".source-health.json").read_bytes(), health)
+        explicit = self.sandbox.cli("index")
+        self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+        self.assertNotIn("unchanged since last index", explicit.stdout)
+
+    def assert_audit_names(self, agent: str, store: Path, session: str | None) -> None:
+        """audit cannot certify a store it could not read (exit 2), and says which failure and
+        what to do as doctor does: the chat where one failed, and doctor's remedy."""
+        named = f"{agent} conversation {session} at {store}" if session else f"{agent} at {store}"
+        audited = self.sandbox.cli("audit", "--json")
+        self.assertEqual(audited.returncode, 2, audited.stdout + audited.stderr)
+        problems = json.loads(audited.stdout)["problems"]
+        problem = next((item for item in problems if "store audit snapshot is degraded" in item),
+                       None)
+        self.assertIsNotNone(problem, problems)
+        self.assertIn(named, problem)
+        doctor_line = next(line for line in self.sandbox.cli("doctor").stdout.splitlines()
+                           if "store unreadable:" in line)
+        self.assertTrue(problem.endswith(" - " + doctor_line.rsplit(" - ", 1)[1]),
+                        f"{problem!r} vs {doctor_line!r}")
+
+    def plant_bad_cursor_composer(self, cursor: Path, session: str, text: str) -> None:
+        _cursor_store(cursor, [(session, text)])
+        _crush_exec(cursor, f"UPDATE cursorDiskKV SET value = '{{not json' WHERE key = 'bubbleId:{session}:u'")
+
+    def doctor_remedy(self) -> str:
+        """The remedy doctor's agent-stores row gives a chat whose rows do not parse: why's for
+        the same chat (a file it can read, so making it readable is no remedy)."""
+        line = next(line for line in self.sandbox.cli("doctor").stdout.splitlines()
+                    if "store unreadable:" in line)
+        remedy = line.rsplit(" - ", 1)[1]
+        self.assertRegex(remedy, r"^retry `[^`]* index`; inspect the named source if it persists$")
+        return remedy
+
+    def plant_bad_crush_session(self, crush: Path, session: str, at: int, text: str) -> None:
+        _crush_add(crush, session, at, text)
+        _crush_exec(crush, f"INSERT INTO messages VALUES ('{session}-bad', '{session}', 'user', "
+                           f"'{{not json', '', {at + 1}, {at + 1})")
+
+    def test_first_index_publishes_past_a_malformed_cursor_composer(self) -> None:
+        cursor = self.cursor_path()
+        _cursor_store(cursor, [("cursor-good", "walnut ledger question")])
+        self.plant_bad_cursor_composer(cursor, "cursor-bad", "hazel invoice question")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("copper lantern"), {CLAUDE})
+        self.assertEqual(self.hit_sessions("walnut"), {"cursor-good"})
+        self.assertEqual(self.hit_sessions("hazel"), set())
+        self.assertEqual(self.health(), [("cursor", str(cursor), "cursor-bad")])
+        payload = self.assert_verdict("source-unreadable", "cursor-bad",
+                                      next_action=self.doctor_remedy())
+        self.assertEqual(payload["evidence"]["issue"]["session"], "cursor-bad")
+        self.assertIsNone(self.assert_verdict("indexed", "cursor-good")["evidence"]["issue"])
+        self.assert_verdict("indexed", CLAUDE)
+        self.assert_named("cursor", cursor, "cursor-bad")
+        self.assert_audit_names("cursor", cursor, "cursor-bad")
+        self.assert_settled_beside_the_failure()
+        # The failed composer was never cached as read: once it parses, the next index has it.
+        _crush_exec(cursor, "UPDATE cursorDiskKV SET value = '"
+                            + json.dumps({"type": 1, "text": "hazel invoice question"})
+                            + "' WHERE key = 'bubbleId:cursor-bad:u'")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("hazel"), {"cursor-bad"})
+        self.assertEqual(self.health(), [])
+        self.assert_verdict("indexed", "cursor-bad")
+
+    def test_first_index_publishes_past_a_malformed_crush_session(self) -> None:
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-good", 1000, "walnut ledger question")])
+        self.plant_bad_crush_session(crush, "crushchat-bad", 2000, "hazel invoice question")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("copper lantern"), {CLAUDE})
+        self.assertEqual(self.hit_sessions("walnut"), {"crushchat-good"})
+        self.assertEqual(self.hit_sessions("hazel"), set())
+        self.assertEqual(self.health(), [("crush", str(crush), "crushchat-bad")])
+        payload = self.assert_verdict("source-unreadable", "crushchat-bad",
+                                      next_action=self.doctor_remedy())
+        self.assertEqual(payload["evidence"]["issue"]["session"], "crushchat-bad")
+        self.assertIsNone(self.assert_verdict("indexed", "crushchat-good")["evidence"]["issue"])
+        self.assert_named("crush", crush, "crushchat-bad")
+        self.assert_settled_beside_the_failure()
+        _crush_exec(crush, "DELETE FROM messages WHERE id = 'crushchat-bad-bad'",
+                    "UPDATE sessions SET updated_at = 3000 WHERE id = 'crushchat-bad'")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("hazel"), {"crushchat-bad"})
+        self.assertEqual(self.health(), [])
+
+    def test_a_new_malformed_conversation_leaves_siblings_and_other_agents_publishing(self) -> None:
+        cursor, crush = self.cursor_path(), self.crush_path()
+        _cursor_store(cursor, [("cursor-good", "walnut ledger question")])
+        _crush_store(crush, [("crushchat-good", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        self.plant_bad_cursor_composer(cursor, "cursor-bad", "hazel invoice question")
+        self.plant_bad_crush_session(crush, "crushchat-bad", 2000, "hazel invoice question")
+        _cursor_store(cursor, [("cursor-new", "maple budget question")])
+        _crush_add(crush, "crushchat-new", 3000, "maple budget question")
+        _append_claude_turn(self.sandbox.home / ".claude" / "projects" / "-projects-cedar"
+                            / f"{CLAUDE}.jsonl", self.sandbox.home, "maple cedar follow-up",
+                            "2000-01-21T12:00:00.000Z")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("maple"), {"cursor-new", "crushchat-new", CLAUDE})
+        self.assertEqual(self.hit_sessions("walnut"), {"cursor-good", "crushchat-good"})
+        self.assertEqual(self.hit_sessions("hazel"), set())
+        self.assertEqual(sorted(self.health()), [("crush", str(crush), "crushchat-bad"),
+                                                 ("cursor", str(cursor), "cursor-bad")])
+        for session in ("cursor-bad", "crushchat-bad"):
+            with self.subTest(session=session):
+                self.assert_verdict("source-unreadable", session,
+                                    next_action=self.doctor_remedy())
+        for session in ("cursor-new", "crushchat-new", "cursor-good", "crushchat-good"):
+            with self.subTest(session=session):
+                self.assert_verdict("indexed", session)
+
+    def test_a_published_conversation_turned_malformed_keeps_its_last_good_rows(self) -> None:
+        cursor, crush = self.cursor_path(), self.crush_path()
+        _cursor_store(cursor, [("cursor-chat", "walnut ledger question")])
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        _crush_exec(cursor, "UPDATE cursorDiskKV SET value = '{not json' "
+                            "WHERE key = 'bubbleId:cursor-chat:u'")
+        _crush_exec(crush, "INSERT INTO messages VALUES ('bad', 'crushchat-one', 'user', '{not json', "
+                           "'', 2000, 2000)",
+                    "UPDATE sessions SET updated_at = 2000 WHERE id = 'crushchat-one'")
+        for round_ in range(2):
+            self.sandbox.index()
+            self.assertEqual(self.hit_sessions("walnut"), {"cursor-chat", "crushchat-one"})
+            sessions = (self.sandbox.data / "sessions.jsonl").read_text(encoding="utf-8")
+            self.assertIn("cursor-chat", sessions)
+            self.assertIn("crushchat-one", sessions)
+            for session in ("cursor-chat", "crushchat-one"):
+                with self.subTest(session=session, round=round_):
+                    payload = self.assert_verdict("source-unreadable", session,
+                                                  next_action=self.UNREADABLE)
+                    self.assertIn("sessions.jsonl still serves the last good parse (1 message)",
+                                  payload["evidence"]["lines"])
+
+    def test_first_index_publishes_past_a_store_that_fails_to_read(self) -> None:
+        opencode = self.opencode_path()
+        opencode.parent.mkdir(parents=True)
+        broken = sqlite3.connect(str(opencode))
+        try:
+            # The schema probe finds opencode 2.x, whose message query then cannot run.
+            broken.executescript("CREATE TABLE session_message(id TEXT PRIMARY KEY);")
+        finally:
+            broken.close()
+
+        def assert_disclosed() -> None:
+            self.assertIn("claude", self.published_agents())
+            self.assertNotIn("opencode", self.published_agents())
+            self.assertEqual(self.hit_sessions("copper lantern"), {CLAUDE})
+            self.assertEqual(self.health(), [("opencode", str(opencode), None)])
+            self.assert_named("opencode", opencode, None)
+            payload = self.sandbox.why_json(str(opencode))[0]
+            self.assertEqual(payload["verdict"], "source-unreadable", payload)
+            self.assertEqual(payload["evidence"]["issue"]["path"], str(opencode))
+
+        self.sandbox.index()
+        assert_disclosed()
+        self.assert_audit_names("opencode", opencode, None)
+        # An automatic pass over the unchanged store keeps the durable disclosure, unread.
+        self.assertIn("unchanged since last index", self.automatic_pass())
+        assert_disclosed()
+        # An explicit index, the remedy every surface names, reads it again with nothing changed.
+        explicit = self.sandbox.cli("index")
+        self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+        self.assertNotIn("unchanged since last index", explicit.stdout)
+        assert_disclosed()
+        opencode.unlink()
+        _opencode_store(opencode, self.sandbox.home, [("ses_quince", 1000, "quince ledger question")])
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+        self.assertEqual(self.health(), [])
+        self.assertTrue((self.sandbox.data / ".source_snapshot.bin").exists())
+        self.assertEqual(self.census_state("opencode"), "available")
+        self.assert_verdict("indexed", "ses_quince")
+        # With nothing on record, an explicit index keeps the unchanged shortcut.
+        settled = self.sandbox.cli("index")
+        self.assertIn("unchanged since last index", settled.stdout, settled.stdout + settled.stderr)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_a_store_made_readable_is_read_by_the_next_automatic_pass(self) -> None:
+        """Restoring the permission changes the store's identity, so even an automatic pass
+        reads it again; until then an unchanged automatic pass keeps it disclosed."""
+        opencode = self.opencode_path()
+        _opencode_store(opencode, self.sandbox.home, [("ses_quince", 1000, "quince ledger question")])
+        opencode.chmod(0)
+        try:
+            self.sandbox.index()
+            self.assertEqual(self.health(), [("opencode", str(opencode), None)])
+            self.assert_named("opencode", opencode, None)
+            self.assertIn("unchanged since last index", self.automatic_pass())
+            self.assertEqual(self.health(), [("opencode", str(opencode), None)])
+        finally:
+            opencode.chmod(0o600)
+        self.assertNotIn("unchanged since last index", self.automatic_pass())
+        self.assertEqual(self.health(), [])
+        self.assertIn("opencode", self.published_agents())
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+        self.assert_verdict("indexed", "ses_quince")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_a_published_store_that_fails_to_read_keeps_its_last_good_rows(self) -> None:
+        opencode = self.opencode_path()
+        _opencode_store(opencode, self.sandbox.home, [("ses_quince", 1000, "quince ledger question")])
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+        healthy = opencode.with_name("healthy.db")
+        opencode.rename(healthy)
+        broken = sqlite3.connect(str(opencode))
+        try:
+            broken.executescript("CREATE TABLE session_message(id TEXT PRIMARY KEY);")
+        finally:
+            broken.close()
+        for failure in ("query", "permission"):
+            if failure == "permission":
+                opencode.unlink()
+                healthy.rename(opencode)
+                opencode.chmod(0)
+            with self.subTest(failure=failure):
+                self.sandbox.index()
+                self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+                self.assertIn("ses_quince",
+                              (self.sandbox.data / "sessions.jsonl").read_text(encoding="utf-8"))
+                self.assertIn(("opencode", str(opencode), None), self.health())
+        opencode.chmod(0o600)
+        self.sandbox.index()
+        self.assertEqual(self.health(), [])
+        self.assert_verdict("indexed", "ses_quince")
+
+    def test_a_composer_id_holding_a_colon_owns_its_bubbles(self) -> None:
+        cursor = self.cursor_path()
+        _cursor_store(cursor, [("chat:one", "walnut ledger question")])
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("walnut"), {"chat:one"})
+        _crush_exec(cursor, "UPDATE cursorDiskKV SET value = '"
+                            + json.dumps({"type": 1, "text": "hazel invoice question"})
+                            + "' WHERE key = 'bubbleId:chat:one:u'")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("hazel"), {"chat:one"})
+        self.assertEqual(self.hit_sessions("walnut"), set())
+
+    # The sandbox turns embeddings off, so no surface adds the meaning-search rebuild's cost.
+    HOLD = ("fix or remove it in {agent}, or run `{command}` to rebuild without it "
+            "(it is indexed again once readable)")
+
+    def lose_parse_cache(self) -> None:
+        for name in (".ingest_cache.bin", ".ingest_cache.bin.head", ".ingest_cache.bin.journal"):
+            (self.sandbox.data / name).unlink(missing_ok=True)
+
+    def assert_held_until_reindex_full(self, agent: str, store: Path, session: str | None,
+                                       chat: str) -> str:
+        """Case (4): published material turned unreadable while the parse cache is lost. The
+        daemon's pass, `agrep index` and `agrep index --full` keep the old index; the refusal,
+        status, doctor, audit and `why` of the held `chat` name it with the rebuild as the remedy,
+        never a retry. Then `agrep reindex --full` publishes the rest without it, named. Returns
+        its output."""
+        named = f"{agent} conversation {session} at {store}" if session else f"{agent} at {store}"
+        published = (self.sandbox.data / "messages.jsonl").read_bytes()
+        # A first observation is retried, the consent's own pass included; seen again the same
+        # way, it persists and the rebuild without it becomes the remedy.
+        first = self.sandbox.cli("reindex", "--full", "--no-build")
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("and will retry; if it persists, `agrep reindex --full` rebuilds without it",
+                      first.stderr)
+        self.assertNotIn("rebuilt without", first.stdout)
+        self.assertEqual((self.sandbox.data / "messages.jsonl").read_bytes(), published)
+        automatic = self.sandbox.spawn([sys.executable, "-c", self._AUTOMATIC_PASS])
+        self.assertNotEqual(automatic.returncode, 0, automatic.stdout)
+        self.assertIn(f"conversation {session}" if session else str(store), automatic.stderr)
+        self.assertIn(self.HOLD.format(agent=agent, command="agrep reindex --full"),
+                      automatic.stderr)
+        for argv in (("index",), ("index", "--full")):
+            with self.subTest(argv=argv):
+                refused = self.sandbox.cli(*argv)
+                self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                self.assertEqual((self.sandbox.data / "messages.jsonl").read_bytes(), published)
+        lines = {}
+        for command in ("status", "doctor"):
+            shown = self.sandbox.cli(command).stdout
+            lines[command] = next(line for line in shown.splitlines() if "store unreadable:" in line)
+            with self.subTest(command=command):
+                self.assertIn(f"store unreadable: {named} - ", lines[command])
+                self.assertRegex(lines[command], " - " + re.escape(
+                    self.HOLD.format(agent=agent, command="@")).replace(
+                        "@", "[^`]*reindex --full") + "$")
+                self.assertNotIn("retry `", lines[command])
+        # Every pass refuses, the daemon's too: the freshness row says what that costs.
+        freshness_row = next(line for line in self.sandbox.cli("doctor").stdout.splitlines()
+                             if " freshness " in line)
+        self.assertIn("new chats are not being indexed - " + lines["doctor"].rsplit(" - ", 1)[1],
+                      freshness_row)
+        self.assertNotIn("[ok ]", freshness_row)
+        freshness = json.loads(self.sandbox.cli("status", "--json").stdout)["freshness"]
+        self.assertEqual(freshness.get("code"), "unreadable-holds-index", freshness)
+        self.assertIn(str(store), freshness["reason"])
+        bare = self.sandbox.cli().stdout
+        self.assertIn("new chats are not being indexed", bare)
+        self.assertRegex(bare, r"`[^`]*reindex --full`")
+        audited = self.sandbox.cli("audit", "--json")
+        self.assertEqual(audited.returncode, 2, audited.stdout + audited.stderr)
+        problem = next(item for item in json.loads(audited.stdout)["problems"]
+                       if "store audit snapshot is degraded" in item)
+        self.assertIn(f"{agent}{f' conversation {session}' if session else ''} at {store}",
+                      problem)
+        self.assertTrue(problem.endswith(" - " + lines["doctor"].rsplit(" - ", 1)[1]),
+                        f"{problem!r} vs {lines['doctor']!r}")
+        self.assertNotIn("retry `", problem)
+        held = self.assert_verdict("source-unreadable", chat,
+                                   next_action=lines["doctor"].rsplit(" - ", 1)[1])
+        self.assertEqual(held["evidence"]["issue"]["path"], str(store))
+        rebuilt = self.sandbox.cli("reindex", "--full", "--no-build")
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stdout + rebuilt.stderr)
+        self.assertIn("rebuilt without unreadable", rebuilt.stdout)
+        # Left out, it stays disclosed but holds nothing back: the retry remedy is true again.
+        freshness = json.loads(self.sandbox.cli("status", "--json").stdout)["freshness"]
+        self.assertEqual(freshness.get("code"), "source-unreadable", freshness)
+        doctor_line = next(line for line in self.sandbox.cli("doctor").stdout.splitlines()
+                           if "store unreadable:" in line)
+        self.assertIn(f"store unreadable: {named} - ", doctor_line)
+        self.assertNotIn("reindex --full", doctor_line)
+        if session:
+            # Left out of the index and the parse cache, `why` still names its standing failure,
+            # with the remedy doctor gives it.
+            dropped = self.assert_verdict("source-unreadable", chat,
+                                          next_action=doctor_line.rsplit(" - ", 1)[1])
+            self.assertEqual(dropped["evidence"]["issue"]["path"], str(store))
+        return rebuilt.stdout
+
+    def test_a_published_chat_unreadable_past_a_lost_cache_is_left_out_by_reindex_full(
+            self) -> None:
+        cursor = self.cursor_path()
+        _cursor_store(cursor, [("cursor-chat", "walnut ledger question"),
+                               ("cursor-other", "hazel invoice question")])
+        self.sandbox.index()
+        self.lose_parse_cache()
+        _crush_exec(cursor, "UPDATE cursorDiskKV SET value = '{not json' "
+                            "WHERE key = 'bubbleId:cursor-chat:u'")
+        _append_claude_turn(self.sandbox.home / ".claude" / "projects" / "-projects-cedar"
+                            / f"{CLAUDE}.jsonl", self.sandbox.home, "maple cedar follow-up",
+                            "2000-01-21T12:00:00.000Z")
+        self.assertEqual(self.hit_sessions("walnut"), {"cursor-chat"})
+        rebuilt = self.assert_held_until_reindex_full("cursor", cursor, "cursor-chat", "cursor-chat")
+        self.assertIn("conversation cursor-chat", rebuilt)
+        self.assertEqual(self.hit_sessions("maple"), {CLAUDE})
+        self.assertEqual(self.hit_sessions("walnut"), set())
+        self.assertEqual(self.hit_sessions("hazel"), {"cursor-other"})
+        self.assertEqual(self.health(), [("cursor", str(cursor), "cursor-chat")])
+        _crush_exec(cursor, "UPDATE cursorDiskKV SET value = '"
+                            + json.dumps({"type": 1, "text": "walnut ledger question"})
+                            + "' WHERE key = 'bubbleId:cursor-chat:u'")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("walnut"), {"cursor-chat"})
+        self.assertEqual(self.health(), [])
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_a_published_transcript_unreadable_past_a_lost_cache_is_left_out_by_reindex_full(
+            self) -> None:
+        birch = (self.sandbox.home / ".claude" / "projects" / "-projects-birch"
+                 / f"{CLAUDE_TWIN}.jsonl")
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("birch lantern"), {CLAUDE_TWIN})
+        self.lose_parse_cache()
+        birch.chmod(0)
+        try:
+            _append_claude_turn(self.sandbox.home / ".claude" / "projects" / "-projects-cedar"
+                                / f"{CLAUDE}.jsonl", self.sandbox.home, "maple cedar follow-up",
+                                "2000-01-21T12:00:00.000Z")
+            rebuilt = self.assert_held_until_reindex_full("claude", birch, None, CLAUDE_TWIN)
+            self.assertIn(str(birch), rebuilt)
+            self.assertEqual(self.hit_sessions("maple"), {CLAUDE})
+            self.assertEqual(self.hit_sessions("birch lantern"), set())
+            self.assertEqual(self.health(), [("claude", str(birch), None)])
+        finally:
+            birch.chmod(0o600)
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("birch lantern"), {CLAUDE_TWIN})
+        self.assertEqual(self.health(), [])
+
+    def test_a_store_mid_write_is_retried_never_left_out(self) -> None:
+        """A store another process is writing (its rollback journal live), seen for the first
+        time, is never left out: `agrep reindex --full` keeps it and its last index, promises a
+        retry, marks nothing, and the pass after the writer finishes reads it."""
+        opencode = self.opencode_path()
+        _opencode_store(opencode, self.sandbox.home, [("ses_quince", 1000, "quince ledger question")])
+        self.sandbox.index()
+        self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+        self.lose_parse_cache()
+        writer = sqlite3.connect(str(opencode), isolation_level=None)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE session_v2 SET time_updated = time_updated + 1")
+            self.assertTrue(opencode.with_name("opencode.db-journal").exists())
+            refused = self.sandbox.cli("reindex", "--full", "--no-build")
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("will retry", refused.stderr)
+            self.assertNotIn("to rebuild without", refused.stderr)
+            self.assertNotIn("rebuilt without", refused.stdout)
+            self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+            record = json.loads((self.sandbox.data / ".source-health.json")
+                                .read_text(encoding="utf-8"))["issues"]
+            self.assertFalse(any(issue.get("blocks_publication") for issue in record), record)
+            freshness = json.loads(self.sandbox.cli("status", "--json").stdout)["freshness"]
+            self.assertNotEqual(freshness.get("code"), "unreadable-holds-index", freshness)
+            for command in ("status", "doctor"):
+                with self.subTest(command=command):
+                    self.assertNotIn("reindex --full", self.sandbox.cli(command).stdout)
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+        self.sandbox.index()
+        self.assertEqual(self.health(), [])
+        self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
+
+    def test_history_that_is_all_the_index_holds_names_only_its_agents_fix(self) -> None:
+        """A record held because it is all the published history (`rebuild` false): no rebuild
+        can help, so status, doctor, the freshness reason and why all give the agent's fix."""
+        birch = (self.sandbox.home / ".claude" / "projects" / "-projects-birch"
+                 / f"{CLAUDE_TWIN}.jsonl")
+        self.sandbox.index()
+        (self.sandbox.data / ".source-health.json").write_text(json.dumps({
+            "code": "source-unreadable",
+            "issues": [{"agent": "claude", "path": str(birch), "kind": "source-read-failed",
+                        "reason": "source parser could not complete the read",
+                        "blocks_publication": True, "rebuild": False}],
+        }), encoding="utf-8")
+        manual = ("fix or remove it in claude (all the index holds is history agrep cannot "
+                  "read now)")
+        for command in ("status", "doctor"):
+            with self.subTest(command=command):
+                shown = self.sandbox.cli(command).stdout
+                line = next(line for line in shown.splitlines() if "store unreadable:" in line)
+                self.assertTrue(line.endswith(" - " + manual), line)
+                self.assertNotIn("reindex --full", shown)
+        freshness = json.loads(self.sandbox.cli("status", "--json").stdout)["freshness"]
+        self.assertEqual(freshness.get("code"), "unreadable-holds-everything", freshness)
+        self.assert_verdict("source-unreadable", CLAUDE_TWIN, next_action=manual)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_a_held_store_and_an_interrupted_pass_resolve_by_the_holds_remedy(self) -> None:
+        """A held transcript plus a pass killed mid-write: the interrupted-pass surfaces give the
+        hold's remedy (no plain index can publish), reindex names the interrupted pass, `agrep
+        index` rolls corpus.db back, and the consent's rebuild then publishes, event store and
+        all, leaving the record unmarked."""
+        from _test_support import kill_mid_write
+        from test_cli_conformance import CORPUS_SPILL, EVENT_SPILL
+
+        birch = (self.sandbox.home / ".claude" / "projects" / "-projects-birch"
+                 / f"{CLAUDE_TWIN}.jsonl")
+        self.sandbox.index()
+        self.lose_parse_cache()
+        birch.chmod(0)
+        try:
+            for _ in range(2):
+                self.assertNotEqual(self.sandbox.cli("index").returncode, 0)
+            held = json.loads((self.sandbox.data / ".source-health.json")
+                              .read_text(encoding="utf-8"))["issues"]
+            self.assertTrue(any(issue.get("blocks_publication") for issue in held), held)
+            store = self.sandbox.data / "events" / ".store.sqlite3"
+            corpus = self.sandbox.data / "corpus.db"
+            kill_mid_write(store, EVENT_SPILL)
+            kill_mid_write(corpus, CORPUS_SPILL)
+            # The event store's journal waits for a publication, which the hold refuses; any
+            # index pass, a refused one included, rolls corpus.db's back.
+            rolls_back = re.compile(r"`[^`]* index` rolls it back, though new chats wait on what "
+                                    r"holds the index back$")
+            doctor = self.sandbox.cli("doctor").stdout
+            for name in ("event store", "search db"):
+                with self.subTest(row=name):
+                    row = next(line for line in doctor.splitlines() if f" {name} " in line
+                               and "interrupted" in line)
+                    self.assertNotIn("runs a publication now", row)
+                    if name == "event store":
+                        self.assertIn("to rebuild without it", row)
+                    else:
+                        self.assertRegex(row, rolls_back)
+            status = self.sandbox.cli().stdout
+            for line in (line for line in status.splitlines() if "interrupted index pass" in line):
+                with self.subTest(line=line):
+                    if "search index" in line:
+                        self.assertRegex(line, rolls_back)
+                    else:
+                        self.assertNotIn("index`", line.replace("reindex --full`", ""))
+                        self.assertIn("to rebuild without it", line)
+            skipped = self.sandbox.cli("reindex", "--full", "--no-build")
+            self.assertNotEqual(skipped.returncode, 0)
+            self.assertIn("an interrupted index pass left", skipped.stdout)
+            self.assertNotIn("live rollback journal", skipped.stdout)
+            self.assertNotEqual(self.sandbox.cli("index").returncode, 0)
+            self.assertFalse(Path(f"{corpus}-journal").exists())
+            rebuilt = self.sandbox.cli("reindex", "--full", "--no-build")
+            self.assertEqual(rebuilt.returncode, 0, rebuilt.stdout + rebuilt.stderr)
+            self.assertIn("rebuilt without unreadable", rebuilt.stdout)
+            self.assertFalse(Path(f"{store}-journal").exists())
+            record = json.loads((self.sandbox.data / ".source-health.json")
+                                .read_text(encoding="utf-8"))["issues"]
+            self.assertFalse(any(issue.get("blocks_publication") for issue in record), record)
+            self.assertEqual(self.hit_sessions("birch lantern"), set())
+        finally:
+            birch.chmod(0o600)
+
+
+    def test_the_consent_remedy_names_the_meaning_rebuild_only_where_it_runs(self) -> None:
+        """`reindex --full` redoes meaning search only where embeddings are on and their runtime
+        is installed; the consent remedy says so there, and nowhere else."""
+        import dist
+        import source_health
+        held = {"agent": "claude", "kind": "permission-denied", "blocks_publication": True}
+        cost = "; the rebuild also redoes meaning search, which can take a while)"
+        for embeddings, installed, disclosed in (("on", True, True), ("off", True, False),
+                                                 ("on", False, False)):
+            with self.subTest(embeddings=embeddings, installed=installed), \
+                    mock.patch.object(source_health.common, "setting",
+                                      return_value=embeddings), \
+                    mock.patch.object(dist, "semantic_runtime_installed",
+                                      return_value=installed):
+                remedy = source_health.source_issue_remedy(held)
+                self.assertEqual(remedy.endswith(cost), disclosed, remedy)
+                self.assertTrue(remedy.endswith("(it is indexed again once readable)")
+                                or disclosed, remedy)
+
+    def test_every_held_record_is_named_by_the_hold_remedy(self) -> None:
+        """Doctor's freshness row and every surface built on the hold's remedy name each agent
+        holding publication back, as the agent-stores row does, not only the first."""
+        import source_health
+        import surface_policy as surface
+        held = [{"agent": agent, "kind": "permission-denied", "blocks_publication": True}
+                for agent in ("claude", "crush", "claude")]
+        with mock.patch.object(source_health, "source_health_issues", return_value=held), \
+                mock.patch.object(source_health, "rebuild_cost", return_value="; COST"):
+            remedy = source_health.held_publication_remedy()
+            advice = surface.indexing_advice_line(
+                surface.FreshnessFailure("unreadable-holds-index", "raw"), "agrep",
+                hold=source_health.hold_fields)
+        # One clause for them all, as the ingest's own refusal words it, its cost said once.
+        self.assertTrue(remedy.startswith("fix or remove them in claude, crush, or run `"), remedy)
+        self.assertTrue(remedy.endswith(
+            " reindex --full` to rebuild without them (they are indexed again once readable"
+            "; COST)"), remedy)
+        self.assertEqual((remedy.count("fix or remove"), remedy.count("COST")), (1, 1), remedy)
+        # Status's and bare agrep's warning names those agents too, not "its agent".
+        self.assertIn("; fix or remove them in claude, crush, or rebuild without them (they are "
+                      "indexed again once readable; COST): `agrep reindex --full`", advice)
+
+    def test_why_names_a_chat_never_published_that_keeps_failing_to_read(self) -> None:
+        """A malformed conversation never reaches the index or the parse cache, yet doctor,
+        status and audit name it from source health: `why` names that standing failure too."""
+        crush = self.crush_path()
+        _crush_store(crush, [("sc1", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        _crush_add(crush, "sbad", 2000, "hazel invoice question")
+        _crush_exec(crush, "UPDATE messages SET parts = '{not json' WHERE session_id = 'sbad'")
+        self.sandbox.index()
+        self.assertIn(("crush", str(crush), "sbad"), self.health())
+        doctor_line = next(line for line in self.sandbox.cli("doctor").stdout.splitlines()
+                           if "store unreadable:" in line)
+        payload = self.assert_verdict("source-unreadable", "sbad",
+                                      next_action=doctor_line.rsplit(" - ", 1)[1])
+        self.assertTrue(payload["summary"].startswith(
+            "not indexed: the last index could not read crush chat sbad: "), payload)
+        self.assertEqual(payload["evidence"]["issue"]["session"], "sbad")
+
+    def test_a_failure_under_a_newer_agreps_anchor_never_offers_this_builds_index(self) -> None:
+        """This build declines `agrep index` in a data dir a newer agrep owns, so a failure that
+        holds nothing (a chat never published) is not sent to retry it either: doctor and why
+        both defer to that agrep."""
+        crush = self.crush_path()
+        _crush_store(crush, [("sc1", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        _crush_add(crush, "sbad", 2000, "hazel invoice question")
+        _crush_exec(crush, "UPDATE messages SET parts = '{not json' WHERE session_id = 'sbad'")
+        self.sandbox.index()
+        self.assertIn(("crush", str(crush), "sbad"), self.health())
+        owner = self.sandbox.data / ".derived-owner.json"
+        record = json.loads(owner.read_text(encoding="utf-8"))
+        record["version"] = 2
+        owner.write_text(json.dumps(record), encoding="utf-8")
+        update = ("update agrep to index it again (a newer agrep owns this data dir, and this "
+                  "one cannot index it)")
+        doctor_line = next(line for line in self.sandbox.cli("doctor").stdout.splitlines()
+                           if "store unreadable:" in line)
+        self.assertTrue(doctor_line.endswith(" - " + update), doctor_line)
+        self.assertNotIn("retry `", doctor_line)
+        self.assert_verdict("source-unreadable", "sbad", next_action=update)
+
+    def test_why_defers_to_a_newer_agrep_for_a_published_chat_it_cannot_read(self) -> None:
+        """A published chat whose rows stopped parsing keeps its last good parse; why's action
+        for it, and for a parser panic, runs `agrep index`, which this build declines in a data
+        dir a newer agrep owns: there both defer to updating agrep."""
+        import indexd_runtime
+        import why
+        crush = self.crush_path()
+        _crush_store(crush, [("crushchat-one", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        _crush_exec(crush, "INSERT INTO messages VALUES ('bad', 'crushchat-one', 'user', "
+                           "'{not json', '', 2000, 2000)",
+                    "UPDATE sessions SET updated_at = 2000 WHERE id = 'crushchat-one'")
+        self.sandbox.index()
+        self.assert_verdict("source-unreadable", "crushchat-one", next_action=self.UNREADABLE)
+        owner = self.sandbox.data / ".derived-owner.json"
+        record = json.loads(owner.read_text(encoding="utf-8"))
+        record["version"] = 2
+        owner.write_text(json.dumps(record), encoding="utf-8")
+        self.assert_verdict(
+            "source-unreadable", "crushchat-one",
+            next_action="make the file readable, then update agrep to index it again (a newer "
+                        "agrep owns this data dir, and this one cannot index it)")
+        panic = {"kind": "source-read-failed", "reason": "parser panicked at x.rs:1:1"}
+        with mock.patch.object(indexd_runtime, "newer_anchor", return_value=(2, None)):
+            # The parser fix that ships in a new build is still why updating helps.
+            self.assertEqual(why._issue_action(panic),
+                             "update agrep to index it again (a parser fix ships in a new build, "
+                             "and a newer agrep owns this data dir)")
+        with mock.patch.object(indexd_runtime, "newer_anchor", return_value=None):
+            self.assertEqual(why._issue_action(panic),
+                             "update agrep (a parser fix ships in a new build), then agrep index")
+
+    def test_every_index_action_of_why_defers_to_a_newer_agrep(self) -> None:
+        """Each of why's actions that runs this build's index (a chat written after the last
+        index, a store to mount, a parse cache to refill) defers to updating agrep in a data dir
+        a newer agrep owns, where this build declines that index; elsewhere they stay as they are."""
+        import indexd_runtime
+        import why
+        crush = self.crush_path()
+        _crush_store(crush, [("sc1", 1000, "walnut ledger question")])
+        self.sandbox.index()
+        _crush_add(crush, "sc9new", 9000, "spruce gauge question")
+        self.assert_verdict("written-after-last-index", "sc9new", next_action="agrep index")
+        owner = self.sandbox.data / ".derived-owner.json"
+        record = json.loads(owner.read_text(encoding="utf-8"))
+        record["version"] = 2
+        owner.write_text(json.dumps(record), encoding="utf-8")
+        newer = ("update agrep to index it again (a newer agrep owns this data dir, and this one "
+                 "cannot index it)")
+        self.assert_verdict("written-after-last-index", "sc9new", next_action=newer)
+        cases = ((dict(), "agrep index"), (dict(full=True), "agrep index --full"),
+                 (dict(then=why._MOUNT), "mount or restore the store, then agrep index"))
+        for kwargs, plain in cases:
+            with self.subTest(**kwargs):
+                with mock.patch.object(indexd_runtime, "newer_anchor", return_value=None):
+                    self.assertEqual(why._index_action(**kwargs), plain)
+                with mock.patch.object(indexd_runtime, "newer_anchor", return_value=(2, None)):
+                    self.assertEqual(why._index_action(**kwargs),
+                                     plain.replace("agrep index --full", newer)
+                                     .replace("agrep index", newer))
+
+    def test_two_held_agents_share_one_remedy_on_every_row(self) -> None:
+        """Doctor's agent-stores row and audit's degraded snapshot give the held records one
+        clause naming each agent once, the rebuild's cost said once, and every other record its
+        own remedy beside it."""
+        import audit
+        import doctor
+        import source_health
+        claude, crush = "/h/.claude/projects/p/a.jsonl", "/h/.local/share/crush/crush.db"
+        health = [
+            {"agent": "claude", "path": claude, "kind": "permission-denied", "reason": "denied",
+             "blocks_publication": True},
+            {"agent": "crush", "path": crush, "kind": "source-read-failed", "reason": "bad rows",
+             "session": "sc1", "blocks_publication": True},
+            {"agent": "crush", "path": crush + "x", "kind": "source-read-incomplete",
+             "reason": "moved"},
+        ]
+        rows = [{"agent": "claude", "found": True, "state": "source-unreadable",
+                 "issues": [health[0]]},
+                {"agent": "crush", "found": True, "state": "source-unreadable",
+                 "issues": health[1:]}]
+        with mock.patch.object(source_health, "rebuild_cost", return_value="; COST"), \
+                mock.patch.object(source_health, "source_health_issues", return_value=health), \
+                mock.patch.object(doctor, "_newer_owner", return_value=False), \
+                mock.patch.object(audit.derived_anchor, "newer_anchor", return_value=None):
+            _, stores = doctor._store_status(rows)
+            degraded = audit._degraded_detail(
+                [(i["agent"], i["path"], i["kind"], i["reason"]) for i in health])
+        for name, line in (("doctor", stores), ("audit", degraded)):
+            with self.subTest(row=name):
+                remedy = line.rsplit(" - ", 1)[1]
+                self.assertTrue(remedy.startswith("fix or remove them in claude, crush, or run `"),
+                                remedy)
+                self.assertEqual((remedy.count("fix or remove"), remedy.count("COST")), (1, 1),
+                                 remedy)
+                self.assertIn("COST); retry `", remedy)
+
+    def test_an_interrupted_pass_under_a_newer_agrep_defers_to_it(self) -> None:
+        """An interrupted pass's journal clears with the next publication, which this build
+        declines in a data dir a newer agrep owns: doctor, status and audit defer to that agrep."""
+        import audit
+        import cli
+        import doctor
+        import source_health
+        newer = ("update agrep to index it again (a newer agrep owns this data dir, and this one "
+                 "cannot index it)")
+        with mock.patch.object(source_health, "source_health_issues", return_value=[]):
+            with mock.patch.object(doctor, "_newer_owner", return_value=True):
+                self.assertEqual(doctor.interrupted_pass_remedy(), newer)
+            self.assertEqual(cli._interrupted_remedy(True, "agrep"), f"; {newer}")
+            self.assertEqual(cli._interrupted_remedy(False, "agrep"), ": `agrep index`")
+        with mock.patch.object(audit.derived_anchor, "newer_anchor", return_value=(2, None)):
+            self.assertEqual(audit._interrupted_index(), newer)
+        with mock.patch.object(audit.derived_anchor, "newer_anchor", return_value=None):
+            self.assertRegex(audit._interrupted_index(), r"^run `[^`]* index`$")
+
+    def test_audit_names_a_hold_past_its_row_cap(self) -> None:
+        """Audit names the first three degraded sources; a held one past them still gives the
+        hold's clause, the one remedy that helps."""
+        import audit
+        import source_health
+        rows = [("claude", f"/h/denied-{n}", "permission-denied", "denied") for n in range(3)]
+        rows.append(("crush", "/h/crush.db", "source-read-failed", "bad rows"))
+        health = [{"agent": "crush", "path": "/h/crush.db", "kind": "source-read-failed",
+                   "reason": "bad rows", "session": "sc1", "blocks_publication": True}]
+        with mock.patch.object(source_health, "source_health_issues", return_value=health), \
+                mock.patch.object(source_health, "rebuild_cost", return_value=""), \
+                mock.patch.object(audit.derived_anchor, "newer_anchor", return_value=None):
+            detail = audit._degraded_detail(rows)
+        self.assertIn("; and 1 more - ", detail)
+        self.assertNotIn("/h/crush.db", detail)
+        self.assertIn("fix or remove it in crush, or run `", detail)
+
+    def test_corpus_journal_remedy_is_any_index_pass_even_under_a_hold(self) -> None:
+        """Any `agrep index`, a refused one included, rolls corpus.db's interrupted journal back,
+        so its remedy is that pass, not the hold's; a newer agrep's data dir leaves it to it."""
+        import cli
+        import source_health
+        held = [{"agent": "crush", "kind": "source-read-failed", "blocks_publication": True}]
+        with mock.patch.object(source_health, "source_health_issues", return_value=held), \
+                mock.patch.object(source_health, "rebuild_cost", return_value=""):
+            self.assertRegex(cli._interrupted_remedy(False, "agrep", corpus=True),
+                             r"^; `[^`]* index` rolls it back, though new chats wait on what "
+                             r"holds the index back$")
+            self.assertIn("to rebuild without it", cli._interrupted_remedy(False, "agrep"))
+            self.assertIn("update agrep to index it again",
+                          cli._interrupted_remedy(True, "agrep", corpus=True))
+        with mock.patch.object(source_health, "source_health_issues", return_value=[]):
+            self.assertEqual(cli._interrupted_remedy(False, "agrep", corpus=True),
+                             ": `agrep index`")
+
+    def test_a_blocked_sidecar_comes_first_on_every_interrupted_pass_line(self) -> None:
+        """A store sidecar no pass can use blocks the pass that would clear an interrupted
+        journal, a hold or not: its fix comes first on every such line, ahead of the hold, and
+        under a newer agrep's anchor its tail defers to that agrep, never this build's index."""
+        import audit
+        import cli
+        import doctor
+        import source_health
+        sidecar = {"path": "/d/corpus.db-journal", "store": "search index",
+                   "kind": "rollback journal", "access": "mode"}
+        held = [{"agent": "crush", "kind": "source-read-failed", "blocks_publication": True}]
+        newer = ("update agrep to index it again (a newer agrep owns this data dir, and this one "
+                 "cannot index it)")
+        for anchor in (None, (2, None)):
+            with self.subTest(newer=anchor is not None), \
+                    mock.patch.object(source_health, "store_sidecars_blocked",
+                                      return_value=[sidecar]), \
+                    mock.patch.object(source_health, "source_health_issues", return_value=held), \
+                    mock.patch.object(source_health, "rebuild_cost", return_value=""), \
+                    mock.patch.object(source_health.derived_anchor, "newer_anchor",
+                                      return_value=anchor), \
+                    mock.patch.object(audit.derived_anchor, "newer_anchor", return_value=anchor), \
+                    mock.patch.object(doctor, "_newer_owner", return_value=anchor is not None):
+                lines = {
+                    "doctor event store": doctor.interrupted_pass_remedy(),
+                    "status event store": cli._interrupted_remedy(anchor is not None, "agrep"),
+                    "status search db": cli._interrupted_remedy(anchor is not None, "agrep",
+                                                                corpus=True),
+                    "audit": audit._interrupted_index(),
+                }
+                for name, line in lines.items():
+                    with self.subTest(line=name):
+                        self.assertIn("index updates wait on /d/corpus.db-journal: `chmod u+rw",
+                                      line)
+                        self.assertNotIn("rolls it back", line)
+                        if anchor is not None:
+                            self.assertIn(newer, line)
+                            self.assertNotRegex(line, r"then `[^`]* index`")
+                        elif "fix or remove" in line:
+                            self.assertLess(line.index("index updates wait"),
+                                            line.index("fix or remove"))
+
+    def test_hold_advice_fills_every_placeholder_it_carries(self) -> None:
+        """Any of a hold's placeholders in an advice template is filled, never printed as braces."""
+        import surface_policy as surface
+        cost_only = surface.StatusAdvice("new chats wait{cost}", "doctor")
+        with mock.patch.object(surface, "indexing_advice", return_value=cost_only):
+            line = surface.indexing_advice_line(
+                surface.FreshnessFailure("x", "raw"), "agrep", hold=lambda: {"cost": "; COST"})
+        self.assertEqual(line, "new chats wait; COST: `agrep doctor`")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "permission bits do not bind here")
+    def test_a_hold_under_a_newer_agreps_anchor_defers_to_updating_agrep(self) -> None:
+        """This build refuses `reindex --full` in a data dir a newer agrep owns, so no surface
+        offers it there: the hold's remedy is that agrep's rebuild, or fixing the source."""
+        birch = (self.sandbox.home / ".claude" / "projects" / "-projects-birch"
+                 / f"{CLAUDE_TWIN}.jsonl")
+        self.sandbox.index()
+        self.lose_parse_cache()
+        birch.chmod(0)
+        try:
+            for _ in range(2):
+                self.assertNotEqual(self.sandbox.cli("index").returncode, 0)
+            owner = self.sandbox.data / ".derived-owner.json"
+            record = json.loads(owner.read_text(encoding="utf-8"))
+            record["version"] = 2
+            owner.write_text(json.dumps(record), encoding="utf-8")
+            status = json.loads(self.sandbox.cli("status", "--json").stdout)
+            self.assertEqual(status["freshness"].get("code"), "unreadable-holds-newer-owner",
+                             status["freshness"])
+            update = ("fix or remove it in claude, or update agrep to rebuild without it "
+                      "(a newer agrep owns this data dir)")
+            self.assertTrue(any(update in line for line in status["warnings"]), status)
+            shown = {"status --json": json.dumps(status),
+                     "status": self.sandbox.cli().stdout,
+                     "doctor": self.sandbox.cli("doctor").stdout,
+                     "audit": self.sandbox.cli("audit", "--json").stdout}
+            self.assertIn("update agrep to rebuild without it", shown["audit"])
+            for surface_name, text in shown.items():
+                with self.subTest(surface=surface_name):
+                    self.assertNotIn("reindex --full", text)
+            stores = next(line for line in shown["doctor"].splitlines()
+                          if "store unreadable:" in line)
+            self.assertIn("fix or remove it in claude, or update agrep to rebuild without it",
+                          stores)
+            self.assert_verdict(
+                "source-unreadable", CLAUDE_TWIN,
+                next_action="fix or remove it in claude, or update agrep to rebuild without it "
+                            "(a newer agrep owns this data dir, and this one cannot rebuild it)")
+        finally:
+            birch.chmod(0o600)
 
 
 if __name__ == "__main__":

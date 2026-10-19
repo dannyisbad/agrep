@@ -97,35 +97,27 @@ def _observe_posix_process(pid: int) -> _PosixProcessObservation:
     if sys.platform == "darwin":
         try:
             ctypes, _, short_info, _, pidinfo, _ = _darwin_proc_api()
-            info = short_info()
-            ctypes.set_errno(0)
-            got = pidinfo(
-                pid, 13, 0, ctypes.byref(info), ctypes.sizeof(info))
-            if got == ctypes.sizeof(info):
-                state = (
-                    "zombie" if info.status == 5 else
-                    "stopped" if info.status == 4 else "active")
-                return _PosixProcessObservation(state, int(info.pgid))
-            if ctypes.get_errno() == errno.ESRCH:
+            # arg=1 makes XNU search its zombie list too: only p_stat tells an exiting
+            # process (files still open) from a reapable zombie. ESRCH while kill(pid, 0)
+            # succeeds is a process moving between the lists; one re-read settles it.
+            for _attempt in range(2):
+                info = short_info()
+                ctypes.set_errno(0)
+                got = pidinfo(
+                    pid, 13, 1, ctypes.byref(info), ctypes.sizeof(info))
+                if got == ctypes.sizeof(info):
+                    state = (
+                        "zombie" if info.status == 5 else
+                        "stopped" if info.status == 4 else "active")
+                    return _PosixProcessObservation(state, int(info.pgid))
+                if ctypes.get_errno() != errno.ESRCH:
+                    return _PosixProcessObservation("unknown", None)
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
                     return _PosixProcessObservation("gone", None)
                 except OSError:
                     return _PosixProcessObservation("unknown", None)
-                try:
-                    group = os.getpgid(pid)
-                except ProcessLookupError:
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        return _PosixProcessObservation("gone", None)
-                    except OSError:
-                        return _PosixProcessObservation("unknown", None)
-                    return _PosixProcessObservation("zombie", None)
-                except OSError:
-                    return _PosixProcessObservation("unknown", None)
-                return _PosixProcessObservation("unknown", group)
             return _PosixProcessObservation("unknown", None)
         except (AttributeError, OSError, OverflowError, ValueError):
             return _PosixProcessObservation("unknown", None)

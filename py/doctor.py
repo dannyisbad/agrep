@@ -33,10 +33,12 @@ import common
 import console
 import dist
 import fileops
+import index_lock
 import indexd_runtime
 import install_lag
 import ownerfile
 import settings
+import source_health
 import surface_policy as surface
 
 ROOT = common.REPO_ROOT
@@ -104,14 +106,8 @@ def _concluded(observation: object) -> bool:
         (observation or {}).get("state")) not in ("unavailable", "unreadable")
 
 
-def _cli_command(*args: object) -> str:
-    return console.shell_command(
-        *dist.cli_invocation(*args), fallback="<agrep command>")
-
-
-def _command_remedy(name: str, *args: object, **values: object) -> str:
-    return surface.render_remedy(
-        name, command=_cli_command(*args), **values)
+_cli_command = source_health.cli_command
+_command_remedy = source_health.command_remedy
 
 
 def _routine_deadline(*, deep: bool) -> float | None:
@@ -162,6 +158,7 @@ def _deep_notice(*, stream=None, semantic: bool = True) -> None:
 _RUST_STAGING_ARTIFACTS = frozenset({
     ".boundary_stats.bin",
     ".changed_sessions",
+    ".consent_pending",
     ".derived-owner.json",
     ".derived_generation.json",
     ".harness_prefixes.snapshot",
@@ -169,6 +166,7 @@ _RUST_STAGING_ARTIFACTS = frozenset({
     ".indexd.v2.lock",
     ".ingest.sig",
     ".ingest_cache.bin",
+    ".ingest_cache.bin.head",
     ".ingest_cache.bin.journal",
     ".ingest_pending.bin",
     ".source-health.json",
@@ -266,6 +264,121 @@ def _rust_staging_orphans() -> dict:
     }
 
 
+# Mirrors `displace_sidecar_directory` in crates/agrep-core/src/ingest_cache.rs: a directory
+# found where a parse cache sidecar (journal, head) belongs is moved aside under this name.
+_DISPLACED_JOURNAL_RE = re.compile(
+    r"\.ingest_cache\.bin\.(?:journal|head)\.displaced-[0-9]+")
+
+
+def _tree_bytes(root: Path, deadline: float | None = None) -> int | None:
+    """Bytes under `root`, links counted by their own size.
+
+    None when any entry is unreadable or the deadline passes mid-walk: the
+    tree is user data of any size, so the routine tier gives up on sizing
+    rather than on its budget.
+    """
+    total = 0
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                stat = entry.stat(follow_symlinks=False)
+                if entry.is_dir(follow_symlinks=False):
+                    below = _tree_bytes(Path(entry.path), deadline)
+                    if below is None:
+                        return None
+                    total += below
+                else:
+                    total += int(stat.st_size)
+    except OSError:
+        return None
+    return total
+
+
+def _displaced_journals(*, deadline: float | None = None) -> dict:
+    """Directories the ingest moved out of the parse cache journal's place.
+
+    Whatever someone put there is theirs, so doctor names each with its size
+    and leaves deletion to them: inspect, then delete. Naming costs one
+    listing; sizing stops at the deadline (`--deep` passes none) and reports
+    "size unknown" past it.
+    """
+    found = []
+    try:
+        with os.scandir(common.DATA_DIR) as entries:
+            for entry in entries:
+                if _DISPLACED_JOURNAL_RE.fullmatch(entry.name) is None:
+                    continue
+                size = None
+                if deadline is None or time.monotonic() < deadline:
+                    try:
+                        size = (_tree_bytes(Path(entry.path), deadline)
+                                if entry.is_dir(follow_symlinks=False)
+                                else int(entry.stat(follow_symlinks=False).st_size))
+                    except OSError:
+                        size = None
+                found.append({"path": entry.path, "bytes": size})
+    except OSError as exc:
+        return {
+            "state": "unavailable", "complete": False, "paths": (),
+            "detail": f"displaced sidecar census is unavailable ({type(exc).__name__})",
+        }
+    found.sort(key=lambda item: item["path"])
+    return {"state": "complete", "complete": True, "paths": tuple(found)}
+
+
+# the doctor row names this many displaced directories in full, then counts the rest
+_DISPLACED_JOURNALS_LISTED = 3
+
+
+def _event_store_journal() -> dict:
+    """The event store's rollback journal, as `index_lock.rollback_journal_state` observes it."""
+    return index_lock.rollback_journal_state(
+        common.DATA_DIR / "events" / common.EVENT_STORE_NAME, common.INDEX_LOCK_PATH)
+
+
+def event_store_interrupted(journal: dict) -> bool:
+    """Whether an interrupted pass left the event store a hot journal readers fail on."""
+    # A journal whose first byte is zero is inert: SQLite never replays it and readers serve it.
+    return journal.get("state") == "interrupted-pass" and bool(journal.get("hot"))
+
+
+def interrupted_pass_remedy() -> str:
+    """What clears the event store's interrupted journal: the next publication, which a held
+    record refuses until its own remedy is taken. corpus.db's rolls back on any index pass."""
+    return source_health.publication_remedy(newer_owner=_newer_owner())
+
+
+def _displaced_kind(path: str) -> str:
+    """Which sidecar a displaced directory stood in for: `journal`, `head`, or `sidecar`."""
+    name = os.path.basename(path)
+    for kind in ("journal", "head"):
+        if name.startswith(f".ingest_cache.bin.{kind}.displaced-"):
+            return kind
+    return "sidecar"
+
+
+def displaced_sidecar_line(census: dict) -> str | None:
+    """The doctor line naming displaced sidecar directories, or None when there are none."""
+    paths = census.get("paths") or ()
+    if not paths:
+        return None
+    def size(item: dict) -> str:
+        value = item.get("bytes")
+        return "size unknown" if value is None else f"{value / (1024 ** 2):.1f} MiB"
+    listed = "; ".join(
+        f"{item['path']} ({_displaced_kind(item['path'])}, {size(item)})"
+        for item in paths[:_DISPLACED_JOURNALS_LISTED])
+    rest = len(paths) - _DISPLACED_JOURNALS_LISTED
+    if rest > 0:
+        listed += f"; and {rest} more (see --json)"
+    one = len(paths) == 1
+    return (f"{len(paths)} director{'y' if one else 'ies'} stood where a parse cache "
+            f"sidecar belongs and {'was' if one else 'were'} moved aside, not deleted: "
+            f"{listed} - inspect, then delete")
+
+
 def _orphan_inventory(
         *, deep: bool = True, deadline: float | None = None) -> dict:
     # Three directory listings, measured at ~1 ms on a 5,700-file store: the
@@ -277,6 +390,7 @@ def _orphan_inventory(
             "corpus": {"count": None, "bytes": None},
             "rust_staging": {"count": None, "bytes": None},
             "embeddings": {"count": None, "bytes": None},
+            "semantic_preparations": {"count": None, "bytes": None},
         }
     def complete_group(value: dict) -> dict:
         return {
@@ -316,10 +430,17 @@ def _orphan_inventory(
             meta, allow_missing_manifest=not meta.exists()))
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         embeddings = unavailable_group("embedding", exc)
+    try:
+        import embedding_segments
+        preparations = complete_group(
+            embedding_segments.abandoned_preparations(common.DATA_DIR))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        preparations = unavailable_group("semantic preparation", exc)
     groups = {
         "corpus": corpus,
         "rust_staging": staging,
         "embeddings": embeddings,
+        "semantic_preparations": preparations,
     }
     incomplete = [
         name for name, group in groups.items() if not group.get("complete")]
@@ -336,6 +457,34 @@ def _orphan_inventory(
         "bytes": sum(group["bytes"] for group in groups.values()),
         **groups,
     }
+
+
+def _abandoned_preparation_row(group: dict, *, fix_actions: bool) -> None:
+    """A killed or OOM'd segment build left its staging directory behind.
+
+    Each holds a full f32/q8/f16 copy of the rows it was building (about
+    2.7 KB per row), so the inventory speaks in size; `--fix` is the consent
+    to reclaim it here, otherwise the next embedding pass does.
+    """
+    count = int(group["count"])
+    size = f"{group['bytes'] / (1024 ** 2):.1f} MiB"
+    noun = "dir" if count == 1 else "dirs"
+    if fix_actions and not common.data_dir_readonly(common.DATA_DIR):
+        import embedding_segments
+        done = embedding_segments.prune_abandoned_preparations(common.DATA_DIR)
+        if not done["deferred"]:
+            _row("semantic staging", OK,
+                 f"reclaimed {count} abandoned build {noun} ({size})")
+            return
+        _row("semantic staging", WARN,
+             f"{len(done['deferred'])} abandoned build {noun} could not be "
+             f"removed under {common.DATA_DIR}")
+        return
+    _row("semantic staging", WARN,
+         f"{count} abandoned semantic build {noun} ({size}) under "
+         f"{common.DATA_DIR}; the next embedding pass or "
+         f"`{_cli_command('doctor', '--fix')}` reclaims them")
+
 
 
 def _data_footprint(*, deadline: float | None = None) -> dict:
@@ -620,6 +769,9 @@ def _resident_worker_detail(
             reason = common.terminal_safe(
                 readiness.get("reason") or "reason unavailable")
             return f"not query-serving: {reason}"
+        if resident.get("namespace_blocked"):
+            return (common.terminal_safe(resident.get("reason") or "")
+                    + "; keyword search remains available")
         if resident.get("blocked"):
             reason = str(
                 resident.get("reason")
@@ -662,7 +814,10 @@ def _semantic_readiness_detail(readiness: dict) -> str:
     probe_error = common.terminal_safe(
         readiness.get("generation_probe_error") or "")
     if not readiness.get("current_generation"):
-        detail = f"current generation not ready - embeddings {generation}"
+        detail = (
+            f"generation moved during the probe - embeddings {generation}"
+            if readiness.get("state") == "generation-moved" else
+            f"current generation not ready - embeddings {generation}")
         if probe_error:
             detail += f"; {probe_error}"
         refresh = readiness.get("refresh") or {}
@@ -694,17 +849,49 @@ def _semantic_readiness_detail(readiness: dict) -> str:
     return "current generation ready; no resident worker to probe"
 
 
+def _query_failure_is_breakage(readiness: dict) -> bool:
+    """A worker waiting on a generation that heals by itself (stale, missing,
+    converging) is not broken; the embeddings row already carries that state."""
+    if readiness.get("query_serving") is not False:
+        return False
+    if readiness.get("state") != "generation-not-ready":
+        return True
+    return not surface.semantic_generation_self_heals(
+        readiness.get("generation_state"))
+
+
+_MODEL_FETCH_FAILURE_MARKERS = ("could not fetch", "model files missing",
+                                "metal weights missing")
+
+
+def _model_fetch_failure(smart: dict) -> bool:
+    """Whether the recorded build failure is the model fetch itself failing.
+
+    Nothing retries that automatically: every automatic refresh runs offline
+    and refuses an uncached model before it starts."""
+    why = str(smart.get("embed_fail_reason") or "")
+    return any(marker in why for marker in _MODEL_FETCH_FAILURE_MARKERS)
+
+
 def _semantic_failure_detail(
         smart: dict, *, embeddings_off: bool,
         lane: surface.SemanticLanePolicy) -> str:
     why = smart.get("embed_fail_reason")
+    if _model_fetch_failure(smart) and not embeddings_off:
+        tail = ("automatic search never fetches the model; `agrep -s <query>` "
+                f"or `{_cli_command('setup')}` retries the fetch")
+    elif surface.host_block(why) is not None and not embeddings_off:
+        tail = (f"agrep needs {surface.host_block(why).ask} to finish the "
+                "build; it resumes by itself once there is room")
+    elif embeddings_off:
+        tail = f"retries {lane.disabled_tail}"
+    else:
+        tail = f"{lane.retries} (log: semantic-embed.log)"
     return (
         "last build failed" + (f": {why}" if why else "")
         + " - " + ("still searchable on the previous build; "
                    if smart.get("generation_ready", smart["live"]) else "")
-        + (f"retries {lane.disabled_tail}"
-           if embeddings_off else
-           f"{lane.retries} (log: semantic-embed.log)")
+        + tail
     )
 
 
@@ -731,12 +918,55 @@ def _routine_lane_row(snapshot: dict, smart: dict, *,
     if smart.get("runtime_state") != "not-inspected" or embeddings_off:
         return None                      # the deep tier owns the richer rows
     cache = snapshot["resources"].get("semantic_model_cache") or {}
-    if cache.get("complete") is not True or cache.get("files") != 0:
+    if cache.get("complete") is not True:
         return None
-    return ("embeddings",
-            "never built - the pinned model is not cached and automatic "
-            "search never fetches it; `agrep -s <query>` or "
-            f"`{_cli_command('setup')}` permits the one-time ~50MB fetch")
+    if cache.get("files") == 0:
+        return ("embeddings",
+                "never built - the pinned model is not cached and automatic "
+                "search never fetches it; `agrep -s <query>` or "
+                f"`{_cli_command('setup')}` permits the one-time ~50MB fetch")
+    if _metal_weights_absent_cheaply(Path(str(cache.get("path") or ""))):
+        return ("embeddings",
+                "will build on the CPU lane until the Metal weights are "
+                f"downloaded; `{_cli_command('doctor', '--fix')}` fetches them "
+                "(~91 MiB, one time); AGREP_MLX=off keeps CPU and silences this")
+    return None
+
+
+def _metal_weights_absent_cheaply(model_root: Path) -> bool:
+    """The Metal lane would open here, no store is published yet, and its
+    checkpoint is neither in the model root nor where adoption looks."""
+    if (os.environ.get("AGREP_MLX") == "off"
+            or _store_embedding_identity() is not None):
+        return False
+    try:
+        import embedder
+        import mlx_embed
+        if embedder._metal_lane_declined(embedder.PROFILE) is not None:
+            return False
+        legacy = mlx_embed._legacy_weights_dir()
+    except Exception:  # noqa: BLE001 -- no lane to speak of without the runtime
+        return False
+    return not any(
+        (base / "model.safetensors").exists()
+        for base in (model_root / mlx_embed.SUBDIR, legacy))
+
+
+def _lane_fallback_reason() -> str | None:
+    """The embed pass's own record; a file read, so every tier may speak."""
+    path = common.EMBEDDINGS_PATH.parent / ".semantic-lane-fallback.json"
+    try:
+        return str(json.loads(path.read_text(encoding="utf-8"))["reason"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _lane_weights_pending() -> str | None:
+    try:
+        import semantic
+        return semantic.lane_weights_pending()
+    except Exception:  # noqa: BLE001 -- an unprobed lane says nothing
+        return None
 
 
 def _routine_coverage_row(smart: dict) -> tuple[str, str] | None:
@@ -836,6 +1066,9 @@ def _store_embedding_lane() -> str | None:
 # embedder.lane_of owns this mapping but costs numpy; the routine tier parses
 # only the suffix (CPU lane is the bare profile string, so no suffix = no row).
 _LANE_IDENTITY_SUFFIX = ":lane-"
+# embedder.LANE_METAL, spelled here because this tier must not import numpy
+# to compare a string; test_mlx_embed pins the two together.
+_METAL_LANE = "mlx-fp16-metal"
 
 
 def _metal_capability() -> tuple[bool, str]:
@@ -870,6 +1103,23 @@ def _store_lane_notice(smart: dict | None = None) -> tuple[str, str] | None:
             f"({refusal}); meaning queries are refused rather than answered "
             f"from the cpu lane's vector space - run where {lane} opens, or "
             "`agrep reindex --full` rebuilds onto the cpu lane")
+    if (os.environ.get("AGREP_MLX") != "off" and _lane_fallback_reason()
+            and _metal_capability()[0]):
+        return OPT, (
+            "meaning search runs on the CPU lane because the Metal weights "
+            "weren't available when it was built; `agrep doctor --fix` "
+            "downloads them and `agrep reindex --full` moves the store to "
+            "Metal (or set AGREP_MLX=off to keep CPU and silence this)")
+    runtime_lane = (smart or {}).get("runtime_lane")
+    if runtime_lane == _METAL_LANE:
+        return OPT, (
+            "store uses CPU embeddings; this machine opens the metal lane - "
+            "`agrep reindex --full` rebuilds onto it")
+    if runtime_lane:
+        refusal = str((smart or {}).get("runtime_lane_refusal") or "")
+        return OPT, (
+            "store uses CPU embeddings; the metal lane did not open here"
+            + (f" ({refusal})" if refusal else ""))
     if _metal_capability()[0]:
         # "installed", not "will open": the parity gate and a pinned ONNX
         # provider can still decline, and this tier does not pay a model load
@@ -1027,36 +1277,12 @@ def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
                             "state": "corrupt-embeddings",
                             "reason": reason, "basis": None,
                         }
-                embed_state = semantic.read_embed_state()
-                if semantic.embed_failure_superseded(embed_state, coherence):
-                    # a complete lane (or the staleness law) contradicts the
-                    # recorded failure; never report what newer evidence refutes
-                    embed_state = {"state": "idle"}
-                # a refs-only child holds the claim without publishing; its
-                # window must not render the previous pass's numbers as live
-                embed_live = (semantic.embed_running()
-                              and embed_state.get("state") == "running")
-                generation_readiness = {
-                    **semantic.query_readiness(coherence),
-                    "generation_probe_state": "verified",
-                }
+                embed_state, embed_live, generation_readiness = (
+                    _generation_observation(semantic, coherence))
             except Exception as exc:  # noqa: BLE001 -- expose a failed probe
-                inferred_ready = bool(
-                    runtime_ready and coherence.get(
-                        "searchable", coherence.get("coherent", False)))
-                generation_readiness = {
-                    **generation_readiness,
-                    "state": "ready" if inferred_ready else "not-ready",
-                    "generation_state": str(
-                        coherence.get("state") or "unknown"),
-                    "current_generation": inferred_ready,
-                    "complete": bool(coherence.get("coherent")),
-                    "coverage": coherence.get("coverage"),
-                    "generation_probe_state": "diagnostic-failed",
-                    "generation_probe_error": (
-                        "semantic generation-readiness probe failed "
-                        f"({type(exc).__name__}: {common.terminal_safe(exc)})"),
-                }
+                generation_readiness = _inferred_generation_readiness(
+                    generation_readiness, coherence,
+                    runtime_ready=runtime_ready, error=exc)
             try:
                 import semworker
                 generation_ready = bool(
@@ -1064,8 +1290,24 @@ def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
                         "searchable", coherence.get("coherent", False)))
                 query_status = semworker.diagnostic_query_status(
                     ready=generation_ready,
-                    timeout_s=_SEMANTIC_QUERY_PROBE_TIMEOUT_S)
+                    timeout_s=_SEMANTIC_QUERY_PROBE_TIMEOUT_S,
+                    coherence_probe=semantic.embedding_coherence)
                 resident = query_status.get("resident_after") or resident
+                moved = query_status.get("coherence_after")
+                if (query_status.get("state") == "generation-moved"
+                        and isinstance(moved, dict)):
+                    # the newest observation is the report: every row speaks
+                    # of the generation the probe actually met
+                    coherence = moved
+                    generation_ready = False
+                    query_status = {**query_status, "ready": False}
+                    try:
+                        embed_state, embed_live, generation_readiness = (
+                            _generation_observation(semantic, coherence))
+                    except Exception as exc:  # noqa: BLE001 -- expose a failed probe
+                        generation_readiness = _inferred_generation_readiness(
+                            generation_readiness, coherence,
+                            runtime_ready=runtime_ready, error=exc)
             except Exception as exc:  # noqa: BLE001 -- expose a failed probe
                 query_status = {
                     "state": "diagnostic-failed",
@@ -1087,6 +1329,8 @@ def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
                 == "missing-optional-dependencies" else None),
             "unavailable_reason": unavailable_reason,
             "deps": deps, "model_cached": model_cached,
+            "lane_weights_pending": (
+                _lane_weights_pending() if model_cached else None),
             "model_integrity": model_integrity,
             "embedding_lane": _store_embedding_lane(),
             **_runtime_lane_facts(deep=deep, model_cached=model_cached),
@@ -1108,30 +1352,75 @@ def _semantic_probe(*, deep: bool = True, fix: bool = True) -> dict:
             }}
 
 
-def _source_health_issues() -> list[dict]:
-    path = common.DATA_DIR / ".source-health.json"
+def _generation_observation(
+        semantic, coherence: dict) -> tuple[dict, bool, dict]:
+    """(embed_state, embed_live, generation_readiness) for one coherence read."""
+    embed_state = semantic.read_embed_state()
+    if semantic.embed_failure_superseded(embed_state, coherence):
+        # a complete lane (or the staleness law) contradicts the
+        # recorded failure; never report what newer evidence refutes
+        embed_state = {"state": "idle"}
+    # a refs-only child holds the claim without publishing; its
+    # window must not render the previous pass's numbers as live
+    embed_live = (semantic.embed_running()
+                  and embed_state.get("state") == "running")
+    readiness = {
+        **semantic.query_readiness(coherence),
+        "generation_probe_state": "verified",
+    }
+    return embed_state, embed_live, readiness
 
-    def unavailable(reason: str) -> list[dict]:
-        return [{
-            "agent": "all",
-            "path": str(path),
-            "kind": "source-health-unavailable",
-            "reason": reason,
-        }]
 
-    try:
-        raw = ownerfile.snapshot(path, max_bytes=1024 * 1024).raw
-        record = json.loads(raw.decode("utf-8"))
-    except FileNotFoundError:
-        return []
-    except (OSError, RecursionError, UnicodeError, ValueError) as exc:
-        return unavailable(f"source health record is unreadable ({exc})")
-    if not isinstance(record, dict) or record.get("code") != "source-unreadable":
-        return unavailable("source health record is malformed")
-    issues = record.get("issues")
-    if not isinstance(issues, list) or not all(isinstance(issue, dict) for issue in issues):
-        return unavailable("source health record is malformed")
-    return issues
+def _inferred_generation_readiness(
+        base: dict, coherence: dict, *, runtime_ready: bool,
+        error: BaseException) -> dict:
+    inferred_ready = bool(
+        runtime_ready and coherence.get(
+            "searchable", coherence.get("coherent", False)))
+    return {
+        **base,
+        "state": "ready" if inferred_ready else "not-ready",
+        "generation_state": str(coherence.get("state") or "unknown"),
+        "current_generation": inferred_ready,
+        "complete": bool(coherence.get("coherent")),
+        "coverage": coherence.get("coverage"),
+        "generation_probe_state": "diagnostic-failed",
+        "generation_probe_error": (
+            "semantic generation-readiness probe failed "
+            f"({type(error).__name__}: {common.terminal_safe(error)})"),
+    }
+
+
+_ISSUE_KIND_RANK = {"permission-denied": 0, "unsupported-file-type": 1, "unsupported-link": 1,
+                    "invalid-mtime": 1, "source-read-failed": 2, "source-stat-failed": 2,
+                    "io-error": 2}
+
+
+def _one_issue_per_path(issues: list[dict]) -> list[dict]:
+    """A path the walk, the census and the parse each recorded keeps one issue: the kind that
+    names what to change, at the position of its first record. Records of distinct conversations
+    in one store are distinct failures and each keep theirs. A record holding publication back
+    keeps that mark whichever record names the kind."""
+    kept: list[dict] = []
+    slots: dict[tuple[str, str, str], int] = {}
+    for issue in issues:
+        key = (str(issue.get("agent") or ""), str(issue.get("path") or ""),
+               str(issue.get("session") or ""))
+        slot = slots.get(key)
+        if slot is None:
+            slots[key] = len(kept)
+            kept.append(issue)
+            continue
+        held = kept[slot].get("blocks_publication") is True
+        manual = kept[slot].get("rebuild") is False or issue.get("rebuild") is False
+        if (_ISSUE_KIND_RANK.get(str(issue.get("kind")), 3)
+                < _ISSUE_KIND_RANK.get(str(kept[slot].get("kind")), 3)):
+            kept[slot] = issue
+        if held or issue.get("blocks_publication") is True:
+            kept[slot] = {**kept[slot], "blocks_publication": True}
+        if manual:
+            kept[slot] = {**kept[slot], "rebuild": False}
+    return kept
 
 
 def _store_counts(
@@ -1145,7 +1434,7 @@ def _store_counts(
         "issues": list(item.get("issues") or []),
     } for item in (common.store_freshness() if observed is None else observed)
         if item.get("name")]
-    durable = _source_health_issues()
+    durable = source_health.source_health_issues()
     global_issues = [issue for issue in durable
                      if str(issue.get("agent") or "all") == "all"]
     by_agent: dict[str, list[dict]] = {}
@@ -1156,11 +1445,16 @@ def _store_counts(
     for row in rows:
         issues = by_agent.pop(row["agent"], []) + global_issues
         if issues:
-            row["state"] = "source-unreadable"
+            # An attribution-only record reads every chat: the store stays available, noted.
+            if not all(surface.attribution_only_issue(issue) for issue in issues):
+                row["state"] = "source-unreadable"
             row["issues"].extend(
                 issue for issue in issues if issue not in row["issues"])
-    rows.extend({"agent": agent, "found": 0, "state": "source-unreadable",
-                 "issues": issues}
+        row["issues"] = _one_issue_per_path(row["issues"])
+    rows.extend({"agent": agent, "found": 0,
+                 "state": ("available" if all(surface.attribution_only_issue(i) for i in issues)
+                           else "source-unreadable"),
+                 "issues": _one_issue_per_path(issues)}
                 for agent, issues in sorted(by_agent.items()))
     if global_issues and not rows:
         rows.append({"agent": "all", "found": 0,
@@ -1171,19 +1465,6 @@ def _store_counts(
                      "issues": []}
                     for agent in sorted(set(indexed_agents) - observed))
     return rows
-
-
-def _source_issue_remedy(issue: dict) -> str:
-    kind = str(issue.get("kind") or "")
-    if kind == "permission-denied":
-        return surface.render_remedy("store-unreadable")
-    if kind == "source-read-incomplete":
-        return _command_remedy("source-read-incomplete", "index")
-    if kind == "not-found":
-        return surface.render_remedy("source-not-found")
-    if kind == "source-health-unavailable":
-        return _command_remedy("source-health-unavailable", "index")
-    return _command_remedy("source-inspect", "index")
 
 
 def _installed_build_detail(observation: dict) -> str:
@@ -1289,6 +1570,16 @@ def _runtime_build_detail(identity: dict | None = None) -> str:
         f"{kind} at {location}")
 
 
+# Freshness codes of a record holding publication back: every pass refuses until it is fixed.
+HOLD_CODES = frozenset({
+    "unreadable-holds-index", "unreadable-holds-newer-owner", "unreadable-holds-everything"})
+
+
+def _newer_owner() -> bool:
+    """A newer agrep owns the data dir: only that build can rebuild without held history."""
+    return indexd_runtime.newer_anchor() is not None
+
+
 def _stores_row_owns(code: str, snapshot: dict) -> bool:
     """True when the agent-stores row already renders this cause itself.
 
@@ -1296,7 +1587,8 @@ def _stores_row_owns(code: str, snapshot: dict) -> bool:
     repeating it is one cause counted twice. Only a row that will actually
     render may claim ownership - suppressing under a row that stays silent
     would delete the reader's only mention."""
-    if code != "source-unreadable" or not snapshot["core"].get("binary"):
+    if (code not in {"source-unreadable", *HOLD_CODES}
+            or not snapshot["core"].get("binary")):
         return False
     observation = snapshot["core"].get("store_observation") or {}
     if observation.get("state") != "complete":
@@ -1307,19 +1599,29 @@ def _stores_row_owns(code: str, snapshot: dict) -> bool:
 
 def _store_status(store_rows: list[dict]) -> tuple[str, str]:
     found = [item["agent"] for item in store_rows if item["found"]]
-    unreadable = [
-        item for item in store_rows if item["state"] == "source-unreadable"]
-    if unreadable:
+    noted = [item for item in store_rows
+             if item["state"] == "source-unreadable" or item["issues"]]
+    if noted:
         details = []
-        remedies = []
-        for item in unreadable:
+        issues = []
+        provisional = []
+        for item in noted:
             for issue in item["issues"] or ({},):
                 path = common.terminal_safe(issue.get("path") or item["agent"])
-                details.append(f"{item['agent']} at {path}")
-                remedies.append(_source_issue_remedy(issue))
-        remedy = "; ".join(dict.fromkeys(remedies))
+                if surface.attribution_only_issue(issue):
+                    provisional.append(f"{item['agent']} projects provisional until {path} is readable")
+                else:
+                    # A record carrying a conversation names the chat that failed, not its store.
+                    session = issue.get("session")
+                    chat = f" conversation {common.terminal_safe(session)}" if session else ""
+                    details.append(f"{item['agent']}{chat} at {path}")
+                issues.append(issue)
+        remedy = source_health.issue_remedies(issues, newer_owner=_newer_owner())
         suffix = f" - {remedy}" if remedy else ""
-        return MISS, "store unreadable: " + "; ".join(details) + suffix
+        # An attribution gap reads every chat: the store is readable, its project labels are not.
+        if not details:
+            return WARN, "; ".join(provisional) + suffix
+        return MISS, "store unreadable: " + "; ".join(details + provisional) + suffix
     return (
         OK if found else MISS,
         ", ".join(found) if found
@@ -1619,7 +1921,12 @@ def _model_cache_probe(embedder, *, deep: bool) -> tuple[bool, dict]:
                 "checked": True,
                 "verified": verified,
                 "cached": True,
-                "detail": "cached model SHA256 verified for unchanged files",
+                "present": True,
+                "detail": (
+                    "cached model SHA256 verified for unchanged files"
+                    if verified else
+                    "cached model SHA256 verification failed for unchanged "
+                    "files; `agrep -s <query>` or `agrep setup` re-fetches them"),
             }
     if not deep:
         return identity is not None, {
@@ -1647,10 +1954,12 @@ def _model_cache_probe(embedder, *, deep: bool) -> tuple[bool, dict]:
         "checked": True,
         "verified": verified,
         "cached": False,
+        "present": after is not None,
         "persisted": persisted,
         "detail": (
             "model SHA256 verified" if verified else
-            "model SHA256 verification failed"
+            "model SHA256 verification failed" if after is not None else
+            "model files absent"
         ),
     }
 
@@ -1825,6 +2134,14 @@ class _DerivedIdentityUnavailable(OSError):
     verdict exists - not a fact about the database or about another owner."""
 
 
+class _CorpusJournalPending(OSError):
+    """corpus.db has a rollback journal: a pass is writing it, or a killed one left it."""
+
+
+class _CorpusSidecarBlocked(OSError):
+    """A corpus.db sidecar this user cannot read and write keeps every writer waiting."""
+
+
 def _post_adoption_clobber_remedy(path: Path) -> str:
     data = common.terminal_safe(path.parent)
     database = common.terminal_safe(path)
@@ -1853,6 +2170,10 @@ def _open_corpus_diagnostic_snapshot(
         ownership = corpusdb._derived_write_ownership(for_write=True)
         if not ownership.writable:
             sqlite_failure = getattr(ownership, "sqlite_failure", None)
+            if getattr(ownership, "sidecar_blocked", False):
+                raise _CorpusSidecarBlocked(ownership.reason)
+            if getattr(ownership, "journal_blocked", False):
+                raise _CorpusJournalPending(ownership.reason)
             if sqlite_failure is not None:
                 raise sqlite_failure
             if ownership.state == "post-adoption-clobber":
@@ -1865,6 +2186,20 @@ def _open_corpus_diagnostic_snapshot(
             path, 0,
             max_clone_bytes=corpusdb._ROUTINE_ALIAS_CLONE_MAX_BYTES)
     return corpusdb._connect_read_snapshot(path, 0)
+
+
+def _derived_owner_fields() -> dict:
+    """`core.derived_owner` only when the anchor was written by a newer agrep:
+    the one ownership state the reader can end (upgrade, or point elsewhere),
+    so every surface names it. Other ownership states keep their rows."""
+    newer = indexd_runtime.newer_anchor()
+    if newer is None:
+        return {}
+    version, fmt = newer
+    return {"derived_owner": {
+        "state": "newer-agrep", "version": version, "format": fmt,
+        "detail": indexd_runtime.newer_anchor_reason(version, fmt),
+    }}
 
 
 def _corpus_db_readiness(
@@ -2001,6 +2336,25 @@ def _corpus_db_readiness(
             "code": "post-adoption-clobber",
             "detail": reason,
             "remedy": _post_adoption_clobber_remedy(path),
+        })
+    except _CorpusSidecarBlocked as error:
+        # the inaccessible-sidecar row names the file and its fix; this verdict only stops the
+        # search db row from calling it another agrep's
+        return finish({
+            "state": "sidecar-blocked", "code": "sidecar-blocked",
+            "detail": common.terminal_safe(error),
+        })
+    except _CorpusJournalPending:
+        journal = index_lock.rollback_journal_state(path, common.INDEX_LOCK_PATH)
+        if journal["state"] == "interrupted-pass":
+            return finish({
+                "state": "interrupted-pass", "code": "interrupted-pass",
+                "detail": surface.SEARCH_INDEX_INTERRUPTED, "journal": journal,
+            })
+        # a pass caught mid-write, or one that committed between the two looks
+        return finish({
+            "state": "busy", "code": "index-pass-writing",
+            "detail": "an index pass is writing the search database",
         })
     except _DerivedOwnerRefusal as error:
         return finish({
@@ -2529,6 +2883,9 @@ def probe(
     orphans = _orphan_inventory(deep=deep, deadline=deadline)
     footprint = _data_footprint(
         deadline=None if deep else deadline)
+    displaced = _displaced_journals(deadline=None if deep else deadline)
+    event_journal = _event_store_journal()
+    inaccessible = source_health.store_sidecars_blocked()
     model_cache = _model_cache_footprint(
         deadline=None if deep else deadline)
     summary = _index_summary_state(
@@ -2716,7 +3073,10 @@ def probe(
         "core": {"live": has_bin, "rust": has_cargo, "binary": has_bin,
                  "stores": stores, "indexed": indexed,
                  "search_db": search_db,
-                 "store_observation": store_observation},
+                 "store_observation": store_observation,
+                 "event_store_journal": event_journal,
+                 "inaccessible_sidecars": inaccessible,
+                 **_derived_owner_fields()},
         "archive": archive_state,
         "teach_reconcile": teach_reconcile,
         "teach_enrollment": teach_enrollment,
@@ -2743,6 +3103,7 @@ def probe(
             "semantic_model_cache": model_cache,
             "indexd": daemon,
             "orphans": orphans,
+            "displaced_journals": displaced,
         },
         "self_exclusion": surface.self_exclusion_disclosure(
             None, inactive_reason="not-applicable"),
@@ -2857,6 +3218,13 @@ def report(*, deep: bool = False, fix_actions: bool = False,
     elif _ran(footprint):
         _row("footprint", WARN,
              str(footprint.get("detail") or "footprint is unavailable"))
+    displaced = snapshot["resources"].get("displaced_journals") or {}
+    displaced_line = displaced_sidecar_line(displaced)
+    if displaced_line is not None:
+        _row("displaced cache sidecar", WARN, displaced_line)
+    elif displaced and not displaced.get("complete"):
+        _row("displaced cache sidecar", WARN,
+             str(displaced.get("detail") or "displaced sidecar census is unavailable"))
     model_cache = snapshot["resources"].get("semantic_model_cache") or {}
     if model_cache.get("complete") and model_cache.get("files"):
         _row(
@@ -2868,8 +3236,12 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             "model cache", WARN,
             str(model_cache.get("detail") or "model cache is unavailable"))
     # Superseded artifacts are reclaimed by the publication that orphans them
-    # (`embedding_segments._publish`), so there is no housekeeping left here to
-    # announce. The inventory stays in the snapshot for `--json` forensics.
+    # (`embedding_segments._publish`); only a preparation whose builder died
+    # has no publication coming, so that is the one housekeeping row here.
+    preparations = (snapshot["resources"].get("orphans") or {}).get(
+        "semantic_preparations") or {}
+    if preparations.get("complete") and preparations.get("count"):
+        _abandoned_preparation_row(preparations, fix_actions=fix_actions)
 
     print("\nindex")
     summary = render["summary"]
@@ -2907,7 +3279,10 @@ def report(*, deep: bool = False, fix_actions: bool = False,
     elif summary_state == "status-deferred":
         pass
     elif summary_state == "never-built":
+        newer = snapshot["core"].get("derived_owner") or {}
         _row("corpus", WARN,
+             "none yet - this agrep cannot build it (see freshness)"
+             if newer.get("state") == "newer-agrep" else
              "none yet - "
              + _command_remedy("index-publish", "index")
              + "; searches never "
@@ -2938,6 +3313,13 @@ def report(*, deep: bool = False, fix_actions: bool = False,
         # An index writer holding the database is agrep working, not agrep
         # broken. Asking the reader to re-run the diagnostic to route around
         # our own lock is the diagnostic refusing to do its one job.
+        pass
+    elif db_state == "interrupted-pass":
+        db_status = WARN
+        db_detail = (f"{db_readiness['detail']}; "
+                     f"{source_health.rollback_remedy(newer_owner=_newer_owner())}")
+    elif db_state == "sidecar-blocked":
+        # one cause, one line: the inaccessible-sidecar row below names the file and its fix
         pass
     elif db_state == "post-adoption-clobber":
         db_status = WARN
@@ -2973,6 +3355,14 @@ def report(*, deep: bool = False, fix_actions: bool = False,
              OK if integrity.get("state") == "verified" else
              WARN if integrity.get("state") in ("failed", "error") else OPT,
              str(integrity.get("detail") or "integrity state is unavailable"))
+    event_journal = snapshot["core"].get("event_store_journal") or {}
+    if event_store_interrupted(event_journal):
+        _row("event store", WARN,
+             surface.events_interrupted_pass(int(event_journal.get("bytes") or 0))
+             + "; " + interrupted_pass_remedy())
+    for sidecar in snapshot["core"].get("inaccessible_sidecars") or ():
+        _row("search db" if sidecar.get("store") == "search index" else "event store", WARN,
+             source_health.inaccessible_sidecar_line(sidecar))
 
     archive_state = snapshot["archive"]
     archive_name = str(archive_state.get("state") or "capture-blocked")
@@ -3001,21 +3391,27 @@ def report(*, deep: bool = False, fix_actions: bool = False,
         # not an alarm to hand the reader seconds after setup.
         never_captured = (archive_name == "freshness-unknown"
                           and pass_outcome == "never")
+        waiting = archive_state.get("waiting") or {}
+        waiting_detail = (
+            f"; {int(waiting.get('count') or 0)} source(s) waiting for capture"
+            if waiting else "")
         _row("archive",
              OPT if archive_name == "disabled" else
              OK if archive_name == "healthy" and last_pass.get("fresh") else
-             OPT if archive_name in ("busy", "migration") else
+             OPT if archive_name in ("busy", "migration", "interrupted") else
              OPT if never_captured else WARN,
              archive_reason if archive_name == "disabled"
              else "first capture pass is pending; capture runs in the "
                   "background" if never_captured
-             else f"{archive_reason}; {age_detail}")
+             else f"{archive_reason}; {age_detail}{waiting_detail}")
 
     daemon = snapshot["resources"]["indexd"]
     machine_freshness = snapshot.get("freshness") or {}
     behind_line = ""
     behind_base = ""
     live_churn = False
+    # a store sidecar no pass can use: the daemon is up but paused, and no `index` publishes
+    block_remedy = source_health.sidecar_block_remedy()
     if machine_freshness.get("state") == "index-behind":
         changed = int(machine_freshness.get("changed_stores") or 0)
         live_churn = bool(machine_freshness.get("young")
@@ -3034,7 +3430,7 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             )).removesuffix(" - daemon catching up")
             behind_line = (
                 behind_base + " - "
-                + _command_remedy("index-publish", "index"))
+                + (block_remedy or _command_remedy("index-publish", "index")))
     fails = int(render["freshness_failures"])
     freshness_failure = render["indexing_failure"]
     generation = render["generation"]
@@ -3058,14 +3454,30 @@ def report(*, deep: bool = False, fix_actions: bool = False,
     # of a named volume vanish, keyed on the failure's OWN code only - a
     # permission to grant or an escalated streak speaks, repair queued or not.
     host_line = indexd_runtime.host_block_escalation()
-    if freshness_failure is not None and (
-            host_line or corpusdb.state_self_clears(freshness_failure.code)
-            or _stores_row_owns(freshness_failure.code, snapshot)):
+    owned = freshness_failure is not None and _stores_row_owns(freshness_failure.code, snapshot)
+    # The stores row names what holds the index back; this row keeps what it costs, since every
+    # pass (the daemon's too) refuses until its remedy is taken.
+    if owned and not host_line and freshness_failure.code in HOLD_CODES:
+        held = source_health.blocked_publication_remedy(newer_owner=_newer_owner())
+        freshness_failure = surface.FreshnessFailure(
+            freshness_failure.code,
+            "new chats are not being indexed" + (f" - {held}" if held else ""),
+            freshness_failure.consecutive_failures)
+    elif freshness_failure is not None and (
+            host_line or corpusdb.state_self_clears(freshness_failure.code) or owned):
         freshness_failure = None
     if host_line:
         behind_line = behind_base = ""
     tail = f" - {surface.FRESHNESS_POLICY.last_good_index_tail}"
     persistent_failure = surface.persistent_freshness_failure(fails)
+    # A census that could not vouch (its diagnostic budget ran out, or it
+    # returned no verdict) proves nothing wrong: the row stays neutral.
+    unverified = ""
+    if (freshness_failure is not None
+            and freshness_failure.code in surface.FRESHNESS_UNVERIFIED_CODES):
+        unverified = ("freshness not verified - "
+                      + common.terminal_safe(freshness_failure.reason))
+        freshness_failure = None
     freshness_reason = (
         common.terminal_safe(freshness_failure.reason)
         if freshness_failure is not None else "")
@@ -3096,9 +3508,14 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             detail += f", DEGRADED: {freshness_reason}{tail}"
         elif behind_line:
             detail += f", {behind_line}"
+        elif block_remedy:
+            detail += f", paused - {block_remedy}"
+        elif unverified:
+            detail += f", {unverified}"
         _row(
             "freshness",
             WARN if freshness_failure is not None
+            else OPT if unverified or block_remedy
             else OK if live_churn or not behind_line else OPT,
             detail)
     elif daemon.get("blocked"):
@@ -3120,6 +3537,8 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             detail += f"; {behind_base}"
         if freshness_failure is not None:
             detail += f"; {freshness_reason}{tail}"
+        elif unverified:
+            detail += f"; {unverified}"
         _row("freshness", WARN if freshness_failure is not None else OPT, detail)
     elif daemon.get("backoff"):
         detail = (
@@ -3129,6 +3548,8 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             detail += f"; {behind_base}"
         if freshness_failure is not None:
             detail += f"; {freshness_reason}{tail}"
+        elif unverified:
+            detail += f"; {unverified}"
         _row("freshness", WARN if freshness_failure is not None else OPT, detail)
     elif freshness_failure is not None:
         if persistent_failure:
@@ -3147,10 +3568,14 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             level = OPT
         else:
             detail = ("daemon not running - "
-                      + surface.repair_decline_line(kick.cause))
-            level = WARN if behind_base else OPT
+                      + (kick.detail
+                         or surface.repair_decline_line(kick.cause)))
+            level = (WARN if behind_base or kick.cause == "newer-anchor"
+                     else OPT)
         if behind_base:
             detail = f"{behind_base} - {detail}"
+        if unverified:
+            detail += f"; {unverified}"
         _row("freshness", level, detail)
 
     # Law 2, the one thing here the reader can act on: what is left under a
@@ -3324,8 +3749,9 @@ def report(*, deep: bool = False, fix_actions: bool = False,
     inspected = smart.get("runtime_state") != "not-inspected"
     visible_failed_job = _semantic_failure_visible(
         smart, embeddings_off=embeddings_off)
-    routine_lane = _routine_lane_row(
-        snapshot, smart, embeddings_off=embeddings_off)
+    routine_lane = (
+        None if _model_fetch_failure(smart) and visible_failed_job
+        else _routine_lane_row(snapshot, smart, embeddings_off=embeddings_off))
     # Every tier: a suffixed identity is a file read, not a runtime probe, and a
     # store nobody told you was approximate is the whole reason for the row.
     store_lane = _store_lane_notice(smart)
@@ -3412,7 +3838,8 @@ def report(*, deep: bool = False, fix_actions: bool = False,
         elif embeddings_off:
             model_detail = f"not cached; downloads {lane.disabled_tail}"
         else:
-            model_detail = "downloads (~50MB) with the first embedding build"
+            model_detail = ("not cached; `agrep -s <query>` or "
+                            f"`{_cli_command('setup')}` fetches it (~50MB) once")
         if verified and not smart["model_cached"] and model_integrity.get("detail"):
             model_detail += f"; {model_integrity['detail']}"
         if smart.get("embedding_lane"):
@@ -3424,7 +3851,11 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             model_detail += f"; this machine opens {runtime_lane}"
             if smart.get("runtime_lane_refusal"):
                 model_detail += f" ({smart['runtime_lane_refusal']})"
-        _row("model", OK if smart["model_cached"] else OPT, model_detail)
+        model_failed = (
+            verified and model_integrity.get("state") == "failed"
+            and model_integrity.get("present"))
+        _row("model", WARN if model_failed else
+             OK if smart["model_cached"] else OPT, model_detail)
         coverage = smart.get("embedding_coverage")
         cov = (f" ({coverage['indexed']:,}/{coverage['total']:,} rows)"
                if coverage and not coverage.get("complete", True) else "")
@@ -3441,7 +3872,8 @@ def report(*, deep: bool = False, fix_actions: bool = False,
         running = bool(smart.get("embed_running"))
         state = smart["embeddings"]
         deferral = (
-            surface.observed_semantic_deferral(
+            surface.lane_semantic_deferral(
+                state,
                 common.available_memory_fraction,
                 common.battery_state,
                 common.host_cpu_fraction,
@@ -3498,8 +3930,12 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             detail = "never built - " + (
                 f"first build running{live_cov}" if running else
                 paused or
-                "builds on the first semantic search; "
-                + _command_remedy("semantic-fix", "doctor", "--fix"))
+                (f"builds on the first semantic search, on the CPU lane: "
+                 f"{smart['lane_weights_pending']}; "
+                 f"`{_cli_command('doctor', '--fix')}` downloads them"
+                 if smart.get("lane_weights_pending") else
+                 "builds on the first semantic search; "
+                 + _command_remedy("semantic-fix", "doctor", "--fix")))
         elif state == "missing-source":
             detail = "waiting on the first index build"
         else:
@@ -3556,7 +3992,7 @@ def report(*, deep: bool = False, fix_actions: bool = False,
                         or "loopback bind is unavailable"))
         resident = smart.get("resident_worker") or {}
         worker_status = (WARN if resident.get("blocked") else
-                         WARN if readiness.get("query_serving") is False else
+                         WARN if _query_failure_is_breakage(readiness) else
                          OK if readiness.get("query_serving") is True else OPT)
         _row("semantic worker", worker_status,
              _resident_worker_detail(
@@ -3593,9 +4029,10 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             in corpusdb.SELF_REPAIRING_CORPUS_STATES
             or str(snapshot["core"]["search_db"].get("state") or "")
             in corpusdb.SELF_REPAIRING_DB_STATES
-            # a dead owner's claim: the kick's own liveness guard decides
+            # a dead owner's claim or a killed pass's journal: the kick's own liveness guard decides
             or str(snapshot["core"]["search_db"].get("state") or "")
-            == "owned-elsewhere"):
+            in ("owned-elsewhere", "interrupted-pass")
+            or event_store_interrupted(snapshot["core"].get("event_store_journal") or {})):
         indexd_runtime.kick_background_repair()
     return {"fixes": fixes, "has_cargo": has_cargo, "deps": smart["deps"]}
 
@@ -3622,14 +4059,25 @@ def fix() -> int:
         print(f"on a supported OS/Python, enable it with "
               f"{SEMANTIC_INSTALL_ACTION}.")
         return 0
-    if smart["model_cached"]:
-        print("semantic model already cached.")
-        return 0
+    fetched = False
     try:
         import embedder
-        print("fetching the pinned semantic model (~52 MiB, one time) ...",
-              flush=True)
-        embedder.ensure_model()
+        if smart["model_cached"]:
+            print("semantic model already cached.")
+        else:
+            print("fetching the pinned semantic model (~52 MiB, one time) ...",
+                  flush=True)
+            embedder.ensure_model()
+            fetched = True
+        # The lane the first build opens needs its own checkpoint, and no
+        # automatic path may fetch it: setup is where the owner consented.
+        try:
+            embedder.ensure_lane_weights(None, download=False)
+        except embedder.EmbedderUnavailable:
+            print("fetching the Metal checkpoint (~91 MiB, one time) ...",
+                  flush=True)
+            embedder.ensure_lane_weights(None, download=True)
+            fetched = True
     except (ImportError, ModuleNotFoundError) as e:
         # A module may have a discoverable package directory but fail to import
         # because an optional native dependency is unavailable on this tuple.
@@ -3641,7 +4089,8 @@ def fix() -> int:
     except Exception as e:  # noqa: BLE001 -- a real fetch/cache failure is actionable
         print(f"  ! model fetch failed ({e}); it retries on first semantic use.")
         return 1
-    print("\ndone.")
+    if fetched:
+        print("\ndone.")
     return 0
 
 
@@ -3697,10 +4146,12 @@ def setup(
     print(f"tiers now: {tiers}")
     if prefetch_semantic:
         rc = fix()
+        # the Metal note needs the deep probe, whose onnxruntime import leaves
+        # files behind; an opted-out run never loads the semantic runtime.
+        _metal_lane_note()
     else:
         print("semantic model prefetch skipped for this setup run.")
         rc = 0
-    _metal_lane_note()
     if rc != 0:
         print("semantic tier deferred; core setup and agent enrollment continue.")
         print(_command_remedy("setup-retry", "setup")

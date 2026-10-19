@@ -1,433 +1,15 @@
-// Drives gemini-cli's own ChatRecordingService the way GeminiClient/GeminiChat do, under both the
+// Drives gemini-cli's own ChatRecordingService (session.ts) under both the
 // current recorder (fb972b2) and the `$set.messages` one released before it (361b0bb), each with
 // and without getHistory()'s coalescing, and writes one session file per flow plus the transcript
 // a person would read (expected.json). Run through record.sh, which fetches those recorders; each
 // flow's `expect` is written by hand.
+
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import {
-  ChatRecordingService,
-  loadConversationRecord,
-} from './services/chatRecordingService.ts';
-import {
-  ChatRecordingService as PreDeltaRecordingService,
-  loadConversationRecord as loadPreDeltaRecord,
-} from './services/preChatRecordingService.ts';
-import type { ConversationRecord, ToolCallRecord } from './services/chatRecordingTypes.ts';
-import { convertSessionToClientHistory, ensureStableToolIds } from './utils/sessionUtils.ts';
-import { deriveStableId } from './utils/cryptoUtils.ts';
-import { randomUUID, setIdPrefix } from './utils/fakeCrypto.ts';
-
-type Part = Record<string, unknown>;
-type Content = { role: string; parts: Part[] };
-type Turn = { id: string; content: Content };
-type Resumed = { conversation: ConversationRecord; filePath: string };
-
-/** The surface both recorder versions share. */
-interface Recorder {
-  initialize(resumed?: Resumed, kind?: 'main' | 'subagent'): Promise<void>;
-  updateMessagesFromHistory(history: readonly Turn[]): void;
-  recordMessage(message: { model: string | undefined; type: string; content: unknown }): string;
-  recordSyntheticMessage(type: string, content: unknown): string;
-  recordToolCalls(model: string, toolCalls: ToolCallRecord[]): void;
-  getConversation(): ConversationRecord | null;
-  getConversationFilePath(): string | null;
-  rewindTo(messageId: string): ConversationRecord | null;
-}
-type Version = {
-  name: string;
-  make: (ctx: Context) => Recorder;
-  load: (file: string) => Promise<ConversationRecord | null>;
-};
-
-type Context = {
-  promptId: string;
-  config: {
-    getProjectRoot: () => string;
-    storage: { getProjectTempDir: () => string };
-    getWorkspaceContext: () => { getDirectories: () => string[] };
-  };
-  toolRegistry: {
-    getTool: (name: string) => { displayName: string; description: string; isOutputMarkdown: boolean };
-  };
-};
-
-// The recorder stamps records with `new Date()`; a settable clock keeps fixtures byte-stable.
-const RealDate = Date;
-let clock = 0;
-class FakeDate extends RealDate {
-  constructor(...args: ConstructorParameters<typeof Date> | []) {
-    if (args.length === 0) super(clock);
-    else super(...(args as ConstructorParameters<typeof Date>));
-  }
-  static override now(): number {
-    return clock;
-  }
-}
-globalThis.Date = FakeDate as DateConstructor;
+import { setIdPrefix } from './utils/fakeCrypto.ts';
+import { ENV_ID, INVESTIGATE, MASKED, Session, VERSIONS, type Context } from './session.ts';
 
 const OUT = process.argv[2];
-const MODEL = 'gemini-2.5-pro';
-const ENV_ID = deriveStableId(['environment-context']);
-const ENV_TEXT = '<session_context>\nThis is the Gemini CLI.\n</session_context>';
-const ACK = 'Got it. Thanks for the additional context!';
-const INTERRUPTED = '[The previous response was interrupted before it completed.]';
-const CANCELLED = '[Operation Cancelled] Reason: User cancelled the operation.';
-const DENIED = '[Operation Cancelled] Reason: User denied execution.';
-const MASKED = '<tool_output_masked>\noutput hidden to save context\n</tool_output_masked>';
-
-// Both classes expose the Recorder surface; their declared private fields differ by version.
-const VERSIONS: Version[] = [
-  {
-    name: 'current',
-    make: (ctx) => new ChatRecordingService(ctx) as unknown as Recorder,
-    load: loadConversationRecord,
-  },
-  {
-    name: 'checkpoint',
-    make: (ctx) => new PreDeltaRecordingService(ctx) as unknown as Recorder,
-    load: loadPreDeltaRecord,
-  },
-];
-
-/**
- * stripThoughts then coalesceConsecutiveRoles (geminiChat.ts 1813-1881): thought parts go, with
- * turns left without parts, then one turn per run of a role, its parts concatenated.
- */
-function coalesce(contents: Content[]): Content[] {
-  const out: Content[] = [];
-  const stripped = contents
-    .map((content) => ({ role: content.role, parts: content.parts.filter((part) => !part.thought) }))
-    .filter((content) => content.parts.length > 0);
-  for (const content of stripped) {
-    const last = out.at(-1);
-    if (last && last.role === content.role) last.parts = [...last.parts, ...content.parts];
-    else out.push({ role: content.role, parts: content.parts });
-  }
-  return out;
-}
-
-/** The reply text upstream records: zero-width characters and HTML comments go (1552-1563). */
-function responseText(raw: string): string {
-  return raw.replace(/[\u200B-\u200D\uFEFF\u200E\u200F]/g, '').replace(/<!--[\s\S]*?-->/g, '').trim();
-}
-
-/** GeminiClient + GeminiChat, reduced to the calls that reach the recorder. */
-class Session {
-  history: Turn[] = [];
-  recorder!: Recorder;
-  private promptStart: number | undefined;
-  private minute = 0;
-  /** The file as an index saw it while the session was under way (see `midway`). */
-  seen: { size: number; body: string } | undefined;
-
-  constructor(
-    readonly version: Version,
-    readonly ctx: Context,
-    readonly day: string,
-    // getHistoryTurns (geminiChat.ts 1179-1194) coalesces for Gemini 2, Gemini 3 and custom
-    // models, the default `auto` included, and contextManagement's scrubHistory always does
-    readonly coalesced: boolean,
-  ) {}
-
-  tick(): string {
-    this.minute += 1;
-    const iso = `${this.day}T09:${String(this.minute).padStart(2, '0')}:00.000Z`;
-    clock = RealDate.parse(iso);
-    return iso;
-  }
-
-  /** GeminiClient.startChat: env turn first, Content turns get fresh ids, then init + sync. */
-  async start(extra: Array<Turn | Content>, resumed?: Resumed): Promise<void> {
-    const first = extra[0];
-    const withEnv: Array<Turn | Content> =
-      first && 'id' in first && first.id === ENV_ID
-        ? [...extra]
-        : [{ id: ENV_ID, content: { role: 'user', parts: [{ text: ENV_TEXT }] } }, ...extra];
-    this.history = withEnv.map((item) => ('id' in item ? item : { id: randomUUID(), content: item }));
-    ensureStableToolIds(this.history);
-    this.recorder = this.version.make(this.ctx);
-    await this.recorder.initialize(resumed, 'main');
-    this.recorder.updateMessagesFromHistory(this.history);
-    this.promptStart = undefined;
-  }
-
-  /** sendMessageStream for a typed prompt (a new prompt_id). */
-  prompt(text: string): void {
-    this.tick();
-    this.promptStart = this.history.length;
-    // closeUnansweredToolResponseTurn: a cancelled tool's response gets an unrecorded closer
-    const last = this.history.at(-1);
-    if (last?.content.role === 'user' && last.content.parts.some((part) => 'functionResponse' in part)) {
-      this.history.push({ id: randomUUID(), content: { role: 'model', parts: [{ text: INTERRUPTED }] } });
-    }
-    const parts = [{ text }];
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'user', content: parts });
-    this.history.push({ id, content: { role: 'user', parts } });
-  }
-
-  /** A model text response: the record keeps upstream's cleaned `responseText`. */
-  reply(raw: string): void {
-    this.tick();
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: responseText(raw) });
-    this.history.push({ id, content: { role: 'model', parts: [{ text: raw }] } });
-  }
-
-  /**
-   * A model function call and its completion record (recordCompletedToolCalls), which merges into
-   * the model's record (chatRecordingService.ts 1133-1157) beside any text streamed before the call.
-   */
-  call(callId: string, name: string, args: Record<string, unknown>, output: string, status = 'success', lead = ''): void {
-    this.tick();
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: responseText(lead) });
-    const call = { functionCall: { id: callId, name, args } };
-    this.history.push({ id, content: { role: 'model', parts: lead ? [{ text: lead }, call] : [call] } });
-    const response = [{ functionResponse: { id: callId, name, response: { output } } }];
-    this.recorder.recordToolCalls(MODEL, [
-      { id: callId, name, args, result: response, status, timestamp: new Date().toISOString() },
-    ]);
-  }
-
-  /** The function response sent back, or after Esc handed to addHistory: both record it. */
-  respond(callId: string, name: string, output: string): void {
-    const response = [{ functionResponse: { id: callId, name, response: { output } } }];
-    const rid = this.recorder.recordSyntheticMessage('user', response);
-    this.history.push({ id: rid, content: { role: 'user', parts: response } });
-  }
-
-  tool(callId: string, name: string, args: Record<string, unknown>, output: string): void {
-    this.call(callId, name, args, output);
-    this.respond(callId, name, output);
-  }
-
-  /**
-   * useHistory().addItem: every info, warning and error item the UI shows is recorded as a session
-   * message too (useHistoryManager.ts 91-124 at fb972b2), never part of the model's history.
-   */
-  notice(type: 'info' | 'warning' | 'error', text: string): void {
-    this.recorder.recordMessage({ model: undefined, type, content: text });
-  }
-
-  /**
-   * Esc while a tool runs: cancelOngoingRequest's notice (915-923) comes first, then the scheduler
-   * completes the cancelled call (useToolScheduler.ts 210-222, useGeminiStream.ts 352-363) and
-   * recordToolCalls, finding a notice last, starts a record of its own for it (chatRecordingService
-   * 1133-1157); then the cancelled result goes in through addHistory. Text the model streamed
-   * before the call stays in the first record, cleaned, and in the history's turn, raw.
-   */
-  escTool(callId: string, name: string, args: Record<string, unknown>, lead = ''): void {
-    this.tick();
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: responseText(lead) });
-    const call = { functionCall: { id: callId, name, args } };
-    this.history.push({ id, content: { role: 'model', parts: lead ? [{ text: lead }, call] : [call] } });
-    this.notice('info', 'Request cancelled.');
-    const response = [{ functionResponse: { id: callId, name, response: { output: CANCELLED } } }];
-    this.recorder.recordToolCalls(MODEL, [
-      { id: callId, name, args, result: response, status: 'cancelled', timestamp: new Date().toISOString() },
-    ]);
-    this.respond(callId, name, CANCELLED);
-  }
-
-  /**
-   * A prompt whose tool call the person declines. useGeminiStream notes getHistory().length before
-   * sending (1742-1745 at fb972b2) and, with every tool cancelled, records 'Request cancelled.'
-   * and sets the history back to that length when it is longer (2105-2147); coalesced, the first
-   * prompt is merged into the environment turn and stays. Auto-compression in the same turn
-   * (processTurn, client.ts 703) changes the length the target is measured against.
-   */
-  async declined(
-    text: string,
-    callId: string,
-    name: string,
-    args: Record<string, unknown>,
-    compressed?: { goal: string; keep: number },
-    lead = '',
-  ): Promise<void> {
-    const before = this.contents().length;
-    if (compressed) await this.compress(compressed.goal, compressed.keep);
-    this.prompt(text);
-    this.call(callId, name, args, DENIED, 'cancelled', lead);
-    this.notice('info', 'Request cancelled.');
-    if (this.contents().length > before) this.setHistory(this.contents().slice(0, before));
-  }
-
-  /**
-   * A call declined in a later round. submitQuery notes the length for every send, the tool
-   * results' too (1742-1745, 2189-2195), so the rollback keeps the prompt and its first call.
-   */
-  declinedLater(
-    text: string,
-    first: { callId: string; name: string; args: Record<string, unknown>; output: string },
-    declined: { callId: string; name: string; args: Record<string, unknown> },
-    lead: string,
-  ): void {
-    this.prompt(text);
-    this.call(first.callId, first.name, first.args, first.output);
-    const before = this.contents().length;
-    this.respond(first.callId, first.name, first.output);
-    this.call(declined.callId, declined.name, declined.args, DENIED, 'cancelled', lead);
-    this.notice('info', 'Request cancelled.');
-    if (this.contents().length > before) this.setHistory(this.contents().slice(0, before));
-  }
-
-  /** sendMessageStream in IDE mode: the editor context goes in as its own turn (addHistory). */
-  ide(json: string): void {
-    const parts = [{ text: `Here is the user's editor context as a JSON object. This is for your information only.\n\`\`\`json\n${json}\n\`\`\`` }];
-    const id = this.recorder.recordSyntheticMessage('user', parts);
-    this.history.push({ id, content: { role: 'user', parts } });
-  }
-
-  /** The SessionStart hook, at startup or resume: addHistory of its context (AppContainer.tsx 489-507). */
-  hook(context: string): void {
-    const parts = [{ text: `<hook_context>${context}</hook_context>` }];
-    const id = this.recorder.recordSyntheticMessage('user', parts);
-    this.history.push({ id, content: { role: 'user', parts } });
-  }
-
-  /**
-   * A read_file of audio answered and replied to. The tool's result carries the data under
-   * __binary_injection__ (generateContentResponseUtilities.ts 96-150); sendMessageStream records
-   * the result, then removes it and records a thought acknowledgement and the data as an info
-   * message, which the history keeps as a user turn (geminiChat.ts 575-622).
-   */
-  binaryTool(callId: string, word: string): void {
-    this.tick();
-    const name = 'read_file';
-    const args = { file_path: `${word}.mp3` };
-    const id = this.recorder.recordMessage({ model: MODEL, type: 'gemini', content: '' });
-    this.history.push({ id, content: { role: 'model', parts: [{ functionCall: { id: callId, name, args } }] } });
-    const data = [{ inlineData: { mimeType: 'audio/mpeg', data: 'SUQzBAAAAAAA' } }];
-    const output = 'Binary content (audio/mpeg) read successfully. Content will be injected for analysis in the next sequence.';
-    const response: Part[] = [{ functionResponse: { id: callId, name, response: { output, __binary_injection__: data } } }];
-    this.recorder.recordToolCalls(MODEL, [
-      { id: callId, name, args, result: structuredClone(response), status: 'success', timestamp: new Date().toISOString() },
-    ]);
-    const rid = this.recorder.recordSyntheticMessage('user', response);
-    delete ((response[0].functionResponse as Part).response as Part).__binary_injection__;
-    this.history.push({ id: rid, content: { role: 'user', parts: response } });
-    const ack = [{ text: 'Binary content received. Proceeding with analysis.', thought: true, thoughtSignature: 'skip_thought_signature_validator' }];
-    const aid = this.recorder.recordSyntheticMessage('gemini', ack);
-    this.history.push({ id: aid, content: { role: 'model', parts: ack } });
-    const bid = this.recorder.recordSyntheticMessage('info', data);
-    this.history.push({ id: bid, content: { role: 'user', parts: data } });
-  }
-
-  /** Esc while a reply streams: the notice (915-923), then sendMessageStream's rollback. */
-  abort(): void {
-    this.notice('info', 'Request cancelled.');
-    this.rollBack();
-  }
-
-  /** A failed request: the rollback, then handleErrorEvent's error item (1217-1238). */
-  fail(): void {
-    this.rollBack();
-    this.notice('error', '[API Error: The model is overloaded. Please try again later.]');
-  }
-
-  /** The `finally` of sendMessageStream: abort or failure rolls back to before the prompt. */
-  rollBack(): void {
-    this.tick();
-    if (this.promptStart === undefined) throw new Error('no prompt to roll back');
-    this.history = this.history.slice(0, this.promptStart);
-    this.recorder.updateMessagesFromHistory(this.history);
-    this.promptStart = undefined;
-  }
-
-  /** GeminiChat.setHistory with plain Content: every turn is re-recorded, then synced. */
-  setHistory(contents: Content[]): void {
-    this.tick();
-    this.history = contents.map((content) => ({
-      id: this.recorder.recordSyntheticMessage(content.role === 'user' ? 'user' : 'gemini', content.parts),
-      content,
-    }));
-    ensureStableToolIds(this.history);
-    this.recorder.updateMessagesFromHistory(this.history);
-  }
-
-  /** GeminiChat.getHistory(), which saves, masking and compression's kept tail start from. */
-  contents(rewrite: (part: Part) => Part = (part) => part): Content[] {
-    const contents = this.history.map((turn) => ({
-      role: turn.content.role,
-      parts: structuredClone(turn.content.parts).map(rewrite),
-    }));
-    return this.coalesced ? coalesce(contents) : contents;
-  }
-
-  /** /chat save: the checkpoint, and the info item its result shows (chatCommand.ts 139-149). */
-  save(tag: string): Content[] {
-    this.notice('info', `Conversation checkpoint saved with tag: ${tag}.`);
-    return this.contents();
-  }
-
-  /** client.tryMaskToolOutputs and CONTENT_TRUNCATED: tool outputs replaced, then setHistory. */
-  mask(marker: string): void {
-    this.setHistory(
-      this.contents((part) =>
-        typeof part.functionResponse === 'object' && part.functionResponse !== null
-          ? { functionResponse: { ...part.functionResponse, response: { output: marker } } }
-          : part,
-      ),
-    );
-  }
-
-  /** GeminiClient.tryCompressChat on COMPRESSED: snapshot + ack + kept tail, startChat(resumed). */
-  async compress(goal: string, keep: number): Promise<void> {
-    this.tick();
-    const conversation = this.recorder.getConversation();
-    const filePath = this.recorder.getConversationFilePath();
-    if (!conversation || !filePath) throw new Error('nothing to compress');
-    const tail = keep > 0 ? this.contents().slice(-keep) : [];
-    const before = this.recorder;
-    await this.start(
-      [
-        { role: 'user', parts: [{ text: `<state_snapshot>\n<overall_goal>${goal}</overall_goal>\n</state_snapshot>` }] },
-        { role: 'model', parts: [{ text: ACK }] },
-        ...tail,
-      ],
-      { conversation, filePath },
-    );
-    // handleChatCompressionEvent's item (1370-1398) goes through the recorder addItem was bound to
-    // (AppContainer.tsx 235-237), the one tryCompressChat just replaced (client.ts 1236-1250)
-    before.recordMessage({ model: undefined, type: 'info', content: 'Context compressed from 74% to 21%.' });
-  }
-
-  /** rewindCommand: recorder.rewindTo, then client.setHistory(convertSessionToClientHistory). */
-  rewind(messageId: string): void {
-    this.tick();
-    const conversation = this.recorder.rewindTo(messageId);
-    if (!conversation) throw new Error('rewind failed');
-    this.history = convertSessionToClientHistory(conversation.messages) as Turn[];
-    ensureStableToolIds(this.history);
-    this.recorder.updateMessagesFromHistory(this.history);
-  }
-
-  /** useSessionResume: load the file, startChat(convertSessionToClientHistory, resumed). */
-  async resume(): Promise<void> {
-    this.tick();
-    const filePath = this.recorder.getConversationFilePath();
-    if (!filePath) throw new Error('no file to resume');
-    const conversation = await this.version.load(filePath);
-    if (!conversation) throw new Error('resume load failed');
-    await this.start(convertSessionToClientHistory(conversation.messages) as Turn[], { conversation, filePath });
-  }
-
-  /** The id of the live user message whose text starts with `text`. */
-  idOf(text: string): string {
-    const found = this.history.find((turn) =>
-      turn.content.parts.some((part) => typeof part.text === 'string' && part.text.startsWith(text)),
-    );
-    if (!found) throw new Error(`no live turn for ${text}`);
-    return found.id;
-  }
-
-  /** Marks the file as an index reads it now, for a later warm index of the whole file. */
-  midway(): void {
-    const file = this.recorder.getConversationFilePath();
-    if (!file) throw new Error('no file yet');
-    const body = fs.readFileSync(file, 'utf8');
-    this.seen = { size: Buffer.byteLength(body), body };
-  }
-}
 
 type Row = [who: string, text: string, reply: string];
 type Scenario = {
@@ -435,6 +17,8 @@ type Scenario = {
   expect: Row[];
   /** The call ids of the tool events left, sorted, where a flow pins them. */
   events?: string[];
+  /** The subagent sessions the flow invokes, in order: each one's rows and pinned events. */
+  children?: Array<{ expect: Row[]; events?: string[] }>;
   run: (s: Session) => Promise<void>;
 };
 
@@ -1147,6 +731,131 @@ const SCENARIOS: Scenario[] = [
       s.abort();
     },
   },
+  {
+    // an invoke_agent call runs a subagent, whose chat records as its own file under the parent's
+    // id; the parent's call record links to it by agent id and carries the result it returned
+    name: 'subagent',
+    expect: [user('alpaca'), user('cheetah')],
+    events: ['agent-alpaca', 'read-cheetah'],
+    children: [{
+      expect: [['subagent', `${INVESTIGATE}Where does alpaca live?`, 'Searching for alpaca. Found it in zoo.ts.']],
+      events: ['done-alpaca', 'grep-alpaca'],
+    }],
+    run: async (s) => {
+      s.prompt('alpaca');
+      await s.subagent('agent-alpaca', 'codebase_investigator', 'Where does alpaca live?', (child) => {
+        child.prompt(`${INVESTIGATE}Where does alpaca live?`);
+        child.call('grep-alpaca', 'grep_search', { pattern: 'alpaca' }, 'zoo.ts:1:alpaca', 'success', 'Searching for alpaca.');
+        child.respond('grep-alpaca', 'grep_search', 'zoo.ts:1:alpaca');
+        child.call('done-alpaca', 'complete_task', { result: 'alpaca lives in zoo.ts' }, 'Task completed.', 'success', 'Found it in zoo.ts.');
+      }, 'alpaca lives in zoo.ts');
+      s.reply('ok alpaca');
+      toolTurn(s, 'cheetah');
+    },
+  },
+  {
+    // two subagents in one session, one of them after a compression that copies the first's call;
+    // /rewind then undoes the second prompt and its call, never the first subagent's chat
+    name: 'subagent_compress_rewind',
+    expect: [user('alpaca'), recap('alpaca only'), user('cheetah')],
+    events: ['agent-alpaca', 'read-cheetah'],
+    children: [
+      { expect: [['subagent', `${INVESTIGATE}Where does alpaca live?`, 'Found it in zoo.ts.']], events: ['done-alpaca'] },
+      { expect: [['subagent', `${INVESTIGATE}Where does bison live?`, 'Found it in zoo.ts.']], events: ['done-bison'] },
+    ],
+    run: async (s) => {
+      s.prompt('alpaca');
+      await s.subagent('agent-alpaca', 'codebase_investigator', 'Where does alpaca live?', (child) => {
+        child.prompt(`${INVESTIGATE}Where does alpaca live?`);
+        child.call('done-alpaca', 'complete_task', { result: 'alpaca lives in zoo.ts' }, 'Task completed.', 'success', 'Found it in zoo.ts.');
+      }, 'alpaca lives in zoo.ts');
+      s.reply('ok alpaca');
+      await s.compress('alpaca only', 2);
+      s.prompt('bison');
+      await s.subagent('agent-bison', 'codebase_investigator', 'Where does bison live?', (child) => {
+        child.prompt(`${INVESTIGATE}Where does bison live?`);
+        child.call('done-bison', 'complete_task', { result: 'bison lives in zoo.ts' }, 'Task completed.', 'success', 'Found it in zoo.ts.');
+      }, 'bison lives in zoo.ts');
+      s.reply('ok bison');
+      s.rewind(s.idOf('bison'));
+      toolTurn(s, 'cheetah');
+    },
+  },
+  {
+    // Esc on a turn whose model text follows the call, then a mask copies the turn
+    name: 'esc_trail_mask',
+    expect: [user('alpaca'), user('bison', 'Reading bison now.'), user('cheetah'), user('dingo')],
+    events: ['read-alpaca', 'read-bison'],
+    run: async (s) => {
+      toolTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' }, '', 'Reading bison now.');
+      plainTurn(s, 'cheetah');
+      s.mask(MASKED);
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // Esc on a turn with text on both sides of the call, then /chat resume of a save from before it
+    name: 'esc_both_resume',
+    expect: [user('alpaca'), user('bison', 'I will read bison.Reading bison now.'), user('cheetah'), user('dingo')],
+    events: ['read-bison'],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      const saved = s.save('s7');
+      s.prompt('bison');
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' }, 'I will read bison.', 'Reading bison now.');
+      plainTurn(s, 'cheetah');
+      s.setHistory(saved);
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // Esc with trailing text, then compression copies the turn into the kept tail, then /rewind
+    // to the Esc'd prompt undoes it with its cancelled call
+    name: 'esc_trail_compress_rewind',
+    expect: [user('alpaca'), recap('alpaca to cheetah'), user('dingo')],
+    events: ['read-alpaca'],
+    run: async (s) => {
+      toolTurn(s, 'alpaca');
+      s.prompt('bison');
+      s.escTool('read-bison', 'read_file', { file_path: 'bison.ts' }, 'I will read bison.', 'Reading bison now.');
+      plainTurn(s, 'cheetah');
+      await s.compress('alpaca to cheetah', 8);
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'dingo');
+    },
+  },
+  {
+    // a completed tool round with text after the call, masked and rewound past
+    name: 'trail_mask_rewind',
+    expect: [user('alpaca', 'Reading alpaca.Read alpaca. ok alpaca'), user('cheetah')],
+    events: ['read-alpaca'],
+    run: async (s) => {
+      s.prompt('alpaca');
+      s.call('read-alpaca', 'read_file', { file_path: 'alpaca.ts' }, 'export const alpaca = 1;', 'success', 'Reading alpaca.', 'Read alpaca.');
+      s.respond('read-alpaca', 'read_file', 'export const alpaca = 1;');
+      s.reply('ok alpaca');
+      plainTurn(s, 'bison');
+      s.mask(MASKED);
+      s.rewind(s.idOf('bison'));
+      plainTurn(s, 'cheetah');
+    },
+  },
+  {
+    // /rewind undoes a turn whose reply the model streamed with a comment and a zero-width
+    // character; /chat resume of a save from before brings the turn back as a copy of the raw
+    // history text, which reads as the cleaned reply upstream recorded
+    name: 'raw_reply_chat_resume_rewound',
+    expect: [user('alpaca'), user('dingo')],
+    run: async (s) => {
+      plainTurn(s, 'alpaca');
+      plainTurn(s, 'dingo', 'ok <!-- dingo -->dingo\u200B');
+      const saved = s.save('s8');
+      s.rewind(s.idOf('dingo'));
+      s.setHistory(saved);
+    },
+  },
 ];
 
 const expected: string[] = [];
@@ -1179,15 +888,25 @@ for (const coalesced of [false, true]) {
       await session.start([]);
       await scenario.run(session);
       const flow = `${version.name}${coalesced ? '+coalesced' : ''}/${scenario.name}`;
-      const rows = scenario.expect.map((row) => `  ${JSON.stringify(row)}`).join(',\n');
-      const events = scenario.events ? `, "events": ${JSON.stringify(scenario.events)}` : '';
+      const entry = (id: string, name: string, expect: Row[], events?: string[], extra = ''): string => {
+        const rows = expect.map((row) => `  ${JSON.stringify(row)}`).join(',\n');
+        const pinned = events ? `, "events": ${JSON.stringify(events)}` : '';
+        const body = rows ? `[\n${rows}\n ]` : '[]';
+        return ` ${JSON.stringify(id)}: {"flow": "${name}", "rows": ${body}${pinned}${extra}}`;
+      };
       const file = session.recorder.getConversationFilePath();
       const seen = session.seen;
       // a warm index of the whole file only stands for the session if the file only grew
       if (seen && !(file && fs.readFileSync(file, 'utf8').startsWith(seen.body))) throw new Error(`${flow} rewrote`);
       const midway = seen ? `, "midway": ${seen.size}` : '';
-      const body = rows ? `[\n${rows}\n ]` : '[]';
-      expected.push(` ${JSON.stringify(sessionId)}: {"flow": "${flow}", "rows": ${body}${events}${midway}}`);
+      expected.push(entry(sessionId, flow, scenario.expect, scenario.events, midway));
+      const children = scenario.children ?? [];
+      if (children.length !== session.children.length) throw new Error(`${flow}: ${session.children.length} children`);
+      for (const [c, child] of session.children.entries()) {
+        const { expect, events } = children[c];
+        const parent = `, "parent": ${JSON.stringify(sessionId)}`;
+        expected.push(entry(child.ctx.promptId, `${flow}/subagent${c + 1}`, expect, events, parent));
+      }
       console.log(flow, file ? path.basename(file) : '?');
     }
   }

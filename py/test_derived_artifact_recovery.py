@@ -7,11 +7,14 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir, publish_derived_generation
+from _test_support import (
+    isolate_data_dir, publish_derived_generation, publish_derived_proof)
 
 isolate_data_dir()
 
@@ -779,6 +782,171 @@ class DerivedArtifactRecoveryTests(unittest.TestCase):
         self.assertFalse(semantic._deterministic_integrity_error(race))
         self.assertFalse(semantic._deterministic_integrity_error(
             embedding_segments.SegmentPublicationRace("prefix changed")))
+
+    def _proof_ahead_of_event_stats(self, root: Path) -> None:
+        message = {
+            "id": "claude:pending:1", "agent": "claude", "project": "pending",
+            "session": "pending", "ts": 1_700_000_000_000, "turn": 1,
+            "text": "a turn published before the event write", "who": "user",
+        }
+        publish_derived_generation(
+            root, [message], common, corpusdb, signature="before-events")
+        # The writer rewrites event_stats.json right after its event commit and publishes the
+        # proof and signature covering it only later in the same pass.
+        (root / "event_stats.json").write_bytes(b'{"claude":{"calls":1}}')
+
+    def test_direct_snapshot_serves_once_the_writer_publishes_its_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+
+            def publish() -> None:
+                time.sleep(0.2)
+                publish_derived_proof(root, corpusdb, signature="after-events")
+
+            writer = threading.Thread(target=publish)
+            with (
+                mock.patch.object(common, "DATA_DIR", root),
+                mock.patch.object(corpusdb, "query_publication_active", return_value=True),
+                mock.patch.object(explore, "_kick_derived_repair") as kick,
+            ):
+                writer.start()
+                try:
+                    snapshot = explore._capture_direct_snapshot()
+                finally:
+                    writer.join()
+        self.assertEqual(snapshot["signal"], b"after-events\n")
+        kick.assert_not_called()
+
+    def test_direct_snapshot_refuses_a_proof_mismatch_that_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+            with (
+                mock.patch.object(common, "DATA_DIR", root),
+                mock.patch.object(corpusdb, "query_publication_active", return_value=True),
+                mock.patch.object(explore, "_kick_derived_repair") as kick,
+                self.assertRaisesRegex(
+                    explore.DirectSnapshotError,
+                    "event_stats.json does not match its committed generation"),
+            ):
+                explore._capture_direct_snapshot()
+        kick.assert_called_once_with()
+
+    def _refuses_at_once(self, root: Path, problem: str, *, publisher: bool) -> None:
+        with (
+            mock.patch.object(common, "DATA_DIR", root),
+            mock.patch.object(
+                corpusdb, "query_publication_active", return_value=publisher),
+            mock.patch.object(explore, "_kick_derived_repair") as kick,
+            self.assertRaisesRegex(explore.DirectSnapshotError, problem),
+        ):
+            started = time.monotonic()
+            try:
+                explore._capture_direct_snapshot()
+            finally:
+                elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5, "the refusal waited out the publication bound")
+        kick.assert_called_once_with()
+
+    def test_a_mismatch_no_live_publisher_will_close_refuses_at_once(self) -> None:
+        # A crashed pass's leftover mismatch cost every direct read the whole 1 s wait.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+            self._refuses_at_once(
+                root, "event_stats.json does not match its committed generation",
+                publisher=False)
+
+    def test_a_missing_derived_file_refuses_at_once_even_beside_a_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+            publish_derived_proof(root, corpusdb, signature="after-events")
+            (root / "replies.jsonl").rename(root / "replies.aside")
+            self._refuses_at_once(root, "replies.jsonl cannot be verified", publisher=True)
+
+    def test_a_bad_proof_version_refuses_at_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+            publish_derived_proof(root, corpusdb, signature="after-events")
+            proof = root / ".derived_generation.json"
+            body = json.loads(proof.read_text(encoding="utf-8"))
+            body["version"] = -1
+            proof.write_text(json.dumps(body), encoding="utf-8")
+            self._refuses_at_once(root, "proof is invalid", publisher=True)
+
+    def _serves_through(self, root: Path, **patches) -> None:
+        with (
+            mock.patch.object(common, "DATA_DIR", root),
+            mock.patch.multiple(corpusdb, **patches),
+            mock.patch.object(explore, "_kick_derived_repair") as kick,
+        ):
+            snapshot = explore._capture_direct_snapshot()
+        self.assertEqual(snapshot["signal"], b"after-events\n")
+        kick.assert_not_called()
+
+    def test_a_rename_landing_mid_validation_with_a_live_publisher_serves(self) -> None:
+        # A writer's rename inside the edge read used to refuse `around` at once.
+        real = corpusdb._validate_derived_file
+        calls = []
+
+        def renamed_once(root, expected, validated=None, *, routine=False):
+            calls.append(expected.get("name"))
+            if len(calls) == 2:
+                return (f"{expected['name']} cannot be verified (derived artifact changed "
+                        f"while reading: {root / expected['name']})")
+            return real(root, expected, validated, routine=routine)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+            publish_derived_proof(root, corpusdb, signature="after-events")
+            self._serves_through(
+                root, _validate_derived_file=renamed_once,
+                query_publication_active=mock.Mock(return_value=True))
+
+    def test_a_proof_replaced_mid_read_with_a_live_publisher_serves(self) -> None:
+        real = corpusdb._read_derived_file
+        failed = []
+
+        def replaced_once(path, max_bytes):
+            if not failed and path.name in (".derived_generation.json", ".ingest.sig"):
+                failed.append(path.name)
+                raise OSError(f"derived artifact changed while reading: {path}")
+            return real(path, max_bytes)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+            publish_derived_proof(root, corpusdb, signature="after-events")
+            self._serves_through(
+                root, _read_derived_file=replaced_once,
+                query_publication_active=mock.Mock(return_value=True))
+        self.assertEqual(failed, [".ingest.sig"])
+
+    def test_a_publisher_finishing_before_the_liveness_check_serves(self) -> None:
+        # The attempt read the old proof; the writer published and released before the check.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._proof_ahead_of_event_stats(root)
+
+            def finished() -> bool:
+                publish_derived_proof(root, corpusdb, signature="after-events")
+                return False
+
+            self._serves_through(
+                root, query_publication_active=mock.Mock(side_effect=finished))
+
+    def test_a_floor_note_offers_no_exact_count_where_counting_is_a_floor_too(self) -> None:
+        # Under tool exclusion (pending FTS build or unreadable events) -c is a floor as well.
+        disclosure = surface.completeness_disclosure(
+            shown=1, total=1, unit="chat", totals_exact=False, truncated=True)
+        self.assertIn("-c counts exactly", surface.completeness_line(disclosure))
+        line = surface.completeness_line(disclosure, count_exact=False)
+        self.assertIn("a floor, not the total", line)
+        self.assertNotIn("-c counts exactly", line)
 
 
 if __name__ == "__main__":

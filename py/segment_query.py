@@ -885,6 +885,48 @@ def _assert_settled(path: Path, before_meta, before_artifacts, after_artifacts) 
             "semantic artifacts moved during integrity verification")
 
 
+def _metadata_only_change(expected, observed) -> bool:
+    """Same file (dev, ino) at the same length, with only mtime/ctime moved.
+
+    That is what chmod, chown, touch and xattr tools leave behind; whether the
+    bytes moved too is a question only the recorded digest can answer."""
+    return (observed is not None
+            and tuple(expected)[:3] == tuple(observed)[:3]
+            and tuple(expected) != tuple(observed))
+
+
+def _reverify_metadata_changes(
+        manifest: embedding_segments.LoadedManifest,
+        changed: list, observed: dict) -> None:
+    """Accept a metadata-only change once its bytes still match the descriptor.
+
+    The verdict and the artifact's current identity land in the integrity
+    receipt - the reader's own record - so the next cold open does not pay
+    the hash again. The publisher repairs the proof itself at its next
+    publication (`embedding_segments._verified_prefix_identities`)."""
+    descriptors = _artifact_descriptors(manifest)
+    receipt = _read_integrity_receipt(manifest.path)
+    verified = dict(receipt)
+    hashed = False
+    for artifact in changed:
+        path = Path(artifact)
+        key = str(path)
+        identity = list(observed[key])
+        expected = str(descriptors[path]["sha256"])
+        cached = receipt.get(key)
+        if not (isinstance(cached, dict)
+                and cached.get("sha256") == expected
+                and cached.get("identity") == identity):
+            if _sha256_file(path) != expected:
+                raise SegmentIntegrityError(
+                    f"active semantic artifact changed after publication: {path}")
+            hashed = True
+        verified[key] = {"sha256": expected, "identity": identity}
+    if hashed:
+        _write_integrity_receipt(manifest.path, verified)
+
+
+
 def _verified_manifest(path: Path):
     try:
         before_meta = _stamp(path)
@@ -893,15 +935,22 @@ def _verified_manifest(path: Path):
         proof = embedding_segments.publication_artifact_identities(candidate)
         if proof is not None:
             observed = dict(before_artifacts)
-            changed = next((artifact for artifact, identity in proof.items()
-                            if observed.get(str(artifact)) != identity), None)
-            if changed is not None:
-                if _current_identity_republished(
-                        Path(changed), proof[changed]):
+            changed = [artifact for artifact, identity in proof.items()
+                       if observed.get(str(artifact)) != identity]
+            if changed:
+                first = changed[0]
+                if _current_identity_republished(Path(first), proof[first]):
                     raise SegmentArtifactMoved(
-                        f"semantic artifact was republished: {changed}")
-                raise SegmentIntegrityError(
-                    f"active semantic artifact changed after publication: {changed}")
+                        f"semantic artifact was republished: {first}")
+                damaged = next((
+                    artifact for artifact in changed
+                    if not _metadata_only_change(
+                        proof[artifact], observed.get(str(artifact)))), None)
+                if damaged is not None:
+                    raise SegmentIntegrityError(
+                        f"active semantic artifact changed after publication: "
+                        f"{damaged}")
+                _reverify_metadata_changes(candidate, changed, observed)
             after_artifacts = _artifact_stamp(candidate)
             _assert_settled(path, before_meta, before_artifacts, after_artifacts)
             return candidate, before_meta, after_artifacts

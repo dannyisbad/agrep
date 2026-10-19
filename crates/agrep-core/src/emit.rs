@@ -15,21 +15,21 @@ use std::sync::OnceLock;
 use serde::Serialize;
 
 use crate::model::Message;
-use crate::row_class;
+use crate::row_class::{self, HarnessPolicy};
 
 static MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SINK_OPEN: AtomicBool = AtomicBool::new(false);
-static HARNESS_PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
+static HARNESS_POLICY: OnceLock<HarnessPolicy> = OnceLock::new();
 
 pub fn enable() {
     SINK_OPEN.store(true, Ordering::Relaxed);
     MODE_ENABLED.store(true, Ordering::Relaxed);
 }
 
-/// The local harness-prefix policy the normalize pass will use, so streamed
-/// rows classify identically. Set once, before the first adapter emits.
-pub fn set_harness_prefixes(prefixes: &[String]) {
-    let _ = HARNESS_PREFIXES.set(prefixes.to_vec());
+/// The local harness policy the normalize pass will use, so streamed rows
+/// classify identically. Set once, before the first adapter emits.
+pub fn set_harness_policy(policy: &HarnessPolicy) {
+    let _ = HARNESS_POLICY.set(policy.clone());
 }
 
 pub fn on() -> bool {
@@ -141,8 +141,11 @@ struct StreamRow<'a> {
 }
 
 fn rows_json(msgs: &[Message]) -> Vec<u8> {
-    static NO_PREFIXES: Vec<String> = Vec::new();
-    let prefixes = HARNESS_PREFIXES.get().unwrap_or(&NO_PREFIXES);
+    static NO_POLICY: HarnessPolicy = HarnessPolicy {
+        text_prefixes: Vec::new(),
+        project_prefixes: Vec::new(),
+    };
+    let policy = HARNESS_POLICY.get().unwrap_or(&NO_POLICY);
     let capacity = msgs
         .iter()
         .map(|m| {
@@ -165,7 +168,7 @@ fn rows_json(msgs: &[Message]) -> Vec<u8> {
                     text: &m.text,
                     ts: m.ts,
                     turn: m.turn,
-                    who: row_class::row_kind(m, prefixes).who(),
+                    who: row_class::row_kind(m, policy).who(),
                 },
             },
         );
@@ -211,6 +214,7 @@ mod tests {
             reply_chars: 0,
             side,
             parent: Arc::from(""),
+            reply_shape: Default::default(),
         }
     }
 

@@ -356,6 +356,84 @@ pub fn unlock_dir(dir: &Path) {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Write a cline task `task_id` (a `Date.now()` millisecond string) under `root/tasks`, one
+/// prompt with a tool call, and index it in `root/state/taskHistory.json`.
+pub fn cline_task(root: &Path, task_id: &str, text: &str) {
+    let task = root.join("tasks").join(task_id);
+    fs::create_dir_all(&task).unwrap();
+    let ts: u64 = task_id.parse().unwrap();
+    let history = serde_json::json!([
+        {"role": "user", "ts": ts,
+         "content": [{"type": "text", "text": format!("<task>{text}</task>")}]},
+        {"role": "assistant", "ts": ts + 1000, "modelInfo": {"modelId": "claude-fable-5"},
+         "content": [{"type": "text", "text": format!("did {text}")},
+                     {"type": "tool_use", "id": format!("cu-{task_id}"), "name": "write_to_file",
+                      "input": {"path": "x.py", "content": "x"}}]},
+        {"role": "user", "ts": ts + 2000,
+         "content": [{"type": "tool_result", "tool_use_id": format!("cu-{task_id}"),
+                      "content": "ok", "is_error": false}]},
+    ]);
+    fs::write(
+        task.join("api_conversation_history.json"),
+        history.to_string(),
+    )
+    .unwrap();
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let mut index: Vec<serde_json::Value> = fs::read(state.join("taskHistory.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    index.push(
+        serde_json::json!({"id": task_id, "cwdOnTaskInitialization": "/work/x",
+                                  "modelId": "claude-fable-5"}),
+    );
+    fs::write(
+        state.join("taskHistory.json"),
+        serde_json::Value::Array(index).to_string(),
+    )
+    .unwrap();
+}
+
+/// A crush database at `path` holding one conversation `session`: a prompt `text` answered with
+/// a tool call. An existing database gains the conversation.
+pub fn crush_db(path: &Path, session: &str, text: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(concat!(
+        "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, ",
+        "title TEXT, updated_at INTEGER, created_at INTEGER);",
+        "CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, ",
+        "parts TEXT, model TEXT, created_at INTEGER, updated_at INTEGER);"
+    ))
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions VALUES (?1, NULL, ?2, 1767348100000, 1767348000000)",
+        (session, text),
+    )
+    .unwrap();
+    let prompt = serde_json::json!([{"type": "text", "data": {"text": text}}]).to_string();
+    conn.execute(
+        "INSERT INTO messages VALUES (?1, ?2, 'user', ?3, NULL, 1767348000000, 1767348000000)",
+        (format!("{session}-m1"), session, prompt),
+    )
+    .unwrap();
+    let reply = serde_json::json!([
+        {"type": "text", "data": {"text": format!("done {text}")}},
+        {"type": "tool_call", "data": {"id": format!("tc-{session}"), "name": "bash",
+                                       "input": "{\"command\":\"ls\"}", "finished": true}},
+        {"type": "tool_result", "data": {"tool_call_id": format!("tc-{session}"), "name": "bash",
+                                         "content": "ok", "is_error": false}},
+    ])
+    .to_string();
+    conn.execute(
+        "INSERT INTO messages VALUES (?1, ?2, 'assistant', ?3, 'gpt-5.5', 1767348001000, 1767348001000)",
+        (format!("{session}-m2"), session, reply),
+    )
+    .unwrap();
+    conn.close().unwrap();
+}
+
 /// Write a codex rollout of `session` under `.codex/sessions/2026/01/<day>`, a prompt a minute
 /// from `hour`, each answered.
 pub fn codex_rollout(

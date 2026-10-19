@@ -58,8 +58,7 @@ class ReplyTruncationTests(unittest.TestCase):
                                           "reply_truncated": True}}
         with mock.patch.object(explore, "_reply_records_by_id", return_value=record), \
                 mock.patch.object(explore, "_summary_by_session", return_value={}), \
-                mock.patch.object(explore, "_session_concept", return_value={}), \
-                mock.patch.object(explore, "has_events", return_value=False):
+                mock.patch.object(explore, "_session_concept", return_value={}):
             window = explore._pack_window(SESSION, context, 0, rows)
         turn = window["turns"][0]
         self.assertEqual(turn["reply_chars"], 90_000)

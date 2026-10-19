@@ -1,6 +1,7 @@
 """Black-box parity and lifecycle coverage for the POSIX resident CLI."""
 from __future__ import annotations
 
+import atexit
 import errno
 import json
 import os
@@ -20,9 +21,60 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "py"))
 import resident
+from _test_support import write_budget_injection
 
-CLIENT_PATH = [str(ROOT / "py"), str(ROOT), *sys.path[2:]]
+
+
+# The home screen observes under routine budgets a loaded host spends, dropping a line
+# from one run of a normal/served pair; every CLI process here runs with them widened.
+INJECT = Path(tempfile.mkdtemp(prefix="resident-inject-"))
+atexit.register(shutil.rmtree, INJECT, ignore_errors=True)
+write_budget_injection(INJECT, "generous")
+# Every CLI process these tests start, launcher and served client alike, runs under
+# this PYTHONPATH; the endpoint key hashes the sys.path it produces.
+CLI_PYTHONPATH = os.pathsep.join((str(INJECT), str(ROOT), str(ROOT / "py")))
+
+
+def _cli_sys_path() -> list[str]:
+    """sys.path exactly as `python cli.py` has it when it hands off to the resident.
+
+    The endpoint key hashes sys.path, so the served client must present the
+    launcher's: a shared unittest process accumulates entries from earlier
+    modules, and the runner's own PYTHONPATH (unset under plain discovery,
+    extended under a gate) is not the one the launcher runs with.
+    """
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import json, os, sys; sys.path.insert(0, os.path.join(sys.argv[1], 'py')); "
+         "print(json.dumps(sys.path))", str(ROOT)],
+        cwd=ROOT, env={**os.environ, "PYTHONPATH": CLI_PYTHONPATH},
+        capture_output=True, text=True, timeout=60, check=True)
+    path = json.loads(probe.stdout)
+    # A `-c` program's path[1] is '' (the cwd); cli.py's is its own directory.
+    path[1] = str(ROOT)
+    return path
+
+
+CLIENT_PATH = _cli_sys_path()
+# Bound on waiting for a condition that a correct resident reaches promptly; only a
+# hang reaches it, so it is sized for a saturated host rather than for a measurement.
+WAIT_S = 60.0
+# The resident declines a command it cannot acknowledge within its deadline,
+# which a loaded host can cause; while its endpoint exists the client asks again.
 CLIENT = (
+    "import os,sys,time;import resident;"
+    f"sys.path[:]={CLIENT_PATH!r};"
+    f"sys.argv[0]={str(ROOT / 'cli.py')!r};"
+    f"deadline=time.monotonic()+{WAIT_S!r}\n"
+    "while True:\n"
+    " code=resident.try_run()\n"
+    " if code is not None or time.monotonic()>=deadline: break\n"
+    " if not os.path.exists(resident.socket_path()): break\n"
+    " time.sleep(0.03)\n"
+    "sys.exit(97 if code is None else code)"
+)
+# One request and its verdict: a server that cannot be acknowledged is 97, not asked again.
+CLIENT_ONCE = (
     "import sys;import resident;"
     f"sys.path[:]={CLIENT_PATH!r};"
     f"sys.argv[0]={str(ROOT / 'cli.py')!r};"
@@ -33,6 +85,14 @@ IMPORT_EXPORTS = (
     "AGREP_RUNTIME_BUILD_ID", "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
     "AGREP_DERIVED_ADOPTION_OWNER_TOKEN", "AGREP_INDEXD_REFRESH_EXPECTED_WRITER",
 )
+# The slow-command self-explanation appears only when a loaded host crosses
+# its wall-clock threshold; it is not part of a command's answer.
+_SLOW_DISCLOSURE = re.compile(rb"(?m)^took \d+(?:\.\d+)?s\b.*\n?")
+
+
+def _comparable(result):
+    code, stdout, stderr = result
+    return code, stdout, _SLOW_DISCLOSURE.sub(b"", stderr)
 
 
 @unittest.skipIf(sys.platform == "win32", "SCM_RIGHTS and fork require POSIX")
@@ -40,17 +100,22 @@ class ResidentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base = Path(tempfile.mkdtemp(prefix="resident-"))
+        cls.addClassCleanup(shutil.rmtree, cls.base, ignore_errors=True)
         # sun_path is 104 bytes on macOS; a TMPDIR-rooted runtime dir would not fit.
         cls.runtime = Path(tempfile.mkdtemp(prefix="agr-", dir="/tmp"))
+        cls.addClassCleanup(shutil.rmtree, cls.runtime, ignore_errors=True)
         cls.home = cls.base / "home"
         cls.data = cls.base / "data"
         for path in (cls.home, cls.data):
             path.mkdir()
+        # A served call after a gap longer than this idle would meet a missing socket
+        # and answer 97 while a new server starts; setUp re-warms the class server. The
+        # idle stays short so a killed run leaves no server or runtime directory for long.
         cls.env = {**os.environ, "HOME": str(cls.home), "AGREP_HOME": str(cls.home),
                    "AGREP_DATA_DIR": str(cls.data), "XDG_RUNTIME_DIR": str(cls.runtime),
-                   "AGREP_NO_DAEMON": "1", "AGREP_RESIDENT_IDLE_S": "30",
+                   "AGREP_NO_DAEMON": "1", "AGREP_RESIDENT_IDLE_S": "120",
                    "AGREP_CALLER_PUBLICATION_DIR": str(cls.base / "callers"),
-                   "AGREP_CLI_NAME": "agrep", "PYTHONPATH": f"{ROOT}:{ROOT / 'py'}"}
+                   "AGREP_CLI_NAME": "agrep", "PYTHONPATH": CLI_PYTHONPATH}
         cls.env.pop("AGREP_NO_RESIDENT", None)
         for name in ("claude", "codex", "pi", "omp"):
             shutil.copytree(ROOT / "bench" / "fixtures" / "upgrade_store" / name,
@@ -62,7 +127,7 @@ class ResidentTests(unittest.TestCase):
         (cls.data / "settings.json").write_text('{"embeddings":"off"}\n')
         indexed = subprocess.run([sys.executable, str(ROOT / "cli.py"), "index"],
                                  env={**cls.env, "AGREP_NO_RESIDENT": "1"}, cwd=ROOT,
-                                 capture_output=True, timeout=60)
+                                 capture_output=True, timeout=300)
         if indexed.returncode:
             raise AssertionError((indexed.returncode, indexed.stdout, indexed.stderr))
         # A future ingest receipt makes the wall-clock age explicitly unknown on both paths.
@@ -73,6 +138,10 @@ class ResidentTests(unittest.TestCase):
         cls.project = cls.base / project
         cls.project.mkdir(exist_ok=True)
         cls._warm()
+
+    def setUp(self):
+        if not os.path.exists(self._socket_path(self.env)):
+            self._warm()
 
     @classmethod
     def tearDownClass(cls):
@@ -137,7 +206,7 @@ class ResidentTests(unittest.TestCase):
 
     @classmethod
     def _warm(cls, env=None):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + WAIT_S
         while time.monotonic() < deadline:
             result = cls._call(["--help"], served=True, env=env)
             if result[0] != 97:
@@ -197,7 +266,7 @@ resident.serve(path, lock)
             self.fail(server.stderr.read())
         return server
 
-    def _poll(self, condition, timeout=10):
+    def _poll(self, condition, timeout=WAIT_S):
         deadline = time.monotonic() + timeout
         while True:
             value = condition()
@@ -268,7 +337,7 @@ resident.serve(path, lock)
             for args in commands:
                 with self.subTest(args=args, pty=pty):
                     if not args:
-                        # The home screen ages messages.jsonl in whole seconds; start the pair at a wrap.
+                        # It ages messages.jsonl in whole seconds; start the pair at a wrap.
                         fraction = (time.time() - (self.data / "messages.jsonl").stat().st_mtime) % 1
                         time.sleep((1 - fraction) % 1 + 0.02)
                     normal = self._call(args, normal=True, pty=pty)
@@ -279,6 +348,7 @@ resident.serve(path, lock)
                             (code, re.sub(rb"last indexed \d+[smhd] ago",
                                           b"last indexed <AGE> ago", out), err)
                             for code, out, err in (normal, served))
+                    normal, served = _comparable(normal), _comparable(served)
                     self.assertNotEqual(served[0], 97)
                     self.assertEqual(served, normal)
                     if "resident-unfindable-token" in args:
@@ -298,7 +368,7 @@ resident.serve(path, lock)
                 with self.subTest(cwd=cwd, pty=pty):
                     normal = self._call(args, normal=True, env=env, cwd=cwd, pty=pty)
                     served = self._call(args, served=True, env=env, cwd=cwd, pty=pty)
-                    self.assertEqual(served, normal)
+                    self.assertEqual(_comparable(served), _comparable(normal))
                     self.assertEqual(served[0], 0 if cwd == self.project else 1)
         self.assertEqual(self._call(["--help"], served=True, env={"COLUMNS": "49"}),
                          self._call(["--help"], normal=True, env={"COLUMNS": "49"}))
@@ -313,8 +383,8 @@ resident.serve(path, lock)
         }))
         try:
             for args in (["search", "Both synthetic checklists", "-n", "40"], ["recall", "copper", "--json"]):
-                normal = self._call(args, normal=True)
-                served = self._call(args, served=True)
+                normal = _comparable(self._call(args, normal=True))
+                served = _comparable(self._call(args, served=True))
                 self.assertEqual(served, normal)
                 self.assertEqual(served[0], 0)
             self.assertTrue(self._call(["search", "Both synthetic checklists", "-n", "40"],
@@ -366,7 +436,7 @@ assert __import__("threading").active_count() == 1
             data = home / ".local" / "share" / "agrep"
         overrides = {"HOME": str(home), "AGREP_HOME": str(home), "AGREP_RS_BIN": str(wrapper),
                      "AGREP_DERIVED_ADOPTION_OWNER_TOKEN": "leaked", "AGREP_DATA_DIR": None}
-        indexed = subprocess.run(self._command(["index"]), cwd=ROOT, capture_output=True, timeout=60,
+        indexed = subprocess.run(self._command(["index"]), cwd=ROOT, capture_output=True, timeout=300,
                                  env={**self._environ(overrides), "AGREP_NO_RESIDENT": "1",
                                       "AGREP_RS_BIN": real})
         self.assertEqual(indexed.returncode, 0, indexed.stderr)
@@ -421,13 +491,13 @@ assert __import__("threading").active_count() == 1
 
     def test_two_simultaneous_clients(self):
         args = ["search", "copper", "-n", "1"]
-        expected = self._call(args, normal=True)
+        expected = _comparable(self._call(args, normal=True))
         children = [subprocess.Popen(self._command(args, served=True), cwd=ROOT, env=self.env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     for _ in range(2)]
         for child in children:
             stdout, stderr = child.communicate(timeout=30)
-            self.assertEqual((child.returncode, stdout, stderr), expected)
+            self.assertEqual(_comparable((child.returncode, stdout, stderr)), expected)
 
     def test_concurrent_misses_start_one_server(self):
         import fcntl
@@ -451,12 +521,147 @@ assert __import__("threading").active_count() == 1
     def test_launcher_miss_starts_server(self):
         env = {"AGREP_RESIDENT_IDLE_S": "9"}
         self.assertEqual(self._call(["--help"], env=env)[0], 0)
-        time.sleep(0.5)
+        # A served probe would start a server itself on a miss; wait for the
+        # launcher's server to accept before asking it anything.
+        path = self._socket_path({**self.env, **env})
+
+        def accepting():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.25)
+                probe.connect(path)
+                return True
+            except OSError:
+                return False
+            finally:
+                probe.close()
+
+        self._poll(accepting)
         self.assertEqual(self._call(["--help"], served=True, env=env)[0], 0)
+
+    def test_a_slow_server_fork_is_awaited_not_declined(self):
+        """Forking the preloaded server outlasts the connect's quarter second on a
+        loaded host; the client waits the request deadline for the acknowledgement
+        instead of giving up and asking again, which forked another child each time."""
+        env = self._private_runtime()
+        self._hand_server(env, '''
+import os, time
+real_fork = os.fork
+def slow_fork():
+    time.sleep(0.6)
+    return real_fork()
+os.fork = slow_fork
+''')
+        result = subprocess.run(
+            [sys.executable, "-c", CLIENT_ONCE, "--version"], cwd=ROOT, env=env,
+            capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count(b"\n"), 1, result.stdout)
+
+    def test_a_late_acknowledgement_runs_the_command_once_or_not_at_all(self):
+        """A descheduled client whose request lands late, on a server whose fork is
+        slow: the command runs exactly once with its output, or the client is
+        declined before committing and falls back. Never a silent exit 1 with no run."""
+        env = self._private_runtime()
+        marks = self.base / "late-ack-runs"
+        marks.mkdir()
+        self._hand_server(env, f'''
+import os, time
+real_fork = os.fork
+def slow_fork():
+    time.sleep(1.7)
+    return real_fork()
+os.fork = slow_fork
+preload = resident._preload
+def wrapped():
+    entry = preload()
+    def command():
+        with open(os.path.join({str(marks)!r}, str(os.getpid())), "w") as fh:
+            fh.write("ran")
+        print("ran once")
+        return 0
+    return command
+resident._preload = wrapped
+''')
+        # a client descheduled between connect and request, then one descheduled
+        # between the acknowledgement and its go byte for longer than the server waits
+        stalls = {
+            "request": (
+                "import socket, time\n"
+                "real = socket.socket.sendmsg\n"
+                "def stalled(self, *args, **kwargs):\n"
+                "    time.sleep(0.5)\n"
+                "    return real(self, *args, **kwargs)\n"
+                "socket.socket.sendmsg = stalled\n"),
+            "go byte": (
+                "import socket, time\n"
+                "real = socket.socket.sendall\n"
+                "def stalled(self, data, *args, **kwargs):\n"
+                "    if data == b'G':\n"
+                "        time.sleep(2.5)\n"
+                "    return real(self, data, *args, **kwargs)\n"
+                "socket.socket.sendall = stalled\n"),
+        }
+        for stalled, prelude in stalls.items():
+            with self.subTest(stalled=stalled):
+                before = len(list(marks.iterdir()))
+                result = subprocess.run(
+                    [sys.executable, "-c", prelude + CLIENT_ONCE, "--version"], cwd=ROOT,
+                    env=env, capture_output=True, timeout=60)
+                runs = len(list(marks.iterdir())) - before
+                self.assertIn(
+                    (result.returncode, runs), {(0, 1), (97, 0)},
+                    (result.returncode, runs, result.stdout, result.stderr))
+                if result.returncode == 0:
+                    self.assertEqual(result.stdout, b"ran once\n")
+
+    def test_a_wedged_server_is_abandoned_within_the_short_wait(self):
+        """A server that accepts but never greets (stopped, swapped out, hung before
+        its loop) costs a command the quarter-second connect round, not the
+        acknowledgement wait a greeting server earns."""
+        env = self._private_runtime()
+        marks = self.base / "wedged-runs"
+        marks.mkdir()
+        server = self._hand_server(env, f'''
+preload = resident._preload
+def wrapped():
+    entry = preload()
+    def command():
+        with open(os.path.join({str(marks)!r}, str(os.getpid())), "w") as fh:
+            fh.write("ran")
+        return entry()
+    return command
+resident._preload = wrapped
+''')
+        os.kill(server.pid, signal.SIGSTOP)
+        try:
+            timed_client = (
+                "import time\n"
+                "started = time.perf_counter()\n"
+                "try:\n"
+                + "".join("    " + line + "\n" for line in CLIENT_ONCE.split(";"))
+                + "finally:\n"
+                "    import sys\n"
+                "    sys.stderr.write(repr(time.perf_counter() - started))\n")
+            result = subprocess.run(
+                [sys.executable, "-c", timed_client, "--version"], cwd=ROOT, env=env,
+                capture_output=True, timeout=60)
+        finally:
+            os.kill(server.pid, signal.SIGCONT)
+        self.assertEqual(result.returncode, 97, result.stderr)
+        self.assertLess(float(result.stderr.rsplit(b"\n", 1)[-1]), 1.0, result.stderr)
+        # Resumed, the server reads the stale request of a client that has already run
+        # the command itself; without a go byte that request runs nothing, and the
+        # server goes on serving.
+        self.assertEqual(
+            subprocess.run([sys.executable, "-c", CLIENT_ONCE, "--version"], cwd=ROOT,
+                           env=env, capture_output=True, timeout=60).returncode, 0)
+        self.assertEqual(len(list(marks.iterdir())), 1, "the stale request ran the command")
+        self.assertIsNone(server.poll())
 
     def test_dont_write_bytecode_client_is_served(self):
         command = [sys.executable, "-B", "-c", CLIENT, "--help"]
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + WAIT_S
         while True:
             result = subprocess.run(command, cwd=ROOT, env=self.env, capture_output=True, timeout=30)
             if result.returncode != 97:
@@ -503,6 +708,8 @@ assert __import__("threading").active_count() == 1
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(2)
             connection.connect(path)
+            connection.sendall(resident._HELLO)
+            self.assertEqual(connection.recv(1), resident._GREETING)
             connection.sendmsg([len(body).to_bytes(4, "big") + body],
                                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [0, 1, 2]))])
             self.assertEqual(connection.recv(5), b"")
@@ -514,7 +721,7 @@ assert __import__("threading").active_count() == 1
         self._warm(env)
         path = self._socket_path({**self.env, **env})
         os.unlink(path)
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + WAIT_S
         with open(path + ".lock", "rb") as lock:
             while True:
                 try:
@@ -539,7 +746,7 @@ assert __import__("threading").active_count() == 1
         env = {"AGREP_RESIDENT_IDLE_S": "0.4"}
         self._warm(env)
         path = self._socket_path({**self.env, **env})
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + WAIT_S
         while os.path.exists(path) and time.monotonic() < deadline:
             time.sleep(0.025)
         self.assertFalse(os.path.exists(path))
@@ -563,6 +770,93 @@ else:
                                 capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self._warm()
+
+    def test_remove_waits_for_a_server_still_starting(self):
+        """A server spawned just before a remove holds its lock through its preload
+        and can only notice the stopping marker past it; the remove waits for that
+        on a loaded host instead of reporting the resident unstoppable."""
+        env = self._private_runtime()
+        preloading = self.base / "preloading"
+        code = f'''
+import os, sys, time
+sys.path[:] = {CLIENT_PATH!r}
+import resident
+path = resident.socket_path()
+import fcntl
+lock = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(lock, fcntl.LOCK_EX)
+preload = resident._preload
+def slow_preload():
+    open({str(preloading)!r}, "w").close()
+    time.sleep(4.0)
+    return preload()
+resident._preload = slow_preload
+resident.serve(path, lock)
+'''
+        server = subprocess.Popen([sys.executable, "-c", code], env=env, cwd=ROOT,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: (server.poll() is None and server.kill(), server.communicate()))
+        with mock.patch.dict(os.environ, env, clear=True):
+            runtime = Path(resident._directory())
+            self._poll(lambda: preloading.exists() or server.poll() is not None)
+            if server.poll() is not None:
+                self.fail(server.stderr.read())
+            started = time.monotonic()
+            outcome = resident.stop_servers()
+        self.assertTrue(outcome["ok"], outcome)
+        self.assertGreaterEqual(time.monotonic() - started, 3.0, "the starting server was not waited for")
+        self.assertEqual(server.wait(timeout=30), 0)
+        self.assertEqual(list(runtime.parent.glob(runtime.name)), [], "runtime directory remains")
+
+    def test_stop_is_a_plain_ok_in_both_directions(self):
+        """`agrep remove` right after an upgrade meets the other version's resident
+        for up to its idle time: a stop is STOP answered by OK on the wire, with no
+        greeting either way, so each version's stopper stops the other's server."""
+        env = self._private_runtime()
+        # a server of the previous protocol: reads a request, answers a STOP with OK
+        old_server = f'''
+import os, socket, sys
+sys.path[:] = {CLIENT_PATH!r}
+import resident
+path = os.path.join(resident._directory(), "0" * 20 + ".sock")
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+mask = os.umask(0o077)
+listener.bind(path)
+os.umask(mask)
+listener.listen(8)
+print("ready", flush=True)
+while True:
+    connection, _ = listener.accept()
+    request = connection.recv(4)
+    if request == b"STOP":
+        connection.sendall(b"OK")
+        connection.close()
+        break
+    connection.close()
+listener.close()
+os.unlink(path)
+'''
+        server = subprocess.Popen([sys.executable, "-c", old_server], env=env, cwd=ROOT,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: (server.poll() is None and server.kill(), server.communicate()))
+        self.assertEqual(server.stdout.readline(), b"ready\n")
+        with mock.patch.dict(os.environ, env, clear=True):
+            outcome = resident.stop_servers()
+        self.assertTrue(outcome["ok"], outcome)
+        self.assertIn("resident CLI", outcome["stopped"])
+        self.assertEqual(server.wait(timeout=30), 0, server.stderr.read())
+
+        # a stopper of the previous protocol against this server: STOP, then exactly OK
+        env = self._private_runtime()
+        server = self._hand_server(env, "")
+        path = next(Path(env["XDG_RUNTIME_DIR"]).rglob("*.sock"))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(WAIT_S)
+            connection.connect(str(path))
+            connection.sendall(b"STOP")
+            self.assertEqual(connection.recv(2), b"OK")
+            self.assertEqual(connection.recv(1), b"")
+        self.assertEqual(server.wait(timeout=WAIT_S), 0, server.stderr.read())
 
     def test_stale_stopping_marker_is_reclaimed(self):
         import fcntl
@@ -755,31 +1049,37 @@ resident._preload = lambda: command
 
     def test_debug_clocks_restart_per_command(self):
         env = self._private_runtime(AGREP_DEBUG="1")
+        # The server's clocks are aged an hour so an inherited clock is unmistakable
+        # from a command's own however slowly a loaded host runs the command.
         self._hand_server(env, '''
 preload = resident._preload
 def wrapped():
     entry = preload()
+    import console
     from hookless import _log
+    _log._DBG_T0 -= 3600.0
+    console._DBG_T0 -= 3600.0
     def command():
         _log.dbg("resident probe")
         return entry()
     return command
 resident._preload = wrapped
 ''')
-        time.sleep(1.25)
         code, _, stderr = self._call(["--version"], served=True, env=env)
         self.assertEqual(code, 0, stderr)
         self.assertIn(b"resident probe", stderr)
         offsets = [float(value) for value in re.findall(rb"\[agrep \+\s*([0-9.]+)ms\]", stderr)]
         self.assertTrue(offsets, stderr)
-        self.assertLess(max(offsets), 1200, stderr)
+        self.assertLess(max(offsets), 1_800_000, stderr)
 
     def test_signal_forwarding_and_abnormal_exit(self):
         env = self._private_runtime()
         pidfile = self.base / "child.pid"
         self._hand_server(env, f'''
 def command():
-    with open({str(pidfile)!r}, "w") as f: f.write(str(os.getpid()))
+    staged = {str(pidfile)!r} + ".tmp"
+    with open(staged, "w") as f: f.write(str(os.getpid()))
+    os.replace(staged, {str(pidfile)!r})
     time.sleep(30)
     return 0
 resident._preload = lambda: command

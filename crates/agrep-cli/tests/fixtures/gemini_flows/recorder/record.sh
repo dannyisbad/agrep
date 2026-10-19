@@ -72,7 +72,7 @@ echo "export type AgentLoopContext = unknown;" > "$work/config/agent-loop-contex
 echo "export type HistoryTurn = { id: string; content: { role?: string; parts?: unknown[] } };" \
   > "$work/core/agentChatHistory.ts"
 
-cp "$here/driver.ts" "$work/driver.ts"
+cp "$here/session.ts" "$here/driver.ts" "$work/"
 (cd "$work" && bun run driver.ts "$work/out")
 rm -rf "$here/../home"
 mkdir -p "$here/../home/.gemini/tmp"

@@ -21,7 +21,9 @@ detected agents are taught immediately; every written block is disclosed in
 the setup output and undone by `agrep remove`. That includes the
 uninstall-cleanup sentinel (a launchd agent, systemd user units, or a
 scheduled task) whose only job is stripping agrep's own blocks and hooks if
-the package disappears. Set `AGREP_NO_AUTO_SETUP=1` to only warm uv's cache
+the package disappears: it watches this npm package's own `bin.js`, so
+`npm uninstall -g` triggers it while a `uv cache clean` does not. Set
+`AGREP_NO_AUTO_SETUP=1` to only warm uv's cache
 instead, or `AGREP_SKIP_POSTINSTALL=1` to skip postinstall entirely. npm's
 own `bin` shim remains the PATH entrypoint, so the install does not create
 or replace a persistent uv-managed command.

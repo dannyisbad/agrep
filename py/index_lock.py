@@ -8,10 +8,11 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import sys
 import time
 
-from events import DATA_DIR, data_dir_readonly
+from events import DATA_DIR, EVENT_STORE_NAME, data_dir_readonly, open_regular_binary
 import ownerfile
 from proc import WIN, pid_alive, process_start_identity
 
@@ -153,6 +154,144 @@ def _lock_holder_pid(path: Path) -> int | None:
     return owner.pid if owner is not None else None
 
 
+def holder_live(path: Path | None = None, *, alive=None, start_identity=None) -> bool:
+    """Whether the lock record at `path` names its exact live process."""
+    alive = pid_alive if alive is None else alive
+    start_identity = process_start_identity if start_identity is None else start_identity
+    try:
+        observed = _snapshot(INDEX_LOCK_PATH if path is None else path)
+        owner = parse_owner(observed.raw) if observed is not None else None
+        if owner is None or owner.start in (None, "unknown"):
+            return False
+        return alive(owner.pid) and start_identity(owner.pid) == owner.start
+    except OSError:
+        return False
+
+
+_SQLITE_SIDECARS = (
+    ("-journal", "rollback journal"), ("-wal", "write-ahead log"), ("-shm", "shared-memory file"))
+
+
+def _user_name(uid: int) -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return f"uid {uid}"
+
+
+def _first_byte_nonzero(path: Path) -> bool:
+    # SQLite takes no POSIX lock on a journal, so this read cannot drop one a connection holds.
+    try:
+        with open_regular_binary(path) as stream:
+            return stream.read(1) not in (b"", b"\0")
+    except OSError:
+        return False
+
+
+def _wal_mode(database: Path) -> bool:
+    # Read only for a blocked -shm with no -wal; every reader already opens this header.
+    try:
+        with open_regular_binary(database) as stream:
+            header = stream.read(20)
+    except OSError:
+        return False
+    return len(header) == 20 and header[18:20] == b"\x02\x02"
+
+
+def _sidecar_blocks(database: Path, suffix: str) -> bool:
+    """Whether this sidecar, already known not readable and writable here, stops every pass.
+    The writer itself gets past a readable inert journal (debris), a -shm a DELETE-mode store
+    never uses (corpus.db's only if readable), and the event store's empty -wal beside a
+    DELETE-mode header (its settle removes it); anything else it cannot use."""
+    path = Path(f"{database}{suffix}")
+    if suffix == "-journal":
+        return not os.access(path, os.R_OK) or _first_byte_nonzero(path)
+    if suffix == "-shm":
+        # the Rust writer's corpus.db ownership probe reads every sidecar's first bytes, and
+        # serves read-only when it cannot
+        if database.name != EVENT_STORE_NAME:
+            if not os.access(path, os.R_OK):
+                return True
+            return Path(f"{database}-wal").exists() or _wal_mode(database)
+        return not _settled_wal(database) or _wal_mode(database)
+    if suffix == "-wal" and database.name == EVENT_STORE_NAME:
+        return not _settled_wal(database) or _wal_mode(database)
+    return True
+
+
+def _settled_wal(database: Path) -> bool:
+    # absent or empty: SQLite reads a zero-byte -wal as no WAL at all
+    try:
+        return Path(f"{database}-wal").lstat().st_size == 0
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def inaccessible_sidecars(database: Path, store: str) -> list[dict]:
+    """SQLite sidecars beside `database` this user cannot both read and write and no pass can
+    clean up. The sidecars themselves are never opened beyond a journal's first byte, which
+    SQLite never locks: closing a probe fd on a locked file would drop SQLite's own locks."""
+    getuid = getattr(os, "getuid", None)
+    found = []
+    for suffix, kind in _SQLITE_SIDECARS:
+        path = Path(f"{database}{suffix}")
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if (not stat.S_ISREG(info.st_mode) or os.access(path, os.R_OK | os.W_OK)
+                or not _sidecar_blocks(database, suffix)):
+            continue
+        if getuid is not None and info.st_uid != getuid():
+            access = "owner"
+        elif info.st_mode & 0o600 == 0o600:
+            access = "flags"  # the mode allows it, so an immutable flag or an ACL denies it
+        else:
+            access = "mode"
+        found.append({"store": store, "kind": kind, "path": str(path), "access": access,
+                      "owner": _user_name(info.st_uid) if access == "owner" else None})
+    return found
+
+
+def rollback_journal_state(database: Path, lock_path: Path | None = None) -> dict:
+    """The rollback journal beside `database`: `state` (`none`, `live-pass`, `interrupted-pass`
+    or `inaccessible` to this user), `bytes`, and `hot` (read only without a live pass): SQLite
+    replays it, so read-only readers fail until a write-capable open."""
+    journal = Path(f"{database}-journal")
+
+    def observed() -> tuple[int, int, int, int] | None:
+        try:
+            info = journal.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+            return None
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+    def result(state: str, observation: tuple | None, hot: bool = False) -> dict:
+        return {"state": state, "bytes": observation[2] if observation else 0, "hot": hot}
+
+    before = observed()
+    if before is None:
+        return result("none", None)
+    # Every writer of corpus.db and the event store is an index pass holding this lock, so a
+    # journal without a live holder is a killed pass's. A live one's journal is never opened:
+    # on Windows that open could collide with the writer deleting it at commit.
+    if holder_live(lock_path):
+        return result("live-pass", before)
+    if not os.access(journal, os.R_OK | os.W_OK) and _sidecar_blocks(database, "-journal"):
+        return result("inaccessible", before)
+    hot = _first_byte_nonzero(journal)
+    # A pass that committed and released (or started) around these reads replaced the journal.
+    after = observed()
+    if after != before:
+        return result("none" if after is None else "live-pass", after)
+    return result("interrupted-pass", before, hot)
+
+
 def _unlink_if_unchanged(path: Path, expected: str | bytes) -> bool:
     """Tombstone and remove only the exact raw record observed by the caller."""
     if data_dir_readonly(path.parent):
@@ -222,6 +361,8 @@ class IndexLock:
         self.label = label
         self.timeout = timeout
         self._handle: ownerfile.Handle | None = None
+        # what the exit found in place of this process's record, if anything
+        self.displaced: str | None = None
 
     def __enter__(self) -> "IndexLock":
         if self._handle is not None:
@@ -238,18 +379,18 @@ class IndexLock:
         while True:
             pid = os.getpid()
             process_start = process_start_identity(pid) or "unknown"
+            token = secrets.token_hex(16)
             raw = render_record(
                 pid=pid,
                 start=process_start,
-                token=secrets.token_hex(16),
+                token=token,
                 label=self.label,
                 time_ms=time.time_ns() // 1_000_000,
             )
             try:
-                handle = ownerfile.create_exclusive(
-                    INDEX_LOCK_PATH, raw, mode=0o600, retain_fd=True,
+                self._handle = ownerfile.create_held(
+                    INDEX_LOCK_PATH, raw, token=token, mode=0o600, retain_fd=True,
                     exact_mode=True)
-                self._handle = handle
                 return self
             except FileExistsError:
                 try:
@@ -270,8 +411,13 @@ class IndexLock:
                             and actual_start is not None
                             and actual_start != owner.start
                         )
-                        if (not alive or reused) and ownerfile.remove_exact(
-                                INDEX_LOCK_PATH, observed):
+                        stranded = ownerfile.stranded_own_record(
+                            owner.pid, owner.start,
+                            _owner_field(_record_text(observed.raw) or "", "token"),
+                            process_start=process_start_identity)
+                        if ((not alive or reused or stranded)
+                                and ownerfile.remove_exact(
+                                    INDEX_LOCK_PATH, observed)):
                             continue
                     else:
                         age_ms = (time.time() - observed.mtime) * 1000
@@ -304,15 +450,43 @@ class IndexLock:
                     RETRY_MAX_MS / 1000,
                 )
 
+    def verify(self) -> None:
+        """The record at the path is still exactly this process's. Called before each
+        derived commit: a holder whose record was reaped or replaced excludes nobody."""
+        handle = self._handle
+        if handle is None:
+            raise OSError(f"index lock is not held: {INDEX_LOCK_PATH}")
+        try:
+            observed = ownerfile.snapshot(handle.path)
+        except FileNotFoundError as error:
+            raise OSError(
+                f"index lock disappeared while held: {handle.path}") from error
+        except OSError as error:
+            raise OSError(
+                f"could not verify index lock {handle.path}: {error}") from error
+        if (observed.identity[:3] != handle.snapshot.identity[:3]
+                or observed.raw != handle.snapshot.raw):
+            raise OSError(
+                f"index lock was displaced while held: {handle.path} "
+                f"now held by {_holder_description(observed)}")
+
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Remove this process's record. A record neither at the path nor in a tomb was
+        removed or replaced while this writer ran; every derived commit re-verified the
+        record first, so that is disclosed on stderr and kept in `displaced`, never raised,
+        and whatever now holds the slot is never touched. A record of ours that could not
+        be removed raises."""
         handle = self._handle
         self._handle = None
+        self.displaced = None
         if handle is not None:
             if data_dir_readonly(handle.path.parent):
                 handle.close()
+                ownerfile.forget_held(handle.token)
                 raise PermissionError(
                     "AGREP_DATA_READONLY protects this data directory")
-            if handle.release():
+            released = handle.release()
+            if released:
                 return
             candidates = [handle.path]
             prefix = f".{handle.path.name}.owner-reap-"
@@ -344,8 +518,18 @@ class IndexLock:
                         ) from error
                     raise OSError(
                         f"could not verify index lock release: {candidate}")
-                if (observed is not None
-                        and observed.identity == handle.snapshot.identity
+                if (observed.identity == handle.snapshot.identity
                         and observed.raw == handle.snapshot.raw):
                     raise OSError(
                         f"could not release owned index lock: {candidate}")
+            try:
+                observed = _snapshot(handle.path)
+            except OSError:
+                observed = None
+            self.displaced = (
+                f"index lock disappeared while held: {handle.path}"
+                if observed is None else
+                f"index lock was displaced while held: {handle.path} "
+                f"now held by {_holder_description(observed)}")
+            print(f"{self.displaced}; another writer may have run alongside "
+                  "this one: `agrep doctor`", file=sys.stderr, flush=True)

@@ -439,6 +439,17 @@ class SlowLaneHealsItself(unittest.TestCase):
                       err)
         self.assertIn("--who/--project/--since narrows it", err)
 
+    def test_a_newer_anchor_names_itself_on_the_slow_lane(self) -> None:
+        # [W16 round 2] an index this build cannot open under a newer
+        # agrep's anchor: the cause and remedy, not "held by another agrep"
+        import indexd_runtime
+        reason = indexd_runtime.newer_anchor_reason(2, 1)
+        err = self._run_unusable_db(
+            ["zz probe", "--classic", "--color", "never"],
+            kick=indexd_runtime.RepairKick(False, "newer-anchor", reason))
+        self.assertIn(f"{reason} - scanning sources this query", err)
+        self.assertNotIn("held by another agrep", err)
+
     def test_held_owner_lever_tail_omits_filters_already_in_use(self) -> None:
         import indexd_runtime
         err = self._run_unusable_db(

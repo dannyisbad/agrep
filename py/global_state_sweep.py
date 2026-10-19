@@ -83,8 +83,72 @@ def _python_source_inventory(repo: Path = REPO) -> set[str]:
             if os.path.lexists(repo / Path(path))}
 
 
+def _coordination_namespaces() -> set[str]:
+    """Namespaces present in the shared base for data dirs THIS process handed
+    out (the harness registry). Every such data dir a test process resolves a
+    worker path against mints one, and only the hourly reaper inside a serving
+    worker removes them. Other processes' namespaces are never attributed.
+    """
+    import _test_support
+    base = _test_support.coordination_base_path()
+    return {name for name in _test_support.registered_namespaces()
+            if os.path.lexists(base / name)}
+
+
+import contextlib
+import tempfile
+
+# Data dir names fixtures place directly under a temporary root and hand to
+# the public CLI, whose child process is the one that creates them.
+_FIXTURE_DATA_DIR_NAMES = ("data", "home", "d")
+
+
+@contextlib.contextmanager
+def _recording_fixture_trees():
+    """Register every temporary tree a module creates, while it exists.
+
+    TemporaryDirectory and mkdtemp both go through tempfile.mkdtemp; its
+    result is a fixture root whose first-level directories are where every
+    sandboxed data dir lives. Registered at creation, so a tree deleted before
+    the module ends still names the namespace it may have minted. Patched only
+    inside this harness process, never in product code.
+    """
+    import _test_support
+    real_mkdtemp = tempfile.mkdtemp
+    real_mkdir = os.mkdir
+    roots: set[str] = set()
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        roots.add(os.path.realpath(path))
+        _test_support.register_data_dir(path)
+        # Child processes create the data dir themselves under these
+        # conventional names; the parent never mkdirs them.
+        for child in _FIXTURE_DATA_DIR_NAMES:
+            _test_support.register_data_dir(os.path.join(path, child))
+        return path
+
+    def recording_mkdir(path, mode=0o777, *, dir_fd=None):
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        # A directory created directly under a fixture root is a data dir
+        # candidate (Path.mkdir(parents=True) also arrives here per level).
+        if dir_fd is None:
+            parent = os.path.realpath(os.path.dirname(os.fspath(path)))
+            if parent in roots:
+                _test_support.register_data_dir(path)
+
+    tempfile.mkdtemp = recording_mkdtemp
+    os.mkdir = recording_mkdir
+    try:
+        yield
+    finally:
+        os.mkdir = real_mkdir
+        tempfile.mkdtemp = real_mkdtemp
+
+
 def _snapshot() -> dict:
     return {
+        "namespaces": _coordination_namespaces(),
         "signals": {name: signal.getsignal(getattr(signal, name))
                     for name in _SIGNALS},
         "env": dict(os.environ),
@@ -132,6 +196,12 @@ def _leaks(before: dict, after: dict) -> list[str]:
         found.append(
             f"repo .py files added {sorted(after['tree'] - before['tree'])} "
             f"removed {sorted(before['tree'] - after['tree'])}")
+    minted = after["namespaces"] - before["namespaces"]
+    if minted:
+        import _test_support
+        found.append(
+            "semantic coordination namespace left in the shared base: "
+            + ", ".join(_test_support.describe_namespace(name) for name in sorted(minted)))
     return found
 
 
@@ -164,15 +234,19 @@ def main() -> int:
     # and the purity prepend belong to the harness, not the first importer -
     # measured from here, any later touch is a leak.
     import _test_support
-    _test_support.isolate_data_dir()
-    with open(os.devnull, "w", encoding="utf-8") as quiet:
+    sandbox_data = _test_support.isolate_data_dir()
+    with open(os.devnull, "w", encoding="utf-8") as quiet, _recording_fixture_trees():
         runner = unittest.TextTestRunner(stream=quiet, verbosity=0)
         state = _snapshot()
         first_atexit = state["atexit"]
         for name in modules:
             suite = loader.loadTestsFromName(name)
-            result = runner.run(suite)
+            with _test_support.registering_for(name):
+                result = runner.run(suite)
             found.extend(_result_failures(name, result))
+            # The shared sandbox's own namespace is the harness's; any other
+            # new one is a data dir the module created and did not clean up.
+            _test_support.remove_coordination_namespace(sandbox_data)
             after = _snapshot()
             found.extend(f"{name}: {line}" for line in _leaks(state, after))
             state = after

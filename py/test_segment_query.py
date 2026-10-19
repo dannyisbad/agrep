@@ -185,6 +185,70 @@ class SegmentQueryTests(unittest.TestCase):
                         "artifact changed after publication"):
                     segment_query.open_current(meta)
 
+    def test_metadata_only_change_is_rehashed_not_rebuilt(self) -> None:
+        # chmod/chown/touch/xattr leave dev, ino, size and bytes alone and only
+        # move mtime/ctime; that read as damage and discarded the whole store.
+        with _temporary_root() as root:
+            source, meta, manifest, _, _ = self._fixture(root)
+            segments = meta.parent / embedding_segments.SEGMENT_DIR
+            receipt = meta.with_name(".semantic-integrity-cache.json")
+            with mock.patch.object(
+                    common, "transcript_generation", return_value=source):
+                segment_query.open_current(meta)
+                segment_query.close_cache()
+                for path in segments.iterdir():
+                    wait_for_next_ctime_tick(path)
+                    mode = path.stat().st_mode
+                    path.chmod(0o600)
+                    path.chmod(mode)
+                    os.utime(path)
+                manifest_after, _, refs, coverage = segment_query.open_current(meta)
+                self.assertEqual(
+                    manifest_after["generation"], manifest["generation"])
+                self.assertEqual(coverage["indexed"], manifest["live_rows"])
+                self.assertEqual(refs.rows, manifest["next_row_ref"])
+                self.assertTrue(receipt.exists())
+                # The receipt now records the current identities: a later cold
+                # open must not hash the artifacts again.
+                segment_query.close_cache()
+                with mock.patch.object(
+                        segment_query, "_sha256_file",
+                        side_effect=AssertionError("unchanged artifacts were rehashed")):
+                    segment_query.open_current(meta)
+                # Same metadata-only identity, different bytes: still damage.
+                segment_query.close_cache()
+                descriptor = manifest["segments"][-1]["artifacts"]["f16"]
+                active = embedding_segments.artifact_path(manifest, descriptor)
+                wait_for_next_ctime_tick(active)
+                payload = active.read_bytes()
+                midpoint = len(payload) // 2
+                active.write_bytes(payload[midpoint:] + payload[:midpoint])
+                with self.assertRaisesRegex(
+                        segment_query.SegmentIntegrityError,
+                        "artifact changed after publication"):
+                    segment_query.open_current(meta)
+
+    def test_explicit_search_refusal_names_the_cause_not_the_command(self) -> None:
+        # The reader of this line has just run `agrep -s`; telling them to run
+        # `agrep -s` is not a remedy. The cause is.
+        with _temporary_root() as root:
+            source, meta, _, _, _ = self._fixture(root)
+            with mock.patch.object(
+                    common, "transcript_generation", return_value=source), \
+                    mock.patch.object(common, "EMBEDDINGS_PATH",
+                                      root / "embeddings.f32"), \
+                    mock.patch.object(
+                        segment_query, "open_current",
+                        side_effect=segment_query.SegmentIntegrityError(
+                            "active semantic artifact changed after "
+                            f"publication: {root / 'seg.f16'}")), \
+                    self.assertRaises(RuntimeError) as caught:
+                ask._require_current_message_index()
+        message = str(caught.exception)
+        self.assertIn("not a validated current generation", message)
+        self.assertIn("changed after publication", message)
+        self.assertNotIn("agrep -s", message)
+
     def test_publisher_proof_keeps_cold_open_bounded(self) -> None:
         with _temporary_root() as root:
             source, meta, _, _, _ = self._fixture(root)

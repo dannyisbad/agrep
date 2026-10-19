@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -45,6 +46,23 @@ def _fixture_raw(case: dict) -> bytes:
         byte = base64.b64decode(repeat["base64_byte"], validate=True)
         return byte * int(repeat["count"])
     return base64.b64decode(case["base64"], validate=True)
+
+
+def _strand_own_record(
+        case: unittest.TestCase, label: str, path: Path) -> ownerfile.Snapshot:
+    """Hold, then exit while a remover keeps the directory mutex (minted by an earlier reap)
+    busy past every attempt: the record stays with this process's live pid, start and token."""
+    (path.parent / ownerfile.SLOT_MUTEX_NAME).touch()
+    lock = index_lock.IndexLock(label, timeout=1)
+    lock.__enter__()
+    stranded = lock._handle.snapshot
+    with mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.02), \
+            mock.patch.object(ownerfile, "_lock_descriptor", return_value="busy"):
+        with case.assertRaisesRegex(OSError, "could not release owned index lock"):
+            lock.__exit__(None, None, None)
+    case.assertEqual(ownerfile.snapshot(path), stranded)
+    case.assertIsNone(lock._handle)
+    return stranded
 
 
 class IndexLockFixtureTests(unittest.TestCase):
@@ -334,7 +352,7 @@ class IndexLockFixtureTests(unittest.TestCase):
             corpusdb._ConnectIndexLock(True)
             lock_type.assert_called_once_with(f"corpusdb:{writer}", timeout=0)
 
-    def test_release_preserves_replacement_and_cleans_transient_failures(self) -> None:
+    def test_release_reports_a_replacement_and_retries_transient_failures(self) -> None:
         lock = index_lock.IndexLock("replace", timeout=1)
         lock.__enter__()
         replacement = b"pid=999999 start=unknown future=value\n"
@@ -345,25 +363,92 @@ class IndexLockFixtureTests(unittest.TestCase):
             path.write_bytes(replacement)
             return real_remove(path, expected, **kwargs)
 
+        stderr = io.StringIO()
         with mock.patch.object(
-                ownerfile, "remove_exact", side_effect=replace_then_remove):
+                ownerfile, "remove_exact", side_effect=replace_then_remove), \
+                contextlib.redirect_stderr(stderr):
             lock.__exit__(None, None, None)
+        self.assertIn("displaced while held", lock.displaced)
+        self.assertIn("pid=999999", lock.displaced)
+        self.assertIn("another writer may have run alongside this one", stderr.getvalue())
         self.assertEqual(self.path.read_bytes(), replacement)
         self.path.unlink()
-        real_replace = ownerfile.os.replace
+        real_unlink = Path.unlink
         attempts = 0
 
-        def transient(source, target):
+        def transient(target, *args, **kwargs):
             nonlocal attempts
-            attempts += 1
-            if attempts < 3:
-                raise PermissionError("transient sharing failure")
-            return real_replace(source, target)
+            if ".owner-reap-" in target.name:
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("transient sharing failure")
+            return real_unlink(target, *args, **kwargs)
 
-        with mock.patch.object(ownerfile.os, "replace", transient):
+        with mock.patch.object(Path, "unlink", new=transient):
             with index_lock.IndexLock("retry", timeout=1):
                 pass
         self.assertGreaterEqual(attempts, 3)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(any(
+            ".owner-reap-" in entry.name
+            for entry in Path(self.tmp.name).iterdir()))
+
+    def test_a_process_reclaims_its_own_stranded_record_on_the_next_acquire(self) -> None:
+        stranded = _strand_own_record(self, "stranded", self.path)
+        started = time.monotonic()
+        with index_lock.IndexLock("again", timeout=1) as again:
+            self.assertLess(time.monotonic() - started, 0.5)
+            current = again._handle.snapshot
+            self.assertNotEqual(current.raw, stranded.raw)
+            self.assertIn(b"label=again", current.raw)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(any(
+            ".owner-reap-" in entry.name
+            for entry in Path(self.tmp.name).iterdir()))
+
+    def test_a_record_a_live_handle_holds_is_never_reclaimed_by_its_own_process(self) -> None:
+        with index_lock.IndexLock("holder", timeout=1) as holder:
+            held = holder._handle.snapshot
+            with self.assertRaises(TimeoutError):
+                index_lock.IndexLock("twin", timeout=0.2).__enter__()
+            self.assertEqual(ownerfile.snapshot(self.path), held)
+        self.assertFalse(self.path.exists())
+
+    def test_a_sibling_thread_never_reaps_a_record_created_but_not_yet_returned(self) -> None:
+        created = threading.Event()
+        sibling_done = threading.Event()
+        real_create = ownerfile.create_exclusive
+        outcome: dict[str, object] = {}
+
+        def paused_create(path, raw, **kwargs):
+            handle = real_create(path, raw, **kwargs)
+            if threading.current_thread() is first:
+                # the record is complete on disk; the sibling runs before this create returns
+                created.set()
+                sibling_done.wait(5)
+            return handle
+
+        def hold_first() -> None:
+            try:
+                with index_lock.IndexLock("first", timeout=1) as lock:
+                    outcome["first"] = lock._handle.snapshot
+                    lock.verify()
+            except OSError as error:
+                outcome["first_error"] = error
+
+        first = threading.Thread(target=hold_first)
+        with mock.patch.object(ownerfile, "create_exclusive", side_effect=paused_create):
+            first.start()
+            self.assertTrue(created.wait(5))
+            try:
+                with self.assertRaises(TimeoutError):
+                    index_lock.IndexLock("sibling", timeout=0.3).__enter__()
+                outcome["on_disk"] = ownerfile.snapshot(self.path)
+            finally:
+                sibling_done.set()
+            first.join(5)
+        self.assertNotIn("first_error", outcome)
+        self.assertEqual(outcome["on_disk"], outcome["first"])
         self.assertFalse(self.path.exists())
         self.assertFalse(any(
             ".owner-reap-" in entry.name
@@ -376,6 +461,7 @@ class IndexLockFixtureTests(unittest.TestCase):
         real_restore = ownerfile._restore_tomb
 
         with (
+            mock.patch.object(ownerfile, "_lock_descriptor", return_value="unsupported"),
             mock.patch.object(ownerfile, "_retry_unlink", return_value=False),
             mock.patch.object(ownerfile, "_restore_tomb", return_value=None),
         ):
@@ -749,15 +835,55 @@ class IndexLockCrossLanguageTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), malformed)
                     path.unlink()
 
-    def test_rust_release_preserves_a_replacement_entry(self) -> None:
+    def test_rust_release_reports_a_replacement_entry_as_displacement(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agrep rust replace Δ ") as raw:
             path = Path(raw) / ".index.lock"
             process = self._start_rust_holder(path, label="replace-rust")
             replacement = b"pid=999999 start=unknown future=value\n"
             path.unlink()
             path.write_bytes(replacement)
-            self._finish_rust_holder(process)
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=5), 0)
+            stderr = process.stderr.read().decode("utf-8", "replace")
+            process.stdout.close()
+            process.stderr.close()
+            self.assertIn("was displaced while held", stderr)
+            self.assertIn("another writer may have run alongside this one", stderr)
+            self.assertIn("pid=999999", stderr)
             self.assertEqual(path.read_bytes(), replacement)
+
+    def test_a_stranded_python_record_clears_for_a_waiting_rust_writer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep stranded Δ ") as raw:
+            path = Path(raw) / ".index.lock"
+            saved = index_lock.INDEX_LOCK_PATH
+            index_lock.INDEX_LOCK_PATH = path
+            try:
+                _strand_own_record(self, "stranded", path)
+                self.assertIn(f"pid={os.getpid()} ".encode("ascii"), path.read_bytes())
+                waiter = subprocess.Popen(
+                    [
+                        str(RUST_BIN), "index-lock-contract", "hold",
+                        "--path", str(path), "--label", "rust-waiter",
+                        "--timeout-ms", "5000",
+                    ],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                # the Rust writer sees a live holder; only the stranding process may reclaim
+                time.sleep(0.3)
+                self.assertIsNone(waiter.poll())
+                self.assertIn(f"pid={os.getpid()} ".encode("ascii"), path.read_bytes())
+                try:
+                    with index_lock.IndexLock("again", timeout=1):
+                        pass
+                except TimeoutError:
+                    pass  # the Rust writer took the slot the moment it cleared
+                ready = json.loads(waiter.stdout.readline())
+                self.assertEqual(ready, {"ready": True, "pid": waiter.pid})
+                self._finish_rust_holder(waiter)
+                self.assertFalse(path.exists())
+            finally:
+                index_lock.INDEX_LOCK_PATH = saved
 
 
 if __name__ == "__main__":

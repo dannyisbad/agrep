@@ -265,6 +265,58 @@ class DriftIsTheFreshnessVerdict(unittest.TestCase):
         self.assertEqual(failure.code, "census-unavailable")
         self.assertIn("history may be stale", notice)
 
+    def test_unverifiable_census_is_unchecked_on_every_machine_surface(
+            self) -> None:
+        # status/search/recall/summary/around build freshness here and doctor
+        # reads the same dict: one observation must not be "degraded,
+        # failing" on one surface and "unchecked" on another.
+        import doctor
+
+        for code in ("census-unavailable", "diagnostic-budget-exceeded"):
+            with self.subTest(code=code):
+                report = indexd_runtime.DriftReport(
+                    "unknown", code=code,
+                    detail="the live store census exceeded its diagnostic "
+                           "time budget")
+                with tempfile.TemporaryDirectory() as raw, \
+                        _publication(Path(raw), None):
+                    failure = indexd_runtime.indexing_failure(
+                        drift_report=report)
+                    self.assertEqual(failure.code, code)
+                    for checked in (True, False, None):
+                        machine = indexd_runtime.machine_freshness(
+                            checked=checked, failure=failure,
+                            drift_report=report)
+                        self.assertEqual(machine["state"], "unchecked")
+                        self.assertFalse(machine["failing"])
+                        self.assertTrue(machine["may_be_stale"])
+                        self.assertFalse(machine["checked"])
+                        self.assertEqual(machine["code"], code)
+                        self.assertIn("diagnostic time budget", machine["reason"])
+                        via_doctor = doctor._machine_freshness_fields(
+                            machine, {"state": "ready"})["freshness"]
+                        self.assertEqual(via_doctor, machine)
+                    story = indexd_runtime.freshness_story()
+                # freshness_story re-observes drift itself; the census path
+                # names its own code, doctor's budget code renders the same way
+                self.assertEqual(story.state, "unverified")
+                self.assertEqual(story.code, "census-unavailable")
+                for human in (story, surface.FreshnessStory(
+                        "unverified", code=code, detail=report.detail)):
+                    line = surface.freshness_story_line(human)
+                    self.assertIn("history may be stale", line)
+                    self.assertNotIn("failed", line)
+                self.assertEqual(
+                    surface.indexing_advice_line(failure, "agrep"), "")
+
+    def test_a_recorded_failure_stays_degraded_on_the_shared_source(self) -> None:
+        failure = surface.FreshnessFailure(
+            "consecutive-failures", "ingest exited 101", 3)
+        disclosure = surface.freshness_disclosure(failure)
+        self.assertEqual(disclosure["state"], "degraded")
+        self.assertTrue(disclosure["failing"])
+        self.assertEqual(disclosure["consecutive_failures"], 3)
+
 
 class DriftGraceWindow(unittest.TestCase):
     """The blocker's tolerance: drift younger than the daemon's debounce
@@ -1296,10 +1348,19 @@ class AbsorbedDriftObservation(unittest.TestCase):
         self.assertEqual(surface.grep_absence_exit(exact=True, freshness=story), 1)
 
 
-def _parse_cache_base(sources: int) -> bytes:
-    """A minimal v4 parse-cache base whose payload prelude claims `sources`."""
+def _parse_cache_base(sources: int, *, released_record: bool = False) -> bytes:
+    """A minimal v4 parse-cache base whose payload prelude claims `sources`.
+
+    With `released_record`, the map's first entry is the writer's released-row
+    record (its key under the reserved prefix), as the writer serializes it,
+    and the prelude counts it among the entries.
+    """
+    entries = sources + (1 if released_record else 0)
+    first_key = b"\0released\0" + b"ab" * 16
+    body = (len(first_key).to_bytes(8, "little") + first_key
+            if released_record else b"")
     payload = ((22).to_bytes(4, "little")
-               + sources.to_bytes(8, "little") + b"\0" * sources)
+               + entries.to_bytes(8, "little") + body + b"\0" * sources)
     header = bytearray(100)
     header[0:4] = (22).to_bytes(4, "little")
     header[12:20] = b"AGRPCB01"
@@ -1352,6 +1413,11 @@ class CensusContradictionSignals(unittest.TestCase):
             cache = Path(raw) / ".ingest_cache.bin"
             cache.write_bytes(_parse_cache_base(853))
             self.assertEqual(surface.parse_cache_source_count(cache), 853)
+            # the one released-row record a base may hold is not a source
+            cache.write_bytes(_parse_cache_base(853, released_record=True))
+            self.assertEqual(surface.parse_cache_source_count(cache), 853)
+            cache.write_bytes(_parse_cache_base(0, released_record=True))
+            self.assertEqual(surface.parse_cache_source_count(cache), 0)
             # a torn tail declines instead of guessing
             cache.write_bytes(_parse_cache_base(853)[:-1])
             self.assertIsNone(surface.parse_cache_source_count(cache))

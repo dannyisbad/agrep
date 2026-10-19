@@ -158,8 +158,8 @@ class CompressedResumeTests(_Sandbox):
 
 @unittest.skipUnless(os.name == "posix", "the sandbox relies on POSIX paths")
 class RecordedFlowsTests(_Sandbox):
-    """Compression, masking, truncation, /chat resume, aborts, failures, /rewind, resume and
-    IDE mode, recorded with and without getHistory()'s coalescing."""
+    """Compression, masking, truncation, /chat resume, aborts, failures, /rewind, resume, IDE
+    mode and subagents, recorded with and without getHistory()'s coalescing."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -167,20 +167,56 @@ class RecordedFlowsTests(_Sandbox):
         shutil.copytree(FLOWS / "home" / ".gemini", cls.home / ".gemini")
         cls._index()
 
+    def _chats(self, *extra: str) -> dict[str, dict]:
+        result = self._run(ROOT / "cli.py", "chats", "--agent", "gemini", "--json", "-n", "0",
+                           *extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return {row["session"]: row for row in map(json.loads, result.stdout.splitlines())
+                if row.get("kind") != "agrep-meta"}
+
     def test_each_chat_has_the_turns_its_person_had(self) -> None:
         expected = json.loads((FLOWS / "expected.json").read_text(encoding="utf-8"))
-        result = self._run(ROOT / "cli.py", "chats", "--agent", "gemini", "--json",
-                           "-n", str(len(expected)))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        chats = {row["session"]: row for row in map(json.loads, result.stdout.splitlines())
-                 if row.get("kind") != "agrep-meta"}
+        chats = self._chats()
+        with_side = self._chats("--side")
         for session, case in expected.items():
             with self.subTest(flow=case["flow"]):
                 if not case["rows"]:
-                    self.assertNotIn(session, chats)
+                    self.assertNotIn(session, with_side)
                     continue
-                self.assertEqual(chats[session]["turns"], len(case["rows"]))
-                self.assertEqual(chats[session]["first_text"], case["rows"][0][1])
+                # a subagent's chat is a side chat: listed on request, never by default
+                self.assertEqual(session in chats, "parent" not in case)
+                self.assertEqual(with_side[session]["side"], "parent" in case)
+                self.assertEqual(with_side[session]["turns"], len(case["rows"]))
+                self.assertEqual(with_side[session]["first_text"],
+                                 " ".join(case["rows"][0][1].split()))
+
+    def test_subagent_chats_are_side_chats_of_their_parent(self) -> None:
+        expected = json.loads((FLOWS / "expected.json").read_text(encoding="utf-8"))
+        children = {session: case for session, case in expected.items() if "parent" in case}
+        self.assertEqual(len(children), 12)
+        sessions = {row["session"]: row for row in map(json.loads, (
+            Path(self.env["AGREP_DATA_DIR"]) / "sessions.jsonl").read_text(
+                encoding="utf-8").splitlines())}
+        for session, case in children.items():
+            with self.subTest(flow=case["flow"]):
+                self.assertEqual(sessions[session]["parent"], case["parent"])
+                self.assertEqual(sessions[case["parent"]].get("parent"), None)
+        # the subagent's own words are side-chat content: found by search, hidden by --no-side
+        self.assertEqual(self._count("deep investigation"), len(children))
+        result = self._run(ROOT / "cli.py", "-c", "deep investigation", "--agent", "gemini",
+                           "--no-side", "--no-auto")
+        self.assertEqual(int(result.stdout.strip()), 0, result.stderr)
+        # summary folds the subagents into their families: every one counted as a side chat,
+        # none left pending, since each result reached its parent (exit 1 = proven none)
+        result = self._run(ROOT / "py" / "summary.py", "pending", "--since", "2026-08-01",
+                           "--until", "2026-12-31", "--agent", "gemini", "--json")
+        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line]
+        self.assertEqual(lines[0]["side_chats"], len(children), result.stdout)
+        self.assertNotIn(next(iter(children.values()))["parent"],
+                         {item.get("session") for item in lines[1:]})
+        result = self._run(ROOT / "cli.py", "audit", "--agent", "gemini", "--strict")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_editor_context_is_no_prompt_and_audit_accounts_for_it(self) -> None:
         # IDE mode sends the editor context as a user turn of its own; nobody typed it

@@ -23,8 +23,20 @@ Checks, per file:
   freshness   the tally's fingerprint still matches the file on disk
   coverage    every discovered file has a tally at all
 
-Exit codes: 0 clean · 1 warning-only coverage/drift · 2 accounting or
-evidence error. ``--strict`` promotes warnings to errors.
+Agents keep writing while the audit runs. Evidence that MOVED during the audit
+(a source appended to between observations, the book or corpus.db republished
+by an index run, a store with an open write transaction) is re-observed after
+a short settle (--full only; a routine run's next pass is its retry) and, if
+it keeps moving, reported as live: uncertified, never an accounting error. A
+source written after the last published book is also live: it is
+not-yet-indexed work. Evidence that held still and disagrees (census mismatch,
+broken identity, unreadable or corrupt evidence) is an error. A full audit with
+no errors and no coverage gaps prunes tallies of vanished sources that the last
+index pass's published source inventory no longer lists, under the index lock.
+
+Exit codes: 0 clean · 1 warning (coverage gaps, live evidence, routine
+deferral) · 2 accounting or evidence error. ``--strict`` promotes coverage
+gaps and live evidence to errors.
 """
 
 from __future__ import annotations
@@ -34,8 +46,10 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat as statmod
+import struct
 import subprocess
 import sys
 import tempfile
@@ -43,10 +57,13 @@ import time
 from pathlib import Path
 
 import common
+import derived_anchor
 import events
 import fileops
 from hookless import registry
+import index_lock
 import ownerfile
+import source_health
 import surface_policy as surface
 
 BOOK_PATH = common.DATA_DIR / "intake_stats.json"
@@ -70,6 +87,19 @@ _SQLITE_PROGRESS_OPS = 1_000
 _CENSUS_CHUNK_BYTES = 64 * 1024
 _PROBLEM_SAMPLE_LIMIT = 40
 _GAP_SAMPLE_LIMIT = 40
+_LIVE_SAMPLE_LIMIT = 40
+_LIVE_SETTLE_ROUNDS = 2
+_LIVE_SETTLE_S = 1.0
+_PRUNE_LOCK_TIMEOUT_S = 5.0
+_SOURCE_SNAPSHOT_NAME = ".source_snapshot.bin"
+# crates/agrep-core/src/ingest/registry.rs SOURCE_SNAPSHOT_VERSION; the layout read below is
+# the versioned contract (test_audit_live_evidence pins the two constants to each other).
+_SOURCE_SNAPSHOT_VERSION = 11
+_SOURCE_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
+_INGEST_PENDING_NAME = ".ingest_pending.bin"
+_SOURCE_ABSENCE_NAME = ".source_absence_pending"
+_ZERO_RUN = re.compile(b"\x00{6,}")
+_INVENTORY_CANARIES = 64
 _DETAIL_MAX_CHARS = 2_048
 _INDEXED_DEADLINE_OVERRIDE: float | None = None
 _NO_CENSUS_PROBLEM = (
@@ -89,6 +119,26 @@ class AuditRoutineBudget(AuditEvidenceError):
 
 class AuditSnapshotDeferred(AuditRoutineBudget):
     """One routine external snapshot hit its local cap; other joins may proceed."""
+
+
+class AuditEvidenceMoved(AuditEvidenceError):
+    """Evidence changed or was busy while observed: retry, then report live."""
+
+    def __init__(self, message: str, what: str = ""):
+        super().__init__(message)
+        self.what = what or message
+
+
+class AuditEvidenceInterrupted(AuditEvidenceError):
+    """A killed index pass left evidence that only the next pass can make readable again."""
+
+
+class AuditEvidenceBlocked(AuditEvidenceError):
+    """A store file this user cannot read and write keeps evidence uncertifiable until fixed."""
+
+
+class _SourceMoved(OSError):
+    """A plain source changed identity between two reads of one observation."""
 
 
 class _DetailLog:
@@ -412,16 +462,17 @@ def _plain_binary(path: str | os.PathLike):
         opened_identity = fileops.file_identity_fd(fd)
         reparse = getattr(statmod, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
         if (not statmod.S_ISREG(opened.st_mode)
-                or bool(getattr(opened, "st_file_attributes", 0) & reparse)
-                or entry != opened_identity):
-            raise OSError(f"source changed before reading: {value}")
+                or bool(getattr(opened, "st_file_attributes", 0) & reparse)):
+            raise OSError(f"source is not a plain regular file: {value}")
+        if entry != opened_identity:
+            raise _SourceMoved(f"source changed before reading: {value}")
         stream = os.fdopen(fd, "rb")
         fd = -1
         yield stream
         after = fileops.file_identity_fd(stream.fileno())
         if (opened_identity != after
                 or fileops.file_identity(Path(value)) != after):
-            raise OSError(f"source changed while reading: {value}")
+            raise _SourceMoved(f"source changed while reading: {value}")
     finally:
         if stream is not None:
             stream.close()
@@ -564,6 +615,52 @@ def _live_tokens(
         raise AuditEvidenceError(f"token census evidence is invalid: {error}") from error
 
 
+def _interrupted_index() -> str:
+    """The pass that rolls an interrupted journal back: a store sidecar no pass can use first
+    (its fix defers to a newer agrep itself), then this build's index, or in a data dir a newer
+    agrep owns, where this build declines it, that agrep's."""
+    blocked = source_health.sidecar_block_remedy()
+    if blocked:
+        return blocked
+    if derived_anchor.newer_anchor() is not None:
+        return surface.render_remedy("newer-owner-index")
+    return f"run `{source_health.cli_command('index')}`"
+
+
+def _degraded_detail(issue_rows: list[tuple[str, str, str, str]]) -> str:
+    """Each issue as doctor and status name it, the chats a disclosed read failure names
+    included, then the remedy they give for it."""
+    health = [issue for issue in source_health.source_health_issues() if isinstance(issue, dict)]
+    details, issues = [], []
+    for row, (agent, path, kind, reason) in enumerate(issue_rows):
+        # Any record of this source holding publication back makes retrying no remedy.
+        held = any(issue.get("blocks_publication") is True for issue in health
+                   if (issue.get("agent"), issue.get("path")) == (agent, path))
+        manual = any(issue.get("rebuild") is False for issue in health
+                     if (issue.get("agent"), issue.get("path")) == (agent, path))
+        # Past the rows named, a held source still gives the hold's clause: it is the remedy.
+        if row >= 3 and not held:
+            continue
+        issues.append({"agent": agent, "kind": kind, "blocks_publication": held,
+                       **({"rebuild": False} if manual else {})})
+        if row >= 3:
+            continue
+        sessions = [str(issue["session"]) for issue in health
+                    if (issue.get("agent"), issue.get("path"), issue.get("kind"),
+                        issue.get("reason")) == (agent, path, kind, reason)
+                    and isinstance(issue.get("session"), str) and issue["session"]]
+        chats = (f" conversation{'s' if len(sessions) > 1 else ''} "
+                 + ", ".join(common.terminal_safe(session) for session in sessions)
+                 if sessions else "")
+        details.append(f"{agent}{chats} at {path}: {kind}: {reason}")
+    detail = "; ".join(details)
+    if len(issue_rows) > 3:
+        detail += f"; and {len(issue_rows) - 3} more"
+    remedy = source_health.issue_remedies(
+        issues, newer_owner=derived_anchor.newer_anchor() is not None)
+    return f"{detail} - {remedy}"
+
+
 def _parse_store_audit_payload(raw: str, *, selection: str = "all") -> dict:
     try:
         payload = json.loads(
@@ -652,13 +749,8 @@ def _parse_store_audit_payload(raw: str, *, selection: str = "all") -> dict:
             raise ValueError("complete snapshot carries named issues")
         if not payload["complete"]:
             if issue_rows:
-                detail = "; ".join(
-                    f"{agent}: {path}: {kind}: {reason}"
-                    for agent, path, kind, reason in issue_rows[:3])
-                if len(issue_rows) > 3:
-                    detail += f"; and {len(issue_rows) - 3} more"
                 raise AuditEvidenceError(
-                    f"store audit snapshot is degraded: {detail}")
+                    f"store audit snapshot is degraded: {_degraded_detail(issue_rows)}")
             raise AuditEvidenceError(
                 "store audit snapshot is incomplete without a named issue")
         return {
@@ -744,6 +836,9 @@ def _book(*, deadline: float | None = None) -> dict:
         return {}
     except AuditRoutineBudget:
         raise
+    except ownerfile.OwnershipLost as error:
+        raise AuditEvidenceMoved(
+            f"evidence book {BOOK_PATH} was replaced while reading") from error
     except (OSError, UnicodeError) as error:
         raise AuditEvidenceError(
             f"cannot read evidence book {BOOK_PATH}: {error}") from error
@@ -770,6 +865,12 @@ def _stat_evidence(
                 fileops.file_identity_fd(stream.fileno()))
         key = f"s:{int(info.st_mtime_ns // 1_000_000)}:{info.st_size}"
         return key, identity
+    except FileNotFoundError as error:
+        raise AuditEvidenceMoved(
+            f"source vanished: {path}", "source removed during the audit") from error
+    except _SourceMoved as error:
+        raise AuditEvidenceMoved(
+            str(error), "source written while it was observed") from error
     except OSError as error:
         raise AuditEvidenceError(f"cannot stat source {path}: {error}") from error
 
@@ -801,6 +902,12 @@ def _census_jsonl(path: str, *, deadline: float | None = None) -> int:
                 line_has_content = line_has_content or bool(parts[-1].strip())
     except AuditRoutineBudget:
         raise
+    except FileNotFoundError as error:
+        raise AuditEvidenceMoved(
+            f"source vanished: {path}", "source removed during the audit") from error
+    except _SourceMoved as error:
+        raise AuditEvidenceMoved(
+            str(error), "source written while it was counted") from error
     except OSError as error:
         raise AuditEvidenceError(f"cannot census source {path}: {error}") from error
 
@@ -826,16 +933,25 @@ def _optional_plain_identity(
         return None
 
 
+def _member_identity(member: Path, suffix: str, *, change_sensitive: bool) -> tuple:
+    probe = fileops.change_sensitive_file_identity if change_sensitive else fileops.file_identity
+    try:
+        return _entry_identity(probe(member))
+    except PermissionError:
+        if not suffix:
+            raise
+        # a sidecar this user cannot open: its metadata still brackets the audit, and the
+        # blocked-sidecar gap names it with its fix
+        return _entry_identity(member.lstat())
+
+
 def _sqlite_family_identity(path: Path) -> tuple:
     """Strong, cheap identity for final-boundary comparison without a requery."""
     family = []
     for suffix in ("", "-wal", "-shm", "-journal"):
         member = Path(f"{path}{suffix}")
         try:
-            family.append((
-                suffix,
-                _entry_identity(fileops.change_sensitive_file_identity(member)),
-            ))
+            family.append((suffix, _member_identity(member, suffix, change_sensitive=True)))
         except FileNotFoundError:
             if not suffix:
                 return ()
@@ -851,7 +967,7 @@ def _sqlite_family_sizes(path: Path) -> dict[str, int]:
     for suffix in ("", "-wal", "-shm", "-journal"):
         member = Path(f"{path}{suffix}")
         try:
-            sizes[suffix] = fileops.file_identity(member)[2]
+            sizes[suffix] = _member_identity(member, suffix, change_sensitive=False)[2]
         except FileNotFoundError:
             if not suffix:
                 return {}
@@ -859,6 +975,13 @@ def _sqlite_family_sizes(path: Path) -> dict[str, int]:
             raise AuditEvidenceError(
                 f"cannot stat indexed-row evidence {member}: {error}") from error
     return sizes
+
+
+def _blocked_sidecar_gap(path: Path, sidecar: dict | None) -> str:
+    cause = (source_health.inaccessible_sidecar_line(sidecar) if sidecar
+             else "its rollback journal is not readable and writable by you")
+    return (f"indexed-row evidence {path} cannot be certified: {cause}; "
+            "no clean result was certified")
 
 
 def _indexed_cache_record(identity: tuple, agents: set[str]) -> dict:
@@ -908,6 +1031,7 @@ def _indexed_agents(*, deadline: float | None = None) -> set[str]:
             f"cannot stat indexed-row evidence {path}: {detail}")
     db = None
     progress_installed = False
+    family_before: tuple | None = None
     try:
         _deadline_check(deadline, "indexed-row snapshot")
         if deadline is not None:
@@ -933,6 +1057,8 @@ def _indexed_agents(*, deadline: float | None = None) -> set[str]:
             timeout_s = min(0.25, max(0.0, remaining))
         else:
             timeout_s = 0.25
+        # Captured after the size tiers: a Windows change proof may hash the file.
+        family_before = _sqlite_family_identity(path)
         db = events.open_sqlite_snapshot(path, timeout_s)
         _deadline_check(deadline, "indexed-row snapshot")
         set_progress = getattr(db, "set_progress_handler", None)
@@ -957,6 +1083,23 @@ def _indexed_agents(*, deadline: float | None = None) -> set[str]:
                 "routine audit incomplete: indexed-row DISTINCT census "
                 "exceeded the shared observation budget; "
                 "run agrep audit --full") from error
+        verdict = _indexed_evidence_verdict(path, family_before, error)
+        if isinstance(verdict, dict) and verdict["state"] == "inaccessible":
+            sidecars = index_lock.inaccessible_sidecars(path, "search index")
+            raise AuditEvidenceBlocked(
+                _blocked_sidecar_gap(path, sidecars[0] if sidecars else None)) from error
+        if isinstance(verdict, dict):
+            # Searches read a private copy whether the journal is hot or inert; only audit's own
+            # writer-free snapshot refuses it.
+            raise AuditEvidenceInterrupted(
+                f"indexed-row evidence {path} awaits the next index pass: "
+                f"{surface.SEARCH_INDEX_INTERRUPTED} "
+                f"({surface.journal_size(verdict['bytes'])} rollback journal), and audit "
+                f"cannot certify past it; {_interrupted_index()}; "
+                "no clean result was certified") from error
+        if verdict:
+            raise AuditEvidenceMoved(
+                f"indexed-row evidence {path} is being written: {error}") from error
         raise AuditEvidenceError(
             f"cannot inspect indexed-row evidence {path}: {error}") from error
     finally:
@@ -967,6 +1110,26 @@ def _indexed_agents(*, deadline: float | None = None) -> set[str]:
                 except sqlite3.Error:
                     pass
             db.close()
+
+
+def _indexed_evidence_verdict(
+        path: Path, family_before: tuple | None, error: Exception) -> bool | dict:
+    """True for movement (a republished family, an open write transaction or a lock); a killed
+    pass's journal, as `index_lock.rollback_journal_state` observes it; False for damage."""
+    try:
+        family_after = _sqlite_family_identity(path)
+    except AuditEvidenceError:
+        return False
+    if family_before is not None and family_after != family_before:
+        return True
+    journal = dict(family_after).get("-journal")
+    if journal is not None and journal[2] > 0:
+        observed = index_lock.rollback_journal_state(path, common.INDEX_LOCK_PATH)
+        return observed if observed["state"] in ("interrupted-pass", "inaccessible") else True
+    if isinstance(error, sqlite3.OperationalError):
+        detail = str(error).lower()
+        return "locked" in detail or "busy" in detail
+    return False
 
 
 def _merge_entries(
@@ -1040,69 +1203,371 @@ def _store_snapshot_timeout(
     return min(_ROUTINE_STORE_TIMEOUT_S, remaining)
 
 
-def main(argv: list[str] | None = None) -> int:
-    common.utf8_stdio()
-    ap = surface.ArgumentParser(
-        prog="agrep audit",
-        description="hold the ingest to its accounting: nothing seen goes missing",
-        allow_abbrev=False,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  agrep audit                 bounded cached accounting check\n"
-            "  agrep audit --agent codex   check one source adapter\n"
-            "  agrep audit --full          recount every eligible source file\n"
-            "\nexit: 0 clean, 1 evidence warning, 2 accounting error or invalid input."
-        ))
-    ap.add_argument("--agent", action="append", help="audit only this agent")
-    ap.add_argument("--json", action="store_true", help="machine output")
-    ap.add_argument("--strict", action="store_true",
-                    help="promote coverage/drift warnings to errors (exit 2)")
-    ap.add_argument(
-        "--full", action="store_true",
-        help="trustless raw-file recount (prints an estimate and ignores cache)")
-    args = ap.parse_args(argv)
-    if args.agent and len(args.agent) > 1:
-        ap.error("--agent may be supplied only once")
-    args.agent = args.agent[0] if args.agent else None
-    # `--agent ""` would audit every agent and report it as one agent's audit
-    blank_filter = surface.filter_value_error(args)
-    if blank_filter:
-        ap.error(blank_filter)
-    if args.agent:
-        selected = registry.normalize_agent_name(args.agent)
-        if selected not in registry.ADAPTER_NAMES:
-            ap.error("--agent must name one of: "
-                     + ", ".join(registry.ADAPTER_NAMES))
-        args.agent = selected
-    if args.full:
-        print(
-            "full audit: trustless recount; discovering sources and evidence "
-            "for the estimate",
-            file=sys.stderr, flush=True)
+def _written_after_book(
+        source_stat_key: str | None,
+        book_identity: tuple[int, int, int, int, int] | None) -> bool:
+    """A source newer than the last published book is unindexed work, not drift."""
+    if book_identity is None or not source_stat_key:
+        return False
+    try:
+        mtime_ms = int(source_stat_key.split(":")[1])
+    except (IndexError, ValueError):
+        return False
+    return mtime_ms > int(book_identity[3]) // 1_000_000
 
+
+def _store_snapshot_diff(before: dict, after: dict) -> list[tuple[str, str, str]]:
+    """Content sources whose presence, witness, or conversation tokens moved between snapshots."""
+    rows: list[tuple[str, str, str]] = []
+    before_set = set(before["discovered"])
+    after_set = set(after["discovered"])
+    for agent, path in sorted(after_set - before_set):
+        rows.append((agent, path, "appeared during the audit"))
+    for agent, path in sorted(before_set - after_set):
+        rows.append((agent, path, "removed during the audit"))
+    for agent, path in sorted(before_set & after_set):
+        if (before["witnesses"].get((agent, path))
+                != after["witnesses"].get((agent, path))):
+            rows.append((agent, path, "written during the audit"))
+    touched: set[tuple[str, str]] = set()
+    for token_id in set(before["tokens"]) | set(after["tokens"]):
+        old = before["tokens"].get(token_id)
+        new = after["tokens"].get(token_id)
+        if old == new:
+            continue
+        identity = _token_identity(token_id)
+        agent = (new or old)[0]
+        touched.add((agent, identity[0] if identity else "<token store>"))
+    for agent, path in sorted(touched):
+        rows.append((agent, path, "conversations changed during the audit"))
+    return rows
+
+
+class _Inventory:
+    """The source snapshot the last completed index pass published, bracketed by identity."""
+
+    __slots__ = ("raw", "selection", "identity")
+
+    def __init__(self, raw: bytes, selection: str, identity: tuple):
+        self.raw = raw
+        self.selection = selection
+        self.identity = identity
+
+
+def _inventory_identity() -> tuple | None:
+    """The published snapshot's change-sensitive identity; None while a pass is pending."""
+    data = BOOK_PATH.parent
+    for marker in (_INGEST_PENDING_NAME, _SOURCE_ABSENCE_NAME):
+        try:
+            os.lstat(data / marker)
+            return None
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    try:
+        return _entry_identity(
+            fileops.change_sensitive_file_identity(data / _SOURCE_SNAPSHOT_NAME))
+    except OSError:
+        return None
+
+
+def _published_inventory() -> _Inventory | None:
+    """The source snapshot the last completed index pass published, with its selection.
+
+    The indexer commits the book, drops vanished sources from its parse cache, then publishes
+    this snapshot of the walk it tallied; any guarded read withholds it and leaves the pending
+    marker. A path the snapshot omits was absent at that walk, so its return is re-parsed."""
+    before = _inventory_identity()
+    if before is None:
+        return None
+    try:
+        raw = ownerfile.snapshot(
+            BOOK_PATH.parent / _SOURCE_SNAPSHOT_NAME,
+            max_bytes=_SOURCE_SNAPSHOT_MAX_BYTES).raw
+    except OSError:
+        return None
+    if _inventory_identity() != before:
+        return None
+    # bincode fixint layout: version u32, cache version u32, selection string, adapters, complete.
+    if len(raw) < 17 or raw[-1] != 1:
+        return None
+    if struct.unpack_from("<I", raw, 0)[0] != _SOURCE_SNAPSHOT_VERSION:
+        return None
+    (length,) = struct.unpack_from("<Q", raw, 8)
+    if length > 64 or 16 + length > len(raw):
+        return None
+    try:
+        selection = raw[16:16 + length].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if selection != "all" and selection not in registry.ADAPTER_NAMES:
+        return None
+    return _Inventory(raw, selection, before)
+
+
+def _encoded_path(path: str) -> tuple[int, bytes] | None:
+    """The path's bincode string encoding as (prefix length, body), or None when it has none.
+
+    The prefix counts UTF-8 bytes, or UTF-16 units on Windows where the body is twice as wide."""
+    if "\ufffd" in path:
+        return None
+    try:
+        if os.name == "nt":
+            body = path.encode("utf-16-le")
+            length = len(body) // 2
+        else:
+            body = path.encode("utf-8")
+            length = len(body)
+    except UnicodeEncodeError:
+        return None
+    if length >= 1 << 16:
+        return None
+    return length, body
+
+
+def _inventory_lists(inventory: bytes, paths: set[str]) -> dict[str, bool | None]:
+    """Which of ``paths`` the published snapshot names; None for a path with no exact encoding.
+
+    One pass over the snapshot: a length-prefixed string shorter than 64 KiB has six zero bytes
+    at prefix offset 2, so its prefix ends a zero run at that run's first or second position
+    (deeper positions read a zero length). A coincidental match elsewhere only withholds a prune."""
+    wanted: dict[int, dict[bytes, str]] = {}
+    listed: dict[str, bool | None] = {}
+    for path in paths:
+        encoded = _encoded_path(path)
+        if encoded is None:
+            listed[path] = None
+            continue
+        listed[path] = False
+        length, body = encoded
+        wanted.setdefault(length, {})[body] = path
+    if not wanted:
+        return listed
+    unit = 2 if os.name == "nt" else 1
+    for run in _ZERO_RUN.finditer(inventory):
+        start, end = run.span()
+        for position in (start, start + 1):
+            if position < 2 or position + 6 > end:
+                continue
+            length = inventory[position - 2] | (inventory[position - 1] << 8)
+            bodies = wanted.get(length)
+            if bodies is None:
+                continue
+            path = bodies.get(inventory[position + 6:position + 6 + length * unit])
+            if path is not None:
+                listed[path] = True
+    return listed
+
+
+def _inventory_canaries(
+        present: dict[str, str], orphans: set[str], selection: str,
+        snapshot_mtime_ns: int) -> list[str]:
+    """Present tallied sources the last pass must have walked, so the scan can prove its own
+    encoding: a bounded spread of them plus each orphan's nearest present sibling, leaving
+    out any file written or (re)created since the inventory was published."""
+    eligible = sorted(
+        path for path, agent in present.items()
+        if selection in ("all", agent) and path not in orphans)
+    if not eligible:
+        return []
+    by_parent: dict[str, str] = {}
+    for path in eligible:
+        by_parent.setdefault(os.path.dirname(path), path)
+    canaries: list[str] = []
+    considered: set[str] = set()
+
+    def admit(path: str) -> bool:
+        if path in considered:
+            return False
+        considered.add(path)
+        if _encoded_path(path) is None:
+            return False
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return False
+        if (not statmod.S_ISREG(info.st_mode)
+                or max(int(info.st_mtime_ns), int(info.st_ctime_ns)) > snapshot_mtime_ns):
+            return False
+        canaries.append(path)
+        return True
+
+    for orphan in sorted(orphans):
+        sibling = by_parent.get(os.path.dirname(orphan))
+        if sibling is not None:
+            admit(sibling)
+    stride = max(1, len(eligible) // _INVENTORY_CANARIES)
+    sampled = 0
+    for offset in range(stride):
+        for path in eligible[offset::stride]:
+            if sampled >= _INVENTORY_CANARIES:
+                return canaries
+            sampled += int(admit(path))
+    return canaries
+
+
+def _prune_orphaned_tallies(
+        orphans: dict[str, tuple[str, str]],
+        expected_identity: tuple[int, int, int, int, int] | None,
+        present: dict[str, str],
+        ) -> tuple[int, str]:
+    """Drop tallies of vanished sources the last index pass already saw absent."""
+    if not orphans or expected_identity is None:
+        return 0, ""
+    if common.data_dir_readonly(common.DATA_DIR):
+        return 0, "data directory is read-only"
+    inventory = _published_inventory()
+    if inventory is None:
+        return 0, "no complete source inventory is published for this book"
+    scoped = {
+        path for path, agent in orphans.values()
+        if inventory.selection in ("all", agent)}
+    canaries = _inventory_canaries(
+        present, scoped, inventory.selection, inventory.identity[3])
+    if not canaries:
+        return 0, ("no present tallied source older than the last index pass's inventory "
+                   "can vouch for it; nothing is pruned until a pass lists one")
+    # The scan is the expensive part; it runs outside the lock against an inventory whose
+    # identity is re-checked under it. The canaries must all be found or the inventory is
+    # not what this reader assumes.
+    listed = _inventory_lists(inventory.raw, scoped | set(canaries))
+    unverified = [path for path in canaries if listed[path] is not True]
+    if unverified:
+        return 0, (
+            f"{surface.count_noun(len(unverified), 'present tallied source')} "
+            f"(for example {unverified[0]}) "
+            f"{'is' if len(unverified) == 1 else 'are'} not in the last index pass's "
+            "inventory (restored or moved back since that pass, or an inventory format "
+            "this reader does not understand); nothing is pruned until a pass lists "
+            f"{'it' if len(unverified) == 1 else 'them'}")
+    unlisted = {path for path in scoped if listed[path] is False}
+    if not unlisted:
+        return 0, ("the last index pass still listed every vanished source; "
+                   "the next pass observes the deletion")
+    fd = -1
+    temporary = None
+    try:
+        with index_lock.IndexLock("audit-prune", timeout=_PRUNE_LOCK_TIMEOUT_S):
+            if _optional_plain_identity(BOOK_PATH) != expected_identity:
+                return 0, "the book was republished after the audit"
+            if _inventory_identity() != inventory.identity:
+                return 0, "an index pass published a new source inventory during the audit"
+            raw = ownerfile.snapshot(BOOK_PATH, max_bytes=_BOOK_MAX_BYTES).raw
+            data = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+            if (not isinstance(data, dict) or data.get("version") != BOOK_VERSION
+                    or not isinstance(data.get("files"), dict)):
+                return 0, "the book is not a version-1 files table"
+            files = data["files"]
+            removed = [
+                key for key, (path, _agent) in orphans.items()
+                if key in files and path in unlisted
+                and _path_state(path)[0] == "missing"
+            ]
+            if not removed:
+                return 0, "every vanished source returned or left the book before the prune"
+            for key in removed:
+                del files[key]
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            # The book's mtime is the last index pass; a prune keeps that clock.
+            published = _plain_entry(BOOK_PATH)
+            fd, name = tempfile.mkstemp(
+                prefix=f".{BOOK_PATH.name}.", suffix=".tmp", dir=BOOK_PATH.parent)
+            temporary = Path(name)
+            if os.name != "nt":
+                os.fchmod(fd, statmod.S_IMODE(published.st_mode))
+            with os.fdopen(fd, "wb") as stream:
+                fd = -1
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.utime(temporary, ns=(published.st_atime_ns, published.st_mtime_ns))
+            if _optional_plain_identity(BOOK_PATH) != expected_identity:
+                return 0, "the book was republished after the audit"
+            common.replace_with_retry(temporary, BOOK_PATH)
+            temporary = None
+            return len({orphans[key][0] for key in removed}), ""
+    except TimeoutError:
+        return 0, "an index pass holds the index lock"
+    except (OSError, RecursionError, UnicodeError, ValueError) as error:
+        return 0, str(error)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+class _Round:
+    """Everything one complete observation pass learned, for the renderer and the retry gate."""
+
+    def __init__(self):
+        self.problems = _DetailLog(_PROBLEM_SAMPLE_LIMIT)
+        self.gaps = _DetailLog(_GAP_SAMPLE_LIMIT)
+        self.live = _DetailLog(_LIVE_SAMPLE_LIMIT)
+        self.moved: list[str] = []
+        self.interrupted_gaps = 0
+        self.blocked_gaps = 0
+        self.per_agent: dict[str, dict] = {}
+        self.verified_by_agent: dict[str, int] = {}
+        self.orphan_count = 0
+        self.orphans: dict[str, tuple[str, str]] = {}
+        self.present_tallied: dict[str, str] = {}
+        self.book_identity_after = None
+        self.book_readable = False
+        self.routine_deferred_reason = ""
+        self.snapshot_deferred_reasons: list[str] = []
+        self.indexed_deferred_reason = ""
+        self.cache_deferred_reason = ""
+        self.indexed_cache_hit = False
+        self.indexed_source = None
+        self.cached_files = 0
+        self.recounted_files = 0
+        self.recounted_bytes = 0
+        self.pending_files = 0
+        self.pending_bytes = 0
+        self.full_estimated_files = 0
+        self.full_estimated_bytes = 0
+        self.cache_path = None
+        self.census_cache: dict[str, dict] = {}
+        self.cache_dirty = False
+        self.indexed_record_to_publish = None
+        self.final_snapshot: dict | None = None
+
+
+def _audit_round(
+        args, memo: dict, *, round_index: int,
+        initial_snapshot: dict | None = None) -> _Round:
+    """One complete observation pass. A settle round starts from the previous pass's final
+    store snapshot and re-reads only evidence whose identity moved; memoised reads stand."""
+    out = _Round()
     routine_deadline = (
         None if args.full else time.monotonic() + _ROUTINE_BUDGET_S)
+    scan_start_ns = time.time_ns()
     work_deadline = (
         None if routine_deadline is None else
         routine_deadline - _ROUTINE_FINAL_SNAPSHOT_RESERVE_S)
-    problems = _DetailLog(_PROBLEM_SAMPLE_LIMIT)
-    gaps = _DetailLog(_GAP_SAMPLE_LIMIT)
-    routine_deferred_reason = ""
-    snapshot_deferred_reasons: list[str] = []
+    problems = out.problems
+    gaps = out.gaps
+    live = out.live
+    moved = out.moved
+    live_paths: set[str] = set()
 
     def defer_routine(reason: object) -> None:
-        nonlocal routine_deferred_reason
-        if not routine_deferred_reason:
-            routine_deferred_reason = str(reason)
+        if not out.routine_deferred_reason:
+            out.routine_deferred_reason = str(reason)
 
     def defer_snapshot(reason: object) -> None:
         rendered = str(reason)
-        if rendered not in snapshot_deferred_reasons:
-            snapshot_deferred_reasons.append(rendered)
+        if rendered not in out.snapshot_deferred_reasons:
+            out.snapshot_deferred_reasons.append(rendered)
 
     def work_available(label: str) -> bool:
-        if routine_deferred_reason:
+        if out.routine_deferred_reason:
             return False
         try:
             _deadline_check(work_deadline, label)
@@ -1112,8 +1577,8 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
     cache_path = _census_cache_path()
+    out.cache_path = cache_path
     # --full is a trustless recount and never even parses prior cached evidence.
-    cache_deferred_reason = ""
     if args.full:
         census_cache = {}
         cached_indexed_record = None
@@ -1127,7 +1592,7 @@ def main(argv: list[str] | None = None) -> int:
             # census work and disclose why the warm path was unavailable.
             census_cache = {}
             cached_indexed_record = None
-            cache_deferred_reason = str(error)
+            out.cache_deferred_reason = str(error)
     full_recount_cache: dict[str, dict] = {}
     cache_dirty = False
     cached_files = 0
@@ -1135,43 +1600,62 @@ def main(argv: list[str] | None = None) -> int:
     recounted_bytes = 0
     pending_files = 0
     pending_bytes = 0
-    indexed_deferred_reason = ""
-    indexed_cache_hit = False
     indexed_record_to_publish: dict | None = None
+    # Settle rounds share only settled counts: a same-tick rewrite keeps a racy identity, so a
+    # later round re-reads it. This round's priority counts are reused, and reported, once.
+    census_memo: dict[tuple[str, tuple], int] = memo.setdefault("census", {})
+    round_census: dict[tuple[str, tuple], int] = {}
+    book_memo: dict = memo.setdefault("book", {})
+    indexed_memo: dict = memo.setdefault("indexed", {})
+    book_reader_is_real = getattr(_book, "__module__", None) == __name__
 
     try:
         book_identity_before = _optional_plain_identity(BOOK_PATH)
     except OSError as error:
         book_identity_before = None
         problems.append(f"cannot stat evidence book {BOOK_PATH}: {error}")
-    try:
-        book = _book(deadline=work_deadline)
-    except AuditRoutineBudget as error:
-        book = {}
-        defer_routine(error)
-    except AuditEvidenceError as error:
-        book = {}
-        problems.append(str(error))
-    discovered_before: list[tuple[str, str]] = []
-    live_tokens_before: dict[str, tuple[str, str]] = {}
+    if (book_reader_is_real and book_identity_before is not None
+            and book_memo.get("identity") == book_identity_before):
+        book = book_memo["files"]
+        out.book_readable = True
+    else:
+        try:
+            book = _book(deadline=work_deadline)
+            out.book_readable = True
+            if book_reader_is_real and book_identity_before is not None:
+                book_memo["identity"] = book_identity_before
+                book_memo["files"] = book
+        except AuditRoutineBudget as error:
+            book = {}
+            defer_routine(error)
+        except AuditEvidenceMoved as error:
+            book = {}
+            moved.append(str(error))
+            live.append(str(error))
+        except AuditEvidenceError as error:
+            book = {}
+            problems.append(str(error))
+    discovered: list[tuple[str, str]] = []
+    live_tokens: dict[str, tuple[str, str]] = {}
     source_witnesses: dict[tuple[str, str], tuple[str, str]] = {}
-    store_snapshot_before: dict | None = None
+    store_snapshot_before: dict | None = initial_snapshot
     selection = args.agent or "all"
-    if work_available("combined store audit snapshot"):
+    if store_snapshot_before is None and work_available("combined store audit snapshot"):
         try:
             store_snapshot_before = _store_snapshot(
                 selection=selection,
                 timeout_s=_store_snapshot_timeout(
                     work_deadline, "combined store audit snapshot"))
-            discovered_before = store_snapshot_before["discovered"]
-            live_tokens_before = store_snapshot_before["tokens"]
-            source_witnesses = store_snapshot_before["witnesses"]
         except AuditSnapshotDeferred as error:
             defer_snapshot(error)
         except AuditRoutineBudget as error:
             defer_routine(error)
         except AuditEvidenceError as error:
             problems.append(str(error))
+    if store_snapshot_before is not None:
+        discovered = store_snapshot_before["discovered"]
+        live_tokens = store_snapshot_before["tokens"]
+        source_witnesses = store_snapshot_before["witnesses"]
     corpus_path = common.DATA_DIR / "corpus.db"
     try:
         indexed_identity_before = _sqlite_family_identity(corpus_path)
@@ -1181,14 +1665,38 @@ def main(argv: list[str] | None = None) -> int:
     indexed_agents: set[str] = set()
     index_reader_is_real = (
         getattr(_indexed_agents, "__module__", None) == __name__)
-    if (not args.full
+    indexed_racy = any(
+        fileops.racy_identity(member[1], scan_start_ns, time.time_ns())
+        for member in indexed_identity_before)
+    blocked_sidecars = index_lock.inaccessible_sidecars(corpus_path, "search index")
+    if blocked_sidecars:
+        # no census can read past it and no pass can clear it: an uncertified warning (exit 1)
+        gaps.append(_blocked_sidecar_gap(corpus_path, blocked_sidecars[0]))
+        out.blocked_gaps += 1
+    elif (not args.full
             and bool(indexed_identity_before)
             and index_reader_is_real
+            and not indexed_racy
             and _indexed_cache_matches(
                 cached_indexed_record, indexed_identity_before)):
         indexed_agents = set(cached_indexed_record["agents"])
-        indexed_cache_hit = True
+        out.indexed_cache_hit = True
+        out.indexed_source = "cache"
         indexed_record_to_publish = cached_indexed_record
+    elif (bool(indexed_identity_before)
+            and indexed_identity_before in indexed_memo.get("scans", {})
+            and not indexed_racy):
+        indexed_agents = set(indexed_memo["scans"][indexed_identity_before])
+        out.indexed_source = "corpus"
+        indexed_record_to_publish = _indexed_cache_record(
+            indexed_identity_before, indexed_agents)
+        cache_dirty = True
+    elif (round_index > 0 and indexed_memo.get("rescan_spent")
+            and "last" in indexed_memo):
+        # A corpus republished in every round is live; one rescan bounds the cost. The reuse names an
+        # older generation, so it is neither published nor memoised, and needs no racy gate.
+        indexed_agents = set(indexed_memo["last"])
+        out.indexed_source = "corpus"
     elif work_available("indexed-row census"):
         try:
             global _INDEXED_DEADLINE_OVERRIDE
@@ -1206,28 +1714,47 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 _INDEXED_DEADLINE_OVERRIDE = prior_indexed_deadline
         except AuditRoutineBudget as error:
-            indexed_deferred_reason = str(error)
+            # The proof-bound session census names every agent with published
+            # rows without scanning corpus.db; it gets the DISTINCT query's share
+            # of the budget so source accounting keeps the rest.
+            session_agents = _session_census_agents(
+                None if work_deadline is None else min(
+                    work_deadline,
+                    time.monotonic() + _ROUTINE_INDEXED_QUERY_BUDGET_S))
+            if session_agents is None:
+                out.indexed_deferred_reason = str(error)
+            else:
+                indexed_agents = session_agents
+                out.indexed_source = "session-census"
+        except AuditEvidenceBlocked as error:
+            # an uncertified warning (exit 1), like a pending pass, but no pass alone clears it
+            gaps.append(str(error))
+            out.blocked_gaps += 1
+        except AuditEvidenceInterrupted as error:
+            # Not movement: settling cannot clear it. A gap keeps the uncertified warning (exit 1).
+            gaps.append(str(error))
+            out.interrupted_gaps += 1
+        except AuditEvidenceMoved as error:
+            moved.append(str(error))
+            live.append(str(error))
         except AuditEvidenceError as error:
             problems.append(str(error))
         else:
-            if indexed_identity_before:
+            out.indexed_source = "corpus"
+            indexed_memo["last"] = set(indexed_agents)
+            if round_index > 0:
+                indexed_memo["rescan_spent"] = True
+            if indexed_identity_before and not indexed_racy:
                 indexed_record_to_publish = _indexed_cache_record(
                     indexed_identity_before, indexed_agents)
                 cache_dirty = True
-    discovered = discovered_before
-    live_tokens = live_tokens_before
+    # Memoised and published before any --agent filter: the record names every indexed agent.
+    indexed_agents_all = set(indexed_agents)
     if args.agent:
-        discovered_before = [
-            row for row in discovered_before if row[0] == args.agent
-        ]
         discovered = [(a, p) for a, p in discovered if a == args.agent]
         book = {key: entry for key, entry in book.items()
                 if isinstance(entry, dict) and entry.get("agent") == args.agent}
         indexed_agents &= {args.agent}
-        live_tokens_before = {
-            key: value for key, value in live_tokens_before.items()
-            if value[0] == args.agent
-        }
         live_tokens = {
             key: value for key, value in live_tokens.items()
             if value[0] == args.agent
@@ -1238,8 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
         }
 
     # Use the Rust snapshot's opaque identity to find and recount cache misses
-    # before cached rows. Complete accounting remains authoritative, and final
-    # boundary instability still withholds the cache update.
+    # before cached rows. Each record is bound to the exact identity it counted.
     routine_inventory_paths: set[str] = set()
     routine_pending_census: dict[str, tuple[int, str, str]] = {}
     routine_witness_inventory_complete = False
@@ -1289,6 +1815,9 @@ def main(argv: list[str] | None = None) -> int:
                 break
             try:
                 observed_key, source_identity = _stat_evidence(path)
+            except AuditEvidenceMoved:
+                # The source join below classifies the movement.
+                continue
             except AuditEvidenceError as error:
                 problems.append(f"priority census: {error}")
                 continue
@@ -1304,22 +1833,26 @@ def main(argv: list[str] | None = None) -> int:
             except AuditRoutineBudget as error:
                 defer_routine(error)
                 break
+            except AuditEvidenceMoved:
+                continue
             except AuditEvidenceError as error:
                 problems.append(f"priority census: {error}")
                 continue
             if after_identity != source_identity:
-                problems.append(
-                    "source changed while priority census evidence was "
-                    f"collected: {path}")
                 continue
-            record = {
-                "identity": list(source_identity),
-                "identity_sha256": identity_sha256,
-                "nonblank_lines": int(n),
-            }
-            if census_cache.get(path) != record:
-                census_cache[path] = record
-                cache_dirty = True
+            memo_key = (path, tuple(after_identity))
+            round_census[memo_key] = int(n)
+            if not fileops.racy_identity(
+                    after_identity, scan_start_ns, time.time_ns()):
+                census_memo[memo_key] = int(n)
+                record = {
+                    "identity": list(source_identity),
+                    "identity_sha256": identity_sha256,
+                    "nonblank_lines": int(n),
+                }
+                if census_cache.get(path) != record:
+                    census_cache[path] = record
+                    cache_dirty = True
             routine_pending_census.pop(path, None)
             recounted_files += 1
             recounted_bytes += source_size
@@ -1329,7 +1862,7 @@ def main(argv: list[str] | None = None) -> int:
     full_unknown_sizes = 0
     full_attempted_files = 0
     full_last_progress = time.monotonic()
-    if args.full:
+    if args.full and round_index == 0:
         for agent, path in discovered:
             if agent not in JSONL_CENSUS:
                 continue
@@ -1345,21 +1878,51 @@ def main(argv: list[str] | None = None) -> int:
             f"{surface.count_noun(full_estimated_files, 'file')}, "
             f"{_human_bytes(full_estimated_bytes)}{unknown}",
             file=sys.stderr, flush=True)
+        memo["estimate"] = (full_estimated_files, full_estimated_bytes)
+    elif args.full:
+        full_estimated_files, full_estimated_bytes = memo.get("estimate", (0, 0))
 
     instrumented = set(registry.ADAPTER_NAMES)
     if args.agent:
         instrumented &= {args.agent}
-    per_agent: dict[str, dict] = {}
-    verified_by_agent: dict[str, int] = {}
+    per_agent = out.per_agent
+    verified_by_agent = out.verified_by_agent
     fresh_by_agent: dict[str, int] = {}
+    live_by_agent: dict[str, int] = {}
+    stale_by_agent: dict[str, int] = {}
 
     def agent_bucket(name: str) -> dict:
         return per_agent.setdefault(name, {
-            "files": 0, "tallied": 0, "stale": 0, "untallied": 0,
+            "files": 0, "tallied": 0, "stale": 0, "untallied": 0, "live": 0,
             "seen": 0, "rows": 0, "agent_rows": 0, "errors": 0,
             "skips": {}, "identity_breaks": 0, "census_mismatch": 0,
             "error_samples": [],
         })
+
+    def mark_live(agent: str, path: str, what: str) -> None:
+        if path in live_paths:
+            return
+        live_paths.add(path)
+        live.append(f"{agent}: {what}: {path}")
+        if agent in instrumented:
+            agent_bucket(agent)["live"] += 1
+            live_by_agent[agent] = live_by_agent.get(agent, 0) + 1
+
+    def mark_moved(agent: str, path: str, what: str) -> None:
+        # The retry gate counts every movement; the report keeps one line per source.
+        moved.append(f"{agent}: {what}: {path}")
+        mark_live(agent, path, what)
+
+    def source_stat_key(agent: str, path: str) -> tuple[str | None, str | None]:
+        witness = source_witnesses.get((agent, path))
+        if witness is not None:
+            return witness[0], None
+        try:
+            return _stat_evidence(path)[0], None
+        except AuditEvidenceMoved as error:
+            return None, error.what
+        except AuditEvidenceError:
+            return None, None
 
     # Token stores tally per conversation, then join discovery by source path.
     # A missing initial source boundary makes every downstream join
@@ -1389,6 +1952,7 @@ def main(argv: list[str] | None = None) -> int:
             legacy_live_identities[legacy_alias] = identity
 
     by_path: dict[str, list[tuple[object, dict]]] = {}
+    book_keys_by_path: dict[str, list[str]] = {}
     book_token_entries: dict[tuple[str, str], dict] = {}
     for key, entry in (book.items() if validation_complete else ()):
         if not work_available("evidence-book join"):
@@ -1417,9 +1981,12 @@ def main(argv: list[str] | None = None) -> int:
                     problems.append(
                         "evidence book has conflicting tallies for duplicate "
                         f"token identity in {source}")
+                else:
+                    book_keys_by_path.setdefault(source, []).append(key)
                 continue
             book_token_entries[identity] = entry
         by_path.setdefault(source, []).append((identity, entry))
+        book_keys_by_path.setdefault(source, []).append(key)
 
     discovered_pairs = set(discovered) if validation_complete else set()
     for path, tokens in (live_by_path.items() if validation_complete else ()):
@@ -1453,9 +2020,20 @@ def main(argv: list[str] | None = None) -> int:
         seen_paths.add(path)
         keyed_entries = by_path.get(path) or []
         if not keyed_entries:
-            b["untallied"] += 1
-            if agent in instrumented:
-                gaps.append(f"{agent}: never tallied: {path}")
+            observed_key, what = (
+                source_stat_key(agent, path) if agent in instrumented
+                else (None, None))
+            if what:
+                mark_moved(agent, path, what)
+            elif agent in instrumented and _written_after_book(
+                    observed_key, book_identity_before):
+                mark_live(
+                    agent, path,
+                    "not yet tallied (written after the last index pass)")
+            else:
+                b["untallied"] += 1
+                if agent in instrumented:
+                    gaps.append(f"{agent}: never tallied: {path}")
             continue
         entries = []
         entry_agents: set[str] = set()
@@ -1474,6 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
         if not validation_complete:
             break
         b["tallied"] += 1
+        out.present_tallied[path] = agent
         if entry_agents != {agent}:
             problems.append(
                 f"{agent}: tally adapter mismatch for {path}: {sorted(entry_agents)}")
@@ -1493,6 +2072,7 @@ def main(argv: list[str] | None = None) -> int:
         source_identity = None
         source_identity_sha256 = None
         source_size = 0
+        stat_key = None
         if token_entries:
             expected = {}
             for key, item in token_entries:
@@ -1517,6 +2097,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 try:
                     stat_key, source_identity = _stat_evidence(path)
+                except AuditEvidenceMoved as error:
+                    mark_moved(agent, path, error.what)
+                    continue
                 except AuditEvidenceError as error:
                     problems.append(f"{agent}: {error}")
                     continue
@@ -1524,19 +2107,33 @@ def main(argv: list[str] | None = None) -> int:
             if args.full and source_identity is None:
                 try:
                     observed_key, source_identity = _stat_evidence(path)
+                except AuditEvidenceMoved as error:
+                    mark_moved(agent, path, error.what)
+                    continue
                 except AuditEvidenceError as error:
                     problems.append(f"{agent}: {error}")
                     continue
                 if observed_key != stat_key:
-                    problems.append(
-                        f"{agent}: source changed after store snapshot: {path}")
+                    mark_moved(agent, path, "source written after the store snapshot")
                     continue
                 source_size = source_identity[2]
             fresh = entry.get("key") == stat_key
         if not fresh:
-            b["stale"] += 1
-            detail = "token census mismatch" if token_entries else "source moved"
-            gaps.append(f"{agent}: stale tally ({detail}): {path}")
+            observed_key, what = (
+                (stat_key, None) if stat_entries
+                else source_stat_key(agent, path))
+            if what:
+                mark_moved(agent, path, what)
+                continue
+            if _written_after_book(observed_key, book_identity_before):
+                mark_live(
+                    agent, path,
+                    "tally behind the source (written after the last index pass)")
+            else:
+                b["stale"] += 1
+                stale_by_agent[agent] = stale_by_agent.get(agent, 0) + 1
+                detail = "token census mismatch" if token_entries else "source moved"
+                gaps.append(f"{agent}: stale tally ({detail}): {path}")
         else:
             # Freshness and structural intake accounting remain useful evidence
             # even when a bounded routine census later remains pending.
@@ -1584,47 +2181,61 @@ def main(argv: list[str] | None = None) -> int:
                 if source_identity is None:
                     try:
                         observed_key, source_identity = _stat_evidence(path)
+                    except AuditEvidenceMoved as error:
+                        mark_moved(agent, path, error.what)
+                        continue
                     except AuditEvidenceError as error:
                         problems.append(f"{agent}: {error}")
                         continue
                     if observed_key != stat_key:
-                        problems.append(
-                            f"{agent}: source changed after store snapshot: {path}")
+                        mark_moved(agent, path, "source written after the store snapshot")
                         continue
                     source_size = source_identity[2]
-                try:
-                    n = _census_jsonl(path, deadline=work_deadline)
-                    _after_key, after_identity = _stat_evidence(path)
-                    _deadline_check(
-                        work_deadline, "source census final identity check")
-                except AuditRoutineBudget as error:
-                    if not routine_witness_inventory_complete:
-                        pending_files += 1
-                        pending_bytes += source_size
-                    defer_routine(error)
-                    validation_complete = False
-                    break
-                except AuditEvidenceError as error:
-                    problems.append(f"{agent}: {error}")
-                    continue
-                if after_identity != source_identity:
-                    problems.append(
-                        f"{agent}: source changed while census evidence was collected: "
-                        f"{path}")
-                    continue
-                recounted_files += 1
-                recounted_bytes += source_size
-                record = {
-                    "identity": list(source_identity),
-                    "nonblank_lines": int(n),
-                }
-                if source_identity_sha256 is not None:
-                    record["identity_sha256"] = source_identity_sha256
-                if args.full:
-                    full_recount_cache[path] = record
-                elif census_cache.get(path) != record:
-                    census_cache[path] = record
-                    cache_dirty = True
+                memo_key = (path, tuple(source_identity))
+                after_identity = source_identity
+                n = round_census.get(memo_key)
+                counted = n is None
+                if n is None:
+                    n = census_memo.get(memo_key)
+                if n is None:
+                    try:
+                        n = _census_jsonl(path, deadline=work_deadline)
+                        _after_key, after_identity = _stat_evidence(path)
+                        _deadline_check(
+                            work_deadline, "source census final identity check")
+                    except AuditRoutineBudget as error:
+                        if not routine_witness_inventory_complete:
+                            pending_files += 1
+                            pending_bytes += source_size
+                        defer_routine(error)
+                        validation_complete = False
+                        break
+                    except AuditEvidenceMoved as error:
+                        mark_moved(agent, path, error.what)
+                        continue
+                    except AuditEvidenceError as error:
+                        problems.append(f"{agent}: {error}")
+                        continue
+                    if after_identity != source_identity:
+                        mark_moved(agent, path, "source written while it was counted")
+                        continue
+                if counted:
+                    recounted_files += 1
+                    recounted_bytes += source_size
+                if not fileops.racy_identity(
+                        after_identity, scan_start_ns, time.time_ns()):
+                    census_memo[memo_key] = int(n)
+                    record = {
+                        "identity": list(after_identity),
+                        "nonblank_lines": int(n),
+                    }
+                    if source_identity_sha256 is not None:
+                        record["identity_sha256"] = source_identity_sha256
+                    if args.full:
+                        full_recount_cache[path] = record
+                    elif census_cache.get(path) != record:
+                        census_cache[path] = record
+                        cache_dirty = True
                 if routine_witness_inventory_complete:
                     routine_pending_census.pop(path, None)
                 if args.full and time.monotonic() - full_last_progress >= 2.0:
@@ -1645,16 +2256,18 @@ def main(argv: list[str] | None = None) -> int:
         active_eligible_candidate = False
 
     if routine_witness_inventory_complete:
-        pending_files = len(routine_pending_census)
-        pending_bytes = sum(
-            row[0] for row in routine_pending_census.values())
+        # A source that moved is live, not budget-pending.
+        still_pending = [
+            row for path, row in routine_pending_census.items()
+            if path not in live_paths]
+        pending_files = len(still_pending)
+        pending_bytes = sum(row[0] for row in still_pending)
     elif not validation_complete:
         untouched_candidates = (
             eligible_source_candidates - eligible_candidates_started
             + int(active_eligible_candidate))
         pending_files = max(pending_files, max(0, untouched_candidates))
 
-    orphan_count = 0
     book_agents: set[str] = set()
     for path, keyed_entries in (by_path.items() if validation_complete else ()):
         if not work_available("orphaned-tally join"):
@@ -1667,7 +2280,9 @@ def main(argv: list[str] | None = None) -> int:
         state, detail = _path_state(path)
         if state == "missing":
             # A deleted store's tallies stay behind; they count here, not as that agent's evidence.
-            orphan_count += 1
+            out.orphan_count += 1
+            for key in book_keys_by_path.get(path, ()):
+                out.orphans[key] = (path, next(iter(agents_here), ""))
             continue
         book_agents.update(agents_here)
         if state == "unreadable":
@@ -1699,15 +2314,12 @@ def main(argv: list[str] | None = None) -> int:
             if not work_available("fresh-evidence join"):
                 validation_complete = False
                 break
-            if fresh_by_agent.get(agent, 0) == 0:
+            # Live files explain a missing fresh tally only while nothing held still and stale.
+            if (fresh_by_agent.get(agent, 0) == 0
+                    and (live_by_agent.get(agent, 0) == 0
+                         or stale_by_agent.get(agent, 0))):
                 problems.append(
                     f"{agent}: no tallied source file had fresh readable evidence")
-
-    if (validation_complete and not verified_by_agent
-            and not problems and not gaps
-            and not snapshot_deferred_reasons
-            and not indexed_deferred_reason):
-        problems.append(_NO_CENSUS_PROBLEM)
 
     if args.full:
         print(
@@ -1717,18 +2329,26 @@ def main(argv: list[str] | None = None) -> int:
             "validating the independent evidence snapshots",
             file=sys.stderr, flush=True)
 
-    store_boundary_stable = False
+    store_snapshot_after: dict | None = None
     if store_snapshot_before is not None:
         try:
             store_snapshot_after = _store_snapshot(
                 selection=selection,
                 timeout_s=_store_snapshot_timeout(
                     routine_deadline, "final combined store audit snapshot"))
-            store_boundary_stable = (
-                store_snapshot_before["boundary_sha256"]
-                == store_snapshot_after["boundary_sha256"])
-            if not store_boundary_stable:
-                problems.append("store source evidence changed during audit")
+            out.final_snapshot = store_snapshot_after
+            if (store_snapshot_before["boundary_sha256"]
+                    != store_snapshot_after["boundary_sha256"]):
+                changed = _store_snapshot_diff(
+                    store_snapshot_before, store_snapshot_after)
+                for agent, path, what in changed:
+                    if agent in instrumented:
+                        mark_moved(agent, path, what)
+                if not changed:
+                    moved.append("store evidence boundary moved during the audit")
+                    live.append(
+                        "store evidence boundary moved during the audit "
+                        "(no content source differs; a store sidecar was written)")
         except AuditSnapshotDeferred as error:
             defer_snapshot(error)
         except AuditRoutineBudget as error:
@@ -1745,18 +2365,143 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as error:
         book_identity_after = None
         problems.append(f"cannot stat evidence book {BOOK_PATH}: {error}")
+    out.book_identity_after = book_identity_after
     if indexed_identity_before != indexed_identity_after:
         indexed_record_to_publish = None
         cache_dirty = True
-        problems.append("indexed-row evidence changed during audit")
+        moved.append("indexed rows were republished during the audit")
+        live.append(
+            "indexed rows were republished during the audit (an index pass ran)")
+    elif indexed_record_to_publish is not None and out.indexed_source == "corpus":
+        # The memo holds only what this round may publish: never a racy scan or a reused generation.
+        indexed_memo.setdefault("scans", {})[indexed_identity_before] = (
+            indexed_agents_all)
     if book_identity_before != book_identity_after:
-        problems.append("evidence book changed during audit")
+        moved.append("evidence book was republished during the audit")
+        live.append(
+            "evidence book was republished during the audit (an index pass ran)")
+    # Decided last: evidence that moved explains an empty census without an error.
+    if (validation_complete and not verified_by_agent
+            and not problems and not gaps and not live
+            and not out.snapshot_deferred_reasons
+            and not out.indexed_deferred_reason):
+        problems.append(_NO_CENSUS_PROBLEM)
 
+    out.cached_files = cached_files
+    out.recounted_files = recounted_files
+    out.recounted_bytes = recounted_bytes
+    out.pending_files = pending_files
+    out.pending_bytes = pending_bytes
+    out.full_estimated_files = full_estimated_files
+    out.full_estimated_bytes = full_estimated_bytes
+    out.indexed_record_to_publish = indexed_record_to_publish
+    if args.full:
+        # Each record is an independent raw read bracketed by exact identity.
+        # A full run publishes only completed records, so unrelated failures
+        # cannot poison reusable evidence or accumulate stale entries.
+        out.census_cache = full_recount_cache
+        out.cache_dirty = bool(
+            full_recount_cache or indexed_record_to_publish)
+    else:
+        out.census_cache = census_cache
+        out.cache_dirty = cache_dirty
+    return out
+
+
+def _session_census_agents(deadline: float | None) -> set[str] | None:
+    """Agents with published rows, from the proof-bound session census."""
+    try:
+        summary = (
+            common.index_summary() if deadline is None
+            else common.index_summary(deadline=deadline))
+    except TimeoutError:
+        return None
+    except (OSError, TypeError, ValueError):
+        return None
+    if summary is None or not isinstance(summary.get("per_agent"), list):
+        return None
+    agents = set()
+    for row in summary["per_agent"]:
+        if (not isinstance(row, dict)
+                or not isinstance(row.get("agent"), str)
+                or type(row.get("messages")) is not int):
+            return None
+        if row["agent"] in registry.ADAPTER_NAMES and row["messages"] > 0:
+            agents.add(row["agent"])
+    return agents
+
+
+def main(argv: list[str] | None = None) -> int:
+    common.utf8_stdio()
+    ap = surface.ArgumentParser(
+        prog="agrep audit",
+        description="hold the ingest to its accounting: nothing seen goes missing",
+        allow_abbrev=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  agrep audit                 bounded cached accounting check\n"
+            "  agrep audit --agent codex   check one source adapter\n"
+            "  agrep audit --full          recount every eligible source file\n"
+            "\nexit: 0 clean, 1 evidence warning, 2 accounting error or invalid input."
+        ))
+    ap.add_argument("--agent", action="append", help="audit only this agent")
+    ap.add_argument("--json", action="store_true", help="machine output")
+    ap.add_argument("--strict", action="store_true",
+                    help="promote coverage gaps and live/uncertified evidence "
+                         "to errors (exit 2)")
+    ap.add_argument(
+        "--full", action="store_true",
+        help="trustless raw-file recount (prints an estimate and ignores cache)")
+    args = ap.parse_args(argv)
+    if args.agent and len(args.agent) > 1:
+        ap.error("--agent may be supplied only once")
+    args.agent = args.agent[0] if args.agent else None
+    # `--agent ""` would audit every agent and report it as one agent's audit
+    blank_filter = surface.filter_value_error(args)
+    if blank_filter:
+        ap.error(blank_filter)
+    if args.agent:
+        selected = registry.normalize_agent_name(args.agent)
+        if selected not in registry.ADAPTER_NAMES:
+            ap.error("--agent must name one of: "
+                     + ", ".join(registry.ADAPTER_NAMES))
+        args.agent = selected
+    if args.full:
+        print(
+            "full audit: trustless recount; discovering sources and evidence "
+            "for the estimate",
+            file=sys.stderr, flush=True)
+
+    # A routine run has no settle budget; its next run is the retry.
+    rounds = 1 + (_LIVE_SETTLE_ROUNDS if args.full else 0)
+    memo: dict = {}
+    initial_snapshot = None
+    for round_index in range(rounds):
+        result = _audit_round(
+            args, memo, round_index=round_index,
+            initial_snapshot=initial_snapshot)
+        if not result.moved or round_index == rounds - 1:
+            break
+        print(
+            "full audit: evidence moved during round "
+            f"{round_index + 1} of {rounds} "
+            f"({surface.count_noun(len(result.moved), 'movement')}); "
+            f"settling {_LIVE_SETTLE_S:g}s before re-observing",
+            file=sys.stderr, flush=True)
+        time.sleep(_LIVE_SETTLE_S)
+        # The pass's final snapshot brackets the settle round from its start.
+        initial_snapshot = result.final_snapshot
+
+    problems = result.problems
+    gaps = result.gaps
+    live = result.live
+    per_agent = result.per_agent
     strict_gap_count = len(gaps)
     incomplete_reasons = [
         reason for reason in (
-            routine_deferred_reason, indexed_deferred_reason,
-            *snapshot_deferred_reasons)
+            result.routine_deferred_reason, result.indexed_deferred_reason,
+            *result.snapshot_deferred_reasons)
         if reason
     ]
     if incomplete_reasons:
@@ -1767,68 +2512,76 @@ def main(argv: list[str] | None = None) -> int:
             "run agrep audit --full")
 
     total_errors = sum(b["errors"] for b in per_agent.values())
-    if problems or total_errors or (args.strict and strict_gap_count):
+    if (problems or total_errors
+            or (args.strict and (strict_gap_count or live))):
         exit_code = 2
         status = "error"
-    elif gaps or incomplete_reasons:
+    elif gaps or live or incomplete_reasons:
         exit_code = 1
         status = "warning"
     else:
         exit_code = 0
         status = "clean"
 
+    cache_path = result.cache_path
     cache_state = "unchanged"
     if cache_path is None:
         cache_state = "unavailable"
-    elif args.full:
-        # Each record is an independent raw read bracketed by exact identity.
-        # A full run publishes only completed records, so unrelated failures
-        # cannot poison reusable evidence or accumulate stale entries.
-        census_cache = full_recount_cache
-        cache_dirty = bool(
-            full_recount_cache or indexed_record_to_publish)
-    if not store_boundary_stable:
-        cache_dirty = False
-        if cache_path is not None and (args.full or recounted_files):
-            cache_state = "update withheld: store boundary was not stable"
-    if cache_path is not None and cache_dirty:
+    if cache_path is not None and result.cache_dirty:
         if _write_census_cache(
-                cache_path, census_cache,
-                indexed_agents=indexed_record_to_publish):
+                cache_path, result.census_cache,
+                indexed_agents=result.indexed_record_to_publish):
             cache_state = (
                 "updated with completed identity-bound evidence"
-                if problems or total_errors or gaps else
+                if problems or total_errors or gaps or live else
                 "updated")
         else:
             cache_state = "update unavailable"
 
+    pruned = 0
+    prune_note = ""
+    if result.orphans:
+        if not args.full:
+            prune_note = "a full audit with no errors and no coverage gaps prunes them"
+        elif (problems or total_errors or strict_gap_count
+              or not result.book_readable):
+            prune_note = "pruning needs a full audit with no errors and no coverage gaps"
+        else:
+            pruned, prune_note = _prune_orphaned_tallies(
+                result.orphans, result.book_identity_after, result.present_tallied)
+
+    recounted_files = result.recounted_files
     if args.full:
         census_disclosure = (
             "trustless recount read "
             f"{surface.count_noun(recounted_files, 'file')}; cache was ignored")
     else:
-        if pending_files:
+        if result.pending_files:
             pending_disclosure = (
-                f"{'at least ' if routine_deferred_reason else ''}"
-                f"{surface.count_noun(pending_files, 'file')} remained unverified "
-                f"({_human_bytes(pending_bytes)} of source bytes known) "
+                f"{'at least ' if result.routine_deferred_reason else ''}"
+                f"{surface.count_noun(result.pending_files, 'file')} remained unverified "
+                f"({_human_bytes(result.pending_bytes)} of source bytes known) "
                 "when the routine budget expired; ")
-        elif routine_deferred_reason or snapshot_deferred_reasons:
+        elif result.routine_deferred_reason or result.snapshot_deferred_reasons:
             pending_disclosure = (
                 "changed-file pending total was not established before the "
                 "routine cutoff; ")
         else:
             pending_disclosure = "no changed file remained pending; "
         census_disclosure = (
-            f"{surface.count_noun(cached_files, 'file')} verified from cache; "
+            f"{surface.count_noun(result.cached_files, 'file')} verified from cache; "
             "routine recounted "
             f"{surface.count_noun(recounted_files, 'uncached or changed file')} "
-            f"({_human_bytes(recounted_bytes)}); "
+            f"({_human_bytes(result.recounted_bytes)}); "
             f"{pending_disclosure}"
             "--full ignores cache and recounts every eligible file")
-        if cache_deferred_reason:
+        if result.cache_deferred_reason:
             census_disclosure += (
-                f"; census-cache acceleration deferred: {cache_deferred_reason}")
+                f"; census-cache acceleration deferred: {result.cache_deferred_reason}")
+        if result.indexed_source == "session-census":
+            census_disclosure += (
+                "; indexed-agent coverage read from the proof-bound session "
+                "census (corpus.db exceeds the routine scan tier)")
         if incomplete_reasons:
             census_disclosure += (
                 f"; routine validation incomplete/deferred: "
@@ -1837,13 +2590,13 @@ def main(argv: list[str] | None = None) -> int:
         census_disclosure += f"; census cache {cache_state}"
     census_summary = {
         "full": bool(args.full),
-        "cached_files": cached_files,
+        "cached_files": result.cached_files,
         "recounted_files": recounted_files,
-        "recounted_bytes": recounted_bytes,
-        "pending_files": pending_files,
-        "pending_bytes": pending_bytes,
-        "estimated_files": full_estimated_files if args.full else None,
-        "estimated_bytes": full_estimated_bytes if args.full else None,
+        "recounted_bytes": result.recounted_bytes,
+        "pending_files": result.pending_files,
+        "pending_bytes": result.pending_bytes,
+        "estimated_files": result.full_estimated_files if args.full else None,
+        "estimated_bytes": result.full_estimated_bytes if args.full else None,
         "cache": cache_state,
         "disclosure": census_disclosure,
     }
@@ -1853,6 +2606,9 @@ def main(argv: list[str] | None = None) -> int:
             f"full audit: evidence validation finished with status {status}",
             file=sys.stderr, flush=True)
 
+    instrumented = set(registry.ADAPTER_NAMES)
+    if args.agent:
+        instrumented &= {args.agent}
     if args.json:
         print(json.dumps({
             "status": status, "exit_code": exit_code,
@@ -1863,17 +2619,23 @@ def main(argv: list[str] | None = None) -> int:
             "gaps": len(gaps),
             "gap_details": gaps.items,
             "gap_details_omitted": gaps.omitted,
-            "orphaned_tallies": orphan_count,
+            "live": len(live),
+            "live_details": live.items,
+            "live_details_omitted": live.omitted,
+            "orphaned_tallies": result.orphan_count,
+            "orphaned_tallies_pruned": pruned,
+            "orphaned_tallies_note": prune_note or None,
             "routine": {
                 "complete": not bool(incomplete_reasons),
                 "deferred_reason": (
                     "; ".join(incomplete_reasons)
                     if incomplete_reasons else None),
-                "indexed_agents_from_cache": indexed_cache_hit,
+                "indexed_agents_from_cache": result.indexed_cache_hit,
+                "indexed_agents_source": result.indexed_source,
             },
             "census": census_summary,
         }, ensure_ascii=False))
-    elif (not per_agent and not gaps and not orphan_count
+    elif (not per_agent and not gaps and not live and not result.orphan_count
           and total_errors == 0 and problems.items == [_NO_CENSUS_PROBLEM]):
         scope = (f"no {common.terminal_safe(args.agent)} source files"
                  if args.agent else "no supported source files")
@@ -1881,21 +2643,23 @@ def main(argv: list[str] | None = None) -> int:
               "no completeness claim was made.")
     else:
         print(f"\n{'agent':<12} {'files':>6} {'tallied':>8} {'stale':>6} "
-              f"{'seen':>9} {'rows':>8} {'agent':>8} {'errors':>7}")
-        print("─" * 70)
+              f"{'live':>5} {'seen':>9} {'rows':>8} {'agent':>8} {'errors':>7}")
+        print("─" * 76)
         for agent in sorted(per_agent):
             b = per_agent[agent]
             mark = "" if agent in instrumented else "  (not instrumented yet)"
             safe_agent = common.terminal_safe(agent)
             print(f"{safe_agent:<12} {b['files']:>6} {b['tallied']:>8} {b['stale']:>6} "
+                  f"{b['live']:>5} "
                   f"{b['seen']:>9,} {b['rows']:>8,} {b['agent_rows']:>8,} "
                   f"{b['errors']:>7}{mark}")
             if b["skips"]:
+                # Skip names come from the book, a store-derived file.
                 kinds = " · ".join(f"{k} {v:,}" for k, v in sorted(b["skips"].items()))
-                print(f"{'':<12} skips: {kinds}")
+                print(f"{'':<12} skips: {common.terminal_safe(kinds)}")
             for s in b["error_samples"]:
                 print(f"{'':<12} ! {common.terminal_safe(s)}")
-        print(f"\ncounted: {census_disclosure}")
+        print(f"\ncounted: {common.terminal_safe(census_disclosure)}")
         if problems:
             print(f"\n{len(problems)} accounting/evidence error(s):")
             for p in problems[:20]:
@@ -1909,19 +2673,51 @@ def main(argv: list[str] | None = None) -> int:
                 gap_severity = " - errors because --strict was requested"
             else:
                 gap_severity = " - warnings"
-            print(f"\n{len(gaps)} audit evidence gap(s) "
-                  f"({surface.REMEDIES['audit-gap'].text})"
-                  + gap_severity)
+            blocked_remedy = (source_health.sidecar_block_remedy()
+                              if result.blocked_gaps else None)
+            if (blocked_remedy
+                    and result.blocked_gaps + result.interrupted_gaps == len(gaps)):
+                gap_remedy = blocked_remedy
+            elif result.interrupted_gaps != len(gaps):
+                gap_remedy = surface.REMEDIES["audit-gap"].text
+            elif derived_anchor.newer_anchor() is not None:
+                gap_remedy = _interrupted_index()
+            else:
+                # Any store's blocked sidecar (the event store's too) stops the pass that clears
+                # the journal; a hold does not, since any pass rolls corpus.db back.
+                gap_remedy = (source_health.sidecar_block_remedy()
+                              or source_health.command_remedy("audit-gap-interrupted", "index"))
+            print(f"\n{len(gaps)} audit evidence gap(s) ({gap_remedy})" + gap_severity)
             for g in gaps[:10]:
                 print(f"  - {common.terminal_safe(g)}")
             if len(gaps) > 10:
                 print(f"  … {len(gaps) - 10} additional gap(s) omitted")
-        if orphan_count:
+        if live:
+            if exit_code == 2 and (problems or total_errors):
+                live_severity = " - warnings in addition to the errors above"
+            elif args.strict:
+                live_severity = " - errors because --strict was requested"
+            else:
+                live_severity = " - warnings"
+            print(f"\n{surface.count_noun(len(live), 'live/uncertified evidence item')} "
+                  f"({surface.REMEDIES['audit-live'].text})"
+                  + live_severity)
+            for item in live[:10]:
+                print(f"  ~ {common.terminal_safe(item)}")
+            if len(live) > 10:
+                print(f"  … {len(live) - 10} additional live item(s) omitted")
+        if result.orphan_count:
+            if pruned:
+                orphan_note = f"; {surface.count_noun(pruned, 'tally')} pruned from the book"
+            else:
+                orphan_note = (
+                    f"; not pruned: {common.terminal_safe(prune_note)}"
+                    if prune_note else "")
             print(
-                f"\n{surface.count_noun(orphan_count, 'tallied file')} "
+                f"\n{surface.count_noun(result.orphan_count, 'tallied file')} "
                 "no longer on disk "
-                "(rotated/deleted)")
-        if status == "clean" and verified_by_agent:
+                f"(rotated/deleted){orphan_note}")
+        if status == "clean" and result.verified_by_agent:
             print("\naudit clean: every seen record is accounted for.")
 
     return exit_code

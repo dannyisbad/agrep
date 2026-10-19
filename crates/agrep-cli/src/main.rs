@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -216,6 +216,7 @@ fn require_semantic_q8_output_ownership(output_dir: &Path) -> anyhow::Result<()>
 const ROOT_STAGING_ARTIFACTS: &[&str] = &[
     ".boundary_stats.bin",
     ".changed_sessions",
+    ".consent_pending",
     ".derived-owner.json",
     ".derived_generation.json",
     ".harness_prefixes.snapshot",
@@ -223,6 +224,7 @@ const ROOT_STAGING_ARTIFACTS: &[&str] = &[
     ".indexd.v2.lock",
     ".ingest.sig",
     ".ingest_cache.bin",
+    ".ingest_cache.bin.head",
     ".ingest_cache.bin.journal",
     ".ingest_pending.bin",
     ".source_absence_pending",
@@ -243,8 +245,9 @@ const ROOT_STAGING_ARTIFACTS: &[&str] = &[
 const DERIVED_OWNER_FILE: &str = ".derived-owner.json";
 const DERIVED_OWNER_VERSION: u32 = 1;
 const DERIVED_OWNER_MAX_BYTES: u64 = 4096;
-const CORPUS_DB_SCHEMA_VERSION: &str = "15";
-const CORPUS_DB_RETAINED_SCHEMA_VERSION: &str = "14";
+// the retained reader accepts the last RELEASED schema (0.4.2 wrote 15; 16 never shipped)
+const CORPUS_DB_SCHEMA_VERSION: &str = "17";
+const CORPUS_DB_RETAINED_SCHEMA_VERSION: &str = "15";
 const CORPUS_DB_TRIGGER_SCHEMA: &str = "4";
 const CORPUS_DB_TRIGGER_NAMES: [&str; 7] = [
     "msgs_ad",
@@ -683,39 +686,70 @@ fn probe_corpus_db_owner(path: &Path, current: &str) -> CorpusDbOwnerProbe {
     result
 }
 
+/// (version, format) of an ownership record a newer agrep wrote: a JSON object whose integer
+/// `version` exceeds this build's. Any other shape is not newer; it is this build's record or a
+/// malformed one.
+fn newer_owner_record_version(bytes: &[u8]) -> Option<(u64, Option<u64>)> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let record = value.as_object()?;
+    let version = record.get("version")?.as_u64()?;
+    if version <= u64::from(DERIVED_OWNER_VERSION) {
+        return None;
+    }
+    let format = record.get("format").and_then(serde_json::Value::as_u64);
+    Some((version, format))
+}
+
+fn newer_owner_record_reason(version: u64, format: Option<u64>) -> String {
+    let detail = match format {
+        Some(format) => format!("ownership record version {version}, format {format}"),
+        None => format!("ownership record version {version}"),
+    };
+    format!(
+        "the data dir was written by a newer agrep ({detail}); this agrep serves it read-only; \
+         upgrade, or point AGREP_DATA_DIR elsewhere"
+    )
+}
+
 fn derived_write_ownership(data: &Path) -> DerivedWriteOwnership {
     use agrep_core::ingest_cache::CacheOwnerProbe;
 
     let current = agrep_core::ingest_cache::current_cache_writer_build_id();
     let owner_path = data.join(DERIVED_OWNER_FILE);
     let owner = match read_optional_bytes(&owner_path, DERIVED_OWNER_MAX_BYTES) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<DerivedOwnerRecord>(&bytes) {
-            Ok(record)
-                if record.version == DERIVED_OWNER_VERSION
-                    && valid_derived_build_id(&record.build_id) =>
-            {
-                if (record.legacy_corpus_db.is_some() && record.retained_corpus_db.is_some())
-                    || record.retained_corpus_db.as_ref().is_some_and(|retained| {
-                        !valid_derived_build_id(&retained.build_id)
-                            || retained.proof.name != "corpus.db"
-                            || retained.proof.len != retained.reader_identity.len
-                            || retained.proof.modified_ns != retained.reader_identity.modified_ns
-                    })
+        Ok(Some(bytes)) => {
+            if let Some((version, format)) = newer_owner_record_version(&bytes) {
+                return DerivedWriteOwnership::Refused(newer_owner_record_reason(version, format));
+            }
+            match serde_json::from_slice::<DerivedOwnerRecord>(&bytes) {
+                Ok(record)
+                    if record.version == DERIVED_OWNER_VERSION
+                        && valid_derived_build_id(&record.build_id) =>
                 {
+                    if (record.legacy_corpus_db.is_some() && record.retained_corpus_db.is_some())
+                        || record.retained_corpus_db.as_ref().is_some_and(|retained| {
+                            !valid_derived_build_id(&retained.build_id)
+                                || retained.proof.name != "corpus.db"
+                                || retained.proof.len != retained.reader_identity.len
+                                || retained.proof.modified_ns
+                                    != retained.reader_identity.modified_ns
+                        })
+                    {
+                        return DerivedWriteOwnership::Refused(format!(
+                            "derived-store ownership record {} is malformed",
+                            owner_path.display()
+                        ));
+                    }
+                    Some(record)
+                }
+                _ => {
                     return DerivedWriteOwnership::Refused(format!(
                         "derived-store ownership record {} is malformed",
                         owner_path.display()
                     ));
                 }
-                Some(record)
             }
-            _ => {
-                return DerivedWriteOwnership::Refused(format!(
-                    "derived-store ownership record {} is malformed",
-                    owner_path.display()
-                ));
-            }
-        },
+        }
         Ok(None) => None,
         Err(error) => {
             return DerivedWriteOwnership::Refused(format!(
@@ -878,18 +912,36 @@ fn daemon_owner_name(name: &str) -> bool {
                 }))
 }
 
-fn read_daemon_owner_fields(path: &Path, name: &str) -> Result<HashMap<String, String>, String> {
-    let body = match read_optional_bytes(path, DERIVED_OWNER_MAX_BYTES) {
+static FENCE_EVALUATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One freshness-daemon owner record the fence's directory scan listed, read exactly once.
+struct OwnerRecord {
+    name: String,
+    fields: Result<HashMap<String, String>, String>,
+}
+
+/// Read one owner record the scan listed. `None` when it vanished in between: its holder released
+/// or reaped it, so no writer stands behind it now and there is nothing to fence against or wait
+/// for. `vanished` is the test hook that makes a present record read that way.
+fn read_daemon_owner_record(
+    path: &Path,
+    name: &str,
+    vanished: bool,
+) -> Option<Result<HashMap<String, String>, String>> {
+    if vanished {
+        return None;
+    }
+    let body = match agrep_core::ingest::registry::read_bounded_regular_file(
+        path,
+        DERIVED_OWNER_MAX_BYTES,
+    ) {
         Ok(Some(body)) => body,
-        Ok(None) => {
-            return Err(format!(
-                "freshness-daemon owner {name} disappeared during legacy adoption"
-            ));
-        }
+        Ok(None) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            return Err(format!(
+            return Some(Err(format!(
                 "freshness-daemon owner {name} is unreadable: {error}"
-            ));
+            )));
         }
     };
     let text = match std::str::from_utf8(&body) {
@@ -900,26 +952,88 @@ fn read_daemon_owner_fields(path: &Path, name: &str) -> Result<HashMap<String, S
         {
             text
         }
-        _ => return Err(format!("freshness-daemon owner {name} is malformed")),
+        _ => return Some(Err(format!("freshness-daemon owner {name} is malformed"))),
     };
     let mut fields = HashMap::new();
     for field in text.split_ascii_whitespace() {
         let Some((key, value)) = field.split_once('=') else {
-            return Err(format!("freshness-daemon owner {name} is malformed"));
+            return Some(Err(format!("freshness-daemon owner {name} is malformed")));
         };
         if fields.insert(key.to_owned(), value.to_owned()).is_some() {
-            return Err(format!(
+            return Some(Err(format!(
                 "freshness-daemon owner {name} has duplicate fields"
-            ));
+            )));
         }
     }
-    Ok(fields)
+    Some(Ok(fields))
+}
+
+/// An exact live same-build `derived-adoption` claim; `daemon` when it is the freshness
+/// daemon's own indexing child, proven through the daemon's child fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveAdoption {
+    pid: u32,
+    daemon: bool,
+}
+
+impl LiveAdoption {
+    fn wait_notice(&self) -> String {
+        if self.daemon {
+            format!(
+                "waiting for the freshness daemon to finish updating the index (pid {}) ...",
+                self.pid
+            )
+        } else {
+            format!(
+                "waiting for another agrep indexer (pid {}) to finish updating the index ...",
+                self.pid
+            )
+        }
+    }
+
+    fn expiry_reason(&self) -> String {
+        if self.daemon {
+            format!(
+                "freshness daemon is still adopting the index (pid {}); the wait budget \
+                 expired, but this adoption finishes on its own; run `agrep index` again \
+                 after it completes",
+                self.pid
+            )
+        } else {
+            format!(
+                "another agrep indexer (pid {}) is still updating the index; the wait \
+                 budget expired; run `agrep index` again once it has finished",
+                self.pid
+            )
+        }
+    }
+}
+
+impl std::fmt::Display for LiveAdoption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.daemon {
+            write!(
+                f,
+                "the freshness daemon is adopting the index (pid {})",
+                self.pid
+            )
+        } else {
+            write!(
+                f,
+                "another agrep indexer (pid {}) is updating the index",
+                self.pid
+            )
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum AdoptionFence {
-    LiveSameWriter(u32),
+    LiveSameWriter(LiveAdoption),
     Refused(String),
+    /// A local failure publishing this writer's own claim (permissions, space); not a verdict
+    /// about any other writer, so never something to wait out.
+    Failed(String),
 }
 
 impl From<String> for AdoptionFence {
@@ -931,21 +1045,71 @@ impl From<String> for AdoptionFence {
 impl std::fmt::Display for AdoptionFence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LiveSameWriter(pid) => {
-                write!(f, "this build is already adopting the index (pid {pid})")
-            }
-            Self::Refused(reason) => f.write_str(reason),
+            Self::LiveSameWriter(live) => live.fmt(f),
+            Self::Refused(reason) | Self::Failed(reason) => f.write_str(reason),
         }
     }
 }
 
-fn live_same_writer_adoption(owners: &[(String, PathBuf)], writer: &str) -> Option<u32> {
-    let mut claim = None;
-    for (name, path) in owners {
-        if !matches!(name.as_str(), ".indexd.lock" | ".indexd.v2.lock") {
+/// Whether `path` (the `.indexd.v2.lock` slot) holds the daemon generation this launch is
+/// authorized for: the one record a derived writer shares the claim pair with.
+fn authorized_daemon_record(path: &Path, writer: &str) -> bool {
+    let Some(Ok(fields)) = read_daemon_owner_record(path, ".indexd.v2.lock", false) else {
+        return false;
+    };
+    fields.get("state").map(String::as_str) != Some("derived-adoption")
+        && fields.get("writer").map(String::as_str) == Some(writer)
+        && fields.get("token").is_some_and(|token| {
+            std::env::var(DERIVED_ADOPTION_OWNER_TOKEN_ENV).as_deref() == Ok(token)
+        })
+}
+
+fn lowercase_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether the daemon generation `token` runs `pid`/`start` as its indexing child: the child
+/// fence names the exact process the daemon launched, so a stranger's claim never qualifies.
+fn daemon_indexing_child(data: &Path, token: &str, pid: u32, start: &str) -> bool {
+    let path = data.join(format!(".indexd.v2.child.{token}"));
+    let Ok(Some(body)) = read_optional_bytes(&path, DERIVED_OWNER_MAX_BYTES) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return false;
+    };
+    if !text.ends_with('\n') {
+        return false;
+    }
+    let field = |name: &str| {
+        text.split_ascii_whitespace()
+            .filter_map(|part| part.split_once('='))
+            .find_map(|(key, value)| (key == name).then_some(value))
+    };
+    field("owner") == Some(token)
+        && field("target") == Some(pid.to_string().as_str())
+        && field("target_start") == Some(start)
+}
+
+/// Every `owners` record is an exact live same-build claim, or the daemon generation this launch
+/// is authorized for; several live claims (two claimers that each won one record) are waited on
+/// by the lowest pid.
+fn live_same_writer_adoption(
+    data: &Path,
+    owners: &[OwnerRecord],
+    writer: &str,
+) -> Option<LiveAdoption> {
+    let mut claims: Vec<(u32, String)> = Vec::new();
+    let mut daemon_token = None;
+    for record in owners {
+        let name = record.name.as_str();
+        if !matches!(name, ".indexd.lock" | ".indexd.v2.lock") {
             return None;
         }
-        let fields = read_daemon_owner_fields(path, name).ok()?;
+        let fields = record.fields.as_ref().ok()?;
         let pid_text = fields.get("pid")?;
         if !pid_text.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
@@ -957,10 +1121,7 @@ fn live_same_writer_adoption(owners: &[(String, PathBuf)], writer: &str) -> Opti
             || pid > index_lock::MAX_PID
             || !index_lock::process_is_exact_live(pid, start)
             || fields.get("writer").map(String::as_str) != Some(writer)
-            || token.len() != 32
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !lowercase_hex(token, 32)
         {
             return None;
         }
@@ -968,22 +1129,32 @@ fn live_same_writer_adoption(owners: &[(String, PathBuf)], writer: &str) -> Opti
             if fields.len() != 5 {
                 return None;
             }
-            let identity = (pid, token.clone());
-            if claim.as_ref().is_some_and(|prior| prior != &identity) {
-                return None;
-            }
-            claim = Some(identity);
-        } else if name != ".indexd.v2.lock"
-            || fields.get("protocol").map(String::as_str) != Some("2")
-            || std::env::var(DERIVED_ADOPTION_OWNER_TOKEN_ENV).as_deref() != Ok(token.as_str())
+            claims.push((pid, start.clone()));
+        } else if name == ".indexd.v2.lock"
+            && fields.get("protocol").map(String::as_str) == Some("2")
+            && std::env::var(DERIVED_ADOPTION_OWNER_TOKEN_ENV).as_deref() == Ok(token.as_str())
         {
+            daemon_token = Some(token.clone());
+        } else {
             return None;
         }
     }
-    claim.map(|(pid, _)| pid)
+    claims.sort();
+    let daemon_child = |(pid, start): &(u32, String)| {
+        daemon_token
+            .as_deref()
+            .is_some_and(|token| daemon_indexing_child(data, token, *pid, start))
+    };
+    let (pid, daemon) = match claims.iter().find(|claim| daemon_child(claim)) {
+        Some((pid, _)) => (*pid, true),
+        None => (claims.first()?.0, false),
+    };
+    Some(LiveAdoption { pid, daemon })
 }
 
 fn adoption_daemon_fence(data: &Path) -> Option<AdoptionFence> {
+    let evaluation = FENCE_EVALUATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let vanished = agrep_core::fault_injection::owner_vanish_evaluations().contains(&evaluation);
     let entries = match fs::read_dir(data) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -1032,6 +1203,16 @@ fn adoption_daemon_fence(data: &Path) -> Option<AdoptionFence> {
             }
         }
     }
+    classify_daemon_owners(data, owners, vanished)
+}
+
+/// The fence verdict over the records a scan listed. Each is read once, after the scan; one that
+/// vanished in between is dropped, so a peer's release never reads as a legacy or absent owner.
+fn classify_daemon_owners(
+    data: &Path,
+    mut owners: Vec<(String, PathBuf)>,
+    vanished: bool,
+) -> Option<AdoptionFence> {
     if owners.is_empty() {
         return None;
     }
@@ -1039,72 +1220,63 @@ fn adoption_daemon_fence(data: &Path) -> Option<AdoptionFence> {
     let current = agrep_core::ingest_cache::current_cache_writer_build_id();
     let claim_token = std::env::var(DERIVED_ADOPTION_CLAIM_TOKEN_ENV)
         .ok()
-        .filter(|value| {
-            value.len() == 32
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        });
+        .filter(|value| lowercase_hex(value, 32));
     let mut external = Vec::new();
     for (name, path) in owners {
+        let Some(fields) = read_daemon_owner_record(&path, &name, vanished) else {
+            continue;
+        };
         let claimed = claim_token.as_ref().is_some_and(|token| {
             matches!(name.as_str(), ".indexd.lock" | ".indexd.v2.lock")
-                && read_daemon_owner_fields(&path, &name).is_ok_and(|fields| {
+                && fields.as_ref().is_ok_and(|fields| {
                     fields.get("state").map(String::as_str) == Some("derived-adoption")
                         && fields.get("writer").map(String::as_str) == Some(current.as_str())
                         && fields.get("token").map(String::as_str) == Some(token.as_str())
                 })
         });
         if !claimed {
-            external.push((name, path));
+            external.push(OwnerRecord { name, fields });
         }
     }
     if external.is_empty() {
         return None;
     }
-    if let Some(pid) = live_same_writer_adoption(&external, &current) {
-        return Some(AdoptionFence::LiveSameWriter(pid));
+    if let Some(live) = live_same_writer_adoption(data, &external, &current) {
+        return Some(AdoptionFence::LiveSameWriter(live));
     }
-    if external.len() != 1 || external[0].0 == ".indexd.lock" {
+    if external.len() != 1 || external[0].name == ".indexd.lock" {
         return Some(
             format!(
                 "legacy or ambiguous freshness-daemon ownership is present ({})",
                 external
                     .iter()
-                    .map(|(name, _)| name.as_str())
+                    .map(|record| record.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
             .into(),
         );
     }
-    let fields = match read_daemon_owner_fields(&external[0].1, &external[0].0) {
+    let fields = match &external[0].fields {
         Ok(fields) => fields,
-        Err(reason) => return Some(reason.into()),
+        Err(reason) => return Some(reason.clone().into()),
     };
     if fields.get("writer").map(String::as_str) != Some(current.as_str()) {
         return Some(
             format!(
                 "freshness-daemon owner {} belongs to a different writing build",
-                external[0].0
+                external[0].name
             )
             .into(),
         );
     }
     let expected_token = match std::env::var(DERIVED_ADOPTION_OWNER_TOKEN_ENV) {
-        Ok(value)
-            if value.len() == 32
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
-        {
-            value
-        }
+        Ok(value) if lowercase_hex(&value, 32) => value,
         _ => {
             return Some(
                 format!(
                     "freshness-daemon owner {} is not authorized for this derived write",
-                    external[0].0
+                    external[0].name
                 )
                 .into(),
             );
@@ -1114,7 +1286,7 @@ fn adoption_daemon_fence(data: &Path) -> Option<AdoptionFence> {
         return Some(
             format!(
                 "freshness-daemon owner {} belongs to a different writing generation",
-                external[0].0
+                external[0].name
             )
             .into(),
         );
@@ -1130,20 +1302,35 @@ struct AdoptionClaim {
     files: Vec<(PathBuf, Vec<u8>)>,
 }
 
+/// Attempts to hold both claim records before the claim is reported as settled; each retry only
+/// runs after a fence pass found a record vacant, so the bound is a churn limit, not a timer.
+const CLAIM_SETTLE_ATTEMPTS: usize = 8;
+
 impl AdoptionClaim {
     fn acquire(data: &Path) -> Result<Self, AdoptionFence> {
+        Self::acquire_with(data, || {})
+    }
+
+    /// `between_publish_and_fence` runs after each publish round, before the fence that settles
+    /// it: the window a peer's record can land in. Tests inject that activity; callers pass a no-op.
+    fn acquire_with(
+        data: &Path,
+        mut between_publish_and_fence: impl FnMut(),
+    ) -> Result<Self, AdoptionFence> {
         if let Some(reason) = adoption_daemon_fence(data) {
             return Err(reason);
         }
         fs::create_dir_all(data).map_err(|error| {
-            format!(
+            AdoptionFence::Failed(format!(
                 "cannot create derived-store directory {}: {error}",
                 data.display()
-            )
+            ))
         })?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| format!("cannot create derived-adoption claim: {error}"))?
+            .map_err(|error| {
+                AdoptionFence::Failed(format!("cannot create derived-adoption claim: {error}"))
+            })?
             .as_nanos();
         let token = format!(
             "{:08x}{:024x}",
@@ -1162,25 +1349,42 @@ impl AdoptionClaim {
             token,
             files: Vec::new(),
         };
-        for name in [".indexd.lock", ".indexd.v2.lock"] {
-            let path = data.join(name);
-            match publish_claim_record(&path, &raw, nanos) {
-                Ok(true) => claim.files.push((path, raw.clone())),
-                Ok(false) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot publish derived-adoption claim {}: {error}",
-                        path.display()
-                    )
-                    .into());
+        std::env::set_var(DERIVED_ADOPTION_CLAIM_TOKEN_ENV, &claim.token);
+        let slots = [".indexd.lock", ".indexd.v2.lock"].map(|name| data.join(name));
+        let covered = |claim: &Self, slot: &Path| {
+            claim.files.iter().any(|(path, _)| path == slot)
+                || (slot == slots[1] && authorized_daemon_record(slot, &current))
+        };
+        // A slot another claimer held at publish time, then released before the fence passed,
+        // would stay open to a later claimer during this writer's locked section: publish again
+        // until both slots are this claim's or the authorized daemon's.
+        for _ in 0..CLAIM_SETTLE_ATTEMPTS {
+            for slot in &slots {
+                if covered(&claim, slot) {
+                    continue;
+                }
+                match publish_claim_record(slot, &raw, nanos) {
+                    Ok(true) => claim.files.push((slot.clone(), raw.clone())),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(AdoptionFence::Failed(format!(
+                            "cannot publish derived-adoption claim {}: {error}",
+                            slot.display()
+                        )));
+                    }
                 }
             }
+            between_publish_and_fence();
+            if let Some(reason) = adoption_daemon_fence(data) {
+                return Err(reason);
+            }
+            if slots.iter().all(|slot| covered(&claim, slot)) {
+                return Ok(claim);
+            }
         }
-        std::env::set_var(DERIVED_ADOPTION_CLAIM_TOKEN_ENV, &claim.token);
-        if let Some(reason) = adoption_daemon_fence(data) {
-            return Err(reason);
-        }
-        Ok(claim)
+        Err(AdoptionFence::Refused(
+            "derived-adoption claim records kept changing hands".to_owned(),
+        ))
     }
 }
 
@@ -1212,7 +1416,7 @@ fn write_claim_record_in_place(path: &Path, raw: &[u8]) -> std::io::Result<bool>
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) if index_lock::exclusive_create_contended(path, &error) => return Ok(false),
         Err(error) => return Err(error),
     };
     if let Err(error) = file.write_all(raw).and_then(|()| file.sync_all()) {
@@ -1250,6 +1454,27 @@ fn remove_derived_artifact(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot discard {}: {error}", path.display())),
     }
+}
+
+/// Discard a foreign parse cache that cannot be adopted: a directory standing where a sidecar
+/// belongs moved aside, then the base, then its sidecars. Whatever a failed removal leaves is the
+/// whole evidence (base, journal, head) or sidecars a new base instance ignores; never a base
+/// without the head that dates it, which the next takeover would adopt stale.
+fn discard_foreign_cache(
+    data: &Path,
+    mut remove: impl FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let cache_path = data.join(".ingest_cache.bin");
+    let journal = data.join(".ingest_cache.bin.journal");
+    let head = data.join(".ingest_cache.bin.head");
+    for (sidecar, kind) in [(&journal, "journal"), (&head, "head")] {
+        agrep_core::ingest_cache::displace_sidecar_directory(sidecar, kind)
+            .map_err(|error| error.to_string())?;
+    }
+    for path in [&cache_path, &journal, &head] {
+        remove(path)?;
+    }
+    Ok(())
 }
 
 /// The rollback journal a writer leaves on disk only while it is mid-transaction - or after
@@ -1389,10 +1614,8 @@ fn take_over_foreign_derived_stores(data: &Path, reason: &str) -> Result<bool, S
                     format!("foreign parse cache verified and adopted ({adopted} sources)")
                 }
                 Err(_) => {
-                    for path in [&cache_path, &data.join(".ingest_cache.bin.journal")] {
-                        remove_derived_artifact(path)
-                            .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
-                    }
+                    discard_foreign_cache(data, remove_derived_artifact)
+                        .map_err(|error| format!("{reason}; takeover declined: {error}"))?;
                     cache_discarded = true;
                     String::from("foreign parse cache discarded")
                 }
@@ -1591,7 +1814,6 @@ fn require_corpus_schema_sql(
     kind: &str,
     name: &str,
     expected: &str,
-    compatible: Option<&str>,
     schema_version: &str,
 ) -> Result<(), CorpusDbAdoptionError> {
     let observed: String = connection
@@ -1603,10 +1825,7 @@ fn require_corpus_schema_sql(
         .map_err(|error| {
             corpus_adoption_sqlite_error("search schema inventory failed", error, true)
         })?;
-    let observed = normalized_corpus_schema_sql(&observed);
-    if observed != normalized_corpus_schema_sql(expected)
-        && compatible.is_none_or(|sql| observed != normalized_corpus_schema_sql(sql))
-    {
+    if normalized_corpus_schema_sql(&observed) != normalized_corpus_schema_sql(expected) {
         return Err(CorpusDbAdoptionError::Rebuildable(format!(
             "corpus.db adoption declined: {kind} {name} does not match schema {schema_version}"
         )));
@@ -1850,10 +2069,6 @@ fn validate_corpus_search_schema_with(
             kind,
             name,
             sql,
-            (retained_reader && name == "session_family").then_some(
-                "CREATE TABLE session_family(
-                    session TEXT PRIMARY KEY, root TEXT NOT NULL) WITHOUT ROWID",
-            ),
             if retained_reader {
                 CORPUS_DB_RETAINED_SCHEMA_VERSION
             } else {
@@ -2633,6 +2848,16 @@ enum Cmd {
         /// greps this stream so hits print during the cold parse, not after it.
         #[arg(long)]
         emit_rows: bool,
+        /// Re-read sources even when nothing changed while source health records a failed
+        /// read (any record but an attribution gap). Explicit user-requested passes set it;
+        /// automatic passes keep the unchanged-source shortcut.
+        #[arg(long)]
+        retry_failed_sources: bool,
+        /// The consent of an explicit rebuild (`agrep reindex --full`) to publish without what
+        /// failed to read and has no complete cache fallback: each is named and stays on source
+        /// health until a pass reads it. Daemon, `agrep index` and other passes never set it.
+        #[arg(long, requires = "full")]
+        drop_unreadable: bool,
     },
     /// Probe for detected-but-not-indexed stores and print `[{"name","count"}]` as JSON.
     Detect,
@@ -2734,11 +2959,13 @@ fn run() -> anyhow::Result<()> {
             agent,
             full,
             emit_rows,
+            retry_failed_sources,
+            drop_unreadable,
         } => {
             if emit_rows {
                 agrep_core::emit::enable();
             }
-            index_cmd(&agent, full)
+            index_cmd(&agent, full, retry_failed_sources, drop_unreadable)
         }
         Cmd::Detect => detect_cmd(),
         Cmd::Stores {
@@ -3462,33 +3689,31 @@ fn stores_cmd(paths: bool, census: bool, tokens: bool, audit: bool, agent: &str)
         return Ok(());
     }
     if tokens {
+        let data = data_dir()?;
+        let decoded = agrep_core::ingest_cache::CacheView::read(&data.join(".ingest_cache.bin"));
         let mut items = Vec::new();
         for adapter in ingest::registry::ADAPTERS {
             if adapter.fingerprint() != ingest::registry::Fingerprint::Token {
                 continue;
             }
-            match adapter.intake_tokens() {
-                ingest::registry::TokenAvailability::Data(rows) => {
-                    items.extend(rows.into_iter().map(|(id, key)| {
-                        serde_json::json!({
-                            "name": adapter.name(), "id": id, "key": key,
-                            "state": "token",
-                        })
-                    }));
-                }
-                ingest::registry::TokenAvailability::Empty => {}
-                ingest::registry::TokenAvailability::Unreadable(issues) => {
-                    items.extend(issues.into_iter().map(|issue| {
-                        serde_json::json!({
-                            "name": adapter.name(),
-                            "path": issue.path,
-                            "state": "source-unreadable",
-                            "kind": "token-census-unreadable",
-                            "reason": issue.reason,
-                        })
-                    }));
-                }
-            }
+            let (rows, unreadable) = adapter
+                .intake_tokens_with(decoded.as_ref().ok())
+                .into_parts();
+            items.extend(rows.into_iter().map(|(id, key)| {
+                serde_json::json!({
+                    "name": adapter.name(), "id": id, "key": key,
+                    "state": "token",
+                })
+            }));
+            items.extend(unreadable.into_iter().map(|issue| {
+                serde_json::json!({
+                    "name": adapter.name(),
+                    "path": issue.path,
+                    "state": "source-unreadable",
+                    "kind": "token-census-unreadable",
+                    "reason": issue.reason,
+                })
+            }));
         }
         println!("{}", serde_json::to_string(&items)?);
         return Ok(());
@@ -3529,7 +3754,12 @@ fn stores_cmd(paths: bool, census: bool, tokens: bool, audit: bool, agent: &str)
                 })
             }));
         }
-        path_items.extend(durable_issues.iter().map(|issue| {
+        // An attribution-only record names no store member: it stays off the listing drift
+        // digests, carried by the census row's issues and doctor instead.
+        let members = durable_issues
+            .iter()
+            .filter(|issue| !attribution_only_record(issue));
+        path_items.extend(members.map(|issue| {
             serde_json::json!({
                 "name": issue.get("agent").and_then(|value| value.as_str()).unwrap_or("all"),
                 "path": issue.get("path").and_then(|value| value.as_str()).unwrap_or(""),
@@ -3538,6 +3768,7 @@ fn stores_cmd(paths: bool, census: bool, tokens: bool, audit: bool, agent: &str)
                 "reason": issue.get("reason").and_then(|value| value.as_str()).unwrap_or("read failed"),
             })
         }));
+        path_items = most_specific_per_path(path_items);
     }
     if paths {
         println!("{}", serde_json::to_string(&path_items)?);
@@ -3588,6 +3819,16 @@ fn stores_cmd(paths: bool, census: bool, tokens: bool, audit: bool, agent: &str)
     Ok(())
 }
 
+fn attribution_only_record(issue: &serde_json::Value) -> bool {
+    issue
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .is_some_and(ingest::registry::attribution_only_issue)
+}
+
+/// A durable record names the store unreadable, except an attribution-only one: every chat of
+/// that store was read, so it stays available (drift keeps checking it) with the issue listed,
+/// and an agent the census does not list has no store for such a record to describe.
 fn apply_durable_store_issues(
     items: &mut Vec<serde_json::Value>,
     durable_issues: Vec<serde_json::Value>,
@@ -3597,9 +3838,12 @@ fn apply_durable_store_issues(
             .get("agent")
             .and_then(|value| value.as_str())
             .unwrap_or("all");
+        let unreadable = !attribution_only_record(&issue);
         if agent == "all" && !items.is_empty() {
             for item in items.iter_mut() {
-                item["state"] = serde_json::json!("source-unreadable");
+                if unreadable {
+                    item["state"] = serde_json::json!("source-unreadable");
+                }
                 if let Some(issues) = item
                     .get_mut("issues")
                     .and_then(|value| value.as_array_mut())
@@ -3615,7 +3859,9 @@ fn apply_durable_store_issues(
             .iter_mut()
             .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(agent))
         {
-            item["state"] = serde_json::json!("source-unreadable");
+            if unreadable {
+                item["state"] = serde_json::json!("source-unreadable");
+            }
             if let Some(issues) = item
                 .get_mut("issues")
                 .and_then(|value| value.as_array_mut())
@@ -3624,7 +3870,7 @@ fn apply_durable_store_issues(
                     issues.push(issue);
                 }
             }
-        } else {
+        } else if unreadable {
             items.push(serde_json::json!({
                 "name": agent,
                 "files": 0,
@@ -3634,6 +3880,50 @@ fn apply_durable_store_issues(
             }));
         }
     }
+}
+
+/// A durable kind names what the user must change; the first record of it is kept.
+fn issue_kind_rank(kind: &str) -> u8 {
+    match kind {
+        "permission-denied" => 0,
+        "unsupported-file-type" | "unsupported-link" | "invalid-mtime" => 1,
+        "source-read-failed" | "source-stat-failed" | "io-error" => 2,
+        _ => 3,
+    }
+}
+
+/// One unreadable record per (name, path) in `stores --paths`, the most specific kind, at the
+/// position its first record held; an available row for the same path stays beside it.
+fn most_specific_per_path(items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let field = |item: &serde_json::Value, key: &str| -> String {
+        item.get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(items.len());
+    let mut slots: HashMap<(String, String), usize> = HashMap::new();
+    for item in items {
+        if field(&item, "state") != "source-unreadable" {
+            kept.push(item);
+            continue;
+        }
+        let key = (field(&item, "name"), field(&item, "path"));
+        match slots.get(&key) {
+            None => {
+                slots.insert(key, kept.len());
+                kept.push(item);
+            }
+            Some(&slot)
+                if issue_kind_rank(&field(&item, "kind"))
+                    < issue_kind_rank(&field(&kept[slot], "kind")) =>
+            {
+                kept[slot] = item;
+            }
+            Some(_) => {}
+        }
+    }
+    kept
 }
 
 const SOURCE_HEALTH_FILE: &str = ".source-health.json";
@@ -3657,6 +3947,39 @@ fn source_health_records(data: &Path) -> anyhow::Result<Vec<serde_json::Value>> 
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("source health record is malformed"))?;
     Ok(records)
+}
+
+/// Whether source health holds a failed read a retry may clear: any record but an attribution
+/// gap, or a record too damaged to tell.
+fn source_health_records_failure(data: &Path) -> bool {
+    source_health_records(data).map_or(true, |records| {
+        records.iter().any(|record| {
+            !record
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .is_some_and(ingest::registry::attribution_only_issue)
+        })
+    })
+}
+
+/// Whether a record on source health holds publication back: only a pass that reads the source
+/// again may keep that mark, since a retryable or mended failure retires it.
+fn source_health_holds_publication(data: &Path) -> bool {
+    source_health_records(data).is_ok_and(|records| {
+        records
+            .iter()
+            .any(|record| record.get("blocks_publication") == Some(&serde_json::Value::Bool(true)))
+    })
+}
+
+/// Whether source health records a failure a retry may still clear: an automatic pass reads the
+/// sources again rather than take the shortcut past it.
+fn source_health_retry_pending(data: &Path) -> bool {
+    source_health_records(data).is_ok_and(|records| {
+        records
+            .iter()
+            .any(|record| record.get("retry") == Some(&serde_json::Value::Bool(true)))
+    })
 }
 
 const WHY_SOURCE_VERSION: u32 = 1;
@@ -3729,13 +4052,20 @@ fn why_source_cmd(only: &[PathBuf]) -> anyhow::Result<()> {
                 if !selected(path) {
                     continue;
                 }
-                issues.push(serde_json::json!({
+                let mut issue = serde_json::json!({
                     "agent": record.get("agent").and_then(serde_json::Value::as_str).unwrap_or("all"),
                     "path": path,
                     "kind": record.get("kind").and_then(serde_json::Value::as_str).unwrap_or("source-read-failed"),
                     "reason": record.get("reason").and_then(serde_json::Value::as_str).unwrap_or("read failed"),
                     "durable": true,
-                }));
+                    "session": record.get("session").and_then(serde_json::Value::as_str),
+                });
+                for flag in ["blocks_publication", "rebuild"] {
+                    if let Some(value @ serde_json::Value::Bool(_)) = record.get(flag) {
+                        issue[flag] = value.clone();
+                    }
+                }
+                issues.push(issue);
             }
         }
         Err(error) => issues.push(serde_json::json!({
@@ -3747,44 +4077,46 @@ fn why_source_cmd(only: &[PathBuf]) -> anyhow::Result<()> {
         })),
     }
 
+    // One decode serves the token census and the session claims: a commit landing between two
+    // reads could otherwise mix generations.
+    let cache_path = data.join(".ingest_cache.bin");
+    let decoded = agrep_core::ingest_cache::CacheView::read(&cache_path);
     let mut tokens = Vec::new();
     let mut live_tokens: HashMap<String, String> = HashMap::new();
     for adapter in ingest::registry::ADAPTERS {
         if adapter.fingerprint() != ingest::registry::Fingerprint::Token {
             continue;
         }
-        match adapter.intake_tokens() {
-            ingest::registry::TokenAvailability::Data(rows) => {
-                for (id, key) in rows {
-                    let path = agrep_core::intake::parse_token_id(&id).map(|(path, _)| path);
-                    if !path.as_deref().is_some_and(&selected) {
-                        continue;
-                    }
-                    tokens.push(serde_json::json!({
-                        "agent": adapter.name(), "id": id, "key": key, "state": "token",
-                    }));
-                    live_tokens.insert(id, key);
-                }
+        let (rows, unreadable) = adapter
+            .intake_tokens_with(decoded.as_ref().ok())
+            .into_parts();
+        for (id, key) in rows {
+            let path = agrep_core::intake::parse_token_id(&id).map(|(path, _)| path);
+            if !path.as_deref().is_some_and(&selected) {
+                continue;
             }
-            ingest::registry::TokenAvailability::Empty => {}
-            ingest::registry::TokenAvailability::Unreadable(unreadable) => {
-                for issue in unreadable {
-                    issues.push(serde_json::json!({
-                        "agent": adapter.name(),
-                        "path": issue.path,
-                        "kind": "token-census-unreadable",
-                        "reason": issue.reason,
-                        "durable": false,
-                    }));
-                }
-            }
+            tokens.push(serde_json::json!({
+                "agent": adapter.name(), "id": id, "key": key, "state": "token",
+            }));
+            live_tokens.insert(id, key);
+        }
+        for issue in unreadable {
+            issues.push(serde_json::json!({
+                "agent": adapter.name(),
+                "path": issue.path,
+                "kind": "token-census-unreadable",
+                "reason": issue.reason,
+                "durable": false,
+                "provisional": issue.provisional,
+                "hidden": issue.hidden,
+            }));
         }
     }
 
-    let cache_path = data.join(".ingest_cache.bin");
-    let cache = match agrep_core::ingest_cache::session_sources_at(&cache_path) {
-        Ok(claims) => {
-            let sessions: Vec<_> = claims
+    let cache = match &decoded {
+        Ok(view) => {
+            let sessions: Vec<_> = view
+                .session_sources()
                 .into_iter()
                 .filter(|(path, _, _)| selected(&path.to_string_lossy()))
                 .map(|(path, agent, session)| {
@@ -3797,7 +4129,7 @@ fn why_source_cmd(only: &[PathBuf]) -> anyhow::Result<()> {
             serde_json::json!({"state": "ok", "sessions": sessions})
         }
         Err(refusal) => serde_json::json!({
-            "state": if refusal == agrep_core::ingest_cache::CacheDecodeRefusal::MissingFile {
+            "state": if *refusal == agrep_core::ingest_cache::CacheDecodeRefusal::MissingFile {
                 "missing"
             } else {
                 "unreadable"
@@ -3872,7 +4204,15 @@ fn why_source_cmd(only: &[PathBuf]) -> anyhow::Result<()> {
 }
 
 fn write_source_health(data: &Path, mut records: Vec<serde_json::Value>) -> anyhow::Result<()> {
-    records.sort_by_cached_key(|record| serde_json::to_string(record).unwrap_or_default());
+    // Ordered as before identities existed: the first record surfaces name stays the same.
+    records.sort_by_cached_key(|record| {
+        let mut key = record.clone();
+        if let Some(fields) = key.as_object_mut() {
+            fields.remove("identity");
+            fields.remove("retry");
+        }
+        serde_json::to_string(&key).unwrap_or_default()
+    });
     records.dedup();
     let body = serde_json::to_vec(&serde_json::json!({
         "code": "source-unreadable",
@@ -3881,11 +4221,11 @@ fn write_source_health(data: &Path, mut records: Vec<serde_json::Value>) -> anyh
     cache::write_bytes_atomic(&data.join(SOURCE_HEALTH_FILE), &body)
 }
 
+/// `current` holds this pass's records, each stamped with its identity.
 fn publish_source_unreadable(
     data: &Path,
     agent: &str,
-    issues: &[ingest::registry::SourceIssue],
-    runtime_issues: &[agrep_core::ingest_cache::SourceReadIssue],
+    mut current: Vec<serde_json::Value>,
     fallback_reason: &str,
 ) -> anyhow::Result<()> {
     let mut records = source_health_records(data)?;
@@ -3895,18 +4235,6 @@ fn publish_source_unreadable(
         records
             .retain(|record| record.get("agent").and_then(|value| value.as_str()) != Some(agent));
     }
-    let mut current: Vec<_> = issues
-        .iter()
-        .map(|issue| {
-            serde_json::json!({
-                "agent": issue.agent(),
-                "path": issue.path(),
-                "kind": issue.kind(),
-                "reason": issue.reason(),
-            })
-        })
-        .collect();
-    current.extend(runtime_issues.iter().map(runtime_source_issue_value));
     if current.is_empty() {
         current.extend(
             ingest::registry::runtime_issue_roots(agent)
@@ -3938,64 +4266,154 @@ fn add_source_read_issues(
     write_source_health(data, records)
 }
 
+/// `session` is present only for a failure the collector tied to one conversation; a reader
+/// without it, or of a record without it, attributes the failure to no chat.
 fn runtime_source_issue_value(
     issue: &agrep_core::ingest_cache::SourceReadIssue,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "agent": issue.agent,
         "path": issue.path.to_string_lossy(),
         "kind": issue.kind,
         "reason": issue.reason,
-    })
+    });
+    if let Some(session) = issue.session.as_deref() {
+        value["session"] = serde_json::Value::String(session.to_owned());
+    }
+    value
 }
 
-/// The first issue `settled`/`read_settled` cannot publish past, or the first issue at all when
+/// The first issue `settled`/`read_settled` cannot publish past, a read whose material the
+/// published generation may hold before one proven unpublished, or the first issue at all when
 /// every one is settled (the pass was held back for another reason).
 fn blocking_source_issue_label(
     issues: &[ingest::registry::SourceIssue],
     runtime_issues: &[agrep_core::ingest_cache::SourceReadIssue],
     settled: impl Fn(&ingest::registry::SourceIssue) -> bool,
     read_settled: impl Fn(&agrep_core::ingest_cache::SourceReadIssue) -> bool,
+    read_holds_rows: impl Fn(&agrep_core::ingest_cache::SourceReadIssue) -> bool,
 ) -> Option<String> {
-    let label = |issue: &ingest::registry::SourceIssue| {
-        format!(
-            "agent {}: {} ({}: {})",
-            issue.agent(),
-            issue.path(),
-            issue.kind(),
-            issue.reason()
-        )
-    };
-    let read_label = |issue: &agrep_core::ingest_cache::SourceReadIssue| {
-        format!(
-            "agent {}: {} ({}: {})",
-            issue.agent,
-            issue.path.to_string_lossy(),
-            issue.kind,
-            issue.reason
-        )
-    };
+    let unsettled = || runtime_issues.iter().filter(|issue| !read_settled(issue));
     issues
         .iter()
         .find(|issue| !settled(issue))
-        .map(label)
-        .or_else(|| {
-            runtime_issues
-                .iter()
-                .find(|issue| !read_settled(issue))
-                .map(read_label)
-        })
-        .or_else(|| issues.first().map(label))
-        .or_else(|| runtime_issues.first().map(read_label))
+        .map(source_issue_label)
+        .or_else(|| unsettled().find(|issue| read_holds_rows(issue)).map(read_issue_label))
+        .or_else(|| unsettled().next().map(read_issue_label))
+        .or_else(|| issues.first().map(source_issue_label))
+        .or_else(|| runtime_issues.first().map(read_issue_label))
+}
+
+fn source_issue_value(issue: &ingest::registry::SourceIssue) -> serde_json::Value {
+    serde_json::json!({
+        "agent": issue.agent(),
+        "path": issue.path(),
+        "kind": issue.kind(),
+        "reason": issue.reason(),
+    })
+}
+
+fn source_issue_label(issue: &ingest::registry::SourceIssue) -> String {
+    format!(
+        "agent {}: {} ({}: {})",
+        issue.agent(),
+        issue.path(),
+        issue.kind(),
+        issue.reason()
+    )
+}
+
+/// Names the conversation a read failed on, where the collector tied it to one.
+fn read_issue_label(issue: &agrep_core::ingest_cache::SourceReadIssue) -> String {
+    let conversation = issue
+        .session
+        .as_deref()
+        .map(|session| format!(" conversation {session}"))
+        .unwrap_or_default();
+    format!(
+        "agent {}: {}{conversation} ({}: {})",
+        issue.agent,
+        issue.path.to_string_lossy(),
+        issue.kind,
+        issue.reason
+    )
+}
+
+/// Marks each record of `held` on source health as holding publication back; one no rebuild
+/// can help (all that was published) also carries `"rebuild": false`.
+fn mark_held(
+    data: &Path,
+    held: &[(&str, String, serde_json::Value)],
+    rebuild: bool,
+) -> anyhow::Result<()> {
+    let mut records = source_health_records(data)?;
+    for record in &mut records {
+        if held.iter().any(|(_, _, value)| value == record) {
+            record["blocks_publication"] = serde_json::Value::Bool(true);
+            if !rebuild {
+                record["rebuild"] = serde_json::Value::Bool(false);
+            }
+        }
+    }
+    write_source_health(data, records)
+}
+
+/// A refusal only an explicit rebuild's consent lifts: source health marks each record of
+/// `dropped` as holding publication back, so status, doctor and audit give the refusal's remedy.
+/// Returns the refusal's detail and remedy.
+fn withhold_for_consent(
+    data: &Path,
+    dropped: &[(&str, String, serde_json::Value)],
+) -> anyhow::Result<(Option<String>, String)> {
+    mark_held(data, dropped, true)?;
+    let (detail, agents, them) = material_names(dropped);
+    let they = if them == "it" { "it is" } else { "they are" };
+    Ok((
+        Some(detail),
+        format!(
+            " - fix or remove {them} in {agents}, or run `agrep reindex --full` to rebuild \
+             without {them} ({they} indexed again once readable)"
+        ),
+    ))
+}
+
+/// Names unreadable material as audit does (the first three, then a count), its agents, and
+/// the pronoun for it.
+fn material_names(
+    dropped: &[(&str, String, serde_json::Value)],
+) -> (String, String, &'static str) {
+    let mut detail = dropped
+        .iter()
+        .take(3)
+        .map(|(_, label, _)| label.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if dropped.len() > 3 {
+        detail.push_str(&format!("; and {} more", dropped.len() - 3));
+    }
+    let mut agents: Vec<&str> = Vec::new();
+    for (agent, _, _) in dropped {
+        if !agents.contains(agent) {
+            agents.push(agent);
+        }
+    }
+    let them = if dropped.len() == 1 { "it" } else { "them" };
+    (detail, agents.join(", "), them)
 }
 
 /// Source defects the snapshot itself serializes and a retry cannot heal: only the user can
-/// grant permission or replace an unsupported file. Content unreadable behind a healthy stamp
-/// (torn writes, locked stores) is transient and deliberately absent from this list.
+/// grant permission, replace an unsupported or corrupt file, or let its agent recover a journal.
+/// Content unreadable behind a healthy stamp (torn writes, locked stores) is transient and
+/// deliberately absent from this list.
 fn durable_source_issue(kind: &str) -> bool {
     matches!(
         kind,
-        "permission-denied" | "unsupported-link" | "unsupported-file-type" | "invalid-mtime"
+        "permission-denied"
+            | "unsupported-link"
+            | "unsupported-file-type"
+            | "invalid-mtime"
+            | "corrupt-database"
+            | "needs-recovery"
     )
 }
 
@@ -4011,10 +4429,18 @@ fn disclose_cache_refusal(
     IngestCache,
     Option<agrep_core::ingest_cache::CacheDecodeRefusal>,
 ) {
-    if let Some(refusal) = refusal.filter(|refusal| refusal.is_undecodable()) {
-        agrep_core::emit::human_line(format_args!(
-            "  discarded an undecodable parse cache ({refusal}); rebuilding it from sources"
-        ));
+    match refusal {
+        Some(refusal) if refusal.is_undecodable() => {
+            agrep_core::emit::human_line(format_args!(
+                "  discarded an undecodable parse cache ({refusal}); rebuilding it from sources"
+            ));
+        }
+        Some(agrep_core::ingest_cache::CacheDecodeRefusal::StaleJournal) => {
+            agrep_core::emit::human_line(format_args!(
+                "  parse cache journal is behind its last commit; rebuilding the cache from sources"
+            ));
+        }
+        _ => {}
     }
     (cache, refusal)
 }
@@ -4063,12 +4489,12 @@ fn preserve_signal_age(
 fn ingest_agent(
     agent: &str,
     cache: &mut IngestCache,
-    harness_prefixes: &[String],
+    harness: &HarnessPolicy,
 ) -> anyhow::Result<(Vec<Message>, Vec<Event>, HashSet<String>)> {
     let started = Instant::now();
     let (msgs, events, repaired_sessions) = ingest::registry::collect(agent, cache)?;
     let collected = started.elapsed();
-    let msgs = normalize_messages(msgs, harness_prefixes);
+    let msgs = normalize_messages(msgs, harness);
     if std::env::var_os("AGREP_DEBUG").is_some() {
         eprintln!(
             "* [agrep ingest] collect {:.1}ms · normalize {:.1}ms",
@@ -4081,7 +4507,7 @@ fn ingest_agent(
 
 // Classification lives in agrep_core::row_class: one owned artifact shared by
 // this normalize pass and the streamed `--emit-rows` row emission.
-use agrep_core::row_class::{row_kind, RowKind};
+use agrep_core::row_class::{row_kind, HarnessPolicy, RowKind};
 
 #[inline]
 fn set_arc_str(value: &mut Arc<str>, desired: &str) {
@@ -4090,12 +4516,12 @@ fn set_arc_str(value: &mut Arc<str>, desired: &str) {
     }
 }
 
-fn normalize_messages(msgs: Vec<Message>, harness_prefixes: &[String]) -> Vec<Message> {
+fn normalize_messages(msgs: Vec<Message>, harness: &HarnessPolicy) -> Vec<Message> {
     // row_kind is cheap per row: one sequential pass is faster and less scheduler-sensitive
     // than dispatching thousands of tiny rayon jobs.
     let kinds: Vec<RowKind> = msgs
         .iter()
-        .map(|message| row_kind(message, harness_prefixes))
+        .map(|message| row_kind(message, harness))
         .collect();
     let needs_model_backfill = msgs.iter().zip(&kinds).any(|(m, kind)| {
         matches!(kind, RowKind::User | RowKind::Subagent) && m.model.trim().is_empty()
@@ -4243,6 +4669,13 @@ fn content_sig(msgs: &[Message], aliases: &[cache::SessionAlias]) -> u64 {
             h = fnv(h, m.project.as_bytes()); // project is a written column; a relabel must re-sig
             h = fnv(h, m.reply.as_bytes());
             h = fnv(h, &m.reply_chars.to_le_bytes());
+            for offset in m.reply_shape.breaks.iter() {
+                h = fnv(h, &offset.to_le_bytes());
+            }
+            h = fnv(h, &m.reply_shape.worked);
+            h = fnv(h, &[m.reply_shape.lead]);
+            h = fnv(h, m.reply_shape.end.as_bytes()); // replies.jsonl carries the shape too
+            h = fnv(h, &[u8::from(m.reply_shape.end_cut)]);
             h = fnv(h, &[u8::from(m.side)]);
             h = fnv(h, m.parent.as_bytes()); // sessions.jsonl linkage is derived content too
             h
@@ -4421,13 +4854,13 @@ const SOURCE_ABSENCE_MAX_BYTES: u64 = 64 * 1024;
 const SOURCE_ABSENCE_HEADER: &str = "agrep-source-absence-v1\n";
 // Any ingest policy change that can alter derived rows must bump this version: a bump
 // voids the source-identical shortcut even when every source file is byte-identical.
-const HARNESS_POLICY_HEADER: &[u8] = b"agrep-harness-policy-v5\0";
+const HARNESS_POLICY_HEADER: &[u8] = b"agrep-harness-policy-v6\0";
 
 /// Load the corpus-local classification policy once per index pass. The exact bytes plus a
 /// format version are part of the all-hit permission slip, while parsing is done from that same
 /// captured generation so a mid-run edit cannot classify rows from a different policy. Missing
 /// means an empty policy; every other read/UTF-8 error aborts before derived output mutation.
-fn harness_policy() -> anyhow::Result<(Vec<u8>, Vec<String>)> {
+fn harness_policy() -> anyhow::Result<(Vec<u8>, HarnessPolicy)> {
     let path = data_dir()?.join("harness_prefixes.txt");
     let (present, bytes) = match read_optional_bytes(&path, HARNESS_POLICY_MAX_BYTES)? {
         Some(bytes) => (1u8, bytes),
@@ -4435,17 +4868,12 @@ fn harness_policy() -> anyhow::Result<(Vec<u8>, Vec<String>)> {
     };
     let body = String::from_utf8(bytes.clone())
         .map_err(|error| anyhow::anyhow!("invalid UTF-8 in {}: {error}", path.display()))?;
-    let prefixes = body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-        .collect();
+    let policy = HarnessPolicy::parse(&body);
     let mut snapshot = Vec::with_capacity(HARNESS_POLICY_HEADER.len() + 1 + bytes.len());
     snapshot.extend_from_slice(HARNESS_POLICY_HEADER);
     snapshot.push(present);
     snapshot.extend_from_slice(&bytes);
-    Ok((snapshot, prefixes))
+    Ok((snapshot, policy))
 }
 
 /// Clean-absence observations one preflight recorded: whole agents, and single store roots of an
@@ -4585,7 +5013,7 @@ fn validated_source_snapshot(
             )
         };
     }
-    match ingest::registry::source_snapshot(agent) {
+    match agrep_core::fault_injection::postflight(|| ingest::registry::source_snapshot(agent)) {
         // A byte-identical incomplete pair carries the same serialized issue records: the
         // unreadable subset is a stable disclosed fact, not an in-flight condition.
         Ok(after) if after == before => SourceValidation::Valid(after),
@@ -4662,14 +5090,33 @@ fn generation_for_publication(
         GenerationValidation::Valid(source) => Ok(Some(source)),
         GenerationValidation::Moved => Ok(None),
         GenerationValidation::Unreadable(issues, reason) => {
-            publish_source_unreadable(data, agent, &issues, &[], &reason)?;
+            // A source caught moving by the postflight snapshot (a store committing while it is
+            // stamped) is the same transient fact the preflight retries: it asks for that retry.
+            let moving = !issues.is_empty()
+                && issues.iter().all(|issue| !durable_source_issue(issue.kind()));
+            publish_source_unreadable(
+                data,
+                agent,
+                issues
+                    .iter()
+                    .map(|issue| {
+                        let mut value = source_issue_value(issue);
+                        if moving {
+                            value["retry"] = serde_json::Value::Bool(true);
+                        }
+                        value
+                    })
+                    .collect(),
+                &reason,
+            )?;
             let detail = issues
                 .first()
                 .map(|issue| format!("{}: {}", issue.path(), issue.reason()))
                 .unwrap_or(reason);
             anyhow::bail!(
-                "source-unreadable: {}; retained the old generation",
-                agrep_core::ingest::terminal_safe(detail)
+                "source-unreadable: {}; retained the old generation{}",
+                agrep_core::ingest::terminal_safe(detail),
+                if moving { " and will retry" } else { "" }
             )
         }
     }
@@ -4919,6 +5366,8 @@ struct GenerationPublication<'a> {
     preserve_signal_if_unchanged: bool,
     /// Family proof bytes bound to `signature`; None keeps the published proof.
     family_meta: Option<&'a [u8]>,
+    /// A consented rebuild's fault-injection gates at each boundary of this commit.
+    park: &'a dyn Fn(&'static str),
 }
 
 fn ensure_derived_write_ownership(data: &Path) -> anyhow::Result<()> {
@@ -4949,14 +5398,23 @@ fn commit_generation_cache(
     agents: &[&str],
     staged_cache: StagedCache,
     invalidate_events: bool,
+    (consent, signature): (&ConsentRecord<'_>, &str),
 ) -> anyhow::Result<()> {
     ensure_derived_write_ownership(data)?;
-    if invalidate_events {
+    // A consent rolled back before its commit point discards this cache, so its proven event
+    // store stays the published one's until that point is recorded.
+    let consented = consent.armed.get();
+    if invalidate_events && !consented {
         // A crash after cache advancement must force event payload reconstruction on retry.
         cache::invalidate_events_complete(event_dir, agents)?;
     }
     staged_cache.commit()?;
-    publish_derived_owner(data)
+    publish_derived_owner(data)?;
+    consent.commit(signature)?;
+    if invalidate_events && consented {
+        cache::invalidate_events_complete(event_dir, agents)?;
+    }
+    Ok(())
 }
 
 fn publish_generation_markers(publication: GenerationPublication<'_>) -> anyhow::Result<bool> {
@@ -4970,6 +5428,7 @@ fn publish_generation_markers(publication: GenerationPublication<'_>) -> anyhow:
         repaired_sessions,
         preserve_signal_if_unchanged,
         family_meta,
+        park,
     } = publication;
     ensure_derived_write_ownership(data)?;
     let started = Instant::now();
@@ -4980,13 +5439,16 @@ fn publish_generation_markers(publication: GenerationPublication<'_>) -> anyhow:
     if let Some(bytes) = family_meta {
         cache::write_bytes_atomic(&data.join(cache::SESSION_FAMILY_META_FILE), bytes)?;
     }
+    park("consent-proof");
     publish_derived_proof(data, signature)?;
+    park("consent-signature");
     let proof_done = started.elapsed();
     let signal_written =
         !(preserve_signal_if_unchanged && regular_file_has_bytes(sig_path, signature.as_bytes())?);
     if signal_written {
         cache::write_bytes_atomic(sig_path, signature.as_bytes())?;
     }
+    park("consent-signed");
     let signature_done = started.elapsed();
     if std::env::var_os("AGREP_DEBUG").is_some() {
         eprintln!(
@@ -5153,7 +5615,12 @@ fn unlocked_owner_has_no_retained_corpus(data: &Path) -> bool {
 
 fn unlocked_warm_skip(data: &Path, agent: &str) -> Option<(usize, u128)> {
     let started = Instant::now();
-    if [INGEST_PENDING_FILE, SOURCE_ABSENCE_FILE, SOURCE_HEALTH_FILE]
+    if [
+        INGEST_PENDING_FILE,
+        SOURCE_ABSENCE_FILE,
+        SOURCE_HEALTH_FILE,
+        CONSENT_PENDING_FILE,
+    ]
         .into_iter()
         .any(|name| !entry_absent(&data.join(name)))
     {
@@ -5203,6 +5670,49 @@ fn unlocked_warm_skip(data: &Path, agent: &str) -> Option<(usize, u128)> {
     Some((count, started.elapsed().as_millis()))
 }
 
+/// Bounded, budget-shared pacing for an explicit index that meets a live same-build claim.
+struct AdoptionPacing {
+    budget: std::time::Duration,
+    started: Option<Instant>,
+    announced: bool,
+}
+
+impl AdoptionPacing {
+    fn new(budget: std::time::Duration) -> Self {
+        Self {
+            budget,
+            started: None,
+            announced: false,
+        }
+    }
+
+    fn wait(&mut self, live: &LiveAdoption) -> anyhow::Result<()> {
+        if !self.announced {
+            eprintln!("{}", live.wait_notice());
+            self.announced = true;
+        }
+        self.pause(|| live.expiry_reason())
+    }
+
+    fn retry(&mut self) -> anyhow::Result<()> {
+        self.pause(|| {
+            "another agrep indexer kept claiming the index; the wait budget expired; \
+             run `agrep index` again"
+                .to_owned()
+        })
+    }
+
+    fn pause(&mut self, expired: impl FnOnce() -> String) -> anyhow::Result<()> {
+        let started = *self.started.get_or_insert_with(Instant::now);
+        let remaining = self.budget.saturating_sub(started.elapsed());
+        anyhow::ensure!(!remaining.is_zero(), "{}", expired());
+        // Jitter keeps two waiters that keep splitting the claim pair from retrying in lockstep.
+        let pace = std::time::Duration::from_millis(100 + index_lock::jitter_millis(50));
+        std::thread::sleep(remaining.min(pace));
+        Ok(())
+    }
+}
+
 /// `agrep index` writes the canonical corpus; external enrichment workers repair optional data.
 ///
 /// Sig-skip invariants: when the content fingerprint of the in-memory messages matches the last
@@ -5214,7 +5724,12 @@ fn unlocked_warm_skip(data: &Path, agent: &str) -> Option<(usize, u128)> {
 /// "last checked" clock. Skip only when the WHOLE published set is on disk - a matching sig with
 /// a derived file missing (deleted out-of-band) would otherwise never regenerate it short of
 /// --full.
-fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
+fn index_cmd(
+    agent: &str,
+    full: bool,
+    retry_failed_sources: bool,
+    drop_unreadable: bool,
+) -> anyhow::Result<()> {
     let t0 = Instant::now();
     let data = data_dir()?;
     if data_dir_is_protected(&data) {
@@ -5235,39 +5750,17 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         disclose_read_only_ownership(&format!("derived writer identity is unavailable: {reason}"));
         return Ok(());
     }
-    let wait_budget = std::env::var(DERIVED_ADOPTION_WAIT_MS_ENV)
+    let mut pacing = std::env::var(DERIVED_ADOPTION_WAIT_MS_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .map(|millis| std::time::Duration::from_millis(millis.min(180_000)));
-    let mut waiting_since = None;
-    let mut wait_on_adoption = |fence: &AdoptionFence| -> anyhow::Result<bool> {
-        let (AdoptionFence::LiveSameWriter(pid), Some(budget)) = (fence, wait_budget) else {
-            return Ok(false);
-        };
-        let started = waiting_since.get_or_insert_with(|| {
-            eprintln!(
-                "waiting for the freshness daemon to finish adopting the index (pid {pid}) ..."
-            );
-            Instant::now()
-        });
-        let remaining = budget.saturating_sub(started.elapsed());
-        anyhow::ensure!(
-            !remaining.is_zero(),
-            "freshness daemon is still adopting the index (pid {pid}); \
-             the wait budget expired, but this adoption finishes on its own; \
-             run `agrep index` again after it completes"
-        );
-        std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
-        Ok(true)
-    };
+        .map(|millis| AdoptionPacing::new(std::time::Duration::from_millis(millis.min(180_000))));
     let (adoption_claim, ownership_was_current) = loop {
         // The incumbent may be replacing ownership artifacts or holding a SQLite
         // journal; wait before probing that family or taking its index lock.
-        if wait_budget.is_some() {
-            if let Some(fence) = adoption_daemon_fence(&data) {
-                if wait_on_adoption(&fence)? {
-                    continue;
-                }
+        if let Some(pacing) = pacing.as_mut() {
+            if let Some(AdoptionFence::LiveSameWriter(live)) = adoption_daemon_fence(&data) {
+                pacing.wait(&live)?;
+                continue;
             }
         }
         // A rollback journal blocks the ownership probe itself and nothing on the
@@ -5302,9 +5795,35 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
             Ok(claim) => {
                 break (Some(claim), ownership == DerivedWriteOwnership::Current);
             }
+            // A local failure to publish this writer's own claim is this writer's error:
+            // an explicit index reports it and fails; a background pass stays read-only.
+            Err(AdoptionFence::Failed(reason)) => {
+                anyhow::ensure!(pacing.is_none(), "{reason}");
+                disclose_read_only_ownership(&reason);
+                return Ok(());
+            }
             Err(fence) => {
-                if wait_on_adoption(&fence)? {
-                    continue;
+                if let Some(pacing) = pacing.as_mut() {
+                    match &fence {
+                        AdoptionFence::LiveSameWriter(live) => {
+                            pacing.wait(live)?;
+                            continue;
+                        }
+                        // A claimer may have released, or two claimers each won one record,
+                        // since the scan; only a steady refusal is a verdict.
+                        AdoptionFence::Refused(_) => match adoption_daemon_fence(&data) {
+                            None => {
+                                pacing.retry()?;
+                                continue;
+                            }
+                            Some(AdoptionFence::LiveSameWriter(live)) => {
+                                pacing.wait(&live)?;
+                                continue;
+                            }
+                            Some(AdoptionFence::Refused(_) | AdoptionFence::Failed(_)) => {}
+                        },
+                        AdoptionFence::Failed(_) => {}
+                    }
                 }
                 let reason = match ownership {
                     DerivedWriteOwnership::Foreign(reason) => format!("{reason}; {fence}"),
@@ -5337,8 +5856,41 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         }
     }
     let mut index_lock = acquire_index_lock()?;
-    let result = index_cmd_locked(agent, full, t0, adoption_claim.as_ref());
-    let release = index_lock.release();
+    // A consent's drop takes effect only with its publication: one that failed or was killed
+    // is settled here, by the next pass, before anything reads.
+    let settled = settle_unfinished_consent(&data, false);
+    let mut result = settled.as_ref().map(drop).map_err(|error| anyhow::anyhow!("{error:#}"));
+    if let Ok(completing) = settled {
+        let health_before = if drop_unreadable {
+            read_optional_bytes(&data.join(SOURCE_HEALTH_FILE), SOURCE_HEALTH_MAX_BYTES)?
+        } else {
+            None
+        };
+        let consent = ConsentRecord {
+            data: &data,
+            requested: drop_unreadable,
+            completing,
+            health_before,
+            armed: std::cell::Cell::new(completing),
+        };
+        result = index_cmd_locked(
+            agent,
+            full,
+            retry_failed_sources,
+            t0,
+            adoption_claim.as_ref(),
+            &index_lock,
+            &consent,
+        );
+        if let Err(undo) = settle_unfinished_consent(&data, true) {
+            result = Err(match result {
+                Ok(()) => undo,
+                Err(error) => anyhow::anyhow!("{error:#}; additionally {undo:#}"),
+            });
+        }
+    }
+    // A displaced record was disclosed by the release itself; the work ran under verification.
+    let release = index_lock.release().map(drop);
     match (result, release) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -5349,12 +5901,121 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
     }
 }
 
+/// Present from a consented rebuild's first drop until its publication. Before its commit point
+/// it holds the source health the pass found (`1` then the bytes, or `0` for none), restored if
+/// the consent does not publish; from that point, `p` then the signature it publishes.
+const CONSENT_PENDING_FILE: &str = ".consent_pending";
+
+/// Whether a pass consented to drop, and the source health it found, armed on disk once that
+/// pass starts dropping; `completing` when it republishes a consent that stopped after its commit.
+struct ConsentRecord<'a> {
+    data: &'a Path,
+    requested: bool,
+    completing: bool,
+    health_before: Option<Vec<u8>>,
+    armed: std::cell::Cell<bool>,
+}
+
+impl ConsentRecord<'_> {
+    /// A committed consent's record is never replaced by an undo record.
+    fn arm(&self) -> anyhow::Result<()> {
+        if self.armed.get() {
+            return Ok(());
+        }
+        let mut body = Vec::new();
+        match &self.health_before {
+            Some(bytes) => {
+                body.push(b'1');
+                body.extend_from_slice(bytes);
+            }
+            None => body.push(b'0'),
+        }
+        cache::write_bytes_atomic(&self.data.join(CONSENT_PENDING_FILE), &body)?;
+        self.armed.set(true);
+        self.park("consent-armed");
+        Ok(())
+    }
+
+    /// The consent's commit point, durable right after its cache commit and before any event or
+    /// derived write: from here an interrupted consent is completed, never undone, since the
+    /// event store or readers may already carry it.
+    fn commit(&self, signature: &str) -> anyhow::Result<()> {
+        if !self.armed.get() {
+            return Ok(());
+        }
+        self.park("consent-cached");
+        let mut body = vec![b'p'];
+        body.extend_from_slice(signature.as_bytes());
+        cache::write_bytes_atomic(&self.data.join(CONSENT_PENDING_FILE), &body)?;
+        self.park("consent-commit");
+        Ok(())
+    }
+
+    fn park(&self, step: &'static str) {
+        if self.armed.get() {
+            agrep_core::fault_injection::park_gate(step);
+        }
+    }
+
+    fn disarm(&self) -> anyhow::Result<()> {
+        self.park("consent-published");
+        cache::remove_if_exists(&self.data.join(CONSENT_PENDING_FILE))
+    }
+}
+
+/// Settles an unfinished consented rebuild (`here`: this pass's own). Stopped before its commit, it
+/// is undone: health restored, marks included, and its cache discarded, so the next pass holds
+/// again. Stopped after, it stays recorded; true when this pass must publish it again in full.
+fn settle_unfinished_consent(data: &Path, here: bool) -> anyhow::Result<bool> {
+    let marker = data.join(CONSENT_PENDING_FILE);
+    let Some(body) = read_optional_bytes(&marker, SOURCE_HEALTH_MAX_BYTES + 1)? else {
+        return Ok(false);
+    };
+    let health = data.join(SOURCE_HEALTH_FILE);
+    match body.split_first() {
+        Some((b'p', _)) => {
+            // Its outputs may be part promoted: none is trusted until a pass republishes them.
+            agrep_core::emit::human_line(format_args!(
+                "{}",
+                if here {
+                    "  the consented rebuild stopped while publishing; the next pass publishes \
+                     it again in full, without what it dropped"
+                } else {
+                    "  completing a consented rebuild that stopped while publishing: publishing \
+                     its generation again in full, without what it dropped"
+                }
+            ));
+            Ok(!here)
+        }
+        restore => {
+            match restore {
+                Some((b'1', bytes)) => cache::write_bytes_atomic(&health, bytes)?,
+                _ => cache::remove_if_exists(&health)?,
+            }
+            discard_foreign_cache(data, |path| {
+                cache::remove_if_exists(path).map_err(|error| error.to_string())
+            })
+            .map_err(|error| anyhow::anyhow!("could not undo the unpublished rebuild: {error}"))?;
+            agrep_core::emit::human_line(format_args!(
+                "  undid a consented rebuild that stopped before publishing; what it would have \
+                 left out is held again"
+            ));
+            cache::remove_if_exists(&marker)?;
+            Ok(false)
+        }
+    }
+}
+
 fn index_cmd_locked(
     agent: &str,
     full: bool,
+    retry_failed_sources: bool,
     t0: Instant,
     adoption_claim: Option<&AdoptionClaim>,
+    index_lock: &IndexLock,
+    consent: &ConsentRecord<'_>,
 ) -> anyhow::Result<()> {
+    let drop_unreadable = consent.requested;
     // Per-phase wall clock, printed at the end: optimize from these numbers, not intuition.
     let mut phases: Vec<(&'static str, u128)> = Vec::new();
     let mut mark = Instant::now();
@@ -5385,6 +6046,7 @@ fn index_cmd_locked(
                 disclose_read_only_ownership(&reason.to_string());
                 return Ok(());
             }
+            index_lock.verify()?;
             consume_retained_corpus_owner(&data)?;
             true
         }
@@ -5412,6 +6074,7 @@ fn index_cmd_locked(
                 disclose_read_only_ownership(&format!("{reason}; {fence}"));
                 return Ok(());
             }
+            index_lock.verify()?;
             takeover_discarded_cache = match take_over_foreign_derived_stores(&data, &reason) {
                 Ok(discarded) => discarded,
                 Err(refusal) => {
@@ -5451,10 +6114,10 @@ fn index_cmd_locked(
     // the parse cache or deduping rows (the every-search warm path). --full must force a parse
     // and --emit-rows must stream rows even when unchanged, so both bypass the shortcut.
     let emit_rows = agrep_core::emit::on();
-    let (policy_before, harness_prefixes) = harness_policy()?;
+    let (policy_before, harness) = harness_policy()?;
     if emit_rows {
         // streamed rows must classify exactly as this run's normalize pass will
-        agrep_core::emit::set_harness_prefixes(&harness_prefixes);
+        agrep_core::emit::set_harness_policy(&harness);
     }
     // Every stat this run takes - preflight and parse cache - happens after this instant, so a
     // stamp not safely older than it may be shared by a later same-size rewrite (racy-clean).
@@ -5526,6 +6189,10 @@ fn index_cmd_locked(
         .map(|prior| prior == policy_before.as_slice())
         .unwrap_or(false);
     let source_identical = transcripts_identical && policy_identical;
+    // A completing consent trusts no event store its interrupted run may have left, proven or not.
+    if consent.completing {
+        cache::invalidate_events_complete(&edir, &run_agents)?;
+    }
     // The source snapshot proves transcripts only; an incomplete scoped event-store proof
     // forces a complete source parse.
     let event_authority = cache::event_publication_authority(&edir, &run_agents)?;
@@ -5535,6 +6202,7 @@ fn index_cmd_locked(
     let pending_residue =
         pending_source.is_some() && pending_source.as_deref() == published_source.as_deref();
     if !full
+        && !consent.completing
         && !emit_rows
         && ownership_current
         && derived_valid
@@ -5543,9 +6211,15 @@ fn index_cmd_locked(
         && source_identical
         && events_complete
         && (pending_source.is_none() || pending_residue)
+        && !(retry_failed_sources && source_health_records_failure(&data))
+        && !source_health_holds_publication(&data)
+        && !source_health_retry_pending(&data)
     {
         // Preserve the existing content signature; its mtime is the freshness clock Python
-        // checks before every search.
+        // checks before every search. The source pass above can take seconds: a holder
+        // displaced during it must not revert another writer's signature or markers.
+        agrep_core::fault_injection::park_gate("warm-lane");
+        index_lock.verify()?;
         cache::write_bytes_atomic(
             &sig_path,
             previous_sig.as_deref().unwrap_or_default().as_bytes(),
@@ -5633,6 +6307,9 @@ fn index_cmd_locked(
         .into_iter()
         .filter(|root| current_absence.roots.contains(root))
         .collect();
+    // The source pass above can take seconds: a holder displaced during it must not overwrite
+    // the absence record the lock holder's deletion confirmation reads as its prior observation.
+    index_lock.verify()?;
     if !emit_rows {
         write_source_absence(&absence_path, &current_absence)?;
     }
@@ -5665,14 +6342,16 @@ fn index_cmd_locked(
     {
         cache::write_bytes_atomic(&pending_path, source_before.as_deref().unwrap_or_default())?;
     }
+    // What earlier passes recorded, before this one rewrites it: a failure persists only when it
+    // repeats one of these.
+    let prior_health = source_health_records(&data).unwrap_or_default();
     // Only now, behind the pending marker: a pass that dies after this disclosure is never
     // followed by the unchanged-source shortcut, which keeps whatever health it finds.
     if !source_issues.is_empty() || source_preflight_error.is_some() {
         publish_source_unreadable(
             &data,
             agent,
-            &source_issues,
-            &[],
+            source_issues.iter().map(source_issue_value).collect(),
             source_preflight_error
                 .as_deref()
                 .unwrap_or("a source was unreadable during preflight"),
@@ -5836,19 +6515,43 @@ fn index_cmd_locked(
         .filter(|issue| durable_source_issue(issue.kind()))
         .flat_map(|issue| pcache.sessions_under(Path::new(issue.path())))
         .collect();
+    // An attribution source holds no rows: its issue neither scopes the counts of rows seen go
+    // nor settles any read that failed on the store it describes.
+    let material_issues = || {
+        source_issues
+            .iter()
+            .filter(|issue| !ingest::registry::attribution_only_issue(issue.kind()))
+    };
     if published_legible {
         pcache.mark_base_rows(
-            source_issues
-                .iter()
-                .map(|issue| (issue.agent(), Path::new(issue.path()))),
+            material_issues().map(|issue| (issue.agent(), Path::new(issue.path()))),
             generation,
         );
+    }
+    // An attribution gap keeps every published project. A decoded last-good base holds them
+    // (every token row published was cached first); a cold or discarded cache reads them from
+    // the generation's rows, and an agent whose rows it cannot read keeps the gap unadmitted.
+    let mut unresolved_attribution: HashSet<&str> = HashSet::new();
+    if prior_generation && !pcache.decoded_last_good_base() {
+        let attribution_gaps: HashSet<&str> = source_issues
+            .iter()
+            .filter(|issue| ingest::registry::attribution_only_issue(issue.kind()))
+            .map(|issue| issue.agent())
+            .collect();
+        for agent in attribution_gaps {
+            match cache::published_session_projects(&data, agent) {
+                Some(projects) => pcache.set_published_token_projects(agent, projects),
+                None => {
+                    unresolved_attribution.insert(agent);
+                }
+            }
+        }
     }
     lap!("load-cache");
     // a complete parse (cold cache or --full) yields the full event set; a warm run only
     // carries touched sessions' events, so the pulse rollup waits for the next complete run.
     let complete = full || repair_events || !pcache.warm;
-    let (msgs, evts, repaired_sessions) = ingest_agent(agent, &mut pcache, &harness_prefixes)?;
+    let (msgs, evts, repaired_sessions) = ingest_agent(agent, &mut pcache, &harness)?;
     let session_aliases = session_aliases(&pcache, &msgs);
     lap!("ingest+dedupe");
     // A whole store holds last-good rows only in its snapshot; when no snapshot covers a failed
@@ -5874,40 +6577,277 @@ fn index_cmd_locked(
             cache::published_agent_rows(&data, agent)
         });
     }
+    // With no base to answer for them, a failed token conversation no verified published file
+    // names was never published: the other conversations and agents publish past it.
+    if derived_valid {
+        pcache.admit_unpublished_token_conversations(|agent| {
+            cache::published_agent_rows(&data, agent).map(|rows| {
+                let turns = rows.turns.into_keys().map(|(session, _)| session);
+                turns.chain(rows.sessions).chain(rows.event_sessions).collect()
+            })
+        });
+    }
     let source_snapshot_safe = pcache.source_snapshot_safe()
         && source_issues.is_empty()
         && source_preflight_error.is_none();
-    // Only a positive Retained verdict may publish past an unreadable scope.
-    let preflight_issue_settled = |issue: &ingest::registry::SourceIssue| {
-        durable_source_issue(issue.kind())
-            && pcache.published_material_under(issue.agent(), Path::new(issue.path()))
-                == agrep_core::ingest_cache::MaterialVerdict::Retained
+    // One verdict per unreadable scope, judged once: several guards below consult it, and a
+    // store with thousands of denied files must not pay the published-generation walk per guard.
+    let verdicts: HashMap<(&str, &Path), agrep_core::ingest_cache::MaterialVerdict> = source_issues
+        .iter()
+        .map(|issue| (issue.agent(), Path::new(issue.path())))
+        .chain(
+            pcache
+                .source_read_issues()
+                .iter()
+                .filter(|read| read.kind == "source-read-failed")
+                .map(|read| (read.agent, read.path.as_path())),
+        )
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|(agent, path)| ((agent, path), pcache.published_material_under(agent, path)))
+        .collect();
+    let verdict_of = |agent: &str, path: &Path| {
+        verdicts
+            .get(&(agent, path))
+            .copied()
+            .unwrap_or_else(|| pcache.published_material_under(agent, path))
     };
-    let read_issue_settled = |read: &agrep_core::ingest_cache::SourceReadIssue| {
-        source_issues
+    // How a pass may lift what holds it back: only with a retry, by a rebuild's consent
+    // (`--drop-unreadable`), or by that consent once each failure is seen twice.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lever {
+        Retry,
+        Rebuild,
+        RebuildIfPersists,
+    }
+    let pass_lever = if drop_unreadable {
+        Lever::Rebuild
+    } else {
+        Lever::Retry
+    };
+    // A failure persists when the record an earlier pass wrote names the same item, failing the
+    // same way, with the same identity; a first observation of anything is never dropped.
+    let recorded_identities: HashSet<(String, String, String, String, String, String)> =
+        prior_health
             .iter()
-            .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
+            .filter_map(|record| {
+                let field = |name: &str| {
+                    record
+                        .get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                Some((
+                    field("agent")?,
+                    field("path")?,
+                    field("session").unwrap_or_default(),
+                    field("kind")?,
+                    field("reason")?,
+                    field("identity")?,
+                ))
+            })
+            .collect();
+    let recorded = |agent: &str,
+                    path: &str,
+                    session: Option<&str>,
+                    kind: &str,
+                    reason: &str,
+                    identity: &str| {
+        recorded_identities.contains(&(
+            agent.to_owned(),
+            path.to_owned(),
+            session.unwrap_or_default().to_owned(),
+            kind.to_owned(),
+            reason.to_owned(),
+            identity.to_owned(),
+        ))
+    };
+    // A file failure seen within a timestamp tick of the pass may be a write in flight: it is
+    // recorded under an identity no later observation matches, so it proves nothing persists.
+    let file_identity = |path: &Path| {
+        let identity = ingest::failure_identity(path);
+        if ingest::failure_observation_racy(path, scan_start) {
+            format!("racy|{identity}")
+        } else {
+            identity
+        }
+    };
+    let read_stamps: HashMap<&agrep_core::ingest_cache::SourceReadIssue, (Option<String>, bool)> =
+        pcache
+            .source_read_issues()
+            .iter()
+            .map(|read| {
+                let identity = if read.moving {
+                    None
+                } else if let Some(session) = read.session.as_deref() {
+                    pcache
+                        .token_failure_identity(read.agent, &read.path, session)
+                        .map(|token| format!("token:{token}"))
+                } else {
+                    Some(file_identity(&read.path))
+                };
+                let persisted = identity.as_deref().is_some_and(|identity| {
+                    !identity.starts_with("racy|")
+                        && recorded(
+                            read.agent,
+                            &read.path.to_string_lossy(),
+                            read.session.as_deref(),
+                            read.kind,
+                            &read.reason,
+                            identity,
+                        )
+                });
+                (read, (identity, persisted))
+            })
+            .collect();
+    let preflight_stamps: BTreeMap<&ingest::registry::SourceIssue, (String, bool)> = source_issues
+        .iter()
+        .map(|issue| {
+            let identity = file_identity(Path::new(issue.path()));
+            let persisted = !identity.starts_with("racy|")
+                && recorded(
+                    issue.agent(),
+                    issue.path(),
+                    None,
+                    issue.kind(),
+                    issue.reason(),
+                    &identity,
+                );
+            (issue, (identity, persisted))
+        })
+        .collect();
+    let read_persisted = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        read_stamps.get(read).is_some_and(|(_, persisted)| *persisted)
+    };
+    let preflight_persisted = |issue: &ingest::registry::SourceIssue| {
+        preflight_stamps
+            .get(issue)
+            .is_some_and(|(_, persisted)| *persisted)
+    };
+    // Each record carries its identity; one a retry may still clear asks for that retry, so an
+    // automatic pass over unchanged sources does not take the shortcut past it.
+    let read_value = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        let mut value = runtime_source_issue_value(read);
+        if let Some((Some(identity), _)) = read_stamps.get(read) {
+            value["identity"] = serde_json::Value::String(identity.clone());
+        }
+        if read.retryable || read.moving {
+            value["retry"] = serde_json::Value::Bool(true);
+        }
+        value
+    };
+    let preflight_value = |issue: &ingest::registry::SourceIssue| {
+        let mut value = source_issue_value(issue);
+        if let Some((identity, _)) = preflight_stamps.get(issue) {
+            value["identity"] = serde_json::Value::String(identity.clone());
+        }
+        value
+    };
+    // Any consent judges the pass as an explicit rebuild would: reads that failed with no
+    // last-good copy hold nothing back, every other guard still does.
+    let output_complete = |lever: Lever| {
+        if lever == Lever::Retry {
+            pcache.output_complete()
+        } else {
+            pcache.output_complete_past_unreadable()
+        }
+    };
+    // Only a positive Retained verdict may publish past an unreadable scope. An attribution
+    // source holds no rows: its issue settles once the pass read every conversation, with the
+    // published projects kept, so one agent's metadata gap never freezes the other agents.
+    let attribution_settled = |agent: &str, kind: &str, lever: Lever| {
+        ingest::registry::attribution_only_issue(kind)
+            && output_complete(lever)
+            && !unresolved_attribution.contains(agent)
+    };
+    let preflight_served = |issue: &ingest::registry::SourceIssue, lever: Lever| {
+        attribution_settled(issue.agent(), issue.kind(), lever)
+            || (durable_source_issue(issue.kind())
+                && verdict_of(issue.agent(), Path::new(issue.path()))
+                    == agrep_core::ingest_cache::MaterialVerdict::Retained)
+    };
+    // An attribution issue settles only itself: a read that failed on the same store (a parser
+    // panic on one conversation) is covered by no issue of a source that holds no rows.
+    let read_served = |read: &agrep_core::ingest_cache::SourceReadIssue, lever: Lever| {
+        attribution_settled(read.agent, read.kind, lever)
+            || material_issues()
+                .any(|issue| issue.agent() == read.agent && read.path.starts_with(issue.path()))
             // Only a deterministic parse failure ("source-read-failed") may ride the
             // covered lane: guard-synthesized absence issues ("source-read-incomplete")
             // keep the two-stable-observation deletion protocol.
             || (read.kind == "source-read-failed"
                 && pcache.unreadable_scope_covered(read.agent, &read.path))
+            // One malformed token conversation its lane served from a last good copy or proved
+            // unpublished: the snapshot of its siblings stays a fact, and a panic is no such case.
+            || (read.kind == "source-read-failed"
+                && output_complete(lever)
+                && read.session.as_deref().is_some_and(|session| {
+                    pcache.token_failure_settled(read.agent, &read.path, session)
+                }))
     };
-    // A parse failure is stably unreadable like a stat failure PROVIDED the guarded
-    // snapshot serves the scope's last-good rows or the inventory proves it empty:
-    // one broken store degrades to disclosed staleness, never a frozen index.
-    let stable_unreadable = !source_snapshot_safe
-        && source_preflight_error.is_none()
-        && (!source_issues.is_empty() || !pcache.source_read_issues().is_empty())
-        && source_before.is_some()
-        && source_issues.iter().all(preflight_issue_settled)
-        && pcache.source_read_issues().iter().all(read_issue_settled);
+    // What the consent drops: unreadable material (a durable preflight defect, or a failed read
+    // but one a retry may clear, a parser panic or a source that moved under it) this pass has
+    // no last-good copy of.
+    let preflight_dropped = |issue: &ingest::registry::SourceIssue, lever: Lever| {
+        lever != Lever::Retry
+            && durable_source_issue(issue.kind())
+            && (lever == Lever::RebuildIfPersists || preflight_persisted(issue))
+            && !preflight_served(issue, lever)
+    };
+    let read_dropped = |read: &agrep_core::ingest_cache::SourceReadIssue, lever: Lever| {
+        lever != Lever::Retry
+            && read.unreadable_material()
+            && (lever == Lever::RebuildIfPersists || read_persisted(read))
+            && !read_served(read, lever)
+    };
+    let preflight_settled_as = |issue: &ingest::registry::SourceIssue, lever: Lever| {
+        preflight_served(issue, lever) || preflight_dropped(issue, lever)
+    };
+    let read_settled_as = |read: &agrep_core::ingest_cache::SourceReadIssue, lever: Lever| {
+        read_served(read, lever) || read_dropped(read, lever)
+    };
+    let preflight_issue_settled =
+        |issue: &ingest::registry::SourceIssue| preflight_settled_as(issue, pass_lever);
+    let read_issue_settled = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        read_settled_as(read, pass_lever)
+    };
+    // A parse failure is stably unreadable like a stat failure PROVIDED the guarded snapshot serves
+    // the scope's last-good rows or the inventory proves it empty, so one broken store is disclosed
+    // staleness. An `--emit-rows` first index has no preflight, and nothing published to drop.
+    let stable_unreadable_as = |lever: Lever| {
+        !source_snapshot_safe
+            && source_preflight_error.is_none()
+            && (!source_issues.is_empty() || !pcache.source_read_issues().is_empty())
+            && (source_before.is_some() || (emit_rows && !prior_generation))
+            && source_issues
+                .iter()
+                .all(|issue| preflight_settled_as(issue, lever))
+            && pcache
+                .source_read_issues()
+                .iter()
+                .all(|read| read_settled_as(read, lever))
+    };
+    let stable_unreadable = stable_unreadable_as(pass_lever);
     let read_issue_served = |read: &agrep_core::ingest_cache::SourceReadIssue| {
         pcache.unread_scope_served(read.agent, &read.path)
+    };
+    // The unreadable material the consent drops, each as named and as recorded on source health.
+    let dropped_material = |lever: Lever| -> Vec<(&str, String, serde_json::Value)> {
+        let preflight = source_issues
+            .iter()
+            .filter(|issue| preflight_dropped(issue, lever))
+            .map(|issue| (issue.agent(), source_issue_label(issue), preflight_value(issue)));
+        let reads = pcache
+            .source_read_issues()
+            .iter()
+            .filter(|read| read_dropped(read, lever))
+            .map(|read| (read.agent, read_issue_label(read), read_value(read)));
+        preflight.chain(reads).collect()
     };
     // This pass read every source, so its verdict is the whole truth about
     // their health. Publication can still be declined for reasons that say
     // nothing about readability, and a record no pass retires outlives its bug.
+    index_lock.verify()?;
     if emit_rows {
         // Without a preflight it saw only what it parsed: it adds what failed to the record
         // and retires nothing, since the next pass may take the shortcut that keeps it.
@@ -5916,40 +6856,266 @@ fn index_cmd_locked(
         publish_source_unreadable(
             &data,
             agent,
-            &source_issues,
-            pcache.source_read_issues(),
+            source_issues
+                .iter()
+                .map(preflight_value)
+                // A stamp of a path the preflight already found denied restates that denial; it
+                // records no second fact (a read that failed otherwise there still does).
+                .chain(
+                    pcache
+                        .source_read_issues()
+                        .iter()
+                        .filter(|read| {
+                            read.session.is_some()
+                                || !source_issues.iter().any(|issue| {
+                                    issue.kind() == "permission-denied"
+                                        && issue.agent() == read.agent
+                                        && Path::new(issue.path()) == read.path
+                                        && issue.reason() == read.reason
+                                })
+                        })
+                        .map(read_value),
+                )
+                .collect(),
             "a source became unavailable while it was being read",
         )?;
     } else {
         clear_source_health(&data, agent)?;
     }
+    // A per-file agent's Drops verdict is the published generation itself saying this pass would
+    // lose rows it holds under a scope it could not read (a token scope's is only "may hold").
+    // No lane's cache fallback is complete then: a base can be older than the rows.
+    let drops_published = |agent: &str, path: &Path| {
+        published_legible
+            && !ingest::registry::whole_store_agent(agent)
+            && !ingest::registry::token_store_agent(agent)
+            && verdict_of(agent, path) == agrep_core::ingest_cache::MaterialVerdict::Drops
+    };
+    let dropping_as = |lever: Lever| {
+        source_issues.iter().any(|issue| {
+            !preflight_dropped(issue, lever)
+                && drops_published(issue.agent(), Path::new(issue.path()))
+        }) || pcache.source_read_issues().iter().any(|read| {
+            read.kind == "source-read-failed"
+                && !read_dropped(read, lever)
+                && drops_published(read.agent, &read.path)
+        })
+    };
     // A stably-denied store with nothing expected under it publishes empty with the denial
-    // on source health; every other incomplete output keeps the fail-closed retry.
-    if !pcache.output_complete() && !stable_unreadable {
-        let detail = source_detail_suffix(
-            blocking_source_issue_label(
-                &source_issues,
-                pcache.source_read_issues(),
-                preflight_issue_settled,
-                read_issue_settled,
-            )
-            .or_else(|| source_preflight_error.clone())
-            .as_deref(),
-        );
-        // The tail names only satisfiable levers: retries and --full both re-read sources,
-        // so a durably unreadable scope with no cache witness recovers only with its access.
-        let recovery = if durable_blocked {
-            " - the index recovers automatically once the source is readable again"
+    // on source health; every other incomplete output keeps the fail-closed retry. A failed
+    // read admitted as unpublished lets other sources publish, never an empty generation.
+    let withheld_as = |lever: Lever| {
+        ((!output_complete(lever) || dropping_as(lever)) && !stable_unreadable_as(lever))
+            || (pcache.admitted_unpublished_failure() && msgs.is_empty())
+    };
+    // What a rebuild's consent would publish past, under `lever`: only unreadable material with
+    // no last-good copy holding this pass back, and never down to an empty generation. That
+    // consent comes with `--full`, a complete pass, so it publishes past only what is stable.
+    let heals_as = |lever: Lever| {
+        let dropped = dropped_material(lever);
+        (!dropped.is_empty()
+            && !withheld_as(lever)
+            && (!prior_generation || stable_unreadable_as(lever))
+            && !(prior_generation && msgs.is_empty()))
+        .then_some(dropped)
+    };
+    // Material seen to fail the same way twice: the refusal names it, marks it on source
+    // health, and gives the remedy the consent is.
+    let consent_remedy = || {
+        if drop_unreadable {
+            None
         } else {
-            ""
+            heals_as(Lever::Rebuild)
+        }
+    };
+    // A --full pass parses without the parse cache, so it cannot serve what that cache still
+    // serves a plain pass: its failure to read that material holds nothing back, nor marks it.
+    // A plain pass decodes it under the index lock this pass holds, so its verdict is that one's.
+    let bypassed_view = std::cell::OnceCell::new();
+    let bypassed = std::cell::Cell::new(false);
+    let cache_serves = |dropped: &[(&str, String, serde_json::Value)]| {
+        if !full || drop_unreadable || full_retains_unreadable || dropped.is_empty() {
+            return false;
+        }
+        let view = bypassed_view
+            .get_or_init(|| agrep_core::ingest_cache::CacheView::read_locked(&cache_path).ok());
+        let Some(view) = view.as_ref() else {
+            return false;
+        };
+        let live = pcache.token_namespaces();
+        dropped.iter().all(|(agent, _, value)| {
+            let live: HashSet<String> = live
+                .iter()
+                .filter(|(live_agent, _)| live_agent == agent)
+                .map(|(_, namespace)| namespace.clone())
+                .collect();
+            value["path"].as_str().is_some_and(|path| {
+                view.serves(agent, Path::new(path), value["session"].as_str(), &live)
+            })
+        })
+    };
+    let bypassed_cache = |dropped: &[(&str, String, serde_json::Value)]| {
+        bypassed.set(true);
+        let (detail, _, them) = material_names(dropped);
+        (
+            Some(detail),
+            format!(
+                " - the parse cache this --full pass skipped still serves {them}; run \
+                 `agrep index`, which publishes with {them}"
+            ),
+        )
+    };
+    // A read whose material the published generation may hold: a failure proven unpublished
+    // holds nothing back, so a refusal names the others first.
+    let read_holds_rows = |read: &agrep_core::ingest_cache::SourceReadIssue| {
+        !read_served(read, Lever::RebuildIfPersists)
+    };
+    // "will retry" is a promise made only where a retry can differ: a first observation (the
+    // consent follows if it persists) or a source that moved or was busy under the read. A
+    // journal whose writer cannot be probed is named by its record instead.
+    let retry_pending = pcache.source_read_issues().iter().any(|read| {
+        (read.retryable || read.moving) && !read.reason.contains(ingest::JOURNAL_PRESENT)
+    }) || source_issues.iter().any(|issue| {
+        !durable_source_issue(issue.kind())
+            && !ingest::registry::attribution_only_issue(issue.kind())
+            && !issue.reason().contains(ingest::JOURNAL_PRESENT)
+    });
+    let journal_present = pcache
+        .source_read_issues()
+        .iter()
+        .any(|read| read.reason.contains(ingest::JOURNAL_PRESENT));
+    // Durable material holding back a pass whose only history it is: no rebuild can help, and
+    // only a denied permission recovers by itself once lifted. Returns it, and whether it is all
+    // there is (a first index's unreadable chats included).
+    let unrebuildable = || -> (Vec<(&str, String, serde_json::Value)>, bool) {
+        if msgs.is_empty() {
+            let held: Vec<_> = if prior_generation {
+                dropped_material(Lever::RebuildIfPersists)
+            } else {
+                pcache
+                    .source_read_issues()
+                    .iter()
+                    .filter(|read| read.unreadable_material())
+                    .map(|read| (read.agent, read_issue_label(read), read_value(read)))
+                    .collect()
+            };
+            if !held.is_empty() {
+                return (held, true);
+            }
+        }
+        let held = source_issues
+            .iter()
+            .filter(|issue| {
+                durable_source_issue(issue.kind()) && !preflight_settled_as(issue, pass_lever)
+            })
+            .map(|issue| (issue.agent(), source_issue_label(issue), preflight_value(issue)))
+            .collect();
+        (held, false)
+    };
+    // A corrupt store recorded before under another identity: its agent keeps rewriting it, so
+    // it never fails the same way twice until that agent stops.
+    let rewritten_corrupt = source_issues.iter().find(|issue| {
+        issue.kind() == "corrupt-database"
+            && preflight_stamps.get(issue).is_some_and(|(identity, persisted)| {
+                !persisted
+                    && prior_health.iter().any(|record| {
+                        let field = |name: &str| record.get(name).and_then(serde_json::Value::as_str);
+                        field("agent") == Some(issue.agent())
+                            && field("path") == Some(issue.path())
+                            && field("kind") == Some(issue.kind())
+                            && field("identity").is_some_and(|recorded| {
+                                recorded.trim_start_matches("racy|")
+                                    != identity.trim_start_matches("racy|")
+                            })
+                    })
+            })
+    });
+    let refusal_tail = |otherwise: &str| -> anyhow::Result<String> {
+        if let Some(issue) = rewritten_corrupt {
+            let agent = issue.agent();
+            return Ok(format!(
+                " and will retry; {agent} keeps rewriting a database agrep reads as corrupt - stop \
+                 {agent}, and once agrep has seen it unchanged, `agrep reindex --full` rebuilds \
+                 without it"
+            ));
+        }
+        if let Some(dropped) = heals_as(Lever::RebuildIfPersists) {
+            if cache_serves(&dropped) {
+                return Ok(bypassed_cache(&dropped).1);
+            }
+            return Ok(
+                " and will retry; if it persists, `agrep reindex --full` rebuilds without it"
+                    .to_owned(),
+            );
+        }
+        let (held, everything) = unrebuildable();
+        if !held.is_empty() {
+            if held
+                .iter()
+                .all(|(_, _, value)| value["kind"] == "permission-denied")
+            {
+                return Ok(
+                    " - the index recovers automatically once the source is readable again"
+                        .to_owned(),
+                );
+            }
+            let (_, agents, them) = material_names(&held);
+            // Only what an earlier pass saw fail the same way is marked as holding the index.
+            let stable = if everything && prior_generation {
+                dropped_material(Lever::Rebuild)
+            } else {
+                Vec::new()
+            };
+            if stable.is_empty() && everything && prior_generation {
+                return Ok(format!(" and will retry; if it persists, fix or remove {them} in {agents}"));
+            }
+            if !stable.is_empty() {
+                mark_held(&data, &stable, false)?;
+            }
+            return Ok(format!(" - fix or remove {them} in {agents}"));
+        }
+        Ok(if retry_pending {
+            " and will retry".to_owned()
+        } else if journal_present {
+            String::new()
+        } else {
+            otherwise.to_owned()
+        })
+    };
+    if withheld_as(pass_lever) {
+        let consented = consent_remedy();
+        let (detail, recovery) = match consented.as_deref() {
+            Some(dropped) if cache_serves(dropped) => bypassed_cache(dropped),
+            Some(dropped) => withhold_for_consent(&data, dropped)?,
+            None => (
+                blocking_source_issue_label(
+                    &source_issues,
+                    pcache.source_read_issues(),
+                    preflight_issue_settled,
+                    read_issue_settled,
+                    read_holds_rows,
+                )
+                .or_else(|| source_preflight_error.clone()),
+                // The tail names only satisfiable levers: retries and --full both re-read
+                // sources, so a durably unreadable scope with no cache witness recovers only
+                // with its access.
+                refusal_tail("")?,
+            ),
+        };
+        let detail = source_detail_suffix(detail.as_deref());
+        // A refusal only this pass's skipped cache would have served had that fallback.
+        let fallback = if bypassed.get() {
+            "without the parse cache"
+        } else {
+            "and had no complete cache fallback"
         };
         if prior_generation {
             anyhow::bail!(
-                "ingest could not read a source{detail} and had no complete cache fallback; retained the old generation{recovery}"
+                "ingest could not read a source{detail} {fallback}; retained the old generation{recovery}"
             );
         }
         anyhow::bail!(
-            "ingest could not read a source{detail} and had no complete cache fallback; no generation was published{recovery}"
+            "ingest could not read a source{detail} {fallback}; no generation was published{recovery}"
         );
     }
     if complete && !emit_rows && source_before.is_none() {
@@ -5964,8 +7130,9 @@ fn index_cmd_locked(
         && !repair_events
         && pcache.decoded_last_good_base()
         && source_issues.iter().all(|issue| {
-            pcache.published_material_under(issue.agent(), Path::new(issue.path()))
-                == agrep_core::ingest_cache::MaterialVerdict::Retained
+            attribution_settled(issue.agent(), issue.kind(), pass_lever)
+                || verdict_of(issue.agent(), Path::new(issue.path()))
+                    == agrep_core::ingest_cache::MaterialVerdict::Retained
         });
     // Event repair after a crash may do the same only where the decoded base served every scope
     // it could not read and the crash left the event store consistent: the unread entries keep
@@ -5985,32 +7152,37 @@ fn index_cmd_locked(
         && !stable_unreadable
         && !(repair_served && cache::event_store_consistent(&edir, &run_agents)?)
     {
+        let consented = consent_remedy();
         // Name the scope that holds the pass back, not merely the first one it saw: the repair
         // lane's served test only where that lane failed on an issue.
-        let detail = if repair_events && !repair_served {
-            blocking_source_issue_label(
-                &source_issues,
-                pcache.source_read_issues(),
-                preflight_issue_settled,
-                read_issue_served,
-            )
-        } else {
-            blocking_source_issue_label(
-                &source_issues,
-                pcache.source_read_issues(),
-                preflight_issue_settled,
-                read_issue_settled,
-            )
+        let (detail, recovery) = match consented.as_deref() {
+            Some(dropped) if cache_serves(dropped) => bypassed_cache(dropped),
+            Some(dropped) => withhold_for_consent(&data, dropped)?,
+            None => (
+                if repair_events && !repair_served {
+                    blocking_source_issue_label(
+                        &source_issues,
+                        pcache.source_read_issues(),
+                        preflight_issue_settled,
+                        read_issue_served,
+                        read_holds_rows,
+                    )
+                } else {
+                    blocking_source_issue_label(
+                        &source_issues,
+                        pcache.source_read_issues(),
+                        preflight_issue_settled,
+                        read_issue_settled,
+                        read_holds_rows,
+                    )
+                }
+                .or_else(|| source_preflight_error.clone()),
+                // "will retry" is a promise; it is only made when a retry can differ. A durably
+                // unreadable scope recovers exactly when its access does, and the tail says so.
+                refusal_tail(" and will retry")?,
+            ),
         };
-        let detail =
-            source_detail_suffix(detail.or_else(|| source_preflight_error.clone()).as_deref());
-        // "will retry" is a promise; it is only made when a retry can differ. A durably
-        // unreadable scope recovers exactly when its access does, and the tail says so.
-        let recovery = if durable_blocked {
-            " - the index recovers automatically once the source is readable again"
-        } else {
-            " and will retry"
-        };
+        let detail = source_detail_suffix(detail.as_deref());
         if repair_events {
             anyhow::bail!(
                 "event repair observed an unavailable/incomplete source{detail}; retained the old generation{recovery}"
@@ -6019,6 +7191,24 @@ fn index_cmd_locked(
         anyhow::bail!(
             "complete ingest observed an unavailable/incomplete source{detail}; retained the old generation{recovery}"
         );
+    }
+    // The consent's rebuild names what it publishes without; source health keeps each. It
+    // rebuilds from what is readable, never an empty generation over a published one.
+    let dropped = dropped_material(pass_lever);
+    if !dropped.is_empty() && prior_generation && msgs.is_empty() {
+        // What persists still holds publication back, and only its agent's fix can help.
+        mark_held(&data, &dropped, false)?;
+        let (detail, agents, them) = material_names(&dropped);
+        let detail = source_detail_suffix(Some(&detail));
+        anyhow::bail!(
+            "ingest could not read a source{detail} and rebuilding without {them} would leave no \
+             history; retained the old generation - fix or remove {them} in {agents}"
+        );
+    }
+    let rebuilt_without: Vec<String> = dropped.into_iter().map(|(_, label, _)| label).collect();
+    let consented_drop = !rebuilt_without.is_empty();
+    if consented_drop {
+        consent.arm()?;
     }
     pcache.record_released_rows();
     // Cache serialization and the corpus fingerprint are independent, CPU-heavy walks over
@@ -6046,6 +7236,7 @@ fn index_cmd_locked(
         ));
     }
     lap!("stage-cache+content-sig");
+    index_lock.verify()?;
     let keep = pcache.live_event_files();
     let prune_files = pcache.event_prune_files(&keep);
     let proven_event_delta = (events_complete && !complete)
@@ -6065,13 +7256,19 @@ fn index_cmd_locked(
             &edir,
             &keep,
             &run_agents,
-            complete && source_snapshot_safe,
+            // A consented rebuild publishes past only material dropped by that consent, so its
+            // complete parse may rebuild and prune the event store as a safe snapshot's does; so
+            // may the pass completing it, which the event store may not yet reflect.
+            complete
+                && (source_snapshot_safe
+                    || ((consented_drop || consent.completing) && stable_unreadable)),
             &prune_files,
             cache::EventRecovery {
                 recover_corrupt: recover_corrupt_events,
                 authority: event_authority.as_ref(),
             },
         )?;
+        agrep_core::fault_injection::park_gate("event-proof");
         let proof_complete = cache::publish_events_complete(&edir, &run_agents)?;
         Ok((event_result, proof_complete))
     };
@@ -6079,6 +7276,7 @@ fn index_cmd_locked(
     // A current proof excludes partial outputs, so a pending retry may reuse it. Legacy proof
     // stays blocked because it cannot distinguish a complete generation from a crash remnant.
     if !full
+        && !consent.completing
         && (derived_valid || (!retry_sources && legacy_derived_valid))
         && previous_sig
             .as_deref()
@@ -6129,12 +7327,14 @@ fn index_cmd_locked(
         // forces the retry, and a live-writer pass whose next read fails must serve THIS
         // pass's rows. The clock advances only on a safe or publishing pass.
         let generation_publishes = source_after.is_some();
+        index_lock.verify()?;
         commit_generation_cache(
             &data,
             &edir,
             &run_agents,
             staged_cache,
             proven_event_delta.is_none(),
+            (consent, &sig_line),
         )?;
         let committed_token_material = pcache.token_namespaces();
         stage_token_material(
@@ -6149,6 +7349,8 @@ fn index_cmd_locked(
             proof_complete,
             "event publication remained incomplete after reconstruction"
         );
+        index_lock.verify()?;
+        consent.park("consent-promote");
         let signal_written = publish_generation_markers(GenerationPublication {
             data: &data,
             sig_path: &sig_path,
@@ -6159,6 +7361,7 @@ fn index_cmd_locked(
             repaired_sessions: &repaired_sessions,
             preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
             family_meta: family_meta.as_deref(),
+            park: &|step| consent.park(step),
         })?;
         preserve_signal_age(
             &sig_path,
@@ -6190,6 +7393,7 @@ fn index_cmd_locked(
         let breakdown: Vec<String> = phases.iter().map(|(k, ms)| format!("{k} {ms}ms")).collect();
         agrep_core::emit::human_line(format_args!("  phases: {}", breakdown.join(" · ")));
         let _ = mark;
+        consent.disarm()?;
         return Ok(());
     }
 
@@ -6226,12 +7430,14 @@ fn index_cmd_locked(
     // See the event-only branch above: the cache commits unconditionally so a later failed
     // read serves this pass's rows; only the freshness clock is gated on publication.
     let generation_publishes = source_after.is_some();
+    index_lock.verify()?;
     commit_generation_cache(
         &data,
         &edir,
         &run_agents,
         staged_cache,
         proven_event_delta.is_none(),
+        (consent, &sig_line),
     )?;
     let committed_token_material = pcache.token_namespaces();
     stage_token_material(
@@ -6242,13 +7448,14 @@ fn index_cmd_locked(
     )?;
 
     // The final signature remains the cross-file permission slip.
-    agrep_core::boundary_stats::write(
+    let (_boundary_families, boundary_staged) = agrep_core::boundary_stats::stage(
         &msgs,
         &session_aliases,
         &boundary_path,
         &boundary_cache_path,
         sig_line.trim(),
-        if full {
+        // A completing pass's still-published signature names the pre-consent stats, not a base.
+        if full || consent.completing {
             None
         } else {
             previous_sig.as_deref().map(str::trim)
@@ -6257,17 +7464,16 @@ fn index_cmd_locked(
     )?;
     lap!("write-boundary-stats");
 
-    let messages_work = || timed!(cache::write_messages(&msgs, &path));
-    let replies_work = || timed!(cache::write_replies(&msgs, &rpath));
+    let messages_work = || timed!(cache::stage_messages(&msgs, &path));
+    let replies_work = || timed!(cache::stage_replies(&msgs, &rpath));
     let sessions_work = || {
-        timed!(cache::write_session_index(
+        timed!(cache::stage_session_index(
             &msgs,
             &session_aliases,
             &sessions_path,
             sig_line.trim(),
         ))
     };
-    let events_work = || timed!(refresh_events());
     // Concurrent derived I/O triggers pathological Windows content-filter stalls.
     #[cfg(windows)]
     let message_outputs = {
@@ -6282,13 +7488,38 @@ fn index_cmd_locked(
         ((messages_result, messages_elapsed), (replies_result, replies_elapsed)),
         (sessions_result, sessions_elapsed),
     ) = message_outputs;
-    messages_result?;
-    replies_result?;
-    let (n_sessions, family_meta) = sessions_result?;
-    invalidate_turn_enrichment(&data)?;
-    let (event_proof_result, events_elapsed) = events_work();
+    let messages_staged = messages_result?;
+    let replies_staged = replies_result?;
+    let (n_sessions, family_meta, sessions_staged) = sessions_result?;
+    let staged: Vec<cache::StagedFile> = boundary_staged
+        .into_iter()
+        .chain([messages_staged, replies_staged, sessions_staged])
+        .collect();
+    // Promoted only after a complete event proof. A failure before the event commit, or a
+    // directory in the way, leaves the published files and proof whole; one after it may have
+    // rewritten event_stats.json, and readers then refuse until the next pass.
+    for file in &staged {
+        file.check_destination()?;
+    }
+    let (event_proof_result, events_elapsed) = timed!(refresh_events());
     let (event_result, proof_complete) = event_proof_result?;
     let (n_files, n_events, n_rewritten) = event_result;
+    anyhow::ensure!(
+        proof_complete,
+        "event publication remained incomplete after reconstruction"
+    );
+    consent.park("consent-promote");
+    const PROMOTED: [&str; 4] = [
+        "consent-promoted-1",
+        "consent-promoted-2",
+        "consent-promoted-3",
+        "consent-promoted-4",
+    ];
+    for (index, file) in staged.into_iter().enumerate() {
+        file.promote()?;
+        consent.park(PROMOTED[index.min(PROMOTED.len() - 1)]);
+    }
+    invalidate_turn_enrichment(&data)?;
     if std::env::var_os("AGREP_DEBUG").is_some() {
         eprintln!(
             "* [agrep ingest] messages {:.1}ms · replies {:.1}ms · sessions {:.1}ms · events {:.1}ms · postflight {:.1}ms",
@@ -6300,11 +7531,8 @@ fn index_cmd_locked(
         );
     }
     lap!("write-derived+source-validate");
-    anyhow::ensure!(
-        proof_complete,
-        "event publication remained incomplete after reconstruction"
-    );
     // Union onto any unconsumed prior delta so a skipped corpus refresh can't drop a session.
+    index_lock.verify()?;
     let signal_written = publish_generation_markers(GenerationPublication {
         data: &data,
         sig_path: &sig_path,
@@ -6315,6 +7543,7 @@ fn index_cmd_locked(
         repaired_sessions: &repaired_sessions,
         preserve_signal_if_unchanged: !(source_snapshot_safe || generation_publishes),
         family_meta: Some(&family_meta),
+        park: &|step| consent.park(step),
     })?;
     preserve_signal_age(
         &sig_path,
@@ -6346,6 +7575,12 @@ fn index_cmd_locked(
         agrep_core::ingest::terminal_safe(path.display()),
         t0.elapsed().as_secs_f64() * 1000.0
     ));
+    for label in &rebuilt_without {
+        agrep_core::emit::human_line(format_args!(
+            "  rebuilt without unreadable {}; it is indexed again once readable",
+            agrep_core::ingest::terminal_safe(label)
+        ));
+    }
     agrep_core::emit::human_line(format_args!(
         "  {} turns carry a model · {} carry an agent reply -> {}",
         with_model,
@@ -6369,6 +7604,7 @@ fn index_cmd_locked(
             ));
         }
     }
+    consent.disarm()?;
     Ok(())
 }
 
@@ -6403,16 +7639,114 @@ mod tests {
         absolute_data_dir, adopt_foreign_corpus_db_with, apply_durable_store_issues,
         clear_source_health, decoded_store_audit_payload, derived_generation_valid,
         derived_generation_valid_with, derived_names, derived_proof, derived_write_ownership,
-        normalize_messages, platform_data_dir_from, probe_corpus_db_owner, publish_derived_owner,
-        publish_derived_proof, publish_retained_corpus_owner, publish_source_snapshot,
-        publish_source_snapshot_with, publish_source_unreadable, read_fallback_event_scan_request,
-        read_optional_bytes, reclaim_cold_rollback_journal, regular_file_has_bytes,
-        resolve_data_dir, runtime_source_issue_value, serialize_store_audit_payload,
-        source_health_records, staging_temp_owner, store_audit_payload, sweep_staging_temps_with,
+        discard_foreign_cache, normalize_messages, platform_data_dir_from, probe_corpus_db_owner,
+        publish_derived_owner, publish_derived_proof, publish_retained_corpus_owner,
+        publish_source_snapshot, publish_source_snapshot_with, publish_source_unreadable,
+        read_fallback_event_scan_request, read_optional_bytes, reclaim_cold_rollback_journal,
+        regular_file_has_bytes, remove_derived_artifact, resolve_data_dir,
+        runtime_source_issue_value, serialize_store_audit_payload, source_health_records,
+        staging_temp_owner, store_audit_payload, sweep_staging_temps_with,
         unlocked_owner_has_no_retained_corpus, write_changed_sessions, write_source_health, Cli,
         CorpusDbAdoptionError, CorpusDbOwnerProbe, DerivedOwnerRecord, DerivedWriteOwnership,
         RetainedCorpusDb, SourcePublishOutcome, DERIVED_OWNER_FILE, DERIVED_OWNER_VERSION,
     };
+
+    /// Tests that set the adoption env vars serialize on this; the fence reads process env.
+    fn adoption_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A cache whose only frame is lost: base and head of a committed journal, the journal
+    /// itself unreadable garbage. Every writer lane refuses it as stale; adopting it would
+    /// serve rows older than the generation it fed.
+    fn stale_journal_cache(data: &std::path::Path) -> PathBuf {
+        use agrep_core::ingest_cache::{collect_cached, IngestCache};
+        use agrep_core::model::RawMessage;
+
+        let cache_path = data.join(".ingest_cache.bin");
+        let source = data.join("session.jsonl");
+        let row = |text: &str| {
+            RawMessage {
+                agent: "claude",
+                project: "project".into(),
+                session: "session".into(),
+                ts: 1,
+                turn: 0,
+                text: text.into(),
+                model: String::new(),
+                reply: String::new(),
+                reply_chars: 0,
+                side: false,
+                parent: String::new(),
+                reply_shape: Default::default(),
+            }
+            .freeze()
+        };
+        std::fs::write(&source, b"base").unwrap();
+        let mut cold = IngestCache::cold();
+        collect_cached(&mut cold, data, std::slice::from_ref(&source), |_| {
+            (vec![row("base")], Vec::new())
+        });
+        cold.stage_save(&cache_path).unwrap().commit().unwrap();
+        std::fs::write(&source, b"journaled delta").unwrap();
+        let mut warm = IngestCache::load(&cache_path);
+        collect_cached(&mut warm, data, std::slice::from_ref(&source), |_| {
+            (vec![row("journaled")], Vec::new())
+        });
+        let head = warm.stage_save(&cache_path).unwrap().commit().unwrap();
+        assert!(head.sequence() == 1);
+        std::fs::write(data.join(".ingest_cache.bin.journal"), b"garbage").unwrap();
+        assert_eq!(
+            agrep_core::ingest_cache::adopt_foreign_cache(&cache_path),
+            Err("cache journal behind its last commit"),
+        );
+        cache_path
+    }
+
+    /// A removal that fails at any step of the discard leaves no base a later takeover adopts:
+    /// the base goes before its sidecars, so what survives is the whole evidence or nothing.
+    #[test]
+    fn a_discard_that_fails_at_any_step_never_leaves_a_stale_base_adoptable() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-discard-steps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for failing_step in 0..=3 {
+            let data = root.join(format!("step-{failing_step}"));
+            std::fs::create_dir_all(&data).unwrap();
+            let cache_path = stale_journal_cache(&data);
+            let mut step = 0;
+            let outcome = discard_foreign_cache(&data, |path| {
+                let this = step;
+                step += 1;
+                if this == failing_step {
+                    return Err(format!("cannot discard {}: injected", path.display()));
+                }
+                remove_derived_artifact(path)
+            });
+            assert_eq!(outcome.is_err(), failing_step < 3, "step {failing_step}");
+            let adopted = agrep_core::ingest_cache::adopt_foreign_cache(&cache_path);
+            assert!(
+                matches!(
+                    adopted,
+                    Err("missing cache file") | Err("cache journal behind its last commit")
+                ),
+                "step {failing_step}: a stale base was adopted: {adopted:?}"
+            );
+            if cache_path.exists() {
+                assert!(
+                    data.join(".ingest_cache.bin.head").exists(),
+                    "step {failing_step}: the base outlived the head that dates it"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn protocol_panic_guard_recovers_for_the_next_request() {
@@ -6708,6 +8042,7 @@ mod tests {
                     reply_chars: 0,
                     side: false,
                     parent: String::new(),
+                    reply_shape: Default::default(),
                 };
                 (vec![message.freeze()], Vec::new())
             },
@@ -6927,30 +8262,86 @@ mod tests {
     }
 
     #[test]
-    fn harness_projects_require_a_path_segment_prefix() {
-        use agrep_core::row_class::is_harness_project;
+    fn harness_projects_come_only_from_the_configured_policy() {
+        use agrep_core::row_class::{is_harness_project, HarnessPolicy};
+        let policy = HarnessPolicy::parse(
+            "# text prefixes and project segment prefixes\nhow do i fix\n\
+             project: control_\nproject:_probe\nproject:vo-exp\nproject:\n",
+        );
+        assert_eq!(policy.text_prefixes, vec!["how do i fix".to_string()]);
+        assert_eq!(
+            policy.project_prefixes,
+            vec!["control_".to_string(), "_probe".to_string(), "vo-exp".to_string()]
+        );
+        let prefixes = &policy.project_prefixes;
         for project in [
             "vo-exp",
             "_probe",
             "_probe-run",
             "control_fixture",
-            "run_control_42",
-            "haiku-control-case",
-            "haiku-treatment-case",
             "root/control_fixture",
-            r"root\RUN_CONTROL_case",
+            r"root\CONTROL_case",
         ] {
-            assert!(is_harness_project(project), "{project}");
+            assert!(is_harness_project(project, prefixes), "{project}");
+            // the former built-in names are user projects without the policy
+            assert!(!is_harness_project(project, &[]), "{project}");
         }
-        for project in [
-            "version_control_tools",
-            "my-haiku-control-tools",
-            "runbook_run_control",
-            "production_probe",
-            "vo-expansion",
+        for project in ["version_control_tools", "production_probe", "plane"] {
+            assert!(!is_harness_project(project, prefixes), "{project}");
+        }
+    }
+
+    #[test]
+    fn derived_owner_names_a_newer_record_and_keeps_malformed_wording() {
+        let data = std::env::temp_dir().join(format!(
+            "agrep-derived-owner-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let owner_path = data.join(DERIVED_OWNER_FILE);
+        for (record, detail) in [
+            (
+                r#"{"version": 2, "format": 1, "package": "0.5.0"}"#,
+                "ownership record version 2, format 1)",
+            ),
+            (r#"{"version": 7}"#, "ownership record version 7)"),
+            (
+                r#"{"version": 2, "build_id": "aaaaaaaaaaaaaaaaaaaa", "format": "x"}"#,
+                "ownership record version 2)",
+            ),
         ] {
-            assert!(!is_harness_project(project), "{project}");
+            std::fs::write(&owner_path, record).unwrap();
+            let DerivedWriteOwnership::Refused(reason) = derived_write_ownership(&data) else {
+                panic!("a newer ownership record must refuse every writer: {record}");
+            };
+            assert!(reason.contains("written by a newer agrep"), "{reason}");
+            assert!(reason.contains(detail), "{reason}");
+            assert!(reason.contains("AGREP_DATA_DIR"), "{reason}");
+            assert!(!reason.contains("malformed"), "{reason}");
         }
+        for record in [
+            r#"{"version": "2"}"#,
+            r#"{"version": 2.0}"#,
+            r#"{"version": true}"#,
+            r#"{"version": -2}"#,
+            r#"{"version": 0, "build_id": "aaaaaaaaaaaaaaaaaaaa"}"#,
+            r#"{"version": 1}"#,
+            r#"{"version": 1, "build_id": "short"}"#,
+            "[2]",
+            "not json",
+        ] {
+            std::fs::write(&owner_path, record).unwrap();
+            let DerivedWriteOwnership::Refused(reason) = derived_write_ownership(&data) else {
+                panic!("a malformed ownership record must refuse every writer: {record}");
+            };
+            assert!(reason.contains("is malformed"), "{record}: {reason}");
+        }
+
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
@@ -7509,7 +8900,7 @@ mod tests {
         connection
             .execute_batch(&format!(
                 "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-                 INSERT INTO meta VALUES('schema', '14');
+                 INSERT INTO meta VALUES('schema', '15');
                  INSERT INTO meta VALUES('stamp', 'retained-stamp');
                  CREATE TABLE msgs(
                      id INTEGER PRIMARY KEY,
@@ -7543,32 +8934,39 @@ mod tests {
     }
 
     #[test]
-    fn retained_reader_accepts_both_valid_family_table_generations() {
+    fn retained_reader_accepts_only_the_released_schemas_family_table() {
+        let connection = retained_schema_connection(
+            "CREATE TABLE session_family(
+                session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                side INTEGER NOT NULL CHECK(side IN (0, 1))) WITHOUT ROWID",
+        );
+        super::validate_corpus_reader_schema(&connection).unwrap();
+        // the unreleased 16 is not retained
+        connection
+            .execute("UPDATE meta SET value='16' WHERE key='schema'", [])
+            .unwrap();
+        let error = super::validate_corpus_reader_schema(&connection).unwrap_err();
+        assert!(format!("{error:?}").contains("schema"), "{error:?}");
+
         for family_sql in [
             "CREATE TABLE session_family(
                 session TEXT PRIMARY KEY, root TEXT NOT NULL) WITHOUT ROWID",
             "CREATE TABLE session_family(
                 session TEXT PRIMARY KEY, root TEXT NOT NULL,
-                side INTEGER NOT NULL CHECK(side IN (0, 1))) WITHOUT ROWID",
+                stale INTEGER NOT NULL) WITHOUT ROWID",
         ] {
             let connection = retained_schema_connection(family_sql);
-            super::validate_corpus_reader_schema(&connection).unwrap();
+            let error = super::validate_corpus_reader_schema(&connection).unwrap_err();
+            assert!(format!("{error:?}").contains("session_family"), "{error:?}");
         }
-
-        let connection = retained_schema_connection(
-            "CREATE TABLE session_family(
-                session TEXT PRIMARY KEY, root TEXT NOT NULL,
-                stale INTEGER NOT NULL) WITHOUT ROWID",
-        );
-        let error = super::validate_corpus_reader_schema(&connection).unwrap_err();
-        assert!(format!("{error:?}").contains("session_family"), "{error:?}");
     }
 
     #[test]
     fn retained_reader_rejects_the_schema_13_fts_layout() {
         let connection = retained_schema_connection(
             "CREATE TABLE session_family(
-                session TEXT PRIMARY KEY, root TEXT NOT NULL) WITHOUT ROWID",
+                session TEXT PRIMARY KEY, root TEXT NOT NULL,
+                side INTEGER NOT NULL CHECK(side IN (0, 1))) WITHOUT ROWID",
         );
         connection
             .execute_batch(
@@ -7612,7 +9010,7 @@ mod tests {
             .execute_batch(&format!(
                 "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
                  INSERT INTO meta(key, value) VALUES('build_id', '{foreign}');
-                 INSERT INTO meta(key, value) VALUES('schema', '15');
+                 INSERT INTO meta(key, value) VALUES('schema', '17');
                  INSERT INTO meta(key, value) VALUES('stamp', 'publish-failure-stamp');
                  INSERT INTO meta(key, value) VALUES('fts_triggers', '4');
                  CREATE TABLE msgs(
@@ -8005,17 +9403,75 @@ mod tests {
         );
         std::fs::write(&legacy, &raw).unwrap();
         std::fs::write(&current, &raw).unwrap();
+        let busy = super::LiveAdoption { pid, daemon: false };
         assert_eq!(
             super::adoption_daemon_fence(&data),
-            Some(super::AdoptionFence::LiveSameWriter(pid))
+            Some(super::AdoptionFence::LiveSameWriter(busy.clone()))
         );
         assert_eq!(std::fs::read_to_string(&legacy).unwrap(), raw);
         assert_eq!(std::fs::read_to_string(&current).unwrap(), raw);
+        // Two claimers that each won one record are both live same-build writers: waitable.
         std::fs::write(&current, raw.replace(&token, &"d".repeat(32))).unwrap();
-        assert!(matches!(
+        assert_eq!(
             super::adoption_daemon_fence(&data),
-            Some(super::AdoptionFence::Refused(_))
-        ));
+            Some(super::AdoptionFence::LiveSameWriter(busy.clone()))
+        );
+        // A record that vanished between the scan and the read is nothing to fence against or
+        // wait on: beside a live claim it is ignored, alone it is no owner at all, and it never
+        // turns a live legacy owner into something else.
+        let vanished = data.join(".indexd.v2.lock.vanished");
+        let scan = |names: &[(&str, &std::path::Path)]| {
+            names
+                .iter()
+                .map(|(name, path)| ((*name).to_owned(), path.to_path_buf()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            super::classify_daemon_owners(
+                &data,
+                scan(&[(".indexd.lock", &legacy), (".indexd.v2.lock", &vanished)]),
+                false,
+            ),
+            Some(super::AdoptionFence::LiveSameWriter(busy))
+        );
+        assert_eq!(
+            super::classify_daemon_owners(
+                &data,
+                scan(&[(".indexd.lock", &vanished), (".indexd.v2.lock", &vanished)]),
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            super::classify_daemon_owners(
+                &data,
+                scan(&[(".indexd.lock", &legacy), (".indexd.v2.lock", &current)]),
+                true,
+            ),
+            None
+        );
+        let foreign = data.join(".indexd.v2.lock.foreign");
+        std::fs::write(&foreign, raw.replace(&writer, &"f".repeat(20))).unwrap();
+        let refused = super::classify_daemon_owners(
+            &data,
+            scan(&[(".indexd.lock", &vanished), (".indexd.v2.lock", &foreign)]),
+            false,
+        );
+        assert!(
+            matches!(&refused, Some(super::AdoptionFence::Refused(reason)) if reason.contains("different writing build")),
+            "{refused:?}"
+        );
+        let stranger = super::LiveAdoption { pid, daemon: false };
+        assert!(stranger
+            .wait_notice()
+            .starts_with(&format!("waiting for another agrep indexer (pid {pid})")));
+        assert!(!stranger.expiry_reason().contains("daemon"));
+        assert!(!stranger.expiry_reason().contains("finishes on its own"));
+        let daemon = super::LiveAdoption { pid, daemon: true };
+        assert!(daemon
+            .wait_notice()
+            .starts_with("waiting for the freshness daemon to finish updating the index"));
+        assert!(daemon.expiry_reason().contains("finishes on its own"));
 
         std::fs::remove_file(&current).unwrap();
         for untrusted in [
@@ -8052,6 +9508,169 @@ mod tests {
                 Some(super::AdoptionFence::Refused(_))
             ));
         }
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn only_the_daemons_own_indexing_child_is_named_as_the_daemon() {
+        let _env = adoption_env_guard();
+        let pid = std::process::id();
+        let start = super::index_lock::current_process_start_identity().unwrap();
+        let writer = agrep_core::ingest_cache::current_cache_writer_build_id();
+        let generation = "e".repeat(32);
+        let data = std::env::temp_dir().join(format!(
+            "agrep-daemon-child-adoption-{pid}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let claim = data.join(".indexd.lock");
+        let daemon = data.join(".indexd.v2.lock");
+        let child = data.join(format!(".indexd.v2.child.{generation}"));
+        std::fs::write(
+            &claim,
+            format!(
+                "state=derived-adoption pid={pid} start={start} writer={writer} token={}\n",
+                "c".repeat(32)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &daemon,
+            format!(
+                "pid={pid} start={start} protocol=2 package=x build=y writer={writer} \
+                 group={pid} token={generation} time=1\n"
+            ),
+        )
+        .unwrap();
+        let owners = || {
+            vec![
+                (".indexd.lock".to_owned(), claim.clone()),
+                (".indexd.v2.lock".to_owned(), daemon.clone()),
+            ]
+        };
+        let classify = || super::classify_daemon_owners(&data, owners(), false);
+        // The launch must be authorized for that daemon generation at all.
+        std::env::remove_var(super::DERIVED_ADOPTION_OWNER_TOKEN_ENV);
+        assert!(matches!(classify(), Some(super::AdoptionFence::Refused(_))));
+        std::env::set_var(super::DERIVED_ADOPTION_OWNER_TOKEN_ENV, &generation);
+        let stranger = Some(super::AdoptionFence::LiveSameWriter(super::LiveAdoption {
+            pid,
+            daemon: false,
+        }));
+        let own_child = Some(super::AdoptionFence::LiveSameWriter(super::LiveAdoption {
+            pid,
+            daemon: true,
+        }));
+        // No child fence: a claim beside the daemon is some other indexer of this build.
+        assert_eq!(classify(), stranger);
+        let fence = |target: u32, target_start: &str| {
+            format!(
+                "owner={generation} guard=1 guard_start=x target={target} \
+                 target_start={target_start} group={target}\n"
+            )
+        };
+        std::fs::write(&child, fence(pid, &start)).unwrap();
+        assert_eq!(classify(), own_child);
+        for other in [
+            fence(pid, "not-this-birth"),
+            fence(super::index_lock::MAX_PID, &start),
+            fence(pid, &start).replace(&generation, &"f".repeat(32)),
+            fence(pid, &start).trim_end().to_owned(),
+        ] {
+            std::fs::write(&child, other).unwrap();
+            assert_eq!(classify(), stranger);
+        }
+        std::env::remove_var(super::DERIVED_ADOPTION_OWNER_TOKEN_ENV);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn a_settled_claim_holds_both_records_or_shares_them_with_its_daemon() {
+        let _env = adoption_env_guard();
+        let pid = std::process::id();
+        let start = super::index_lock::current_process_start_identity().unwrap();
+        let writer = agrep_core::ingest_cache::current_cache_writer_build_id();
+        let data = std::env::temp_dir().join(format!(
+            "agrep-settled-claim-{pid}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let legacy = data.join(".indexd.lock");
+        let current = data.join(".indexd.v2.lock");
+        std::env::remove_var(super::DERIVED_ADOPTION_OWNER_TOKEN_ENV);
+
+        // No daemon: the claim must end up in both slots, not just the first one it won.
+        let claim = super::AdoptionClaim::acquire(&data).unwrap();
+        assert_eq!(claim.files.len(), 2, "{:?}", claim.files);
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            std::fs::read(&current).unwrap()
+        );
+        assert_eq!(
+            std::env::var(super::DERIVED_ADOPTION_CLAIM_TOKEN_ENV).as_deref(),
+            Ok(claim.token.as_str())
+        );
+        drop(claim);
+        assert!(!legacy.exists() && !current.exists());
+        assert!(std::env::var(super::DERIVED_ADOPTION_CLAIM_TOKEN_ENV).is_err());
+
+        // The authorized daemon generation keeps its record; the claim shares the pair with it.
+        let generation = "e".repeat(32);
+        let daemon = format!(
+            "pid={pid} start={start} protocol=2 package=x build=y writer={writer} \
+             group={pid} token={generation} time=1\n"
+        );
+        std::fs::write(&current, &daemon).unwrap();
+        std::env::set_var(super::DERIVED_ADOPTION_OWNER_TOKEN_ENV, &generation);
+        let claim = super::AdoptionClaim::acquire(&data).unwrap();
+        assert_eq!(
+            claim
+                .files
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![legacy.clone()]
+        );
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), daemon);
+        drop(claim);
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), daemon);
+
+        // A daemon generation that changes after this claim published its half is a refusal at the
+        // post-publish fence, and that half-published claim is withdrawn.
+        let mut published_before_fence = None;
+        let successor = daemon.replace(&generation, &"f".repeat(32));
+        let Err(fence) = super::AdoptionClaim::acquire_with(&data, || {
+            published_before_fence = Some(std::fs::read_to_string(&legacy).ok());
+            std::fs::write(&current, &successor).unwrap();
+        }) else {
+            panic!("a daemon generation that changed must refuse the claim");
+        };
+        assert!(
+            matches!(&fence, super::AdoptionFence::Refused(reason) if reason.contains("different writing generation")),
+            "{fence}"
+        );
+        let published = published_before_fence
+            .flatten()
+            .expect("the claim must have published .indexd.lock before its settling fence");
+        assert!(
+            published.starts_with(&format!("state=derived-adoption pid={pid} ")),
+            "{published}"
+        );
+        assert!(
+            !legacy.exists(),
+            "the half-published claim was not withdrawn"
+        );
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), successor);
+        assert!(std::env::var(super::DERIVED_ADOPTION_CLAIM_TOKEN_ENV).is_err());
+
+        std::env::remove_var(super::DERIVED_ADOPTION_OWNER_TOKEN_ENV);
         std::fs::remove_dir_all(data).unwrap();
     }
 
@@ -8121,9 +9740,11 @@ mod tests {
             reply_chars: 0,
             side: false,
             parent: String::new(),
+            reply_shape: Default::default(),
         }
         .freeze();
-        let normalized = normalize_messages(vec![message], &[]);
+        let policy = agrep_core::row_class::HarnessPolicy::default();
+        let normalized = normalize_messages(vec![message], &policy);
         assert_eq!(&*normalized[0].who, "user");
     }
 
@@ -8581,7 +10202,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&data).unwrap();
-        publish_source_unreadable(&data, "cursor", &[], &[], "snapshot failed").unwrap();
+        publish_source_unreadable(&data, "cursor", Vec::new(), "snapshot failed").unwrap();
         let records = source_health_records(&data).unwrap();
         assert_eq!(records.len(), 1);
         let path = records[0]["path"].as_str().unwrap();
@@ -8603,6 +10224,9 @@ mod tests {
             path,
             kind: "source-read-failed",
             reason: "permission denied".to_string(),
+            session: None,
+            retryable: false,
+            moving: false,
         };
         let first = runtime_source_issue_value(&issue);
         let second = runtime_source_issue_value(&issue);
@@ -8638,6 +10262,36 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn attribution_only_source_health_keeps_the_store_available_with_the_issue_listed() {
+        let mut stores = vec![serde_json::json!({
+            "name": "cursor", "files": 1, "state": "available", "issues": []
+        })];
+        let gap = serde_json::json!({
+            "agent": "cursor",
+            "path": "/fixture/workspaceStorage/ws/state.vscdb",
+            "kind": agrep_core::ingest::registry::ATTRIBUTION_ISSUE_KIND,
+            "reason": "file is not a database",
+        });
+        apply_durable_store_issues(&mut stores, vec![gap.clone()]);
+        assert_eq!(stores[0]["state"], "available");
+        assert_eq!(stores[0]["issues"], serde_json::json!([gap.clone()]));
+        // A store the census did not see has nothing for the note to describe: no row, since an
+        // available row without a newest mtime would void the whole census for its readers.
+        let mut absent = Vec::new();
+        apply_durable_store_issues(&mut absent, vec![gap.clone()]);
+        assert!(absent.is_empty(), "{absent:?}");
+        // A real read failure on the same store still names it unreadable.
+        let failed = serde_json::json!({
+            "agent": "cursor",
+            "path": "/fixture/globalStorage/state.vscdb",
+            "kind": "source-read-failed",
+            "reason": "parser panicked",
+        });
+        apply_durable_store_issues(&mut stores, vec![failed]);
+        assert_eq!(stores[0]["state"], "source-unreadable");
+    }
+
     #[cfg(windows)]
     #[test]
     fn runtime_source_health_serializes_unpaired_utf16_without_panicking() {
@@ -8654,6 +10308,9 @@ mod tests {
             path,
             kind: "source-read-failed",
             reason: "sharing violation".to_string(),
+            session: None,
+            retryable: false,
+            moving: false,
         };
         let first = runtime_source_issue_value(&issue);
         assert_eq!(first, runtime_source_issue_value(&issue));

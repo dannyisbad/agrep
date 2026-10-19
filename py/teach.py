@@ -165,6 +165,19 @@ def manifest_targets(
             active = ("codex", candidate, candidate / "AGENTS.md")
             if active not in resolved:
                 resolved.append(active)
+    # XDG_CONFIG_HOME relocates the whole ~/.config tree: a target there is
+    # read from the relocated dir only, so the default copy is never written.
+    raw_xdg = env.get("XDG_CONFIG_HOME")
+    if raw_xdg:
+        xdg = Path(os.path.expanduser(raw_xdg))
+        default_config = root / ".config"
+        if xdg.is_absolute():
+            resolved = [
+                (label, proof,
+                 xdg / target.relative_to(default_config)
+                 if target.is_relative_to(default_config) else target)
+                for label, proof, target in resolved
+            ]
     return resolved
 
 
@@ -610,6 +623,40 @@ def _atomic_write_text(path: Path, body: str, *, encoding: str = "utf-8",
     _atomic_write_bytes(path, body.encode(encoding), mode=mode)
 
 
+# Pending state for the next _save_state: EOLs appended before each freshly
+# added block (so removal takes exactly those back out) and directories mkdir'd.
+_ADDED_SEPARATORS: dict[str, int] = {}
+_CREATED_DIRS: list[str] = []
+
+
+def _mkdir_recording(directory: Path) -> None:
+    """mkdir -p that notes every directory it had to create."""
+    missing: list[Path] = []
+    current = directory
+    while not current.exists() and current.parent != current:
+        missing.append(current)
+        current = current.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    for created in missing:
+        if str(created) not in _CREATED_DIRS:
+            _CREATED_DIRS.append(str(created))
+
+
+def _without_blocks(raw: bytes, spans: list[_BlockSpan], separator: int) -> bytes:
+    """Splice the spans out, plus the EOLs agrep appended before the first one.
+    Content the user added after the block keeps exactly one EOL in front of it,
+    so the lines on either side of the block never run together."""
+    spliced = _splice_blocks(raw, spans)
+    if separator <= 0 or not spans:
+        return spliced
+    eol = _preferred_eol(raw)
+    head = raw[:spans[0].start]
+    if not head.endswith(eol + eol):
+        return spliced
+    strip = separator if len(spliced) == len(head) else 1
+    return head[:len(head) - len(eol) * strip] + spliced[len(head):]
+
+
 def _updated_block_bytes(path: Path, raw: bytes) -> tuple[str, bytes]:
     raw.decode("utf-8")
     spans = _block_spans(raw)
@@ -629,9 +676,9 @@ def _updated_block_bytes(path: Path, raw: bytes) -> tuple[str, bytes]:
         return "updated", _splice_blocks(raw, spans, block)
     if not raw:
         return "added", block
-    separator = b"" if raw.endswith(eol + eol) else (
-        eol if raw.endswith(b"\n") else eol + eol)
-    return "added", raw + separator + block
+    units = 0 if raw.endswith(eol + eol) else (1 if raw.endswith(b"\n") else 2)
+    _ADDED_SEPARATORS[str(path)] = units
+    return "added", raw + eol * units + block
 
 
 def _write_block(
@@ -640,7 +687,7 @@ def _write_block(
 ) -> str:
     if _data_dir_readonly():
         raise _readonly_error()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_recording(path.parent)
     try:
         if observed is None:
             old = path.read_bytes() if path.exists() else b""
@@ -664,7 +711,7 @@ def _write_skill(
 ) -> str:
     if _data_dir_readonly():
         raise _readonly_error()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_recording(path.parent)
     if observed is not None or path.exists():
         on_disk = path.read_bytes() if observed is None else observed
         old = on_disk
@@ -730,7 +777,7 @@ def _transition(
     return f"{verb} {noun}"
 
 
-def _remove_block(path: Path) -> bool:
+def _remove_block(path: Path, *, separator: int = 0) -> bool:
     if _data_dir_readonly():
         raise _readonly_error()
     if not path.exists():
@@ -743,7 +790,7 @@ def _remove_block(path: Path) -> bool:
     spans = _block_spans(old)
     if not spans:
         return False
-    new = _splice_blocks(old, spans)
+    new = _without_blocks(old, spans, separator)
     if not new.strip():
         if path.is_symlink():
             _atomic_write_bytes(path, b"")
@@ -754,7 +801,7 @@ def _remove_block(path: Path) -> bool:
     return True
 
 
-def _remove_skill(path: Path) -> bool:
+def _remove_skill(path: Path, *, separator: int = 0) -> bool:
     if _data_dir_readonly():
         raise _readonly_error()
     if not path.exists():
@@ -767,7 +814,7 @@ def _remove_skill(path: Path) -> bool:
     spans = _block_spans(old)
     if not spans:
         return False
-    new = _splice_blocks(old, spans)
+    new = _without_blocks(old, spans, separator)
     fronts = {
         _SKILL_FRONT.encode("utf-8"),
         _encode_lines(_SKILL_FRONT, b"\r\n"),
@@ -843,16 +890,74 @@ def enrollment_active() -> bool:
     )
 
 
+def _state_separators(state: dict) -> dict[str, int]:
+    """Per-target EOL counts agrep appended before its block (0 is implicit)."""
+    value = state.get("separators")
+    if not isinstance(value, dict):
+        return {}
+    return {key: units for key, units in value.items()
+            if isinstance(key, str) and isinstance(units, int)
+            and not isinstance(units, bool) and 0 < units <= 2}
+
+
+def _state_created_dirs(state: dict) -> list[str]:
+    """Directories agrep created for a target, deepest first; only ancestors
+    of a known target are admitted so a tampered record cannot aim rmdir."""
+    value = state.get("created_dirs")
+    if not isinstance(value, list):
+        return []
+    home = Path(os.path.abspath(HOME))
+    targets = [target for _, _, target in MD_TARGETS + SKILL_TARGETS]
+    accepted: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item in accepted:
+            continue
+        path = Path(item)
+        if (path.is_absolute() and path != home
+                and any(target.is_relative_to(path) for target in targets)):
+            accepted.append(item)
+    return sorted(accepted, key=lambda item: -len(Path(item).parts))
+
+
+def _persist_pending_dirs() -> None:
+    """Record directories created outside _install (reconcile repairs)."""
+    if not _CREATED_DIRS or _data_dir_readonly():
+        return
+    state = _load_state()
+    targets = _state_paths(state.get("targets"), include_retired=True)
+    if not targets:
+        _CREATED_DIRS.clear()
+        return
+    _save_state(
+        [Path(value) for value in targets],
+        [Path(value) for value in _state_paths(
+            state.get("skills"), skills_only=True, include_retired=True)],
+        [Path(value) for value in _state_paths(
+            state.get("removing"), include_retired=True)])
+
+
 def _save_state(
         targets: list[Path], skills: list[Path] | None = None,
         removing: list[Path] | None = None) -> None:
     global _LAST_RECONCILE_HEALTH, _PENDING_RECONCILE_HEALTH
     if _data_dir_readonly():
         raise _readonly_error()
+    previous = _load_state()
+    enrolled = {str(t) for t in targets} | {str(t) for t in (removing or [])}
+    separators = {
+        key: units
+        for key, units in (_state_separators(previous) | _ADDED_SEPARATORS).items()
+        if key in enrolled and 0 < units <= 2}
+    created = _state_created_dirs(previous)
+    created += [item for item in _CREATED_DIRS if item not in created]
     body = {"version": 2, "targets": [str(t) for t in targets],
             "skills": [str(t) for t in (skills or [])],
-            "removing": [str(t) for t in (removing or [])]}
+            "removing": [str(t) for t in (removing or [])],
+            "separators": separators,
+            "created_dirs": _state_created_dirs({"created_dirs": created})}
     _atomic_write_text(STATE_PATH, json.dumps(body, indent=1) + "\n")
+    _ADDED_SEPARATORS.clear()
+    _CREATED_DIRS.clear()
     _LAST_RECONCILE_HEALTH = None
     _PENDING_RECONCILE_HEALTH = None
     try:
@@ -998,6 +1103,9 @@ def strip(cfg):
     prefix = cfg["mark_prefix"].encode("ascii")
     end_marker = cfg["mark_end"].encode("ascii")
     begin = re.compile(re.escape(prefix) + rb" v([0-9]+) -->\Z")
+    # only a block this install or an older one wrote is its to strip; a newer
+    # agrep's block (a higher version) stays with the install that owns it
+    max_version = cfg.get("block_version")
     skills = set(cfg.get("skill_files", []))
     for t in cfg.get("targets", []):
         p = Path(t)
@@ -1008,6 +1116,7 @@ def strip(cfg):
             old.decode("utf-8")
             spans = []
             opened = None
+            strippable = False
             bad = False
             offset = 0
             while offset < len(old):
@@ -1016,16 +1125,20 @@ def strip(cfg):
                 line = old[offset:line_end if nl < 0 else nl]
                 if line.endswith(b"\r"):
                     line = line[:-1]
-                if begin.fullmatch(line):
+                begun = begin.fullmatch(line)
+                if begun:
                     if opened is not None:
                         bad = True
                         break
                     opened = offset
+                    strippable = (isinstance(max_version, int)
+                                  and int(begun.group(1)) <= max_version)
                 elif line == end_marker:
                     if opened is None:
                         bad = True
                         break
-                    spans.append((opened, line_end))
+                    if strippable:
+                        spans.append((opened, line_end))
                     opened = None
                 elif prefix in line or end_marker in line:
                     bad = True
@@ -1040,6 +1153,15 @@ def strip(cfg):
                 cursor = finish
             pieces.append(old[cursor:])
             new = b"".join(pieces)
+            units = (cfg.get("separators") or {}).get(t, 0)
+            head = old[:spans[0][0]]
+            if isinstance(units, int) and 0 < units <= 2:
+                nl = old.find(b"\n")
+                eol = b"\r\n" if nl > 0 and old[nl - 1:nl] == b"\r" else b"\n"
+                if head.endswith(eol * 2):
+                    # the user's lines after the block keep one EOL in front of them
+                    strip = units if len(new) == len(head) else 1
+                    new = head[:len(head) - len(eol) * strip] + new[len(head):]
             front = cfg.get("skill_front", "").encode("utf-8")
             fronts = {front, front.replace(b"\n", b"\r\n")}
             if t in skills and new in fronts and not p.is_symlink():
@@ -1057,15 +1179,15 @@ def strip(cfg):
             # ValueError covers UnicodeDecodeError: one cp1252 byte in one
             # target must not abort the strip and skip the teardown below
             continue
-    # codex's hook command names a script inside the package that just went
-    # away, so a stranded one errors on every compaction. Exact match against
-    # the install-time snapshot; any edit since then makes the file the user's.
-    snapshot = cfg.get("codex_hooks_snapshot") or ""
-    for t in (cfg.get("codex_hooks") or []) if snapshot else ():
-        p = Path(t)
+    # codex's hook and the payload copy it runs: exact match against the
+    # install-time snapshot of each; any edit since then makes the file the user's.
+    for item in cfg.get("codex_owned") or []:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[1], str)):
+            continue
+        p = Path(item[0])
         try:
             if not p.is_symlink() and p.is_file() \
-                    and p.read_text(encoding="utf-8") == snapshot:
+                    and p.read_text(encoding="utf-8") == item[1]:
                 p.unlink()
         except (OSError, ValueError):
             continue
@@ -1080,6 +1202,11 @@ def strip(cfg):
                 p.unlink()
         except (OSError, ValueError):
             continue
+    for d in cfg.get("created_dirs") or []:
+        try:
+            Path(d).rmdir()
+        except OSError:
+            pass
     subprocess.run(["schtasks", "/Delete", "/TN", cfg["task_name"], "/F"],
                    capture_output=True, creationflags=0x08000000)
     for n in ("sentinel.json", "teach.json", "teach-reconcile.json"):
@@ -1134,25 +1261,28 @@ use warnings;
 use File::Basename qw(basename dirname);
 use File::Temp qw(tempfile);
 
-my ($path, $prefix, $ending) = @ARGV;
+my ($path, $prefix, $ending, $target, $sidecar, $max_version) = @ARGV;
+# only a block this install or an older one wrote is its to strip; a newer
+# agrep's block (a higher version) stays with the install that owns it
+exit 3 unless defined $max_version && $max_version =~ /^[0-9]+\z/;
 open my $in, "<:raw", $path or exit 2;
 local $/;
 my $old = <$in>;
 close $in;
 
-my (@spans, $opened);
+my (@spans, $opened, $version);
 my $offset = 0;
 while ($offset < length($old)) {
     my $nl = index($old, "\n", $offset);
     my $finish = $nl < 0 ? length($old) : $nl + 1;
     my $line = substr($old, $offset, ($nl < 0 ? $finish : $nl) - $offset);
     $line =~ s/\r\z//;
-    if ($line =~ /^\Q$prefix\E v[0-9]+ -->\z/) {
+    if ($line =~ /^\Q$prefix\E v([0-9]+) -->\z/) {
         exit 3 if defined $opened;
-        $opened = $offset;
+        ($opened, $version) = ($offset, $1);
     } elsif ($line eq $ending) {
         exit 3 unless defined $opened;
-        push @spans, [$opened, $finish];
+        push @spans, [$opened, $finish] if $version <= $max_version;
         undef $opened;
     } elsif (index($line, $prefix) >= 0 || index($line, $ending) >= 0) {
         exit 3;
@@ -1162,12 +1292,37 @@ while ($offset < length($old)) {
 exit 3 if defined $opened;
 exit 0 unless @spans;
 
+# the sidecar names how many EOLs agrep itself appended before its block
+my $units = 0;
+if (defined $sidecar && defined $target && open my $sc, "<:raw", $sidecar) {
+    local $/ = "\n";  # the transcript above was slurped; the sidecar is one row per target
+    while (my $row = <$sc>) {
+        $row =~ s/\n\z//;
+        my ($n, $p) = split /\t/, $row, 2;
+        if (defined $p && $p eq $target && $n =~ /^[12]\z/) { $units = $n; last; }
+    }
+    close $sc;
+}
+
 my ($new, $cursor) = ("", 0);
 for my $span (@spans) {
     $new .= substr($old, $cursor, $span->[0] - $cursor);
     $cursor = $span->[1];
 }
 $new .= substr($old, $cursor);
+
+if ($units > 0) {
+    my $nl = index($old, "\n");
+    my $eol = ($nl > 0 && substr($old, $nl - 1, 1) eq "\r") ? "\r\n" : "\n";
+    my $lead = substr($old, 0, $spans[0][0]);
+    my $twice = $eol x 2;
+    if (length($lead) >= length($twice) && substr($lead, -length($twice)) eq $twice) {
+        # content the user added after the block keeps one EOL in front of it
+        my $strip = length($new) == length($lead) ? $units : 1;
+        $new = substr($lead, 0, length($lead) - length($eol) * $strip)
+             . substr($new, length($lead));
+    }
+}
 
 my @stat = stat($path);
 my ($out, $tmp) = tempfile("." . basename($path) . ".XXXXXX",
@@ -1199,7 +1354,7 @@ for t in @@TARGETS@@; do
         p=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$p" 2>/dev/null) || continue
     fi
     [ -f "$p" ] || continue
-    if perl "$DIR/sentinel_strip.pl" "$p" '@@PREFIX@@' '@@END@@' 2>/dev/null; then
+    if perl "$DIR/sentinel_strip.pl" "$p" '@@PREFIX@@' '@@END@@' "$t" "$DIR/sentinel_separators" '@@VERSION@@' 2>/dev/null; then
         if ! grep -q '[^[:space:]]' "$p" 2>/dev/null && [ "$linked" -eq 0 ]; then rm -f "$p"; fi
     fi
 done
@@ -1216,27 +1371,30 @@ for f in @@SKILLFILES@@; do
         rmdir "$(dirname "$f")" 2>/dev/null || true
     fi
 done
-# codex's hook runs a script inside the package that just vanished, so a
-# stranded one errors on every compaction. Byte-exact against the snapshot
-# taken when it was installed: any edit since then makes it the user's.
-for f in @@CODEXHOOKS@@; do
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
-    if cmp -s "$f" "$DIR/sentinel_codex_hooks"; then rm -f "$f"; fi
-done
+# codex: the hooks.json registration and the payload copy it runs from the codex
+# home's hooks/agrep. Byte-exact against the snapshot taken when each was
+# installed: any edit since then makes the file the user's.
+drop_owned() { if [ -f "$1" ] && [ ! -L "$1" ] && cmp -s "$1" "$2"; then rm -f "$1"; fi; }
+@@CODEXOWNED@@
 # Pi and OMP share one byte-identical extension payload. Preserve any copy
 # edited since enrollment; only the install-time snapshot is ours to remove.
 for f in @@PIEXTENSIONS@@; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     if cmp -s "$f" "$DIR/sentinel_pi_extension"; then rm -f "$f"; fi
 done
+# directories agrep itself created for the files above, deepest first; rmdir
+# refuses anything that still has content, so a user's files stay put.
+for d in @@CREATEDDIRS@@; do
+    rmdir "$d" 2>/dev/null || true
+done
 """
 
 _SENTINEL_TAIL_MAC = r"""launchctl bootout gui/$(id -u)/@@LABEL@@ 2>/dev/null || launchctl unload @@PLIST@@ 2>/dev/null
-rm -f @@PLIST@@ "$DIR/teach.json" "$DIR/teach-reconcile.json" "$DIR/sentinel_skill_front" "$DIR/sentinel_codex_hooks" "$DIR/sentinel_pi_extension" "$DIR/sentinel_strip.pl" "$0"
+rm -f @@PLIST@@ "$DIR/teach.json" "$DIR/teach-reconcile.json" "$DIR/sentinel_skill_front" "$DIR"/sentinel_codex_* "$DIR/sentinel_pi_extension" "$DIR/sentinel_separators" "$DIR/sentinel_strip.pl" "$0"
 """
 
 _SENTINEL_TAIL_LINUX = r"""systemctl --user disable --now @@UNIT@@.timer @@UNIT@@.path 2>/dev/null
-rm -f @@UNITS@@ "$DIR/teach.json" "$DIR/teach-reconcile.json" "$DIR/sentinel_skill_front" "$DIR/sentinel_codex_hooks" "$DIR/sentinel_pi_extension" "$DIR/sentinel_strip.pl" "$0"
+rm -f @@UNITS@@ "$DIR/teach.json" "$DIR/teach-reconcile.json" "$DIR/sentinel_skill_front" "$DIR"/sentinel_codex_* "$DIR/sentinel_pi_extension" "$DIR/sentinel_separators" "$DIR/sentinel_strip.pl" "$0"
 systemctl --user daemon-reload 2>/dev/null
 """
 
@@ -1256,12 +1414,39 @@ _LAUNCHD_PLIST = """\
 """
 
 
+_INSTALL_ANCHOR_ENV = "AGREP_INSTALL_ANCHOR"
+
+
+def install_anchor() -> Path:
+    """The file whose disappearance means agrep was uninstalled.
+
+    A package shim (the npm package) runs agrep out of uv's or pipx's cache,
+    where the code vanishes on every cache prune while the shim stays; it
+    names its own entry point in AGREP_INSTALL_ANCHOR so the sentinel tracks
+    the install the user actually has. uv tool and pipx installs keep their
+    code inside the tool venv, which cli.py's own location already tracks."""
+    raw = os.environ.get(_INSTALL_ANCHOR_ENV, "")
+    if raw:
+        anchor = Path(raw)
+        try:
+            if anchor.is_absolute() and anchor.is_file():
+                return anchor
+        except OSError:
+            pass
+    return REPO / "cli.py"
+
+
 def _sentinel_watch_paths() -> list[Path]:
     """The install dir, plus a stable ancestor when the install lives inside a
     tool venv (uv/pipx reinstalls delete the whole venv; a watch on the deleted
     tree can dangle and take the launchd job with it - the surviving parent
     still fires on the venv's own delete/recreate)."""
-    paths = [REPO]
+    anchor = install_anchor()
+    paths = [anchor.parent]
+    if anchor != REPO / "cli.py":
+        if anchor.parent.parent != anchor.parent:
+            paths.append(anchor.parent.parent)
+        return paths
     prefix = Path(sys.prefix)
     try:
         if REPO.is_relative_to(prefix) and prefix.parent != prefix:
@@ -1361,35 +1546,45 @@ def _sentinel_skill_paths(targets: list[Path]) -> list[Path]:
     return [target for target in targets if str(target) in known_skills]
 
 
-def _owned_codex_hooks() -> list[Path]:
-    """The codex hooks.json files agrep installed and still owns, judged now,
-    while agrep is here to judge. The sentinel runs after the package is gone
-    and cannot import this verdict, so it is frozen to disk as a snapshot."""
+def _owned_codex_files() -> list[tuple[Path, str]]:
+    """(file, snapshot name) for every codex file agrep installed and still
+    owns - each home's hooks.json, the payload copies its hook runs and the
+    launcher - judged now, while agrep is here to judge. The sentinel runs after
+    the package is gone and cannot import this verdict, so each is frozen by name."""
     try:
         import hookinstall
     except ImportError:
         return []
-    owned = []
-    for path in hookinstall.codex_hooks_paths():
+    owned: list[tuple[Path, str]] = []
+    for path in hookinstall.known_codex_hooks_paths():
         try:
             raw = path.read_text(encoding="utf-8")
         except (OSError, ValueError):
-            continue
-        if not path.is_symlink() and hookinstall._codex_hooks_owned(raw):
-            owned.append(path)
+            raw = None
+        if raw is not None and not path.is_symlink() and hookinstall._codex_hooks_owned(raw):
+            index = len(owned)
+            owned.append((path, "sentinel_codex_hooks" + (f".{index}" if index else "")))
+        for installed in hookinstall.owned_codex_files(path):
+            owned.append((installed, f"sentinel_codex_payload.{len(owned)}"))
     return owned
 
 
-def _write_codex_hook_snapshot(directory: Path) -> None:
-    """Freeze the exact bytes of the owned codex hooks.json, or clear a stale
-    snapshot when there is none. One file is all codex has; a second target
-    would need its own snapshot rather than sharing this one."""
-    owned = _owned_codex_hooks()
-    snapshot = directory / "sentinel_codex_hooks"
-    if not owned:
-        snapshot.unlink(missing_ok=True)
-        return
-    _atomic_write_bytes(snapshot, owned[0].read_bytes())
+def _write_codex_snapshots(directory: Path) -> list[tuple[Path, str]]:
+    """Freeze the exact bytes of every owned codex file; stale snapshots go."""
+    owned = _owned_codex_files()
+    for stale in directory.glob("sentinel_codex_*"):
+        stale.unlink(missing_ok=True)
+    for path, name in owned:
+        _atomic_write_bytes(directory / name, path.read_bytes())
+    return owned
+
+
+def _codex_snapshot_names() -> list[str]:
+    """Every codex snapshot currently in the data dir (sentinel_codex_*)."""
+    try:
+        return sorted(p.name for p in common.DATA_DIR.glob("sentinel_codex_*"))
+    except OSError:
+        return []
 
 
 def _owned_pi_extensions() -> list[Path]:
@@ -1420,21 +1615,47 @@ def _write_pi_extension_snapshot(directory: Path) -> None:
     _atomic_write_bytes(snapshot, owned[0].read_bytes())
 
 
+def _sentinel_created_dirs() -> list[str]:
+    """Directories setup created for its files, deepest first."""
+    created = _state_created_dirs(_load_state())
+    try:
+        import hookinstall
+        created += [d for d in hookinstall.created_dirs() if d not in created]
+    except ImportError:
+        pass
+    return sorted(created, key=lambda item: -len(Path(item).parts))
+
+
 def _sh_subs(targets: list[Path]) -> dict[str, str]:
-    """The template values the mac and linux sentinel scripts share."""
+    """The template values the mac and linux sentinel scripts share. Writes
+    the codex snapshots the rendered lines refer to."""
     skills = _sentinel_skill_paths(targets)
+    codex_owned = _write_codex_snapshots(common.DATA_DIR)
     return {
         "@@DIR@@": _sh_squote(common.DATA_DIR),
-        "@@CLI@@": _sh_squote(REPO / "cli.py"),
+        "@@CLI@@": _sh_squote(install_anchor()),
         "@@TARGETS@@": " ".join(_sh_squote(t) for t in targets),
         "@@SKILLFILES@@": " ".join(_sh_squote(t) for t in skills),
-        "@@CODEXHOOKS@@": " ".join(
-            _sh_squote(t) for t in _owned_codex_hooks()),
+        "@@CODEXOWNED@@": "\n".join(
+            f'drop_owned {_sh_squote(path)} "$DIR/{name}"' for path, name in codex_owned),
         "@@PIEXTENSIONS@@": " ".join(
             _sh_squote(t) for t in _owned_pi_extensions()),
+        "@@CREATEDDIRS@@": " ".join(
+            _sh_squote(d) for d in _sentinel_created_dirs()),
+        # not a script slot: the sidecar body _write_sentinel_sh stores
+        "@@SEPARATORS@@": _separator_sidecar(targets),
         "@@PREFIX@@": MARK_PREFIX,
         "@@END@@": MARK_END,
+        "@@VERSION@@": str(NUDGE_V),
     }
+
+
+def _separator_sidecar(targets: list[Path]) -> str:
+    """One `units<TAB>path` row per target whose block agrep prefixed with EOLs."""
+    separators = _state_separators(_load_state())
+    return "".join(
+        f"{separators[str(t)]}\t{t}\n" for t in targets
+        if str(t) in separators and "\n" not in str(t))
 
 
 def _write_sentinel_sh(tail: str, subs: dict[str, str]) -> Path:
@@ -1447,8 +1668,8 @@ def _write_sentinel_sh(tail: str, subs: dict[str, str]) -> Path:
     for k, v in subs.items():
         body = body.replace(k, v)
     _atomic_write_text(d / "sentinel_skill_front", _SKILL_FRONT)
-    _write_codex_hook_snapshot(d)
     _write_pi_extension_snapshot(d)
+    _atomic_write_text(d / "sentinel_separators", subs.get("@@SEPARATORS@@", ""))
     _atomic_write_text(d / "sentinel_strip.pl", _SENTINEL_STRIP_PERL, mode=0o700)
     _atomic_write_text(script, body, mode=0o700)
     return script
@@ -1458,9 +1679,10 @@ def _sentinel_install(targets: list[Path]) -> bool:
     """Arm package-loss cleanup for enrolled instructions and owned hooks.
 
     The platform watcher rechecks a missing CLI after 20 seconds, then strips
-    every enrolled instruction block and removes only hook/extension bytes
-    frozen during this install. User edits survive. Timers are backstops for
-    watch-manager loss; the filesystem watch is the mechanism.
+    every enrolled instruction block of this install's version or older (a
+    newer install's block stays with it) and removes only hook/extension
+    bytes frozen during this install. User edits survive. Timers are backstops
+    for watch-manager loss; the filesystem watch is the mechanism.
     """
     if _data_dir_readonly():
         return False
@@ -1677,25 +1899,29 @@ def _sentinel_install_win(targets: list[Path]) -> bool:
     skills = _sentinel_skill_paths(targets)
     # Snapshots ride in sentinel.json on Windows because the watcher already
     # reads that config. Exact text survives the JSON round-trip.
-    codex_hooks = _owned_codex_hooks()
-    codex_snapshot = (codex_hooks[0].read_text(encoding="utf-8")
-                      if codex_hooks else "")
-    codex_hooks = codex_hooks[:1]
+    codex_owned = []
+    for path, _ in _owned_codex_files():
+        try:
+            codex_owned.append([str(path), path.read_text(encoding="utf-8")])
+        except (OSError, ValueError):
+            continue
     pi_extensions = _owned_pi_extensions()
     pi_snapshot = (pi_extensions[0].read_text(encoding="utf-8")
                    if pi_extensions else "")
     _atomic_write_text(d / "sentinel.json", json.dumps({
-        "cli": str(REPO / "cli.py"),
+        "cli": str(install_anchor()),
         "task_name": _sentinel_task_name(),
         "mark_prefix": MARK_PREFIX,
         "mark_end": MARK_END,
+        "block_version": NUDGE_V,
         "targets": [str(t) for t in targets],
         "skill_files": [str(t) for t in skills],
         "skill_front": _SKILL_FRONT,
-        "codex_hooks": [str(t) for t in codex_hooks],
-        "codex_hooks_snapshot": codex_snapshot,
+        "codex_owned": codex_owned,
         "pi_extensions": [str(t) for t in pi_extensions],
         "pi_extension_snapshot": pi_snapshot,
+        "separators": _state_separators(_load_state()),
+        "created_dirs": _sentinel_created_dirs(),
     }, indent=1) + "\n")
     # schtasks /SC ONLOGON demands elevation (denied under npm postinstall);
     # the Task Scheduler COM surface allows an own-user logon trigger
@@ -1983,7 +2209,7 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
     service.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(service, _SYSTEMD_SERVICE.format(script=script))
     _atomic_write_text(timer, _SYSTEMD_TIMER)
-    _atomic_write_text(path_unit, _SYSTEMD_PATH.format(cli=REPO / "cli.py"))
+    _atomic_write_text(path_unit, _SYSTEMD_PATH.format(cli=install_anchor()))
     _systemctl_user("daemon-reload")
     ok_path = _systemctl_user("enable", "--now", path_unit.name) == 0
     ok_timer = _systemctl_user("enable", "--now", timer.name) == 0
@@ -2013,8 +2239,9 @@ def _sentinel_install_linux(targets: list[Path]) -> bool:
         unit.unlink(missing_ok=True)
     if proven_unarmed:
         for name in (
-                "sentinel.sh", "sentinel_skill_front", "sentinel_codex_hooks",
-                "sentinel_pi_extension", "sentinel_strip.pl"):
+                "sentinel.sh", "sentinel_skill_front",
+                "sentinel_pi_extension", "sentinel_separators",
+                "sentinel_strip.pl", *_codex_snapshot_names()):
             try:
                 (common.DATA_DIR / name).unlink(missing_ok=True)
             except OSError:
@@ -2103,9 +2330,8 @@ def _sentinel_remove() -> bool:
             _systemctl_user("daemon-reload")
         for n in ("sentinel.ps1", "sentinel.sh", "sentinel.json", "sentinel.miss",
                   "sentinel_watch.py", "sentinel_skill_front",
-                  "sentinel_codex_hooks", "sentinel_pi_extension",
-                  "sentinel_strip.pl", _LINUX_UNARMED_MARKER,
-                  RECONCILE_HEALTH):
+                  "sentinel_pi_extension", "sentinel_separators", "sentinel_strip.pl",
+                  _LINUX_UNARMED_MARKER, RECONCILE_HEALTH, *_codex_snapshot_names()):
             (common.DATA_DIR / n).unlink(missing_ok=True)
     except OSError:
         return False
@@ -2147,11 +2373,12 @@ def reconcile() -> list[str]:
         return repaired
     skill_paths = set(_state_paths(
         state.get("skills"), skills_only=True, include_retired=True))
+    separators = _state_separators(state)
     for t in [value for value in all_targets if value in removing]:
         p = Path(t)
         try:
             remove = _remove_skill if t in skill_paths else _remove_block
-            remove(p)
+            remove(p, separator=separators.get(t, 0))
             _unenroll_target(p)
             removing.discard(t)
         except Exception as exc:  # noqa: BLE001 -- keep the removal recoverable
@@ -2186,6 +2413,8 @@ def reconcile() -> list[str]:
     skill_paths = set(_state_paths(state.get("skills"), skills_only=True))
     known_skills = {str(target) for _, _, target in SKILL_TARGETS}
     skill_paths.update(str(t) for t in targets if str(t) in known_skills)
+    proofs = {str(target): proof for _, proof, target in MD_TARGETS + SKILL_TARGETS}
+    _CREATED_DIRS.clear()
     for t in targets:
         if t in removing:
             continue
@@ -2230,6 +2459,11 @@ def reconcile() -> list[str]:
                      "target drifted; run agrep setup to reconcile it safely"))
                 refusals.append(_reconcile_issue(p, kind, detail))
                 continue
+            proof = proofs.get(t)
+            if proof is None or not proof.is_dir():
+                # the agent's home is gone: writing the block back would fabricate
+                # it. The enrollment stays dormant and repairs once the home returns.
+                continue
             if is_skill:
                 verb = _write_skill(
                     p, expect_absent=True)
@@ -2260,6 +2494,7 @@ def reconcile() -> list[str]:
             refusals.append(_reconcile_issue(
                 p, "target-unreadable", f"{type(exc).__name__}: {exc}"))
             continue
+    _persist_pending_dirs()
     health = {
         "version": 1,
         "state": ("refused" if refusals else
@@ -2336,10 +2571,33 @@ def teach(yes: bool = False) -> int:
     return _install()
 
 
+def _write_failure_hint(exc: BaseException) -> str:
+    """What to do about one instruction file setup could not write."""
+    if isinstance(exc, PermissionError):
+        return "make the file and its directory writable by you, then re-run `agrep setup`"
+    if isinstance(exc, BlockStructureError):
+        return (f"delete the stray `{MARK_PREFIX}`/`{MARK_END}` lines by hand, "
+                "then re-run `agrep setup`")
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        return "repair the dangling link or path, then re-run `agrep setup`"
+    return "fix the file, then re-run `agrep setup`"
+
+
+def _report_teach_failures(failures: list[str]) -> None:
+    if not failures:
+        return
+    names = ", ".join(dict.fromkeys(failures))
+    print(f"  ! {len(failures)} instruction file(s) not written ({names}); "
+          "the other agents and the rest of setup are unaffected. "
+          "`agrep setup` retries once the files above are fixed.")
+
+
 def _install() -> int:
     if _data_dir_readonly():
         print("agent setup skipped: AGREP_DATA_READONLY protects this data directory")
         return 1
+    _ADDED_SEPARATORS.clear()
+    _CREATED_DIRS.clear()
     if not removal_fence.clear_background_removal_fence():
         print("  ! setup is blocked by an active removal")
         return 1
@@ -2386,6 +2644,7 @@ def _install() -> int:
     written: list[Path] = []
     skills: list[Path] = []
     failed = False
+    failures: list[str] = []
     for agent, proof, target in MD_TARGETS:
         if not proof.is_dir():
             continue
@@ -2393,11 +2652,14 @@ def _install() -> int:
         try:
             verb = _write_block(target)
         except (OSError, ValueError) as exc:
-            print(f"  {agent}: could not write {target}: {common.terminal_safe(exc)}")
+            print(f"  ! {agent}: could not write {target}: {common.terminal_safe(exc)}"
+                  f" - {_write_failure_hint(exc)}")
             failed = True
+            failures.append(agent)
             continue
         if verb == "skipped":
             failed = True
+            failures.append(agent)
             continue
         print(f"  {agent}: {_transition(verb, 'block', version, edited)} "
               f"in {target}")
@@ -2409,12 +2671,16 @@ def _install() -> int:
         try:
             verb = _write_skill(target)
         except (OSError, ValueError) as exc:
-            print(f"  {agent}: could not write {target}: {common.terminal_safe(exc)}")
+            print(f"  ! {agent}: could not write {target}: {common.terminal_safe(exc)}"
+                  f" - {_write_failure_hint(exc)}")
             failed = True
+            failures.append(agent)
             continue
         if verb == "conflict":
-            print(f"  {agent}: refused to overwrite existing unowned skill {target}")
+            print(f"  {agent}: refused to overwrite existing unowned skill {target}"
+                  " - move or delete that skill, then re-run `agrep setup`")
             failed = True
+            failures.append(agent)
             continue
         print(f"  {agent}: {_transition(verb, 'skill', version, edited)} "
               f"in {target}")
@@ -2443,7 +2709,8 @@ def _install() -> int:
             continue
         try:
             remove = _remove_skill if is_skill else _remove_block
-            removed = remove(target)
+            removed = remove(
+                target, separator=_state_separators(previous).get(str(target), 0))
         except (OSError, ValueError) as exc:
             print(f"  retired: could not remove {target}: "
                   f"{common.terminal_safe(exc)}")
@@ -2470,7 +2737,23 @@ def _install() -> int:
                   "terminal to retry)")
     elif not failed:
         STATE_PATH.unlink(missing_ok=True)
+    _report_teach_failures(failures)
     return 1 if failed else 0
+
+
+def _stopped_summary(stopped: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for name in stopped:
+        counts[name] = counts.get(name, 0) + 1
+    parts = []
+    for name, count in counts.items():
+        if count == 1:
+            parts.append(name)
+        elif name == "resident CLI":
+            parts.append(f"{name} ({count} servers)")
+        else:
+            parts.append(f"{name} ({count})")
+    return ", ".join(parts)
 
 
 def _stop_daemons() -> bool:
@@ -2501,6 +2784,9 @@ def _stop_daemons() -> bool:
         outcome = semworker.stop_worker_and_wait()
         if outcome.get("ok") and outcome.get("pid"):
             stopped.append("semantic worker")
+        elif outcome.get("ok") and outcome.get("reason"):
+            # a planted entry at our namespace path: nothing of ours to stop
+            print(f"  - semantic worker: {outcome['reason']}")
         elif not outcome.get("ok"):
             reason = str(
                 outcome.get("reason")
@@ -2523,8 +2809,18 @@ def _stop_daemons() -> bool:
         print("  ! semantic background writer teardown failed")
         clean = False
     if stopped:
-        print(f"  background processes stopped: {', '.join(stopped)}")
+        print(f"  background processes stopped: {_stopped_summary(stopped)}")
     return clean
+
+
+def _remove_created_dirs(created: list[str]) -> None:
+    """rmdir, deepest first, the directories setup itself created; a directory
+    holding anything else refuses and stays."""
+    for item in created:
+        try:
+            Path(item).rmdir()
+        except OSError:
+            pass
 
 
 def _remove() -> int:
@@ -2532,7 +2828,7 @@ def _remove() -> int:
     if _data_dir_readonly():
         print("  ! removal skipped: AGREP_DATA_READONLY protects this data directory")
         return 1
-    fence = removal_fence.acquire_background_removal_fence()
+    fence = removal_fence.acquire_background_removal_fence(supersede_cooldown=True)
     if fence is None:
         print("  ! another removal is active; nothing was changed")
         return 1
@@ -2550,6 +2846,8 @@ def _remove() -> int:
             ]
             persisted_skills = set(_state_paths(
                 state.get("skills"), skills_only=True, include_retired=True))
+            separators = _state_separators(state)
+            created_dirs = _state_created_dirs(state)
             removals: list[tuple[str, Path, bool]] = []
             seen: set[str] = set()
             for agent, _, target in MD_TARGETS:
@@ -2568,7 +2866,7 @@ def _remove() -> int:
                 try:
                     _mark_target_removing(target, is_skill)
                     remove = _remove_skill if is_skill else _remove_block
-                    if remove(target):
+                    if remove(target, separator=separators.get(str(target), 0)):
                         noun = "skill" if is_skill else "block"
                         print(f"  {agent}: {noun} removed")
                     _unenroll_target(target)
@@ -2590,6 +2888,7 @@ def _remove() -> int:
             if failed:
                 print("  ! some targets were not removed; cleanup sentinel preserved")
             else:
+                _remove_created_dirs(created_dirs)
                 if _sentinel_remove():
                     STATE_PATH.unlink(missing_ok=True)
                     result = 0

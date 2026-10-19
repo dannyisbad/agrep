@@ -133,6 +133,23 @@ def _resume_exe(agent: str, session: str) -> str:
     return sibling if shutil.which(sibling) else owner
 
 
+def new_session_exe(agent: str, requested: str | None = None) -> tuple[str, str | None]:
+    """(executable, resolved path or None) for a fresh session. A pi-family
+    launch runs the fork the user named (`pi` or `omp`), falling back to the
+    sibling fork when that one is not installed; every other agent is the
+    static table."""
+    exe = _RESUME[agent][0]
+    if agent != "pi":
+        return exe, shutil.which(exe)
+    wanted = requested if requested in ("pi", "omp") else "pi"
+    sibling = "omp" if wanted == "pi" else "pi"
+    for candidate in (wanted, sibling):
+        path = shutil.which(candidate)
+        if path:
+            return candidate, path
+    return wanted, None
+
+
 def opencode_db_paths(home: str = HOME, *, include_default: bool = False) -> list[str]:
     dirs = opencode_data_dirs(home)
     paths = []
@@ -191,7 +208,16 @@ def _vt_ok() -> bool:
 
 
 def _dim(text: str) -> str:
-    return f"\033[2m{text}\033[0m" if _vt_ok() else text
+    from hookless import _log
+
+    override = _log.color_override()
+    if override is None:
+        colour = _vt_ok()
+    else:
+        colour = override
+        if colour:
+            _vt_ok()  # forced colour on a console still needs VT processing on
+    return f"\033[2m{text}\033[0m" if colour else text
 
 
 def _terminal_safe(value: object) -> str:
@@ -344,6 +370,30 @@ def _remap_dead_cwd(cwd: str) -> str:
     return ""
 
 
+def _own_claude_link(root: str, session: str, dst: str) -> bool:
+    """Exactly the link a previous resume made: absolute, aimed at this
+    session's transcript under another slug of the same store, and that
+    transcript is a plain file. Anything else stays refused."""
+    try:
+        target = os.readlink(dst)
+    except OSError:
+        return False
+    if (not os.path.isabs(target)
+            or os.path.basename(target) != f"{session}.jsonl"
+            or os.path.normpath(os.path.dirname(os.path.dirname(target)))
+            != os.path.normpath(root)
+            or os.path.normpath(os.path.dirname(target))
+            == os.path.normpath(os.path.dirname(dst))):
+        return False
+    try:
+        info = os.lstat(target)
+    except OSError:
+        return False
+    attrs = getattr(info, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISREG(info.st_mode) and not (attrs & reparse)
+
+
 def _claude_link_session(session: str, cwd: str) -> None:
     """`claude --resume` only sees transcripts under the launch cwd's project slug, and a
     re-anchored cwd has a different slug than the transcript was recorded under - link it
@@ -374,12 +424,15 @@ def _claude_link_session(session: str, cwd: str) -> None:
             if linklike(os.fspath(current), info) or not stat.S_ISDIR(info.st_mode):
                 raise OSError(f"unsafe Claude resume destination parent: {current}")
 
-    ensure_parent()
+    # the destination is created only once a transcript to link is in hand: an
+    # unresumable id must not leave an empty project folder behind
     try:
         existing = os.lstat(dst)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         existing = None
     if existing is not None:
+        if stat.S_ISLNK(existing.st_mode) and _own_claude_link(root, session, dst):
+            return
         if linklike(dst, existing) or not stat.S_ISREG(existing.st_mode):
             raise OSError(f"unsafe Claude resume destination: {dst}")
         return
@@ -457,11 +510,34 @@ def _owned_windows_payload(argv: list[str], cwd: str) -> str:
 
 def _launch_owned(
         argv: list[str], *, cwd: str, env: dict[str, str] | None = None,
-        stdout=None, stderr=None, hide_window: bool = False) -> subprocess.Popen:
+        stdout=None, stderr=None, hide_window: bool = False,
+        handoff: _TerminalHandoff | None = None) -> subprocess.Popen:
     if sys.platform != "win32":
-        return subprocess.Popen(
+        if handoff is None:
+            return subprocess.Popen(
+                argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
+                start_new_session=True)
+        # an interactive agent stays in the caller's session, so the terminal remains
+        # its controlling tty (SIGWINCH, /dev/tty prompts), in a process group of its
+        # own that is lent the foreground - the way a shell starts a foreground job
+        tty_fd = handoff.fd if handoff.holds_foreground() else None
+
+        def own_group_and_terminal() -> None:
+            os.setpgid(0, 0)
+            if tty_fd is not None:
+                # the child takes the terminal too (so does the parent): whichever
+                # runs first wins, and the agent never sees itself in the background
+                _tcsetpgrp(tty_fd, os.getpid())
+
+        process = subprocess.Popen(
             argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
-            start_new_session=True)
+            preexec_fn=own_group_and_terminal)
+        try:
+            os.setpgid(process.pid, process.pid)
+        except OSError:
+            pass  # EACCES once it exec'd, ESRCH once it exited: the group is already its own
+        handoff.give(process.pid)
+        return process
     child_env = dict(os.environ if env is None else env)
     child_env[_OWNED_PAYLOAD] = _owned_windows_payload(argv, cwd)
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
@@ -471,6 +547,142 @@ def _launch_owned(
         _owned_bootstrap_argv(),
         cwd=cwd, env=child_env, stdout=stdout, stderr=stderr,
         creationflags=creationflags)
+
+
+def _tcsetpgrp(fd: int, group: int) -> bool:
+    """tcsetpgrp from a background group raises SIGTTOU, which stops the caller
+    unless blocked: block it around the call, as a job-control shell does."""
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    try:
+        os.tcsetpgrp(fd, group)
+        return True
+    except OSError:
+        return False
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+def _continue_group(group: int) -> None:
+    try:
+        os.killpg(group, signal.SIGCONT)
+    except OSError:
+        pass
+
+
+def _interactive_stdio() -> bool:
+    """An interactive agent run: the user's keyboard and screen are this process's
+    stdin and stdout. A pipe on either side makes agrep a pipeline stage whose
+    partners share the terminal, and the foreground must stay with the whole job."""
+    try:
+        return os.isatty(0) and os.isatty(1)
+    except (OSError, ValueError):
+        return False
+
+
+class _TerminalHandoff:
+    """Lends the controlling terminal's foreground to an owned process group and
+    takes it back when that group exits or stops. Without a controlling terminal,
+    or while this process is not the foreground itself, nothing is lent and the
+    child simply runs in its own group (a background job's child)."""
+
+    def __init__(self) -> None:
+        self.fd: int | None = None
+        self.lent: int | None = None
+        try:
+            self.fd = os.open(
+                "/dev/tty", os.O_RDWR | os.O_NOCTTY | getattr(os, "O_CLOEXEC", 0))
+        except OSError:
+            pass
+
+    def foreground(self) -> int | None:
+        if self.fd is None:
+            return None
+        try:
+            return os.tcgetpgrp(self.fd)
+        except OSError:
+            return None
+
+    def holds_foreground(self) -> bool:
+        return self.fd is not None and self.foreground() == os.getpgrp()
+
+    def give(self, group: int) -> bool:
+        """Hand the foreground over, only while this process holds it (or the
+        child already took it for itself)."""
+        if self.fd is None:
+            return False
+        if self.foreground() != group:
+            if not self.holds_foreground() or not _tcsetpgrp(self.fd, group):
+                return False
+        self.lent = group
+        return True
+
+    def lend(self, group: int) -> None:
+        """Give once this process becomes the foreground (`fg` after a `&` launch)."""
+        if self.lent is None and self.fd is not None:
+            self.give(group)
+
+    def take_back(self) -> None:
+        """Reclaim the foreground this process lent; never steal one it did not."""
+        if self.lent is None:
+            return
+        if self.foreground() not in (None, os.getpgrp()):
+            _tcsetpgrp(self.fd, os.getpgrp())
+        self.lent = None
+
+    def close(self) -> None:
+        self.take_back()
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+def _reap_owned(process: subprocess.Popen) -> tuple[str, int]:
+    """Poll the owned leader without hiding stops: 'running', 'stopped' (with
+    the stop signal) or 'exited' (returncode recorded on `process`)."""
+    if process.returncode is not None:
+        return "exited", 0
+    try:
+        pid, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+    except ChildProcessError:
+        process.returncode = 0
+        return "exited", 0
+    if pid == 0:
+        return "running", 0
+    if os.WIFSTOPPED(status):
+        return "stopped", os.WSTOPSIG(status)
+    process.returncode = os.waitstatus_to_exitcode(status)
+    return "exited", 0
+
+
+def _owned_child_stopped(
+        process: subprocess.Popen, handoff: _TerminalHandoff, stop_signal: int,
+) -> None:
+    """Mirror the agent's stop onto this job as a shell would see it: take the
+    terminal back, stop this whole process group (a wrapper such as the npm shim
+    sits in it too), and once continued hand the terminal back and continue the agent."""
+    group = process.pid
+    if (stop_signal in (signal.SIGTTIN, signal.SIGTTOU)
+            and handoff.foreground() == group):
+        # it touched the terminal a beat before the handoff landed; it is the
+        # foreground now, so it just goes on
+        _continue_group(group)
+        return
+    handoff.take_back()
+    previous = signal.getsignal(signal.SIGTSTP)
+    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+    try:
+        # discarded by the kernel when this group is orphaned (no shell to `fg` it),
+        # in which case the agent is simply continued below
+        os.killpg(os.getpgrp(), signal.SIGTSTP)
+    except OSError:
+        pass
+    finally:
+        signal.signal(signal.SIGTSTP, previous)
+    handoff.give(group)
+    _continue_group(group)
 
 
 def _posix_group_active(group: int) -> bool | None:
@@ -483,6 +695,9 @@ def _signal_owned(process: subprocess.Popen, signum: int) -> None:
     if sys.platform != "win32":
         try:
             os.killpg(process.pid, signum)
+            if signum != signal.SIGINT:
+                # a stopped group acts on a termination only once continued
+                os.killpg(process.pid, signal.SIGCONT)
         except ProcessLookupError:
             pass
         return
@@ -503,6 +718,9 @@ def _reaped_owner_group_gone(process: subprocess.Popen) -> bool:
     group = process.pid
     return (process_util.pid_alive(group)
             or process_util.process_start_identity(group) is not None)
+
+
+_OWNED_KILLED_GROUP_REAP_S = 10.0
 
 
 def _drain_owned(process: subprocess.Popen, signum: int | None = None) -> bool:
@@ -550,9 +768,14 @@ def _drain_owned(process: subprocess.Popen, signum: int | None = None) -> bool:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         return False
-    deadline = time.monotonic() + 1.0
+    # Every member has SIGKILL by now; only the kernel's reaping is left, and a
+    # saturated host can take seconds over it. Waiting here cannot hang.
+    deadline = time.monotonic() + _OWNED_KILLED_GROUP_REAP_S
     active = _posix_group_active(group)
     while active is not False and time.monotonic() < deadline:
+        if _reaped_owner_group_gone(process):
+            # the pgid is a stranger's now: the owned group ended, nothing to wait for
+            return True
         time.sleep(0.02)
         active = _posix_group_active(group)
     return active is False or _reaped_owner_group_gone(process)
@@ -563,9 +786,11 @@ def _wait_owned(
         relay_signals: bool = False,
         tick: Callable[[subprocess.Popen], None] | None = None,
         signal_box: list[int | None] | None = None,
+        handoff: _TerminalHandoff | None = None,
 ) -> tuple[int, int | None, bool, bool]:
     caught: int | None = signal_box[0] if signal_box is not None else None
     handlers: dict[int, object] = {}
+    suspend_requested = False
 
     def forward(signum, _frame) -> None:
         nonlocal caught
@@ -573,6 +798,21 @@ def _wait_owned(
         if signal_box is not None:
             signal_box[0] = signal_box[0] or signum
         _signal_owned(process, signum)
+
+    def suspend(_signum, _frame) -> None:
+        nonlocal suspend_requested
+        suspend_requested = True
+
+    def alive() -> bool:
+        if handoff is None:
+            return process.poll() is None
+        state, stop_signal = _reap_owned(process)
+        if state == "stopped":
+            _owned_child_stopped(process, handoff, stop_signal)
+            return True
+        if state == "running":
+            handoff.lend(process.pid)
+        return state == "running"
 
     if relay_signals:
         for signum in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
@@ -583,6 +823,12 @@ def _wait_owned(
                 signal.signal(signum, forward)
             except (ValueError, OSError):
                 handlers.pop(signum, None)
+        if handoff is not None:
+            try:
+                handlers[signal.SIGTSTP] = signal.getsignal(signal.SIGTSTP)
+                signal.signal(signal.SIGTSTP, suspend)
+            except (ValueError, OSError):
+                handlers.pop(signal.SIGTSTP, None)
     if signal_box is not None:
         caught = caught or signal_box[0]
     if caught is not None:
@@ -593,9 +839,17 @@ def _wait_owned(
     try:
         if tick is not None:
             tick(process)
-        while process.poll() is None:
+        while alive():
             if tick is not None:
                 tick(process)
+            if suspend_requested:
+                # a SIGTSTP aimed at this wrapper: stop the agent's group; alive()
+                # then mirrors the stop and resumes both on SIGCONT
+                suspend_requested = False
+                try:
+                    os.killpg(process.pid, signal.SIGTSTP)
+                except ProcessLookupError:
+                    pass
             if caught is not None:
                 signal_deadline = signal_deadline or time.monotonic() + 1.0
                 if time.monotonic() >= signal_deadline:
@@ -607,6 +861,8 @@ def _wait_owned(
     finally:
         for signum, previous in handlers.items():
             signal.signal(signum, previous)
+        if handoff is not None:
+            handoff.take_back()
     drained = _drain_owned(process, caught or signal.SIGTERM)
     return _canonical_returncode(process.returncode), caught, timed_out, drained
 
@@ -616,10 +872,21 @@ def run_owned_process(
         timeout: float | None = None, capture_output: bool = False,
         relay_signals: bool = False, hide_window: bool = False,
         tick: Callable[[subprocess.Popen], None] | None = None,
+        foreground: bool = False,
 ) -> subprocess.CompletedProcess:
+    """Run argv as an owned process tree and wait for it.
+
+    foreground (POSIX): for an interactive run - stdin and stdout both the
+    terminal - the child shares this session, gets its own process group and
+    is lent the controlling terminal's foreground, so an interactive agent
+    receives SIGWINCH and Ctrl-C/Ctrl-Z directly and can open /dev/tty; a stop
+    is mirrored onto this job and the foreground is restored on exit. As a
+    pipeline stage (`agrep run x -- -p ... | less`) nothing is lent and the child
+    runs detached as before, so a partner reading /dev/tty is never stopped."""
     stdout_file = tempfile.TemporaryFile() if capture_output else None
     stderr_file = tempfile.TemporaryFile() if capture_output else None
     process = None
+    handoff: _TerminalHandoff | None = None
     signal_box: list[int | None] | None = [None] if relay_signals else None
     launch_handlers: dict[int, object] = {}
 
@@ -638,12 +905,14 @@ def run_owned_process(
                     signal.signal(signum, defer_signal)
                 except (ValueError, OSError):
                     launch_handlers.pop(signum, None)
+        if foreground and sys.platform != "win32" and _interactive_stdio():
+            handoff = _TerminalHandoff()
         process = _launch_owned(
             argv, cwd=cwd, env=env, stdout=stdout_file, stderr=stderr_file,
-            hide_window=hide_window)
+            hide_window=hide_window, handoff=handoff)
         returncode, caught, timed_out, drained = _wait_owned(
             process, timeout=timeout, relay_signals=relay_signals, tick=tick,
-            signal_box=signal_box)
+            signal_box=signal_box, handoff=handoff)
         stdout = stderr = None
         if capture_output:
             stdout_file.seek(0)
@@ -660,6 +929,8 @@ def run_owned_process(
         result.relayed_signal = caught
         return result
     except BaseException:
+        if handoff is not None:
+            handoff.take_back()
         if process is not None:
             _drain_owned(
                 process,
@@ -667,6 +938,8 @@ def run_owned_process(
                  else signal.SIGTERM))
         raise
     finally:
+        if handoff is not None:
+            handoff.close()
         for signum, previous in launch_handlers.items():
             signal.signal(signum, previous)
         if stdout_file is not None:
@@ -752,7 +1025,8 @@ def resume_in_place(agent: str, session: str) -> int:
             host, env = _windows_resume_host(argv, cwd, keep_open=False)
             return run_owned_process(
                 host, cwd=cwd, env=env, relay_signals=True).returncode
-        return run_owned_process(argv, cwd=cwd, relay_signals=True).returncode
+        return run_owned_process(
+            argv, cwd=cwd, relay_signals=True, foreground=True).returncode
     except OSError as e:
         print(f"couldn't launch {_terminal_safe(agent)}: {_terminal_safe(e)}", file=sys.stderr)
         return 1

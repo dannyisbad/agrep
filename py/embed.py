@@ -12,7 +12,8 @@ require a manual embed step.
 --background passes yield to the machine: low battery (pmset on macOS,
 GetSystemPowerStatus on Windows) or a busy CPU (loadavg, so posix-only) defers the
 run (exit 0; the next pass resumes by content hash). AGREP_EMBED_ANYWAY=1 forces it.
-Indexd may allow one bounded stale bootstrap on battery; memory and load still gate it.
+A bounded pass for a lane nobody can query (stale, missing, unbound after an upgrade) runs
+through battery and load; memory pressure still gates every background pass.
 
 Usage: python embed.py [--smoke 8] [--full] [--max-new N] [--background]
 """
@@ -2152,7 +2153,7 @@ def _rebase_segmented_generation(
     source_fence = _segment_source_publication_fence(source)
     if shadow_refs:
         if int(manifest.get("delta_count", 0)) >= 16:
-            _schedule_segment_compaction()
+            _schedule_segment_compaction(unblocks_lane=True)
             common.log(
                 "semantic shadow rebase deferred at the 16-delta cap")
             return None
@@ -2473,8 +2474,9 @@ def _governor_deferral(
     Semantic indexing is deferrable-forever work: keyword search never depends
     on it and the next incremental pass resumes exactly where this one stopped,
     so a busy or battery-strapped machine wins. AGREP_EMBED_ANYWAY=1 bypasses.
-    A bounded stale bootstrap may ignore battery, and an explicit `doctor --fix`
-    battery and load, but nothing ignores memory pressure.
+    The spawner sets ignore_battery/ignore_load for a bounded pass that makes an
+    unsearchable lane queryable and for an explicit `doctor --fix`; nothing
+    ignores memory pressure.
     """
     if os.environ.get("AGREP_EMBED_ANYWAY", "").lower() not in ("", "0", "false", "no", "off"):
         return None
@@ -2485,7 +2487,26 @@ def _governor_deferral(
     return deferral.runtime_reason if deferral else None
 
 
-def _schedule_segment_compaction(*, refresh_metadata: bool = False) -> bool:
+_GOVERNOR_OVERRIDE_ENV = ("AGREP_EMBED_IGNORE_BATTERY", "AGREP_EMBED_IGNORE_LOAD")
+
+
+def _governor_env_overrides() -> "tuple[bool, bool]":
+    """(ignore_battery, ignore_load) as the spawner set them for this pass."""
+    return tuple(
+        os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+        for name in _GOVERNOR_OVERRIDE_ENV)
+
+
+def _schedule_segment_compaction(
+        *, refresh_metadata: bool = False, unblocks_lane: bool = False) -> bool:
+    """Launch one governed compaction child.
+
+    ``unblocks_lane`` means this pass could not publish until compaction runs
+    (the delta cap, a refs-schema upgrade): the child then inherits the
+    battery/load overrides the spawner gave this pass, so a lane nobody can
+    query is not stranded behind maintenance that defers for as long as the
+    load lasts. Routine post-publication compaction stays fully governed.
+    """
     if _data_dir_readonly():
         return False
     if removal_fence.background_removal_active():
@@ -2502,9 +2523,13 @@ def _schedule_segment_compaction(*, refresh_metadata: bool = False) -> bool:
         if refresh_metadata:
             command += ["--force", "--refresh-metadata"]
         logf = common.open_bounded_log("semantic-embed.log")
+        child_env = dict(os.environ)
+        if not unblocks_lane:
+            for name in _GOVERNOR_OVERRIDE_ENV:
+                child_env.pop(name, None)
         kwargs = {
             "stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf,
-            "cwd": str(common.REPO_ROOT), "env": dict(os.environ), "close_fds": True,
+            "cwd": str(common.REPO_ROOT), "env": child_env, "close_fds": True,
         }
         if sys.platform == "win32":
             kwargs["creationflags"] = common.windows_background_child_flags(
@@ -2567,10 +2592,7 @@ def main() -> int:
     # gate before claim/plan/model load: declining after ONNX startup wastes the win.
     # refs-only serves an active semantic search and loads no model; only embedding defers.
     if args.background and not args.refs_only:
-        ignore_battery = os.environ.get(
-            "AGREP_EMBED_IGNORE_BATTERY", "").lower() in ("1", "true", "yes", "on")
-        ignore_load = os.environ.get(
-            "AGREP_EMBED_IGNORE_LOAD", "").lower() in ("1", "true", "yes", "on")
+        ignore_battery, ignore_load = _governor_env_overrides()
         deferral = _governor_deferral(
             ignore_battery=ignore_battery, ignore_load=ignore_load)
         if deferral:
@@ -2593,7 +2615,9 @@ def main() -> int:
             "AGREP_SEM_BG_THREADS", "4")
 
     if not _acquire_claim():
-        common.log("another embed pass owns the claim; nothing to do.")
+        common.log("the data directory is read-only; nothing to do."
+                   if _data_dir_readonly() else
+                   "another embed pass owns the claim; nothing to do.")
         return 0
     global _PRIOR_FAILURES
     try:
@@ -2628,16 +2652,31 @@ def main() -> int:
             return 0
         except Exception as exc:  # noqa: BLE001 -- detached job must publish failure
             detail = f"{type(exc).__name__}: {exc}"[-500:]
-            _publish_state({
-                "state": "failed",
-                "finished_at": time.time(),
-                "failures": _PRIOR_FAILURES + 1,
-                "error": detail,
-            })
+            _publish_state(_failure_record(exc, detail))
             common.log(f"embedding failed: {detail}")
             return 1
     finally:
         _release_claim()
+
+
+_DISK_FULL_RE = re.compile(r"\((\d+) needed, (\d+) free\)")
+
+
+def _failure_record(exc: BaseException, detail: str) -> dict:
+    record = {
+        "state": "failed",
+        "finished_at": time.time(),
+        "failures": _PRIOR_FAILURES + 1,
+        "error": detail,
+    }
+    import semantic_segment_build
+    found = _DISK_FULL_RE.search(str(exc))
+    if isinstance(exc, semantic_segment_build.SegmentDiskFull) and found:
+        # Deterministic until the volume changes: the launcher holds the
+        # retry until free space reaches what this pass needed.
+        record["disk_full"] = {"needed": int(found.group(1)),
+                               "free": int(found.group(2))}
+    return record
 
 
 def _run_smoke(args) -> int:
@@ -2761,6 +2800,11 @@ def _materialize_pending_vectors(
             opened = embedder.lane_of(model.profile_string)
             if opened is not None and opened != _active_lane():
                 _adopt_opened_lane(opened)
+            # A slower lane beats no meaning search: build on CPU now, and
+            # leave the reason where doctor can offer the move to Metal.
+            semantic.record_lane_fallback(
+                getattr(model, "metal_weights_refusal", None)
+                if opened == embedder.LANE_CPU else None)
         if model.profile_string != _active_model_id():
             raise embedder.EmbedderUnavailable(
                 f"planned this pass as '{_active_model_id()}' but the loaded "
@@ -2819,7 +2863,8 @@ def _defer_segment_maintenance(manifest: dict | None, incremental: bool) -> bool
     current = manifest["segments"]
     versions = manifest.get("refs_versions")
     if versions is not None and versions != frozenset({5}):
-        scheduled = _schedule_segment_compaction(refresh_metadata=True)
+        scheduled = _schedule_segment_compaction(
+            refresh_metadata=True, unblocks_lane=True)
         _publish_state({
             "state": "compacting" if scheduled else "stale",
             "finished_at": time.time(),
@@ -2832,7 +2877,7 @@ def _defer_segment_maintenance(manifest: dict | None, incremental: bool) -> bool
         return True
     if int(current["delta_count"]) < 16:
         return False
-    _schedule_segment_compaction()
+    _schedule_segment_compaction(unblocks_lane=True)
     _publish_state({
         "state": "compacting", "finished_at": time.time(),
         "indexed": int(current["live_rows"]),
@@ -2847,9 +2892,18 @@ def _defer_segment_maintenance(manifest: dict | None, incremental: bool) -> bool
 def _prune_loaded_segment_orphans(manifest: dict | None) -> None:
     if _data_dir_readonly():
         return
+    import embedding_segments
+
+    # Under the embed claim no other segment preparation can be live, and a
+    # compaction's directory carries its own owner record.
+    abandoned = embedding_segments.prune_abandoned_preparations(common.DATA_DIR)
+    if abandoned["removed"] or abandoned["deferred"]:
+        common.log(
+            f"semantic segment cleanup: reclaimed {len(abandoned['removed'])} "
+            f"abandoned preparation dir(s) ({abandoned['bytes'] / 1e6:.0f} MB), "
+            f"deferred {len(abandoned['deferred'])}")
     if not manifest or not manifest.get("segmented"):
         return
-    import embedding_segments
 
     segmented = manifest.get("segments")
     if not isinstance(segmented, embedding_segments.LoadedManifest):
@@ -3120,6 +3174,10 @@ def _publish_pending(
         args, plan: _RefreshPlan, retention: _RetentionPlan,
         dim: int, base: dict, run_started: float) -> int:
     _require_writable_data_dir("publish semantic embeddings")
+    import semantic_segment_build
+    semantic_segment_build.require_segment_capacity(
+        common.DATA_DIR, len(plan.messages)
+        + (0 if retention.append_segmented else retention.kept_count), dim)
     current_metadata = _metadata_hashes_for_messages(plan.messages)
     started = time.perf_counter()
     plan_s = started - run_started

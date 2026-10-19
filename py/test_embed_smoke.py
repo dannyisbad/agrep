@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import site
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,18 @@ import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
+
+def setUpModule() -> None:
+    home = tempfile.TemporaryDirectory(prefix="agrep-embed-home-")
+    user_base = site.getuserbase()
+    home_patch = mock.patch.dict(
+        os.environ, {"HOME": home.name, "PYTHONUSERBASE": user_base})
+    home_patch.start()
+    unittest.addModuleCleanup(home_patch.stop)
+    unittest.addModuleCleanup(home.cleanup)
 
 import numpy as np
 
@@ -388,11 +401,17 @@ class EmbedSmokeTests(unittest.TestCase):
         class Proceeded(Exception):
             pass
 
-        def child_env(**overrides) -> dict:
-            with (mock.patch.object(semantic, "runtime_dependencies_available",
+        def child_env(coherence: dict | None = None, **overrides) -> dict:
+            # The spawn decision reads the process environment: a shared test
+            # interpreter may carry another suite's AGREP_NO_DAEMON, which
+            # answers "disabled" before any probe runs. Pin what this test means.
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ("AGREP_NO_DAEMON", "AGREP_NO_SEM_WORKER")}
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(semantic, "runtime_dependencies_available",
                                     return_value=True),
                   mock.patch.object(semantic, "embedding_coherence",
-                                    return_value={"state": "stale"}),
+                                    return_value=coherence or {"state": "stale"}),
                   mock.patch.object(semantic, "embed_running", return_value=False),
                   mock.patch.object(semantic, "read_embed_state", return_value={}),
                   mock.patch("embedder.ensure_model"),
@@ -412,6 +431,7 @@ class EmbedSmokeTests(unittest.TestCase):
                   mock.patch.object(common, "available_memory_fraction",
                                     return_value=memory),
                   mock.patch.object(embed, "_acquire_claim", side_effect=Proceeded),
+                  mock.patch.object(embed.os, "nice", return_value=0, create=True),
                   mock.patch.object(common, "log")):
                 try:
                     self.assertEqual(embed.main(), 0)
@@ -422,7 +442,12 @@ class EmbedSmokeTests(unittest.TestCase):
         explicit = child_env(ignore_battery=True, ignore_load=True)
         self.assertTrue(run_child(explicit, memory=0.9))
         self.assertFalse(run_child(explicit, memory=0.01))
-        self.assertFalse(run_child(child_env(), memory=0.9))
+        # a searchable lane's catch-up is the pass --fix's consent exists for
+        searchable = {"coherent": False, "searchable": True, "state": "partial"}
+        self.assertFalse(run_child(child_env(searchable), memory=0.9))
+        self.assertTrue(run_child(
+            child_env(searchable, ignore_battery=True, ignore_load=True),
+            memory=0.9))
 
     def test_cold_cli_smoke_is_one_line_and_preserves_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -505,6 +530,221 @@ class EmbedSmokeTests(unittest.TestCase):
         self.assertNotIn("failures", published[0])
         self.assertNotIn("error", published[0])
         self.assertIn("lost a publication race", log.call_args.args[0])
+
+
+class UnsearchableLaneGovernorTests(unittest.TestCase):
+    """A lane nobody can query gets its bounded pass through battery and CPU
+    load; a searchable lane's catch-up and every unbounded pass keep the full
+    governor, and memory pressure defers everything."""
+
+    class _Proceeded(Exception):
+        pass
+
+    @staticmethod
+    def _lane(state: str, *, searchable: bool) -> dict:
+        return {"coherent": False, "searchable": searchable, "state": state}
+
+    @staticmethod
+    def _spawn_mocks(coherence: dict) -> list:
+        import semantic
+
+        return [
+            # the isolation default would read as 'disabled'; the spawn is the point
+            mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}),
+            mock.patch.object(semantic, "runtime_dependencies_available",
+                              return_value=True),
+            mock.patch.object(semantic, "embedding_coherence",
+                              return_value=coherence),
+            mock.patch.object(semantic, "embed_running", return_value=False),
+            mock.patch.object(semantic, "read_embed_state", return_value={}),
+            mock.patch("embedder.ensure_model"),
+            mock.patch.object(semantic, "_needs_unverified_bundle_rebuild",
+                              return_value=False),
+        ]
+
+    def _spawned(self, coherence: dict, **kwargs) -> tuple[list, dict]:
+        """(argv, child env) of the embed.py ensure_fresh_async launches."""
+        import semantic
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._spawn_mocks(coherence):
+                stack.enter_context(patcher)
+            popen = stack.enter_context(
+                mock.patch.object(semantic.subprocess, "Popen"))
+            self.assertEqual(
+                semantic.ensure_fresh_async(**kwargs)["state"], "running")
+        return popen.call_args.args[0], popen.call_args.kwargs["env"]
+
+    def _child_outcome(self, env: dict, *, memory: float, load: float,
+                       battery: tuple) -> tuple[bool, list]:
+        """(proceeded past the governor, deferral log lines) for one child."""
+        logs: list[str] = []
+        with (mock.patch.object(sys, "argv", ["embed.py", "--background"]),
+              mock.patch.dict(os.environ, env, clear=True),
+              mock.patch.object(embed, "_mutation_refusal_reason", return_value=None),
+              mock.patch.object(embed, "_normalized_load", return_value=load),
+              mock.patch.object(embed, "_battery_state", return_value=battery),
+              mock.patch.object(common, "available_memory_fraction",
+                                return_value=memory),
+              mock.patch.object(embed, "_acquire_claim",
+                                side_effect=self._Proceeded),
+              mock.patch.object(embed.os, "nice", return_value=0, create=True),
+              mock.patch.object(common, "log", logs.append)):
+            try:
+                self.assertEqual(embed.main(), 0)
+            except self._Proceeded:
+                return True, logs
+        return False, logs
+
+    def test_unsearchable_lane_bootstrap_runs_through_battery_and_load(self) -> None:
+        import semantic
+
+        for state in ("stale", "missing-embeddings", "unstable-source"):
+            with self.subTest(state=state):
+                argv, env = self._spawned(
+                    self._lane(state, searchable=False),
+                    max_new=semantic.SEMANTIC_BOOTSTRAP_MAX_NEW)
+                self.assertEqual(
+                    argv[argv.index("--max-new") + 1],
+                    str(semantic.SEMANTIC_BOOTSTRAP_MAX_NEW))
+                proceeded, logs = self._child_outcome(
+                    env, memory=0.9, load=30.0, battery=(True, 10))
+                self.assertTrue(proceeded, logs)
+                self.assertEqual(logs, [])
+
+    def test_unsearchable_lane_bootstrap_still_yields_to_memory_pressure(
+            self) -> None:
+        import semantic
+
+        _argv, env = self._spawned(
+            self._lane("stale", searchable=False),
+            max_new=semantic.SEMANTIC_BOOTSTRAP_MAX_NEW)
+        proceeded, logs = self._child_outcome(
+            env, memory=0.01, load=0.1, battery=(False, None))
+        self.assertFalse(proceeded)
+        self.assertEqual(logs, ["embedding deferred: memory pressure (1% available)"])
+
+    def test_searchable_lane_catch_up_keeps_the_full_governor(self) -> None:
+        partial = {**self._lane("partial", searchable=True),
+                   "coverage": {"indexed": 128, "total": 400, "pending": 272}}
+        argv, env = self._spawned(partial, max_new=128)
+        self.assertEqual(argv[argv.index("--max-new") + 1], "128")
+        self.assertNotIn("AGREP_EMBED_IGNORE_BATTERY", env)
+        self.assertNotIn("AGREP_EMBED_IGNORE_LOAD", env)
+        loaded, logs = self._child_outcome(
+            env, memory=0.9, load=30.0, battery=(False, None))
+        self.assertFalse(loaded)
+        self.assertEqual(logs, ["embedding deferred: load 30.0/core"])
+        drained, logs = self._child_outcome(
+            env, memory=0.9, load=0.1, battery=(True, 10))
+        self.assertFalse(drained)
+        self.assertEqual(logs, ["embedding deferred: on battery (10%)"])
+
+    def test_unbounded_refresh_keeps_the_governor_even_when_unsearchable(
+            self) -> None:
+        argv, env = self._spawned(self._lane("stale", searchable=False))
+        self.assertNotIn("--max-new", argv)
+        self.assertNotIn("AGREP_EMBED_IGNORE_BATTERY", env)
+        self.assertNotIn("AGREP_EMBED_IGNORE_LOAD", env)
+        proceeded, logs = self._child_outcome(
+            env, memory=0.9, load=30.0, battery=(False, None))
+        self.assertFalse(proceeded)
+        self.assertEqual(logs, ["embedding deferred: load 30.0/core"])
+
+    def test_explicit_semantic_query_bootstraps_an_unsearchable_lane_through_load(
+            self) -> None:
+        import semantic
+
+        stale = self._lane("stale", searchable=False)
+        with contextlib.ExitStack() as stack:
+            for patcher in self._spawn_mocks(stale):
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(semantic, "note_semantic_use"))
+            stack.enter_context(mock.patch.object(
+                semantic, "_await_publishing_coherence", lambda initial: initial))
+            popen = stack.enter_context(
+                mock.patch.object(semantic.subprocess, "Popen"))
+            with self.assertRaises(semantic.SemanticUnavailable):
+                semantic.search("deployment retry loop", level="message")
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        env = popen.call_args.kwargs["env"]
+        self.assertIn("--background", argv)
+        self.assertEqual(
+            argv[argv.index("--max-new") + 1],
+            str(semantic.SEMANTIC_BOOTSTRAP_MAX_NEW))
+        proceeded, logs = self._child_outcome(
+            env, memory=0.9, load=30.0, battery=(True, 10))
+        self.assertTrue(proceeded, logs)
+
+    def _scheduled_compaction_env(
+            self, env: dict, *, delta_count: int, **kwargs) -> dict | None:
+        """Env of the compaction child one pass schedules under ``env``."""
+        import embedding_segments
+        import removal_fence
+
+        manifest = {"delta_count": delta_count}
+        with (mock.patch.dict(os.environ, env, clear=True),
+              mock.patch.object(embed, "_data_dir_readonly", return_value=False),
+              mock.patch.object(removal_fence, "background_removal_active",
+                                return_value=False),
+              mock.patch.object(embedding_segments, "load_manifest",
+                                return_value=manifest),
+              mock.patch.object(embedding_segments, "prune_orphans"),
+              mock.patch.object(embedding_segments, "should_compact",
+                                side_effect=lambda m: m["delta_count"] >= 8),
+              mock.patch.object(common, "open_bounded_log",
+                                return_value=mock.Mock()),
+              mock.patch.object(embed.subprocess, "Popen") as popen):
+            launched = embed._schedule_segment_compaction(**kwargs)
+        if not launched:
+            return None
+        return popen.call_args.kwargs["env"]
+
+    def test_compaction_that_unblocks_the_lane_inherits_the_overrides(
+            self) -> None:
+        # At the 16-delta cap the pass cannot publish until compaction runs;
+        # the bounded pass got through load and battery, so must the child.
+        overrides = {"AGREP_EMBED_IGNORE_BATTERY": "1",
+                     "AGREP_EMBED_IGNORE_LOAD": "1"}
+        env = self._scheduled_compaction_env(
+            overrides, delta_count=16, unblocks_lane=True)
+        self.assertEqual(env["AGREP_EMBED_IGNORE_BATTERY"], "1")
+        self.assertEqual(env["AGREP_EMBED_IGNORE_LOAD"], "1")
+        upgrade = self._scheduled_compaction_env(
+            overrides, delta_count=0, refresh_metadata=True, unblocks_lane=True)
+        self.assertEqual(upgrade["AGREP_EMBED_IGNORE_LOAD"], "1")
+
+    def test_routine_post_publication_compaction_drops_the_overrides(
+            self) -> None:
+        overrides = {"AGREP_EMBED_IGNORE_BATTERY": "1",
+                     "AGREP_EMBED_IGNORE_LOAD": "1"}
+        env = self._scheduled_compaction_env(overrides, delta_count=9)
+        self.assertNotIn("AGREP_EMBED_IGNORE_BATTERY", env)
+        self.assertNotIn("AGREP_EMBED_IGNORE_LOAD", env)
+
+    def test_the_delta_cap_schedules_an_unblocking_compaction(self) -> None:
+        segments = {
+            "delta_count": 16, "live_rows": 100,
+            "coverage": {"total": 120, "pending": 20},
+        }
+        manifest = {"segmented": True, "segments": segments,
+                    "refs_versions": frozenset({5})}
+        with (mock.patch.object(embed, "_schedule_segment_compaction",
+                                return_value=True) as schedule,
+              mock.patch.object(embed, "_publish_state"),
+              mock.patch.object(common, "log")):
+            self.assertTrue(embed._defer_segment_maintenance(manifest, True))
+            schedule.assert_called_once_with(unblocks_lane=True)
+            schedule.reset_mock()
+            upgrade = {**manifest, "refs_versions": frozenset({4})}
+            self.assertTrue(embed._defer_segment_maintenance(upgrade, True))
+            schedule.assert_called_once_with(
+                refresh_metadata=True, unblocks_lane=True)
+            schedule.reset_mock()
+            below = {**manifest, "segments": {**segments, "delta_count": 15}}
+            self.assertFalse(embed._defer_segment_maintenance(below, True))
+            schedule.assert_not_called()
 
 
 if __name__ == "__main__":

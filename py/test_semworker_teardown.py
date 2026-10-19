@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import fixture_tree, isolate_data_dir
 
 
 isolate_data_dir()
@@ -38,7 +38,7 @@ def _owner(
 
 class StaleNamespaceReapTests(unittest.TestCase):
     def test_reaper_removes_only_idle_empty_sibling_namespaces(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with fixture_tree() as raw:
             base = Path(raw)
             prefix = f"agrep-semantic-v{semworker._COORDINATION_NAMESPACE_VERSION}-1-"
             live = base / f"{prefix}live"
@@ -61,6 +61,68 @@ class StaleNamespaceReapTests(unittest.TestCase):
             for kept in (live, fresh, busy, other):
                 self.assertTrue(kept.exists(), kept.name)
 
+    @staticmethod
+    def _lock_record(pid: int, process_start: str) -> str:
+        return json.dumps({
+            "pid": pid, "started_at": time.time() - 7200.0,
+            "process_start": process_start, "nonce": "ab" * 16,
+            "tree_bound": False, "named_job": False,
+        })
+
+    def test_reaper_reclaims_a_dead_owner_lock_and_spares_a_live_one(
+            self) -> None:
+        # A sandboxed probe used to leave its namespace forever: the worker's
+        # lease-exit parked an exact-owner record nothing reclaimed. Dead or
+        # reused owners (pid + start identity) go; live or unverifiable stay.
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            prefix = f"agrep-semantic-v{semworker._COORDINATION_NAMESPACE_VERSION}-1-"
+            live_namespace = base / f"{prefix}live"
+            dead, reused, alive, unverifiable, crowded = (
+                base / f"{prefix}{name}" for name in
+                ("dead", "reused", "alive", "unverifiable", "crowded"))
+            for d in (live_namespace, dead, reused, alive, unverifiable, crowded):
+                d.mkdir(mode=0o700)
+            dead_pid = os.getpid() + 10_000_000
+            me = os.getpid()
+            my_start = common.process_start_identity(me)
+            if not my_start:
+                self.skipTest("no process start identity on this host")
+            (dead / "worker.lock").write_text(
+                self._lock_record(dead_pid, "gone"), encoding="utf-8")
+            (reused / "worker.lock").write_text(
+                self._lock_record(me, "a-different-start"), encoding="utf-8")
+            (alive / "worker.lock").write_text(
+                self._lock_record(me, my_start), encoding="utf-8")
+            (unverifiable / "worker.lock").write_text(
+                self._lock_record(me, "unknown"), encoding="utf-8")
+            (crowded / "worker.lock").write_text(
+                self._lock_record(dead_pid, "gone"), encoding="utf-8")
+            (crowded / ("retire-" + "cd" * 16)).write_text("{}", encoding="utf-8")
+            old = time.time() - 2 * semworker._STALE_NAMESPACE_S
+            for d in (dead, reused, alive, unverifiable, crowded):
+                for entry in d.iterdir():
+                    os.utime(entry, (old, old))
+                os.utime(d, (old, old))
+            with mock.patch.object(semworker, "_coordination_base_path",
+                                   return_value=base), \
+                    mock.patch.object(semworker, "_ephemeral_coordination_dir",
+                                      return_value=live_namespace):
+                removed = semworker.reap_stale_coordination_dirs()
+            self.assertEqual(removed, 2)
+            self.assertFalse(dead.exists())
+            self.assertFalse(reused.exists())
+            for kept in (live_namespace, alive, unverifiable, crowded):
+                self.assertTrue(kept.exists(), kept.name)
+            self.assertTrue((alive / "worker.lock").exists())
+            self.assertTrue((unverifiable / "worker.lock").exists())
+            # the crowded namespace lost only its dead record, never the rest; the reap
+            # that removed it leaves the directory's removal mutex beside them
+            self.assertFalse((crowded / "worker.lock").exists())
+            self.assertEqual(
+                sorted(entry.name for entry in crowded.iterdir()),
+                [ownerfile.SLOT_MUTEX_NAME, "retire-" + "cd" * 16])
+
 
 class SemanticWorkerTeardownUnitTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -71,7 +133,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
     def test_stop_drains_a_spawn_whose_launcher_claim_was_released(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with fixture_tree() as raw, \
                 mock.patch.object(common, "DATA_DIR", Path(raw)), \
                 mock.patch.object(
                     semworker, "_ephemeral_coordination_dir", return_value=Path(raw)), \
@@ -105,7 +167,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                     process.wait(timeout=5)
 
     def test_unknown_birth_lookup_does_not_kill_a_starting_worker(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with fixture_tree() as raw, \
                 mock.patch.object(common, "DATA_DIR", Path(raw)), \
                 mock.patch.object(
                     semworker, "_ephemeral_coordination_dir", return_value=Path(raw)), \
@@ -135,7 +197,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                     process.wait(timeout=5)
 
     def test_expired_malformed_launch_record_does_not_block_teardown(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with fixture_tree() as raw, \
                 mock.patch.object(common, "DATA_DIR", Path(raw)), \
                 mock.patch.object(
                     semworker, "_ephemeral_coordination_dir", return_value=Path(raw)), \
@@ -163,7 +225,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                 mock.patch.object(semworker, "_request_worker_stop") as stop, \
                 mock.patch.object(semworker, "_terminate_worker_tree") as terminate:
             exited, descriptor, acknowledged = semworker._request_and_drain_worker(
-                rec, None, 0.05)
+                rec, None, 0.05, bound=True)
         self.assertFalse(exited)
         self.assertIsNone(descriptor)
         self.assertFalse(acknowledged)
@@ -182,7 +244,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                     semworker.time, "monotonic", return_value=0.0), \
                 mock.patch.object(semworker.time, "sleep") as sleep:
             exited, descriptor, acknowledged = semworker._request_and_drain_worker(
-                rec, None, 1.0)
+                rec, None, 1.0, bound=True)
         self.assertTrue(exited)
         self.assertIsNone(descriptor)
         self.assertFalse(acknowledged)
@@ -204,7 +266,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                     side_effect=lambda: next(now)), \
                 mock.patch.object(semworker.time, "sleep") as sleep:
             exited, descriptor, acknowledged = semworker._request_and_drain_worker(
-                rec, None, 0.05)
+                rec, None, 0.05, bound=True)
         self.assertFalse(exited)
         self.assertIsNone(descriptor)
         self.assertFalse(acknowledged)
@@ -234,7 +296,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                 mock.patch.object(semworker.time, "sleep"), \
                 mock.patch.object(semworker, "_request_worker_stop") as stop:
             exited, found, acknowledged = semworker._request_and_drain_worker(
-                lock, None, 1.0)
+                lock, None, 1.0, bound=True)
         self.assertTrue(exited)
         self.assertIsNone(found)
         self.assertFalse(acknowledged)
@@ -255,7 +317,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                     semworker, "_process_owner",
                     return_value=ownerfile.ProcessOwner.DEAD):
             exited, found, acknowledged = semworker._request_and_drain_worker(
-                rec, descriptor, 1.0)
+                rec, descriptor, 1.0, bound=True)
         self.assertFalse(exited)
         self.assertIs(found, descriptor)
         self.assertFalse(acknowledged)
@@ -277,7 +339,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
                 mock.patch.object(
                     semworker, "_terminate_worker_tree") as fallback:
             exited, found, acknowledged = semworker._request_and_drain_worker(
-                rec, descriptor, 1.0)
+                rec, descriptor, 1.0, bound=True)
         self.assertTrue(exited)
         self.assertIs(found, descriptor)
         self.assertTrue(acknowledged)
@@ -285,6 +347,65 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
         tree.terminate_and_wait.assert_called_once()
         tree.close.assert_called_once_with()
         fallback.assert_not_called()
+
+    def test_windows_unbound_descriptor_is_never_signalled_whatever_the_port_says(
+            self) -> None:
+        # no owner record in the private namespace names the process: the Job is
+        # not even opened, an accepted stop request earns no termination, and the
+        # worker is given its own retire deadline to exit
+        rec = {
+            "pid": 42, "process_start": "win_123",
+            "tree_bound": True, "named_job": True,
+        }
+        descriptor = (rec, _snapshot("descriptor", 15))
+        clock = [100.0]
+        states = iter((ownerfile.ProcessOwner.EXACT_LIVE,) * 3
+                      + (ownerfile.ProcessOwner.DEAD,))
+        with mock.patch.object(common, "WIN", True), \
+                mock.patch.object(winjob, "open_exact") as opened, \
+                mock.patch.object(
+                    semworker, "_request_worker_stop", return_value=True) as stop, \
+                mock.patch.object(
+                    semworker, "_process_owner",
+                    side_effect=lambda *_: next(states, ownerfile.ProcessOwner.DEAD)), \
+                mock.patch.object(semworker.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(
+                    semworker.time, "sleep",
+                    side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                mock.patch.object(
+                    semworker, "_terminate_worker_tree") as fallback:
+            exited, found, acknowledged = semworker._request_and_drain_worker(
+                rec, descriptor, 1.0, bound=False)
+        self.assertTrue(exited)
+        self.assertIs(found, descriptor)
+        self.assertTrue(acknowledged)
+        stop.assert_called_once()
+        opened.assert_not_called()
+        fallback.assert_not_called()
+
+    def test_unbound_descriptor_outwaits_the_retire_deadline_then_reports(self) -> None:
+        rec = {"pid": 42, "process_start": "1-1", "tree_bound": True, "named_job": False}
+        descriptor = (rec, _snapshot("descriptor", 15))
+        clock = [100.0]
+        with mock.patch.object(common, "WIN", False), \
+                mock.patch.object(
+                    semworker, "_request_worker_stop", return_value=True), \
+                mock.patch.object(
+                    semworker, "_process_owner",
+                    return_value=ownerfile.ProcessOwner.EXACT_LIVE), \
+                mock.patch.object(semworker.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(
+                    semworker.time, "sleep",
+                    side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                mock.patch.object(
+                    semworker, "_terminate_worker_tree") as terminate:
+            exited, _found, acknowledged = semworker._request_and_drain_worker(
+                rec, descriptor, 1.0, bound=False)
+        self.assertFalse(exited)
+        self.assertTrue(acknowledged)
+        terminate.assert_not_called()
+        # the wait outlasted the worker's own retire deadline, not just the budget
+        self.assertGreaterEqual(clock[0] - 100.0, semworker.STOP_ACK_ORPHAN_S + 1.0)
 
     def test_windows_legacy_tree_is_protected_without_signalling(self) -> None:
         rec = {
@@ -436,7 +557,7 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["stop_ack"])
         self.assertFalse(result["fallback_termination"])
-        wait.assert_called_once_with(rec, (rec, descriptor), 5.0)
+        wait.assert_called_once_with(rec, (rec, descriptor), 5.0, bound=True)
         discard_descriptor.assert_called_once_with(
             semworker.descriptor_path(), descriptor)
         discard_owner.assert_called_once_with(
@@ -687,12 +808,14 @@ class SemanticWorkerTeardownUnitTests(unittest.TestCase):
 @unittest.skipIf(os.name == "nt", "POSIX private process groups")
 class PosixSemanticWorkerTeardownTests(unittest.TestCase):
     def test_real_private_group_drains_semantic_descendant(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-semworker-tree-") as raw:
+        with fixture_tree(prefix="agrep-semworker-tree-") as raw:
             ready = Path(raw) / "child.pid"
             child = (
                 "import os,pathlib,signal,sys,time\n"
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
-                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "staged=pathlib.Path(sys.argv[1]+'.tmp')\n"
+                "staged.write_text(str(os.getpid()))\n"
+                "os.replace(staged,sys.argv[1])\n"
                 "while True: time.sleep(1)\n"
             )
             parent = (
@@ -747,7 +870,7 @@ class WindowsSemanticWorkerTeardownTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
     def test_product_worker_stop_releases_mapped_descendant(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-semworker-job-") as raw:
+        with fixture_tree(prefix="agrep-semworker-job-") as raw:
             root = Path(raw)
             mapped = root / "mapped.bin"
             ready = root / "ready.txt"

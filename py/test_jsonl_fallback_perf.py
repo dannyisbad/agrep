@@ -120,6 +120,13 @@ def _create_sealed_event_store(directory: Path, payloads: list[bytes]) -> bytes:
     return generation
 
 
+def _settle_event_proof(directory: Path, agent: str = "codex") -> None:
+    """Date the proof past the store's racy window, as a publication made after the last write is."""
+    store = (directory / events.EVENT_STORE_NAME).stat()
+    settled = max(store.st_mtime_ns, store.st_ctime_ns) + 3_000_000_000
+    os.utime(directory.parent / f".events_complete.{agent}.json", ns=(settled, settled))
+
+
 class OnePassKeywordTerms(unittest.TestCase):
     def test_combined_lane_matches_two_pass_reference_in_one_walk(self) -> None:
         rows = [
@@ -566,6 +573,7 @@ class EventPayloadPrefilter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
                 events, "EVENTS_DIR", Path(td) / "events"):
             _create_sealed_event_store(events.EVENTS_DIR, [nonmatch, matching])
+            _settle_event_proof(events.EVENTS_DIR)
             real_digest = events._event_payload_digest
             with mock.patch.object(
                     events, "_event_payload_digest", wraps=real_digest) as digest:
@@ -594,6 +602,41 @@ class EventPayloadPrefilter(unittest.TestCase):
                 list(events.event_blobs_bulk(
                     [("codex", "s0")], full=True,
                     required_literals=("needle", "other")))
+
+    @unittest.skipIf(events.WIN, "Windows identities carry a change token; no racy window")
+    def test_proof_inside_the_seal_tick_forces_exhaustive_validation(self) -> None:
+        nonmatch = b'{"ts":1,"kind":"tool","input":"ordinary only"}\n'
+        matching = b'{"ts":2,"kind":"tool","input":"needle other"}\n'
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+                events, "EVENTS_DIR", Path(td) / "events"):
+            generation = _create_sealed_event_store(events.EVENTS_DIR, [nonmatch, matching])
+            store = events.EVENTS_DIR / events.EVENT_STORE_NAME
+            db = sqlite3.connect(store)
+            db.execute("UPDATE event_sessions SET digest=? WHERE name='s0.jsonl'", (b"rewritten",))
+            db.commit()
+            db.close()
+            # The proof seals the rewritten store, as a same-tick rewrite the identity misses leaves it.
+            proof = _write_event_proof(
+                events.EVENTS_DIR, generation, count=2, root_a=11, root_b=12)
+            sealed = store.stat()
+            os.utime(proof, ns=(sealed.st_ctime_ns, sealed.st_ctime_ns))
+            real_digest = events._event_payload_digest
+            with mock.patch.object(
+                    events, "_event_payload_digest", wraps=real_digest) as digest:
+                with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                    list(events.event_blobs_bulk(
+                        [("codex", "s0"), ("codex", "s1")], full=True,
+                        required_literals=("needle", "other")))
+            self.assertEqual(digest.call_args_list[0].args[0], nonmatch)
+
+            _settle_event_proof(events.EVENTS_DIR)
+            with mock.patch.object(
+                    events, "_event_payload_digest", wraps=real_digest) as digest:
+                rows = list(events.event_blobs_bulk(
+                    [("codex", "s0"), ("codex", "s1")], full=True,
+                    required_literals=("needle", "other")))
+            self.assertEqual(rows, [("codex", "s1", matching)])
+            self.assertEqual(digest.call_count, 1)
 
     def test_same_mtime_replacement_forces_exhaustive_validation(self) -> None:
         nonmatch = b'{"ts":1,"kind":"tool","input":"ordinary only"}\n'
@@ -643,6 +686,7 @@ class EventPayloadPrefilter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
                 events, "EVENTS_DIR", Path(td) / "events"):
             _create_sealed_event_store(events.EVENTS_DIR, [nonmatch, matching])
+            _settle_event_proof(events.EVENTS_DIR)
             with mock.patch.object(
                     events, "_event_filter_authority_stable", return_value=False):
                 with self.assertRaisesRegex(RuntimeError, "proof changed"):
@@ -665,6 +709,7 @@ class EventPayloadPrefilter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
                 events, "EVENTS_DIR", Path(td) / "events"):
             _create_sealed_event_store(events.EVENTS_DIR, [matching])
+            _settle_event_proof(events.EVENTS_DIR)
             rows = events.event_blobs_bulk(
                 [("codex", "s0")], full=True,
                 required_literals=("needle", "other"))
@@ -682,6 +727,7 @@ class EventPayloadPrefilter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
                 events, "EVENTS_DIR", Path(td) / "events"):
             _create_sealed_event_store(events.EVENTS_DIR, payloads)
+            _settle_event_proof(events.EVENTS_DIR)
             store = events.EVENTS_DIR / events.EVENT_STORE_NAME
             raw = store.read_bytes()
             offset = raw.find(b"needle other")

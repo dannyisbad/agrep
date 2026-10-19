@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from contextlib import redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
@@ -89,6 +90,194 @@ class InProcessDispatchTests(unittest.TestCase):
                 mock.patch("sys.stderr", err):
             self.assertEqual(cli.main(), 130)
         self.assertEqual(err.getvalue(), "")
+
+    @unittest.skipIf(sys.platform == "win32", "the boundary borrows SIGPIPE on POSIX only")
+    def test_a_ctrl_c_during_the_boundary_teardown_is_quiet_too(self) -> None:
+        # a Ctrl-C storm that outlasts a view's exit lands while the boundary
+        # gives SIGPIPE back
+        import signal
+        real, calls = signal.signal, []
+
+        def give_back(signum, handler):
+            previous = real(signum, handler)
+            calls.append(signum)
+            if signum == signal.SIGPIPE and len(calls) == 2:
+                raise KeyboardInterrupt
+            return previous
+        err = io.StringIO()
+        # a long test process would otherwise add its own "took Ns" line
+        with mock.patch.object(cli, "_main", return_value=0), \
+                mock.patch.object(cli.common, "profile_report", return_value=None), \
+                mock.patch.object(signal, "signal", side_effect=give_back), \
+                mock.patch("sys.stderr", err):
+            self.assertEqual(cli.main(), 130)
+        self.assertEqual(calls, [signal.SIGPIPE, signal.SIGPIPE])
+        self.assertEqual(err.getvalue(), "")
+
+    @unittest.skipIf(sys.platform == "win32", "dying of a signal is POSIX")
+    def test_a_late_ctrl_c_after_settling_ends_the_process_silently(self) -> None:
+        # the entry points settle once the command is done, so the rest of a
+        # storm cannot surface as a traceback from interpreter shutdown
+        import os
+        import signal
+        import subprocess
+        script = ("import signal, time\n"
+                  "import console\n"
+                  "console.settle_interrupts()\n"
+                  "signal.raise_signal(signal.SIGINT)\n"
+                  "time.sleep(30)\n")
+        done = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "py")))})
+        self.assertEqual((done.returncode, done.stderr), (-signal.SIGINT, b""))
+
+    def test_only_the_process_entry_settles_and_a_ctrl_c_cannot_break_it(self) -> None:
+        import signal
+        import console
+        from agrep import __main__ as entry
+        before = signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGINT, before)
+        launcher = str(ROOT / "agrep-launcher.py")  # stands in for the main script
+
+        def at_top_level(filename: str) -> dict:
+            scope = {"__name__": "__main__", "main": entry.main}
+            exec(compile("status = main()", filename, "exec"), scope)  # noqa: S102
+            return scope
+
+        with mock.patch.object(sys, "path", list(sys.path)), \
+                mock.patch.object(sys.modules["__main__"], "__file__", launcher, create=True), \
+                mock.patch("resident.try_run", return_value=None), \
+                mock.patch.object(cli, "main", return_value=7):
+            # an in-process caller, a prompt and a notebook cell keep their own handler
+            self.assertEqual(entry.main(), 7)
+            for filename in ("<stdin>", "<python-input-0>", "/tmp/ipykernel_1/cell.py"):
+                self.assertEqual(at_top_level(filename)["status"], 7)
+            with mock.patch.object(sys, "ps1", ">>> ", create=True):
+                self.assertEqual(at_top_level(launcher)["status"], 7)
+            self.assertIs(signal.getsignal(signal.SIGINT), before)
+            # the main script's top level is the process
+            self.assertEqual(at_top_level(launcher)["status"], 7)
+            self.assertIs(signal.getsignal(signal.SIGINT), console._die_of_signal)
+            # a Ctrl-C caught before the switch makes it an interrupted command
+            signal.signal(signal.SIGINT, before)
+            with mock.patch.object(console, "settle_interrupts",
+                                   side_effect=[KeyboardInterrupt, None]) as settle:
+                self.assertEqual(at_top_level(launcher)["status"], 130)
+            self.assertEqual(settle.call_count, 2)
+        script = (ROOT / "cli.py").read_text(encoding="utf-8").rsplit(
+            'if __name__ == "__main__":', 1)[1]
+        self.assertIn("console.settle_interrupts()", script)
+        self.assertIn("except KeyboardInterrupt:", script)
+        self.assertIn("os._exit(130)", script)
+
+    def test_a_ctrl_c_on_the_settle_loop_itself_ends_the_process_quietly(self) -> None:
+        # the trace hook raises the second Ctrl-C at the loop head, outside the inner try,
+        # once the first one made the status 130
+        import os
+        import subprocess
+        import tempfile
+        script = (
+            "import sys\n"
+            "from unittest import mock\n"
+            "from agrep.__main__ import main\n"
+            "import cli, console, resident\n"
+            "def settle():\n"
+            "    settle.calls += 1\n"
+            "    if settle.calls == 1:\n"
+            "        raise KeyboardInterrupt\n"
+            "settle.calls = 0\n"
+            "def local(frame, event, arg):\n"
+            "    if event == 'line' and frame.f_locals.get('status') == 130:\n"
+            "        raise KeyboardInterrupt\n"
+            "    return local\n"
+            "def tracer(frame, event, arg):\n"
+            "    return local if frame.f_code is main.__code__ else None\n"
+            "with mock.patch.object(resident, 'try_run', return_value=None), \\\n"
+            "        mock.patch.object(cli, 'main', return_value=0), \\\n"
+            "        mock.patch.object(console, 'settle_interrupts', settle):\n"
+            "    sys.settrace(tracer)\n"
+            "    status = main()\n"
+            "print('survived', flush=True)\n")
+        with tempfile.TemporaryDirectory() as folder:
+            launcher = Path(folder) / "agrep-launcher.py"
+            launcher.write_text(script, encoding="utf-8")
+            done = subprocess.run(
+                [sys.executable, str(launcher)], capture_output=True, timeout=60,
+                env={**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "py")))})
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (130, b"", b""))
+
+    @unittest.skipUnless(sys.platform != "win32", "a prompt on a pseudo-terminal")
+    def test_main_run_at_a_prompt_leaves_ctrl_c_with_the_prompt(self) -> None:
+        import tempfile
+        lines = ("import cli, resident",
+                 "cli.main = lambda: 0; resident.try_run = lambda: None",
+                 "from agrep.__main__ import main",
+                 "print('main', 'returned', main())")
+        self._ctrl_c_at_the_prompt([], {}, lines)
+        # PYTHONINSPECT, at startup or set by the script, opens a prompt once the script ends
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "agrep-launcher.py"
+            for setup, extra in (((), {"PYTHONINSPECT": "1"}),
+                                 (("import os; os.environ['PYTHONINSPECT'] = '1'",), {})):
+                with self.subTest(setup=setup, env=extra):
+                    script.write_text("\n".join((*setup, *lines)) + "\n", encoding="utf-8")
+                    self._ctrl_c_at_the_prompt([str(script)], extra, ())
+
+    def _ctrl_c_at_the_prompt(self, argv: list, extra: dict, typed: tuple) -> None:
+        import fcntl
+        import os
+        import pty
+        import select
+        import subprocess
+        import termios
+        import time
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "py"))),
+               "PYTHON_BASIC_REPL": "1", "TERM": "dumb"}
+        env.pop("PYTHONSTARTUP", None)
+        env.pop("PYTHONINSPECT", None)
+        prompt = subprocess.Popen(
+            [sys.executable, "-q", *argv], stdin=slave, stdout=slave, stderr=slave,
+            env={**env, **extra}, start_new_session=True,
+            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+        os.close(slave)
+        self.addCleanup(lambda: prompt.poll() is None and prompt.kill())
+        seen = bytearray()
+
+        def read(until_text: str = "", start: int = 0) -> int:
+            """Read the prompt's output until `until_text` shows, or until it exits;
+            its terminal's last close waits for this end to read what is queued."""
+            deadline = time.monotonic() + 30
+            while True:
+                at = seen.find(until_text.encode(), start) if until_text else -1
+                if at >= 0:
+                    return at + len(until_text)
+                exited = prompt.poll() is not None
+                if exited and not until_text:
+                    return len(seen)
+                if exited or time.monotonic() > deadline:
+                    self.fail(f"no {until_text!r}: exit {prompt.poll()}, "
+                              f"tail {bytes(seen[-300:])!r}")
+                if select.select([master], [], [], 0.1)[0]:
+                    with contextlib.suppress(OSError):  # EIO once the prompt is gone
+                        seen.extend(os.read(master, 4096))
+
+        def type_line(line: str) -> None:
+            os.write(master, line.encode() + b"\n")
+
+        at = read(">>> ") if typed else 0
+        for line in typed:
+            type_line(line)
+        at = read(">>> ", read("main returned 0", at))
+        os.write(master, b"\x03")  # Ctrl-C at the prompt
+        at = read("KeyboardInterrupt", at)
+        type_line("print('still', 'here')")
+        read("still here", at)
+        # os._exit: 3.14's prompt reports any later exit as SIGINT once it has caught a Ctrl-C
+        type_line("import os; os._exit(0)")
+        read()
+        self.assertEqual(prompt.wait(30), 0)
 
     def test_audit_help_reaches_the_real_option_parser(self) -> None:
         output = io.StringIO()

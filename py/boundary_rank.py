@@ -42,13 +42,30 @@ class _Cluster:
         return self.text[0]
 
 
+@dataclass(slots=True)
+class _MatchBoundaries:
+    clusters: tuple[_Cluster, ...]
+    length: int
+    indexes: dict[int, int]
+    known: dict[int, bool]
+
+    def __contains__(self, position: int) -> bool:
+        if position not in self.known:
+            index = self.indexes.get(position)
+            self.known[position] = bool(
+                position in (0, self.length)
+                or (index is not None and index > 0
+                    and _boundary_between(self.clusters, index)))
+        return self.known[position]
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedText:
     original: str
     folded: str
     starts: tuple[int, ...]
     ends: tuple[int, ...]
-    boundaries: frozenset[int]
+    boundaries: frozenset[int] | _MatchBoundaries
 
     def find_spans(self, folded_term: str) -> tuple[Span, ...]:
         if not folded_term:
@@ -130,7 +147,7 @@ class PreparedQuery:
                 for term in self.terms for variant in term.variants):
             prepared: _AsciiText | PreparedText = _AsciiText(text, text.lower())
         else:
-            prepared = prepare_text(text)
+            prepared = prepare_text(text, _match_only=True)
         if spans is not None and len(spans) != len(self.terms):
             raise ValueError("one span is required per query token")
         qualities: list[float] = []
@@ -259,7 +276,7 @@ def prepare_query(query: str, stats: Stats = None) -> PreparedQuery:
 
 # ranking re-evaluates the same snippet once per occurrence; cache so preparation is once per text
 @functools.lru_cache(maxsize=64)
-def prepare_text(text: str) -> PreparedText:
+def prepare_text(text: str, *, _match_only: bool = False) -> PreparedText:
     clusters = _clusters(text)
     folded: list[str] = []
     starts: list[int] = []
@@ -269,12 +286,19 @@ def prepare_text(text: str) -> PreparedText:
         folded.append(normalized)
         starts.extend((cluster.start,) * len(normalized))
         ends.extend((cluster.end,) * len(normalized))
-    boundaries = {0, len(text)}
-    for index in range(1, len(clusters)):
-        if _boundary_between(clusters, index):
-            boundaries.add(clusters[index].start)
-    return PreparedText(text, "".join(folded), tuple(starts), tuple(ends),
-                        frozenset(boundaries))
+    # Occurrence endpoints retain their full-text cluster neighbors; lazy
+    # boundaries therefore cannot change the selected span or its quality.
+    if _match_only:
+        boundaries = _MatchBoundaries(
+            clusters, len(text),
+            {cluster.start: index for index, cluster in enumerate(clusters)}, {})
+    else:
+        positions = {0, len(text)}
+        for index in range(1, len(clusters)):
+            if _boundary_between(clusters, index):
+                positions.add(clusters[index].start)
+        boundaries = frozenset(positions)
+    return PreparedText(text, "".join(folded), tuple(starts), tuple(ends), boundaries)
 
 
 def _finish_score(terms: Sequence[BoundaryTerm], qualities: Sequence[float],

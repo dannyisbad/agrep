@@ -110,6 +110,7 @@ def _public_window(raw: dict) -> dict:
             "first_turn", "last_turn", "center")
     } | {
         "turns": turns, "events": events,
+        "events_unavailable": raw.get("events_unavailable") is True,
         "truncated": (
             len(turns) < len(raw_turns) or len(events) < len(raw_events)
             or turn_chars <= 0 or event_chars <= 0),
@@ -503,8 +504,8 @@ class Handler(BaseHTTPRequestHandler):
                 "hits": rows[:limit],
             }
             if result.get("tools_excluded"):
-                response["tools_excluded"] = {
-                    "reason": surface.TOOLS_PENDING_ERROR_CODE}
+                response["tools_excluded"] = surface.tools_excluded_record(result.get(
+                    "tools_excluded_reason", surface.TOOLS_PENDING_ERROR_CODE))
             semantic = _public_semantic_state(result)
             if semantic is not None:
                 response["semantic"] = semantic

@@ -12,8 +12,24 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use common::{fixtures_dir, temp_dir, BIN};
 
 fn run(home: &Path, data: &Path, build_id: &str, full: bool) -> std::process::Output {
+    run_agent("claude", home, data, build_id, full)
+}
+
+/// Every adapter, for stores the claude fixture alone does not hold.
+#[cfg(target_os = "macos")]
+fn run_all(home: &Path, data: &Path, build_id: &str, full: bool) -> std::process::Output {
+    run_agent("all", home, data, build_id, full)
+}
+
+fn run_agent(
+    agent: &str,
+    home: &Path,
+    data: &Path,
+    build_id: &str,
+    full: bool,
+) -> std::process::Output {
     let mut command = Command::new(BIN);
-    command.args(["index", "--agent", "claude"]);
+    command.args(["index", "--agent", agent]);
     if full {
         command.arg("--full");
     }
@@ -155,7 +171,7 @@ fn forge_owned_corpus(data: &Path, owner: &str) {
     connection
         .execute_batch(&format!(
             "INSERT INTO meta(key, value) VALUES('build_id', '{owner}');
-             INSERT INTO meta(key, value) VALUES('schema', '15');
+             INSERT INTO meta(key, value) VALUES('schema', '17');
              INSERT INTO meta(key, value) VALUES('stamp', 'takeover-fixture-stamp');
              INSERT INTO meta(key, value) VALUES('fts_triggers', '4');"
         ))
@@ -426,7 +442,7 @@ fn takeover_adopts_the_cache_and_reparses_nothing() {
                 row.get::<_, String>(0)
             })
             .unwrap(),
-        "15"
+        "17"
     );
     assert_eq!(
         metadata
@@ -791,6 +807,187 @@ fn a_torn_search_db_falls_back_to_the_discard() {
         "{stderr}"
     );
     assert!(!db.exists(), "a torn foreign corpus.db must not survive");
+}
+
+/// A foreign cache that cannot be adopted beside a directory standing where its journal
+/// belongs: the takeover moves the directory aside, as a commit does, discards the cache and
+/// converges in that same pass. The base goes last, so a discard that cannot finish never
+/// leaves a journal-less base; the directory and its contents survive, moved, not deleted.
+#[test]
+fn takeover_displaces_a_directory_journal_and_converges_in_one_pass() {
+    let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+    let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+    let home = temp_dir("takeover-dir-journal-home");
+    copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+    let data = temp_dir("takeover-dir-journal-data");
+    let first = run(&home, &data, owner_a, true);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    forge_owned_corpus(&data, owner_a);
+    let cache = data.join(".ingest_cache.bin");
+    let mut bytes = fs::read(&cache).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    fs::write(&cache, bytes).unwrap();
+    let journal = data.join(".ingest_cache.bin.journal");
+    let _ = fs::remove_file(&journal);
+    fs::create_dir(&journal).unwrap();
+    fs::write(journal.join("keep.txt"), b"user content").unwrap();
+
+    let second = run(&home, &data, owner_b, false);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("foreign parse cache discarded"),
+        "the takeover did not discard the cache in one pass:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("takeover declined"),
+        "the takeover was declined:\n{stderr}"
+    );
+    assert_owned_by(&data, owner_b);
+    assert!(
+        fs::symlink_metadata(&journal).map_or(true, |metadata| metadata.is_file()),
+        "a directory still stands where the journal belongs"
+    );
+    let aside: Vec<_> = fs::read_dir(&data)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".journal.displaced-"))
+        })
+        .collect();
+    assert_eq!(
+        aside.len(),
+        1,
+        "the directory was not moved aside exactly once"
+    );
+    assert_eq!(
+        fs::read(aside[0].join("keep.txt")).unwrap(),
+        b"user content"
+    );
+    let third = run(&home, &data, owner_b, false);
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&third.stdout).contains("unchanged since last index"),
+        "the converged takeover did not settle"
+    );
+}
+
+/// A foreign cache whose journal is lost and whose base cannot be unlinked (immutable): the
+/// declined takeover must leave the head beside the base, so the next takeover, once the base
+/// can go, refuses the stale cache rather than adopting it without the rows the journal held.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_declined_discard_keeps_the_head_that_dates_a_stale_base() {
+    use common::{cline_task, join_native};
+
+    let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+    let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+    for journal_shape in ["deleted", "mode-000"] {
+        let home = temp_dir("takeover-immutable-base-home");
+        copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+        let data = temp_dir("takeover-immutable-base-data");
+        let tasks = join_native(&home, ".cline/data/tasks");
+        cline_task(
+            &home.join(".cline").join("data"),
+            "1767348000000",
+            "a task the base holds",
+        );
+        let first = run_all(&home, &data, owner_a, true);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        cline_task(
+            &home.join(".cline").join("data"),
+            "1767348900000",
+            "a task only the journal cached",
+        );
+        let second = run_all(&home, &data, owner_a, false);
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let published = fs::read_to_string(data.join("messages.jsonl")).unwrap();
+        assert!(published.contains("a task only the journal cached"));
+        forge_owned_corpus(&data, owner_a);
+        let journal = data.join(".ingest_cache.bin.journal");
+        match journal_shape {
+            "deleted" => fs::remove_file(&journal).unwrap(),
+            _ => fs::set_permissions(&journal, fs::Permissions::from_mode(0o000)).unwrap(),
+        }
+        fs::set_permissions(&tasks, fs::Permissions::from_mode(0o000)).unwrap();
+        let cache = data.join(".ingest_cache.bin");
+        let locked = Command::new("chflags")
+            .arg("uchg")
+            .arg(&cache)
+            .status()
+            .is_ok_and(|status| status.success())
+            && fs::remove_file(&cache).is_err();
+        if !locked || fs::read_dir(&tasks).is_ok() {
+            let _ = Command::new("chflags").arg("nouchg").arg(&cache).status();
+            fs::set_permissions(&tasks, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let declined = run_all(&home, &data, owner_b, false);
+        let stderr = String::from_utf8_lossy(&declined.stderr);
+        assert!(
+            stderr.contains("takeover declined") && stderr.contains("cannot discard"),
+            "{journal_shape}: the immutable base did not decline the takeover:\n{stderr}"
+        );
+        assert!(
+            data.join(".ingest_cache.bin.head").exists(),
+            "{journal_shape}: the declined discard removed the head before the base"
+        );
+        assert!(Command::new("chflags")
+            .arg("nouchg")
+            .arg(&cache)
+            .status()
+            .unwrap()
+            .success());
+        for pass in 1..=2 {
+            let output = run_all(&home, &data, owner_b, false);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let published = fs::read_to_string(data.join("messages.jsonl")).unwrap();
+            assert!(
+                published.contains("a task only the journal cached"),
+                "{journal_shape} pass {pass}: adopted the stale base and dropped the task \
+                 (exit {:?})\n{stderr}",
+                output.status.code()
+            );
+            assert!(
+                !stderr.contains("parse cache verified and adopted"),
+                "{journal_shape} pass {pass}: adopted a stale cache:\n{stderr}"
+            );
+        }
+        fs::set_permissions(&tasks, fs::Permissions::from_mode(0o755)).unwrap();
+        if journal_shape == "mode-000" && journal.exists() {
+            fs::set_permissions(&journal, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let healed = run_all(&home, &data, owner_b, false);
+        assert!(
+            healed.status.success(),
+            "{journal_shape}: never healed\n{}",
+            String::from_utf8_lossy(&healed.stderr)
+        );
+        assert!(fs::read_to_string(data.join("messages.jsonl"))
+            .unwrap()
+            .contains("a task only the journal cached"));
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&data);
+    }
 }
 
 #[cfg(unix)]
@@ -1172,6 +1369,51 @@ fn reader_safe_write_shape_drift_is_retained_for_atomic_rebuild() {
                 assert!(cleared.get("legacy_corpus_db").is_none());
             }
         }
+    }
+}
+
+#[test]
+fn released_schema_is_retained_at_upgrade_while_unreleased_ones_are_discarded() {
+    let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+    let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+    // 0.4.2 wrote schema 15; 16 was never released, so no reader of it can still be running
+    for (schema, retained) in [("15", true), ("16", false)] {
+        let home = temp_dir(&format!("takeover-released-{schema}-home"));
+        copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+        let data = temp_dir(&format!("takeover-released-{schema}-data"));
+        assert!(run(&home, &data, owner_a, true).status.success());
+        forge_owned_corpus(&data, owner_a);
+        rusqlite::Connection::open(data.join("corpus.db"))
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='schema'",
+                rusqlite::params![schema],
+            )
+            .unwrap();
+
+        let second = run(&home, &data, owner_b, false);
+        let stderr = String::from_utf8_lossy(&second.stderr);
+        assert!(second.status.success(), "{schema}: {stderr}");
+        let expected = if retained {
+            "search db retained read-only for atomic rebuild"
+        } else {
+            "search db discarded for rebuild"
+        };
+        assert!(stderr.contains(expected), "{schema}: {stderr}");
+        assert_eq!(
+            data.join("corpus.db").exists(),
+            retained,
+            "{schema}: {stderr}"
+        );
+        if retained {
+            assert_eq!(owner_at(&data.join("corpus.db")), owner_a);
+            let owner: serde_json::Value =
+                serde_json::from_slice(&fs::read(data.join(".derived-owner.json")).unwrap())
+                    .unwrap();
+            assert_eq!(owner["retained_corpus_db"]["build_id"], owner_a);
+        }
+        fs::remove_dir_all(&home).unwrap();
+        fs::remove_dir_all(&data).unwrap();
     }
 }
 

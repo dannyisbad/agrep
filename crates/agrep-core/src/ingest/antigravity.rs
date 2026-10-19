@@ -287,6 +287,7 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) -> bo
             }),
             child_session: String::new(),
             meta: String::new(),
+            state: String::new(),
         });
     }
     healthy
@@ -360,6 +361,8 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
     let mut announced: VecDeque<(String, String, usize)> = VecDeque::new();
     let mut seq = 0u32;
     let mut turn = 0u32;
+    // the transcript orders prose and actions: an action sets the flag the next prose consumes
+    let mut worked = false;
     for e in &events {
         // The model's prose turn (PLANNER_RESPONSE) -> attach as the reply to the
         // user message it answers, and queue any announced tool calls.
@@ -369,12 +372,9 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             announced.clear();
             if let Some(txt) = e.content.as_ref().and_then(|c| c.as_str()) {
                 if let Some(last) = out.last_mut() {
-                    let chars = crate::ingest::append_capped(
-                        &mut last.reply,
-                        txt,
-                        crate::ingest::REPLY_CAP,
-                    );
-                    last.reply_chars += chars;
+                    crate::ingest::append_reply(last, txt);
+                    crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, worked);
+                    worked = false;
                 }
             }
             if let Some(tcs) = &e.tool_calls {
@@ -409,6 +409,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                     seq += 1;
                     tally.agent_row();
                     tally.event();
+                    worked |= !crate::ingest::is_bookkeeping_tool(&name);
                     evts.push(Event {
                         agent: "antigravity",
                         session: session.clone(),
@@ -424,6 +425,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                         call_id: format!("ag{}", seq),
                         child_session: String::new(),
                         meta: String::new(),
+                        state: String::new(),
                     });
                     continue;
                 }
@@ -438,6 +440,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                     seq += 1;
                     tally.agent_row();
                     tally.event();
+                    worked = true;
                     let (input, input_chars) = e
                         .content
                         .as_ref()
@@ -459,6 +462,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                         call_id: format!("ag{}", seq),
                         child_session: String::new(),
                         meta: String::new(),
+                        state: String::new(),
                     });
                     continue;
                 }
@@ -488,6 +492,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             continue;
         }
         tally.row();
+        worked = false;
         out.push(crate::model::RawMessage {
             agent: "antigravity",
             project: project.clone(),
@@ -500,6 +505,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
             reply_chars: 0,
             side: false,
             parent: String::new(),
+            reply_shape: Default::default(),
         });
         turn += 1;
     }

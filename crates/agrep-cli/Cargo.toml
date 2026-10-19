@@ -22,8 +22,9 @@ sha2 = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
-# Test builds force one adapter parse to panic and prove the run still publishes around it.
-agrep-core = { path = "../agrep-core", features = ["parse-panic-injection"] }
+# Test builds force one adapter parse to panic and prove the run still publishes around it, and
+# let a test make the owner fence see records vanish between its scan and its read.
+agrep-core = { path = "../agrep-core", features = ["parse-panic-injection", "owner-vanish-injection"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

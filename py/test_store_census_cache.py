@@ -409,9 +409,17 @@ class StoreCensusCacheTests(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "fork"), "fork is POSIX-only")
     def test_forked_reader_reuses_census_but_not_parent_verdict(self) -> None:
-        self.save()
+        # The fixture freezes the wall clock; the cache's clock-agreement check
+        # also reads the monotonic clock, so a descheduled child must not see
+        # the two drift apart. Freeze both at the moment the cache is written.
+        frozen_mono = time.monotonic()
+        with mock.patch.object(runtime.time, "monotonic", return_value=frozen_mono):
+            self.save()
         runtime._DRIFT_CACHE.value = (
-            runtime._drift_cache_key(), time.monotonic(), runtime.DriftReport("unknown"))
+            runtime._drift_cache_key(), frozen_mono, runtime.DriftReport("unknown"))
+        monotonic = mock.patch.object(runtime.time, "monotonic", return_value=frozen_mono)
+        monotonic.start()
+        self.addCleanup(monotonic.stop)
         read_fd, write_fd = os.pipe()
         try:
             with mock.patch.object(runtime.subprocess, "Popen",

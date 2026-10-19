@@ -112,6 +112,24 @@ def _content_budget(budget: int) -> int:
 _CAP_MARKER_RE = re.compile(
     r" \[\+[\d,]+ chars - agrep around .+ \d+ -C 0"
     r"(?: --max-chars 0| --full)?(?: --who \w+)?\]\Z")
+# _match_windows' closing gap (optional) and snippet action
+_SNIPPET_TAIL_RE = re.compile(
+    r"(?: \[(\d[\d,]*) chars\])? \[snippet - open: [^\]]*\]\Z")
+
+
+def _carry_omission(text: str, omitted: int, prior: int, expand: str) -> str:
+    """Re-shrinking a capped row: its new tail marker must count every character the
+    row no longer shows, the earlier cut included, so the marker matches omitted_chars."""
+    if _CAP_MARKER_RE.search(text):
+        return f"{_CAP_MARKER_RE.sub('', text)} [+{omitted:,} chars - {expand}]"
+    if prior <= 0:
+        return text
+    tail = _SNIPPET_TAIL_RE.search(text)
+    if tail is None:
+        # a slide whose remainder fit the limit carries only its head marker
+        return f"{text} [+{omitted:,} chars - {expand}]"
+    gap = int((tail.group(1) or "0").replace(",", "")) + prior
+    return f"{text[:tail.start()]} [{gap:,} chars] [snippet - open: {expand}]"
 
 
 def _shrink_row(row: dict, session_index=None,
@@ -136,8 +154,9 @@ def _shrink_row(row: dict, session_index=None,
         # law 6: a halving that would drop the row's own query match slides
         # the kept slice to the match instead of keeping the blind head
         new_body, cut_now = _anchored_cap(body, keep, expand, list(anchors))
-        omitted = int(row.get("omitted_chars") or 0) + cut_now
-        new = new_body
+        prior = int(row.get("omitted_chars") or 0)
+        omitted = prior + cut_now
+        new = _carry_omission(new_body, omitted, prior, expand) if cut_now else new_body
     else:
         cut = body[:keep]
         if " " in cut[-200:]:
@@ -307,7 +326,7 @@ _TRUNC_MARKER_RE = re.compile(
     r"|[\d,]+ chars|snippet - open: [^\]]*)\]")
 
 # the over-budget trailer recall builds; parsed back when it must be degraded
-_TRAILER_RE = re.compile(r"\[\+(\d+) hit\(s\) over budget - (.*)\]\Z", re.S)
+_TRAILER_RE = re.compile(r"\[\+(\d+) hit\(s\) over budget(?: - (.*))?\]\Z", re.S)
 
 # the final-cap eviction marker _fit_text_payload appends; dimmed like the rest
 _BUDGET_CAP_MARKER_RE = re.compile(r"\[output truncated to --budget[^\]]*\]")
@@ -352,53 +371,145 @@ def _paint_payload(payload: str) -> str:
     return painted.replace("\x1f", " ")
 
 
+_MORE_HINT = "see --json omitted_hits"
+_MORE_RE = re.compile(
+    r"\s*(?:\+(\d+) more \(" + re.escape(_MORE_HINT) + r"\)|" + re.escape(_MORE_HINT) + r")\Z")
+# the shortest trailer that still accounts for every omitted hit: "[+NNN hit(s) over
+# budget - +NNN more (see --json omitted_hits)]"; reserved before floors are set
+_TRAILER_RESERVE = 64
+
+
+def _bare_trailer(count: int) -> str:
+    """The trailer a page too small for handles keeps: the count and the JSON route."""
+    return f"[+{count} hit(s) over budget - {_MORE_HINT}]"
+
+
+def _parse_trailer(trailer: str) -> tuple[int, list[str]] | None:
+    """(omitted count, named commands) of an over-budget trailer, or None."""
+    m = _TRAILER_RE.match(trailer) if trailer else None
+    if m is None:
+        return None
+    tail = _MORE_RE.sub("", m.group(2) or "")
+    words = tail.split()
+    handles_only = bool(words) and all(word.startswith("@") for word in words)
+    cmds = words if handles_only else [c for c in tail.split(" · ") if c]
+    return int(m.group(1)), cmds
+
+
+def _over_budget_trailer(count: int, cmds: list[str], limit: int) -> str:
+    """`[+N hit(s) over budget - h1 h2 +K more (see --json omitted_hits)]`: the
+    `+K more` pointer whenever hits go unnamed, then as many handles as ``limit``
+    bytes hold beside it; the count is never dropped, so the page accounts for
+    every hit even when it can show none of their handles."""
+    cmds = list(dict.fromkeys(c for c in cmds if c))
+    joiner = (" " if cmds and all(c.startswith("@") and not any(ch.isspace() for ch in c)
+                                  for c in cmds) else " · ")
+    base = f"[+{count} hit(s) over budget"
+
+    def fits(candidate: str) -> bool:
+        return not limit or _utf8_size(candidate) <= limit
+
+    def render(shown: int, pointer: bool) -> str:
+        named = joiner.join(cmds[:shown])
+        more = f"+{count - shown} more ({_MORE_HINT})" if pointer and count > shown else ""
+        body = " ".join(part for part in (named, more) if part)
+        return f"{base} - {body}]" if body else f"{base}]"
+
+    for pointer in (True, False):
+        for shown in range(len(cmds), -1, -1):
+            candidate = render(shown, pointer)
+            if (shown or pointer) and fits(candidate):
+                return candidate
+    bare = _bare_trailer(count)
+    return bare if fits(bare) else f"{base}]"
+
+
 def _degrade_trailer(trailer: str, block_ends: list[tuple[int, str]] | None,
                      budget: int) -> str:
     """Disclosure-only page: the content blocks are evicted whole (law 6 - no
     stub rows), so fold them into the over-budget count with the lead hit's
     command first, then drop trailing commands - never the count - to fit."""
-    m = _TRAILER_RE.match(trailer)
-    if m is None:  # unknown trailer shape: keep it whole when it fits
+    parsed = _parse_trailer(trailer)
+    if parsed is None:  # unknown trailer shape: keep it whole when it fits
         return trailer if _utf8_size(trailer) <= budget else _utf8_prefix(trailer, budget)
-    n = int(m.group(1)) + len(block_ends or [])
-    cmds = [c for _, c in block_ends or [] if c]
-    tail = m.group(2)
-    words = tail.split()
-    handles_only = bool(words) and all(word.startswith("@") for word in words)
-    cmds += words if handles_only else [c for c in tail.split(" · ") if c]
-    joiner = (" " if cmds and all(c.startswith("@") and not any(
-        ch.isspace() for ch in c) for c in cmds) else " · ")
-    while cmds:
-        out = f"[+{n} hit(s) over budget - {joiner.join(cmds)}]"
-        if _utf8_size(out) <= budget:
-            return out
-        cmds.pop()
-    out = f"[+{n} hit(s) over budget]"
-    return out if _utf8_size(out) <= budget else _utf8_prefix(out, budget)
+    count, cmds = parsed
+    blocks = [c for _, c in block_ends or [] if c]
+    return _over_budget_trailer(count + len(block_ends or []), [*blocks, *cmds], budget)
+
+
+def _evicted_block_handles(text: str, cut: int,
+                           block_ends: list[tuple[int, str]] | None) -> list[str]:
+    """Handles of the blocks a cut at ``cut`` (a text offset) drops whole: every
+    block that starts at or past the cut. The block the cut lands in keeps its
+    rest-at marker instead."""
+    start, out = 0, []
+    for end, cmd in block_ends or []:
+        if start >= cut and cmd:
+            out.append(cmd)
+        start = end + 2  # blocks are joined with a blank line
+    return [cmd for cmd in out if cmd]
+
+
+def _with_evicted(trailer: str, evicted: list[str], limit: int) -> str:
+    """Fold blocks the final cap evicted whole into the over-budget trailer, so
+    the text page names every omitted hit the way --json's omitted_hits does,
+    within ``limit`` bytes so the first block is never displaced."""
+    if not evicted:
+        return trailer
+    count, cmds = _parse_trailer(trailer) or (0, [])
+    return _over_budget_trailer(count + len(evicted), [*evicted, *cmds], limit)
 
 
 def _fit_text_payload(text: str, budget: int,
                       block_ends: list[tuple[int, str]] | None = None,
-                      trailer: str = "") -> str:
+                      trailer: str = "", keep: int | None = None) -> str:
     """Hard-cap a text payload at ``budget`` without corrupting markers already in it.
 
     ``block_ends``: (end offset, agrep-around command) per window block, so the cap
     marker names the first window the cut lands in (module contract: every
-    truncation marker carries the command that prints the rest).
+    truncation marker carries the command that prints the rest), and blocks the
+    cut evicts whole are folded into the trailer rather than vanishing.
     ``trailer``: trailing disclosure block (the over-budget hit marker) that must
-    survive the cap - content is evicted first, the trailer re-appended whole."""
+    survive the cap - content is evicted first, the trailer re-appended whole.
+    ``keep``: bytes of the first block the trailer may never displace (its hit
+    floor); by default the first block yields the trailer reserve at most."""
+    if not budget or _utf8_size(f"{text}\n\n{trailer}" if text and trailer
+                                else text or trailer) <= budget:
+        return f"{text}\n\n{trailer}" if text and trailer else text or trailer
+    # blocks the cut evicts whole join the trailer, which may grow only into what the
+    # first block leaves; the longer trailer moves the cut, so iterate to a fixed point
+    first = _utf8_size(text[:block_ends[0][0]]) if block_ends else _utf8_size(text)
+    limit = (max(1, budget - min(keep, first) - 2) if keep is not None
+             else max(_TRAILER_RESERVE, budget - first - 2))
+    evicted: list[str] = []
+    for _ in range(6):
+        full = _with_evicted(trailer, evicted, limit)
+        body, cut = _cut_text_payload(text, budget, block_ends, full)
+        now = _evicted_block_handles(text, cut, block_ends) if cut is not None else []
+        if now == evicted:
+            break
+        evicted = now
+    return body
+
+
+def _cut_text_payload(text: str, budget: int,
+                      block_ends: list[tuple[int, str]] | None,
+                      trailer: str) -> tuple[str, int | None]:
+    """One cap pass: the fitted page and the text offset the cut landed at
+    (None when the trailer alone fills the page)."""
     if trailer:
         joined = f"{text}\n\n{trailer}" if text else trailer
         if not budget or _utf8_size(joined) <= budget:
-            return joined
+            return joined, len(text)
         room = budget - _utf8_size(trailer) - 2
         if room >= 80:
-            return _fit_text_payload(text, room, block_ends) + "\n\n" + trailer
+            body, cut = _cut_text_payload(text, room, block_ends, "")
+            return body + "\n\n" + trailer, cut
         # no room for judgeable content beside the disclosure: evict every
         # content block into it and shrink it until it fits, count intact
-        return _degrade_trailer(trailer, block_ends, budget)
+        return _degrade_trailer(trailer, block_ends, budget), None
     if not budget or _utf8_size(text) <= budget:
-        return text
+        return text, len(text)
     generic = "\n[output truncated to --budget; rerun with a larger budget]"
     marker = generic
     byte_ends = [(_utf8_size(text[:end]), cmd) for end, cmd in block_ends or []]
@@ -413,7 +524,7 @@ def _fit_text_payload(text: str, budget: int,
     if _utf8_size(marker) >= budget:
         marker = generic  # a command that cannot fit whole must not be emitted cut
     if _utf8_size(marker) >= budget:
-        return _utf8_prefix(generic, budget)
+        return _utf8_prefix(generic, budget), 0
     cut = len(_utf8_prefix(text, budget - _utf8_size(marker)))
     for m in _TRUNC_MARKER_RE.finditer(text, max(0, cut - 400)):
         if m.start() >= cut:
@@ -421,24 +532,35 @@ def _fit_text_payload(text: str, budget: int,
         if m.end() > cut:
             cut = m.start()
             break
-    return text[:cut].rstrip() + marker
+    # a cut inside a later block's head line would slice its handle: evict that
+    # block whole instead (the trailer names it); the first block's head is the
+    # renderer's floor and stays
+    start = 0
+    for end, _cmd in block_ends or []:
+        if start < cut < end:
+            head_end = text.find("\n", start)
+            if start and (head_end < 0 or cut <= head_end):
+                cut = start
+            break
+        start = end + 2
+    return text[:cut].rstrip() + marker, cut
 
 
 def _render_text_payload(text: str, budget: int,
                          block_ends: list[tuple[int, str]] | None,
-                         trailer: str, *, color: bool) -> str:
+                         trailer: str, *, color: bool, keep: int | None = None) -> str:
     """Fit the bytes actually written, including optional terminal escapes."""
     content_budget = _content_budget(budget)
     if not color:
         return _fit_text_payload(
-            text, content_budget, block_ends, trailer).replace("\x1f", " ")
+            text, content_budget, block_ends, trailer, keep).replace("\x1f", " ")
     if not budget:
         return _paint_payload(
-            _fit_text_payload(text, 0, block_ends, trailer))
+            _fit_text_payload(text, 0, block_ends, trailer, keep))
 
     plain_budget = content_budget
     for _ in range(12):
-        plain = _fit_text_payload(text, plain_budget, block_ends, trailer)
+        plain = _fit_text_payload(text, plain_budget, block_ends, trailer, keep)
         painted = _paint_payload(plain)
         excess = _utf8_size(painted) - content_budget
         if excess <= 0:
@@ -450,7 +572,7 @@ def _render_text_payload(text: str, budget: int,
 
     # A tiny finite page may not hold even one intact paint sequence.
     return _fit_text_payload(
-        text, content_budget, block_ends, trailer).replace("\x1f", " ")
+        text, content_budget, block_ends, trailer, keep).replace("\x1f", " ")
 
 
 _PHRASE_GROUP = "agrep_phrase"
@@ -641,6 +763,57 @@ def _windows(
             if isinstance(window, dict) and "error" not in window]
 
 
+def _merge_chat_windows(pairs: list[tuple[dict, dict]]) -> list[tuple[dict, dict]]:
+    """One chronological block per chat: several hits in one chat (pack's second query,
+    coverage extras) merge their windows, every (session, turn) rendered once. The
+    merged window lists its hit turns in ``hit_turns`` and their queries in ``queries``;
+    the renderer treats each hit turn as the evidence its block exists to show."""
+    by_session: dict[str, int] = {}
+    out: list[tuple[dict, dict]] = []
+    for hit, window in pairs:
+        session = window["session"]
+        hit_turn = int(window["center"])
+        query = int(hit.get("_recall_query", 0) or 0)
+        index = by_session.get(session)
+        if index is None:
+            by_session[session] = len(out)
+            out.append((hit, {**window, "hit_turns": {hit_turn}, "queries": [query]}))
+            continue
+        first, merged = out[index]
+        turns = {int(t["turn"]): t for t in merged["turns"]}
+        turns.update((int(t["turn"]), t) for t in window["turns"]
+                     if int(t["turn"]) not in turns)
+        seen = {(e["turn"], e.get("ts"), e.get("name"), e.get("input"))
+                for e in merged.get("events") or []}
+        events = list(merged.get("events") or [])
+        for e in window.get("events") or []:
+            key = (e["turn"], e.get("ts"), e.get("name"), e.get("input"))
+            if key not in seen:
+                seen.add(key)
+                events.append(e)
+        events.sort(key=lambda e: (int(e["turn"]), e.get("ts") or 0))
+        out[index] = (first, {
+            **merged,
+            "turns": [turns[turn] for turn in sorted(turns)],
+            "events": events,
+            "hit_turns": merged["hit_turns"] | {hit_turn},
+            "queries": merged["queries"] + [query],
+            "events_unavailable": bool(
+                merged.get("events_unavailable") or window.get("events_unavailable")),
+        })
+    return out
+
+
+def _is_hit_turn(window: dict, turn: int) -> bool:
+    return int(turn) in (window.get("hit_turns") or {int(window["center"])})
+
+
+def _gap_line(previous: int, turn: int) -> str:
+    skipped = turn - previous - 1
+    return (f"       [turn {previous + 1} not shown]" if skipped == 1
+            else f"       [turns {previous + 1}-{turn - 1} not shown]")
+
+
 def _center_text(window: dict, hit: dict) -> str | None:
     """Return the indexed side of a window's center turn."""
     for turn in window.get("turns") or []:
@@ -672,13 +845,14 @@ def _select(hits: list[dict], limit: int, query_count: int = 1, *,
     copies of one conversation is strictly worse than three conversations for
     "have I hit this before?". Pack also promises several search angles: reserve
     one result per query in round-robin order before any query gets a second slot,
-    then keep cycling until the shared budget target is full.
+    then keep cycling until the shared budget target is full. Across queries a
+    chat may serve again at a different turn: hits are deduped by (session, turn).
     """
     buckets = [[] for _ in range(max(1, query_count))]
     for hit in hits:
         i = int(hit.get("_recall_query", 0) or 0)
         buckets[i if 0 <= i < len(buckets) else 0].append(hit)
-    out, seen_sessions, seen_query_families = [], set(), set()
+    out, seen_turns, seen_query_families = [], set(), set()
     roots = search._family_roots_for_hits(hits) if family_diverse else {}
     offsets = [0] * len(buckets)
     while len(out) < limit:
@@ -691,10 +865,10 @@ def _select(hits: list[dict], limit: int, query_count: int = 1, *,
                        if family_diverse else hit["session"])
                 # One family slot per query - different queries may need different children of one root.
                 query_family = (i, key)
-                if (hit["session"] in seen_sessions
+                if ((hit["session"], hit.get("turn")) in seen_turns
                         or query_family in seen_query_families):
                     continue
-                seen_sessions.add(hit["session"])
+                seen_turns.add((hit["session"], hit.get("turn")))
                 seen_query_families.add(query_family)
                 out.append(hit)
                 progressed = True
@@ -878,14 +1052,21 @@ def _expand(pairs: list[tuple[dict, dict]], queries: list[str],
             if not self_policy.excludes(str(row["session"]), row.get("turn"))
         ]
 
-    # Phase 1 - widen: a session that fits its budget share is taken whole. Paraphrase
-    # evidence shares no query terms, so term scans can't find it - never keyhole a fitting chat.
+    # Phase 1 - widen: a session that fits its share of the budget LEFT AFTER every hit's
+    # own turn is taken whole. Paraphrase evidence shares no query terms, so term scans
+    # can't find it - never keyhole a fitting chat, never starve another hit for it.
     out = list(pairs)
-    share = budget // len(pairs)
+    floors = _hit_floors([w for _, w in pairs], [_BLOCK_HEAD_COST] * len(pairs), budget)
+    spare_share = max(0, budget - sum(floors)) // len(pairs)
     widen_requests, widen_indexes = [], []
+    widened: set[str] = set()
     for i, (h, w) in enumerate(pairs):
         sess_chars = sizes.get(w["session"])
-        if sess_chars is not None and sess_chars <= share * 1.2:
+        if (sess_chars is not None and sess_chars - floors[i] <= spare_share * 1.2
+                and w["session"] not in widened):
+            # a chat holding several pack hits is read whole once; the merged block
+            # keeps every hit turn
+            widened.add(w["session"])
             widen_indexes.append(i)
             # Turns need not be contiguous (compaction/importers leave gaps); span the
             # actual first/last turn so "fits whole" means the whole conversation.
@@ -1011,7 +1192,7 @@ def _probe(queries: list[str], hits: list[dict], engine: str,
            meaning_status: dict | None = None,
            meaning_coverage: dict | None = None,
            meaning_accelerator: dict | None = None,
-           tools_excluded: bool = False,
+           tools_gap: str | None = None,
            coverage: dict | None = None,
            verdict: surface.MissVerdict | None = None,
            said_once: set[str] | None = None,
@@ -1043,17 +1224,17 @@ def _probe(queries: list[str], hits: list[dict], engine: str,
                 accelerator=meaning_accelerator)
             line = f"{line} - {notice}"
         _write_payload(
-            _fit_probe_line(line, budget, tools_excluded), budget)
+            _fit_probe_line(line, budget, tools_gap), budget)
         return 1
     _write_payload(
-        _fit_probe_line(line, budget, tools_excluded), budget)
+        _fit_probe_line(line, budget, tools_gap), budget)
     return 0
 
 
-def _fit_probe_line(line: str, budget: int, tools_excluded: bool) -> str:
-    if not tools_excluded:
+def _fit_probe_line(line: str, budget: int, tools_gap: str | None) -> str:
+    if tools_gap is None:
         return _fit_text_payload(line, _content_budget(budget))
-    fact = surface.SCAN_TOOLS_PENDING_LINE
+    fact = surface.tools_gap_line(tools_gap)
     full = f"{fact} - {line}"
     room = _content_budget(budget)
     if not room or _utf8_size(full) <= room:
@@ -1068,6 +1249,91 @@ def _fit_probe_line(line: str, budget: int, tools_excluded: bool) -> str:
 
 # Below this, a block becomes a stub that cannot be judged from retrieved evidence.
 _JUDGEABLE_BLOCK = 900
+_BLOCK_HEAD_COST = 120  # the "── @handle · agent · project · when" line
+
+
+# visible hit-turn chars (past the head and a cap marker) below which a block is a
+# stub, not evidence (law 6): the page evicts and names the hit instead
+_JUDGEABLE_HIT = 200
+_CAP_MARKER_RESERVE = 120  # what one "[+N chars - agrep around …]" marker costs
+
+
+def _hit_rows(window: dict):
+    """(turn, who, text) of the hit turn's rendered rows."""
+    return [(t["turn"], who, text)
+            for t in window["turns"] if _is_hit_turn(window, t["turn"])
+            for who, text in ((t["who"], t["text"] or ""), ("agent", t["reply"] or ""))
+            if text]
+
+
+def _hit_need(window: dict) -> int:
+    """Bytes the hit's own turn(s) take as rendered rows (text, reply and their
+    `  NNNN who: ` prefixes), capped at one judgeable block."""
+    own = sum(_utf8_size(text) + 10 + len(who) for _turn, who, text in _hit_rows(window))
+    return min(own, _JUDGEABLE_BLOCK)
+
+
+def _hit_min(window: dict, target: str) -> int:
+    """The smallest block the fitter can render for the hit turn: a capped row keeps
+    its `[+N chars - agrep around …]` pointer whole, so a row never shrinks below it."""
+    return sum(min(_utf8_size(text) + 10 + len(who),
+                   len(f" [+{len(text):,} chars - {_expand_command(target, turn, who)}]")
+                   + 12 + len(who))
+               for turn, who, text in _hit_rows(window))
+
+
+def _water_level(extras: list[int], budget: int) -> int:
+    """The largest per-item level with sum(min(extra, level)) within budget."""
+    ordered = sorted(extras)
+    for index, extra in enumerate(ordered):
+        share = (budget - sum(ordered[:index])) // (len(ordered) - index)
+        if extra > share:
+            return max(0, share)
+    return budget
+
+
+def _hit_floors(windows: list[dict], heads: list[int], budget: int,
+                mins: list[int] | None = None) -> list[int]:
+    """Per-block bytes reserved for each hit's own turn before anything widens or
+    fills: every hit gets what it needs when the budget holds it; otherwise the
+    budget is water-filled above each block's indivisible minimum (small hits take
+    their need, the big ones split the rest) and, when even that leaves a hit a
+    stub, the lowest-ranked hits are evicted (floor 0) until the kept are judgeable."""
+    needs = [_hit_need(w) + head for w, head in zip(windows, heads)]
+    mins = [min(need, head + low) for need, head, low in
+            zip(needs, heads, mins or [0] * len(needs))]
+    if not budget or sum(needs) <= budget:
+        return needs
+    for keep in range(len(needs), 0, -1):
+        base = sum(mins[:keep])
+        if base > budget and keep > 1:
+            continue
+        level = _water_level([need - low for need, low in zip(needs[:keep], mins)],
+                             max(0, budget - base))
+        floors = [low + min(need - low, level) for need, low in zip(needs[:keep], mins)]
+        judgeable = all(
+            floor - head - _CAP_MARKER_RESERVE
+            >= min(_JUDGEABLE_HIT, need - head - _CAP_MARKER_RESERVE)
+            for floor, head, need in zip(floors, heads, needs))
+        if judgeable or keep == 1:
+            return floors + [0] * (len(needs) - keep)
+    return [0] * len(needs)
+
+
+def _block_head(hit: dict, window: dict, session_index) -> str:
+    """The block's head line body: handle · agent · project · when · labels."""
+    sem_score = hit.get("sem_score")
+    meaning_label = ("weak meaning match" if sem_score is not None
+                     and search._semantic_row_weak(hit)
+                     else "meaning match" if sem_score is not None else "")
+    # @session:turn is the universal handle; colliding sessions need longer prefixes.
+    fields = (
+        console.terminal_safe(_window_result_handle(window, hit, session_index)),
+        console.terminal_safe(window["agent"]),
+        console.terminal_safe(search._proj(window["project"])),
+        _ts_label(hit.get("ts") or 0), meaning_label, _provenance_marks(hit),
+    )
+    return " · ".join(x for x in fields if x)
 
 
 def _msg_cap(share: int, w: dict, reserve: int = 120) -> int:
@@ -1135,6 +1401,28 @@ def _cap_line_bytes(line: str, budget: int) -> str:
     return prefix + ellipsis + suffix if prefix else suffix.lstrip()
 
 
+_TINY_MATCH_MIN = 8  # visible match chars below which the line is left out
+
+
+def _tiny_block(head: str, rows: list[str], room: int) -> str | None:
+    """A block for a page too small for row pointers: the head line (its handle is
+    the recovery route) and the first match row cut plain, or the head alone; None
+    when even the head does not fit ``room``."""
+    if _utf8_size(head) > room:
+        return None
+    left = room - _utf8_size(head) - 1
+    for line in rows:
+        plain = _TRUNC_MARKER_RE.sub("", line).rstrip()
+        prefix = _MSG_ROW_RE.match(plain)
+        if prefix is None:
+            continue
+        prefix_bytes = _utf8_size(plain[:prefix.start(4)])
+        if left >= prefix_bytes + _TINY_MATCH_MIN:
+            return f"{head}\n{_cap_line_bytes(plain, left)}"
+        break
+    return head
+
+
 def _cap_required_lines(head: str, records: list[dict], indexes: list[int],
                         budget: int) -> str:
     """Share exact rendered bytes so every required row retains a visible prefix."""
@@ -1142,6 +1430,12 @@ def _cap_required_lines(head: str, records: list[dict], indexes: list[int],
     remaining = max(0, budget - max(0, len(values) - 1))
     pending = list(range(len(values)))
     allocations = [0] * len(values)
+    # the head carries the handle and is never cut inside it: it takes its full size
+    # first whenever the budget holds it, and rows share what is left
+    if _utf8_size(head) <= remaining:
+        allocations[0] = _utf8_size(head)
+        remaining -= allocations[0]
+        pending.remove(0)
     while pending:
         share = remaining // len(pending)
         small = [index for index in pending
@@ -1315,7 +1609,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     help="chats to show (default: 3, increasing with "
                          "--budget; at least one per query)")
     ap.add_argument("--budget", type=int, default=None, metavar="BYTES",
-                    help="maximum output bytes (default 200000; 0 = uncapped)")
+                    help=f"maximum output bytes (default 200000; 0 = uncapped; a finite "
+                         f"budget is at least {MIN_FINITE_BUDGET}, and a page whose first "
+                         "hit block needs more is refused, exit 2, naming the bytes)")
     ap.add_argument("-C", "--context", type=int, default=2, metavar="N",
                     help="turns before and after each hit (default 2)")
     ap.add_argument("-s", "--semantic", action="store_true",
@@ -1627,7 +1923,12 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                         "content-ambiguous", engine="handle", reason=reason)
                     _note_freshness()
                     return 2
-                if rescue.outcome == "absent":
+                # An unreadable event store leaves a tool claim unverifiable, not stale: the
+                # expanded window serves its turn and discloses the missing events.
+                unverifiable = (rescue.outcome == "absent"
+                                and handle_event_identity is not None
+                                and bool(window.get("events_unavailable")))
+                if rescue.outcome == "absent" and not unverifiable:
                     reason = surface.handle_content_lost(
                         compact.encode_session_target(session), turn,
                         common.cli_name())
@@ -1636,7 +1937,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                         "stale-result-handle", engine="handle", reason=reason)
                     _note_freshness()
                     return 2
-                found = rescue.turn
+                found = turn if unverifiable else rescue.turn
                 if handle_event_identity is None:
                     handle_event_identity = rescue.event_identity
                 if found != turn:
@@ -1743,6 +2044,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
 
     active_semantic_pending = None
     tools_excluded = False
+    tools_gap = surface.TOOLS_PENDING_ERROR_CODE
 
     def _finish_active_semantic():
         nonlocal active_semantic_pending
@@ -1764,11 +2066,13 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         search._mark_history_meta(rows, queries, probe_mode=mode)
 
     def _run_query(q: str, *, mode: str, **kwargs):
-        nonlocal tools_excluded
+        nonlocal tools_excluded, tools_gap
         try:
             result = search.run_query(q, mode=mode, **kwargs)
             if result is not None and mode == "keyword" and result.get("tools_excluded"):
                 tools_excluded = True
+                tools_gap = result.get(
+                    "tools_excluded_reason", surface.TOOLS_PENDING_ERROR_CODE)
             if (self_policy is not None and kwargs.get("exclude_session")
                     and result is not None
                     and not result.get("fallback_recommended")):
@@ -2340,7 +2644,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                     meaning_coverage=semantic_meta.get("semantic_coverage"),
                     meaning_accelerator=semantic_meta.get(
                         "semantic_accelerator_coverage"),
-                    tools_excluded=tools_excluded,
+                    tools_gap=tools_gap if tools_excluded else None,
                     coverage=(search.filter_coverage(args) if not selected
                               else surface.filter_coverage_disclosure(
                                   [], checked=True)),
@@ -2429,12 +2733,11 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 obj["error"] = {"code": "semantic-unavailable"}
             elif tools_excluded:
                 obj["error"] = {
-                    "code": surface.TOOLS_PENDING_ERROR_CODE,
-                    "reason": surface.SCAN_TOOLS_PENDING_LINE,
+                    "code": tools_gap,
+                    "reason": surface.tools_gap_line(tools_gap),
                 }
             if tools_excluded:
-                obj["tools_excluded"] = {
-                    "reason": surface.TOOLS_PENDING_ERROR_CODE}
+                obj["tools_excluded"] = surface.tools_excluded_record(tools_gap)
             _write_payload(
                 _fit_json_payload(
                     obj, _content_budget(budget), session_index),
@@ -2445,7 +2748,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 common.log(surface.semantic_unavailable_notice(
                     semantic_meta.get("semantic_status")))
             elif tools_excluded:
-                common.log(surface.tools_pending_zero_line("keyword"))
+                common.log(surface.tools_gap_zero_line("keyword", tools_gap))
             elif weak_neighbors_command is not None:
                 common.log(
                     "no semantic-only candidate cleared the auto-use "
@@ -2472,9 +2775,15 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             freshness=indexd_runtime.freshness_story())
 
     expand_started = time.perf_counter()
-    pairs = _trim_self_windows(
-        _expand(pairs, queries, budget, max(0, args.context), self_policy))
+    pairs = _merge_chat_windows(_trim_self_windows(
+        _expand(pairs, queries, budget, max(0, args.context), self_policy)))
     common.lap("expand")
+    if any(window.get("events_unavailable") for _hit, window in pairs):
+        note = surface.around_service_note("events_unavailable")
+        handle_notes.append(note)
+        # A human render already says it once, in the prose-only line below.
+        if args.json or tools_gap != surface.EVENTS_UNAVAILABLE_ERROR_CODE:
+            common.log(note["note"])
     if timing_enabled:
         recall_timing["expand"] = round(
             (time.perf_counter() - expand_started) * 1000.0, 3)
@@ -2492,18 +2801,21 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
 
     # the hit's own query anchors its center-turn slice: a cap must not elide
     # the very match the window exists to show (law 6)
-    def _hit_anchors(h: dict) -> list[re.Pattern]:
+    def _hit_anchors(h: dict, w: dict | None = None) -> list[re.Pattern]:
         if direct_hit is not None:  # a handle is an address, not a match
             return []
-        i = int(h.get("_recall_query", 0) or 0)
-        return _anchor_patterns(queries[i if 0 <= i < len(queries) else 0])
+        indexes = (w or {}).get("queries") or [int(h.get("_recall_query", 0) or 0)]
+        out: list[re.Pattern] = []
+        for i in dict.fromkeys(indexes):
+            out.extend(_anchor_patterns(queries[i if 0 <= i < len(queries) else 0]))
+        return out
 
     if args.json:
         out_hits = []
         required_tool_rows = []
         for h, w in pairs:
             cap = 0 if fits else _msg_cap(share, w, 260)
-            anchors = [] if fits else _hit_anchors(h)
+            anchors = [] if fits else _hit_anchors(h, w)
             target = compact.encode_session_target(
                 w["session"], session_index=session_index)
             ev: dict[int, list[dict]] = {}
@@ -2515,14 +2827,14 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 # the matched turn is why this window exists: it keeps a privileged slice of
                 # the share, so widening can only ever truncate CONTEXT turns, never the hit
                 tcap = (0 if fits else
-                        max(cap, min(2400, share)) if t["turn"] == w["center"] else cap)
+                        max(cap, min(2400, share)) if _is_hit_turn(w, t["turn"]) else cap)
                 for who, text in ((t["who"], t["text"]), ("agent", t["reply"])):
                     if not text:
                         continue
                     expand = _expand_command(target, t["turn"], who)
                     capped, omitted = (
                         _anchored_cap(text, tcap, expand, anchors)
-                        if anchors and t["turn"] == w["center"]
+                        if anchors and _is_hit_turn(w, t["turn"])
                         else _cap(text, tcap, expand))
                     row = {"kind": "msg", "session": w["session"],
                            "project": w["project"], "turn": t["turn"],
@@ -2579,6 +2891,8 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                              "sem_score": h.get("sem_score"),
                              "score_kind": h.get("score_kind"),
                              **({"lane": h["lane"]} if h.get("lane") else {}),
+                             **({"events_unavailable": True}
+                                if w.get("events_unavailable") else {}),
                              "matched": _matched_label(h),
                              "window": rows})
             required_tool_rows.append(required_tools)
@@ -2600,20 +2914,19 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 [], checked=handle_filter_note is None,
                 reason=handle_filter_note)))
         if tools_excluded:
-            obj["tools_excluded"] = {
-                "reason": surface.TOOLS_PENDING_ERROR_CODE}
+            obj["tools_excluded"] = surface.tools_excluded_record(tools_gap)
         if fell_back and not phrase_found:
             obj["note"] = "no exact phrase match; showing hits containing all terms"
         _write_payload(
             _fit_json_payload(obj, _content_budget(budget), session_index,
-                              hit_anchors=[_hit_anchors(h) for h, _ in pairs],
+                              hit_anchors=[_hit_anchors(h, w) for h, w in pairs],
                               required_tool_rows=required_tool_rows),
             budget)
         _note_freshness()
         return 0
 
     if tools_excluded:
-        common.log(surface.SCAN_TOOLS_PENDING_LINE)
+        common.log(surface.tools_gap_line(tools_gap))
 
     # ~meta demotion speaks through the row markers alone (law 7). Display
     # lane only (--json keeps every row): weak blocks past the top hit
@@ -2622,9 +2935,27 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     full_count = collapse.count(False)
     content_budget = (max(0, budget - _WEAK_LINE_COST * collapse.count(True))
                       if budget else 0)
-    room = max(1, content_budget // _JUDGEABLE_BLOCK) if budget else full_count
-    denom = min(full_count, room) + (1 if full_count > 1 else 0)
-    share = max(80, content_budget // max(1, denom)) if budget else 0
+    # every hit's own turn comes first (_hit_floors: water-filled, stubs evicted and
+    # named); only the spare beyond the floors widens blocks, the strongest drawing two
+    # parts. A head costs its rule, newline and the 4 bytes the block fitter keeps back.
+    heads = [0 if skip else _utf8_size(f"── {_block_head(h, w, session_index)}") + 5
+             for (h, w), skip in zip(pairs, collapse)]
+    full_windows = [w for (_h, w), skip in zip(pairs, collapse) if not skip]
+    full_heads = [head for head, skip in zip(heads, collapse) if not skip]
+    full_mins = [_hit_min(w, compact.encode_session_target(
+        w["session"], session_index=session_index)) for w in full_windows]
+    floors = _hit_floors(full_windows, full_heads, content_budget if budget else 0,
+                         full_mins)
+    if budget and 0 in floors:
+        # omitted hits are named in a trailer the first block must leave room for
+        content_budget = max(0, content_budget - _TRAILER_RESERVE)
+        floors = _hit_floors(full_windows, full_heads, content_budget, full_mins)
+    floors = [0 if skip else floors.pop(0) for skip in collapse]
+    room = sum(1 for floor, skip in zip(floors, collapse) if not skip and floor) \
+        if budget else full_count
+    room = max(1, room)
+    spare = max(0, content_budget - sum(floors)) if budget else 0
+    spare_share = spare // max(1, min(full_count, room) + (1 if full_count > 1 else 0))
     raw = sum(_utf8_size(t["text"] or "") + _utf8_size(t["reply"] or "")
               for (_h, w), skip in zip(pairs, collapse) if not skip
               for t in w["turns"])
@@ -2638,17 +2969,23 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
     block_cmds: list[str] = []  # each block's handle, for the final cap marker
     trailer_cmds: list[str] = []
     trailer = ""
+    first_block: tuple[str, list[str], str] | None = None
     for i, (h, w) in enumerate(pairs):
-        if budget and (used >= budget
-                       or (not collapse[i] and shown_full >= room)):
-            rest = pairs[i:]
+        def _trail(start: int) -> str:
+            rest = pairs[start:]
             # Handles preserve actionability while spending the exhausted budget on evidence.
-            trailer_cmds = [_window_result_handle(
-                w2, h2, session_index)
-                for h2, w2 in rest[:3]]
-            cmds = " ".join(trailer_cmds)
-            # kept out of blocks: _fit_text_payload evicts content before this
-            trailer = f"[+{len(rest)} hit(s) over budget - {cmds}]"
+            trailer_cmds[:] = [_window_result_handle(w2, h2, session_index)
+                               for h2, w2 in rest]
+            # kept out of blocks: _fit_text_payload evicts content before this. It grows
+            # only into what the rendered blocks left; a page too small to hold a block
+            # beside the count degrades to disclosure alone (law 6: no stub rows)
+            left = _content_budget(budget) - used - 2 if budget else 0
+            pointer = _over_budget_trailer(len(rest), [], 0)
+            limit = left if budget and _utf8_size(pointer) <= left else 0
+            return _over_budget_trailer(len(rest), trailer_cmds, limit)
+
+        if budget and (used >= budget or (not collapse[i] and not floors[i])):
+            trailer = _trail(i)
             break
         target = compact.encode_session_target(
             w["session"], session_index=session_index)
@@ -2656,20 +2993,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         # handle can bind to it - a citation the reader copies is the one
         # that most needs to be verifiable
         result_handle = _window_result_handle(w, h, session_index)
-        sem_score = h.get("sem_score")
-        meaning_label = ("weak meaning match" if sem_score is not None
-                         and search._semantic_row_weak(h)
-                         else "meaning match" if sem_score is not None else "")
-        project_label = console.terminal_safe(search._proj(w["project"]))
-        # @session:turn is the universal handle; colliding sessions need longer prefixes.
-        rendered_handle = console.terminal_safe(result_handle)
-        identity = (
-            rendered_handle,
-            console.terminal_safe(w["agent"]), project_label,
-            _ts_label(h.get("ts") or 0),
-        )
-        head_fields = (*identity, meaning_label, _provenance_marks(h))
-        head = " · ".join(x for x in head_fields if x)
+        head = _block_head(h, w, session_index)
         if collapse[i]:
             center = _center_text(w, h) or next(
                 (t["text"] or t["reply"] for t in w["turns"]
@@ -2680,10 +3004,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             block_cmds.append(result_handle)
             used += _utf8_size(line) + 1
             continue
-        block_share = (share * 2 if shown_full == 0 and full_count > 1
-                       else share)
+        block_share = (floors[i] + spare_share * (2 if shown_full == 0 and full_count > 1
+                                                  else 1)) if budget else 0
         cap = 0 if fits else _msg_cap(block_share, w)
-        anchors = [] if fits else _hit_anchors(h)
+        anchors = [] if fits else _hit_anchors(h, w)
         head_line = f"── {head}"
         ev: dict[int, list[tuple[
             dict, bool, tuple[int, int] | None, str | None,
@@ -2697,10 +3021,10 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 (e, tool_match.selected, tool_match.output_span,
                  tool_match.preview))
         center_rows = sum(
-            1 for t in w["turns"] if t["turn"] == w["center"]
+            1 for t in w["turns"] if _is_hit_turn(w, t["turn"])
             for text in (t["text"], t["reply"]) if text)
         context_rows = sum(
-            1 for t in w["turns"] if t["turn"] != w["center"]
+            1 for t in w["turns"] if not _is_hit_turn(w, t["turn"])
             for text in (t["text"], t["reply"]) if text)
         center_cap = cap
         if block_share and not fits and center_rows:
@@ -2715,8 +3039,15 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         records: list[dict] = []
         order = 0
         hidden_events: list[dict] = []
+        previous_turn: int | None = None
         for t in w["turns"]:
-            tcap = center_cap if t["turn"] == w["center"] else cap
+            if previous_turn is not None and int(t["turn"]) > previous_turn + 1:
+                records.append({"line": _gap_line(previous_turn, int(t["turn"])),
+                                "required": True, "kind": "context",
+                                "drop_key": (3, 0, order)})
+                order += 1
+            previous_turn = int(t["turn"])
+            tcap = center_cap if _is_hit_turn(w, t["turn"]) else cap
             # every capped text row keeps its own match window, not just the
             # center turn - context rows exist because they bear on the query
             if t["text"]:
@@ -2728,7 +3059,7 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 records.append({
                     "line": f"  {t['turn']:>4} "
                             f"{console.terminal_safe(t['who'])}: {body}",
-                    "required": t["turn"] == w["center"], "kind": "context",
+                    "required": _is_hit_turn(w, t["turn"]), "kind": "context",
                     "drop_key": (2, -abs(t["turn"] - w["center"]), order),
                 })
                 order += 1
@@ -2758,22 +3089,51 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
                 body += _reply_loss_marker(t)
                 records.append({
                     "line": f"  {t['turn']:>4} agent: {body}",
-                    "required": t["turn"] == w["center"], "kind": "context",
+                    "required": _is_hit_turn(w, t["turn"]), "kind": "context",
                     "drop_key": (2, -abs(t["turn"] - w["center"]), order),
                 })
                 order += 1
         hidden_markers = _marker_counts(hidden_events)
+        if shown_full == 0:
+            first_block = (head_line, [r["line"] for r in records if r["required"]],
+                           result_handle)
         block, _ = _fit_recall_records(
             head_line, records,
             max(80, block_share - 4) if block_share and not fits else 0,
             _window_expand_command(w, target),
             hidden_tools=len(hidden_events) - sum(hidden_markers.values()),
             hidden_markers=hidden_markers)
+        if budget and shown_full >= room and used + _utf8_size(block) + 1 > budget:
+            # past the block reserve, a block still renders when it fits what is left
+            trailer = _trail(i)
+            break
         blocks.append(block)
         block_cmds.append(result_handle)
         used += _utf8_size(block) + 1
         shown_full += 1
-
+    if budget and first_block:
+        # a page too small for its first block: with other hits, the bare count plus the
+        # first block's head (and match line when it fits); alone, a head never cut inside
+        # its handle. Below the head's cost the budget is refused naming the bytes needed.
+        head, rows, handle = first_block
+        content = _content_budget(budget)
+        if trailer:
+            over = used + 2 + _utf8_size(trailer) > content
+            bare = _bare_trailer(len(pairs) - 1)
+            reserve = _utf8_size(bare) + 2
+        else:
+            marker = f"\n[output truncated to --budget - rest at {handle}]"
+            over = used > content and content - _utf8_size(marker) <= _utf8_size(head)
+            bare, reserve = "", 0
+        if over:
+            page = _tiny_block(head, rows, content - reserve)
+            if page is None:
+                need = _utf8_size(head) + reserve + 1
+                what = ("its first hit block and the over-budget line" if bare
+                        else "its hit block's head line")
+                ap.error(f"--budget {budget} is too small for this page: {what} "
+                         f"need at least {need} bytes")
+            blocks, block_cmds, trailer = [page], [handle], bare
     ends, off = [], 0
     for block, cmd in zip(blocks, block_cmds):
         off += len(block)
@@ -2781,7 +3141,9 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
         off += 2
     payload = _render_text_payload(
         "\n\n".join(blocks), budget, ends, trailer,
-        color=common.color_enabled(sys.stdout, args.color))
+        color=common.color_enabled(sys.stdout, args.color),
+        keep=next((floor for floor, skip in zip(floors, collapse) if not skip and floor),
+                  None) if budget else None)
     common.lap("render")
     _write_payload(payload, budget)
 

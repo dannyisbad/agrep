@@ -20,7 +20,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::ingest::registry::{
-    metadata_is_link, read_bounded_regular_file, relative_path, token_fingerprint,
+    metadata_is_link, read_bounded_regular_file, relative_path, stat_proves_absent,
+    token_fingerprint,
 };
 use crate::ingest::{
     cap_event_output, cap_str_with_chars, is_wrapper, project_name,
@@ -37,6 +38,11 @@ struct Database {
 #[derive(Clone, Debug)]
 struct Discovery {
     databases: Vec<Database>,
+    /// registered database paths a stat error hid: unavailable, never absent
+    unavailable: Vec<(PathBuf, Unenumerable)>,
+    /// registered database paths a stat proves gone (a volume unmounted, a project renamed):
+    /// store roots whose absence two observations must confirm before their chats go
+    absent: Vec<PathBuf>,
     incomplete: bool,
     issues: Vec<(PathBuf, String)>,
     /// readable crush.db files under a root that projects.json never registers;
@@ -89,57 +95,102 @@ fn data_roots() -> Vec<PathBuf> {
     )
 }
 
-fn discovered_plain(path: &Path, directory: bool) -> bool {
+/// Whether `path` is a plain file (or directory): a symlink, the wrong type or a stat error that
+/// proves absence is absent; any other failure may hide a store that still holds conversations.
+fn presence(path: &Path, directory: bool) -> Result<bool, Unenumerable> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if metadata_is_link(&meta) => {
             crate::ingest::warn_source_skip("crush", path, "symlink sources are not followed");
-            false
+            Ok(false)
         }
-        Ok(meta) => {
-            if directory {
-                meta.is_dir()
-            } else {
-                meta.is_file()
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(meta) => Ok(if directory {
+            meta.is_dir()
+        } else {
+            meta.is_file()
+        }),
+        Err(error) if stat_proves_absent(path, &error) => Ok(false),
         Err(error) => {
             crate::ingest::warn_source_skip("crush", path, &error);
-            false
+            Err(Unenumerable::uninspectable(path, &error))
         }
     }
 }
 
-fn discovered_dir_below(path: &Path, anchor: &Path) -> Option<bool> {
+fn discovered_plain(path: &Path, directory: bool) -> bool {
+    presence(path, directory).unwrap_or(false)
+}
+
+fn dir_below(path: &Path, anchor: &Path) -> Option<Result<bool, Unenumerable>> {
     let relative = relative_path(path, anchor)?;
-    if !discovered_plain(anchor, true) {
-        return Some(false);
-    }
-    let mut current = anchor.to_path_buf();
-    for component in relative.components() {
-        match component {
-            std::path::Component::CurDir => continue,
-            std::path::Component::Normal(component) => current.push(component),
-            _ => return Some(false),
+    let walk = || {
+        if !presence(anchor, true)? {
+            return Ok(false);
         }
-        if !discovered_plain(&current, true) {
-            return Some(false);
+        let mut current = anchor.to_path_buf();
+        for component in relative.components() {
+            match component {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(component) => current.push(component),
+                _ => return Ok(false),
+            }
+            if !presence(&current, true)? {
+                return Ok(false);
+            }
         }
-    }
-    Some(true)
+        Ok(true)
+    };
+    Some(walk())
 }
 
-fn discovered_data_dir(path: &Path, registry_root: &Path, project_path: &Path) -> bool {
-    discovered_dir_below(path, registry_root)
-        .or_else(|| discovered_dir_below(path, project_path))
-        .unwrap_or_else(|| discovered_plain(path, true))
+fn data_dir_present(
+    path: &Path,
+    registry_root: &Path,
+    project_path: &Path,
+) -> Result<bool, Unenumerable> {
+    dir_below(path, registry_root)
+        .or_else(|| dir_below(path, project_path))
+        .unwrap_or_else(|| presence(path, true))
+}
+
+/// What discovery learned of the databases it looked for.
+#[derive(Default)]
+struct Found {
+    databases: Vec<Database>,
+    unavailable: Vec<(PathBuf, Unenumerable)>,
+    absent: Vec<PathBuf>,
+}
+
+impl Found {
+    /// The database at `path` when its data dir and it are plain; a stat failure on either names
+    /// the database unavailable, so its conversations are retained rather than pruned, and one
+    /// that proves it gone names a `registered` database absent, for two observations to confirm.
+    fn observe(
+        &mut self,
+        path: PathBuf,
+        data_dir_present: Result<bool, Unenumerable>,
+        project: String,
+        registered: bool,
+    ) {
+        match data_dir_present.and_then(|present| {
+            if present {
+                presence(&path, false)
+            } else {
+                Ok(false)
+            }
+        }) {
+            Ok(true) => self.databases.push(Database { path, project }),
+            Ok(false) if registered => self.absent.push(path),
+            Ok(false) => {}
+            Err(failure) => self.unavailable.push((path, failure)),
+        }
+    }
 }
 
 fn add_project_record(
     value: &serde_json::Value,
     fallback_path: Option<&str>,
     registry_root: &Path,
-    databases: &mut Vec<Database>,
+    found: &mut Found,
 ) {
     let Some(record) = value.as_object() else {
         return;
@@ -168,23 +219,15 @@ fn add_project_record(
     } else {
         return;
     };
-    if !discovered_data_dir(&data_dir, registry_root, &project_path) {
-        return;
-    }
-    let path = data_dir.join("crush.db");
-    if discovered_plain(&path, false) {
-        databases.push(Database {
-            path,
-            project: project_name(project_raw),
-        });
-    }
+    found.observe(
+        data_dir.join("crush.db"),
+        data_dir_present(&data_dir, registry_root, &project_path),
+        project_name(project_raw),
+        true,
+    );
 }
 
-fn read_projects(
-    path: &Path,
-    registry_root: &Path,
-    databases: &mut Vec<Database>,
-) -> std::io::Result<()> {
+fn read_projects(path: &Path, registry_root: &Path, found: &mut Found) -> std::io::Result<()> {
     let Some(bytes) = read_bounded_regular_file(path, PROJECTS_JSON_MAX_BYTES)? else {
         return Ok(());
     };
@@ -192,7 +235,7 @@ fn read_projects(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if let Some(records) = value.as_array() {
         for record in records {
-            add_project_record(record, None, registry_root, databases);
+            add_project_record(record, None, registry_root, found);
         }
         return Ok(());
     }
@@ -202,16 +245,16 @@ fn read_projects(
     if let Some(projects) = object.get("projects") {
         if let Some(records) = projects.as_array() {
             for record in records {
-                add_project_record(record, None, registry_root, databases);
+                add_project_record(record, None, registry_root, found);
             }
         } else if let Some(records) = projects.as_object() {
             for (project, record) in records {
-                add_project_record(record, Some(project), registry_root, databases);
+                add_project_record(record, Some(project), registry_root, found);
             }
         }
     } else {
         for (project, record) in object {
-            add_project_record(record, Some(project), registry_root, databases);
+            add_project_record(record, Some(project), registry_root, found);
         }
     }
     Ok(())
@@ -267,15 +310,22 @@ fn warn_unregistered(paths: &[PathBuf]) {
 }
 
 fn discover_at(roots: Vec<PathBuf>, home: &Path) -> std::io::Result<Discovery> {
-    let mut databases = Vec::new();
+    let mut found = Found::default();
     let mut incomplete = false;
     let mut issues = Vec::new();
     for root in &roots {
-        if !discovered_plain(root, true) {
-            continue;
+        match presence(root, true) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            // The registry below it is unread: every database it names stays unlisted.
+            Err(failure) => {
+                incomplete = true;
+                issues.push((root.clone(), failure.reason));
+                continue;
+            }
         }
         let registry = root.join("projects.json");
-        if let Err(error) = read_projects(&registry, root, &mut databases) {
+        if let Err(error) = read_projects(&registry, root, &mut found) {
             incomplete = true;
             eprintln!(
                 "  ! crush: cannot read {}: {}",
@@ -284,25 +334,19 @@ fn discover_at(roots: Vec<PathBuf>, home: &Path) -> std::io::Result<Discovery> {
             );
             issues.push((registry, error.to_string()));
         }
-        let path = root.join("crush.db");
-        if discovered_plain(&path, false) {
-            databases.push(Database {
-                path,
-                project: "crush".to_string(),
-            });
-        }
+        found.observe(root.join("crush.db"), Ok(true), "crush".to_string(), false);
     }
     let old = home.join(".crush").join("crush.db");
-    if old
+    let old_dir_present = old
         .parent()
-        .is_some_and(|parent| discovered_plain(parent, true))
-        && discovered_plain(&old, false)
-    {
-        databases.push(Database {
-            path: old,
-            project: "crush".to_string(),
-        });
-    }
+        .map(|parent| presence(parent, true))
+        .unwrap_or(Ok(false));
+    found.observe(old, old_dir_present, "crush".to_string(), false);
+    let Found {
+        mut databases,
+        mut unavailable,
+        mut absent,
+    } = found;
     let unregistered = unregistered_databases(&roots, &databases);
     warn_unregistered(&unregistered);
     databases.sort_by(|left, right| {
@@ -311,8 +355,21 @@ fn discover_at(roots: Vec<PathBuf>, home: &Path) -> std::io::Result<Discovery> {
             .then_with(|| left.project.cmp(&right.project))
     });
     databases.dedup_by(|left, right| left.path == right.path);
+    unavailable.sort_by(|left, right| left.0.cmp(&right.0));
+    unavailable.dedup_by(|left, right| left.0 == right.0);
+    unavailable.retain(|(path, _)| !databases.iter().any(|database| database.path == *path));
+    absent.sort();
+    absent.dedup();
+    absent.retain(|path| {
+        !databases.iter().any(|database| database.path == *path)
+            && !unavailable
+                .iter()
+                .any(|(unavailable, _)| unavailable == path)
+    });
     Ok(Discovery {
         databases,
+        unavailable,
+        absent,
         incomplete,
         issues,
         unregistered,
@@ -386,8 +443,23 @@ impl Unenumerable {
         }
     }
 
+    /// A stat failure on a registered path or a directory above it; denial is durable.
+    fn uninspectable(path: &Path, error: &std::io::Error) -> Self {
+        Self {
+            kind: if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "permission-denied"
+            } else {
+                "source-unreadable"
+            },
+            reason: format!("cannot inspect {}: {error}", path.display()),
+        }
+    }
+
     fn durable(&self) -> bool {
-        matches!(self.kind, "permission-denied" | "unsupported-file-type")
+        matches!(
+            self.kind,
+            "permission-denied" | "unsupported-file-type" | "corrupt-database" | "needs-recovery"
+        )
     }
 }
 
@@ -396,6 +468,11 @@ fn open_failure(path: &Path, error: &rusqlite::Error) -> Unenumerable {
         Some("unsupported-file-type") => Unenumerable::foreign(error),
         Some(kind) => Unenumerable {
             kind,
+            reason: error.to_string(),
+        },
+        // A journal whose writer cannot be probed is named, with how its agent recovers it.
+        None if error.to_string().contains(crate::ingest::JOURNAL_PRESENT) => Unenumerable {
+            kind: "source-unreadable",
             reason: error.to_string(),
         },
         None => Unenumerable::transient(),
@@ -422,6 +499,26 @@ fn part_text(part: &serde_json::Value) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// A digest of one conversation's stored message rows, None when they cannot all be read.
+fn conversation_digest(conn: &Connection, session: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare("SELECT id, role, parts, model, created_at FROM messages WHERE session_id = ?1 ORDER BY id")
+        .ok()?;
+    let mut rows = stmt.query([session]).ok()?;
+    let mut hash = 0xcbf29ce484222325_u64;
+    while let Some(row) = rows.next().ok()? {
+        for column in 0..5 {
+            let value: rusqlite::types::Value = row.get(column).ok()?;
+            let text = format!("{value:?}\0");
+            for byte in text.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    Some(format!("rows:{hash:016x}"))
 }
 
 /// Parse one session's messages into (user turns + replies, events). Tool results pair to
@@ -471,6 +568,8 @@ fn parse_session(
         }
     };
     let mut turn = 0u32;
+    // parts are in order: a tool_call sets the flag the next text consumes
+    let mut worked = false;
     for (row_ordinal, row) in rows.enumerate() {
         tally.seen();
         let row = match row {
@@ -510,6 +609,7 @@ fn parse_session(
                 continue;
             }
             tally.row();
+            worked = false;
             out.push(crate::model::RawMessage {
                 agent: "crush",
                 project: project.to_string(),
@@ -522,10 +622,14 @@ fn parse_session(
                 reply_chars: 0,
                 side: !parent.is_empty(),
                 parent: parent.clone(),
+                reply_shape: Default::default(),
             });
             turn += 1;
         } else if role == "assistant" {
             let mut reply = String::new();
+            // the row's text parts make one reply block: its join is what came before the
+            // first of them, calls after that join it to the next row
+            let mut worked_before = None;
             for (part_ordinal, p) in parts.iter().enumerate() {
                 match p.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
@@ -534,6 +638,9 @@ fn parse_session(
                             .and_then(|d| d.get("text"))
                             .and_then(|t| t.as_str())
                         {
+                            if worked_before.is_none() {
+                                worked_before = Some(std::mem::take(&mut worked));
+                            }
                             if !reply.is_empty() {
                                 reply.push('\n');
                             }
@@ -547,6 +654,7 @@ fn parse_session(
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
+                        worked |= !crate::ingest::is_bookkeeping_tool(&name);
                         let call_id = d
                             .get("id")
                             .and_then(|i| i.as_str())
@@ -587,6 +695,7 @@ fn parse_session(
                             call_id,
                             child_session: String::new(),
                             meta: String::new(),
+                            state: String::new(),
                         });
                     }
                     Some("tool_result") => {
@@ -608,12 +717,12 @@ fn parse_session(
             }
             if !reply.trim().is_empty() {
                 if let Some(last) = out.last_mut() {
-                    let chars = crate::ingest::append_capped(
-                        &mut last.reply,
-                        &reply,
-                        crate::ingest::REPLY_CAP,
+                    crate::ingest::append_reply(last, &reply);
+                    crate::ingest::ReplyOrder::joined_known(
+                        &mut last.reply_shape,
+                        worked_before.unwrap_or(false),
                     );
-                    last.reply_chars += chars;
+
                     if last.model.is_empty() {
                         if let Some(m) = &model {
                             if !m.is_empty() {
@@ -656,7 +765,16 @@ const PARENT_QUERY: &str = "SELECT COALESCE(parent_session_id,'') FROM sessions 
 const MESSAGES_QUERY: &str = "SELECT role, parts, model, created_at FROM messages \
      WHERE session_id = ? ORDER BY created_at, id";
 
+/// A census failure no retry heals: a schema crush never wrote, or pages SQLite reads as corrupt.
 fn schema_rejection(error: &rusqlite::Error) -> Option<Unenumerable> {
+    if crate::ingest::sqlite_corrupt(error)
+        || crate::ingest::sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase)
+    {
+        return Some(Unenumerable {
+            kind: "corrupt-database",
+            reason: format!("crush database is corrupt: {error}"),
+        });
+    }
     (crate::ingest::sqlite_code(error) == Some(rusqlite::ErrorCode::Unknown))
         .then(|| Unenumerable::foreign(error))
 }
@@ -684,12 +802,22 @@ fn session_tokens(
                 return None;
             }
         }
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .ok()?;
+        let rows = match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            Ok(rows) => rows,
+            Err(error) => {
+                rejected = schema_rejection(&error);
+                return None;
+            }
+        };
         let mut out = Vec::new();
         for r in rows {
-            let r = r.ok()?;
+            let r = match r {
+                Ok(r) => r,
+                Err(error) => {
+                    rejected = schema_rejection(&error);
+                    return None;
+                }
+            };
             // updated_at present -> "u:<ms>" (see registry::token_fingerprint).
             let token = format!(
                 "{}:{generation}:{project_token}",
@@ -743,6 +871,9 @@ fn open_with_tokens(discovery: &Discovery) -> Opened {
         }
         opened.push((database.clone(), connection));
     }
+    for (path, failure) in &discovery.unavailable {
+        unavailable.push((cache_namespace(path), path.clone(), failure.clone()));
+    }
     tokens.sort();
     unavailable.sort_by(|left, right| left.0.cmp(&right.0));
     Opened {
@@ -774,13 +905,18 @@ fn collect_discovered(
         }
     }
     if let Some(opened) = opened.as_ref() {
-        for (_, path, _) in &opened.unavailable {
-            cache.record_source_read_issue(
+        for (_, path, failure) in &opened.unavailable {
+            let issue = crate::ingest_cache::SourceReadIssue::new(
                 "crush",
                 path,
                 "source-read-failed",
-                "the database could not be opened or enumerated",
+                failure.reason.clone(),
             );
+            cache.record_read_issue(if failure.durable() {
+                issue
+            } else {
+                issue.retryable()
+            });
         }
     }
     let mut token_by_cache = HashMap::new();
@@ -822,7 +958,7 @@ fn collect_discovered(
             .filter(|_| !all_failed && !(incomplete_discovery && no_healthy_database))
             .map(|opened| opened.tokens.clone())
     };
-    let unavailable = opened
+    let mut unavailable = opened
         .as_ref()
         .filter(|_| !all_failed)
         .map(|opened| {
@@ -833,11 +969,39 @@ fn collect_discovered(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // A registered database a stat proves gone may be an unmounted volume or a renamed project:
+    // while it may hold material, its cached chats are kept and the pass guarded until a second
+    // preflight confirms the absence, as for a Stat adapter's store root.
+    if let Some(discovery) = discovery.as_ref().filter(|_| !all_failed) {
+        for path in &discovery.absent {
+            if cache.repeated_absence_covers("crush", path)
+                || !cache.token_scope_expected("crush", path)
+            {
+                continue;
+            }
+            crate::ingest::warn_source_skip(
+                "crush",
+                path,
+                "registered database is absent; its conversations wait for a second observation",
+            );
+            cache.record_source_read_issue(
+                "crush",
+                path,
+                "source-root-unavailable",
+                "registered database disappeared; a second observation confirms the removal",
+            );
+            cache.mark_guarded_stale();
+            unavailable.push(cache_namespace(path));
+        }
+    }
     let preserve_unlisted = incomplete_discovery || durably_blind;
     let has_readable_source = opened
         .as_ref()
         .is_some_and(|opened| !opened.databases.is_empty());
     let parse_issues = std::cell::RefCell::new(Vec::new());
+    // A failed conversation is named by its own rows, never by its busy database's generation,
+    // so one stuck chat in a database others keep writing still fails the same way twice.
+    let failed_digests = std::cell::RefCell::new(Vec::new());
     let pass = cache.collect_token_cached_keyed_partial(
         "crush",
         tokens,
@@ -865,32 +1029,53 @@ fn collect_discovered(
             match parsed {
                 Ok((messages, events, true)) => {
                     if messages.is_empty() && events.is_empty() {
-                        parse_issues
-                            .borrow_mut()
-                            .push((database.path.clone(), None));
+                        parse_issues.borrow_mut().push((
+                            database.path.clone(),
+                            session.to_owned(),
+                            None,
+                        ));
                     }
                     (messages, events, ReadOutcome::Complete)
                 }
-                Ok((messages, events, false)) => {
-                    parse_issues
-                        .borrow_mut()
-                        .push((database.path.clone(), None));
-                    (messages, events, ReadOutcome::Invalid)
+                // The conversation failed whole: none of its rows are vouched for, and the record
+                // below confines the failure to it, so its siblings stay complete.
+                Ok((_, _, false)) => {
+                    parse_issues.borrow_mut().push((
+                        database.path.clone(),
+                        session.to_owned(),
+                        None,
+                    ));
+                    if let Some(digest) = conversation_digest(connection, session) {
+                        failed_digests
+                            .borrow_mut()
+                            .push((id.to_owned(), session.to_owned(), digest));
+                    }
+                    (Vec::new(), Vec::new(), ReadOutcome::Invalid)
                 }
                 Err(panic) => {
-                    parse_issues
-                        .borrow_mut()
-                        .push((database.path.clone(), Some(panic.reason)));
+                    parse_issues.borrow_mut().push((
+                        database.path.clone(),
+                        session.to_owned(),
+                        Some(panic.reason),
+                    ));
                     (Vec::new(), Vec::new(), ReadOutcome::Skipped)
                 }
             }
         },
     );
-    for (path, panicked) in parse_issues.into_inner() {
+    // The record names the conversation whose parse failed: a reader must not charge a
+    // database-wide record to the siblings that merely changed since.
+    for (path, session, panicked) in parse_issues.into_inner() {
         let reason = panicked.unwrap_or_else(|| {
             "the database session query did not produce a complete row".to_owned()
         });
-        cache.record_source_read_issue("crush", &path, "source-read-failed", reason);
+        cache.record_read_issue(
+            crate::ingest_cache::SourceReadIssue::new("crush", path, "source-read-failed", reason)
+                .for_session(session),
+        );
+    }
+    for (id, session, digest) in failed_digests.into_inner() {
+        cache.set_token_failure_identity("crush", &id, &session, digest);
     }
     (pass.messages, pass.events)
 }
@@ -903,9 +1088,19 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
 }
 
 fn live_tokens(intake_keys: bool) -> crate::ingest::registry::TokenAvailability {
+    live_tokens_from(discover(), intake_keys)
+}
+
+/// Each database the census opens lists its conversations; one it cannot is named by an issue
+/// scoped to it, as is a registry whose databases stayed undiscovered. Only when nothing opened
+/// is the whole census unreadable.
+fn live_tokens_from(
+    discovery: std::io::Result<Discovery>,
+    intake_keys: bool,
+) -> crate::ingest::registry::TokenAvailability {
     use crate::ingest::registry::{TokenAvailability, TokenReadIssue};
 
-    let discovery = match discover() {
+    let discovery = match discovery {
         Ok(discovery) => discovery,
         Err(error) => {
             return TokenAvailability::Unreadable(vec![TokenReadIssue::new(
@@ -917,56 +1112,51 @@ fn live_tokens(intake_keys: bool) -> crate::ingest::registry::TokenAvailability 
             )])
         }
     };
-    let incomplete = discovery.incomplete;
-    let opened = open_with_tokens(&discovery);
-    if !opened.unavailable.is_empty() || incomplete {
-        let mut issues: Vec<_> = opened
-            .unavailable
+    let Opened {
+        databases,
+        tokens: live,
+        locations,
+        unavailable,
+    } = open_with_tokens(&discovery);
+    let mut issues: Vec<_> = unavailable
+        .iter()
+        .map(|(_, path, failure)| {
+            TokenReadIssue::with_kind(path, failure.kind, failure.reason.clone())
+        })
+        .collect();
+    issues.extend(
+        discovery
+            .issues
             .iter()
-            .map(|(_, path, failure)| {
-                TokenReadIssue::with_kind(path, failure.kind, failure.reason.clone())
-            })
-            .collect();
-        issues.extend(
-            discovery
-                .issues
-                .iter()
-                .map(|(path, reason)| TokenReadIssue::new(path, reason)),
-        );
-        if issues.is_empty() {
-            issues.push(TokenReadIssue::new(
-                data_roots()
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(crate::ingest::home),
-                "source discovery was incomplete",
-            ));
-        }
-        return TokenAvailability::Unreadable(issues);
-    }
-    if !intake_keys {
-        return TokenAvailability::from_tokens(
-            opened
-                .tokens
+            .map(|(path, reason)| TokenReadIssue::new(path, reason)),
+    );
+    if discovery.incomplete && issues.is_empty() {
+        issues.push(TokenReadIssue::new(
+            data_roots()
                 .into_iter()
-                .map(|(cache_id, _, token)| (cache_id, token))
-                .collect(),
-        );
+                .next()
+                .unwrap_or_else(crate::ingest::home),
+            "source discovery was incomplete",
+        ));
     }
-    let mut rows = Vec::with_capacity(opened.tokens.len());
-    for (cache_id, session, token) in opened.tokens {
-        let Some(index) = opened.locations.get(&cache_id).copied() else {
+    let mut tokens = Vec::with_capacity(live.len());
+    for (cache_id, session, token) in live {
+        if !intake_keys {
+            tokens.push((cache_id, token));
+            continue;
+        }
+        let Some(index) = locations.get(&cache_id).copied() else {
             return TokenAvailability::Unreadable(vec![TokenReadIssue::new(
                 crate::ingest::home(),
                 "conversation token has no source database",
             )]);
         };
-        rows.push((
-            crate::intake::token_id(&opened.databases[index].0.path, &session),
+        tokens.push((
+            crate::intake::token_id(&databases[index].0.path, &session),
             token,
         ));
     }
-    TokenAvailability::from_tokens(rows)
+    TokenAvailability::from_observation(tokens, issues)
 }
 
 /// Registry entry (see ingest::registry). Tokens include the live SQLite generation.
@@ -984,11 +1174,17 @@ impl crate::ingest::registry::Adapter for Crush {
     fn store_roots(&self) -> Vec<PathBuf> {
         discover()
             .map(|discovery| {
-                discovery
+                // An absent registered database is a root the walk finds nothing under: two
+                // such preflights confirm its removal, as for a Stat adapter's store root.
+                let mut roots: Vec<PathBuf> = discovery
                     .databases
                     .into_iter()
                     .map(|database| database.path)
-                    .collect()
+                    .chain(discovery.unavailable.into_iter().map(|(path, _)| path))
+                    .chain(discovery.absent)
+                    .collect();
+                roots.sort();
+                roots
             })
             .unwrap_or_default()
     }
@@ -1139,6 +1335,7 @@ mod tests {
             reply_chars: 0,
             side: false,
             parent: String::new(),
+            reply_shape: Default::default(),
         }
         .freeze()
     }
@@ -1179,6 +1376,200 @@ mod tests {
         assert_eq!(
             cache.source_read_issues()[0].path,
             broken_data.join("crush.db")
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_conversations_failed_parse_is_recorded_against_that_conversation() {
+        let base = temp_dir("failed-parse-session");
+        let root = base.join("global");
+        let database = root.join("crush.db");
+        write_db(&database, "healthy sibling");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions VALUES ('bad-session', '', '', 2000, 2000);
+                 INSERT INTO messages VALUES ('bad-good', 'bad-session', 'user', '[{\"type\":\"text\",\"data\":{\"text\":\"must not leak\"}}]', '', 2000, 2000);
+                 INSERT INTO messages VALUES ('bad', 'bad-session', 'user', '{not json', '', 2001, 2001);",
+            )
+            .unwrap();
+        drop(connection);
+        let discovery = discover_at(vec![root], &base.join("home")).unwrap();
+        // A first index: nothing published, so the failed conversation holds nothing back.
+        let mut cache = crate::ingest_cache::IngestCache::cold();
+        cache.set_published_material(std::collections::HashSet::new());
+        cache.set_published_token_namespaces(Some(std::collections::HashSet::new()));
+        let (messages, _) = collect_discovered(&mut cache, Ok(discovery));
+        assert_eq!(messages.len(), 1);
+        assert!(cache.output_complete());
+        let issues = cache.source_read_issues();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].path, database);
+        assert_eq!(issues[0].kind, "source-read-failed");
+        assert_eq!(issues[0].session.as_deref(), Some("bad-session"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A registered data dir (or `~/.crush`) that cannot be searched hides its database from a
+    /// stat: that database is unavailable, its conversations retained and its issue scoped to it,
+    /// in the warm collect, the census and the store roots alike. Never absent, never pruned.
+    #[cfg(unix)]
+    #[test]
+    fn uninspectable_data_dir_keeps_its_database_unavailable_not_absent() {
+        use crate::ingest::registry::TokenAvailability;
+        use std::os::unix::fs::PermissionsExt;
+
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        let base = temp_dir("denied-data-dir");
+        let root = base.join("global");
+        let home = base.join("home");
+        let project = base.join("project");
+        let project_data = project.join(".crush");
+        let old_data = home.join(".crush");
+        fs::create_dir_all(&root).unwrap();
+        write_db(&root.join("crush.db"), "global question");
+        write_db(&project_data.join("crush.db"), "project question");
+        write_db(&old_data.join("crush.db"), "old home question");
+        fs::write(
+            root.join("projects.json"),
+            serde_json::json!({"projects": [{"path": project, "data_dir": project_data}]})
+                .to_string(),
+        )
+        .unwrap();
+        let cache_path = base.join("cache.bin");
+        let mut cold = crate::ingest_cache::IngestCache::cold();
+        let (messages, _) = collect_discovered(&mut cold, discover_at(vec![root.clone()], &home));
+        assert_eq!(messages.len(), 3);
+        cold.save(&cache_path).unwrap();
+
+        for denied in [&project_data, &old_data] {
+            let database = denied.join("crush.db");
+            fs::set_permissions(denied, fs::Permissions::from_mode(0o000)).unwrap();
+            let discovery = discover_at(vec![root.clone()], &home).unwrap();
+            fs::set_permissions(denied, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!discovery.incomplete);
+            assert!(discovery.issues.is_empty());
+            assert_eq!(discovery.databases.len(), 2, "{discovery:?}");
+            assert!(!discovery.databases.iter().any(|db| db.path == database));
+            assert_eq!(discovery.unavailable.len(), 1, "{discovery:?}");
+            assert_eq!(discovery.unavailable[0].0, database);
+            assert_eq!(discovery.unavailable[0].1.kind, "permission-denied");
+
+            fs::set_permissions(denied, fs::Permissions::from_mode(0o000)).unwrap();
+            let mut warm = crate::ingest_cache::IngestCache::load(&cache_path);
+            let (messages, _) =
+                collect_discovered(&mut warm, discover_at(vec![root.clone()], &home));
+            let census = live_tokens_from(discover_at(vec![root.clone()], &home), false);
+            fs::set_permissions(denied, fs::Permissions::from_mode(0o700)).unwrap();
+            let texts: BTreeSet<&str> = messages.iter().map(|m| m.text.as_ref()).collect();
+            assert_eq!(
+                texts,
+                BTreeSet::from(["global question", "project question", "old home question"]),
+                "{}",
+                denied.display()
+            );
+            assert!(warm.output_complete());
+            let issues = warm.source_read_issues();
+            assert_eq!(issues.len(), 1, "{issues:?}");
+            assert_eq!(issues[0].path, database);
+            match census {
+                TokenAvailability::Partial { tokens, issues } => {
+                    assert_eq!(tokens.len(), 2);
+                    assert!(!tokens
+                        .iter()
+                        .any(|(id, _)| id.starts_with(&cache_namespace(&database))));
+                    assert_eq!(issues.len(), 1, "{issues:?}");
+                    assert_eq!(issues[0].path, database);
+                    assert_eq!(issues[0].kind, "permission-denied");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A registered database behind a parent that became a file or a name too long for the
+    /// filesystem cannot exist: absent, never unavailable. Behind a symlink loop or a link
+    /// pointing at a file the data may be intact: unavailable, every cached conversation kept.
+    #[cfg(unix)]
+    #[test]
+    fn registered_paths_a_stat_proves_absent_are_absent_and_mispointed_links_unavailable() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("absent-by-stat");
+        let root = base.join("global");
+        let home = base.join("home");
+        fs::create_dir_all(&root).unwrap();
+        write_db(&root.join("crush.db"), "global question");
+        // Each project sits a level below the defect, so its own stat fails rather than a parent's.
+        let gone = base.join("gone").join("project");
+        fs::write(
+            base.join("gone"),
+            b"a file where the projects directory was",
+        )
+        .unwrap();
+        let too_long = base.join("x".repeat(300)).join("project");
+        let looped = base.join("loop-a").join("project");
+        symlink(base.join("loop-b"), base.join("loop-a")).unwrap();
+        symlink(base.join("loop-a"), base.join("loop-b")).unwrap();
+        let mispointed = base.join("link-to-file").join("project");
+        symlink(base.join("gone"), base.join("link-to-file")).unwrap();
+        for (project, absent) in [
+            (&gone, true),
+            (&too_long, true),
+            (&looped, false),
+            (&mispointed, false),
+        ] {
+            let error = fs::symlink_metadata(project).unwrap_err();
+            assert_eq!(
+                stat_proves_absent(project, &error),
+                absent,
+                "{}: {error:?}",
+                project.display()
+            );
+        }
+        let projects: Vec<_> = [&gone, &too_long, &looped, &mispointed]
+            .iter()
+            .map(|project| serde_json::json!({"path": project, "data_dir": project.join(".crush")}))
+            .collect();
+        fs::write(
+            root.join("projects.json"),
+            serde_json::json!({"projects": projects}).to_string(),
+        )
+        .unwrap();
+        let discovery = discover_at(vec![root.clone()], &home).unwrap();
+        assert!(!discovery.incomplete);
+        assert!(discovery.issues.is_empty());
+        assert_eq!(discovery.databases.len(), 1);
+        assert_eq!(discovery.databases[0].path, root.join("crush.db"));
+        let unavailable: Vec<&Path> = discovery
+            .unavailable
+            .iter()
+            .map(|(path, _)| path.as_path())
+            .collect();
+        assert_eq!(
+            unavailable,
+            vec![
+                mispointed.join(".crush").join("crush.db").as_path(),
+                looped.join(".crush").join("crush.db").as_path()
+            ],
+            "{discovery:?}"
+        );
+        // Registered databases a stat proves gone are listed for the absence protocol; the root
+        // and legacy ~/.crush databases, which nothing registers, are not.
+        assert_eq!(
+            discovery.absent,
+            vec![
+                gone.join(".crush").join("crush.db"),
+                too_long.join(".crush").join("crush.db")
+            ],
+            "{discovery:?}"
         );
         let _ = fs::remove_dir_all(base);
     }
@@ -1414,6 +1805,99 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    /// One database the census cannot open leaves every sibling listed under an issue naming
+    /// it alone; a registry it cannot read names that registry; nothing opened is unreadable.
+    #[test]
+    fn census_lists_each_opened_database_beside_the_issue_scoped_to_an_unopened_one() {
+        use crate::ingest::registry::TokenAvailability;
+
+        let base = temp_dir("scoped-census");
+        let root = base.join("global");
+        let home = base.join("home");
+        let global = root.join("crush.db");
+        let alpha = base.join("alpha");
+        let beta = base.join("beta");
+        let alpha_db = alpha.join(".crush").join("crush.db");
+        let beta_db = beta.join(".crush").join("crush.db");
+        fs::create_dir_all(&root).unwrap();
+        write_db(&global, "global question");
+        write_db(&alpha_db, "alpha question");
+        write_db(&beta_db, "beta question");
+        let registry = serde_json::json!({
+            "projects": [
+                {"path": alpha, "data_dir": alpha_db.parent().unwrap(), "last_accessed": "2026-07-18T12:00:00Z"},
+                {"path": beta, "data_dir": beta_db.parent().unwrap(), "last_accessed": "2026-07-17T12:00:00Z"}
+            ]
+        });
+        fs::write(root.join("projects.json"), registry.to_string()).unwrap();
+        let census = |intake_keys: bool| {
+            live_tokens_from(discover_at(vec![root.clone()], &home), intake_keys)
+        };
+        let ids = |tokens: &[(String, String)]| -> BTreeSet<String> {
+            tokens.iter().map(|(id, _)| id.clone()).collect()
+        };
+        let expected = |databases: &[&Path], intake_keys: bool| -> BTreeSet<String> {
+            databases
+                .iter()
+                .map(|db| {
+                    if intake_keys {
+                        crate::intake::token_id(db, "same-session")
+                    } else {
+                        cache_id(&cache_namespace(db), "same-session")
+                    }
+                })
+                .collect()
+        };
+        match census(false) {
+            TokenAvailability::Data(tokens) => {
+                assert_eq!(
+                    ids(&tokens),
+                    expected(&[&global, &alpha_db, &beta_db], false)
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+
+        fs::write(&alpha_db, b"not a sqlite database").unwrap();
+        for intake_keys in [false, true] {
+            match census(intake_keys) {
+                TokenAvailability::Partial { tokens, issues } => {
+                    assert_eq!(ids(&tokens), expected(&[&global, &beta_db], intake_keys));
+                    assert_eq!(issues.len(), 1, "{issues:?}");
+                    assert_eq!(issues[0].path, alpha_db);
+                    assert_eq!(issues[0].kind, "unsupported-file-type");
+                }
+                other => panic!("intake_keys={intake_keys}: {other:?}"),
+            }
+        }
+
+        fs::write(root.join("projects.json"), b"{broken").unwrap();
+        match census(false) {
+            TokenAvailability::Partial { tokens, issues } => {
+                assert_eq!(ids(&tokens), expected(&[&global], false));
+                assert_eq!(issues.len(), 1, "{issues:?}");
+                assert_eq!(issues[0].path, root.join("projects.json"));
+                assert_eq!(issues[0].kind, "source-unreadable");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        fs::write(&global, b"not a sqlite database").unwrap();
+        match census(false) {
+            TokenAvailability::Unreadable(issues) => {
+                let paths: BTreeSet<PathBuf> =
+                    issues.iter().map(|issue| issue.path.clone()).collect();
+                assert_eq!(
+                    paths,
+                    BTreeSet::from([global.clone(), root.join("projects.json")])
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn token_snapshot_rejects_a_database_generation_that_moves_mid_read() {
         let root = temp_dir("token-generation");
@@ -1472,7 +1956,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let error = read_projects(&path, &root, &mut Vec::new()).unwrap_err();
+        let error = read_projects(&path, &root, &mut Found::default()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         let _ = fs::remove_dir_all(base);
     }
@@ -1698,12 +2182,8 @@ mod tests {
         let data = root.join("Nested").join("Data");
         fs::create_dir_all(&data).unwrap();
         let upper_data = PathBuf::from(data.to_string_lossy().to_uppercase());
-        assert_eq!(discovered_dir_below(&upper_data, &root), Some(true));
-        assert!(discovered_data_dir(
-            &upper_data,
-            &root,
-            &base.join("project")
-        ));
+        assert!(matches!(dir_below(&upper_data, &root), Some(Ok(true))));
+        assert!(data_dir_present(&upper_data, &root, &base.join("project")).unwrap());
         let _ = fs::remove_dir_all(base);
     }
 }

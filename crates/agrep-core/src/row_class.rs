@@ -23,15 +23,43 @@ fn starts_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
-pub fn is_harness_project(project: &str) -> bool {
-    project.split(['/', '\\']).any(|segment| {
-        segment.eq_ignore_ascii_case("vo-exp")
-            || starts_ascii_case_insensitive(segment, "_probe")
-            || starts_ascii_case_insensitive(segment, "control_")
-            || starts_ascii_case_insensitive(segment, "run_control")
-            || starts_ascii_case_insensitive(segment, "haiku-control")
-            || starts_ascii_case_insensitive(segment, "haiku-treatment")
-    })
+/// The corpus-local harness policy (`<data dir>/harness_prefixes.txt`): one entry per line,
+/// blank lines and `#` comments skipped. A plain line is a prompt-text prefix; a
+/// `project:` line names a project path segment prefix (ASCII case-insensitive) whose
+/// chats are all harness traffic. Nothing is built in: a project name alone never
+/// reclassifies a user's own turns unless the user configured it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarnessPolicy {
+    pub text_prefixes: Vec<String>,
+    pub project_prefixes: Vec<String>,
+}
+
+impl HarnessPolicy {
+    pub fn parse(body: &str) -> Self {
+        let mut policy = HarnessPolicy::default();
+        for line in body.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match line.strip_prefix("project:") {
+                Some(segment) if !segment.trim().is_empty() => {
+                    policy.project_prefixes.push(segment.trim().to_string());
+                }
+                Some(_) => {}
+                None => policy.text_prefixes.push(line.to_string()),
+            }
+        }
+        policy
+    }
+}
+
+pub fn is_harness_project(project: &str, project_prefixes: &[String]) -> bool {
+    !project_prefixes.is_empty()
+        && project.split(['/', '\\']).any(|segment| {
+            project_prefixes
+                .iter()
+                .any(|prefix| starts_ascii_case_insensitive(segment, prefix))
+        })
 }
 
 pub fn is_subagent_turn(m: &Message) -> bool {
@@ -41,18 +69,13 @@ pub fn is_subagent_turn(m: &Message) -> bool {
     m.side || t.starts_with("[subagent task]") || t.starts_with("[subagent message]")
 }
 
-pub fn is_harness_turn(project: &str, text: &str, local_prefixes: &[String]) -> bool {
+/// Harness traffic is opt-in: only the corpus-local policy marks it. agrep's own injected
+/// text (compaction recaps, recovery blocks) is classified structurally by the adapters,
+/// never by prompt prefixes, so no built-in prefix list is needed here.
+pub fn is_harness_turn(project: &str, text: &str, policy: &HarnessPolicy) -> bool {
     let t = text.trim_start();
-    is_harness_project(project)
-        || local_prefixes.iter().any(|p| t.starts_with(p.as_str()))
-        || t.starts_with("Return only valid JSON that matches the schema below.")
-        || t.starts_with("You are a workflow planner for OpenCode.")
-        || t.starts_with("You are an independent verifier.")
-        || t.starts_with("\"Create a file named ok.txt")
-        || t.starts_with("\"You are working in the current directory.")
-        || t.starts_with("\"Stay in this directory. STEP 1:")
-        || t.starts_with("\"STEP 1: run ")
-        || t.starts_with("Follow the README in this directory to run the analysis")
+    is_harness_project(project, &policy.project_prefixes)
+        || policy.text_prefixes.iter().any(|p| t.starts_with(p.as_str()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,7 +101,7 @@ impl RowKind {
     }
 }
 
-pub fn row_kind(m: &Message, harness_prefixes: &[String]) -> RowKind {
+pub fn row_kind(m: &Message, policy: &HarnessPolicy) -> RowKind {
     let raw_model = m.model.trim();
     if m.who.as_ref() == "recap" {
         // Structural: the adapter proved a compaction boundary. A propagated
@@ -89,7 +112,7 @@ pub fn row_kind(m: &Message, harness_prefixes: &[String]) -> RowKind {
         RowKind::Synthetic
     } else if is_control_turn(&m.text) {
         RowKind::Control
-    } else if is_harness_turn(&m.project, &m.text, harness_prefixes) {
+    } else if is_harness_turn(&m.project, &m.text, policy) {
         RowKind::Harness
     } else if is_subagent_turn(m) {
         // after harness: a benchmark-project side turn is still benchmark noise

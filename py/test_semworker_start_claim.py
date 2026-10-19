@@ -17,7 +17,8 @@ isolate_data_dir()
 
 
 # Daemon semantics run real here, daemon processes never do (shared seam).
-from _test_support import lift_daemon_semantics, wait_for_next_ctime_tick
+from _test_support import (
+    lift_daemon_semantics, remove_coordination_namespace, wait_for_next_ctime_tick)
 import indexd_runtime  # noqa: E402
 
 setUpModule, tearDownModule = lift_daemon_semantics(indexd_runtime)
@@ -35,11 +36,18 @@ class SemanticWorkerStartClaimTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.saved_data = common.DATA_DIR
         common.DATA_DIR = self.root
+        # In-process coordination stays inside the sandbox; child processes
+        # resolve the real base, so their namespace is removed in tearDown.
+        self.base = mock.patch.object(
+            semworker, "_coordination_base_path", return_value=self.root)
+        self.base.start()
         self.handles: list[ownerfile.Handle] = []
 
     def tearDown(self) -> None:
         for handle in self.handles:
             handle.close()
+        self.base.stop()
+        remove_coordination_namespace(self.root)
         common.DATA_DIR = self.saved_data
         self.temp.cleanup()
 

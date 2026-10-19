@@ -24,15 +24,16 @@ Freshness is generation-based and self-healing:
 from __future__ import annotations
 
 import json
-import importlib.util
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import common
+import dist
 import ownerfile
 import removal_fence
 import surface_policy as surface
@@ -62,6 +63,9 @@ SEMANTIC_PUBLICATION_POLL_MIN_S = 0.01
 SEMANTIC_PUBLICATION_POLL_MAX_S = 0.05
 SEMANTIC_REOPEN_DELAY_S = 0.01
 SEMANTIC_UNSTABLE_SETTLE_DELAYS = (0.005, 0.01, 0.015)
+# A Windows reader whose open overlaps a publisher's replace is denied; the
+# denial outlives the replace by milliseconds, never by seconds.
+SEMANTIC_DENIED_OPEN_PATIENCE_S = 2.0
 # A fast automatic attempt stays cheap. Only a typed transient earns this
 # separate window for publication convergence, serialized owner handoff, a
 # cached-model load, and one retry.
@@ -173,11 +177,7 @@ def runtime_dependencies_available() -> bool:
     that NumPy/ONNX/tokenizers are absent. Import validation remains doctor/model
     work; this hot scheduler check deliberately performs no native imports.
     """
-    try:
-        return all(importlib.util.find_spec(name) is not None
-                   for name in ("numpy", "onnxruntime", "tokenizers"))
-    except (ImportError, AttributeError, ValueError):
-        return False
+    return dist.semantic_runtime_installed()
 
 
 def _runtime_unavailable() -> dict:
@@ -319,7 +319,7 @@ def output_generation() -> dict | None:
         meta_record = json.loads(meta.read_bytes())
     except FileNotFoundError:
         return None
-    except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"embedding metadata is invalid: {exc}") from exc
     if isinstance(meta_record, dict) and meta_record.get("version") == 2:
         state = common.committed_embedding_artifact_state(
@@ -387,6 +387,60 @@ def _active_embedding_profile(recorded_model: str | None = None) -> tuple[int, s
     """
     import embedder
     return int(embedder.PROFILE["dim"]), embedder.store_profile_string(recorded_model)
+
+
+def _recorded_embedding_profile(output: dict) -> tuple[int, str | None]:
+    """(dim, model id) the published vectors were built with.
+
+    A segmented generation carries its validated model record, so the profile
+    comes from the same read as the generation. Only the flat v1 layout re-opens
+    the metadata file.
+    """
+    model = output.get("model")
+    if isinstance(model, dict):
+        return int(model["dim"]), (model.get("id") or None)
+    return common.read_index_meta(common.EMBEDDINGS_PATH.parent / "embeddings.meta")
+
+
+def _denied_open(error: BaseException) -> bool:
+    """Whether a failure is rooted in an open the platform refused."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, PermissionError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+_WINDOWS = os.name == "nt"
+# One streak of consecutive denials: when it began and when it was last seen.
+_DENIED_OPEN: dict[str, float | None] = {"since": None, "last": None}
+
+
+def _denied_open_transient(error: BaseException) -> bool:
+    """Whether a metadata read failure is a Windows sharing denial still young
+    enough to be a publisher's in-flight replace.
+
+    POSIX renames never deny an open, so there every read failure is permanent
+    damage. A streak of denials that outlasts SEMANTIC_DENIED_OPEN_PATIENCE_S
+    is no longer a race either; it is reported as damage. A denial seen after a
+    quiet gap longer than the patience window starts a new streak.
+    """
+    if not _WINDOWS or not _denied_open(error):
+        return False
+    now = time.monotonic()
+    since, last = _DENIED_OPEN["since"], _DENIED_OPEN["last"]
+    if since is None or last is None or now - last >= SEMANTIC_DENIED_OPEN_PATIENCE_S:
+        _DENIED_OPEN.update(since=now, last=now)
+        return True
+    _DENIED_OPEN["last"] = now
+    return now - since < SEMANTIC_DENIED_OPEN_PATIENCE_S
+
+
+def _denied_open_settled() -> None:
+    _DENIED_OPEN.update(since=None, last=None)
 
 
 def _marker_coverage(marker: dict, output: dict) -> dict | None:
@@ -470,10 +524,17 @@ def embedding_coherence() -> dict:
     try:
         output = output_generation()
     except _LegacyEmbeddingBundle as exc:
+        _denied_open_settled()
         return {"coherent": False, "searchable": False,
                 "state": "legacy-embeddings", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
     except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        if _denied_open_transient(exc):
+            return {"coherent": False, "searchable": False,
+                    "state": "unstable-embeddings", "basis": None,
+                    "reason": f"embedding metadata could not be opened: {exc}",
+                    "source_mtime_ns": source_mtime}
+        _denied_open_settled()
         return {"coherent": False, "searchable": False,
                 "state": "corrupt-embeddings", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
@@ -486,11 +547,22 @@ def embedding_coherence() -> dict:
         return {"coherent": False, "searchable": False,
                 "state": "missing-embeddings", "basis": None,
                 "source_mtime_ns": source_mtime}
+    _denied_open_settled()
     try:
-        actual_dim, actual_model = common.read_index_meta(
-            common.EMBEDDINGS_PATH.parent / "embeddings.meta")
+        actual_dim, actual_model = _recorded_embedding_profile(output)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        if _denied_open_transient(exc):
+            return {"coherent": False, "searchable": False,
+                    "state": "unstable-embeddings", "basis": None,
+                    "reason": f"embedding metadata moved during coherence check: {exc}",
+                    "source_mtime_ns": source_mtime}
+        _denied_open_settled()
+        return {"coherent": False, "searchable": False,
+                "state": "profile-unavailable", "basis": None,
+                "reason": str(exc), "source_mtime_ns": source_mtime}
+    try:
         expected_dim, expected_model = _active_embedding_profile(actual_model)
-    except (ImportError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (ImportError, OSError, ValueError, TypeError) as exc:
         return {"coherent": False, "searchable": False,
                 "state": "profile-unavailable", "basis": None,
                 "reason": str(exc), "source_mtime_ns": source_mtime}
@@ -867,19 +939,16 @@ def _stop_background_writer_claim(
 
 
 def stop_background_writers_for_removal(*, wait_s: float = 5.0) -> dict:
-    """Stop exact semantic writers while the removal transaction excludes new ones."""
+    """Stop exact semantic writers while the removal transaction excludes new ones.
+
+    Which build owns the derived stores does not matter here: a claim whose
+    process is gone is nothing to stop, and a live writer is agrep's to end
+    whichever build started it. Only the read-only guard and a removal fence
+    held by another process refuse."""
     if _data_dir_readonly():
         return {
             "ok": False,
             "state": "read-only",
-            "stopped": (),
-            "claims": {},
-        }
-    refusal = _derived_mutation_refusal()
-    if refusal is not None:
-        return {
-            "ok": False,
-            **refusal,
             "stopped": (),
             "claims": {},
         }
@@ -899,10 +968,18 @@ def stop_background_writers_for_removal(*, wait_s: float = 5.0) -> dict:
         claims[label] = outcome
         if outcome.get("stopped") and outcome.get("ok"):
             stopped.append(label)
-    failed = next(
-        (f"{label}: {outcome.get('state')}"
-         for label, outcome in claims.items() if not outcome.get("ok")),
-        None)
+    failed = None
+    for label, outcome in claims.items():
+        if outcome.get("ok"):
+            continue
+        failed = f"{label}: {outcome.get('state')}"
+        pid = _inspect_background_writer_claim(
+            embed_claim_path() if label == "semantic embed" else compaction_claim_path()
+        ).get("pid")
+        if outcome.get("state") == "exact-live" and pid:
+            failed += (f" (pid {pid} did not stop; end that process, then retry "
+                       f"`{common.cli_name()} remove`)")
+        break
     return {
         "ok": failed is None,
         "state": "absent" if failed is None else failed,
@@ -981,6 +1058,58 @@ def query_readiness(
     }
 
 
+def model_fetch_pending_reason(reason: object) -> str:
+    """One short cause for a model the automatic lane will never fetch."""
+    text = str(reason or "")
+    if "metal weights" in text:
+        return "Metal weights not downloaded yet"
+    return "semantic model not downloaded yet"
+
+
+def lane_weights_pending(model_id: str | None = None) -> str | None:
+    """Why the lane this store would open cannot build offline, or None."""
+    try:
+        import embedder
+        embedder.ensure_lane_weights(model_id, download=False)
+    except Exception as exc:  # noqa: BLE001 -- the reason is the answer
+        return str(exc)
+    return None
+
+
+def lane_fallback_path() -> Path:
+    return common.EMBEDDINGS_PATH.parent / ".semantic-lane-fallback.json"
+
+
+def record_lane_fallback(reason: str | None) -> None:
+    """Remember that a fresh store took the CPU lane because the Metal weights
+    were unavailable (``reason``), or clear that memory when a lane opened."""
+    if _data_dir_readonly():
+        return
+    path = lane_fallback_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        if reason is None:
+            path.unlink(missing_ok=True)
+            return
+        tmp.write_text(json.dumps({"reason": str(reason), "at": time.time()}),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def lane_fallback_reason() -> str | None:
+    """Why the store runs on CPU instead of this machine's Metal lane, if so."""
+    try:
+        record = json.loads(lane_fallback_path().read_text(encoding="utf-8"))
+        return str(record["reason"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def _query_unavailable_reason(coherence: dict, refresh: dict | None) -> str:
     readiness = query_readiness(coherence, refresh=refresh)
     generation = readiness["generation_state"]
@@ -996,6 +1125,11 @@ def _query_unavailable_reason(coherence: dict, refresh: dict | None) -> str:
                 f"{lanes['built']} is available, or let the rebuild onto "
                 f"{lanes['active']} finish (refresh {state})")
     detail = f"embeddings {generation} for the current generation; refresh {state}"
+    if state == "model-not-cached":
+        cli = common.cli_name()
+        why = model_fetch_pending_reason((refresh or {}).get("reason"))
+        return (f"{detail} ({why}); `{cli} -s <query>`, `{cli} setup` or "
+                f"`{cli} doctor --fix` downloads it")
     progress = readiness["refresh"]
     if progress["running"]:
         bits = [str(progress["phase"])] if progress["phase"] else []
@@ -1232,6 +1366,25 @@ def clear_superseded_embed_failure(coherence: dict) -> None:
         pass
 
 
+def disk_full_hold(prior: dict) -> str | None:
+    """Why a disk-full failure must not retry yet, or None once room exists.
+
+    The failure is deterministic until the volume changes, and every retry
+    re-embedded the whole pending set before failing the same way."""
+    facts = prior.get("disk_full")
+    if not isinstance(facts, dict):
+        return None
+    try:
+        needed = int(facts["needed"])
+        free = int(shutil.disk_usage(common.DATA_DIR).free)
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if free >= needed:
+        return None
+    return (f"no space left on device ({needed} needed, {free} free) at "
+            f"{common.DATA_DIR}; the build resumes once the volume has room")
+
+
 def bootstrap_backoff_s(prior: dict) -> float:
     """Stepped crash backoff: doubling from BOOTSTRAP_RETRY_BASE_S, capped."""
     try:
@@ -1292,7 +1445,10 @@ def ensure_fresh_async(max_new: int | None = None, *,
     """Spawn one detached embed.py when the lane is stale. Idempotent and cheap:
     embed.py's own claim dedupes concurrent spawns; a recent failure backs off
     stepped (bootstrap_backoff_s) instead of crash-looping - one crash costs
-    seconds, only a persistent failure streak earns the BOOTSTRAP_RETRY_S cap."""
+    seconds, only a persistent failure streak earns the BOOTSTRAP_RETRY_S cap.
+    A bounded pass for a lane nobody can query runs despite battery and CPU
+    load (the child still yields to memory pressure); catch-up of a searchable
+    lane keeps the full governor unless the caller overrides it explicitly."""
     refusal = _mutation_refusal()
     if refusal is not None:
         return refusal
@@ -1329,6 +1485,8 @@ def ensure_fresh_async(max_new: int | None = None, *,
         try:
             import embedder
             embedder.ensure_model(download=False)
+            # Only the ONNX files gate an offline pass: absent Metal weights
+            # mean the pass opens the CPU lane and records the fallback.
         except Exception as exc:  # noqa: BLE001 -- automatic refresh stays offline
             return {
                 "state": "model-not-cached",
@@ -1349,6 +1507,9 @@ def ensure_fresh_async(max_new: int | None = None, *,
         except OSError:
             pass
     if prior.get("state") == "failed":
+        held = disk_full_hold(prior)
+        if held is not None:
+            return {**prior, "reason": held, "coherence": coh}
         backoff_s = bootstrap_backoff_s(prior)
         retry_at = float(prior.get("finished_at") or 0) + backoff_s
         if time.time() < retry_at:
@@ -1363,6 +1524,8 @@ def ensure_fresh_async(max_new: int | None = None, *,
         cmd.append("--full")
     if max_new:
         cmd += ["--max-new", str(max_new)]
+    if max_new and not coh.get("searchable", coh.get("coherent", False)):
+        ignore_battery = ignore_load = True
     logf = common.open_bounded_log("semantic-embed.log")
     child_env = dict(os.environ)
     child_env.pop("AGREP_EMBED_IGNORE_BATTERY", None)
@@ -1754,17 +1917,21 @@ def _legacy_publication_unavailable_payload(coherence: dict, level: str) -> dict
     }
 
 
+def _recorded_store_identity() -> str | None:
+    """The identity the published rows record; None when nothing readable binds."""
+    try:
+        return common.read_index_meta(
+            common.EMBEDDINGS_PATH.parent / "embeddings.meta")[1]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def warm_query_model(*, allow_model_download: bool = False) -> None:
     """Load the lane the STORE was built with (the default would build an ONNX
     session the first query replaces); unreadable meta warms the default lane."""
     import embedder
-    try:
-        recorded = common.read_index_meta(
-            common.EMBEDDINGS_PATH.parent / "embeddings.meta")[1]
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        recorded = None
     embedder.get(download=allow_model_download,
-                 lane=embedder.resolve_lane(recorded))
+                 lane=embedder.resolve_lane(_recorded_store_identity()))
 
 
 def search(query: str, *, level: str = "hybrid", k: int = 10,

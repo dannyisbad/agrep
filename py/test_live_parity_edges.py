@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -171,6 +174,62 @@ class LiveParityEdges(unittest.TestCase):
         }, 100)
         self.assertIn("audit child: found the retry race", rendered)
 
+
+    def test_board_view_toggle_survives_settings_lock_timeout(self):
+        import livetui
+        import settings
+        import termui
+
+        class _Output(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        class _Owner:
+            resumed = False
+
+            def __init__(self, keys) -> None:
+                self.keys = iter(keys)
+
+            def key(self) -> str:
+                return next(self.keys)
+
+        class _Watcher:
+            def wait_boot(self, *_args) -> None:
+                return None
+
+            def snapshot(self) -> dict:
+                return {"sessions": [], "now": 0}
+
+        frames: list[list[str]] = []
+        stored: dict = {}
+        timeout_seen: list[float] = []
+        timeout = settings.SETTINGS_LOCK_TIMEOUT_S
+
+        def set_setting(key, value):
+            timeout_seen.append(settings.SETTINGS_LOCK_TIMEOUT_S)
+            if len(timeout_seen) == 1:
+                raise settings.SettingsError("another board owns settings")
+            stored[key] = value
+
+        # c while another board holds the settings lock, c again once it is free, q
+        with (
+            mock.patch.object(livetui, "_enable_ansi", return_value=True),
+            mock.patch.object(livetui.live, "watcher", return_value=_Watcher()),
+            mock.patch.object(livetui.common, "setting", return_value={}),
+            mock.patch.object(settings, "set_setting", side_effect=set_setting),
+            mock.patch.object(termui, "screen",
+                              return_value=contextlib.nullcontext(_Owner(("c", "c", "q")))),
+            mock.patch.object(termui, "repaint",
+                              side_effect=lambda lines, stdout=None: frames.append(lines)),
+            contextlib.redirect_stdout(_Output()),
+        ):
+            self.assertEqual(livetui.main([]), 0)
+        # the board drew after the locked toggle too, waiting at most 0.15 s each time
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(timeout_seen, [0.15, 0.15])
+        self.assertEqual(settings.SETTINGS_LOCK_TIMEOUT_S, timeout)
+        self.assertEqual(stored, {"board_view": {"agent": "all", "expanded": False}})
+
     def test_board_cell_width_handles_cjk_and_joined_emoji(self):
         from livetui import _cells, _frame, _row
 
@@ -289,6 +348,64 @@ class LiveParityEdges(unittest.TestCase):
         self.assertEqual(_project_of("/repo/mobile"), "repo/mobile")
         self.assertEqual(_project_of("/src/web"), "src/web")
         self.assertEqual(_project_of('/Users/runner/sample-project"'), "sample-project")
+
+    def test_project_root_matches_rust_project_root(self):
+        # the Rust unit test's table (ingest/claude.rs), run with the same home
+        cases = (
+            ("/Users/runner/Desktop/projects/shop", "shop"),
+            ("/Users/runner/Desktop/projects/shop/src/lib", "shop"),
+            ("/Users/runner/repos/api/tests", "api"),
+            ("/Users/runner\\code\\shop", "shop"),
+            ("/work/alpha", "alpha"),
+            ("/Users/runner/Desktop/projects", ""),
+            ("/Users/runner", ""),
+            ("/private/tmp/agrep-mirror", "agrep-mirror"),
+            ("/private/tmp", ""),
+            ("/private/var/folders/zz/abc123/T/proj", "proj"),
+            ("/private/var/folders/zz/abc123/T", ""),
+            ("/Users/runner/code/myapp", "myapp"),
+            ("/work/evil", "evil"),
+            ("//wsl.localhost/Ubuntu/Users/runner/dev/tool", "tool"),
+            ("/Users/runner/Desktop/agrep/py/module.py", "agrep"),
+        )
+        with mock.patch.object(live_mod, "HOME", "/Users/runner"), \
+                mock.patch.object(live_mod, "_USER_SEG", "alice"):
+            for path, expected in cases:
+                with self.subTest(path=path):
+                    self.assertEqual(live_mod._project_root(path), expected)
+
+    def test_project_root_skip_set_is_the_rust_skip_set(self):
+        source = (Path(__file__).resolve().parents[1] / "crates" / "agrep-core" / "src"
+                  / "ingest" / "claude.rs").read_text(encoding="utf-8")
+        start = source.index("fn project_root(")
+        body = source[start:source.index("\n}\n", start)]
+        arms = re.search(r"!matches!\(\s*sl\.as_str\(\),(.*?)\n\s*\)", body, re.S)
+        self.assertIsNotNone(arms)
+        rust_skip = set(re.findall(r'"([a-z]+)"', arms.group(1)))
+        self.assertGreaterEqual(len(rust_skip), 20)
+        self.assertEqual(set(live_mod._ROOT_SKIP), rust_skip)
+        # the container-then-username and macOS temp rules the port mirrors
+        self.assertIn('"users" | "home"', body)
+        self.assertIn('sl == "folders"', body)
+        self.assertIn("after_folders = 3", body)
+
+    def test_live_claude_rows_under_code_containers_carry_the_indexed_project(self):
+        # board/tail once labelled these `code`/`work`, so --project <chats label> missed
+        with mock.patch.object(live_mod, "HOME", "/Users/runner"), \
+                mock.patch.object(live_mod, "_USER_SEG", "alice"):
+            watcher = LiveWatcher()
+            for session, cwd, expected in (
+                    ("s-code", "/Users/runner/code/myapp", "myapp"),
+                    ("s-work", "/work/evil", "evil"),
+                    ("s-projects", "/Users/runner/Desktop/projects/shop/docs", "shop")):
+                line = json.dumps({
+                    "type": "user", "sessionId": session, "cwd": cwd,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"role": "user", "content": f"hello from {session}"},
+                })
+                watcher._claude_line(session, line)
+                event = next(e for e in watcher.ring if e.get("session") == session)
+                self.assertEqual(event.get("project"), expected, cwd)
 
     def test_codex_nested_output_and_replayed_parent(self):
         text, ok = _codex_call_output(

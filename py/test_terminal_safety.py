@@ -33,6 +33,10 @@ import search  # noqa: E402
 PAYLOAD = "before\x1b]52;c;Y2xpcGJvYXJk\x07after\r\u2028\u202eforge\ud800"
 
 
+# the only format controls ordinary text renders through: ZWNJ and ZWJ
+SAFE_JOINERS = frozenset("\u200c\u200d")
+
+
 def _terminal_safe_reference(value: object, *, multiline: bool = False) -> str:
     text = "" if value is None else str(value)
     out: list[str] = []
@@ -45,12 +49,12 @@ def _terminal_safe_reference(value: object, *, multiline: bool = False) -> str:
             continue
         code = ord(char)
         if (code < 0x20 or 0x7F <= code <= 0x9F
-                or unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"}):
-            out.append(f"\\u{code:04x}")
+                or (unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+                    and char not in SAFE_JOINERS)):
+            out.append(f"\\U{code:08x}" if code > 0xFFFF else f"\\u{code:04x}")
         else:
             out.append(char)
     return "".join(out)
-
 
 class TerminalSafetyTests(unittest.TestCase):
     def test_windows_shell_hint_refuses_cross_shell_metacharacters(self):
@@ -105,7 +109,7 @@ class TerminalSafetyTests(unittest.TestCase):
     def test_translate_path_matches_slow_reference(self):
         alphabet = (
             "".join(chr(code) for code in range(0xA0))
-            + "éİ\u0301\u00ad\u2028\u2029\u202e\ud800😀\U0010ffff"
+            + "éİ\u0301\u00ad\u2028\u2029\u202e\u200c\u200d\u200b\ufe0f\ud800😀\U0010ffff"
         )
         values = [
             "",
@@ -128,6 +132,36 @@ class TerminalSafetyTests(unittest.TestCase):
                         common.terminal_safe(value, multiline=multiline),
                         _terminal_safe_reference(value, multiline=multiline),
                     )
+
+    def test_joiners_render_while_spoofing_controls_stay_escaped(self):
+        # ZWNJ inside a Persian word, ZWJ in emoji sequences, variation selectors and
+        # skin tones are what text needs; every other Cf/Cs/Zl/Zp spelling is quoted
+        for text in ("می\u200cخواهم", "\U0001F468\u200d\U0001F469\u200d\U0001F467",
+                     "\U0001F469\u200d\U0001F4BB dev", "\u2764\ufe0f", "\u0915\u094d\u200d\u0937",
+                     "\U0001F44B\U0001F3FD", "#\ufe0f\u20e3", "a\U000E0100b"):
+            with self.subTest(text=text):
+                self.assertEqual(common.terminal_safe(text), text)
+                self.assertEqual(common.terminal_safe(text, multiline=True), text)
+        dangerous = (
+            0x202A, 0x202B, 0x202C, 0x202D, 0x202E,  # bidi embeddings and overrides
+            0x2066, 0x2067, 0x2068, 0x2069,          # bidi isolates
+            0x200E, 0x200F, 0x061C,                  # directional marks
+            0x200B, 0x2060, 0xFEFF, 0x00AD, 0x180E,  # invisible spacers and separators
+            0x2061, 0x2062, 0x2063, 0x2064,          # invisible operators
+            0xE0001, 0xE0020, 0xE0041, 0xE007F,      # tags (ASCII smuggling)
+            0xFFF9, 0xFFFA, 0xFFFB,                  # interlinear annotation
+            0x2028, 0x2029, 0xD800, 0xDFFF, 0x1B, 0x9B,
+        )
+        for code in dangerous:
+            char = chr(code)
+            with self.subTest(code=f"U+{code:04X}"):
+                expected = f"\\U{code:08x}" if code > 0xFFFF else f"\\u{code:04x}"
+                self.assertEqual(common.terminal_safe(f"a{char}b"), f"a{expected}b")
+        # no other Cf character slips through: the allowance is exactly the two joiners
+        passing = {code for code in range(0x110000)
+                   if unicodedata.category(chr(code)) == "Cf"
+                   and common.terminal_safe(chr(code)) == chr(code)}
+        self.assertEqual(passing, {0x200C, 0x200D})
 
     def test_shared_sanitizer_quotes_terminal_controls(self):
         rendered = common.terminal_safe(PAYLOAD)
@@ -253,6 +287,7 @@ class TerminalSafetyTests(unittest.TestCase):
         # pinned here is escape quoting, so the budget is taken out of play.
         with mock.patch.object(audit, "_book", return_value=book), \
                 mock.patch.object(audit, "_ROUTINE_BUDGET_S", 3600.0), \
+                mock.patch.object(audit, "_live_tokens", return_value={}), \
                 mock.patch.object(audit, "_discovered", return_value=[("codex", danger)]):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):

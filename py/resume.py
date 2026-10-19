@@ -1,7 +1,8 @@
 """`agrep resume [reference]` - reopen a session in its own agent, cd'd to where it ran.
 Paste a session id or result handle, name a project, or quote part of the chat's first
 line. With no reference, pick from the most recent sessions; ambiguous human references
-restrict that picker to matching chats.
+restrict that picker to matching chats. A side chat (spawned subagent) is not a
+resumable transcript: its handle resumes the root chat that spawned it.
 
 The agent takes over the current terminal (no new window); when it exits you're back at
 your shell. Session-id matching is shared through common.py and handle parsing through
@@ -50,8 +51,43 @@ def _session_identity(value: str) -> str:
     return text
 
 
+def _is_side(row: dict) -> bool:
+    return common.is_side_session(row)
+
+
+def _resumes_through_parent(row: dict) -> bool:
+    """Whether an agent's resume command can open the side chat itself. Claude keeps
+    subagent transcripts under <slug>/subagents/, outside what `claude --resume` scopes;
+    pi/omp nest a side chat as <slug>/<stamp>_<parent>/<name>.jsonl, a file whose name
+    carries no id for `-r`; codex side threads are rollouts with their own thread ids."""
+    return row.get("agent") in ("claude", "pi") and _is_side(row)
+
+
+def _root_session(row: dict, by_session: dict[str, dict]) -> tuple[dict | None, str]:
+    """The root chat a side chat belongs to, or (None, reason): the chain leaves the
+    index (one live lookup per missing link) or loops."""
+    current, walked = row, set()
+    while _resumes_through_parent(current):
+        session = str(current.get("session") or "")
+        parent = str(current.get("parent") or "")
+        if not parent:
+            return None, f"its parent is unknown"
+        if parent in walked or parent == session:
+            return None, f"its parent chain loops back to {parent}"
+        walked.add(session)
+        found = by_session.get(parent)
+        if found is None:
+            live, complete = _live_match(parent)
+            found = live[0] if len(live) == 1 and complete else None
+        if found is None:
+            return None, f"its parent {parent} isn't indexed"
+        current = found
+    return current, ""
+
+
 def _resolve_reference(rows: list[dict], q: str) -> tuple[list[dict], bool]:
-    """Return matching sessions and whether a human reference permits a picker."""
+    """Return matching sessions and whether a human reference permits a picker.
+    Ids and handles match any session; human references pick among root chats only."""
     raw = compact.normalize_session_arg(q)
     if not raw:
         return [], False
@@ -68,10 +104,11 @@ def _resolve_reference(rows: list[dict], q: str) -> tuple[list[dict], bool]:
         if matches:
             return matches, False
     query = q.strip()
-    matches = [r for r in rows if surface.project_label_matches(r.get("project"), query)]
+    roots = [r for r in rows if not _is_side(r)]
+    matches = [r for r in roots if surface.project_label_matches(r.get("project"), query)]
     if not matches:
         needle = query.casefold()
-        matches = [r for r in rows if needle in (r.get("first_text") or "").casefold()]
+        matches = [r for r in roots if needle in (r.get("first_text") or "").casefold()]
     return sorted(matches, key=lambda r: r.get("last_ts", 0), reverse=True), True
 
 
@@ -95,7 +132,7 @@ def _label(r: dict, color: bool, session_index=None) -> str:
     return f"{who}  {sess}  {txt}"
 
 
-def _pick(rows: list[dict], n: int, color: bool, session_index=None) -> dict | None:
+def _pick(rows: list[dict], n: int | None, color: bool, session_index=None) -> dict | None:
     """Numbered list of recent sessions + a prompt. Clickless, robust, no fullscreen."""
     if not sys.stdin.isatty():
         common.log("no session id given (and stdin isn't a terminal to pick from). "
@@ -144,15 +181,18 @@ def main(argv: list[str] | None = None) -> int:
                "  agrep resume solo-finder        match a project; pick if several\n"
                "  agrep resume                    pick from recent sessions\n"
                "  agrep resume --list             list recent resumable sessions\n"
+               "  agrep resume --list -n 0        list every resumable session\n"
                "\nexit: 0 listed, picker closed, or the resumed agent exited 0; "
                "1 no unique match or launch failed; 2 unavailable data or invalid "
-               "arguments. Other resumed-agent exit codes are passed through.",
+               "arguments; 127 the agent's CLI isn't on PATH. Other resumed-agent "
+               "exit codes are passed through.",
         allow_abbrev=False)
     ap.add_argument("id", nargs="?", metavar="REFERENCE",
                     help="session id/prefix (with optional @, uuid or ses_…), search-hit "
                          "handle, project label, or first-line substring; omit to pick")
     ap.add_argument("-n", "--max", type=int, default=15, metavar="N",
-                    help="how many recent/matching sessions to show in the picker or list (default 15)")
+                    help="how many recent/matching sessions to show in the picker or list "
+                         "(default 15; 0 = all)")
     ap.add_argument("-l", "--list", action="store_true",
                     help="just list recent sessions; don't resume")
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
@@ -173,16 +213,19 @@ def main(argv: list[str] | None = None) -> int:
             common.log(str(exc))
             return 2
     color = common.color_enabled(sys.stderr, args.color)
+    limit = args.max or None
 
     rows = _sessions()
-    session_index = compact.session_prefix_index(
-        r.get("session") for r in rows if r.get("session"))
+    by_session = {r["session"]: r for r in rows if r.get("session")}
+    # side chats resume through their parent, so listings and pickers offer roots only
+    roots = [r for r in rows if not _is_side(r)]
+    session_index = compact.session_prefix_index(by_session.keys())
 
     if args.list:
-        if not rows:
+        if not roots:
             common.log(f"no index yet - {common.setup_hint()}")
             return 2
-        for r in rows[: args.max]:
+        for r in roots[:limit]:
             print(_label(r, color, session_index))
         return 0
 
@@ -205,14 +248,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 common.log(f"no session matches '{common.terminal_safe(args.id)}' "
                            "- recent ones:")
-                for r in rows[: args.max]:
+                for r in roots[:limit]:
                     print(_label(r, color, session_index))
                 return 1
         elif len(m) > 1:
             common.log(f"'{common.terminal_safe(args.id)}' is ambiguous - "
                        f"{len(m)} sessions match:")
             if human_reference and sys.stdin.isatty():
-                chosen = _pick(m, args.max, color, session_index)
+                chosen = _pick(m, limit, color, session_index)
                 if not chosen:
                     return 0
             else:
@@ -222,12 +265,26 @@ def main(argv: list[str] | None = None) -> int:
         else:
             chosen = m[0]
     else:
-        if not rows:
+        if not roots:
             common.log(f"no index yet - {common.setup_hint()}")
             return 2
-        chosen = _pick(rows, args.max, color, session_index)
+        chosen = _pick(roots, limit, color, session_index)
         if not chosen:
             return 0
+
+    if _resumes_through_parent(chosen):
+        named = common.terminal_safe(args.id or chosen.get("session", ""))
+        root, reason = _root_session(chosen, by_session)
+        if root is None:
+            agent = common.terminal_safe(chosen.get("agent") or "this agent")
+            common.log(f"'{named}' is a {agent} side chat and {common.terminal_safe(reason)} "
+                       f"- {agent} side chats resume through the chat that spawned them.")
+            return 1
+        target = common.terminal_safe(compact.encode_session_target(
+            root.get("session"), session_index=session_index))
+        common.log(f"'{named}' is a side chat spawned by {target} - resuming that "
+                   "parent chat.")
+        chosen = root
 
     return native.resume_in_place(chosen.get("agent", ""), chosen.get("session", ""))
 

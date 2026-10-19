@@ -14,7 +14,9 @@ structurally.
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -596,6 +598,417 @@ class LaneChangeRebuild(unittest.TestCase):
         self.assertIsNone(embed._inherited_lane_change())
         self._record({"state": "partial"})
         self.assertIsNone(embed._inherited_lane_change())
+
+
+class WeightsCache(unittest.TestCase):
+    """The Metal checkpoint obeys the ONNX lane's cache and consent rules.
+
+    Two things went wrong at once: the 91 MB fetch ignored the caller's
+    download permission, so offline probes and background passes pulled it,
+    and it landed inside the data dir instead of the shared model cache that
+    AGREP_MODEL_DIR and every isolated index are documented to share.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.payloads = {"model.safetensors": b"weights" * 7,
+                         "config.json": b'{"pooling":"cls"}'}
+        pinned = {name: (len(raw), hashlib.sha256(raw).hexdigest())
+                  for name, raw in self.payloads.items()}
+        for patch in (
+                mock.patch.object(mlx_embed, "FILES", pinned),
+                mock.patch.dict("os.environ",
+                                {"AGREP_MODEL_DIR": str(root / "shared")}),
+                mock.patch.object(embedder.common, "DATA_DIR", root / "data"),
+                mock.patch.object(embedder, "MODEL_DOWNLOAD_WAIT_S", 0.5)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.shared = root / "shared" / mlx_embed.SUBDIR
+        self.legacy = root / "data" / "models" / mlx_embed.SUBDIR
+
+    def _lane_opener(self, download: bool):
+        e = embedder.Embedder.__new__(embedder.Embedder)
+        e.profile = dict(embedder.PROFILE)
+        e._metal = None
+        e.lane = embedder.LANE_CPU
+        e.metal_refusal = None
+        return e
+
+    def test_offline_lane_start_never_fetches_the_checkpoint(self) -> None:
+        # Embedder(download=False) is what doctor --deep, setup --no-semantic
+        # and the daemon's --no-model-download pass construct.
+        e = self._lane_opener(download=False)
+        with mock.patch.object(mlx_embed, "available", return_value=(True, "ok")), \
+                mock.patch.object(embedder, "_cached_parity", return_value=None), \
+                mock.patch.object(
+                    mlx_embed, "MLXEmbedder",
+                    side_effect=lambda **kw: mlx_embed.ensure_weights(
+                        download=kw.get("download", True))), \
+                mock.patch.object(embedder, "_fetch_pinned") as fetch:
+            e._start_metal_lane(download=False)
+        fetch.assert_not_called()
+        self.assertEqual(e.lane, embedder.LANE_CPU)
+        self.assertIn("metal weights missing under", e.metal_refusal)
+        self.assertIn(str(self.shared), e.metal_refusal)
+        self.assertFalse(self.shared.exists())
+
+    def test_default_weights_dir_is_the_shared_model_root(self) -> None:
+        self.assertEqual(mlx_embed.weights_dir(), self.shared)
+        self.assertEqual(mlx_embed.weights_dir().parent,
+                         embedder.model_dir().parent)
+
+    def test_a_legacy_checkpoint_is_adopted_without_a_fetch(self) -> None:
+        self.legacy.mkdir(parents=True)
+        for name, raw in self.payloads.items():
+            (self.legacy / name).write_bytes(raw)
+        (self.legacy / "model.safetensors.part").write_bytes(b"interrupted")
+        with mock.patch.object(embedder, "_fetch_pinned") as fetch:
+            self.assertEqual(
+                mlx_embed.ensure_weights(download=False), self.shared)
+        fetch.assert_not_called()
+        for name, raw in self.payloads.items():
+            self.assertEqual((self.shared / name).read_bytes(), raw)
+        self.assertFalse(self.legacy.exists())
+        self.assertEqual(list(self.shared.glob(".*")), [])
+
+    def test_a_corrupt_legacy_file_is_left_for_the_downloader(self) -> None:
+        self.legacy.mkdir(parents=True)
+        (self.legacy / "model.safetensors").write_bytes(b"x" * 49)
+        (self.legacy / "config.json").write_bytes(self.payloads["config.json"])
+        with self.assertRaisesRegex(mlx_embed.MLXUnavailable,
+                                    "missing under .*: model.safetensors$"):
+            mlx_embed.ensure_weights(download=False)
+        self.assertEqual((self.shared / "config.json").read_bytes(),
+                         self.payloads["config.json"])
+        self.assertTrue((self.legacy / "model.safetensors").exists())
+
+    def test_fetch_uses_the_onnx_lanes_partials_and_claim(self) -> None:
+        self.shared.mkdir(parents=True)
+        stale = self.shared / ".model.safetensors.1.deadbeef.part"
+        stale.write_bytes(b"left by a killed fetch")
+        seen: list[tuple[str, Path, bool]] = []
+
+        def fetch(url: str, part: Path, size: int) -> None:
+            name = url.rsplit("/", 1)[1]
+            seen.append((name, part, (self.shared / ".download.lock").exists()))
+            part.write_bytes(self.payloads[name])
+
+        with mock.patch.object(embedder, "_fetch_pinned", side_effect=fetch), \
+                mock.patch.object(
+                    embedder.common, "process_start_identity",
+                    return_value="birth"):
+            self.assertEqual(mlx_embed.ensure_weights(), self.shared)
+        self.assertEqual({name for name, _, _ in seen}, set(self.payloads))
+        for name, part, claimed in seen:
+            self.assertTrue(claimed, "fetch ran outside the download claim")
+            self.assertRegex(part.name, rf"^\.{name}\.{os.getpid()}\.[0-9a-f]{{16}}\.part$")
+        self.assertFalse(stale.exists())
+        self.assertFalse((self.shared / ".download.lock").exists())
+        self.assertEqual(list(self.shared.glob(".*")), [])
+        for name, raw in self.payloads.items():
+            self.assertEqual((self.shared / name).read_bytes(), raw)
+
+    def test_a_rejected_body_is_discarded_and_named(self) -> None:
+        def fetch(url: str, part: Path, size: int) -> None:
+            part.write_bytes(b"?" * size)
+
+        with mock.patch.object(embedder, "_fetch_pinned", side_effect=fetch), \
+                mock.patch.object(
+                    embedder.common, "process_start_identity",
+                    return_value="birth"), \
+                self.assertRaisesRegex(
+                    mlx_embed.MLXUnavailable,
+                    "could not fetch model.safetensors: .*sha verification"):
+            mlx_embed.ensure_weights()
+        self.assertEqual(sorted(p.name for p in self.shared.iterdir()), [])
+
+    def test_the_offline_precheck_covers_the_lane_a_fresh_store_would_open(
+            self) -> None:
+        with mock.patch.object(mlx_embed, "available", return_value=(True, "ok")), \
+                mock.patch.object(embedder, "_cached_parity", return_value=None), \
+                mock.patch.object(embedder, "_fetch_pinned") as fetch, \
+                self.assertRaisesRegex(embedder.EmbedderUnavailable,
+                                       "metal weights missing under"):
+            embedder.ensure_lane_weights(None, download=False)
+        fetch.assert_not_called()
+        # A store already on the CPU lane needs nothing beyond the ONNX files.
+        with mock.patch.object(mlx_embed, "ensure_weights",
+                               side_effect=AssertionError("asked for weights")):
+            embedder.ensure_lane_weights(embedder.PROFILE_STRING, download=False)
+        # A declined lane (AGREP_MLX=off, pinned provider, low parity) too.
+        with mock.patch.object(mlx_embed, "available",
+                               return_value=(False, "disabled by AGREP_MLX=off")), \
+                mock.patch.object(mlx_embed, "ensure_weights",
+                                  side_effect=AssertionError("asked for weights")):
+            embedder.ensure_lane_weights(None, download=False)
+
+    def test_adoption_keeps_the_legacy_copy_until_the_published_one_verifies(
+            self) -> None:
+        self.legacy.mkdir(parents=True)
+        for name, raw in self.payloads.items():
+            (self.legacy / name).write_bytes(raw)
+        real_replace = os.replace
+
+        def failing_replace(source, destination):
+            if str(destination).endswith("model.safetensors"):
+                raise OSError("replace failed")
+            return real_replace(source, destination)
+
+        with mock.patch.object(mlx_embed.os, "replace", side_effect=failing_replace):
+            mlx_embed._adopt_legacy_weights(self.shared)
+        self.assertEqual((self.legacy / "model.safetensors").read_bytes(),
+                         self.payloads["model.safetensors"])
+        self.assertFalse((self.shared / "model.safetensors").exists())
+        self.assertEqual(list(self.shared.glob(".*")), [])
+        # A stranded .adopt from a dead adopter is swept under the claim.
+        stranded = self.shared / ".model.safetensors.999999999.cafe.adopt"
+        stranded.write_bytes(b"half")
+        with mock.patch.object(
+                embedder, "_fetch_pinned",
+                side_effect=lambda url, part, _s: part.write_bytes(
+                    self.payloads[url.rsplit("/", 1)[1]])), \
+                mock.patch.object(embedder.common, "process_start_identity",
+                                  return_value="birth"):
+            mlx_embed.ensure_weights()
+        self.assertFalse(stranded.exists())
+
+    def test_adoption_never_mutates_a_read_only_data_dir(self) -> None:
+        self.legacy.mkdir(parents=True)
+        for name, raw in self.payloads.items():
+            (self.legacy / name).write_bytes(raw)
+        with mock.patch.dict("os.environ",
+                             {"AGREP_DATA_READONLY": str(self.legacy.parent.parent)}):
+            with self.assertRaises(mlx_embed.MLXUnavailable):
+                mlx_embed.ensure_weights(download=False)
+        self.assertTrue(all((self.legacy / n).exists() for n in self.payloads))
+        self.assertFalse(self.shared.exists())
+
+    def test_adoption_follows_the_derived_writer_verdict_without_importing_up(
+            self) -> None:
+        # mlx_embed sits below indexd_runtime, the fence's owner, which
+        # installs its verdict in common; no verdict or a refusing one means
+        # the legacy copy is neither moved nor deleted.
+        import indexd_runtime
+        self.legacy.mkdir(parents=True)
+        for name, raw in self.payloads.items():
+            (self.legacy / name).write_bytes(raw)
+        self.assertIsNotNone(embedder.common.derived_writes_permitted)
+        for verdict in (None, lambda: False, lambda: 1 / 0):
+            with mock.patch.object(
+                    embedder.common, "derived_writes_permitted", verdict):
+                mlx_embed._adopt_legacy_weights(self.shared)
+            self.assertTrue(all((self.legacy / n).exists() for n in self.payloads))
+            self.assertFalse(self.shared.exists())
+        refusal = indexd_runtime.DerivedMutationInfo(
+            "foreign", "other-build", "corpus.db owned-by other-build")
+        with mock.patch.object(indexd_runtime, "derived_writer_mutation_info",
+                               return_value=refusal):
+            mlx_embed._adopt_legacy_weights(self.shared)
+        self.assertFalse(self.shared.exists())
+        with mock.patch.object(
+                indexd_runtime, "derived_writer_mutation_info",
+                return_value=indexd_runtime.DerivedMutationInfo(
+                    "current", "this-build", "")):
+            mlx_embed._adopt_legacy_weights(self.shared)
+        for name, raw in self.payloads.items():
+            self.assertEqual((self.shared / name).read_bytes(), raw)
+        self.assertFalse(self.legacy.exists())
+
+    def test_unobtainable_weights_fall_back_to_cpu_and_record_why(self) -> None:
+        # A slower lane beats no meaning search: an air-gapped box with only
+        # the ONNX files builds on CPU now and is told how to move to Metal.
+        import doctor
+        import embed
+        import semantic
+        e = self._lane_opener(download=True)
+        with mock.patch.object(mlx_embed, "available", return_value=(True, "ok")), \
+                mock.patch.object(embedder, "_cached_parity", return_value=None), \
+                mock.patch.object(
+                    mlx_embed, "ensure_weights",
+                    side_effect=mlx_embed.MLXUnavailable(
+                        "could not fetch model.safetensors: timed out")), \
+                mock.patch.object(mlx_embed, "MLXEmbedder") as opened:
+            e._start_metal_lane(download=True)
+        opened.assert_not_called()
+        self.assertEqual(e.lane, embedder.LANE_CPU)
+        self.assertIn("could not fetch", e.metal_weights_refusal)
+        e.embed_texts = lambda texts: np.zeros((len(texts), 2), np.float32)
+        root = Path(self.tmp.name) / "data"
+        root.mkdir(exist_ok=True)
+        with mock.patch.object(embed, "_lane_predicted", return_value=True), \
+                mock.patch.object(embed.embedder, "get", return_value=e), \
+                mock.patch.object(embed, "_active_lane",
+                                  side_effect=[embedder.LANE_METAL,
+                                               embedder.LANE_CPU]), \
+                mock.patch.object(embed, "_adopt_opened_lane") as adopt, \
+                mock.patch.object(embed, "_active_model_id",
+                                  return_value=e.profile_string), \
+                mock.patch.object(embed, "_publish_state"), \
+                mock.patch.object(embed, "_embed_input", return_value="t"), \
+                mock.patch.object(embed, "_embed_pending_chunks",
+                                  return_value=([np.zeros((1, 2))], 1, False)), \
+                mock.patch.object(semantic.common, "EMBEDDINGS_PATH",
+                                  root / "embeddings.f32"), \
+                mock.patch.object(semantic, "_data_dir_readonly",
+                                  return_value=False), \
+                mock.patch.object(doctor.common, "EMBEDDINGS_PATH",
+                                  root / "embeddings.f32"):
+            embed._materialize_pending_vectors(
+                [mock.Mock(id="m")], ["h"], set(), append_segmented=True,
+                manifest=None, dim=2, source=None,
+                args=mock.Mock(no_model_download=False, background=False,
+                               bootstrap_pass=False), state={})
+            adopt.assert_called_once_with(embedder.LANE_CPU)
+            self.assertIn("could not fetch", semantic.lane_fallback_reason())
+            with mock.patch.object(doctor, "_store_embedding_identity",
+                                   return_value=embedder.PROFILE_STRING), \
+                    mock.patch.object(doctor, "_metal_capability",
+                                      return_value=(True, "available")):
+                severity, row = doctor._store_lane_notice({})
+                with mock.patch.dict("os.environ", {"AGREP_MLX": "off"}):
+                    silenced = doctor._store_lane_notice({})
+            # The record moved to a box where Metal cannot open (mlx gone,
+            # Intel, Linux): no remedy that names Metal applies there.
+            with mock.patch.object(doctor, "_store_embedding_identity",
+                                   return_value=embedder.PROFILE_STRING), \
+                    mock.patch.object(doctor, "_metal_capability",
+                                      return_value=(False, "mlx missing")):
+                elsewhere = doctor._store_lane_notice({})
+            # A failed publish leaves no per-pid temp file behind.
+            with mock.patch.object(semantic.os, "replace",
+                                   side_effect=OSError("replace failed")):
+                semantic.record_lane_fallback("again")
+            self.assertEqual(
+                [p.name for p in root.glob(".semantic-lane-fallback.json.*")], [])
+            # A later pass that opens Metal clears the record.
+            semantic.record_lane_fallback(None)
+            self.assertIsNone(semantic.lane_fallback_reason())
+        self.assertEqual(severity, doctor.OPT)
+        self.assertIn("runs on the CPU lane because the Metal weights", row)
+        self.assertIn("doctor --fix", row)
+        self.assertIn("reindex --full", row)
+        self.assertIn("AGREP_MLX=off", row)
+        self.assertNotIn("Metal weights weren't available", silenced[1])
+        self.assertNotIn("Metal weights weren't available", elsewhere[1])
+
+    def test_a_cpu_store_full_rebuild_proceeds_without_metal_weights(self) -> None:
+        # An integrity or forced full rebuild must keep a working lane: the
+        # offline precheck gates on the ONNX files only, never on Metal's.
+        import semantic
+        with mock.patch.object(
+                semantic, "_background_refresh_disabled", return_value=None), \
+                mock.patch.object(semantic, "runtime_dependencies_available",
+                                  return_value=True), \
+                mock.patch.object(semantic, "embedding_coherence", return_value={
+                    "coherent": False, "searchable": False,
+                    "state": "missing-embeddings"}), \
+                mock.patch.object(semantic, "embed_running", return_value=False), \
+                mock.patch.object(semantic, "read_embed_state", return_value={}), \
+                mock.patch.object(embedder, "ensure_model", return_value=Path("m")), \
+                mock.patch.object(
+                    embedder, "ensure_lane_weights",
+                    side_effect=embedder.EmbedderUnavailable(
+                        "metal weights missing under cache: model.safetensors")), \
+                mock.patch.object(semantic.common, "open_bounded_log",
+                                  return_value=mock.Mock()), \
+                mock.patch.object(semantic.subprocess, "Popen") as spawn:
+            result = semantic.ensure_fresh_async(max_new=128, force_full=True)
+        self.assertEqual(result["state"], "running")
+        self.assertIn("--no-model-download", spawn.call_args.args[0])
+
+    def test_pending_metal_weights_are_named_on_every_surface(self) -> None:
+        import semantic
+        import doctor
+        refresh = {"state": "model-not-cached",
+                   "reason": "metal weights missing under x: model.safetensors"}
+        line = semantic._query_unavailable_reason(
+            {"state": "missing-embeddings"}, refresh)
+        self.assertIn("Metal weights not downloaded yet", line)
+        self.assertIn("doctor --fix", line)
+        self.assertNotIn("inspect and repair", line)
+        with mock.patch.object(doctor, "_metal_weights_absent_cheaply",
+                               return_value=True):
+            row = doctor._routine_lane_row(
+                {"resources": {"semantic_model_cache": {
+                    "complete": True, "files": 3, "path": "/m"}}},
+                {"runtime_state": "not-inspected"}, embeddings_off=False)
+        self.assertIn("build on the CPU lane until the Metal weights", row[1])
+        self.assertIn("doctor --fix", row[1])
+        self.assertIn("AGREP_MLX=off", row[1])
+        # The cheap gate follows the lane's own decline rules.
+        with mock.patch.object(doctor, "_store_embedding_identity",
+                               return_value=None), \
+                mock.patch.object(embedder, "_metal_lane_declined",
+                                  return_value="disabled by AGREP_MLX=off"):
+            self.assertFalse(doctor._metal_weights_absent_cheaply(Path("/m")))
+        with mock.patch.object(doctor, "_store_embedding_identity",
+                               return_value=None), \
+                mock.patch.object(embedder, "_metal_lane_declined",
+                                  return_value=None):
+            self.assertTrue(doctor._metal_weights_absent_cheaply(
+                Path(self.tmp.name) / "nowhere"))
+            self.legacy.mkdir(parents=True)
+            (self.legacy / "model.safetensors").write_bytes(b"x")
+            self.assertFalse(doctor._metal_weights_absent_cheaply(
+                Path(self.tmp.name) / "nowhere"))
+
+
+class DoctorRows(unittest.TestCase):
+    """Doctor must say the true thing about the model and the lane."""
+
+    def test_metal_lane_constant_tracks_the_embedder(self) -> None:
+        import doctor
+        self.assertEqual(doctor._METAL_LANE, embedder.LANE_METAL)
+
+    def test_deep_lane_row_reports_the_probe_instead_of_asking_for_it(self) -> None:
+        import doctor
+        with mock.patch.object(doctor, "_store_embedding_identity",
+                               return_value=embedder.PROFILE_STRING), \
+                mock.patch.object(doctor, "_metal_capability",
+                                  return_value=(True, "available")):
+            routine = doctor._store_lane_notice({})
+            declined = doctor._store_lane_notice({
+                "runtime_lane": embedder.LANE_CPU,
+                "runtime_lane_refusal": "it did not load: MLXUnavailable: x"})
+            opens = doctor._store_lane_notice({
+                "runtime_lane": embedder.LANE_METAL})
+        self.assertIn("--deep", routine[1])
+        self.assertNotIn("--deep", declined[1])
+        self.assertIn("did not open here (it did not load", declined[1])
+        self.assertNotIn("--deep", opens[1])
+        self.assertIn("reindex --full", opens[1])
+
+    def test_cached_failed_checksum_is_not_reported_as_verified(self) -> None:
+        import doctor
+        record = {"identity": {"profile": "p", "files": {}}, "verified": False,
+                  "checked_at": 1.0}
+        with mock.patch.object(doctor, "_model_identity",
+                               return_value=record["identity"]), \
+                mock.patch.object(doctor, "_cached_model_check",
+                                  return_value=record):
+            ok, integrity = doctor._model_cache_probe(embedder, deep=True)
+        self.assertFalse(ok)
+        self.assertEqual(integrity["state"], "failed")
+        self.assertTrue(integrity["present"])
+        self.assertIn("verification failed", integrity["detail"])
+        self.assertNotIn("SHA256 verified", integrity["detail"])
+
+    def test_failed_model_fetch_claims_no_automatic_retry(self) -> None:
+        import doctor
+        import surface_policy as surface
+        smart = {"embed_job": "failed", "live": False,
+                 "embed_fail_reason": "EmbedderUnavailable: could not fetch "
+                                      "model_quantized.onnx: <urlopen error>"}
+        detail = doctor._semantic_failure_detail(
+            smart, embeddings_off=False, lane=surface.SEMANTIC_LANE_POLICY)
+        self.assertNotIn("retries automatically", detail)
+        self.assertIn("never fetches the model", detail)
+        self.assertIn("agrep -s", detail)
+        crash = dict(smart, embed_fail_reason="RuntimeError: boom")
+        self.assertIn("retries automatically", doctor._semantic_failure_detail(
+            crash, embeddings_off=False, lane=surface.SEMANTIC_LANE_POLICY))
 
 
 class RopeWiring(unittest.TestCase):

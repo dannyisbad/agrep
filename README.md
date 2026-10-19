@@ -48,9 +48,12 @@ with its reason, and waits for your answer:
   unless something puts it there; this block is what tells your agents agrep
   exists. It is plain instructions text the agent reads like any other.
 - **Compaction-only integrations**: Claude's `PreCompact` shapes its summary;
-  Codex's compact-only `SessionStart` supplies recovery context; and one shared
-  pi/oh-my-pi extension shapes their summary, identifies the exact live session,
-  and queues recovery only on a compacted resume or retry. None fires on an
+  Codex's compact-only `SessionStart` supplies recovery context (its hook is
+  `/bin/sh ~/.codex/hooks/agrep/run`, a launcher that works from any login
+  shell and runs a stdlib-only payload copied beside it, so it keeps working
+  across package upgrades and cache prunes); and one shared pi/oh-my-pi
+  extension shapes their summary, identifies the exact live session, and
+  queues recovery only on a compacted resume or retry. None fires on an
   ordinary user message. Existing hooks and extensions are never overwritten,
   and no registration is auto-repaired.
 - **A cleanup sentinel** (launchd on macOS, a systemd user timer on Linux, a
@@ -66,10 +69,17 @@ with its reason, and waits for your answer:
   separate archive prompt, which defaults to no.
 
 `--yes` accepts all of it without prompting. `--no-teach` skips the instruction
-blocks and the sentinel, `--no-hook` skips every compaction integration, and
-`--no-semantic` skips the model download for that run. `agrep remove` takes the
-blocks, integrations, and sentinel back out; the index and your histories are
-left alone.
+blocks, `--no-hook` skips every compaction integration, and `--no-semantic`
+skips the model download for that run. The cleanup sentinel is armed whenever
+either the blocks or an integration is installed, so only `--no-teach --no-hook`
+together leave the box without it. `agrep remove` takes the blocks,
+integrations, and sentinel back out; the index, the archive copies under
+its data directory (`agrep archive --purge` deletes those), and your histories
+are left alone. Nothing deletes the index for you: it is the searchable copy of your
+agent conversations and lives in agrep's data directory (`agrep doctor` prints
+the path; by default `~/Library/Application Support/agrep` on macOS,
+`~/.local/share/agrep` on Linux, `%LOCALAPPDATA%\agrep` on Windows). Delete
+that directory yourself when you want the copy gone.
 
 ```
 uv tool install agrep     # or: pipx install agrep, or: npm i -g @mundy/agrep
@@ -211,6 +221,16 @@ segment, case-insensitively - so `--project shop` reaches both a pi label of
 `shop-admin`. `*` or `?` in the value make it a glob (`--project 'shop*'`);
 `--exclude-project` follows the same rule, and `--here` is shorthand for
 `--project <basename of the current directory>`.
+
+Speakers (`--who`) come from the transcripts themselves: `user`, `agent`,
+`subagent`, `tool`, plus structural `recap`, `control` and `synthetic` rows.
+`harness` marks benchmark traffic and is opt-in: nothing about a project's
+name makes its chats harness rows. To mark your own fixtures, write
+`<data dir>/harness_prefixes.txt`, one entry per line: a plain line is a prompt
+prefix (`Return only valid JSON`), a `project:control_` line marks every chat
+whose project path has a segment starting with `control_` (case-insensitive).
+Harness rows rank below prose, are skipped by meaning search by default, and
+drop under `--no-meta`.
 
 ## `around`
 
@@ -477,10 +497,12 @@ copy of the source file's bytes, because a raw copy of a live database can be
 torn mid-transaction. Archive retention is off by default:
 
 ```
-agrep archive --status   # files, raw vs stored size, ratio
+agrep archive --status   # files, raw vs stored size, ratio; what is still stored after --off
 agrep restore <path>     # the archived bytes, back where the agent expects
+agrep restore <session>  # a whole session, side files included, in its layout
 agrep archive --keep 5   # versions kept per source file (0 = never prune)
-agrep archive --off      # disable retention again
+agrep archive --off      # disable retention; the copies already taken stay on disk
+agrep archive --purge    # delete every archived copy (asks first; --yes to skip)
 ```
 
 Restore verifies the archived representation against its pinned SHA-256 before
@@ -504,7 +526,7 @@ syntax).
 | Antigravity | `~/.gemini/antigravity-cli/brain/<uuid>/` |
 | Kimi CLI | `~/.kimi/sessions/<workdir-hash>/<uuid>/` |
 | Cline | each editor's `globalStorage/saoudrizwan.claude-dev/tasks/`, plus `~/.cline/data/` |
-| Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.jsonl`, plus legacy `session-*.json` (a `.json` with a `.jsonl` beside it was migrated into it and is skipped) |
+| Gemini CLI | `~/.gemini/tmp/<project>/chats/session-*.jsonl`, plus legacy `session-*.json` (a `.json` with a `.jsonl` beside it was migrated into it and is skipped); subagent chats at `chats/<parent session>/<agent>.jsonl` are side chats of that session. The project comes from gemini-cli's `.project_root` marker (or `~/.gemini/projects.json`); sessions in hash-named directories of a project never opened by a gemini-cli with that registry file under `gemini`. Rewritten context (compression, `/chat resume`, `/rewind`) is reconstructed from the records, which carry no lineage: a rewrite that repeats a turn byte-identical to another in the same window (two compressions with identical summaries, the same prompt typed twice with the same reply) may read as one, and rarely a compression's acknowledgement lands on its summary row or a declined prompt is lost after resume, masking and rewind (29 of 1,642 recorder-fuzzed flows) |
 | crush | `~/.local/share/crush/crush.db` (SQLite; also legacy `~/.crush/`), plus each per-project `crush.db` at the `data_dir` its registry (`projects.json`) names - wherever that directory lives |
 | Cursor | `Cursor/User/globalStorage/state.vscdb` under the editor's per-OS app-data dir (SQLite) |
 | pi / oh-my-pi | `~/.pi/agent/sessions/<cwd-slug>/*.jsonl` and `~/.omp/agent/sessions/<cwd-slug>/*.jsonl` |
@@ -528,11 +550,23 @@ qwen-code (`~/.qwen`). agrep surfaces these - with a session count - in
 
 `agrep audit` cross-checks the files the adapters discovered against the
 parsers' per-file intake accounting, and independently line-counts the JSONL
-stores where a dumb recount is well defined (Claude, Codex, Kimi). A store the
+stores where a dumb recount is well defined (Claude, Codex, Kimi, pi). A store the
 adapters never discovered is outside what audit can see, and the other formats
-get the accounting check without an independent census. `agrep audit --strict`
-also fails on files that have not yet been tallied; `agrep index --full` seeds
-that accounting.
+get the accounting check without an independent census. Agents keep writing
+while an audit runs: a source, the intake book, or the search database that
+moves between the audit's observations is re-observed after a short settle
+(`--full` only) and, if it keeps moving, reported as live/uncertified (exit 1)
+rather than as an accounting error; a source written after the last index pass
+is likewise live, not a coverage gap. A search database an interrupted index
+pass left mid-commit is a coverage gap that only the next index pass clears (a
+background indexer runs one; otherwise `agrep index`). Evidence that held still
+and disagrees is still an error
+(exit 2). An `agrep audit --full` with no errors and no coverage
+gaps also prunes, from the intake book, tallies of vanished source files that
+the last index pass's published source inventory no longer lists, under the
+same lock the indexer uses.
+`agrep audit --strict` also fails on files that have not yet been tallied and
+on live evidence; `agrep index --full` seeds that accounting.
 
 ## The tiers
 

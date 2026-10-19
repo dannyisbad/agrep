@@ -9,6 +9,7 @@ pub mod boundary_stats;
 pub mod cache;
 pub mod emit;
 pub mod fallback_scan;
+pub mod fault_injection;
 pub mod ingest;
 pub mod ingest_cache;
 pub mod intake;

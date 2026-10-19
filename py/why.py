@@ -6,11 +6,13 @@ A reference resolves like `agrep resume` after a path lane (a torn or missing se
 falls back to messages.jsonl as resume does), then against the chats corpus.db still holds when
 search serves it; every evidence line names the file it came from.
 
-Token-store conversations resolve through intake session keys and the census token list; a
-whole-store file belongs to its deepest chat directory, an indexed chat or one laid out like
-the files that agent parsed. Without that link, whole-store freshness is unverified. A file's
-age never shows the last index saw it (a move or restore keeps the mtime): only that index's
-store walk, published as .source_snapshot.bin, does.
+Token-store conversations resolve through intake session keys and the census token list, which
+names each database the census opened: an unreadable sibling database scopes its issue to itself,
+while a reference nothing lists stays unprovable as long as any database is unread. A whole-store
+file belongs to its deepest chat directory, an indexed chat or one laid out like the files that
+agent parsed. Without that link, whole-store freshness is unverified. A file's age never shows the
+last index saw it (a move or restore keeps the mtime): only that index's store walk, published as
+.source_snapshot.bin, does.
 """
 
 from __future__ import annotations
@@ -48,6 +50,9 @@ _DATABASE_EXTENSIONS = frozenset({".db", ".sqlite", ".sqlite3", ".vscdb"})
 _TRANSCRIPT_EXTENSIONS = frozenset({".jsonl", ".json"}) | _DATABASE_EXTENSIONS
 _TOKEN_ID_PREFIX = "\0agrep-intake-token-v1\0"
 _RESERVED_SESSIONS = frozenset({"\0census\0", "\0schema-absent\0"})
+# ingest records this on a registered store a stat proves gone, pending a second observation.
+_ROOT_UNAVAILABLE = "source-root-unavailable"
+_MOUNT = "mount or restore the store"
 # registry.rs `SOURCE_SNAPSHOT_VERSION`; `_published_walk` decodes that version's bincode layout.
 _SNAPSHOT_VERSION = 11
 _SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
@@ -727,13 +732,16 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
     stale = [e for e in entries if e.get("fresh") is False and not moved[id(e)]]
     stores = [e["path"] for e in entries if e.get("session") and e.get("path") and _token_trouble(ctx, e)]
     checked = paths + [s["path"] for s in unparsed] + stores
-    issue = next((i for i in (_issue_covering(ctx, p) for p in checked) if i), None)
+    issue = (next((i for i in (_issue_covering(ctx, p) for p in checked) if i), None)
+             or _held_record(ctx, agent, session))
     store_issue = next((i for i in ctx.issues if i.get("agent") == agent), None) if whole_store else None
     unlisted = [e["path"] for e in entries if e.get("session") and e.get("fresh") is None]
-    census_issue = _census_issue(ctx, agent) if unlisted else None
+    census_issue = next((i for i in (_census_issue(ctx, agent, p, session) for p in unlisted) if i), None)
+    provisional = _provisional_issue(ctx, agent, session)
     facts = {"index_row": _candidate_from_row(row, via=via), "corpus": corpus,
              "sources": paths, "intake": entries, "unparsed": [s["path"] for s in unparsed],
-             "issue": issue, "store_issue": store_issue, "census_issue": census_issue}
+             "issue": issue, "store_issue": store_issue, "census_issue": census_issue,
+             "provisional_issue": provisional}
     lines = [_index_line(ctx, row), _corpus_line(corpus)]
     for entry in entries:
         if moved.get(id(entry)):
@@ -759,6 +767,15 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
         lines.append("parse cache: " + (f"no file claims this session ({state})"
                                         if state == "ok" else f"{detail}; freshness unverified"))
 
+    if issue and issue.get("kind") == _ROOT_UNAVAILABLE:
+        lines.insert(1, _issue_line(ctx, issue))
+        lines.insert(2, f"{ctx.index_origin} still serves the last good parse ({count})")
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: the registered store of {agent} chat {_short(session)} is absent "
+            "(unmounted or removed); mount it before the next index, which otherwise removes "
+            "these chats from search",
+            lines, facts=facts, next_action=_index_action(_MOUNT))
     if issue:
         lines.insert(1, _issue_line(ctx, issue))
         lines.insert(2, f"{ctx.index_origin} still serves the last good parse ({count})")
@@ -766,7 +783,24 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             ctx, "source-unreadable",
             f"not fully indexed: agrep cannot read the transcript of {agent} chat "
             f"{_short(session)} any more",
-            lines, facts=facts, next_action=_READABLE_ACTION)
+            lines, facts=facts, next_action=_issue_action(issue))
+    failed = _parse_failure_on(ctx, stale)
+    if failed:
+        # The tally kept the last good parse, so the chat reads as merely changed; the record
+        # says the last index tried it and failed, which indexing again cannot mend.
+        changed = stale[0]
+        then, now = changed.get("key"), changed.get("current_key")
+        lines.insert(1, _issue_line(ctx, failed))
+        lines.insert(2, f"{ctx.index_origin} still serves the last good parse ({count})")
+        lines.insert(3, f"intake_stats.json: {ctx.display(changed.get('path'))} parsed at "
+                        f"{_when(_key_mtime_ms(then))} ({then}), now {_when(_key_mtime_ms(now))} ({now})")
+        lines.insert(4, ctx.sig_line())
+        facts["issue"] = failed
+        return _report(
+            ctx, "source-unreadable",
+            f"not fully indexed: the last index could not parse the transcript of {agent} chat "
+            f"{_short(session)}: {failed.get('reason') or 'read failed'}",
+            lines, facts=facts, next_action=_issue_action(failed))
     if stale:
         changed = stale[0]
         then, now = changed.get("key"), changed.get("current_key")
@@ -777,7 +811,7 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             ctx, "written-after-last-index",
             f"not fully indexed: the transcript of {agent} chat {_short(session)} "
             "was written after the last index",
-            lines, facts=facts, next_action="agrep index")
+            lines, facts=facts, next_action=_index_action())
     if unparsed:
         first = unparsed[0]
         lines.insert(1, f"store census: {ctx.display(first['path'])} modified "
@@ -788,7 +822,7 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             ctx, "written-after-last-index",
             f"not fully indexed: {agent} chat {_short(session)} gained "
             f"{_plural(len(unparsed), 'file')} after the last index",
-            lines, facts=facts, next_action="agrep index")
+            lines, facts=facts, next_action=_index_action())
     if corpus.get("current") is None and corpus.get("state") == "unreadable":
         lines.append(ctx.sig_line())
         return _report(
@@ -800,14 +834,14 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
         lines.append(ctx.sig_line())
         return _report(
             ctx, "corpus-behind-transcripts", _corpus_behind_summary(corpus, agent, session),
-            lines, facts=facts, next_action="agrep index")
+            lines, facts=facts, next_action=_index_action())
     if corpus.get("current") is None:
         lines.append(ctx.sig_line())
         return _report(
             ctx, "not-provable",
             f"unprovable: the search database is behind the published sources and {agent} "
             f"chat {_short(session)} could not be compared",
-            lines, facts=facts, next_action="agrep index")
+            lines, facts=facts, next_action=_index_action())
     if whole_store and not entries:
         return _report(
             ctx, "not-provable",
@@ -820,14 +854,20 @@ def _judge_indexed(ctx: _Context, row: dict, via: str) -> dict:
             ctx, "not-provable",
             f"unprovable: freshness unverified for {agent} chat {_short(session)}; a {agent} "
             "store issue may have kept an older parse in search",
-            lines, facts=facts, next_action=_READABLE_ACTION)
+            lines, facts=facts, next_action=_readable_action())
     if census_issue:
         lines.insert(1, _issue_line(ctx, census_issue))
         return _report(
             ctx, "not-provable",
             f"unprovable: freshness unverified for {agent} chat {_short(session)}; the census lists "
-            f"no {agent} conversation while one of its databases cannot be read",
-            lines, facts=facts, next_action=_census_action(ctx, agent))
+            f"no conversation of its database while {ctx.display(census_issue.get('path'))} cannot "
+            "be read",
+            lines, facts=facts, next_action=_census_action(ctx, agent, census_issue))
+    if provisional:
+        # The chat is searchable under project "cursor"; its own project waits on that source.
+        lines.insert(1, f"store census: project {row.get('project')!r} is provisional until "
+                        f"{ctx.display(provisional.get('path'))} is readable - "
+                        f"{provisional.get('reason')}")
     if via == "alias" or (via == "path" and row.get("alias")):
         verdict, summary = "indexed-under-alias", (
             f"indexed under an alias: {agent} chat {row.get('alias')} is stored as "
@@ -867,11 +907,11 @@ def _judge_stored(ctx: _Context, row: dict) -> dict:
             ctx, "not-provable",
             f"unprovable: the search database is behind the published sources and {agent} "
             f"chat {_short(session)} could not be compared",
-            lines, facts=facts, next_action="agrep index")
+            lines, facts=facts, next_action=_index_action())
     if corpus.get("current") is False:
         return _report(
             ctx, "corpus-behind-transcripts", _corpus_behind_summary(corpus, agent, session),
-            lines, facts=facts, next_action="agrep index")
+            lines, facts=facts, next_action=_index_action())
     return _report(
         ctx, "indexed",
         f"indexed: {agent} chat {session} is searchable from the search database "
@@ -949,6 +989,86 @@ def _corpus_behind_summary(corpus: dict, agent: str, session: str) -> str:
 
 
 _READABLE_ACTION = "make the file readable, then agrep index"
+# ingest's reason prefix for a parse the build's own code panicked on (see parse_guard.rs)
+_PANIC_REASON = "parser panicked at "
+_PANIC_ACTION = "update agrep (a parser fix ships in a new build), then agrep index"
+
+
+def _newer_owner() -> bool:
+    """The flag source_health's remedies take: whether a newer agrep owns the data dir."""
+    import indexd_runtime
+    return indexd_runtime.newer_anchor() is not None
+
+
+def _index_action(then: str = "", *, full: bool = False) -> str:
+    """`then`, then the index that picks it up: this build's `agrep index` (`--full`), or, in a
+    data dir a newer agrep owns, where this build declines both, doctor's deferral to that agrep."""
+    if _newer_owner():
+        index = surface.render_remedy("newer-owner-index")
+    else:
+        index = "agrep index --full" if full else "agrep index"
+    return f"{then}, then {index}" if then else index
+
+
+def _readable_action() -> str:
+    return _index_action("make the file readable")
+
+
+def _panic_action() -> str:
+    if _newer_owner():
+        return ("update agrep to index it again (a parser fix ships in a new build, and a newer "
+                "agrep owns this data dir)")
+    return _PANIC_ACTION
+
+
+def _issue_action(issue: dict | None) -> str:
+    """The remedy a read failure admits: a parser panic recurs for this build and this source
+    however readable the file is, so only a newer build can index it. A record the last pass
+    refused to publish over takes status's and doctor's remedy: fix it, or rebuild without it."""
+    if issue and issue.get("blocks_publication") is True:
+        return _standing_action(issue)
+    if issue and str(issue.get("reason") or "").startswith(_PANIC_REASON):
+        return _panic_action()
+    return _readable_action()
+
+
+def _unindexed_action(issue: dict) -> str:
+    """A chat the index holds no row of whose own rows did not parse (never published, or left
+    out by a consent): its file reads fine, so the remedy is doctor's for it, not readability."""
+    if (issue.get("durable") and issue.get("session") and issue.get("kind") == "source-read-failed"
+            and not str(issue.get("reason") or "").startswith(_PANIC_REASON)):
+        return _standing_action(issue)
+    return _issue_action(issue)
+
+
+def _held_record(ctx: _Context, agent: object, session: str) -> dict | None:
+    """The record holding publication back over `session`'s own source, found without the parse
+    cache that ties a file to its chat: one naming the conversation, or a transcript named for it."""
+    def names(issue: dict) -> bool:
+        if issue.get("session"):
+            return issue["session"] == session
+        stem = Path(str(issue.get("path") or "")).stem
+        return stem == session or stem.endswith("-" + session)
+    return next((i for i in ctx.issues if i.get("blocks_publication") is True
+                 and i.get("agent") == agent and names(i)), None)
+
+
+def _parse_failure_on(ctx: _Context, entries: list[dict]) -> dict | None:
+    """The durable read-failure record the last index tied to one of `entries`' conversations:
+    the collector names the session whose parse failed. A record naming none (an older writer,
+    a failure before any session was known) is attributed to no chat; file times cannot say
+    whether a store written through its WAL changed since the record."""
+    for entry in entries:
+        session = entry.get("session")
+        if not session:
+            continue
+        real = ctx.real(str(entry.get("path") or ""))
+        failed = next((i for i in ctx.issues if i.get("durable") and i.get("session") == session
+                       and i.get("kind") == "source-read-failed" and i.get("path")
+                       and ctx.real(i["path"]) == real), None)
+        if failed:
+            return failed
+    return None
 
 
 def _issue_covering(ctx: _Context, path: str) -> dict | None:
@@ -973,27 +1093,54 @@ def _unparsed_conversations(ctx: _Context, path: str, entries: list[dict]) -> li
                    and t["session"] not in _RESERVED_SESSIONS} - tallied)
 
 
-def _census_issue(ctx: _Context, agent: object) -> dict | None:
-    """The issue that kept the census from reading `agent`'s token lists: one unreadable database
-    blanks them all, so a conversation missing from them, or listed under no key, proves nothing."""
+def _blinding_issues(ctx: _Context, agent: object) -> list[dict]:
+    """Census issues of `agent` that hide conversations; one that only leaves listed chats under
+    a provisional project (cursor's workspace attribution) hides none."""
+    return [i for i in ctx.issues if i.get("kind") == "token-census-unreadable"
+            and i.get("agent") == agent and i.get("path") and not i.get("provisional")]
+
+
+def _census_issue(ctx: _Context, agent: object, path: str, session: object = None) -> dict | None:
+    """The census issue that left conversations of the token store at `path` unlisted: one naming
+    `session` among the conversations it hides, one on that store or a directory above it, or,
+    for a store the census never discovered, one on no store at all (crush's registry or root).
+    A store the census lists whole is scoped by none."""
+    real = ctx.real(path)
+    issues = _blinding_issues(ctx, agent)
+    covering = next((i for i in issues if (session and session in (i.get("hidden") or []))
+                     or _under(path, str(i["path"])) or _under(real, ctx.real(i["path"]))), None)
+    if covering or any(s.get("agent") == agent and ctx.real(s.get("path")) == real
+                       for s in ctx.sources):
+        return covering
+    return next((i for i in issues if not i.get("hidden")
+                 and os.path.splitext(str(i["path"]))[1].lower() not in _DATABASE_EXTENSIONS), None)
+
+
+def _provisional_issue(ctx: _Context, agent: object, session: object) -> dict | None:
+    """The census issue under which `session` carries a fallback project: an attribution source
+    of `agent` it could not read."""
     return next((i for i in ctx.issues if i.get("kind") == "token-census-unreadable"
-                 and i.get("agent") == agent), None)
+                 and i.get("agent") == agent and session in (i.get("provisional") or [])), None)
 
 
-def _census_action(ctx: _Context, agent: object) -> str:
-    """An index still reads every healthy database of `agent` while its census is blind; with none,
-    only a readable database can show a conversation."""
+def _census_action(ctx: _Context, agent: object, issue: dict | None = None) -> str:
+    """An index still reads every database of `agent` the census lists; with none listed, or when
+    the issue hides chats an index cannot relist, only the named source becoming readable helps."""
+    if issue and issue.get("hidden"):
+        return _readable_action()
     healthy = any(s.get("agent") == agent and not _issue_covering(ctx, str(s.get("path") or ""))
                   for s in ctx.sources)
-    return "agrep index" if healthy else _READABLE_ACTION
+    return _index_action() if healthy else _readable_action()
 
 
 def _unlisted_line(ctx: _Context, agent: object, path: str, discovered: bool) -> str | None:
     """Why the census lists no conversation of the token store at `path`."""
+    issue = _census_issue(ctx, agent, path)
+    if issue:
+        return _issue_line(ctx, issue)
     if not discovered:
         return f"store census: discovers no {agent or 'token'} store at {ctx.display(path)}"
-    issue = _census_issue(ctx, agent)
-    return _issue_line(ctx, issue) if issue else None
+    return None
 
 
 def _retired_by(agent: object, path: object) -> str | None:
@@ -1011,11 +1158,17 @@ def _successor(ctx: _Context, agent: object, path: str) -> dict | None:
 
 def _token_trouble(ctx: _Context, entry: dict) -> bool:
     """Whether a token conversation's own tally ties an issue on its database to it: its last parse
-    failed or yielded no row, or the census could not list its token. A sibling's bad row alone
-    records that same database-wide issue."""
+    failed or yielded no row, the census could not list its token, or the database is a registered
+    store awaiting its second absence observation. A sibling's bad row alone records that same
+    database-wide issue."""
     if entry.get("errors") or not (entry.get("rows") or entry.get("agent_rows")):
         return True
-    return entry.get("fresh") is None and _census_issue(ctx, entry.get("agent")) is not None
+    if entry.get("fresh") is not None:
+        return False
+    path = str(entry.get("path") or "")
+    covering = _issue_covering(ctx, path)
+    return (covering is not None and covering.get("kind") == _ROOT_UNAVAILABLE) or (
+        _census_issue(ctx, entry.get("agent"), path, entry.get("session")) is not None)
 
 
 def _parsed_line(conversations: list[dict]) -> str:
@@ -1059,14 +1212,14 @@ def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
         return _report(
             ctx, "not-provable",
             f"unprovable: {label} was discovered but nothing has been indexed yet",
-            [ctx.census_line(), ctx.sig_line()], facts=facts, next_action="agrep index")
+            [ctx.census_line(), ctx.sig_line()], facts=facts, next_action=_index_action())
     # The census token list alone shows a conversation is new: sqlite WAL writes can leave the
     # database file's mtime older than the index that never saw the conversation.
     if conversation or ctx.changed_since_index(source):
         return _report(
             ctx, "written-after-last-index",
             f"not indexed yet: {label} appeared after the last index",
-            [unparsed, modified, ctx.sig_line()], facts=facts, next_action="agrep index")
+            [unparsed, modified, ctx.sig_line()], facts=facts, next_action=_index_action())
     if not ctx.intake_ok:
         book = (ctx.payload or {}).get("intake") or {}
         return _report(
@@ -1091,12 +1244,12 @@ def _untallied(ctx: _Context, agent: str | None, path: str, label: str,
             f"not indexed yet: {label} appeared after the last index",
             [unparsed, f"filesystem: moved, copied or changed {_when(_changed_ms(path))}; a move "
              "or copy keeps the older modification time", modified, ctx.sig_line()],
-            facts=facts, next_action="agrep index")
+            facts=facts, next_action=_index_action())
     return _report(
         ctx, "not-provable",
         f"unprovable: {label} predates the last index, but nothing shows that index saw it",
         [ctx.walk_line(agent, walked), unparsed, modified, ctx.sig_line()],
-        facts=facts, next_action="agrep index")
+        facts=facts, next_action=_index_action())
 
 
 def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | None = None) -> dict:
@@ -1131,11 +1284,18 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
              + (f" conversation {conversation}" if conversation else ""))
     facts = {"path": path, "agent": agent, "session": session, "issue": issue,
              "intake": entries, "cache_claims": claims, "unparsed": unparsed}
+    if issue and issue.get("kind") == _ROOT_UNAVAILABLE:
+        return _report(
+            ctx, "not-provable",
+            f"unprovable: {label} is registered but absent (unmounted or removed); mount it "
+            "before the next index, which otherwise removes its chats from search",
+            [_issue_line(ctx, issue), ctx.sig_line()], facts=facts, next_action=_index_action(_MOUNT))
     if issue:
         return _report(
             ctx, "source-unreadable",
             f"not indexed: agrep cannot read {label}",
-            [_issue_line(ctx, issue), ctx.sig_line()], facts=facts, next_action=_READABLE_ACTION)
+            [_issue_line(ctx, issue), ctx.sig_line()], facts=facts,
+            next_action=_unindexed_action(issue))
     if unparsed:
         shown = ", ".join(unparsed[:_CANDIDATE_LINES]) + (" …" if len(unparsed) > _CANDIDATE_LINES else "")
         return _report(
@@ -1144,7 +1304,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             "appeared after the last index",
             [f"store census: {_plural(len(unparsed), 'conversation')} with no intake_stats.json "
              f"record: {shown}", ctx.sig_line()],
-            facts=facts, next_action="agrep index")
+            facts=facts, next_action=_index_action())
     discovered = any(s.get("path") == path for s in ctx.sources)
     successor = None if discovered or not os.path.lexists(path) else _successor(ctx, agent, path)
     if successor:
@@ -1168,7 +1328,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             f"unprovable: the parse cache attributes {label} to a session the index does not list",
             ["parse cache: session " + ", ".join(c["session"] for c in claims),
              f"{ctx.index_origin}: {len(ctx.rows)} chats, none with that id", ctx.sig_line()],
-            facts=facts, next_action="agrep index")
+            facts=facts, next_action=_index_action())
     tallies = conversations or entries
     if tallies and not os.path.lexists(path):
         # intake_stats.json keeps a vanished source's record until an audit drops it.
@@ -1177,8 +1337,8 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             ctx, "source-not-discovered",
             f"not indexed: {label} was deleted after an index parsed it",
             [f"filesystem: no file at {ctx.display(path)}", tally, ctx.sig_line()], facts=facts)
-    # Only a token store the census discovered and read lists every conversation it still holds.
-    listed_whole = discovered and not _census_issue(ctx, agent)
+    # Only a token store the census discovered and opened lists every conversation it still holds.
+    listed_whole = discovered and not _census_issue(ctx, agent, path)
     several = session is None and len(conversations) > 1
     unlisted = all(e.get("session") and e.get("fresh") is None for e in conversations)
     if several and unlisted and listed_whole:
@@ -1210,7 +1370,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
             f"not indexed yet: {label} was written after the last index",
             [f"intake_stats.json: parsed at {_when(_key_mtime_ms(then))} ({then}), "
              f"now {_when(_key_mtime_ms(now))} ({now})", _intake_line(entry), ctx.sig_line()],
-            facts=facts, next_action="agrep index")
+            facts=facts, next_action=_index_action())
     token = entry.get("session")
     if entry.get("fresh") is None and token and token not in _RESERVED_SESSIONS and listed_whole:
         listed = {t["session"] for t in ctx.token_conversations if t["path"] == path} - _RESERVED_SESSIONS
@@ -1240,7 +1400,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
         detail = cache.get("reason") or cache.get("state")
         # A plain index trusts the published source snapshot and never refills an absent cache;
         # undecodable bytes make every index, --full included, decline.
-        rebuild = "agrep index --full" if cache.get("state") == "missing" else None
+        rebuild = _index_action(full=True) if cache.get("state") == "missing" else None
         return _report(
             ctx, "not-provable",
             f"unprovable: the parse cache is {cache.get('state')} ({detail}), so {label} cannot be "
@@ -1251,7 +1411,7 @@ def _judge_source(ctx: _Context, agent: str | None, path: str, session: str | No
     return _report(
         ctx, "not-provable",
         f"unprovable: {label} yielded {entry.get('rows')} rows that no published session references",
-        [_intake_line(entry), ctx.sig_line()], facts=facts, next_action="agrep index")
+        [_intake_line(entry), ctx.sig_line()], facts=facts, next_action=_index_action())
 
 
 def _under(path: str, root: str) -> bool:
@@ -1330,16 +1490,49 @@ def _no_match(ctx: _Context, stored_line: str | None = None) -> dict:
             ctx, "not-provable",
             f"unprovable: nothing agrep discovered matches '{ctx.reference}', but a store that "
             "changed since the last index may hold it",
-            [moved, *lines], next_action="agrep index")
-    blind = next((i for i in ctx.issues if i.get("kind") == "token-census-unreadable"), None)
+            [moved, *lines], next_action=_index_action())
+    # A reference nothing lists may still sit in what the census could not read; the databases it
+    # opened say nothing about that one. An attribution gap hides no conversation.
+    blind = next((i for i in ctx.issues if i.get("kind") == "token-census-unreadable"
+                  and not i.get("provisional")), None)
     if blind:
         return _report(
             ctx, "not-provable",
-            f"unprovable: nothing agrep discovered matches '{ctx.reference}', but the census lists no "
-            f"{blind.get('agent')} conversation while one of its databases cannot be read",
-            [_issue_line(ctx, blind), *lines], next_action=_census_action(ctx, blind.get("agent")))
+            f"unprovable: nothing agrep discovered matches '{ctx.reference}', but the "
+            f"{blind.get('agent')} census could not read {ctx.display(blind.get('path'))}, so a "
+            "conversation it never listed may match",
+            [_issue_line(ctx, blind), *lines],
+            next_action=_census_action(ctx, blind.get("agent"), blind))
+    # A chat whose read keeps failing never reaches the index or the parse cache (or a consent
+    # dropped it); source health still names it, as doctor, status and audit do.
+    standing = _standing_failure(ctx)
+    if standing:
+        agent = standing.get("agent") or "an agent"
+        return _report(
+            ctx, "source-unreadable",
+            f"not indexed: the last index could not read {agent} chat "
+            f"{_short(str(standing.get('session')))}: {standing.get('reason') or 'read failed'}",
+            [_issue_line(ctx, standing), *lines],
+            facts={"issue": standing}, next_action=_unindexed_action(standing))
     return _report(ctx, "source-not-discovered",
                    f"not indexed: nothing agrep discovered matches '{ctx.reference}'", lines)
+
+
+def _standing_action(issue: dict) -> str:
+    """A chat source health alone names: the remedy doctor's agent-stores row gives it."""
+    import source_health
+    return source_health.source_issue_remedy(issue, newer_owner=_newer_owner())
+
+
+def _standing_failure(ctx: _Context) -> dict | None:
+    """The source-health record naming the referenced conversation, by id or unique prefix."""
+    reference = ctx.reference.strip()
+    named = [i for i in ctx.issues if i.get("durable") and isinstance(i.get("session"), str)
+             and reference and i["session"].startswith(reference)]
+    exact = [i for i in named if i["session"] == reference]
+    if exact:
+        return exact[0]
+    return named[0] if len({i["session"] for i in named}) == 1 else None
 
 
 # --------------------------------------------------------------------------- resolution

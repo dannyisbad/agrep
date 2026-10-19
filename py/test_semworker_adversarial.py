@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import scrub_coordination_namespaces, fixture_tree, isolate_data_dir
 
 
 isolate_data_dir()
@@ -24,7 +24,7 @@ import common  # noqa: E402
 import indexd_runtime  # noqa: E402
 
 # Daemon semantics run real here, daemon processes never do (shared seam).
-from _test_support import lift_daemon_semantics  # noqa: E402
+from _test_support import lift_daemon_semantics, remove_coordination_namespace  # noqa: E402
 
 setUpModule, tearDownModule = lift_daemon_semantics(indexd_runtime)
 import ownerfile  # noqa: E402
@@ -57,6 +57,8 @@ class SemanticWorkerAdversarialTests(unittest.TestCase):
         self.coordination = mock.patch.object(
             semworker, "_coordination_base_path", return_value=self.root)
         self.coordination.start()
+        # fixtures write raw records; a writer would have minted the namespace
+        semworker._prepare_ephemeral_coordination_dir()
         self.handles: list[ownerfile.Handle] = []
 
     def tearDown(self) -> None:
@@ -67,8 +69,8 @@ class SemanticWorkerAdversarialTests(unittest.TestCase):
                 pass
         self.coordination.stop()
         common.DATA_DIR = self.saved_data_dir
+        scrub_coordination_namespaces(self.temp.name)
         self.temp.cleanup()
-
     @staticmethod
     def _snapshot(
             raw: bytes = b"record", identity: int = 1,
@@ -544,7 +546,7 @@ class SemanticWorkerAdversarialTests(unittest.TestCase):
         fallback_budgets = []
 
         def consume_grace(
-                _rec: dict, found, timeout_s: float):
+                _rec: dict, found, timeout_s: float, *, bound: bool):
             clock.now += timeout_s
             return False, found, False
 
@@ -608,7 +610,7 @@ class SemanticWorkerAdversarialTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["running"])
         wait.assert_called_once_with(
-            rec, (rec, descriptor), 0.0)
+            rec, (rec, descriptor), 0.0, bound=True)
         contact.assert_not_called()
         force.assert_not_called()
 
@@ -699,14 +701,16 @@ class SemanticWorkerAdversarialTests(unittest.TestCase):
 @unittest.skipIf(os.name == "nt", "POSIX private-session worker")
 class PosixSemanticWorkerProductStopTests(unittest.TestCase):
     def test_product_stop_drains_a_sigterm_ignoring_descendant(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-product-stop-") as raw:
             root = Path(raw)
             ready = root / "child.pid"
             child = (
                 "import os,pathlib,signal,sys,time\n"
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
-                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "staged=pathlib.Path(sys.argv[1]+'.tmp')\n"
+                "staged.write_text(str(os.getpid()))\n"
+                "os.replace(staged,sys.argv[1])\n"
                 "while True: time.sleep(1)\n"
             )
             worker = (
@@ -758,6 +762,7 @@ class PosixSemanticWorkerProductStopTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertFalse(common.pid_alive(child_pid))
             finally:
+                remove_coordination_namespace(common.DATA_DIR)
                 common.DATA_DIR = saved_data
                 if process.poll() is None:
                     try:
@@ -805,7 +810,7 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
 
     def test_deadline_contract_rejects_stale_work_without_side_effects(
             self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-deadline-") as raw:
             root = Path(raw)
             saved_data = common.DATA_DIR
@@ -873,10 +878,11 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
                 if owner is not None:
                     owner.release(
                         tombstone=True, require_stable_mtime=True)
+                remove_coordination_namespace(common.DATA_DIR)
                 common.DATA_DIR = saved_data
 
     def test_failed_release_stop_never_accepts_a_queued_search(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-stop-") as raw:
             root = Path(raw)
             saved_data = common.DATA_DIR
@@ -958,10 +964,11 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
                 if owner is not None:
                     owner.release(
                         tombstone=True, require_stable_mtime=True)
+                remove_coordination_namespace(common.DATA_DIR)
                 common.DATA_DIR = saved_data
 
     def test_successful_stop_ack_holds_root_for_external_tree_drain(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-ack-") as raw:
             saved_data = common.DATA_DIR
             common.DATA_DIR = Path(raw)
@@ -990,6 +997,9 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
                     semworker._request_worker_stop(record, timeout_s=1.0))
                 self.assertTrue(server_thread.is_alive())
                 self.assertGreater(server.retire_deadline, time.monotonic())
+                # a wrong token is refused outright
+                self.assertFalse(semworker._request_worker_stop(
+                    {**record, "token": "f" * 64}, timeout_s=1.0))
             finally:
                 if server is not None:
                     server.request_stop()
@@ -998,11 +1008,12 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
                 if owner is not None:
                     owner.release(
                         tombstone=True, require_stable_mtime=True)
+                remove_coordination_namespace(common.DATA_DIR)
                 common.DATA_DIR = saved_data
 
     def test_expired_burst_is_drained_before_a_valid_sentinel(
             self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-burst-") as raw:
             root = Path(raw)
             saved_data = common.DATA_DIR
@@ -1118,6 +1129,7 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
                 if owner is not None:
                     owner.release(
                         tombstone=True, require_stable_mtime=True)
+                remove_coordination_namespace(common.DATA_DIR)
                 common.DATA_DIR = saved_data
 
     # COORDINATION.md: only an accepted request retires the worker generation
@@ -1125,7 +1137,7 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
     # queue-consumed residual; only the one whose inference outlives it retires.
     def test_accepted_sliver_budget_pins_which_side_retires_the_worker(
             self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-sliver-") as raw:
             root = Path(raw)
             saved_data = common.DATA_DIR
@@ -1221,6 +1233,7 @@ class SemanticWorkerLoopbackBurstTests(unittest.TestCase):
                 if owner is not None:
                     owner.release(
                         tombstone=True, require_stable_mtime=True)
+                remove_coordination_namespace(common.DATA_DIR)
                 common.DATA_DIR = saved_data
 
 
@@ -1243,6 +1256,8 @@ class ClientDeadlineHardEnforcementTests(unittest.TestCase):
         port = server.getsockname()[1]
         stop = threading.Event()
 
+        sent = []
+
         def serve() -> None:
             try:
                 client, _ = server.accept()
@@ -1259,6 +1274,7 @@ class ClientDeadlineHardEnforcementTests(unittest.TestCase):
                         if stop.wait(0.2):
                             return
                         client.sendall(bytes([value]))
+                        sent.append(value)
                 except OSError:
                     return
 
@@ -1272,13 +1288,15 @@ class ClientDeadlineHardEnforcementTests(unittest.TestCase):
                 semworker._worker_request(
                     rec, {"query": "deadline"}, timeout_s=budget)
             elapsed = time.monotonic() - started
-            # untreated, the trickle holds the client ~4.6s; the wall-clock
-            # deadline must cut it near the 0.5s budget (slack for CI wobble)
-            self.assertLess(elapsed, budget + 1.5)
         finally:
             stop.set()
             server.close()
             thread.join(timeout=5.0)
+        # Untreated, the client reads the whole trickled body (~4.6 s); the
+        # watchdog severs the wire with most of it unsent. Bytes sent is the
+        # evidence, since the host decides how long the raise itself takes.
+        self.assertLess(len(sent), len(body) // 2, (len(sent), elapsed))
+        self.assertLess(elapsed, len(body) * 0.2)
 
 
 if __name__ == "__main__":

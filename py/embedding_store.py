@@ -669,7 +669,11 @@ class EmbeddingPublishLock:
                 ValueError, json.JSONDecodeError):
             age = time.time() - observed.mtime
             return not 0.0 <= age <= _EMBEDDING_PUBLISH_MALFORMED_STALE_S
-        return state in (ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED)
+        if state in (ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED):
+            return True
+        return ownerfile.stranded_own_record(
+            holder, record.get("process_start"), record.get("token"),
+            process_start=process_start_identity)
 
     def __enter__(self):
         _require_publication_target(
@@ -680,8 +684,8 @@ class EmbeddingPublishLock:
         retry_after_progress = False
         while True:
             try:
-                self.handle = ownerfile.create_exclusive(
-                    self.path, self._record(),
+                self.handle = ownerfile.create_held(
+                    self.path, self._record(), token=self.token,
                     mode=_EMBEDDING_PUBLISH_MODE, retain_fd=True)
                 self.owned = True
                 return self

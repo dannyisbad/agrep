@@ -15,36 +15,30 @@ The capture daemon also tags the session in the watcher with `pty_pid` and
 from __future__ import annotations
 
 import os
-import shutil
 import time
 from collections import deque
 
 from hookless import _log, native
 from hookless.registry import normalize_agent_name
 
-def _find_exe(agent: str) -> str | None:
-    spec = native._RESUME.get(agent)
-    return shutil.which(spec[0]) if spec is not None else None
-
-
-def _agent_new_session_argv(agent: str, extra_args: list[str]) -> list[str]:
-    """Build the argv to start a NEW session (not resume). Each agent's fresh-start
-    command — just the bare executable name + any user-provided extra args."""
-    exe = _find_exe(agent)
-    if not exe:
-        raise FileNotFoundError(f"{agent} CLI not found on PATH")
-    return [exe] + extra_args
-
-
 def run_captured(agent: str, extra_args: list[str], cwd: str | None = None) -> int:
     """Launch `agent` as a child process, monitor its liveness, and emit ground-truth
-    working/done events. The agent inherits the real terminal. Returns exit code."""
+    working/done events. The agent inherits the real terminal. Returns exit code.
+    `agent` is the spelling the user typed: for the pi family that picks the fork."""
 
+    requested = agent
     agent = normalize_agent_name(agent)
     if agent not in native._RESUME:
         _log.log(f"capture: unsupported agent {native._terminal_safe(agent)!r}")
         return 2
-    argv = _agent_new_session_argv(agent, extra_args)
+    exe, exe_path = native.new_session_exe(agent, requested)
+    if not exe_path:
+        _log.log(f"capture: {native._terminal_safe(requested)}: the `{exe}` CLI is "
+                 "not found on PATH - install it to launch it here")
+        return 127
+    if exe != requested and requested in ("pi", "omp"):
+        _log.log(f"capture: {requested} isn't on PATH - launching its fork {exe}")
+    argv = [exe_path] + extra_args
     work_dir = cwd or os.getcwd()
 
     _log.dbg(f"capture: launching {argv} in {work_dir}", ">")
@@ -84,7 +78,7 @@ def run_captured(agent: str, extra_args: list[str], cwd: str | None = None) -> i
                 state["watcher"] = None
     try:
         result = native.run_owned_process(
-            argv, cwd=work_dir, relay_signals=True, tick=tick)
+            argv, cwd=work_dir, relay_signals=True, tick=tick, foreground=True)
         rc = result.returncode
     except FileNotFoundError:
         _log.log(f"capture: {argv[0]!r} not found on PATH")

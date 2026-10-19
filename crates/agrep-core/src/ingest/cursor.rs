@@ -21,7 +21,9 @@ use rusqlite::Connection;
 
 #[cfg(test)]
 use crate::ingest::registry::fnv_token;
-use crate::ingest::registry::{metadata_is_link, read_bounded_regular_file};
+use crate::ingest::registry::{
+    metadata_is_link, read_bounded_regular_file, ATTRIBUTION_ISSUE_KIND,
+};
 use crate::ingest::{
     cap_event_output, cap_str_with_chars, is_wrapper, project_name,
     summarize_tool_input_with_chars, EVENT_CAP,
@@ -140,7 +142,7 @@ fn user_dir_checked_in(
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_file() && !metadata_is_link(&meta) => return Ok(Some(user)),
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if crate::ingest::registry::stat_proves_absent(&path, &error) => {}
             Err(error) => {
                 return Err(UserDirError {
                     path,
@@ -166,18 +168,27 @@ fn user_dir() -> Option<std::path::PathBuf> {
     user_dir_checked().ok().flatten()
 }
 
-/// Open Cursor without write authority; failures retain the last-good token generation. The
-/// error is the issue kind of a defect no retry heals, or None for one a retry may clear.
-fn open_ro(
-    path: &std::path::Path,
-) -> Result<crate::ingest::ReadOnlyConnection, Option<&'static str>> {
+/// Why Cursor's database did not open: the issue kind of a defect no retry heals, or none for a
+/// failure a retry may clear, whether the database moved under its snapshot, and the error.
+struct OpenFailure {
+    defect: Option<&'static str>,
+    moved: bool,
+    reason: String,
+}
+
+/// Open Cursor without write authority; failures retain the last-good token generation.
+fn open_ro(path: &std::path::Path) -> Result<crate::ingest::ReadOnlyConnection, OpenFailure> {
     crate::ingest::open_sqlite_ro(path).map_err(|e| {
         eprintln!(
             "  ! cursor: cannot open {}: {}",
             crate::ingest::terminal_safe(path.display()),
             crate::ingest::terminal_safe(&e)
         );
-        crate::ingest::sqlite_open_defect(path, &e)
+        OpenFailure {
+            defect: crate::ingest::sqlite_open_defect(path, &e),
+            moved: crate::ingest::sqlite_open_moved(&e),
+            reason: e.to_string(),
+        }
     })
 }
 
@@ -268,12 +279,13 @@ fn has_conversations(conn: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
-fn first_unmapped_conversation(
+/// Conversations no readable workspace source maps, in key order.
+fn unmapped_conversations(
     conn: &Connection,
     projects: &HashMap<String, String>,
-) -> rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Vec<String>> {
     if !has_cursor_table(conn)? {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut statement = conn.prepare(
         "SELECT key FROM cursorDiskKV
@@ -281,15 +293,73 @@ fn first_unmapped_conversation(
          AND typeof(value) IN ('text', 'blob') ORDER BY key",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut unmapped = Vec::new();
     for key in rows {
         let key = key?;
         if let Some(session) = key.strip_prefix("composerData:") {
             if !projects.contains_key(session) {
-                return Ok(Some(session.to_string()));
+                unmapped.push(session.to_string());
             }
         }
     }
-    Ok(None)
+    Ok(unmapped)
+}
+
+/// Project attribution of every conversation a readable workspace source maps. While a
+/// workspace source cannot be read, the conversations nothing maps keep the project the last
+/// generation published, or carry the "cursor" fallback when none did: attribution is part of
+/// the token, so repair relabels only what changes, in one reparse.
+struct Attribution {
+    projects: HashMap<String, String>,
+    /// The first unreadable workspace source, with the conversations it leaves unattributed.
+    incomplete: Option<AttributionGap>,
+}
+
+#[derive(Clone, Debug)]
+struct AttributionGap {
+    path: std::path::PathBuf,
+    reason: String,
+    /// Conversations under the "cursor" fallback until the source is readable.
+    unmapped: Vec<String>,
+    /// Conversations keeping their published project until the source is readable.
+    retained: Vec<String>,
+}
+
+impl Attribution {
+    fn complete(projects: HashMap<String, String>) -> Self {
+        Self {
+            projects,
+            incomplete: None,
+        }
+    }
+
+    /// Keep the project `published` (the last-good rows) gave each unmapped conversation.
+    fn retain_published(&mut self, published: &HashMap<String, String>) {
+        let Some(gap) = self.incomplete.as_mut() else {
+            return;
+        };
+        let mut unmapped = Vec::with_capacity(gap.unmapped.len());
+        for session in gap.unmapped.drain(..) {
+            match published.get(&session) {
+                Some(project) => {
+                    self.projects.insert(session.clone(), project.clone());
+                    gap.retained.push(session);
+                }
+                None => unmapped.push(session),
+            }
+        }
+        gap.unmapped = unmapped;
+    }
+
+    /// Every conversation whose attribution waits on the unreadable source, in key order.
+    fn pending(&self) -> Vec<String> {
+        let Some(gap) = self.incomplete.as_ref() else {
+            return Vec::new();
+        };
+        let mut pending: Vec<String> = gap.unmapped.iter().chain(&gap.retained).cloned().collect();
+        pending.sort();
+        pending
+    }
 }
 
 /// Minimal percent-decode for workspace.json folder URIs (`file:///c%3A/Users/...`).
@@ -312,23 +382,35 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Composer attribution is part of the session token, so a workspace move relabels cached rows.
-fn workspace_projects(
-    conn: &Connection,
-    user: &std::path::Path,
-) -> anyhow::Result<HashMap<String, String>> {
+fn workspace_projects(conn: &Connection, user: &std::path::Path) -> anyhow::Result<Attribution> {
     let mut map = HashMap::new();
     let mut projects_by_workspace = HashMap::new();
-    let mut incomplete_attribution = None;
+    let mut incomplete_attribution: Option<(std::path::PathBuf, String)> = None;
     let root = user.join("workspaceStorage");
-    let rd = match std::fs::read_dir(&root) {
-        Ok(rd) => rd,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(map),
-        Err(error) => anyhow::bail!("cannot enumerate {}: {error}", root.display()),
-    };
-    let mut dirs: Vec<std::path::PathBuf> = rd
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<_, _>>()
-        .map_err(|error| anyhow::anyhow!("cannot enumerate {}: {error}", root.display()))?;
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    match std::fs::read_dir(&root) {
+        Ok(rd) => match rd
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(listed) => dirs = listed,
+            Err(error) => {
+                crate::ingest::warn_source_skip("cursor", &root, &error);
+                incomplete_attribution = Some((
+                    root.clone(),
+                    format!("cannot enumerate {}: {error}", root.display()),
+                ));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            crate::ingest::warn_source_skip("cursor", &root, &error);
+            incomplete_attribution = Some((
+                root.clone(),
+                format!("cannot enumerate {}: {error}", root.display()),
+            ));
+        }
+    }
     dirs.sort();
     for dir in dirs {
         let workspace = dir.join("workspace.json");
@@ -337,8 +419,12 @@ fn workspace_projects(
             Ok(None) => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &workspace, &error);
-                incomplete_attribution
-                    .get_or_insert_with(|| format!("cannot read {}: {error}", workspace.display()));
+                incomplete_attribution.get_or_insert_with(|| {
+                    (
+                        workspace.clone(),
+                        format!("cannot read {}: {error}", workspace.display()),
+                    )
+                });
                 continue;
             }
         };
@@ -347,7 +433,10 @@ fn workspace_projects(
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &workspace, &error);
                 incomplete_attribution.get_or_insert_with(|| {
-                    format!("cannot decode {}: {error}", workspace.display())
+                    (
+                        workspace.clone(),
+                        format!("cannot decode {}: {error}", workspace.display()),
+                    )
                 });
                 continue;
             }
@@ -366,8 +455,12 @@ fn workspace_projects(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &db, &error);
-                incomplete_attribution
-                    .get_or_insert_with(|| format!("cannot inspect {}: {error}", db.display()));
+                incomplete_attribution.get_or_insert_with(|| {
+                    (
+                        db.clone(),
+                        format!("cannot inspect {}: {error}", db.display()),
+                    )
+                });
                 continue;
             }
         }
@@ -375,8 +468,9 @@ fn workspace_projects(
             Ok(c) => c,
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &db, &error);
-                incomplete_attribution
-                    .get_or_insert_with(|| format!("cannot open {}: {error}", db.display()));
+                incomplete_attribution.get_or_insert_with(|| {
+                    (db.clone(), format!("cannot open {}: {error}", db.display()))
+                });
                 continue;
             }
         };
@@ -385,8 +479,12 @@ fn workspace_projects(
             Ok(false) => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &db, &error);
-                incomplete_attribution
-                    .get_or_insert_with(|| format!("cannot inspect {}: {error}", db.display()));
+                incomplete_attribution.get_or_insert_with(|| {
+                    (
+                        db.clone(),
+                        format!("cannot inspect {}: {error}", db.display()),
+                    )
+                });
                 continue;
             }
         }
@@ -395,8 +493,9 @@ fn workspace_projects(
             Ok(None) => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &db, &error);
-                incomplete_attribution
-                    .get_or_insert_with(|| format!("cannot read {}: {error}", db.display()));
+                incomplete_attribution.get_or_insert_with(|| {
+                    (db.clone(), format!("cannot read {}: {error}", db.display()))
+                });
                 continue;
             }
         };
@@ -404,8 +503,12 @@ fn workspace_projects(
             Ok(value) => value,
             Err(error) => {
                 crate::ingest::warn_source_skip("cursor", &db, &error);
-                incomplete_attribution
-                    .get_or_insert_with(|| format!("cannot decode {}: {error}", db.display()));
+                incomplete_attribution.get_or_insert_with(|| {
+                    (
+                        db.clone(),
+                        format!("cannot decode {}: {error}", db.display()),
+                    )
+                });
                 continue;
             }
         };
@@ -424,23 +527,32 @@ fn workspace_projects(
         let db = user.join("globalStorage").join("state.vscdb");
         crate::ingest::warn_source_skip("cursor", &db, &error);
         incomplete_attribution
-            .get_or_insert_with(|| format!("cannot read {}: {error}", db.display()));
+            .get_or_insert_with(|| (db.clone(), format!("cannot read {}: {error}", db.display())));
     }
-    if let (Some(error), Some(session)) = (
-        incomplete_attribution,
-        first_unmapped_conversation(conn, &map)?,
-    ) {
-        anyhow::bail!("workspace attribution for conversation {session} is incomplete: {error}");
-    }
-    Ok(map)
+    let incomplete = match incomplete_attribution {
+        None => None,
+        Some((path, reason)) => {
+            let unmapped = unmapped_conversations(conn, &map)?;
+            (!unmapped.is_empty()).then_some(AttributionGap {
+                path,
+                reason,
+                unmapped,
+                retained: Vec::new(),
+            })
+        }
+    };
+    Ok(Attribution {
+        projects: map,
+        incomplete,
+    })
 }
 
 fn workspace_projects_if_conversations(
     conn: &Connection,
     user: &std::path::Path,
-) -> anyhow::Result<HashMap<String, String>> {
+) -> anyhow::Result<Attribution> {
     if !has_conversations(conn)? {
-        return Ok(HashMap::new());
+        return Ok(Attribution::complete(HashMap::new()));
     }
     workspace_projects(conn, user)
 }
@@ -475,6 +587,16 @@ fn add_references(cid: &str, value: &[u8], references: &mut HashSet<String>) {
             references.insert(format!("bubbleId:{cid}:{bubble}"));
         }
     }
+}
+
+/// The composer a `bubbleId:<composer>:<bubble>` key belongs to. A composer id may itself hold
+/// ':', so the key is not split at its first one: the longest known composer id followed by ':'
+/// owns it, found with one map probe per ':' in the key.
+fn bubble_composer<'a>(key: &'a str, composers: &HashMap<String, u64>) -> Option<&'a str> {
+    let rest = key.strip_prefix("bubbleId:")?;
+    rest.rmatch_indices(':')
+        .map(|(at, _)| &rest[..at])
+        .find(|cid| composers.contains_key(*cid))
 }
 
 /// Every session's token plus an optional raw-record census.
@@ -545,17 +667,7 @@ fn token_snapshot(
         {
             unreferenced_bubbles += 1;
         }
-        let Some((cid, _)) = key
-            .strip_prefix("bubbleId:")
-            .and_then(|rest| rest.split_once(':'))
-        else {
-            if census {
-                fnv_extend(&mut detached_hash, key.as_bytes());
-                fnv_sql_value(&mut detached_hash, &value);
-            }
-            continue;
-        };
-        let Some(hash) = hashes.get_mut(cid) else {
+        let Some(hash) = bubble_composer(&key, &hashes).and_then(|cid| hashes.get_mut(cid)) else {
             if census {
                 fnv_extend(&mut detached_hash, key.as_bytes());
                 fnv_sql_value(&mut detached_hash, &value);
@@ -625,18 +737,22 @@ fn stable_generation_read<T>(
     read: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let before = crate::ingest::sqlite_generation_token(path)?;
-    anyhow::ensure!(
-        opened_generation.is_none_or(|generation| generation == before),
-        "SQLite generation moved before reading {}",
-        path.display()
-    );
+    if opened_generation.is_some_and(|generation| generation != before) {
+        return Err(crate::ingest::SourceMoved(format!(
+            "SQLite generation moved before reading {}",
+            path.display()
+        ))
+        .into());
+    }
     let value = read()?;
     let after = crate::ingest::sqlite_generation_token(path)?;
-    anyhow::ensure!(
-        before == after,
-        "SQLite generation changed while reading {}",
-        path.display()
-    );
+    if before != after {
+        return Err(crate::ingest::SourceMoved(format!(
+            "SQLite generation changed while reading {}",
+            path.display()
+        ))
+        .into());
+    }
     Ok(value)
 }
 
@@ -672,10 +788,19 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
         .and_then(|p| p.as_str())
         .filter(|s| !s.trim().is_empty())
         .or_else(|| tf.get("rawArgs").and_then(|p| p.as_str()));
+    let name = tf
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let mut state = String::new();
     let (input, input_chars) = args
         .map(|s| {
             serde_json::from_str::<serde_json::Value>(s)
-                .map(|v| summarize_tool_input_with_chars(&v))
+                .map(|v| {
+                    state = crate::ingest::task_state(&name, Some(&v));
+                    summarize_tool_input_with_chars(&v)
+                })
                 .unwrap_or_else(|_| cap_str_with_chars(s, EVENT_CAP))
         })
         .unwrap_or_default();
@@ -692,11 +817,7 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
         session: session.to_string(),
         ts,
         kind: "tool",
-        name: tf
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("?")
-            .to_string(),
+        name,
         input,
         output,
         input_chars,
@@ -712,6 +833,7 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
             .unwrap_or_else(|| format!("cursor:{bubble_id}")),
         child_session: String::new(),
         meta: String::new(),
+        state,
     }
 }
 
@@ -768,6 +890,8 @@ fn parse_session(
     let mut events: Vec<Event> = Vec::new();
     let mut healthy = true;
     let mut turn = 0u32;
+    // bubbles are in order: a tool bubble sets the flag the next prose bubble consumes
+    let mut worked = false;
     for h in &headers {
         let Some(bid) = h.get("bubbleId").and_then(|b| b.as_str()) else {
             continue;
@@ -806,6 +930,7 @@ fn parse_session(
                     continue;
                 }
                 tally.row();
+                worked = false;
                 out.push(crate::model::RawMessage {
                     agent: "cursor",
                     project: project.clone(),
@@ -818,6 +943,7 @@ fn parse_session(
                     reply_chars: 0,
                     side: false,
                     parent: String::new(),
+                    reply_shape: Default::default(),
                 });
                 turn += 1;
             }
@@ -830,21 +956,21 @@ fn parse_session(
                     .unwrap_or(false)
                     && !text.trim().is_empty();
                 let mut consumed = visible_text;
+                // a bubble's prose precedes its own call: the call joins it to the next prose
+                if visible_text {
+                    if let Some(last) = out.last_mut() {
+                        crate::ingest::append_reply(last, text);
+                        crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, worked);
+                        worked = false;
+                    }
+                }
                 if let Some(tf) = b.get("toolFormerData") {
                     if tf.is_object() {
                         consumed = true;
                         tally.event();
-                        events.push(tool_event(cid, bid, ts, tf));
-                    }
-                }
-                if visible_text {
-                    if let Some(last) = out.last_mut() {
-                        let chars = crate::ingest::append_capped(
-                            &mut last.reply,
-                            text,
-                            crate::ingest::REPLY_CAP,
-                        );
-                        last.reply_chars += chars;
+                        let event = tool_event(cid, bid, ts, tf);
+                        worked |= crate::ingest::is_work_event(&event);
+                        events.push(event);
                     }
                 }
                 if consumed {
@@ -868,7 +994,13 @@ fn parse_session(
 /// Open the store read-only and collect messages + tool events, reparsing only sessions
 /// whose token moved. A store that cannot open serves the cached conversations.
 pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
-    let discovery = user_dir_checked();
+    collect_discovered(cache, user_dir_checked())
+}
+
+fn collect_discovered(
+    cache: &mut crate::ingest_cache::IngestCache,
+    discovery: Result<Option<std::path::PathBuf>, UserDirError>,
+) -> (Vec<Message>, Vec<Event>) {
     if let Err(error) = &discovery {
         eprintln!(
             "  ! cursor: source discovery failed: {}",
@@ -885,21 +1017,36 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
     let db_path = user
         .as_ref()
         .map(|u| u.join("globalStorage").join("state.vscdb"));
+    crate::fault_injection::park_gate("cursor-open");
     let opened = db_path.as_deref().map(open_ro);
+    crate::fault_injection::park_gate("cursor-read");
     // A database with a defect no retry heals, where nothing was ever published, lists no
     // conversation and keeps its cache, like a schema-absent one, instead of failing closed.
     let durably_blind = db_path
         .as_deref()
         .zip(opened.as_ref())
         .is_some_and(|(path, opened)| {
-            matches!(opened, Err(Some(_)))
+            matches!(opened, Err(OpenFailure { defect: Some(_), .. }))
                 && cache.published_material_under("cursor", path)
                     == crate::ingest_cache::MaterialVerdict::Retained
         });
+    if let (Some(Err(failure)), Some(path)) = (opened.as_ref(), db_path.as_deref()) {
+        let issue = crate::ingest_cache::SourceReadIssue::new(
+            "cursor",
+            path,
+            "source-read-failed",
+            format!("cursor database could not be opened: {}", failure.reason),
+        );
+        cache.record_read_issue(match failure {
+            OpenFailure { moved: true, .. } => issue.moving(),
+            OpenFailure { defect: None, .. } => issue.retryable(),
+            _ => issue,
+        });
+    }
     let conn = opened.and_then(Result::ok);
-    let projects = match (&conn, &user) {
+    let mut attribution = match (&conn, &user) {
         (Some(conn), Some(user)) => match workspace_projects_if_conversations(conn, user) {
-            Ok(projects) => Some(projects),
+            Ok(attribution) => Some(attribution),
             Err(error) => {
                 eprintln!(
                     "  ! cursor: cannot read {}: {}",
@@ -911,11 +1058,38 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
                     ),
                     crate::ingest::terminal_safe(&error)
                 );
+                if let Some(path) = db_path.as_deref() {
+                    cache.record_source_read_issue(
+                        "cursor",
+                        path,
+                        "source-read-failed",
+                        error.to_string(),
+                    );
+                }
                 None
             }
         },
         _ => None,
     };
+    // A conversation an unreadable workspace source leaves unattributed keeps the project its
+    // cached rows carry (the published generation's when no cache holds them) or parses under
+    // "cursor"; the gap is attribution-only since every conversation was read.
+    if let Some(attribution) = attribution.as_mut() {
+        let mut published = cache.published_token_projects("cursor");
+        published.extend(cache.token_projects("cursor"));
+        attribution.retain_published(&published);
+        if let Some(gap) = attribution.incomplete.as_ref() {
+            cache.record_source_read_issue(
+                "cursor",
+                &gap.path,
+                ATTRIBUTION_ISSUE_KIND,
+                gap.reason.clone(),
+            );
+        }
+    }
+    let projects = attribution
+        .as_ref()
+        .map(|attribution| &attribution.projects);
     let snapshot = match (&discovery, &conn, &projects) {
         (Ok(None), _, _) => Some(TokenSnapshot {
             sessions: Vec::new(),
@@ -942,6 +1116,19 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
                     ),
                     crate::ingest::terminal_safe(&error)
                 );
+                if let Some(path) = db_path.as_deref() {
+                    let issue = crate::ingest_cache::SourceReadIssue::new(
+                        "cursor",
+                        path,
+                        "source-read-failed",
+                        error.to_string(),
+                    );
+                    cache.record_read_issue(if error.is::<crate::ingest::SourceMoved>() {
+                        issue.moving()
+                    } else {
+                        issue
+                    });
+                }
                 None
             }
         },
@@ -970,8 +1157,8 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
     let token_by_session: HashMap<String, String> =
         tokens.as_ref().into_iter().flatten().cloned().collect();
     let empty_projects = HashMap::new();
-    let projects = projects.as_ref().unwrap_or(&empty_projects);
-    let panics = std::cell::RefCell::new(Vec::new());
+    let projects = projects.unwrap_or(&empty_projects);
+    let parse_issues = std::cell::RefCell::new(Vec::new());
     let pass = cache.collect_token_cached_keyed_partial(
         "cursor",
         tokens.map(|tokens| {
@@ -999,16 +1186,34 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
                 parse_session(c, path, projects, sid, token)
             }) {
                 Ok((messages, events, true)) => (messages, events, ReadOutcome::Complete),
-                Ok((messages, events, false)) => (messages, events, ReadOutcome::Invalid),
+                // The composer failed whole: none of its rows are vouched for, and the record
+                // below confines the failure to it, so its siblings stay complete.
+                Ok((_, _, false)) => {
+                    parse_issues
+                        .borrow_mut()
+                        .push((path.to_path_buf(), sid.to_owned(), None));
+                    (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+                }
                 Err(panic) => {
-                    panics.borrow_mut().push((path.to_path_buf(), panic.reason));
+                    parse_issues.borrow_mut().push((
+                        path.to_path_buf(),
+                        sid.to_owned(),
+                        Some(panic.reason),
+                    ));
                     (Vec::new(), Vec::new(), ReadOutcome::Skipped)
                 }
             }
         },
     );
-    for (path, reason) in panics.into_inner() {
-        cache.record_source_read_issue("cursor", &path, "source-read-failed", reason);
+    // The record names the composer whose parse failed: a reader must not charge a
+    // database-wide record to the siblings that merely changed since.
+    for (path, session, panicked) in parse_issues.into_inner() {
+        let reason = panicked
+            .unwrap_or_else(|| "the composer's stored rows did not parse completely".to_owned());
+        cache.record_read_issue(
+            crate::ingest_cache::SourceReadIssue::new("cursor", path, "source-read-failed", reason)
+                .for_session(session),
+        );
     }
     (pass.messages, pass.events)
 }
@@ -1020,18 +1225,24 @@ pub struct Cursor;
 fn freshness_tokens_at(
     discovery: Result<Option<std::path::PathBuf>, UserDirError>,
 ) -> crate::ingest::registry::TokenAvailability {
-    tokens_at(discovery, false)
+    tokens_at(discovery, false, Some(&HashMap::new()))
 }
 
 fn intake_tokens_at(
     discovery: Result<Option<std::path::PathBuf>, UserDirError>,
+    published: Option<&HashMap<String, String>>,
 ) -> crate::ingest::registry::TokenAvailability {
-    tokens_at(discovery, true)
+    tokens_at(discovery, true, published)
 }
 
+/// `published` is the project the last-good rows gave each conversation (the parse cache's
+/// view), which an unreadable workspace source then leaves in place, as `collect` does. None
+/// when that cache could not be read: the pending conversations' tokens are then unknown, since
+/// the index may have kept projects this census cannot see, and are hidden rather than listed.
 fn tokens_at(
     discovery: Result<Option<std::path::PathBuf>, UserDirError>,
     intake_keys: bool,
+    published: Option<&HashMap<String, String>>,
 ) -> crate::ingest::registry::TokenAvailability {
     use crate::ingest::registry::{TokenAvailability, TokenReadIssue};
 
@@ -1055,33 +1266,81 @@ fn tokens_at(
             return TokenAvailability::Unreadable(vec![issue]);
         }
     };
-    let projects = match workspace_projects_if_conversations(&conn, &user) {
-        Ok(projects) => projects,
+    let mut attribution = match workspace_projects_if_conversations(&conn, &user) {
+        Ok(attribution) => attribution,
         Err(error) => {
-            return TokenAvailability::Unreadable(vec![TokenReadIssue::new(
-                &path,
-                format!("cannot read {}: {error}", path.display()),
-            )]);
+            return TokenAvailability::Unreadable(vec![census_read_issue(&path, &error)]);
         }
     };
-    match stable_token_snapshot(&conn, &path, &projects, intake_keys) {
-        Ok(snapshot) => TokenAvailability::from_tokens(if intake_keys {
+    attribution.retain_published(published.unwrap_or(&HashMap::new()));
+    match stable_token_snapshot(&conn, &path, &attribution.projects, intake_keys) {
+        Ok(snapshot) => {
+            let pending = attribution.pending();
+            let hidden = published.is_none() && !pending.is_empty();
             let mut tokens: Vec<_> = snapshot
                 .sessions
                 .into_iter()
-                .map(|(session, token)| (crate::intake::token_id(&path, &session), token))
+                .filter(|(session, _)| !hidden || !pending.contains(session))
+                .map(|(session, token)| {
+                    if intake_keys {
+                        (crate::intake::token_id(&path, &session), token)
+                    } else {
+                        (session, token)
+                    }
+                })
                 .collect();
-            if let Some(census) = snapshot.census {
+            if let (true, false, Some(census)) = (intake_keys, hidden, snapshot.census) {
                 tokens.push((crate::intake::token_id(&path, CENSUS_SESSION), census.token));
             }
-            tokens
-        } else {
-            snapshot.sessions
-        }),
-        Err(error) => TokenAvailability::Unreadable(vec![TokenReadIssue::new(
-            &path,
-            format!("cannot read {}: {error}", path.display()),
-        )]),
+            // Every conversation is listed; the unread workspace source only leaves some of
+            // them under the fallback or their published project until it is readable.
+            let issues = attribution
+                .incomplete
+                .map(|gap| {
+                    if hidden {
+                        let reason = format!(
+                            "{}; the parse cache cannot say which project {} conversation(s) \
+                             kept, so their tokens are unlisted",
+                            gap.reason,
+                            pending.len()
+                        );
+                        return vec![TokenReadIssue::new(gap.path, reason).hiding(pending)];
+                    }
+                    let reason = format!(
+                        "{}; {} conversation(s) keep project \"cursor\" and {} their published \
+                         project until it is readable",
+                        gap.reason,
+                        gap.unmapped.len(),
+                        gap.retained.len()
+                    );
+                    vec![
+                        TokenReadIssue::with_kind(gap.path, ATTRIBUTION_ISSUE_KIND, reason)
+                            .provisional(pending),
+                    ]
+                })
+                .unwrap_or_default();
+            TokenAvailability::from_observation(tokens, issues)
+        }
+        Err(error) => TokenAvailability::Unreadable(vec![census_read_issue(&path, &error)]),
+    }
+}
+
+/// A census read that failed: on pages SQLite reads as corrupt, a defect no retry heals.
+fn census_read_issue(
+    path: &std::path::Path,
+    error: &anyhow::Error,
+) -> crate::ingest::registry::TokenReadIssue {
+    let reason = format!("cannot read {}: {error}", path.display());
+    let corrupt = error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+            crate::ingest::sqlite_corrupt(error)
+                || crate::ingest::sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase)
+        })
+    });
+    if corrupt {
+        crate::ingest::registry::TokenReadIssue::with_kind(path, "corrupt-database", reason)
+    } else {
+        crate::ingest::registry::TokenReadIssue::new(path, reason)
     }
 }
 
@@ -1105,7 +1364,14 @@ impl crate::ingest::registry::Adapter for Cursor {
         freshness_tokens_at(user_dir_checked())
     }
     fn intake_tokens(&self) -> crate::ingest::registry::TokenAvailability {
-        intake_tokens_at(user_dir_checked())
+        intake_tokens_at(user_dir_checked(), Some(&HashMap::new()))
+    }
+    fn intake_tokens_with(
+        &self,
+        cache: Option<&crate::ingest_cache::CacheView>,
+    ) -> crate::ingest::registry::TokenAvailability {
+        let published = cache.map(|cache| cache.token_projects("cursor"));
+        intake_tokens_at(user_dir_checked(), published.as_ref())
     }
     fn token_prefix(&self, database: &std::path::Path) -> Option<String> {
         // One database holds every conversation, so its ids carry no database namespace.
@@ -1121,9 +1387,10 @@ impl crate::ingest::registry::Adapter for Cursor {
 #[cfg(test)]
 mod tests {
     use super::{
-        fnv_token, freshness_tokens_at, intake_tokens_at, parse_session, session_tokens,
-        stable_generation_read, token_snapshot, user_dir_candidates_at, user_dir_checked_at,
-        workspace_projects, SCHEMA_ABSENT_SESSION, SCHEMA_ABSENT_TOKEN, TOKEN_SCAN_SQL,
+        collect_discovered, fnv_token, freshness_tokens_at, intake_tokens_at, parse_session,
+        session_tokens, stable_generation_read, token_snapshot, user_dir_candidates_at,
+        user_dir_checked_at, workspace_projects, SCHEMA_ABSENT_SESSION, SCHEMA_ABSENT_TOKEN,
+        TOKEN_SCAN_SQL,
     };
     use crate::ingest::registry::TokenAvailability;
     use rusqlite::{params, Connection};
@@ -1178,7 +1445,10 @@ mod tests {
             .unwrap()
             .success());
         let conn = Connection::open_in_memory().unwrap();
-        assert!(workspace_projects(&conn, &root).unwrap().is_empty());
+        assert!(workspace_projects(&conn, &root)
+            .unwrap()
+            .projects
+            .is_empty());
         conn.execute_batch(
             "CREATE TABLE cursorDiskKV(
                  key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
@@ -1188,8 +1458,12 @@ mod tests {
              INSERT INTO composerHeaders VALUES('c', 'hash');",
         )
         .unwrap();
-        let error = workspace_projects(&conn, &root).unwrap_err();
-        assert!(error.to_string().contains("conversation c"), "{error}");
+        let gap = workspace_projects(&conn, &root)
+            .unwrap()
+            .incomplete
+            .expect("an unreadable workspace.json leaves c unattributed");
+        assert_eq!(gap.path, workspace);
+        assert_eq!(gap.unmapped, vec!["c".to_string()]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1235,7 +1509,7 @@ mod tests {
                  INSERT INTO composerHeaders VALUES ('modern', 'header-workspace');",
             )
             .unwrap();
-        let projects = workspace_projects(&global, &root).unwrap();
+        let projects = workspace_projects(&global, &root).unwrap().projects;
         assert_eq!(
             projects.get("shared").map(String::as_str),
             Some("header-project")
@@ -1253,7 +1527,7 @@ mod tests {
         global
             .execute("CREATE TABLE composerHeaders(composerId TEXT)", [])
             .unwrap();
-        let drifted = workspace_projects(&global, &root).unwrap();
+        let drifted = workspace_projects(&global, &root).unwrap().projects;
         assert_eq!(
             drifted.get("shared").map(String::as_str),
             Some("legacy-project")
@@ -1371,8 +1645,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A workspace root that cannot be enumerated hides no conversation: each is listed on its
+    /// token under the fallback project, named provisional by the issue on that root.
     #[test]
-    fn conversations_refuse_unreadable_workspace_attribution() {
+    fn conversations_under_an_unreadable_workspace_root_are_listed_provisionally() {
         let root =
             std::env::temp_dir().join(format!("agrep-cursor-data-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1392,15 +1668,57 @@ mod tests {
         drop(conn);
         std::fs::write(root.join("workspaceStorage"), b"not a directory").unwrap();
 
-        assert!(matches!(
-            freshness_tokens_at(Ok(Some(root.clone()))),
-            TokenAvailability::Unreadable(_)
-        ));
-        assert!(matches!(
-            intake_tokens_at(Ok(Some(root.clone()))),
-            TokenAvailability::Unreadable(_)
-        ));
+        for intake_keys in [false, true] {
+            let census = if intake_keys {
+                intake_tokens_at(Ok(Some(root.clone())), Some(&HashMap::new()))
+            } else {
+                freshness_tokens_at(Ok(Some(root.clone())))
+            };
+            match census {
+                TokenAvailability::Partial { tokens, issues } => {
+                    assert_eq!(tokens.len(), if intake_keys { 2 } else { 1 }, "{tokens:?}");
+                    assert_eq!(issues.len(), 1, "{issues:?}");
+                    assert_eq!(issues[0].path, root.join("workspaceStorage"));
+                    assert_eq!(issues[0].provisional, vec!["c#part".to_string()]);
+                }
+                other => panic!("intake_keys={intake_keys}: {other:?}"),
+            }
+        }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A composer id holding ':' owns its bubbles: an edit to one moves that composer's token,
+    /// not the token of a composer whose id is a shorter prefix of it.
+    #[test]
+    fn bubble_keys_belong_to_the_longest_composer_id_they_extend() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        for (key, value) in [
+            ("composerData:c", r#"{"createdAt":1}"#),
+            ("composerData:c:part", r#"{"createdAt":1}"#),
+            ("bubbleId:c:u", r#"{"type":1,"text":"short"}"#),
+            ("bubbleId:c:part:b", r#"{"type":1,"text":"before"}"#),
+        ] {
+            conn.execute("INSERT INTO cursorDiskKV VALUES (?1, ?2)", params![key, value])
+                .unwrap();
+        }
+        let tokens = |conn: &Connection| -> HashMap<String, String> {
+            session_tokens(conn, &HashMap::new())
+                .unwrap()
+                .into_iter()
+                .collect()
+        };
+        let before = tokens(&conn);
+        assert_eq!(before.len(), 2);
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
+            params!["bubbleId:c:part:b", r#"{"type":1,"text":"after"}"#],
+        )
+        .unwrap();
+        let after = tokens(&conn);
+        assert_ne!(before["c:part"], after["c:part"]);
+        assert_eq!(before["c"], after["c"]);
     }
 
     #[test]
@@ -1578,28 +1896,50 @@ mod tests {
             )
             .unwrap();
 
-        let projects = workspace_projects(&global, &root).unwrap();
+        let attribution = workspace_projects(&global, &root).unwrap();
         assert_eq!(
-            projects.get("my-composer").map(String::as_str),
+            attribution.projects.get("my-composer").map(String::as_str),
             Some("my-project"),
             "composerHeaders attribution must survive a corrupt per-workspace DB",
         );
+        assert!(attribution.incomplete.is_none());
+        assert!(attribution.projects.contains_key("my-composer"));
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A corrupt workspace database scopes its issue to the conversations no readable source
+    /// maps: those stay unattributed and unlisted, every mapped one is listed on its token.
     #[test]
-    fn corrupt_legacy_workspace_refuses_unmapped_conversation() {
+    fn corrupt_legacy_workspace_scopes_the_issue_to_unmapped_conversations() {
         let root =
             std::env::temp_dir().join(format!("agrep-cursor-unmapped-ws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ws_dir = root.join("workspaceStorage/my-workspace");
+        let other_dir = root.join("workspaceStorage/other-workspace");
         std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
         std::fs::write(
             ws_dir.join("workspace.json"),
             br#"{"folder":"file:///work/my-project"}"#,
         )
         .unwrap();
         std::fs::write(ws_dir.join("state.vscdb"), b"not a sqlite database").unwrap();
+        std::fs::write(
+            other_dir.join("workspace.json"),
+            br#"{"folder":"file:///work/other-project"}"#,
+        )
+        .unwrap();
+        let other = Connection::open(other_dir.join("state.vscdb")).unwrap();
+        other
+            .execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        other
+            .execute(
+                "INSERT INTO ItemTable VALUES ('composer.composerData', ?1)",
+                [r#"{"allComposers":[{"composerId":"other-composer"}]}"#],
+            )
+            .unwrap();
+        drop(other);
 
         let global = Connection::open_in_memory().unwrap();
         global
@@ -1607,12 +1947,128 @@ mod tests {
                 "CREATE TABLE cursorDiskKV(
                      key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
                  INSERT INTO cursorDiskKV VALUES(
-                     'composerData:legacy-composer', 'composer');",
+                     'composerData:legacy-composer', 'composer');
+                 INSERT INTO cursorDiskKV VALUES(
+                     'composerData:other-composer', 'composer');
+                 INSERT INTO cursorDiskKV VALUES(
+                     'composerData:header-composer', 'composer');
+                 CREATE TABLE composerHeaders(
+                     composerId TEXT PRIMARY KEY, workspaceId TEXT);
+                 INSERT INTO composerHeaders VALUES(
+                     'header-composer', 'my-workspace');",
             )
             .unwrap();
 
-        let error = workspace_projects(&global, &root).unwrap_err();
-        assert!(error.to_string().contains("legacy-composer"), "{error}");
+        let attribution = workspace_projects(&global, &root).unwrap();
+        let gap = attribution
+            .incomplete
+            .as_ref()
+            .expect("the corrupt workspace leaves legacy-composer unattributed");
+        assert_eq!(gap.path, ws_dir.join("state.vscdb"));
+        assert_eq!(gap.unmapped, vec!["legacy-composer".to_string()]);
+        assert_eq!(
+            attribution
+                .projects
+                .get("other-composer")
+                .map(String::as_str),
+            Some("other-project")
+        );
+        assert_eq!(
+            attribution
+                .projects
+                .get("header-composer")
+                .map(String::as_str),
+            Some("my-project")
+        );
+        assert!(!gap
+            .unmapped
+            .iter()
+            .any(|session| session == "other-composer"));
+        assert!(!gap
+            .unmapped
+            .iter()
+            .any(|session| session == "header-composer"));
+        // The published project survives the gap in the token; a never-attributed chat takes
+        // the fallback, and both wait on the source.
+        let mut retained = workspace_projects(&global, &root).unwrap();
+        let published =
+            HashMap::from([("legacy-composer".to_string(), "legacy-project".to_string())]);
+        retained.retain_published(&published);
+        assert_eq!(
+            retained.projects.get("legacy-composer").map(String::as_str),
+            Some("legacy-project")
+        );
+        let gap = retained.incomplete.as_ref().unwrap();
+        assert!(gap.unmapped.is_empty());
+        assert_eq!(gap.retained, vec!["legacy-composer".to_string()]);
+        assert_eq!(retained.pending(), vec!["legacy-composer".to_string()]);
+        let before = session_tokens(
+            &global,
+            &HashMap::from([("legacy-composer".to_string(), "legacy-project".to_string())]),
+        )
+        .unwrap();
+        let during = session_tokens(&global, &retained.projects).unwrap();
+        let fallback = session_tokens(&global, &attribution.projects).unwrap();
+        let token = |tokens: &[(String, String)], session: &str| {
+            tokens
+                .iter()
+                .find(|(id, _)| id == session)
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(
+            token(&before, "legacy-composer"),
+            token(&during, "legacy-composer")
+        );
+        assert_ne!(
+            token(&before, "legacy-composer"),
+            token(&fallback, "legacy-composer")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_composers_failed_parse_is_recorded_against_that_composer() {
+        let root =
+            std::env::temp_dir().join(format!("agrep-cursor-failed-parse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let global = root.join("globalStorage");
+        std::fs::create_dir_all(&global).unwrap();
+        let database = global.join("state.vscdb");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value BLOB);")
+            .unwrap();
+        let headers = r#"{"createdAt":1,"fullConversationHeadersOnly":[{"bubbleId":"u"}]}"#;
+        let bad_headers =
+            r#"{"createdAt":1,"fullConversationHeadersOnly":[{"bubbleId":"u"},{"bubbleId":"bad"}]}"#;
+        for (key, value) in [
+            ("composerData:good", headers),
+            ("bubbleId:good:u", r#"{"type":1,"text":"healthy sibling"}"#),
+            ("composerData:bad", bad_headers),
+            ("bubbleId:bad:u", r#"{"type":1,"text":"must not leak"}"#),
+            ("bubbleId:bad:bad", "{not json"),
+        ] {
+            conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        // A first index: nothing published, so the failed composer holds nothing back.
+        let mut cache = crate::ingest_cache::IngestCache::cold();
+        cache.set_published_material(std::collections::HashSet::new());
+        cache.set_published_token_namespaces(Some(std::collections::HashSet::new()));
+        let (messages, _) = collect_discovered(&mut cache, Ok(Some(root.clone())));
+        let texts: Vec<&str> = messages.iter().map(|m| m.text.as_ref()).collect();
+        assert_eq!(texts, ["healthy sibling"]);
+        assert!(cache.output_complete());
+        let issues = cache.source_read_issues();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].path, database);
+        assert_eq!(issues[0].kind, "source-read-failed");
+        assert_eq!(issues[0].session.as_deref(), Some("bad"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

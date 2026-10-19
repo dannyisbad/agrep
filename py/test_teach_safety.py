@@ -598,6 +598,18 @@ class TeachSafetyTest(unittest.TestCase):
         self.assertEqual(health["state"], "refused")
         self.assertEqual(health["refusals"][0]["kind"], "concurrent-edit")
 
+    def test_target_writes_never_leave_an_owner_mutex_in_the_users_directory(self) -> None:
+        target = self.home / ".codex" / "AGENTS.md"
+        target.parent.mkdir()
+        teach._atomic_write_bytes(target, b"first\n", expect_absent=True)
+        with mock.patch.object(teach.os, "write", return_value=0):
+            with self.assertRaisesRegex(OSError, "short write"):
+                teach._atomic_write_bytes(target.with_name("FAILED.md"), b"never\n",
+                                          expect_absent=True)
+        teach._atomic_write_bytes(target, b"second\n")
+        self.assertEqual(target.read_bytes(), b"second\n")
+        self.assertEqual(sorted(entry.name for entry in target.parent.iterdir()), ["AGENTS.md"])
+
     def test_fresh_non_utf8_target_is_not_enrolled(self) -> None:
         proof = self.home / ".codex"
         proof.mkdir()
@@ -859,8 +871,8 @@ class TeachSafetyTest(unittest.TestCase):
         teach._save_state([first, second])
         real_remove = teach._remove_block
 
-        def interrupt(path: Path) -> bool:
-            real_remove(path)
+        def interrupt(path: Path, **kwargs) -> bool:
+            real_remove(path, **kwargs)
             raise KeyboardInterrupt
 
         fence = mock.Mock()
@@ -948,10 +960,10 @@ class TeachSafetyTest(unittest.TestCase):
         first_before = first.read_bytes()
         real_remove = teach._remove_block
 
-        def remove(path: Path) -> bool:
+        def remove(path: Path, **kwargs) -> bool:
             if path == first:
                 raise PermissionError("denied")
-            return real_remove(path)
+            return real_remove(path, **kwargs)
 
         fence = mock.Mock()
         output = io.StringIO()
@@ -967,7 +979,7 @@ class TeachSafetyTest(unittest.TestCase):
                 mock.patch("sys.stdout", new=output):
             self.assertEqual(teach._remove(), 1)
         self.assertEqual(first.read_bytes(), first_before)
-        self.assertEqual(second.read_bytes(), b"SECOND\n\n")
+        self.assertEqual(second.read_bytes(), b"SECOND\n")
         # audit B9: only the removed target is un-enrolled; the failed one
         # keeps its record for the retry
         state = json.loads(teach.STATE_PATH.read_text(encoding="utf-8"))
@@ -998,7 +1010,8 @@ class TeachSafetyTest(unittest.TestCase):
                 mock.patch("sys.stdout", new=output):
             self.assertEqual(teach._remove(), 0)
 
-        self.assertEqual(markdown.read_text(encoding="utf-8"), "MY RULE\n\n")
+        # byte-exact: the separator setup appended leaves with the block
+        self.assertEqual(markdown.read_text(encoding="utf-8"), "MY RULE\n")
         self.assertFalse(skill.exists())
         self.assertFalse(teach.STATE_PATH.exists())
         self.assertIn("retired: block removed", output.getvalue())
@@ -1208,7 +1221,7 @@ class TeachSafetyTest(unittest.TestCase):
                 mock.patch("sys.stdout", new=io.StringIO()):
             self.assertEqual(teach._install(), 0)
 
-        self.assertEqual(old_markdown.read_text(encoding="utf-8"), "MY RULE\n\n")
+        self.assertEqual(old_markdown.read_text(encoding="utf-8"), "MY RULE\n")
         self.assertFalse(old_skill.exists())
         self.assertIn(teach.MARK_PREFIX, current.read_text(encoding="utf-8"))
         state = json.loads(teach.STATE_PATH.read_text(encoding="utf-8"))
@@ -1336,6 +1349,7 @@ class TeachSafetyTest(unittest.TestCase):
         Path(namespace["__file__"]).write_text("watcher", encoding="utf-8")
         namespace["strip"]({
             "mark_prefix": teach.MARK_PREFIX, "mark_end": teach.MARK_END,
+            "block_version": teach.NUDGE_V,
             "targets": [str(link)], "skill_files": [], "task_name": teach._sentinel_task_name(),
         })
         self.assertTrue(link.is_symlink())
@@ -1363,6 +1377,7 @@ class TeachSafetyTest(unittest.TestCase):
         Path(namespace["__file__"]).write_text("watcher", encoding="utf-8")
         namespace["strip"]({
             "mark_prefix": teach.MARK_PREFIX, "mark_end": teach.MARK_END,
+            "block_version": teach.NUDGE_V,
             "targets": [str(target)], "skill_files": [], "task_name": teach._sentinel_task_name(),
         })
         self.assertEqual(target.read_bytes(), original)
@@ -1380,7 +1395,8 @@ class TeachSafetyTest(unittest.TestCase):
         ).encode("utf-8")
         malformed.write_bytes(damaged)
         bad = subprocess.run(
-            [perl, str(splicer), str(malformed), teach.MARK_PREFIX, teach.MARK_END],
+            [perl, str(splicer), str(malformed), teach.MARK_PREFIX, teach.MARK_END,
+             str(malformed), "", str(teach.NUDGE_V)],
             capture_output=True)
         self.assertEqual(bad.returncode, 3)
         self.assertEqual(malformed.read_bytes(), damaged)
@@ -1393,10 +1409,88 @@ class TeachSafetyTest(unittest.TestCase):
         suffix = b"TAIL\r\n"
         valid.write_bytes(prefix + block + suffix)
         good = subprocess.run(
-            [perl, str(splicer), str(valid), teach.MARK_PREFIX, teach.MARK_END],
+            [perl, str(splicer), str(valid), teach.MARK_PREFIX, teach.MARK_END,
+             str(valid), "", str(teach.NUDGE_V)],
             capture_output=True)
         self.assertEqual(good.returncode, 0)
         self.assertEqual(valid.read_bytes(), prefix + suffix)
+
+    # W16: an uninstall strips its own block and any older one, never a newer
+    # install's (a later agrep upgraded it; the old sentinel is not its owner)
+    def _versioned(self, name: str, *versions: int) -> tuple[Path, dict[int, bytes]]:
+        blocks = {
+            version: (f"{teach.MARK_PREFIX} v{version} -->\nowned v{version}\n"
+                      f"{teach.MARK_END}\n").encode("utf-8")
+            for version in versions}
+        target = self.root / name
+        target.write_bytes(b"USER\n\n" + b"\n".join(blocks[v] for v in versions) + b"TAIL\n")
+        return target, blocks
+
+    def test_posix_sentinel_splicer_keeps_a_newer_block_and_strips_older_ones(self) -> None:
+        perl = shutil.which("perl")
+        if not perl:
+            self.skipTest("perl unavailable")
+        splicer = self.data / "sentinel_strip.pl"
+        splicer.write_text(teach._SENTINEL_STRIP_PERL, encoding="utf-8")
+        current, older, newer = teach.NUDGE_V, teach.NUDGE_V - 1, teach.NUDGE_V + 1
+
+        def strip(target: Path, *extra: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [perl, str(splicer), str(target), teach.MARK_PREFIX, teach.MARK_END,
+                 str(target), "", *extra], capture_output=True)
+
+        kept, blocks = self._versioned("newer.md", newer)
+        self.assertEqual(strip(kept, str(current)).returncode, 0)
+        self.assertEqual(kept.read_bytes(), b"USER\n\n" + blocks[newer] + b"TAIL\n")
+
+        own, _ = self._versioned("own-and-older.md", older, current)
+        self.assertEqual(strip(own, str(current)).returncode, 0)
+        self.assertEqual(own.read_bytes(), b"USER\n\n\nTAIL\n")
+
+        mixed, blocks = self._versioned("mixed.md", older, newer)
+        self.assertEqual(strip(mixed, str(current)).returncode, 0)
+        self.assertEqual(mixed.read_bytes(), b"USER\n\n\n" + blocks[newer] + b"TAIL\n")
+
+        unscoped, blocks = self._versioned("unscoped.md", current)
+        for missing in ((), ("",), ("x",)):
+            with self.subTest(version=missing):
+                self.assertEqual(strip(unscoped, *missing).returncode, 3)
+                self.assertEqual(
+                    unscoped.read_bytes(), b"USER\n\n" + blocks[current] + b"TAIL\n")
+
+    def test_windows_watcher_keeps_a_newer_block_and_strips_older_ones(self) -> None:
+        parsed = ast.parse(teach._SENTINEL_WATCH_PY)
+        selected = [node for node in parsed.body
+                    if isinstance(node, ast.FunctionDef) and node.name in ("_atomic", "strip")]
+        namespace = {
+            "os": __import__("os"), "re": __import__("re"),
+            "tempfile": __import__("tempfile"), "Path": Path,
+            "subprocess": mock.Mock(), "DIR": self.data,
+            "__file__": str(self.data / "sentinel_watch.py"),
+        }
+        exec(compile(ast.Module(body=selected, type_ignores=[]), "<sentinel>", "exec"),
+             namespace)
+        current, older, newer = teach.NUDGE_V, teach.NUDGE_V - 1, teach.NUDGE_V + 1
+        kept, kept_blocks = self._versioned("newer.md", newer)
+        own, _ = self._versioned("own-and-older.md", older, current)
+        mixed, mixed_blocks = self._versioned("mixed.md", older, newer)
+        unscoped, unscoped_blocks = self._versioned("unscoped.md", current)
+        Path(namespace["__file__"]).write_text("watcher", encoding="utf-8")
+
+        def strip(targets: list[Path], **cfg: object) -> None:
+            namespace["strip"]({
+                "mark_prefix": teach.MARK_PREFIX, "mark_end": teach.MARK_END,
+                "targets": [str(t) for t in targets], "skill_files": [],
+                "task_name": teach._sentinel_task_name(), **cfg})
+
+        strip([kept, own, mixed], block_version=current)
+        self.assertEqual(kept.read_bytes(), b"USER\n\n" + kept_blocks[newer] + b"TAIL\n")
+        self.assertEqual(own.read_bytes(), b"USER\n\n\nTAIL\n")
+        self.assertEqual(mixed.read_bytes(), b"USER\n\n\n" + mixed_blocks[newer] + b"TAIL\n")
+        strip([unscoped])
+        strip([unscoped], block_version="39")
+        self.assertEqual(
+            unscoped.read_bytes(), b"USER\n\n" + unscoped_blocks[current] + b"TAIL\n")
 
     def _fenced_remove(self, output: io.StringIO) -> int:
         with mock.patch.object(

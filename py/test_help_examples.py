@@ -102,6 +102,14 @@ class VerbHelpExamples(unittest.TestCase):
             self.assertIn("--no-side", flat)
             self.assertIn("hide side chats", flat)
             self.assertIn("ranking only", flat)
+        # the example that promised side chats hidden must name the flag that does it
+        examples = [line for line in _help_of(search.main, ["--help"]).splitlines()
+                    if line.strip().startswith("agrep ")]
+        side_examples = [line for line in examples if "side" in line]
+        self.assertTrue(side_examples)
+        for line in side_examples:
+            self.assertIn("--no-side", line)
+            self.assertNotIn("--no-who", line)
 
     def test_chats_help_describes_the_content_lookup_it_runs(self) -> None:
         flat = " ".join(_help_of(search.chats_main, ["--help"]).split())

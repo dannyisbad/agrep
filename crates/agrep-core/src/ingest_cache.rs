@@ -29,7 +29,7 @@ use crate::model::{Event, Message};
 
 /// Increment when entry layout or parse semantics change.
 /// Supported prior generations retain last-good entries until their source reparse completes.
-pub const CACHE_VERSION: u32 = 37;
+pub const CACHE_VERSION: u32 = 38;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -80,6 +80,7 @@ struct CMsg {
     model_source: std::sync::Arc<str>,
     reply: std::sync::Arc<str>,
     reply_chars: usize,
+    reply_shape: std::sync::Arc<crate::model::ReplyShape>,
     side: bool,
     parent: std::sync::Arc<str>,
 }
@@ -98,6 +99,8 @@ enum CacheIdentity {
         change: Vec<crate::ingest::registry::ChangeToken>,
         content_sha256: [u8; 32],
     },
+    /// The packed rows a released-row record carries; see [`pack_released`].
+    Released(Vec<u8>),
 }
 
 #[cfg(windows)]
@@ -206,10 +209,35 @@ struct CacheFile {
     version: u32,
     entries: HashMap<String, Entry>,
 }
-#[derive(Serialize)]
 struct CacheFileRef<'a> {
     version: u32,
     entries: &'a HashMap<String, Entry>,
+}
+
+/// The derived wire shape, with the released-row record (at most one) serialized before every
+/// source entry: a bounded reader of the payload prelude then counts sources exactly.
+impl Serialize for CacheFileRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeStruct};
+
+        struct RecordsFirst<'a>(&'a HashMap<String, Entry>);
+        impl Serialize for RecordsFirst<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(Some(self.0.len()))?;
+                let records = self.0.iter().filter(|(key, _)| released_key(key));
+                let sources = self.0.iter().filter(|(key, _)| !released_key(key));
+                for (key, entry) in records.chain(sources) {
+                    map.serialize_entry(key, entry)?;
+                }
+                map.end()
+            }
+        }
+
+        let mut file = serializer.serialize_struct("CacheFileRef", 2)?;
+        file.serialize_field("version", &self.version)?;
+        file.serialize_field("entries", &RecordsFirst(self.entries))?;
+        file.end()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,11 +360,13 @@ pub fn current_cache_writer_build_id() -> String {
     WriterBuildId::current().as_str().to_owned()
 }
 
-/// Atomically re-own validated entries, preserving any required source reparse.
+/// Atomically re-own validated entries, preserving any required source reparse. Returns the
+/// count of sources adopted: the entries that are not a released-row record.
 pub fn adopt_foreign_cache(path: &Path) -> Result<usize, &'static str> {
-    let (entries, _generation, _backing) = decode_cache_owned(path, WriterBuildId::current(), true)
-        .map_err(CacheDecodeRefusal::label)?;
-    let adopted = entries.len();
+    let (entries, _generation, _backing) =
+        decode_cache_owned(path, WriterBuildId::current(), true, DecodeLane::Writer)
+            .map_err(CacheDecodeRefusal::label)?;
+    let adopted = entries.keys().filter(|key| !released_key(key)).count();
     let cache = IngestCache::base(entries, CacheBacking::Rewrite);
     cache
         .save(path)
@@ -428,7 +458,7 @@ enum CacheBacking {
 struct LegacyEntryV15 {
     mtime: i64,
     size: u64,
-    msgs: Vec<CMsg>,
+    msgs: Vec<LegacyCMsgV37>,
     event_keys: Vec<CEventKey>,
     legacy_had_events: bool,
     legacy_needs_reparse: bool,
@@ -438,6 +468,121 @@ struct LegacyEntryV15 {
 struct LegacyCacheFileV15 {
     version: u32,
     entries: HashMap<String, LegacyEntryV15>,
+}
+
+/// The exact row layout generations 18..=37 wrote (no reply shape). Bincode is positional, so
+/// those payloads and journals decode through this shape; every entry then reparses.
+#[derive(Deserialize, Serialize)]
+struct LegacyCMsgV37 {
+    agent: String,
+    project: std::sync::Arc<str>,
+    session: std::sync::Arc<str>,
+    ts: i64,
+    turn: u32,
+    text: std::sync::Arc<str>,
+    who: std::sync::Arc<str>,
+    model: std::sync::Arc<str>,
+    model_source: std::sync::Arc<str>,
+    reply: std::sync::Arc<str>,
+    reply_chars: usize,
+    side: bool,
+    parent: std::sync::Arc<str>,
+}
+
+impl LegacyCMsgV37 {
+    #[cfg(test)]
+    fn from(m: &Message) -> Self {
+        let row = CMsg::from(m);
+        LegacyCMsgV37 {
+            agent: row.agent,
+            project: row.project,
+            session: row.session,
+            ts: row.ts,
+            turn: row.turn,
+            text: row.text,
+            who: row.who,
+            model: row.model,
+            model_source: row.model_source,
+            reply: row.reply,
+            reply_chars: row.reply_chars,
+            side: row.side,
+            parent: row.parent,
+        }
+    }
+
+    fn current(row: LegacyCMsgV37) -> CMsg {
+        CMsg {
+            agent: row.agent,
+            project: row.project,
+            session: row.session,
+            ts: row.ts,
+            turn: row.turn,
+            text: row.text,
+            who: row.who,
+            model: row.model,
+            model_source: row.model_source,
+            reply: row.reply,
+            reply_chars: row.reply_chars,
+            reply_shape: Default::default(),
+            side: row.side,
+            parent: row.parent,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct LegacyEntryV37 {
+    mtime: i64,
+    size: u64,
+    identity: Option<CacheIdentity>,
+    msgs: Vec<LegacyCMsgV37>,
+    event_keys: Vec<CEventKey>,
+    legacy_had_events: bool,
+    legacy_needs_reparse: bool,
+}
+
+impl LegacyEntryV37 {
+    fn into_entry(self) -> Entry {
+        Entry {
+            mtime: self.mtime,
+            size: self.size,
+            identity: self.identity,
+            msgs: self.msgs.into_iter().map(LegacyCMsgV37::current).collect(),
+            event_keys: self.event_keys,
+            legacy_had_events: self.legacy_had_events,
+            legacy_needs_reparse: true,
+        }
+    }
+
+    /// The v37 wire form of a current entry, for tests that stage an older generation.
+    #[cfg(test)]
+    fn downgrade(entry: &Entry) -> Self {
+        LegacyEntryV37 {
+            mtime: entry.mtime,
+            size: entry.size,
+            identity: entry.identity.clone(),
+            msgs: entry
+                .msgs
+                .iter()
+                .map(|row| LegacyCMsgV37::from(&row.to_msg()))
+                .collect(),
+            event_keys: entry.event_keys.clone(),
+            legacy_had_events: entry.legacy_had_events,
+            legacy_needs_reparse: entry.legacy_needs_reparse,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct LegacyCacheFileV37 {
+    version: u32,
+    entries: HashMap<String, LegacyEntryV37>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LegacyJournalDeltaV37 {
+    upserts: Vec<(String, LegacyEntryV37)>,
+    deletes: Vec<String>,
 }
 
 /// Message.agent is &'static str; resolve a cached string against the registry so a
@@ -466,6 +611,7 @@ impl CMsg {
             model_source: m.model_source.clone(),
             reply: m.reply.clone(),
             reply_chars: m.reply_chars,
+            reply_shape: m.reply_shape.clone(),
             side: m.side,
             parent: m.parent.clone(),
         }
@@ -483,11 +629,16 @@ impl CMsg {
             model_source: self.model_source.clone(),
             reply: self.reply.clone(),
             reply_chars: self.reply_chars,
+            reply_shape: self.reply_shape.clone(),
             side: self.side,
             parent: self.parent.clone(),
         }
     }
 }
+
+/// `(agent, database namespace, session)` of a token conversation: one session id may name
+/// different conversations in different databases of the same agent.
+type TokenConversation = (String, String, String);
 
 /// A row's text as a map key: equal only to the same text whole, but hashed by its length and
 /// 16 bytes at its start, middle and end alone, so a long text costs no more than a short one.
@@ -631,8 +782,8 @@ struct ReleasedRows {
     sessions: HashSet<String>,
 }
 
-/// Every agent's [`ReleasedRows`] against `seal`'s generation, sorted so equal records pack equal.
-#[derive(Deserialize, Serialize)]
+/// A 0.4.2 record: every agent's rows as JSON in the key, naming its seal inside.
+#[derive(Deserialize)]
 struct PackedReleased {
     seal: String,
     agents: std::collections::BTreeMap<String, PackedAgent>,
@@ -641,19 +792,34 @@ struct PackedReleased {
 /// One agent's rows as `(session, timestamp, digest, count)`, then its sessions gone whole.
 type PackedAgent = (Vec<(String, i64, String, usize)>, Vec<String>);
 
-/// One reserved key packs every record staged with the cache, so the base's entry count stays its
-/// count of sources. Every key under `\0released` is a record, and only this pass's survives it.
+/// Every agent's [`ReleasedRows`] as the entry packs them: sessions interned once per agent, each
+/// row `(session index, timestamp, digest, count)`, then the indexes of sessions gone whole.
+#[derive(Deserialize, Serialize)]
+struct PackedReleasedRows {
+    agents: std::collections::BTreeMap<String, PackedAgentRows>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PackedAgentRows {
+    sessions: Vec<String>,
+    rows: Vec<(u32, i64, [u8; 16], u32)>,
+    gone: Vec<u32>,
+}
+
+/// One reserved key, naming the sealed generation, packs every record staged with the cache, so
+/// the base's entry count stays its count of sources. Every key under `\0released` is a record,
+/// and only this pass's survives it.
 const RELEASED_KEY: &str = "\0released\0";
 
 fn released_key(key: &str) -> bool {
     key.starts_with("\0released")
 }
 
-fn released_entry() -> Entry {
+fn released_entry(packed: Vec<u8>) -> Entry {
     Entry {
         mtime: 0,
         size: 0,
-        identity: None,
+        identity: Some(CacheIdentity::Released(packed)),
         msgs: Vec::new(),
         event_keys: Vec::new(),
         legacy_had_events: false,
@@ -676,48 +842,79 @@ fn parse_hex16(text: &str) -> Option<[u8; 16]> {
     Some(bytes)
 }
 
-/// The record key of `released`, against the generation `seal` names; None when it records nothing.
-fn pack_released(seal: &str, released: &HashMap<String, ReleasedRows>) -> Option<String> {
+/// The record of `released` against the generation `seal` names, as `(key, entry)`; None when it
+/// records nothing.
+fn pack_released(seal: &str, released: &HashMap<String, ReleasedRows>) -> Option<(String, Entry)> {
     let mut agents = std::collections::BTreeMap::new();
     for (agent, records) in released {
         if records.rows.is_empty() && records.sessions.is_empty() {
             continue;
         }
-        let rows = records.rows.iter();
-        let mut rows: Vec<_> = rows
-            .map(|((session, ts, digest), count)| (session.clone(), *ts, hex16(digest), *count))
+        let mut names: Vec<&str> = records
+            .rows
+            .keys()
+            .map(|(session, _, _)| session.as_str())
+            .chain(records.sessions.iter().map(String::as_str))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let index = |session: &str| names.binary_search(&session).ok().map(|at| at as u32);
+        let mut rows: Vec<(u32, i64, [u8; 16], u32)> = records
+            .rows
+            .iter()
+            .filter_map(|((session, ts, digest), count)| {
+                Some((index(session)?, *ts, *digest, u32::try_from(*count).ok()?))
+            })
             .collect();
         rows.sort_unstable();
-        let mut sessions: Vec<String> = records.sessions.iter().cloned().collect();
-        sessions.sort_unstable();
-        agents.insert(agent.clone(), (rows, sessions));
+        let mut gone: Vec<u32> = records
+            .sessions
+            .iter()
+            .filter_map(|session| index(session))
+            .collect();
+        gone.sort_unstable();
+        agents.insert(
+            agent.clone(),
+            PackedAgentRows {
+                sessions: names.into_iter().map(str::to_owned).collect(),
+                rows,
+                gone,
+            },
+        );
     }
     if agents.is_empty() {
         return None;
     }
-    let packed = PackedReleased {
-        seal: seal.to_owned(),
-        agents,
-    };
-    serde_json::to_string(&packed)
-        .ok()
-        .map(|json| format!("{RELEASED_KEY}{json}"))
+    let packed = bincode::serialize(&PackedReleasedRows { agents }).ok()?;
+    Some((format!("{RELEASED_KEY}{seal}"), released_entry(packed)))
 }
 
-/// The [`ReleasedRows`] of each agent `entries` record against the generation `seal` names; none
-/// unless exactly one record names it.
-fn recorded_released_rows(
-    entries: &HashMap<String, Entry>,
-    seal: &str,
-) -> HashMap<String, ReleasedRows> {
-    let mut packs = entries
-        .keys()
-        .filter_map(|key| key.strip_prefix(RELEASED_KEY))
-        .filter_map(|json| serde_json::from_str::<PackedReleased>(json).ok())
-        .filter(|packed| packed.seal == seal);
-    let (Some(packed), None) = (packs.next(), packs.next()) else {
-        return HashMap::new();
+fn unpack_released(entry: &Entry) -> Option<HashMap<String, ReleasedRows>> {
+    let Some(CacheIdentity::Released(packed)) = entry.identity.as_ref() else {
+        return None;
     };
+    let packed: PackedReleasedRows = bincode::deserialize(packed).ok()?;
+    let mut released: HashMap<String, ReleasedRows> = HashMap::new();
+    for (agent, agent_rows) in packed.agents {
+        let records = released.entry(agent).or_default();
+        let session = |index: u32| agent_rows.sessions.get(index as usize).cloned();
+        for (at, ts, digest, count) in &agent_rows.rows {
+            if let Some(session) = session(*at).filter(|_| *count > 0) {
+                *records.rows.entry((session, *ts, *digest)).or_default() += *count as usize;
+            }
+        }
+        records
+            .sessions
+            .extend(agent_rows.gone.iter().filter_map(|at| session(*at)));
+    }
+    Some(released)
+}
+
+fn unpack_legacy_released(json: &str, seal: &str) -> Option<HashMap<String, ReleasedRows>> {
+    let packed = serde_json::from_str::<PackedReleased>(json).ok()?;
+    if packed.seal != seal {
+        return None;
+    }
     let mut released: HashMap<String, ReleasedRows> = HashMap::new();
     for (agent, (rows, sessions)) in packed.agents {
         let records = released.entry(agent).or_default();
@@ -728,7 +925,27 @@ fn recorded_released_rows(
         }
         records.sessions.extend(sessions);
     }
-    released
+    Some(released)
+}
+
+/// The [`ReleasedRows`] of each agent `entries` record against the generation `seal` names; none
+/// unless exactly one record names it.
+fn recorded_released_rows(
+    entries: &HashMap<String, Entry>,
+    seal: &str,
+) -> HashMap<String, ReleasedRows> {
+    let mut packs = entries.iter().filter_map(|(key, entry)| {
+        let rest = key.strip_prefix(RELEASED_KEY)?;
+        if rest == seal {
+            unpack_released(entry)
+        } else {
+            unpack_legacy_released(rest, seal)
+        }
+    });
+    match (packs.next(), packs.next()) {
+        (Some(packed), None) => packed,
+        _ => HashMap::new(),
+    }
 }
 
 pub struct IngestCache {
@@ -761,6 +978,23 @@ pub struct IngestCache {
     /// A guard fired without a complete last-good cache fallback. Publishing derived outputs from
     /// this pass would drop prior rows; callers must abort when a prior generation exists.
     output_incomplete: bool,
+    /// A read that failed with no last-good copy left output incomplete where a published
+    /// generation may hold its rows: unlike `output_incomplete`, an explicit rebuild may publish
+    /// without them ([`Self::output_complete_past_unreadable`]).
+    unreadable_unserved: bool,
+    /// A failed token read with no last-good copy was let through because nothing published
+    /// could hold its rows; such a pass may not publish a generation of no rows at all.
+    admitted_unpublished_failure: bool,
+    /// Failed token conversations with no last-good copy that neither a base nor the namespace
+    /// record proves unpublished: output stays incomplete until a read of the verified published
+    /// generation does ([`Self::admit_unpublished_token_conversations`]).
+    unproven_token_failures: Vec<TokenConversation>,
+    /// Malformed token conversations this pass served from a last good copy or proved
+    /// unpublished: a durable fact a published snapshot may stand beside. A panic is not one;
+    /// the next pass retries it.
+    settled_token_failures: HashSet<TokenConversation>,
+    /// The staleness token of each failed token conversation no last-good copy served.
+    failed_token_identities: HashMap<TokenConversation, String>,
     /// Automatic event repair retains old entries as fallback but forces every Stat/
     /// Token source through its parser so the otherwise-uncached event stream is complete.
     force_reparse: bool,
@@ -773,6 +1007,9 @@ pub struct IngestCache {
     repeated_absent_agents: HashSet<String>,
     /// The same two-observation witness for single store roots of a still-present agent.
     repeated_absent_roots: Vec<(String, PathBuf)>,
+    /// Per token agent, the project the published generation's rows gave each conversation;
+    /// read only for an agent whose attribution source the preflight could not read.
+    published_token_projects: HashMap<String, HashMap<String, String>>,
     /// Epoch nanoseconds before this run's first source stat; stamps not safely older are
     /// recorded racy. `None` keeps every stamp trusted for callers that never set it.
     racy_scan_start_ns: Option<i64>,
@@ -832,6 +1069,8 @@ pub struct IngestCache {
     coverage_expected_tokens: HashMap<String, Vec<(String, String)>>,
     source_stamps: HashMap<PathBuf, crate::ingest::registry::SourceStatStamp>,
     source_read_issues: Vec<SourceReadIssue>,
+    /// Every entry's source path, built on first use and dropped when a key is added or removed.
+    source_paths: std::sync::OnceLock<HashSet<PathBuf>>,
 }
 
 #[cfg(all(windows, test))]
@@ -936,9 +1175,10 @@ fn source_relative(path: &Path, root: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
-/// Whether `path`, NotFound beneath `root`, may still exist behind an ancestor no walk follows: a
+/// Whether `path`, absent beneath `root`, may still exist behind an ancestor no walk follows: a
 /// link (a day directory moved onto a drive since unmounted) or anything not proven a directory.
-/// Only beneath directories proven real is NotFound a deletion.
+/// Beneath directories proven real, a plain file where one was, or an ancestor a stat proves
+/// gone, absence is a deletion, as the preflight walk judges it.
 fn absence_unproven(root: &Path, path: &Path) -> bool {
     let Some(relative) = source_relative(path, root) else {
         return false;
@@ -952,7 +1192,10 @@ fn absence_unproven(root: &Path, path: &Path) -> bool {
         ancestor.push(component);
         match fs::symlink_metadata(&ancestor) {
             Ok(metadata) if metadata.is_dir() => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Ok(metadata) if metadata.is_file() => return false,
+            Err(error) if crate::ingest::registry::stat_proves_absent(&ancestor, &error) => {
+                return false
+            }
             _ => return true,
         }
     }
@@ -966,7 +1209,9 @@ pub(crate) fn epoch_ns(time: std::time::SystemTime) -> Option<i64> {
 
 /// Racy: a same-size rewrite could still receive this stamp, because it is not safely older
 /// than the scan start. Far-future stamps are not: a later write stamps the present, and
-/// re-verifying a future-dated file would repeat every run. The slack absorbs NFS clock skew.
+/// re-verifying a future-dated file would repeat every run. The window is `(scan start - margin,
+/// now + max(margin, 2 s)]` on the stamping clock: a remote clock more than 2 s ahead, or behind
+/// by more than the margin, can stamp a write made during the scan outside it.
 #[cfg(not(windows))]
 pub(crate) fn racy_stamp(mtime_ns: i64, scan_start_ns: i64, now_ns: i64) -> bool {
     const FUTURE_SLACK_NS: i64 = 2_000_000_000;
@@ -1159,6 +1404,7 @@ pub enum CacheDecodeRefusal {
     PayloadDigestMismatch,
     StorageVersion,
     PayloadShape,
+    StaleJournal,
 }
 
 impl CacheDecodeRefusal {
@@ -1172,12 +1418,13 @@ impl CacheDecodeRefusal {
             Self::PayloadDigestMismatch => "cache digest mismatch",
             Self::StorageVersion => "cache version mismatch",
             Self::PayloadShape => "undecodable cache payload",
+            Self::StaleJournal => "cache journal behind its last commit",
         }
     }
 
     /// The bytes were read and this build conclusively cannot decode them, so no retry changes
     /// the verdict. Such a base is a broken derived artifact agrep owns: recovery discards and
-    /// reparses it. Missing/unreadable/foreign bases are not this - see the callers' refusals.
+    /// reparses it. Missing/unreadable/foreign/stale bases are not this - see the callers' refusals.
     pub fn is_undecodable(self) -> bool {
         matches!(
             self,
@@ -1198,7 +1445,7 @@ impl std::fmt::Display for CacheDecodeRefusal {
 
 /// These generations share the current entry layout but require current parser semantics.
 fn reparse_compatible_cache_version(version: u32) -> bool {
-    matches!(version, 18..=19 | 21..=36)
+    matches!(version, 18..=19 | 21..=37)
 }
 
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
@@ -1207,6 +1454,17 @@ fn decode_cache_payload(
     _path: &Path,
 ) -> Result<(HashMap<String, Entry>, CacheGeneration, bool), CacheDecodeRefusal> {
     let mut refusal = CacheDecodeRefusal::PayloadShape;
+    // generations 18..=37 wrote rows without a reply shape: their own layout decodes them
+    if read_u32(bytes, 0).is_some_and(reparse_compatible_cache_version) {
+        if let Ok(cache) = bincode::deserialize::<LegacyCacheFileV37>(bytes) {
+            let entries = cache
+                .entries
+                .into_iter()
+                .map(|(key, entry)| (key, entry.into_entry()))
+                .collect();
+            return Ok((entries, CacheGeneration::LegacyReparse, false));
+        }
+    }
     if let Ok(cache) = bincode::deserialize::<CacheFile>(bytes) {
         if cache.version == CACHE_VERSION {
             #[cfg(windows)]
@@ -1232,6 +1490,8 @@ fn decode_cache_payload(
                 };
             return Ok((cache.entries, generation, true));
         }
+        // a payload carrying an older version in the current layout (a generation staged for
+        // an upgrade test) still retains its rows for reparse
         if reparse_compatible_cache_version(cache.version) {
             let mut entries = cache.entries;
             for entry in entries.values_mut() {
@@ -1274,7 +1534,7 @@ fn decode_cache_payload(
                                 mtime: entry.mtime,
                                 size: entry.size,
                                 identity: None,
-                                msgs: entry.msgs,
+                                msgs: entry.msgs.into_iter().map(LegacyCMsgV37::current).collect(),
                                 event_keys: entry.event_keys,
                                 legacy_had_events: entry.legacy_had_events,
                                 legacy_needs_reparse: true,
@@ -1308,7 +1568,7 @@ fn decode_cache_payload(
                     mtime: entry.mtime,
                     size: entry.size,
                     identity: None,
-                    msgs: entry.msgs,
+                    msgs: entry.msgs.into_iter().map(LegacyCMsgV37::current).collect(),
                     event_keys: Vec::new(),
                     legacy_had_events,
                     legacy_needs_reparse: true,
@@ -1343,7 +1603,7 @@ fn decode_cache_payload(
 struct LegacyEntryV8 {
     mtime: i64,
     size: u64,
-    msgs: Vec<CMsg>,
+    msgs: Vec<LegacyCMsgV37>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1716,6 +1976,70 @@ fn cache_journal_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.journal"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once between a decode's head read and its journal read, where a lock-free reader
+    /// can see a commit land; tests stand a commit there.
+    static BETWEEN_HEAD_AND_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The journal position a cache commit established: its base instance and the frame sequence.
+/// Recorded beside the cache; a decode that replays to an earlier position has lost frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheHead {
+    instance: [u8; 16],
+    sequence: u64,
+}
+
+impl CacheHead {
+    /// The journal frame sequence this commit established; 0 after a base rewrite.
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    fn encode(self) -> String {
+        format!("{}:{}\n", hex16(&self.instance), self.sequence)
+    }
+
+    fn parse(text: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(text).ok()?;
+        let (instance, sequence) = text.trim().split_once(':')?;
+        Some(CacheHead {
+            instance: parse_hex16(instance)?,
+            sequence: sequence.parse().ok()?,
+        })
+    }
+}
+
+const CACHE_HEAD_MAX_BYTES: usize = 64;
+
+/// The sidecar naming the head of the last commit; a lost journal leaves the base behind it.
+pub fn cache_head_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "ingest-cache".into());
+    path.with_file_name(format!("{name}.head"))
+}
+
+fn read_cache_head(path: &Path) -> Option<CacheHead> {
+    read_regular_prefix(&cache_head_path(path), CACHE_HEAD_MAX_BYTES)
+        .ok()
+        .flatten()
+        .and_then(|bytes| CacheHead::parse(&bytes))
+}
+
+/// Record the head a commit established. The head is the evidence that dates the base, so a
+/// write that fails after the cache commit fails the pass naming the path: a base without its
+/// head would be adopted as whole by the next decode, exactly what the head exists to prevent.
+fn write_cache_head(path: &Path, head: CacheHead) -> anyhow::Result<()> {
+    let sidecar = cache_head_path(path);
+    displace_sidecar_directory(&sidecar, "head")?;
+    crate::cache::write_bytes_atomic(&sidecar, head.encode().as_bytes())
+        .map_err(|error| anyhow::anyhow!("cannot write {}: {error}", sidecar.display()))
+}
+
 fn encode_journal_header(instance: [u8; 16]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(JOURNAL_HEADER_LEN);
     bytes.extend_from_slice(CACHE_JOURNAL_MAGIC);
@@ -2020,11 +2344,51 @@ fn open_regular_journal(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// What replaying the journal found: its frames, or no readable journal at all.
+enum JournalReplay {
+    Replayed(JournalCursor),
+    /// The journal could not be read (denied, a link or directory in its place, torn mid-read):
+    /// persistent under the index lock, a race without it.
+    Unreadable(JournalCursor),
+}
+
 fn replay_journal(
     path: &Path,
     instance: [u8; 16],
     entries: &mut HashMap<String, Entry>,
-) -> JournalCursor {
+) -> JournalReplay {
+    replay_journal_frames(path, instance, |payload, cursor| {
+        let delta = bincode::deserialize::<JournalDelta>(payload).ok()?;
+        apply_delta(entries, cursor, delta.upserts, delta.deletes);
+        Some(())
+    })
+}
+
+fn apply_delta(
+    entries: &mut HashMap<String, Entry>,
+    cursor: &mut JournalCursor,
+    upserts: Vec<(String, Entry)>,
+    deletes: Vec<String>,
+) {
+    for (key, entry) in upserts {
+        entries.insert(key.clone(), entry);
+        cursor.upserts.insert(key.clone());
+        cursor.deletes.remove(&key);
+    }
+    for key in deletes {
+        entries.remove(&key);
+        cursor.upserts.remove(&key);
+        cursor.deletes.insert(key);
+    }
+}
+
+/// Walk the journal's verified frames, handing each payload to `apply` (None: undecodable, the
+/// walk stops there) with the cursor it advances; an unreadable journal yields no frame.
+fn replay_journal_frames(
+    path: &Path,
+    instance: [u8; 16],
+    mut apply: impl FnMut(&[u8], &mut JournalCursor) -> Option<()>,
+) -> JournalReplay {
     let bytes = match read_regular_file(path) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => Vec::new(),
@@ -2032,7 +2396,7 @@ fn replay_journal(
             let observed_len = fs::symlink_metadata(path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            return JournalCursor {
+            return JournalReplay::Unreadable(JournalCursor {
                 sequence: 0,
                 observed_len,
                 valid_len: 0,
@@ -2040,11 +2404,11 @@ fn replay_journal(
                 frames: 0,
                 upserts: HashSet::new(),
                 deletes: HashSet::new(),
-            };
+            });
         }
     };
     if bytes.is_empty() {
-        return JournalCursor {
+        return JournalReplay::Replayed(JournalCursor {
             sequence: 0,
             observed_len: 0,
             valid_len: 0,
@@ -2052,7 +2416,7 @@ fn replay_journal(
             frames: 0,
             upserts: HashSet::new(),
             deletes: HashSet::new(),
-        };
+        });
     };
     let observed_len = bytes.len() as u64;
     if bytes.len() < JOURNAL_HEADER_LEN
@@ -2060,7 +2424,7 @@ fn replay_journal(
         || read_u32(&bytes, 8) != Some(CACHE_STORAGE_VERSION)
         || read_digest(&bytes, 12) != Some(instance)
     {
-        return JournalCursor {
+        return JournalReplay::Replayed(JournalCursor {
             sequence: 0,
             observed_len,
             valid_len: 0,
@@ -2068,7 +2432,7 @@ fn replay_journal(
             frames: 0,
             upserts: HashSet::new(),
             deletes: HashSet::new(),
-        };
+        });
     }
 
     let mut cursor = JournalCursor {
@@ -2101,10 +2465,8 @@ fn replay_journal(
         let Some(digest) = read_digest(&bytes, start + 32) else {
             break;
         };
-        if payload_len_u64 > MAX_FRAME_BYTES
-            || from != cursor.sequence
-            || from.checked_add(1) != Some(to)
-        {
+        // A compacted frame carries the sequence it folded forward, so `to` may lead by more than one.
+        if payload_len_u64 > MAX_FRAME_BYTES || from != cursor.sequence || to <= from {
             break;
         }
         let Ok(payload_len) = usize::try_from(payload_len_u64) else {
@@ -2128,38 +2490,37 @@ fn replay_journal(
         if cache_digest(payload) != digest {
             break;
         }
-        let Ok(delta) = bincode::deserialize::<JournalDelta>(payload) else {
+        if apply(payload, &mut cursor).is_none() {
             break;
-        };
-        for (key, entry) in delta.upserts {
-            entries.insert(key.clone(), entry);
-            cursor.upserts.insert(key.clone());
-            cursor.deletes.remove(&key);
-        }
-        for key in delta.deletes {
-            entries.remove(&key);
-            cursor.upserts.remove(&key);
-            cursor.deletes.insert(key);
         }
         offset = frame_end;
         cursor.sequence = to;
         cursor.valid_len = offset as u64;
         cursor.frames += 1;
     }
-    cursor
+    JournalReplay::Replayed(cursor)
+}
+
+/// Who decodes: a writer holds the index lock, so nothing it fails to read is a race, and a
+/// journal it cannot read is as lost as one deleted; a lock-free reader may be mid-commit.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DecodeLane {
+    Writer,
+    LockFree,
 }
 
 fn decode_cache_for(
     path: &Path,
     current: WriterBuildId,
 ) -> Result<(HashMap<String, Entry>, CacheGeneration, CacheBacking), CacheDecodeRefusal> {
-    decode_cache_owned(path, current, false)
+    decode_cache_owned(path, current, false, DecodeLane::Writer)
 }
 
 fn decode_cache_owned(
     path: &Path,
     current: WriterBuildId,
     adopt_foreign: bool,
+    lane: DecodeLane,
 ) -> Result<(HashMap<String, Entry>, CacheGeneration, CacheBacking), CacheDecodeRefusal> {
     let bytes = match read_regular_file(path) {
         Ok(Some(bytes)) => bytes,
@@ -2176,9 +2537,45 @@ fn decode_cache_owned(
     let (payload, instance, witness) = decode_cache_base(path, &bytes)?;
     let (mut entries, generation, current_wire) = decode_cache_payload(payload.as_ref(), path)?;
     if !current_wire {
+        // the generation's own journal, in its own layout: its last-good rows retain too
+        if read_u32(payload.as_ref(), 0).is_some_and(reparse_compatible_cache_version) {
+            replay_journal_frames(&cache_journal_path(path), instance, |payload, cursor| {
+                let delta = bincode::deserialize::<LegacyJournalDeltaV37>(payload).ok()?;
+                apply_delta(
+                    &mut entries,
+                    cursor,
+                    delta
+                        .upserts
+                        .into_iter()
+                        .map(|(key, entry)| (key, entry.into_entry()))
+                        .collect(),
+                    delta.deletes,
+                );
+                Some(())
+            });
+        }
         return Ok((entries, generation, CacheBacking::Rewrite));
     }
-    let cursor = replay_journal(&cache_journal_path(path), instance, &mut entries);
+    // The head first: a commit lands its frames before it records the head, so a head read
+    // before the journal never exceeds the frames that journal holds, lock or no lock.
+    let head = read_cache_head(path);
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_HEAD_AND_JOURNAL.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    let replay = replay_journal(&cache_journal_path(path), instance, &mut entries);
+    // Frames the last commit established are gone: this base is older than what later passes
+    // may have published from it, so it vouches for nothing. A writer holds the lock, so a
+    // journal it cannot read holds no frame it can trust: lost, exactly as if deleted.
+    let (cursor, judged) = match replay {
+        JournalReplay::Replayed(cursor) => (cursor, true),
+        JournalReplay::Unreadable(cursor) => (cursor, lane == DecodeLane::Writer),
+    };
+    if judged
+        && head.is_some_and(|head| head.instance == instance && cursor.sequence < head.sequence)
+    {
+        return Err(CacheDecodeRefusal::StaleJournal);
+    }
     if read_u32(payload.as_ref(), 0).is_some_and(reparse_compatible_cache_version) {
         for key in &cursor.upserts {
             if let Some(entry) = entries.get_mut(key) {
@@ -2215,11 +2612,15 @@ struct BaseExpectation {
 }
 
 enum StagedCacheKind {
-    Noop,
+    Noop {
+        base: PathBuf,
+        head: CacheHead,
+    },
     Base {
         tmp: PathBuf,
         path: PathBuf,
         journal: PathBuf,
+        instance: [u8; 16],
         expected: Option<BaseExpectation>,
     },
     Journal {
@@ -2360,6 +2761,43 @@ fn base_expectation(
     })
 }
 
+/// A directory where a cache sidecar belongs (no agrep build writes one) blocks every write
+/// there. Move it aside under a name no staging reaper claims, never into it or through it; a
+/// move that fails refuses the commit naming the path, so the user can clear it.
+pub fn displace_sidecar_directory(sidecar: &Path, kind: &str) -> anyhow::Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(sidecar) else {
+        return Ok(());
+    };
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let name = sidecar
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| format!("ingest-cache.{kind}").into());
+    let aside = sidecar.with_file_name(format!("{name}.displaced-{nanos}"));
+    fs::rename(sidecar, &aside).map_err(|error| {
+        anyhow::anyhow!(
+            "a directory stands where the parse cache {kind} belongs, {}, and could not be moved aside: {error}; move or remove it",
+            sidecar.display()
+        )
+    })?;
+    crate::emit::human_line(format_args!(
+        "  a directory stood where the parse cache {kind} belongs; moved it aside to {}",
+        crate::ingest::terminal_safe(aside.display())
+    ));
+    Ok(())
+}
+
+/// [`displace_sidecar_directory`] for the journal.
+pub fn displace_journal_directory(journal: &Path) -> anyhow::Result<()> {
+    displace_sidecar_directory(journal, "journal")
+}
+
 fn journal_cursor_matches(
     file: &mut File,
     instance: [u8; 16],
@@ -2389,16 +2827,26 @@ fn journal_cursor_matches(
 }
 
 impl StagedCache {
-    pub fn commit(mut self) -> anyhow::Result<()> {
+    /// Commit, then record the head established beside the cache: a later decode that replays
+    /// short of it has lost frames and is refused rather than trusted as last-good. The head's
+    /// path is cleared first: a head that cannot be written refuses before the base or journal
+    /// moves, so no commit ever stands without the head that dates it.
+    pub fn commit(mut self) -> anyhow::Result<CacheHead> {
         let _commit = CACHE_COMMIT_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("ingest cache commit lock poisoned"))?;
-        match &self.kind {
-            StagedCacheKind::Noop => {}
+        let base_path = match &self.kind {
+            StagedCacheKind::Noop { base, .. } | StagedCacheKind::Journal { base, .. } => base,
+            StagedCacheKind::Base { path, .. } => path,
+        };
+        displace_sidecar_directory(&cache_head_path(base_path), "head")?;
+        let (base, head) = match &self.kind {
+            StagedCacheKind::Noop { base, head } => (base.clone(), *head),
             StagedCacheKind::Base {
                 tmp,
                 path,
                 journal,
+                instance,
                 expected,
             } => {
                 let mut cursor_guard = None;
@@ -2428,9 +2876,17 @@ impl StagedCache {
                     );
                     cursor_guard = Some(state);
                 }
+                displace_journal_directory(journal)?;
                 crate::cache::replace_file(tmp, path)?;
                 let _ = fs::remove_file(journal);
                 drop(cursor_guard);
+                (
+                    path.clone(),
+                    CacheHead {
+                        instance: *instance,
+                        sequence: 0,
+                    },
+                )
             }
             StagedCacheKind::Journal {
                 tmp,
@@ -2473,6 +2929,7 @@ impl StagedCache {
                 );
                 let new_len = match mode {
                     JournalWrite::Replace => {
+                        displace_journal_directory(journal)?;
                         crate::cache::replace_file(tmp, journal)?;
                         fs::metadata(journal)?.len()
                     }
@@ -2519,10 +2976,18 @@ impl StagedCache {
                     }
                 }
                 let _ = fs::remove_file(tmp);
+                (
+                    base.clone(),
+                    CacheHead {
+                        instance: *instance,
+                        sequence: *next_sequence,
+                    },
+                )
             }
-        }
+        };
         self.committed = true;
-        Ok(())
+        write_cache_head(&base, head)?;
+        Ok(head)
     }
 }
 
@@ -2535,7 +3000,7 @@ impl Drop for StagedCache {
             StagedCacheKind::Base { tmp, .. } | StagedCacheKind::Journal { tmp, .. } => {
                 let _ = fs::remove_file(tmp);
             }
-            StagedCacheKind::Noop => {}
+            StagedCacheKind::Noop { .. } => {}
         }
     }
 }
@@ -2563,14 +3028,94 @@ fn session_sources_of(entries: &HashMap<String, Entry>) -> Vec<SessionSource> {
     out
 }
 
-/// Read-only [`IngestCache::session_sources`] of the cache at `path`, accepting a foreign owner:
-/// a diagnostic describes what was published and never stages over another build's cache.
-pub fn session_sources_at(
-    path: &Path,
-) -> Result<Vec<SessionSource>, CacheDecodeRefusal> {
-    let (entries, _generation, _backing) =
-        decode_cache_owned(path, WriterBuildId::current(), true)?;
-    Ok(session_sources_of(&entries))
+/// The one read-only decode a diagnostic takes of the cache at `path`, accepting a foreign owner:
+/// it describes what was published and never stages over another build's cache. Every view a
+/// diagnostic needs comes from this single decode, so one pass can never mix two generations.
+pub struct CacheView {
+    entries: HashMap<String, Entry>,
+}
+
+impl CacheView {
+    pub fn read(path: &Path) -> Result<Self, CacheDecodeRefusal> {
+        // Without the index lock, a commit may land its frames between the head and journal reads
+        // of one decode; one re-read sees both sides of it.
+        let decode =
+            || decode_cache_owned(path, WriterBuildId::current(), true, DecodeLane::LockFree);
+        let mut decoded = decode();
+        if matches!(decoded, Err(CacheDecodeRefusal::StaleJournal)) {
+            decoded = decode();
+        }
+        let (entries, _generation, _backing) = decoded?;
+        Ok(Self { entries })
+    }
+
+    /// [`IngestCache::session_sources`] of the decoded generation.
+    pub fn session_sources(&self) -> Vec<SessionSource> {
+        session_sources_of(&self.entries)
+    }
+
+    /// [`IngestCache::token_projects`] of the decoded generation.
+    pub fn token_projects(&self, agent: &str) -> HashMap<String, String> {
+        token_projects_of(&self.entries, agent)
+    }
+
+    /// The cache exactly as a writer holding the index lock decodes it: a journal it cannot read
+    /// loses the frames past its head, so such a cache serves nothing, as a plain pass finds.
+    pub fn read_locked(path: &Path) -> Result<Self, CacheDecodeRefusal> {
+        let (entries, _generation, _backing) =
+            decode_cache_owned(path, WriterBuildId::current(), false, DecodeLane::Writer)?;
+        Ok(Self { entries })
+    }
+
+    /// Whether a warm pass serves the last good rows of `agent`'s material at `path` when it
+    /// fails to read: a token conversation `session` from its own database's entry, or from one
+    /// of a database no longer present (`live_namespaces` names those present), as the writer's
+    /// moved-database rule does; any other source from its own path's entry.
+    pub fn serves(
+        &self,
+        agent: &str,
+        path: &Path,
+        session: Option<&str>,
+        live_namespaces: &HashSet<String>,
+    ) -> bool {
+        let holds = |entry: &Entry| {
+            entry.msgs.iter().any(|msg| {
+                msg.agent == agent && session.is_none_or(|session| &*msg.session == session)
+            })
+        };
+        if !crate::ingest::registry::token_store_agent(agent) {
+            return self.entries.iter().any(|(key, entry)| {
+                source_path_from_key(key).is_some_and(|source| source == path) && holds(entry)
+            });
+        }
+        let Some(session) = session else {
+            return false;
+        };
+        let prefix = format!("\0tok\0{agent}\0");
+        let own = crate::ingest::registry::token_prefix(agent, path).unwrap_or_default();
+        self.entries.iter().any(|(key, entry)| {
+            let Some(cache_id) = key.strip_prefix(&prefix) else {
+                return false;
+            };
+            let namespace = crate::ingest::registry::token_namespace(agent, cache_id);
+            (namespace == own || !live_namespaces.contains(&namespace))
+                && (holds(entry) || entry.event_keys.iter().any(|event| &*event.session == session))
+        })
+    }
+}
+
+/// Per cache id of `agent`'s token conversations with cached rows, the project those rows carry:
+/// the attribution the last-good generation published.
+fn token_projects_of(entries: &HashMap<String, Entry>, agent: &str) -> HashMap<String, String> {
+    let prefix = format!("\0tok\0{agent}\0");
+    entries
+        .iter()
+        .filter_map(|(key, entry)| {
+            let cache_id = key.strip_prefix(&prefix)?;
+            let project = entry.msgs.first()?.project.to_string();
+            Some((cache_id.to_owned(), project))
+        })
+        .collect()
 }
 
 impl IngestCache {
@@ -2588,11 +3133,17 @@ impl IngestCache {
             guarded_stale: false,
             guard_epoch: 0,
             output_incomplete: false,
+            unreadable_unserved: false,
+            admitted_unpublished_failure: false,
+            unproven_token_failures: Vec::new(),
+            settled_token_failures: HashSet::new(),
+            failed_token_identities: HashMap::new(),
             force_reparse: false,
             repair_mode: false,
             allow_stable_deletions: false,
             repeated_absent_agents: HashSet::new(),
             repeated_absent_roots: Vec::new(),
+            published_token_projects: HashMap::new(),
             racy_scan_start_ns: None,
             discarded_base: false,
             discarded_base_confirmed: false,
@@ -2621,6 +3172,7 @@ impl IngestCache {
             coverage_expected_tokens: HashMap::new(),
             source_stamps: HashMap::new(),
             source_read_issues: Vec::new(),
+            source_paths: std::sync::OnceLock::new(),
         }
     }
 
@@ -2633,13 +3185,26 @@ impl IngestCache {
 
     fn put_entry(&mut self, key: String, entry: Entry) {
         let base = self.entries.insert(key.clone(), entry);
+        if base.is_none() {
+            self.source_paths.take();
+        }
         self.displaced.entry(key.clone()).or_insert(base);
         self.deleted.remove(&key);
         self.dirty.insert(key);
     }
 
+    /// Keeps an entry's rows but no identity, so its next read misses and reparses once.
+    fn forget_identity(&mut self, key: &str) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            if entry.identity.take().is_some() {
+                self.dirty.insert(key.to_owned());
+            }
+        }
+    }
+
     fn remove_entry(&mut self, key: &str) -> Option<Entry> {
         let entry = self.entries.remove(key)?;
+        self.source_paths.take();
         if !self.displaced.contains_key(key) {
             self.displaced.insert(key.to_owned(), Some(entry.clone()));
         }
@@ -2702,7 +3267,14 @@ impl IngestCache {
                 ..Self::base(entries, backing)
             },
             Err(CacheDecodeRefusal::ForeignOwner) => Self::foreign_owned(),
-            Err(_) => Self::base(HashMap::new(), CacheBacking::Rewrite),
+            Err(refusal) => {
+                if refusal == CacheDecodeRefusal::StaleJournal {
+                    crate::emit::human_line(format_args!(
+                        "  parse cache journal is behind its last commit; rebuilding the cache from sources"
+                    ));
+                }
+                Self::base(HashMap::new(), CacheBacking::Rewrite)
+            }
         }
     }
 
@@ -2818,6 +3390,17 @@ impl IngestCache {
         self.repair_expected_paths = paths;
     }
 
+    /// Whether a token store database at `scope` may still hold material a pass must not drop on one
+    /// observation: this cache holds its conversations, or a snapshot this run inherits expects it.
+    /// `--full` inherits only its own preflight, so a confirmed removal converges there at once.
+    pub(crate) fn token_scope_expected(&self, agent: &str, scope: &Path) -> bool {
+        self.holds_token_entries(agent, scope)
+            || self
+                .repair_expected_paths
+                .iter()
+                .any(|expected| source_path_eq(expected, scope))
+    }
+
     pub fn set_source_coverage(
         &mut self,
         paths: HashSet<PathBuf>,
@@ -2908,7 +3491,7 @@ impl IngestCache {
         self.repeated_absent_roots = roots.into_iter().collect();
     }
 
-    fn repeated_absence_covers(&self, agent: &str, root: &Path) -> bool {
+    pub(crate) fn repeated_absence_covers(&self, agent: &str, root: &Path) -> bool {
         self.repeated_absent_agents.contains(agent)
             || self
                 .repeated_absent_roots
@@ -2969,11 +3552,91 @@ impl IngestCache {
 
     /// Checked after admission: a read of the published generation can still vouch for a store.
     pub fn output_complete(&self) -> bool {
-        !self.output_incomplete
+        self.output_complete_past_unreadable()
+            && !self.unreadable_unserved
+            && self.unproven_token_failures.is_empty()
             && self
                 .unvouched_reads
                 .iter()
                 .all(|(agent, root)| self.published_proves_empty(agent, root))
+    }
+
+    /// [`Self::output_complete`] but for reads that failed with no last-good copy, which an
+    /// explicit rebuild may publish without: every guard else still holds output back.
+    pub fn output_complete_past_unreadable(&self) -> bool {
+        !self.output_incomplete
+    }
+
+    /// See `admitted_unpublished_failure`: the caller refuses a pass that admitted one and
+    /// produced no rows, rather than publish an empty generation over an unread store.
+    pub fn admitted_unpublished_failure(&self) -> bool {
+        self.admitted_unpublished_failure
+    }
+
+    /// Admit each unproven failed token conversation whose session the verified published
+    /// generation, `published_sessions` of its agent (None when it cannot be read whole), holds
+    /// no row, session or event of: nothing published can be dropped with it.
+    pub fn admit_unpublished_token_conversations(
+        &mut self,
+        mut published_sessions: impl FnMut(&str) -> Option<HashSet<String>>,
+    ) {
+        let agents: HashSet<String> = self
+            .unproven_token_failures
+            .iter()
+            .map(|(agent, _, _)| agent.clone())
+            .collect();
+        for agent in agents {
+            let Some(published) = published_sessions(&agent) else {
+                continue;
+            };
+            let (held, admitted): (Vec<_>, Vec<_>) = std::mem::take(&mut self.unproven_token_failures)
+                .into_iter()
+                .partition(|(failed, _, session)| *failed != agent || published.contains(session));
+            self.unproven_token_failures = held;
+            self.admitted_unpublished_failure |= !admitted.is_empty();
+            self.settled_token_failures.extend(admitted);
+        }
+    }
+
+    /// See `settled_token_failures`: whether the failed conversation `session` of the token
+    /// store database at `database` is one.
+    pub fn token_failure_settled(&self, agent: &str, database: &Path, session: &str) -> bool {
+        crate::ingest::registry::token_prefix(agent, database).is_some_and(|namespace| {
+            self.settled_token_failures
+                .contains(&(agent.to_owned(), namespace, session.to_owned()))
+        })
+    }
+
+    /// The token of a conversation of the token store `database` whose read failed with no
+    /// last-good copy: what an earlier pass's record of the same failure must match.
+    pub fn token_failure_identity(
+        &self,
+        agent: &str,
+        database: &Path,
+        session: &str,
+    ) -> Option<&str> {
+        let namespace = crate::ingest::registry::token_prefix(agent, database)?;
+        self.failed_token_identities
+            .get(&(agent.to_owned(), namespace, session.to_owned()))
+            .map(String::as_str)
+    }
+
+    /// Names a failed conversation by `identity` (its own rows) instead of its staleness token.
+    pub(crate) fn set_token_failure_identity(
+        &mut self,
+        agent: &str,
+        cache_id: &str,
+        session: &str,
+        identity: String,
+    ) {
+        let key = (
+            agent.to_owned(),
+            crate::ingest::registry::token_namespace(agent, cache_id),
+            session.to_owned(),
+        );
+        if let Some(held) = self.failed_token_identities.get_mut(&key) {
+            *held = identity;
+        }
     }
 
     pub fn source_read_issues(&self) -> &[SourceReadIssue] {
@@ -3359,9 +4022,10 @@ impl IngestCache {
                     agents.extend(entry.event_keys.iter().map(|event| event.agent.as_str()));
                 }
             }
+            // Whole stores keep their last good rows in a snapshot, not in per-source entries.
             for agent in agents
                 .into_iter()
-                .filter(|agent| Self::per_file_agent(agent))
+                .filter(|agent| !crate::ingest::registry::whole_store_agent(agent))
             {
                 let touched = Self::touched_sessions(agent, &changed);
                 let rows = self.cached_rows(agent, &changed, |session| touched.contains(session));
@@ -3376,19 +4040,19 @@ impl IngestCache {
         let stale: Vec<String> = self
             .entries
             .keys()
-            .filter(|key| released_key(key) && Some(*key) != record.as_ref())
+            .filter(|key| released_key(key) && Some(*key) != record.as_ref().map(|(key, _)| key))
             .cloned()
             .collect();
         for key in stale {
             self.remove_entry(&key);
         }
-        if let Some(key) = record {
+        if let Some((key, entry)) = record {
             let staged = self
                 .entries
                 .get(&key)
-                .is_some_and(|entry| !entry.legacy_needs_reparse);
+                .is_some_and(|held| !held.legacy_needs_reparse && held.identity == entry.identity);
             if !staged {
-                self.put_entry(key, released_entry());
+                self.put_entry(key, entry);
             }
         }
     }
@@ -3398,11 +4062,30 @@ impl IngestCache {
             && !crate::ingest::registry::token_store_agent(agent)
     }
 
+    /// Whether a pass since the published generation, killed before replacing it, saw rows of
+    /// `agent` go that it still holds: this base is ahead of what is published.
+    fn base_ahead(&self, agent: &str) -> bool {
+        self.released
+            .get(agent)
+            .is_some_and(|released| !released.rows.is_empty() || !released.sessions.is_empty())
+    }
+
     fn cache_cannot_answer_for(&self, agent: &str, scope: &Path) -> bool {
         Self::per_file_agent(agent)
             && !self.published_rows.contains_key(agent)
             && ((self.legacy_generation && crate::ingest::registry::partial_read_agent(agent))
                 || self.listed_files_cached(scope) == Some(false))
+    }
+
+    /// The source path of every entry that names one, built once per settled entry set: the
+    /// guards that consult it run once per unreadable scope, which can be thousands.
+    fn source_paths(&self) -> &HashSet<PathBuf> {
+        self.source_paths.get_or_init(|| {
+            self.entries
+                .keys()
+                .filter_map(|key| source_path_from_key(key))
+                .collect()
+        })
     }
 
     /// Whether this cache holds an entry, with rows or none, for every file the published
@@ -3414,16 +4097,13 @@ impl IngestCache {
             .filter(|path| source_path_within(path, scope))
             .peekable();
         listed.peek()?;
-        let cached: Vec<PathBuf> = self
-            .entries
-            .keys()
-            .filter_map(|key| source_path_from_key(key))
-            .filter(|path| source_path_within(path, scope))
-            .collect();
-        let exact: HashSet<&Path> = cached.iter().map(PathBuf::as_path).collect();
+        let cached = self.source_paths();
         Some(listed.all(|path| {
-            exact.contains(path.as_path())
-                || (cfg!(windows) && cached.iter().any(|held| source_path_eq(held, path)))
+            cached.contains(path.as_path())
+                || (cfg!(windows)
+                    && cached
+                        .iter()
+                        .any(|held| source_path_within(held, scope) && source_path_eq(held, path)))
         }))
     }
 
@@ -3462,6 +4142,25 @@ impl IngestCache {
                 (agent.to_owned(), namespace)
             })
             .collect()
+    }
+
+    /// The project each of `agent`'s cached token conversations was published under.
+    pub fn token_projects(&self, agent: &str) -> HashMap<String, String> {
+        token_projects_of(&self.entries, agent)
+    }
+
+    /// The project the published generation gave each of `agent`'s token conversations, read
+    /// from its rows when this cache holds none: an attribution gap keeps them unrelabelled.
+    pub fn published_token_projects(&self, agent: &str) -> HashMap<String, String> {
+        self.published_token_projects
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_published_token_projects(&mut self, agent: &str, projects: HashMap<String, String>) {
+        self.published_token_projects
+            .insert(agent.to_owned(), projects);
     }
 
     /// Sessions the last-good rows attribute to `scope`. Read before ingest, this is the
@@ -3531,6 +4230,45 @@ impl IngestCache {
                 .published_token_namespaces
                 .as_ref()
                 .is_none_or(|published| published.iter().any(recorded))
+    }
+
+    /// Whether no published row of `agent`'s token conversations lies beyond this cache's entries:
+    /// a decoded base no killed pass moved past the published generation cached each it published
+    /// (as `published_token_inventory` relies on), and a verified generation may hold none at all.
+    fn token_entries_answer_for(&self, agent: &str) -> bool {
+        (self.last_good_base && !self.base_ahead(agent)) || self.unpublished_agents.contains(agent)
+    }
+
+    /// Whether no published generation can hold rows of the token conversation `cache_id`, which
+    /// this cache holds no entry for. Without a base that answers for them, the inventory must
+    /// exist and the published-namespace record must name none of its database.
+    fn token_conversation_unpublished(&self, agent: &str, cache_id: &str) -> bool {
+        if self.token_entries_answer_for(agent) {
+            return true;
+        }
+        let namespace = crate::ingest::registry::token_namespace(agent, cache_id);
+        self.published_material.is_some()
+            && self.published_token_namespaces.as_ref().is_some_and(|published| {
+                !published.iter().any(|(owner, recorded)| {
+                    owner == agent
+                        && (recorded.starts_with(&namespace) || namespace.starts_with(recorded.as_str()))
+                })
+            })
+    }
+
+    /// Whether a token store no read could list, and of which this cache holds no entry, had
+    /// nothing published: the base answers for it, or the inventory proves empty every scope its
+    /// reads failed on this pass (a failure that named no scope proves nothing).
+    fn token_store_unpublished(&self, agent: &str) -> bool {
+        if self.token_entries_answer_for(agent) {
+            return true;
+        }
+        let mut failed = self
+            .source_read_issues
+            .iter()
+            .filter(|read| read.agent == agent)
+            .peekable();
+        failed.peek().is_some() && failed.all(|read| self.published_proves_empty(agent, &read.path))
     }
 
     /// A scope with nothing at stake: no publication can drop anything of its agent, and it is a
@@ -3667,7 +4405,8 @@ impl IngestCache {
         }
         match self.published_material.as_ref() {
             Some(paths) => {
-                !paths.iter().any(|path| source_path_within(path, scope))
+                (!paths.iter().any(|path| source_path_within(path, scope))
+                    || self.base_holds_no_file_under(agent, scope))
                     && !self.token_scope_material(agent, scope)
                     && !self.published_inventory_blind_to(agent, scope)
                     && !self.cache_inventory_silent_on(agent, scope)
@@ -3676,11 +4415,34 @@ impl IngestCache {
         }
     }
 
+    /// A decoded base, sealed against the published generation and not moved past it by a killed
+    /// pass, caches every per-file row it published: no entry under `scope` proves it took none,
+    /// though its snapshot lists the files it failed to read (older uncached partial reads aside).
+    fn base_holds_no_file_under(&self, agent: &str, scope: &Path) -> bool {
+        let under = |key: &str| {
+            source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
+        };
+        self.last_good_base
+            && !self.legacy_generation
+            && self.published_seal.is_some()
+            && !self.base_ahead(agent)
+            && !crate::ingest::registry::whole_store_agent(agent)
+            && !crate::ingest::registry::token_store_agent(agent)
+            && !self
+                .source_paths()
+                .iter()
+                .any(|path| source_path_within(path, scope))
+            && !self
+                .displaced
+                .iter()
+                .any(|(key, base)| base.is_some() && under(key))
+    }
+
     pub(crate) fn guard_epoch(&self) -> u64 {
         self.guard_epoch
     }
 
-    fn mark_guarded_stale(&mut self) {
+    pub(crate) fn mark_guarded_stale(&mut self) {
         self.guarded_stale = true;
         self.guard_epoch = self.guard_epoch.saturating_add(1);
     }
@@ -3692,14 +4454,23 @@ impl IngestCache {
         kind: &'static str,
         reason: impl Into<String>,
     ) {
-        let issue = SourceReadIssue {
-            agent,
-            path: path.to_path_buf(),
-            kind,
-            reason: reason.into(),
-        };
+        self.record_read_issue(SourceReadIssue::new(agent, path, kind, reason));
+    }
+
+    pub(crate) fn record_read_issue(&mut self, issue: SourceReadIssue) {
         if !self.source_read_issues.iter().any(|prior| prior == &issue) {
             self.source_read_issues.push(issue);
+        }
+    }
+
+    /// A failed read with no last-good copy holds publication back until a pass reads it or,
+    /// for material seen to fail the same way twice, a rebuild's consent.
+    fn hold_unserved_read(&mut self, outcome: Option<ReadOutcome>) {
+        if matches!(
+            outcome,
+            Some(ReadOutcome::Invalid | ReadOutcome::Unavailable | ReadOutcome::Moved)
+        ) {
+            self.unreadable_unserved = true;
         }
     }
 
@@ -3793,7 +4564,13 @@ impl IngestCache {
     ) -> (Vec<Message>, bool) {
         let key = format!("\x00snapshot\x00{agent}");
         let fresh_event_keys = cached_event_keys(fresh_events);
-        if matches!(source_outcome, ReadOutcome::Invalid | ReadOutcome::Partial) {
+        if matches!(
+            source_outcome,
+            ReadOutcome::Invalid
+                | ReadOutcome::Partial
+                | ReadOutcome::Unavailable
+                | ReadOutcome::Moved
+        ) {
             self.mark_guarded_stale();
             if let Some(entry) = self.entries.get(&key) {
                 return (entry.msgs.iter().map(CMsg::to_msg).collect(), true);
@@ -4046,8 +4823,20 @@ impl IngestCache {
                     .flat_map(|(_, e)| e.msgs.iter().map(CMsg::to_msg))
                     .collect();
                 self.mark_guarded_stale();
+                // A store no read could list contributes its last-good rows; with none, it holds
+                // publication back only where a published generation may hold its rows.
                 if !has_fallback {
-                    self.output_incomplete = true;
+                    if self.token_store_unpublished(agent) {
+                        self.admitted_unpublished_failure = true;
+                    } else if self
+                        .source_read_issues
+                        .iter()
+                        .any(|read| read.agent == agent && read.kind == "source-read-failed")
+                    {
+                        self.unreadable_unserved = true;
+                    } else {
+                        self.output_incomplete = true;
+                    }
                 }
                 crate::emit::rows_only(&messages);
                 return Pass {
@@ -4198,19 +4987,90 @@ impl IngestCache {
             // partial rows, or the reader's dedupe would drop the served last-good copy
             if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
                 self.mark_guarded_stale();
+                let malformed = matches!(healthy, Some(ReadOutcome::Invalid | ReadOutcome::Partial));
+                let settled = (
+                    agent.to_owned(),
+                    crate::ingest::registry::token_namespace(agent, cache_id),
+                    session.clone(),
+                );
                 if let Some(entry) = self.entries.get(&key) {
                     let start = messages.len();
                     messages.extend(entry.msgs.iter().map(CMsg::to_msg));
                     crate::emit::file_done(&messages[start..]);
+                    if malformed {
+                        self.settled_token_failures.insert(settled);
+                    }
                     continue;
                 }
-                if healthy == Some(ReadOutcome::Invalid) {
-                    self.output_incomplete = true;
+                // Its database moved (a new namespace) but the conversation was cached under the
+                // old one: that copy is its last good, kept under this key without an identity.
+                let moved = self
+                    .entries
+                    .iter()
+                    .filter(|(held, _)| {
+                        held.starts_with(&prefix) && !listed.contains(*held) && !fallback_key(held)
+                    })
+                    .find(|(_, entry)| {
+                        entry.msgs.iter().any(|row| row.session.as_ref() == session.as_str())
+                            || entry.event_keys.iter().any(|event| event.session == *session)
+                    })
+                    .map(|(_, entry)| entry.clone());
+                if let Some(moved) = moved {
+                    let start = messages.len();
+                    messages.extend(moved.msgs.iter().map(CMsg::to_msg));
+                    crate::emit::file_done(&messages[start..]);
+                    self.put_entry(
+                        key,
+                        Entry {
+                            identity: None,
+                            ..moved
+                        },
+                    );
+                    if malformed {
+                        self.settled_token_failures.insert(settled);
+                    }
+                    continue;
                 }
-                if healthy != Some(ReadOutcome::Partial) {
+                // No last-good copy: the read contributes only rows it vouches for, and holds
+                // publication back only where a published generation may hold the conversation.
+                if malformed {
+                    // The token digests the conversation's stored rows: unchanged, the same
+                    // failure persists however busy the rest of its database is.
+                    self.failed_token_identities
+                        .insert(settled.clone(), token.clone());
+                    if self.token_conversation_unpublished(agent, cache_id) {
+                        self.admitted_unpublished_failure = true;
+                        self.settled_token_failures.insert(settled);
+                    } else {
+                        self.unproven_token_failures.push(settled);
+                    }
+                }
+                if healthy != Some(ReadOutcome::Partial) || (m.is_empty() && ev.is_empty()) {
                     crate::emit::file_done(&[]);
                     continue;
                 }
+                // Rows a partial read vouches for publish, cached so a later failed read serves
+                // them, but with no identity: every pass retries the read until it completes.
+                crate::emit::file_done(&m);
+                let event_keys = cached_event_keys(&ev);
+                self.touch_event_keys(&event_keys);
+                self.put_entry(
+                    key,
+                    Entry {
+                        mtime: 0,
+                        size: 0,
+                        identity: None,
+                        msgs: m.iter().map(CMsg::from).collect(),
+                        event_keys,
+                        legacy_had_events: false,
+                        legacy_needs_reparse: false,
+                    },
+                );
+                self.touched.insert(session.clone());
+                messages.extend(m);
+                events.extend(ev);
+                parsed += 1;
+                continue;
             }
             if m.is_empty() && ev.is_empty() {
                 if let Some(e) = self.entries.get(&key).cloned() {
@@ -4288,6 +5148,9 @@ impl IngestCache {
         let stage_base = |expected| -> anyhow::Result<StagedCache> {
             let started = std::time::Instant::now();
             let bytes = encode_cache_base(&self.entries)?;
+            let instance = parse_base_header(&bytes[..BASE_HEADER_LEN])
+                .map_err(|refusal| anyhow::anyhow!("staged cache base unreadable: {refusal}"))?
+                .instance;
             let encoded = started.elapsed();
             let tmp = staged_path(path);
             write_staged_file(&tmp, &bytes)?;
@@ -4303,6 +5166,7 @@ impl IngestCache {
                     tmp,
                     path: path.to_path_buf(),
                     journal: cache_journal_path(path),
+                    instance,
                     expected,
                 },
                 committed: false,
@@ -4334,8 +5198,18 @@ impl IngestCache {
             return stage_base(Some(base_expectation(*instance, witness.clone(), cursor)?));
         }
         if self.dirty.is_empty() && self.deleted.is_empty() {
+            let sequence = cursor
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ingest cache journal state poisoned"))?
+                .sequence;
             return Ok(StagedCache {
-                kind: StagedCacheKind::Noop,
+                kind: StagedCacheKind::Noop {
+                    base: path.to_path_buf(),
+                    head: CacheHead {
+                        instance: *instance,
+                        sequence,
+                    },
+                },
                 committed: false,
             });
         }
@@ -4389,7 +5263,11 @@ impl IngestCache {
                 deletes: delete_keys,
             }
         };
-
+        // One frame replaces the journal, but the sequence keeps counting: the head a commit
+        // recorded must stay comparable with every later replay of this base.
+        let next_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("ingest cache journal sequence overflow"))?;
         let compacted = if let Some((mut upserts, mut deletes)) = journal_overlay {
             for key in &delta_upserts {
                 upserts.insert(key.clone());
@@ -4403,7 +5281,7 @@ impl IngestCache {
                 return stage_base(Some(rebase_expectation()));
             }
             let delta = make_delta(&upserts, &deletes);
-            let Some(frame) = encode_bounded_journal_frame(0, 1, &delta)? else {
+            let Some(frame) = encode_bounded_journal_frame(0, next_sequence, &delta)? else {
                 return stage_base(Some(rebase_expectation()));
             };
             let mut bytes = encode_journal_header(*instance);
@@ -4415,37 +5293,24 @@ impl IngestCache {
         } else {
             None
         };
-        let (bytes, mode, next_sequence, staged_upserts, staged_deletes) = if expected_reset {
+        let (bytes, mode, staged_upserts, staged_deletes) = if expected_reset {
             let delta = make_delta(&delta_upserts, &delta_deletes);
-            let Some(frame) = encode_bounded_journal_frame(0, 1, &delta)? else {
+            let Some(frame) = encode_bounded_journal_frame(0, next_sequence, &delta)? else {
                 return stage_base(Some(rebase_expectation()));
             };
             let mut bytes = encode_journal_header(*instance);
             bytes.extend_from_slice(&frame);
-            (
-                bytes,
-                JournalWrite::Replace,
-                1,
-                delta_upserts,
-                delta_deletes,
-            )
+            (bytes, JournalWrite::Replace, delta_upserts, delta_deletes)
         } else if let Some((bytes, upserts, deletes)) = compacted {
-            (bytes, JournalWrite::Replace, 1, upserts, deletes)
+            (bytes, JournalWrite::Replace, upserts, deletes)
         } else {
-            let next = expected_sequence
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("ingest cache journal sequence overflow"))?;
             let delta = make_delta(&delta_upserts, &delta_deletes);
-            let Some(frame) = encode_bounded_journal_frame(expected_sequence, next, &delta)? else {
+            let Some(frame) =
+                encode_bounded_journal_frame(expected_sequence, next_sequence, &delta)?
+            else {
                 return stage_base(Some(rebase_expectation()));
             };
-            (
-                frame,
-                JournalWrite::Append,
-                next,
-                delta_upserts,
-                delta_deletes,
-            )
+            (frame, JournalWrite::Append, delta_upserts, delta_deletes)
         };
         let journal = cache_journal_path(path);
         let tmp = staged_path(&journal);
@@ -4473,7 +5338,7 @@ impl IngestCache {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        self.stage_save(path)?.commit()
+        self.stage_save(path)?.commit().map(|_| ())
     }
 }
 
@@ -4491,6 +5356,15 @@ mod tests {
     use super::{source_path_eq, source_relative, LegacyCacheFileV8, LegacyEntryV8};
     use crate::model::{Event, Message};
 
+    /// The payload an older generation (18..=37, no reply shape) wrote for these entries.
+    fn legacy_payload_v37(version: u32, entries: &HashMap<String, super::Entry>) -> Vec<u8> {
+        let entries: HashMap<String, super::LegacyEntryV37> = entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), super::LegacyEntryV37::downgrade(entry)))
+            .collect();
+        bincode::serialize(&super::LegacyCacheFileV37 { version, entries }).unwrap()
+    }
+
     fn test_message(text: &str) -> crate::model::Message {
         crate::model::RawMessage {
             agent: "claude",
@@ -4504,6 +5378,7 @@ mod tests {
             reply_chars: 0,
             side: false,
             parent: String::new(),
+            reply_shape: Default::default(),
         }
         .freeze()
     }
@@ -4524,6 +5399,7 @@ mod tests {
             call_id: call_id.into(),
             child_session: String::new(),
             meta: String::new(),
+            state: String::new(),
         }
     }
 
@@ -4643,11 +5519,7 @@ mod tests {
         assert!(super::reparse_compatible_cache_version(reparse_compatible));
         fs::write(
             &cache_path,
-            bincode::serialize(&super::CacheFileRef {
-                version: reparse_compatible,
-                entries: &published.entries,
-            })
-            .unwrap(),
+            legacy_payload_v37(reparse_compatible, &published.entries),
         )
         .unwrap();
 
@@ -5816,11 +6688,7 @@ mod tests {
         });
         fs::write(
             &cache_path,
-            bincode::serialize(&super::CacheFileRef {
-                version: CACHE_VERSION - 1,
-                entries: &initial.entries,
-            })
-            .unwrap(),
+            legacy_payload_v37(CACHE_VERSION - 1, &initial.entries),
         )
         .unwrap();
         super::adopt_foreign_cache(&cache_path).unwrap();
@@ -6036,6 +6904,38 @@ mod tests {
         assert!(!first_unavailable.source_snapshot_safe());
         assert!(!first_unavailable.output_complete());
 
+        // A store no read could list, with no last-good copy, holds publication back unless the
+        // inventory proves that the scope its read failed on held nothing published.
+        let database = std::path::Path::new("/fixture/Cursor/User/globalStorage/state.vscdb");
+        let unlistable = |published: Option<HashSet<PathBuf>>,
+                          namespaces: Option<HashSet<(String, String)>>,
+                          recorded: bool| {
+            let mut cache = IngestCache::cold();
+            if let Some(published) = published {
+                cache.set_published_material(published);
+            }
+            cache.set_published_token_namespaces(namespaces);
+            if recorded {
+                cache.record_source_read_issue("cursor", database, "source-read-failed", "locked");
+            }
+            cache.collect_token_cached("cursor", None, |_| -> (Vec<Message>, Vec<Event>) {
+                unreachable!()
+            });
+            assert!(!cache.source_snapshot_safe());
+            cache.output_complete()
+        };
+        let cursor_recorded = || Some(HashSet::from([("cursor".to_string(), String::new())]));
+        let crush_recorded = || Some(HashSet::from([("crush".to_string(), String::new())]));
+        // A first index publishes nothing it could drop.
+        assert!(unlistable(Some(HashSet::new()), Some(HashSet::new()), true));
+        assert!(unlistable(Some(HashSet::new()), crush_recorded(), true));
+        // Published rows of the store, a listed database, no inventory or no named scope.
+        assert!(!unlistable(Some(HashSet::new()), cursor_recorded(), true));
+        assert!(!unlistable(Some(HashSet::from([database.to_path_buf()])), Some(HashSet::new()), true));
+        assert!(!unlistable(None, Some(HashSet::new()), true));
+        assert!(!unlistable(Some(HashSet::new()), None, true));
+        assert!(!unlistable(Some(HashSet::new()), Some(HashSet::new()), false));
+
         // A temporarily unreadable root can make discovery return no files at all.
         let root = std::env::temp_dir().join(format!(
             "agrep-empty-discovery-{}-{}",
@@ -6062,6 +6962,287 @@ mod tests {
         );
         assert_eq!(served.messages.len(), 1);
         assert!(!missing.source_snapshot_safe());
+    }
+
+    /// The published snapshot lists a file its pass failed to read; a decoded base holding no
+    /// entry for it proves that generation took nothing from it, so a later failure is covered.
+    #[test]
+    fn a_decoded_base_proves_a_listed_but_never_cached_file_unpublished() {
+        let failed = std::path::Path::new("/fixture/.local/share/opencode/opencode.db");
+        struct Base {
+            decoded: bool,
+            legacy: bool,
+            cached: bool,
+            sealed: bool,
+            released: bool,
+        }
+        let current = Base {
+            decoded: true,
+            legacy: false,
+            cached: false,
+            sealed: true,
+            released: false,
+        };
+        let covered = |base: Base| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = base.decoded;
+            cache.legacy_generation = base.legacy;
+            cache.published_seal = base.sealed.then_some([7; 16]);
+            if base.released {
+                let mut killed = super::ReleasedRows::default();
+                killed.sessions.insert("moved-away".to_owned());
+                cache.released.insert("opencode".to_owned(), killed);
+            }
+            cache.set_published_material(HashSet::from([failed.to_path_buf()]));
+            if base.cached {
+                let key = failed.to_string_lossy().into_owned();
+                cache.put_entry(key, cached_entry(&[test_message("published row")]));
+            }
+            cache.unreadable_scope_covered("opencode", failed)
+        };
+        assert!(covered(Base { ..current }));
+        assert!(!covered(Base { cached: true, ..current }));
+        // No base, or an older one whose partial reads published uncached, proves nothing.
+        assert!(!covered(Base { decoded: false, ..current }));
+        assert!(!covered(Base { legacy: true, ..current }));
+        // Nor one not sealed against the published generation, or one a killed pass moved past
+        // it: the rows that pass saw go are still published.
+        assert!(!covered(Base { sealed: false, ..current }));
+        assert!(!covered(Base { released: true, ..current }));
+    }
+
+    /// A crush database that moved keys its conversations under a new namespace: one that fails
+    /// to parse there is served from its copy under the old one, which it keeps from then on.
+    #[test]
+    fn a_failed_conversation_of_a_moved_database_keeps_its_last_good_rows() {
+        let tokens = |namespace: &str| {
+            Some(
+                ["good", "bad"]
+                    .map(|session| {
+                        let id = format!("{namespace}\0{session}");
+                        (id, session.to_owned(), "token".to_owned())
+                    })
+                    .to_vec(),
+            )
+        };
+        let row = |session: &str, text: &str| {
+            let mut message = test_message(text);
+            message.session = session.into();
+            (vec![message], Vec::new(), ReadOutcome::Complete)
+        };
+        let mut cache = IngestCache::cold();
+        cache.collect_token_cached_keyed_partial("crush", tokens("old"), &[], false, true, |_, s| {
+            row(s, "first read")
+        });
+        cache.last_good_base = true;
+        for round in 0..2 {
+            let pass = cache
+                .collect_token_cached_keyed_partial("crush", tokens("new"), &[], false, true, |_, s| {
+                    if s == "bad" {
+                        (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+                    } else {
+                        row(s, "after the move")
+                    }
+                });
+            let mut served: Vec<(&str, &str)> = pass
+                .messages
+                .iter()
+                .map(|m| (m.session.as_ref(), m.text.as_ref()))
+                .collect();
+            served.sort_unstable();
+            assert_eq!(served, [("bad", "first read"), ("good", "after the move")], "{round}");
+            assert!(!cache.admitted_unpublished_failure());
+            assert!(cache.entries.contains_key("\0tok\0crush\0new\0bad"));
+        }
+    }
+
+    /// One session id in two crush databases names two conversations: one panicking in the
+    /// first is not settled by the second's malformed read being served from its last good copy.
+    #[test]
+    fn a_settled_token_failure_is_one_databases_conversation() {
+        let first = std::path::Path::new("/fixture/first/crush.db");
+        let second = std::path::Path::new("/fixture/second/crush.db");
+        let id = |database: &std::path::Path| {
+            format!("{}s", crate::ingest::registry::token_prefix("crush", database).unwrap())
+        };
+        let tokens = |token: &str| {
+            Some(
+                [first, second]
+                    .map(|database| (id(database), "s".to_owned(), token.to_owned()))
+                    .to_vec(),
+            )
+        };
+        let mut cache = IngestCache::cold();
+        cache.collect_token_cached_keyed_partial("crush", tokens("t1"), &[], false, true, |_, s| {
+            let mut message = test_message("published");
+            message.session = s.into();
+            (vec![message], Vec::new(), ReadOutcome::Complete)
+        });
+        cache.last_good_base = true;
+        cache.collect_token_cached_keyed_partial("crush", tokens("t2"), &[], false, true, |key, _| {
+            let outcome = if key == id(first) {
+                ReadOutcome::Skipped
+            } else {
+                ReadOutcome::Invalid
+            };
+            (Vec::new(), Vec::new(), outcome)
+        });
+        assert!(cache.token_failure_settled("crush", second, "s"));
+        assert!(!cache.token_failure_settled("crush", first, "s"));
+    }
+
+    /// A killed pass that saw a token conversation go left a base ahead of the published
+    /// generation, which still holds it: that conversation failing with no entry is not proven
+    /// unpublished by the base, only by a read of that generation.
+    #[test]
+    fn a_base_a_killed_pass_moved_proves_no_failed_conversation_unpublished() {
+        let tokens = || Some(vec![("x".to_owned(), "x".to_owned(), "torn".to_owned())]);
+        let failed = |released: bool| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.published_seal = Some([7; 16]);
+            if released {
+                let mut killed = super::ReleasedRows::default();
+                killed.sessions.insert("x".to_owned());
+                cache.released.insert("cursor".to_owned(), killed);
+            }
+            cache.collect_token_cached_keyed_partial("cursor", tokens(), &[], false, true, |_, _| {
+                (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+            });
+            cache
+        };
+        let current = failed(false);
+        assert!(current.output_complete());
+        assert!(current.admitted_unpublished_failure());
+        let mut ahead = failed(true);
+        assert!(!ahead.output_complete());
+        assert!(ahead.output_complete_past_unreadable());
+        ahead.admit_unpublished_token_conversations(|_| Some(HashSet::from(["x".to_owned()])));
+        assert!(!ahead.output_complete());
+        let mut ahead = failed(true);
+        ahead.admit_unpublished_token_conversations(|_| Some(HashSet::from(["y".to_owned()])));
+        assert!(ahead.output_complete());
+    }
+
+    /// A conversation whose read failed with no last-good copy contributes nothing, is not cached
+    /// (so the next pass reads it again), and holds publication back only where a published
+    /// generation may hold it; with a last-good copy that copy is served.
+    #[test]
+    fn failed_token_conversation_without_last_good_is_retried_not_cached() {
+        let parse = |reads: &std::cell::Cell<usize>, session: &str| {
+            if session == "bad" {
+                reads.set(reads.get() + 1);
+                (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+            } else {
+                let mut message = test_message("healthy");
+                message.session = session.into();
+                (vec![message], Vec::new(), ReadOutcome::Complete)
+            }
+        };
+        let tokens = || {
+            Some(vec![
+                ("good".to_string(), "good".to_string(), "good-token".to_string()),
+                ("bad".to_string(), "bad".to_string(), "bad-token".to_string()),
+            ])
+        };
+        let reads = std::cell::Cell::new(0);
+        let mut first = IngestCache::cold();
+        first.set_published_material(HashSet::new());
+        first.set_published_token_namespaces(Some(HashSet::new()));
+        let pass = first
+            .collect_token_cached_keyed_partial("cursor", tokens(), &[], false, true, |_, s| {
+                parse(&reads, s)
+            });
+        let texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        assert_eq!(texts, ["healthy"]);
+        assert!(first.output_complete());
+        assert!(!first.source_snapshot_safe());
+        assert!(!first.entries.contains_key("\0tok\0cursor\0bad"));
+        // Admitted, so the caller would refuse this pass had it produced no row at all.
+        assert!(first.admitted_unpublished_failure());
+        let database = std::path::Path::new("/fixture/User/globalStorage/state.vscdb");
+        assert!(first.token_failure_settled("cursor", database, "bad"));
+        // The healthy sibling hits its cached token; the failed conversation is read again.
+        let pass = first
+            .collect_token_cached_keyed_partial("cursor", tokens(), &[], false, true, |_, s| {
+                parse(&reads, s)
+            });
+        assert_eq!(pass.messages.len(), 1);
+        assert_eq!(reads.get(), 2);
+        assert!(first.output_complete());
+
+        // A pass with no decoded base over a generation recorded as holding this database's
+        // conversations cannot tell the failed one was never published until a read of that
+        // generation shows it holds none of it; one it cannot read, or one naming it, holds.
+        let cold_over_published = || {
+            let mut cold = IngestCache::cold();
+            cold.set_published_material(HashSet::new());
+            cold.set_published_token_namespaces(Some(HashSet::from([(
+                "cursor".into(),
+                String::new(),
+            )])));
+            cold.collect_token_cached_keyed_partial("cursor", tokens(), &[], false, true, |_, s| {
+                parse(&reads, s)
+            });
+            assert!(!cold.output_complete());
+            assert!(!cold.admitted_unpublished_failure());
+            assert!(!cold.token_failure_settled("cursor", database, "bad"));
+            cold
+        };
+        for published in [None, Some(HashSet::from(["bad".to_owned()]))] {
+            let mut held = cold_over_published();
+            held.admit_unpublished_token_conversations(|_| published.clone());
+            assert!(!held.output_complete());
+        }
+        let mut admitted = cold_over_published();
+        admitted.admit_unpublished_token_conversations(|_| Some(HashSet::from(["good".into()])));
+        assert!(admitted.output_complete());
+        assert!(admitted.admitted_unpublished_failure());
+        assert!(admitted.token_failure_settled("cursor", database, "bad"));
+
+        // A conversation published before keeps its last-good rows when its read fails.
+        let mut warm = IngestCache::cold();
+        warm.collect_token_cached_keyed_partial("cursor", tokens(), &[], false, true, |_, s| {
+            let mut message = test_message("last good");
+            message.session = s.into();
+            (vec![message], Vec::new(), ReadOutcome::Complete)
+        });
+        let moved = Some(vec![
+            ("good".to_string(), "good".to_string(), "good-token".to_string()),
+            ("bad".to_string(), "bad".to_string(), "bad-token-2".to_string()),
+        ]);
+        let pass = warm.collect_token_cached_keyed_partial("cursor", moved, &[], false, true, |_, s| {
+            parse(&reads, s)
+        });
+        let mut served: Vec<(&str, &str)> = pass
+            .messages
+            .iter()
+            .map(|m| (m.session.as_ref(), m.text.as_ref()))
+            .collect();
+        served.sort_unstable();
+        assert_eq!(served, [("bad", "last good"), ("good", "last good")]);
+        assert!(warm.output_complete());
+        assert!(!warm.source_snapshot_safe());
+        assert!(!warm.admitted_unpublished_failure());
+
+        // Rows a partial read vouches for publish and are kept for a later failed read, but with
+        // no identity, so every pass reads the conversation again.
+        let mut partial = IngestCache::cold();
+        partial.set_published_material(HashSet::new());
+        partial.set_published_token_namespaces(Some(HashSet::new()));
+        let partial_reads = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let pass = partial
+                .collect_token_cached_keyed_partial("cursor", tokens(), &[], false, true, |_, s| {
+                    partial_reads.set(partial_reads.get() + 1);
+                    let mut message = test_message("vouched");
+                    message.session = s.into();
+                    (vec![message], Vec::new(), ReadOutcome::Partial)
+                });
+            assert_eq!(pass.messages.len(), 2);
+            assert!(partial.output_complete());
+        }
+        assert_eq!(partial_reads.get(), 4);
     }
 
     #[test]
@@ -6156,11 +7337,7 @@ mod tests {
             &[],
             ReadOutcome::Complete,
         );
-        let payload = bincode::serialize(&super::CacheFileRef {
-            version: CACHE_VERSION - 1,
-            entries: &old.entries,
-        })
-        .unwrap();
+        let payload = legacy_payload_v37(CACHE_VERSION - 1, &old.entries);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(CACHE_VERSION - 1).to_le_bytes());
         bytes.extend_from_slice(&0_u64.to_le_bytes());
@@ -6632,6 +7809,149 @@ mod tests {
         }
     }
 
+    /// A v4 base file of the given semantic version, owned by this build, around `payload`.
+    fn write_v4_base(path: &std::path::Path, version: u32, instance: [u8; 16], payload: &[u8]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(super::CACHE_BASE_MAGIC);
+        bytes.extend_from_slice(&super::CACHE_BASE_STORAGE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&super::WriterBuildId::current().0);
+        bytes.extend_from_slice(&instance);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&super::cache_digest(payload));
+        bytes.extend_from_slice(&super::CACHE_CODEC_NONE.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// A journal holding one frame (0 -> 1) whose payload is the given bytes.
+    fn write_journal_frame(path: &std::path::Path, instance: [u8; 16], payload: &[u8]) {
+        let digest = super::cache_digest(payload);
+        let mut bytes = super::encode_journal_header(instance);
+        bytes.extend_from_slice(super::CACHE_FRAME_MAGIC);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&digest);
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(super::CACHE_COMMIT_MAGIC);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&digest);
+        fs::write(path, bytes).unwrap();
+    }
+    #[test]
+    fn a_partial_read_extends_a_v37_entry_and_a_capped_reply() {
+        let cap = crate::ingest::REPLY_CAP;
+        let with_reply = |text: &str, reply: &str| {
+            let mut row = test_message(text);
+            row.reply = reply.into();
+            row.reply_chars = reply.chars().count();
+            row
+        };
+        let capped = format!("{}…", "x".repeat(cap));
+        let cases: [(String, String, bool); 4] = [
+            // the text a v37 entry holds is the text a reparse publishes
+            ("A. B.".into(), "A. B.".into(), true),
+            ("A. B.".into(), "A. B. C.".into(), true),
+            // a capped reply grows no further; a later block changes only its shape
+            (capped.clone(), capped, true),
+            ("A. B.".into(), "A.".into(), false),
+        ];
+        for (cached, fresh, extends) in cases {
+            let prev = cached_entry(&[with_reply("q", &cached)]);
+            assert_eq!(
+                super::partial_read_extends(&prev, &[with_reply("q", &fresh)], &[]),
+                extends,
+                "{cached:.20} -> {fresh:.20}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_v37_wire_decodes_through_its_own_layout_journal_included() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-v37-wire-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cache_path = root.join("cache.bin");
+        let legacy_row = |text: &str, reply: &str| super::LegacyCMsgV37 {
+            agent: "claude".into(),
+            project: "p".into(),
+            session: "s".into(),
+            ts: 1,
+            turn: 0,
+            text: text.into(),
+            who: "user".into(),
+            model: "".into(),
+            model_source: "unknown".into(),
+            reply: reply.into(),
+            reply_chars: reply.chars().count(),
+            side: false,
+            parent: "".into(),
+        };
+        let legacy_entry = |text: &str, reply: &str| super::LegacyEntryV37 {
+            mtime: 1,
+            size: 1,
+            identity: None,
+            msgs: vec![legacy_row(text, reply)],
+            event_keys: Vec::new(),
+            legacy_had_events: false,
+            legacy_needs_reparse: false,
+        };
+        let mut entries = HashMap::new();
+        entries.insert("\0file\0a".to_string(), legacy_entry("base", "one two"));
+        let payload = bincode::serialize(&super::LegacyCacheFileV37 {
+            version: CACHE_VERSION - 1,
+            entries,
+        })
+        .unwrap();
+        let instance = [7u8; 16];
+        write_v4_base(&cache_path, CACHE_VERSION - 1, instance, &payload);
+        let delta = bincode::serialize(&super::LegacyJournalDeltaV37 {
+            upserts: vec![("\0file\0b".to_string(), legacy_entry("journaled", "three"))],
+            deletes: Vec::new(),
+        })
+        .unwrap();
+        write_journal_frame(&super::cache_journal_path(&cache_path), instance, &delta);
+        let (entries, generation, _) =
+            super::decode_cache_for(&cache_path, super::WriterBuildId::current()).unwrap();
+        assert!(generation == super::CacheGeneration::LegacyReparse);
+        let rows: Vec<(String, String, bool)> = {
+            let mut rows: Vec<_> = entries
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        entry.msgs[0].reply.to_string(),
+                        entry.legacy_needs_reparse,
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            rows,
+            [
+                ("\0file\0a".to_string(), "one two".to_string(), true),
+                ("\0file\0b".to_string(), "three".to_string(), true),
+            ]
+        );
+        assert!(entries
+            .values()
+            .all(|e| e.msgs[0].reply_shape.breaks.is_empty()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_per_file_scope_is_served_only_when_the_cache_holds_every_file_listed_under_it() {
         use super::MaterialVerdict;
@@ -6811,7 +8131,11 @@ mod tests {
         assert!(!unproven("2026/01/04/rollout.jsonl"), "its directory gone");
         assert!(unproven("2026/01/05/rollout.jsonl"), "a resolving link");
         assert!(unproven("2026/01/06/rollout.jsonl"), "a dangling link");
-        assert!(unproven("2026/01/07/rollout.jsonl"), "no directory");
+        assert!(!unproven("2026/01/07/rollout.jsonl"), "a plain file where the directory was");
+        assert!(
+            !unproven("2026/01/07/deeper/rollout.jsonl"),
+            "an ancestor whose stat proves it gone (ENOTDIR under the file)"
+        );
         assert!(!unproven("rollout.jsonl"), "directly beneath the root");
         let elsewhere = Path::new("/elsewhere/rollout.jsonl");
         assert!(!super::absence_unproven(&root, elsewhere));
@@ -7064,7 +8388,7 @@ mod tests {
                 "\0snapshot\0cline".to_owned(),
                 cached_entry(&[test_message("a row awaiting reparse")]),
             ),
-            (record, super::released_entry()),
+            record,
         ]);
         let payload = bincode::serialize(&super::CacheFileRef {
             version: CACHE_VERSION,
@@ -7368,7 +8692,7 @@ mod tests {
                 LegacyEntryV8 {
                     mtime: 1,
                     size: 6,
-                    msgs: vec![CMsg::from(&test_message("legacy"))],
+                    msgs: vec![super::LegacyCMsgV37::from(&test_message("legacy"))],
                 },
             )]),
         };
@@ -7845,15 +9169,23 @@ mod tests {
         assert!(stage.commit().is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
 
+        // The link stands where the committed frame was: a writer cannot read it, so the frames
+        // are lost and the base refused as stale; the rebuild unlinks the link, never its target.
         let mut reset = IngestCache::load(&cache_path);
+        assert!(!reset.decoded_last_good_base());
         collect_cached(&mut reset, &root, std::slice::from_ref(&source), |_| {
             (vec![test_message("second")], Vec::new())
         });
-        reset.stage_save(&cache_path).unwrap().commit().unwrap();
+        let head = reset.stage_save(&cache_path).unwrap().commit().unwrap();
+        assert_eq!(head.sequence, 0);
         assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
-        let metadata = fs::symlink_metadata(&journal_path).unwrap();
-        assert!(!metadata.file_type().is_symlink());
-        assert!(metadata.is_file());
+        assert!(fs::symlink_metadata(&journal_path).is_err());
+        let loaded = IngestCache::load(&cache_path);
+        assert!(loaded.decoded_last_good_base());
+        assert_eq!(
+            loaded.entries[&source_key(&source)].msgs[0].text.as_ref(),
+            "second"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8304,6 +9636,472 @@ mod tests {
         assert_eq!(loaded.entries[&key].msgs[0].text.as_ref(), "replacement");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-cache-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Commit `texts` as successive warm deltas over a cold base, returning the cache path.
+    fn committed_deltas(root: &std::path::Path, texts: &[&str]) -> PathBuf {
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"base").unwrap();
+        let mut cold = IngestCache::cold();
+        collect_cached(&mut cold, root, std::slice::from_ref(&source), |_| {
+            (vec![test_message("base")], Vec::new())
+        });
+        cold.save(&cache_path).unwrap();
+        for text in texts {
+            fs::write(&source, format!("delta {text}")).unwrap();
+            let mut warm = IngestCache::load(&cache_path);
+            collect_cached(&mut warm, root, std::slice::from_ref(&source), |_| {
+                (vec![test_message(text)], Vec::new())
+            });
+            warm.stage_save(&cache_path).unwrap().commit().unwrap();
+        }
+        cache_path
+    }
+
+    #[test]
+    fn every_commit_records_the_head_it_establishes() {
+        let root = scratch_root("head");
+        let cache_path = committed_deltas(&root, &["first", "second"]);
+        let head_path = super::cache_head_path(&cache_path);
+        let head = super::read_cache_head(&cache_path).expect("the commits recorded a head");
+        assert_eq!(head.sequence, 2);
+        assert_eq!(
+            fs::read_to_string(&head_path).unwrap(),
+            head.encode(),
+            "the sidecar is the head's text form"
+        );
+        let loaded = IngestCache::load(&cache_path);
+        let super::CacheBacking::Delta {
+            instance, cursor, ..
+        } = &loaded.backing
+        else {
+            panic!("a committed base replays as a delta backing")
+        };
+        assert_eq!(*instance, head.instance);
+        assert_eq!(cursor.lock().unwrap().sequence, 2);
+        // A commit that changes nothing re-records the same head.
+        let noop = loaded.stage_save(&cache_path).unwrap();
+        assert!(matches!(noop.kind, super::StagedCacheKind::Noop { .. }));
+        assert_eq!(noop.commit().unwrap(), head);
+        // A base rewrite starts a new instance at sequence 0.
+        let rewritten = IngestCache::cold()
+            .stage_save(&cache_path)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_ne!(rewritten.instance, head.instance);
+        assert_eq!(rewritten.sequence, 0);
+        assert_eq!(super::read_cache_head(&cache_path), Some(rewritten));
+        assert_eq!(super::CacheHead::parse(b"not a head"), None);
+        assert_eq!(
+            super::CacheHead::parse(rewritten.encode().as_bytes()),
+            Some(rewritten)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A directory in the head's place is moved aside, its contents intact, before the base or
+    /// journal moves; one that cannot be moved refuses the commit naming the path with nothing
+    /// changed, so the last commit's base, journal and head still agree.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_the_heads_place_is_displaced_before_the_commit_or_refuses_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_root("head-directory");
+        let cache_path = committed_deltas(&root, &["first"]);
+        let source = root.join("session.jsonl");
+        let head_path = super::cache_head_path(&cache_path);
+        let journal_path = super::cache_journal_path(&cache_path);
+        let recorded = super::read_cache_head(&cache_path).unwrap();
+        fs::remove_file(&head_path).unwrap();
+        fs::create_dir(&head_path).unwrap();
+        fs::write(head_path.join("keep.txt"), b"user content").unwrap();
+
+        // Movable: the delta commits, the head is recorded, the directory survives aside.
+        fs::write(&source, b"second delta").unwrap();
+        let mut warm = IngestCache::load(&cache_path);
+        collect_cached(&mut warm, &root, std::slice::from_ref(&source), |_| {
+            (vec![test_message("second")], Vec::new())
+        });
+        let head = warm.stage_save(&cache_path).unwrap().commit().unwrap();
+        assert_eq!(head.sequence, recorded.sequence + 1);
+        assert_eq!(super::read_cache_head(&cache_path), Some(head));
+        let aside: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".head.displaced-"))
+            })
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(
+            fs::read(aside[0].join("keep.txt")).unwrap(),
+            b"user content"
+        );
+
+        // Not movable (its parent read-only): the commit refuses naming the path before the
+        // journal or base changed, and the committed state still decodes whole.
+        let journal_before = fs::read(&journal_path).unwrap();
+        fs::write(&source, b"third delta").unwrap();
+        let mut blocked = IngestCache::load(&cache_path);
+        assert!(blocked.decoded_last_good_base());
+        collect_cached(&mut blocked, &root, std::slice::from_ref(&source), |_| {
+            (vec![test_message("third")], Vec::new())
+        });
+        let stage = blocked.stage_save(&cache_path).unwrap();
+        fs::remove_file(&head_path).unwrap();
+        fs::create_dir(&head_path).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = if fs::rename(&head_path, root.join("probe")).is_ok() {
+            // A privileged runner ignores the mode bits; nothing to refuse.
+            fs::rename(root.join("probe"), &head_path).unwrap();
+            None
+        } else {
+            Some(
+                stage
+                    .commit()
+                    .expect_err("a blocked head refuses the commit"),
+            )
+        };
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        if let Some(error) = refused {
+            let message = error.to_string();
+            assert!(
+                message.contains(&head_path.display().to_string())
+                    && message.contains("could not be moved aside"),
+                "{message}"
+            );
+            assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+            assert!(fs::symlink_metadata(&head_path).is_ok_and(|m| m.is_dir()));
+            fs::remove_dir(&head_path).unwrap();
+            super::write_cache_head(&cache_path, head).unwrap();
+            let loaded = IngestCache::load(&cache_path);
+            assert!(loaded.decoded_last_good_base());
+            assert_eq!(
+                loaded.entries[&source_key(&source)].msgs[0].text.as_ref(),
+                "second"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A journal replaying short of the recorded head has lost frames: the base is older than
+    /// what was committed from it, and every decode lane refuses it rather than serving it.
+    #[test]
+    fn a_journal_behind_its_last_commit_is_refused_in_every_lane() {
+        let root = scratch_root("stale-journal");
+        let cache_path = committed_deltas(&root, &["first", "second"]);
+        let journal_path = super::cache_journal_path(&cache_path);
+        let full = fs::read(&journal_path).unwrap();
+        let writer = super::WriterBuildId::current();
+        let refusal = |cache: &std::path::Path| super::decode_cache_for(cache, writer).err();
+        use super::CacheDecodeRefusal;
+
+        fs::remove_file(&journal_path).unwrap();
+        assert_eq!(refusal(&cache_path), Some(CacheDecodeRefusal::StaleJournal));
+        assert!(!CacheDecodeRefusal::StaleJournal.is_undecodable());
+        assert!(IngestCache::load(&cache_path).entries.is_empty());
+        assert!(!IngestCache::load(&cache_path).decoded_last_good_base());
+        let (repair, refused) = IngestCache::repair(&cache_path);
+        assert!(repair.discarded_base() && refused == Some(CacheDecodeRefusal::StaleJournal));
+        let (retry, refused) = IngestCache::guarded_retry(&cache_path);
+        assert!(retry.discarded_base() && refused == Some(CacheDecodeRefusal::StaleJournal));
+        assert_eq!(
+            super::adopt_foreign_cache(&cache_path),
+            Err(CacheDecodeRefusal::StaleJournal.label())
+        );
+
+        // Only the newest frame lost: still short of the head.
+        let instance = super::read_cache_head(&cache_path).unwrap().instance;
+        let replayed = |path: &std::path::Path, entries: &mut HashMap<String, super::Entry>| {
+            match super::replay_journal(path, instance, entries) {
+                super::JournalReplay::Replayed(cursor) => cursor,
+                super::JournalReplay::Unreadable(_) => panic!("a regular journal reads"),
+            }
+        };
+        let mut cursor_entries = HashMap::new();
+        fs::write(&journal_path, &full).unwrap();
+        assert_eq!(replayed(&journal_path, &mut cursor_entries).sequence, 2);
+        let first_frame_end = {
+            let mut partial = HashMap::new();
+            let mut probe = full.clone();
+            probe.truncate(full.len() - 1);
+            fs::write(&journal_path, &probe).unwrap();
+            replayed(&journal_path, &mut partial).valid_len as usize
+        };
+        fs::write(&journal_path, &full[..first_frame_end]).unwrap();
+        assert_eq!(refusal(&cache_path), Some(CacheDecodeRefusal::StaleJournal));
+
+        // The journal whole again: trusted, and a torn append past the head still is.
+        fs::write(&journal_path, &full).unwrap();
+        assert!(refusal(&cache_path).is_none());
+        let mut torn = full.clone();
+        torn.extend_from_slice(b"a frame a kill cut short");
+        fs::write(&journal_path, &torn).unwrap();
+        assert!(refusal(&cache_path).is_none());
+
+        // Unreadable under the lock (mode 000, a link, a directory): lost for every writer lane,
+        // which refuses; the lock-free lane alone keeps reading the base.
+        let source = root.join("session.jsonl");
+        let unreadable = |shape: &str| {
+            let _ = fs::remove_file(&journal_path);
+            let _ = fs::remove_dir(&journal_path);
+            match shape {
+                #[cfg(unix)]
+                "mode-000" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::write(&journal_path, &full).unwrap();
+                    fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                #[cfg(unix)]
+                "link" => {
+                    let copy = root.join("journal-copy");
+                    fs::write(&copy, &full).unwrap();
+                    std::os::unix::fs::symlink(&copy, &journal_path).unwrap();
+                }
+                _ => fs::create_dir(&journal_path).unwrap(),
+            }
+        };
+        let shapes: &[&str] = if cfg!(unix) {
+            &["mode-000", "link", "directory"]
+        } else {
+            &["directory"]
+        };
+        for shape in shapes.iter().copied() {
+            unreadable(shape);
+            if shape == "mode-000" && fs::read(&journal_path).is_ok() {
+                continue;
+            }
+            assert_eq!(
+                refusal(&cache_path),
+                Some(CacheDecodeRefusal::StaleJournal),
+                "{shape}"
+            );
+            assert!(
+                !IngestCache::load(&cache_path).decoded_last_good_base(),
+                "{shape}"
+            );
+            assert_eq!(
+                super::adopt_foreign_cache(&cache_path),
+                Err(CacheDecodeRefusal::StaleJournal.label()),
+                "{shape}"
+            );
+            assert_eq!(
+                super::CacheView::read(&cache_path).map(|view| view.session_sources().len()),
+                Ok(1),
+                "{shape}: the lock-free lane reads the base"
+            );
+        }
+        if fs::symlink_metadata(&journal_path).is_ok_and(|metadata| metadata.is_dir()) {
+            // A directory in the journal's place is moved aside by the rebuild, never deleted.
+            fs::write(journal_path.join("keep.txt"), b"user content").unwrap();
+            let mut rebuilt = IngestCache::load(&cache_path);
+            collect_cached(&mut rebuilt, &root, std::slice::from_ref(&source), |_| {
+                (vec![test_message("rebuilt")], Vec::new())
+            });
+            let head = rebuilt.stage_save(&cache_path).unwrap().commit().unwrap();
+            assert_eq!(head.sequence, 0);
+            assert!(fs::symlink_metadata(&journal_path).is_err());
+            let aside: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().contains(".journal.displaced-"))
+                })
+                .collect();
+            assert_eq!(aside.len(), 1);
+            assert_eq!(
+                fs::read(aside[0].join("keep.txt")).unwrap(),
+                b"user content"
+            );
+            assert!(IngestCache::load(&cache_path).decoded_last_good_base());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Compaction folds the frames into one but keeps counting: the head a commit recorded stays
+    /// comparable, so a compacted journal is never mistaken for a truncated one.
+    #[test]
+    fn compaction_keeps_the_journal_sequence_comparable_with_the_head() {
+        let root = scratch_root("compaction-head");
+        let cache_path = committed_deltas(&root, &["first", "second", "third"]);
+        let source = root.join("session.jsonl");
+        let mut due = IngestCache::load(&cache_path);
+        let super::CacheBacking::Delta { cursor, .. } = &due.backing else {
+            panic!("wrapped base must support deltas")
+        };
+        cursor.lock().unwrap().frames = super::JOURNAL_COMPACT_FRAMES;
+        fs::write(&source, b"compacting delta").unwrap();
+        collect_cached(&mut due, &root, std::slice::from_ref(&source), |_| {
+            (vec![test_message("fourth")], Vec::new())
+        });
+        let stage = due.stage_save(&cache_path).unwrap();
+        assert!(matches!(
+            stage.kind,
+            super::StagedCacheKind::Journal {
+                mode: super::JournalWrite::Replace,
+                ..
+            }
+        ));
+        let head = stage.commit().unwrap();
+        assert_eq!(head.sequence, 4);
+        let loaded = IngestCache::load(&cache_path);
+        assert!(loaded.decoded_last_good_base());
+        let super::CacheBacking::Delta { cursor, .. } = &loaded.backing else {
+            panic!("wrapped base must support deltas")
+        };
+        let state = cursor.lock().unwrap();
+        assert_eq!((state.sequence, state.frames), (4, 1));
+        drop(state);
+        assert_eq!(
+            loaded.entries[&source_key(&source)].msgs[0].text.as_ref(),
+            "fourth"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A lock-free reader (why-source) may see a commit land between its two sidecar reads. Read
+    /// head-first, a landed commit only adds frames past the head, so the base still decodes;
+    /// read the other way round, the same commit would show a head past the frames and refuse.
+    #[test]
+    fn a_commit_landing_between_the_head_and_journal_reads_is_not_a_stale_journal() {
+        let root = scratch_root("decode-race");
+        let cache_path = committed_deltas(&root, &["first"]);
+        let source = root.join("session.jsonl");
+        let commit_between = {
+            let (root, cache_path, source) = (root.clone(), cache_path.clone(), source.clone());
+            move || {
+                fs::write(&source, b"landed between the reads").unwrap();
+                let mut warm = IngestCache::load(&cache_path);
+                collect_cached(&mut warm, &root, std::slice::from_ref(&source), |_| {
+                    (vec![test_message("landed")], Vec::new())
+                });
+                warm.stage_save(&cache_path).unwrap().commit().unwrap();
+            }
+        };
+        super::BETWEEN_HEAD_AND_JOURNAL
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(commit_between)));
+        let sources = super::CacheView::read(&cache_path)
+            .expect("a healthy cache decodes")
+            .session_sources();
+        assert_eq!(sources.len(), 1);
+        super::BETWEEN_HEAD_AND_JOURNAL
+            .with(|hook| assert!(hook.borrow().is_none(), "the hook ran"));
+        assert_eq!(super::read_cache_head(&cache_path).unwrap().sequence, 2);
+
+        // The reverse race, a head ahead of a journal that is intact, is a loss and still refuses.
+        let mut ahead = super::read_cache_head(&cache_path).unwrap();
+        ahead.sequence += 1;
+        super::write_cache_head(&cache_path, ahead).unwrap();
+        assert_eq!(
+            super::CacheView::read(&cache_path).err(),
+            Some(super::CacheDecodeRefusal::StaleJournal)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The record packs every released row and session, reads back exactly, reads a 0.4.2 record
+    /// too, and is serialized ahead of every source so a bounded prelude reader can skip it.
+    #[test]
+    fn a_released_record_packs_compactly_and_serializes_first() {
+        let digest = |text: &str| crate::cache::text_digest(text);
+        let mut rows = HashMap::new();
+        rows.insert(("s1".to_owned(), 5_i64, digest("one")), 1_usize);
+        rows.insert(("s1".to_owned(), 6, digest("two")), 2);
+        rows.insert(("s2".to_owned(), 7, digest("three")), 1);
+        let released = HashMap::from([
+            (
+                "claude".to_owned(),
+                super::ReleasedRows {
+                    rows: rows.clone(),
+                    sessions: HashSet::from(["s2".to_owned(), "s3".to_owned()]),
+                },
+            ),
+            ("codex".to_owned(), super::ReleasedRows::default()),
+        ]);
+        let seal = super::hex16(&[9; 16]);
+        let (key, entry) = super::pack_released(&seal, &released).unwrap();
+        assert_eq!(key, format!("{}{seal}", super::RELEASED_KEY));
+        assert!(super::released_key(&key));
+        let read =
+            super::recorded_released_rows(&HashMap::from([(key.clone(), entry.clone())]), &seal);
+        assert_eq!(
+            read.len(),
+            1,
+            "an agent with nothing released records nothing"
+        );
+        assert_eq!(read["claude"].rows, rows);
+        assert_eq!(
+            read["claude"].sessions,
+            HashSet::from(["s2".to_owned(), "s3".to_owned()])
+        );
+        let other = super::hex16(&[8; 16]);
+        assert!(super::recorded_released_rows(
+            &HashMap::from([(key.clone(), entry.clone())]),
+            &other
+        )
+        .is_empty());
+        // Equal records pack equal, whatever order the maps iterate in.
+        let (again_key, again) = super::pack_released(&seal, &released).unwrap();
+        assert!(again_key == key && again.identity == entry.identity);
+        assert!(super::pack_released(&seal, &HashMap::new()).is_none());
+
+        let legacy = format!(
+            "{}{}",
+            super::RELEASED_KEY,
+            serde_json::json!({"seal": seal, "agents": {"claude": [
+                [["s1", 5, super::hex16(&digest("one")), 1]], ["s3"]]}})
+        );
+        let legacy_entries = HashMap::from([(legacy, super::released_entry(Vec::new()))]);
+        let read = super::recorded_released_rows(&legacy_entries, &seal);
+        assert_eq!(read["claude"].rows.len(), 1);
+        assert_eq!(read["claude"].sessions, HashSet::from(["s3".to_owned()]));
+
+        let mut entries: HashMap<String, super::Entry> = (0..64)
+            .map(|index| {
+                (
+                    format!("/fixture/{index}.jsonl"),
+                    cached_entry(&[test_message("row")]),
+                )
+            })
+            .collect();
+        entries.insert(key.clone(), entry);
+        let payload = bincode::serialize(&super::CacheFileRef {
+            version: CACHE_VERSION,
+            entries: &entries,
+        })
+        .unwrap();
+        let first_len = super::read_u64(&payload, 12).unwrap() as usize;
+        assert_eq!(&payload[20..20 + first_len], key.as_bytes());
+        let (decoded, _, _) =
+            super::decode_cache_payload(&payload, std::path::Path::new("cache.bin")).unwrap();
+        assert_eq!(decoded.len(), 65);
+        assert_eq!(
+            decoded
+                .keys()
+                .filter(|key| !super::released_key(key))
+                .count(),
+            64
+        );
     }
 
     #[test]
@@ -9248,6 +11046,7 @@ mod tests {
                 reply_chars: 0,
                 side: false,
                 parent: String::new(),
+                reply_shape: Default::default(),
             }
             .freeze()
         };
@@ -9349,13 +11148,13 @@ mod tests {
             let cache_path = dir.join(".ingest_cache.bin");
             let mut cache = IngestCache::cold();
             collect_cached(&mut cache, &dir, std::slice::from_ref(&source), |_| {
-                (vec![test_message("released last-good row")], Vec::<Event>::new())
+                (
+                    vec![test_message("released last-good row")],
+                    Vec::<Event>::new(),
+                )
             });
-            let payload = bincode::serialize(&super::CacheFileRef {
-                version,
-                entries: &cache.entries,
-            })
-            .unwrap();
+            // a released generation wrote its own (reply-shape-less) row layout
+            let payload = legacy_payload_v37(version, &cache.entries);
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&version.to_le_bytes());
             bytes.extend_from_slice(&0_u64.to_le_bytes());
@@ -9373,13 +11172,15 @@ mod tests {
             let expected = if journaled {
                 let mut entry = cache.entries[&source_key(&source)].clone();
                 entry.msgs[0].text = "released journal row".into();
-                let delta = super::JournalDelta {
-                    upserts: vec![(source_key(&source), entry)],
+                let delta = bincode::serialize(&super::LegacyJournalDeltaV37 {
+                    upserts: vec![(
+                        source_key(&source),
+                        super::LegacyEntryV37::downgrade(&entry),
+                    )],
                     deletes: Vec::new(),
-                };
-                let mut journal = super::encode_journal_header([7_u8; 16]);
-                journal.extend_from_slice(&super::encode_journal_frame(0, 1, &delta).unwrap());
-                fs::write(super::cache_journal_path(&cache_path), journal).unwrap();
+                })
+                .unwrap();
+                write_journal_frame(&super::cache_journal_path(&cache_path), [7_u8; 16], &delta);
                 "released journal row"
             } else {
                 "released last-good row"
@@ -9537,7 +11338,9 @@ fn source_metadata(root: &Path, path: &Path) -> std::io::Result<Option<fs::Metad
     let mut current = root.to_path_buf();
     let root_metadata = match fs::symlink_metadata(&current) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if crate::ingest::registry::stat_proves_absent(&current, &error) => {
+            return Ok(None)
+        }
         Err(error) => return Err(error),
     };
     if crate::ingest::registry::metadata_is_link(&root_metadata) {
@@ -9558,7 +11361,9 @@ fn source_metadata(root: &Path, path: &Path) -> std::io::Result<Option<fs::Metad
         }
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if crate::ingest::registry::stat_proves_absent(path, &error) => {
+                return Ok(None)
+            }
             Err(error) => return Err(error),
         };
         if crate::ingest::registry::metadata_is_link(&metadata) {
@@ -9589,7 +11394,9 @@ fn source_metadata(root: &Path, path: &Path) -> std::io::Result<Option<fs::Metad
         current.push(name);
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if crate::ingest::registry::stat_proves_absent(&current, &error) => {
+                return Ok(None)
+            }
             Err(error) => return Err(error),
         };
         if crate::ingest::registry::metadata_is_link(&metadata) {
@@ -9616,7 +11423,7 @@ fn single_file_stat(
     let m = match source_metadata(root, p) {
         Ok(Some(metadata)) => metadata,
         Ok(None) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if crate::ingest::registry::stat_proves_absent(p, &error) => return Ok(None),
         Err(error) => return Err(error),
     };
     let mtime = m
@@ -9822,7 +11629,7 @@ fn reconcile_hardlink_identities(
             indices.iter().all(|index| match &stats[*index].4 {
                 CacheIdentity::HardlinkedSource { content_sha256, .. } => content_sha256 == digest,
                 CacheIdentity::Source(change) => known_changes.contains(change),
-                CacheIdentity::Token(_) => false,
+                CacheIdentity::Token(_) | CacheIdentity::Released(_) => false,
             })
         });
         let digest = reusable.or_else(|| {
@@ -9850,7 +11657,7 @@ fn reconcile_hardlink_identities(
                 CacheIdentity::HardlinkedSource { content_sha256, .. } => {
                     *content_sha256 = digest;
                 }
-                CacheIdentity::Token(_) => {}
+                CacheIdentity::Token(_) | CacheIdentity::Released(_) => {}
             }
         }
         for index in &indices {
@@ -9883,12 +11690,19 @@ pub struct Pass {
     pub parsed: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SourceReadIssue {
     pub agent: &'static str,
     pub path: PathBuf,
     pub kind: &'static str,
     pub reason: String,
+    /// The conversation of a token store whose parse this issue records; None for a failure the
+    /// collector cannot tie to one, which a reader must then attribute to no chat.
+    pub session: Option<String>,
+    /// A failure a retry may clear (a lock, a journal, an I/O error), though it may persist.
+    pub retryable: bool,
+    /// The source changed under the read: it never fails the same way twice.
+    pub moving: bool,
 }
 
 impl SourceReadIssue {
@@ -9903,7 +11717,38 @@ impl SourceReadIssue {
             path: path.into(),
             kind,
             reason: reason.into(),
+            session: None,
+            retryable: false,
+            moving: false,
         }
+    }
+
+    pub(crate) fn for_session(mut self, session: impl Into<String>) -> Self {
+        self.session = Some(session.into());
+        self
+    }
+
+    pub(crate) fn retryable(mut self) -> Self {
+        self.retryable = true;
+        self
+    }
+
+    pub(crate) fn moving(mut self) -> Self {
+        self.moving = true;
+        self
+    }
+
+    /// Whether this records material the read could not take for a durable reason (not an
+    /// absence, a failure a retry may clear, a source that moved under the read, nor a parser
+    /// panic, which a fixed build reads): what a rebuild may publish without once a later pass
+    /// sees it fail the same way.
+    pub fn unreadable_material(&self) -> bool {
+        self.kind == "source-read-failed"
+            && !self.retryable
+            && !self.moving
+            && !self
+                .reason
+                .starts_with(crate::ingest::parse_guard::PANIC_REASON_PREFIX)
     }
 }
 
@@ -9934,11 +11779,19 @@ pub enum ReadOutcome {
     /// back or rewound in records the read saw whole. Where an empty read of a changed file may be
     /// torn, this one proves the emptiness, so a file that only grew may publish it over last-good.
     Undone,
+    /// The source could not be opened or read at this moment (a writer's lock or journal, an I/O
+    /// error), which a retry may clear or which may persist. It vouches for nothing.
+    Unavailable,
+    /// The source changed under the read (its generation moved, it shrank or was replaced): a
+    /// later pass reads another source, so this failure never counts as persistent.
+    Moved,
 }
 
 impl ReadOutcome {
     pub fn merge(self, other: Self) -> Self {
         match (self, other) {
+            (Self::Moved, _) | (_, Self::Moved) => Self::Moved,
+            (Self::Unavailable, _) | (_, Self::Unavailable) => Self::Unavailable,
             (Self::Invalid, _) | (_, Self::Invalid) => Self::Invalid,
             (Self::Skipped, _) | (_, Self::Skipped) => Self::Skipped,
             (Self::Partial, _) | (_, Self::Partial) => Self::Partial,
@@ -9966,8 +11819,34 @@ fn read_issue_reason(outcome: Option<ReadOutcome>, panicked: Option<String>) -> 
         reason
     } else if outcome == Some(ReadOutcome::Partial) {
         "source parser could not cover part of the read".to_owned()
+    } else if outcome == Some(ReadOutcome::Unavailable) {
+        "source could not be opened or read; a retry may read it".to_owned()
+    } else if outcome == Some(ReadOutcome::Moved) {
+        "source changed while it was being read".to_owned()
     } else {
         "source parser could not complete the read".to_owned()
+    }
+}
+
+/// The record of a read that failed, typed by whether a retry may clear it.
+fn failed_read_issue(
+    agent: &'static str,
+    path: &Path,
+    outcome: Option<ReadOutcome>,
+    panicked: Option<String>,
+) -> SourceReadIssue {
+    // A source whose read failed for a named cause (a store's journal, an empty file) says so.
+    let opened = crate::ingest::take_read_failure(path).filter(|_| panicked.is_none());
+    let issue = SourceReadIssue::new(
+        agent,
+        path,
+        "source-read-failed",
+        opened.unwrap_or_else(|| read_issue_reason(outcome, panicked)),
+    );
+    match outcome {
+        Some(ReadOutcome::Unavailable) => issue.retryable(),
+        Some(ReadOutcome::Moved) => issue.moving(),
+        _ => issue,
     }
 }
 
@@ -10172,8 +12051,10 @@ where
                 reconciled_files.push(path.clone());
                 listed_paths.insert(path.clone());
             }
+            // A stat proving absence (ENOENT, a real file where a directory was) is a deletion
+            // candidate under the same two-observation protocol as the preflight walk.
             Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
+                if crate::ingest::registry::stat_proves_absent(path, &error)
                     && !absence_unproven(root, path) => {}
             Err(_) => {
                 reconciled_files.push(path.clone());
@@ -10365,12 +12246,19 @@ where
             }
             Err(error) => {
                 crate::ingest::warn_source_skip(agent, &path, &error);
+                // A denial (on the file or a SQLite sidecar the stamp reads) persists until the
+                // user grants access: unreadable material, not a stat a retry may clear.
+                let denied = error.kind() == std::io::ErrorKind::PermissionDenied;
                 cache.record_source_read_issue(
                     agent,
                     &path,
-                    "source-stat-failed",
+                    if denied { "source-read-failed" } else { "source-stat-failed" },
                     error.to_string(),
                 );
+                if denied && !cached_key.as_ref().is_some_and(|key| cache.entries.contains_key(key))
+                {
+                    cache.unreadable_unserved = true;
+                }
                 if let Some(key) = &cached_key {
                     discovered.insert(key.clone());
                 }
@@ -10582,12 +12470,7 @@ where
         // deletion; a partial one that lost nothing the entry held refreshes it instead.
         if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
             cache.mark_guarded_stale();
-            cache.record_source_read_issue(
-                agent,
-                &path,
-                "source-read-failed",
-                read_issue_reason(healthy, panicked),
-            );
+            cache.record_read_issue(failed_read_issue(agent, &path, healthy, panicked));
             if let Some(prev) = cache.entries.get(&key) {
                 if healthy == Some(ReadOutcome::Partial) && partial_read_extends(prev, &m, &e) {
                     // Events already stored for its sessions stay as written: this read
@@ -10630,11 +12513,12 @@ where
                 let start = messages.len();
                 messages.extend(prev.msgs.iter().map(CMsg::to_msg));
                 crate::emit::rows_only(&messages[start..]);
+                // The tally on record is now this failed read's: a source returning to the
+                // entry's exact stamp (a store renamed back) must be read again, not cache-hit.
+                cache.forget_identity(&key);
                 continue;
             }
-            if healthy == Some(ReadOutcome::Invalid) {
-                cache.output_incomplete = true;
-            }
+            cache.hold_unserved_read(healthy);
             if healthy != Some(ReadOutcome::Partial) {
                 continue;
             }
@@ -10731,12 +12615,7 @@ where
         // because `events` cannot be reconstructed completely without this sibling.
         if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
             cache.mark_guarded_stale();
-            cache.record_source_read_issue(
-                agent,
-                &path,
-                "source-read-failed",
-                read_issue_reason(healthy, panicked),
-            );
+            cache.record_read_issue(failed_read_issue(agent, &path, healthy, panicked));
             if let Some(prev) = cache.entries.get(&key) {
                 blocked_event_sessions
                     .extend(prev.msgs.iter().map(|message| message.session.clone()));
@@ -10750,9 +12629,7 @@ where
                 crate::emit::rows_only(&messages[start..]);
                 continue;
             }
-            if healthy == Some(ReadOutcome::Invalid) {
-                cache.output_incomplete = true;
-            }
+            cache.hold_unserved_read(healthy);
             if healthy != Some(ReadOutcome::Partial) {
                 continue;
             }

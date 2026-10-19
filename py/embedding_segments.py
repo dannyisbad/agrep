@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import json
 import math
 import os
 import sqlite3
 import struct
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -22,8 +24,7 @@ PROOF_KEY = "publication_proof"
 SEGMENT_DIR = "embedding-segments"
 ARTIFACT_KEYS = ("f32", "q8", "f16", "groups", "ids", "hashes", "refs")
 _HEX = frozenset("0123456789abcdef")
-_FNV_OFFSET = 0xCBF29CE484222325
-_FNV_PRIME = 0x00000100000001B3
+_GROUP_ID_STRIDE = 4
 _WINDOWS = os.name == "nt"
 
 
@@ -204,17 +205,20 @@ def _validate_descriptor(meta_path: Path, record: object, *, verify_hash: bool) 
     return path
 
 
-def _fnv64(payload: bytes) -> int:
-    value = _FNV_OFFSET
-    for byte in payload:
-        value ^= byte
-        value = (value * _FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
-    return value
+def _group_ids_in_range(groups: Path, rows: int, group_count: int) -> bool:
+    ids = array.array("I")
+    if ids.itemsize != _GROUP_ID_STRIDE:  # pragma: no cover - exotic C ABI
+        ids = array.array("L")
+    with groups.open("rb") as stream:
+        stream.seek(64)
+        ids.frombytes(stream.read(rows * _GROUP_ID_STRIDE))
+    if sys.byteorder != "little":  # pragma: no cover - big-endian host
+        ids.byteswap()
+    return len(ids) == rows and (rows == 0 or max(ids) < group_count)
 
 
 def _matrix_headers(q8: Path, groups: Path, rows: int, dim: int,
                     *, verify_payload: bool) -> int:
-    q8_bytes = q8.read_bytes() if verify_payload else None
     with q8.open("rb") as stream:
         qh = stream.read(64)
     with groups.open("rb") as stream:
@@ -230,21 +234,18 @@ def _matrix_headers(q8: Path, groups: Path, rows: int, dim: int,
     if (len(gh) != 64 or gh[:4] != b"AGQG"
             or struct.unpack_from("<I", gh, 4)[0] != 1
             or struct.unpack_from("<Q", gh, 16)[0] != rows
-            or struct.unpack_from("<I", gh, 40)[0] != 4
+            or struct.unpack_from("<I", gh, 40)[0] != _GROUP_ID_STRIDE
             or qh[24:40] != gh[24:40] or group_count <= 0):
         raise SegmentError("group segment header does not match its descriptor")
     if q8.stat().st_size != 64 + rows * (dim + 4):
         raise SegmentError("q8 segment length does not match its descriptor")
-    if groups.stat().st_size != 64 + rows * 4:
+    if groups.stat().st_size != 64 + rows * _GROUP_ID_STRIDE:
         raise SegmentError("group segment length does not match its descriptor")
-    if verify_payload:
-        group_bytes = groups.read_bytes()
-        if (_fnv64(q8_bytes[64:]) != struct.unpack_from("<Q", qh, 48)[0]
-                or _fnv64(group_bytes[64:]) != struct.unpack_from("<Q", gh, 48)[0]):
-            raise SegmentError("quantized segment checksum mismatch")
-        if any(value[0] >= group_count
-               for value in struct.iter_unpack("<I", group_bytes[64:])):
-            raise SegmentError("group id exceeds the segment group count")
+    # The payload bytes are already proven: the descriptor SHA-256 covers
+    # them and the native builder verified the header checksum as it wrote
+    # them. Only the group ids need a bound the manifest accounting relies on.
+    if verify_payload and not _group_ids_in_range(groups, rows, group_count):
+        raise SegmentError("group id exceeds the segment group count")
     return group_count
 
 
@@ -1502,3 +1503,138 @@ def prune_orphans(manifest_or_path: LoadedManifest | Path, *, grace_seconds: flo
         except OSError:
             deferred.append(path)
     return {"removed": removed, "deferred": deferred}
+
+
+# Segment and compaction builders stage a full f32/q8/f16 copy of their rows in
+# a temporary directory beside the data; SIGKILL and OOM skip every cleanup.
+PREPARATION_PREFIXES = (".semantic-segment-", ".semantic-compaction-")
+_PREPARATION_OWNER = ".owner"
+_PREPARATION_OWNER_MAX_BYTES = 4096
+# A directory with no owner record predates the record; its builder is gone
+# once nothing holds the matching claim and it has sat untouched this long.
+_PREPARATION_UNOWNED_STALE_S = 3600.0
+_PREPARATION_CLAIMS = {
+    ".semantic-segment-": ".semantic-embed.lock",
+    ".semantic-compaction-": ".semantic-compaction.lock",
+}
+
+
+def stamp_preparation_owner(root: Path) -> None:
+    """Record which process is building ``root`` so a scavenger can tell a
+    live preparation from one its owner never came back to."""
+    import common
+    pid = os.getpid()
+    record = {"pid": pid, "process_start": str(common.process_start_identity(pid)),
+              "at": time.time()}
+    (Path(root) / _PREPARATION_OWNER).write_text(
+        json.dumps(record, separators=(",", ":")), encoding="utf-8")
+
+
+def _process_record_alive(raw: bytes) -> bool | None:
+    """True/False for a readable pid+birth record; None when it says nothing."""
+    import common
+    try:
+        record = json.loads(raw.decode("utf-8"))
+        pid = int(record["pid"])
+        start = str(record["process_start"])
+    except (UnicodeError, ValueError, TypeError, KeyError):
+        return None
+    if pid <= 0 or start in ("", "None", "unknown"):
+        return None
+    if not common.pid_alive(pid):
+        return False
+    observed = common.process_start_identity(pid)
+    if observed in (None, "", "None", "unknown"):
+        # A live pid whose birth cannot be read now is protected, like
+        # ownerfile's UNVERIFIABLE; only age and the claim may decide.
+        return None
+    return str(observed) == start
+
+
+def _bounded_record(path: Path) -> bytes | None:
+    try:
+        info = path.lstat()
+        if not _is_regular(info) or info.st_size > _PREPARATION_OWNER_MAX_BYTES:
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _is_regular(info) -> bool:
+    import stat
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return (stat.S_ISREG(info.st_mode)
+            and not getattr(info, "st_file_attributes", 0) & reparse)
+
+
+def _preparation_abandoned(path: Path, info, now: float) -> bool:
+    owner = _bounded_record(path / _PREPARATION_OWNER)
+    if owner is not None:
+        alive = _process_record_alive(owner)
+        if alive is not None:
+            return not alive
+    if now - info.st_mtime < _PREPARATION_UNOWNED_STALE_S:
+        return False
+    prefix = next(p for p in PREPARATION_PREFIXES if path.name.startswith(p))
+    claim = _bounded_record(path.parent / _PREPARATION_CLAIMS[prefix])
+    return claim is None or _process_record_alive(claim) is not True
+
+
+def _tree_bytes(root: Path) -> int:
+    total = 0
+    for directory, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                info = os.lstat(os.path.join(directory, name))
+            except OSError:
+                continue
+            if _is_regular(info):
+                total += int(info.st_size)
+    return total
+
+
+def abandoned_preparations(data_dir: Path, *, now: float | None = None) -> dict:
+    """Inventory preparation directories nobody is coming back for.
+
+    Only this user's plain directories under ``data_dir`` count, and only
+    when their recorded builder is dead or, lacking a record, when they are
+    stale and no live claim could still be building them."""
+    import stat
+    data_dir = Path(data_dir)
+    current = time.time() if now is None else float(now)
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    paths = []
+    size = 0
+    try:
+        entries = list(data_dir.iterdir())
+    except OSError:
+        return {"count": 0, "bytes": 0, "paths": ()}
+    for path in sorted(entries):
+        if not path.name.startswith(PREPARATION_PREFIXES):
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if (not stat.S_ISDIR(info.st_mode)
+                or (uid is not None and info.st_uid != uid)
+                or not _preparation_abandoned(path, info, current)):
+            continue
+        paths.append(path)
+        size += _tree_bytes(path)
+    return {"count": len(paths), "bytes": size, "paths": tuple(paths)}
+
+
+def prune_abandoned_preparations(data_dir: Path) -> dict:
+    """Remove the directories ``abandoned_preparations`` names; best effort."""
+    import shutil
+    inventory = abandoned_preparations(data_dir)
+    removed, deferred = [], []
+    for path in inventory["paths"]:
+        try:
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError:
+            deferred.append(path)
+    return {"removed": removed, "deferred": deferred, "bytes": inventory["bytes"]}

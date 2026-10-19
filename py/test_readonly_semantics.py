@@ -5,6 +5,8 @@ import os
 import sqlite3
 import stat
 import tempfile
+
+from _test_support import fixture_tree  # noqa: E402
 import time
 import unittest
 from pathlib import Path
@@ -107,7 +109,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
 
     def test_semantic_writer_entrypoints_leave_exact_protected_census_unchanged(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-semantic-readonly-") as raw:
+        with fixture_tree(prefix="agrep-semantic-readonly-") as raw:
             root = Path(raw)
             (root / "keep.bin").write_bytes(b"protected bytes")
             marker = root / ".semantic-full-rebuild"
@@ -148,7 +150,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
             spawn.assert_not_called()
 
     def test_protection_matches_only_the_exact_data_root(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-semantic-boundary-") as raw:
+        with fixture_tree(prefix="agrep-semantic-boundary-") as raw:
             parent = Path(raw)
             protected = parent / "protected"
             writable = parent / "sandbox"
@@ -183,7 +185,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
 
     def test_segment_integrity_verification_cannot_publish_a_protected_receipt(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-segment-readonly-") as raw:
+        with fixture_tree(prefix="agrep-segment-readonly-") as raw:
             root = Path(raw)
             meta = root / "embeddings.meta"
             meta.write_bytes(b"immutable manifest")
@@ -203,7 +205,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
 
     def test_ask_reads_valid_refs_but_never_publishes_or_snapshots_in_place(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-refs-readonly-") as raw:
+        with fixture_tree(prefix="agrep-refs-readonly-") as raw:
             root = Path(raw)
             identity = _refs_identity()
             path = root / (
@@ -261,7 +263,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
 
     def test_windows_matrix_reader_maps_a_coherent_system_temp_copy(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-matrix-readonly-") as raw:
+        with fixture_tree(prefix="agrep-matrix-readonly-") as raw:
             root = Path(raw)
             embeddings = root / "embeddings.f32"
             ids_path = root / "embeddings.ids"
@@ -350,7 +352,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
             self) -> None:
         import embedder
 
-        with tempfile.TemporaryDirectory(prefix="agrep-semantic-errors-") as raw:
+        with fixture_tree(prefix="agrep-semantic-errors-") as raw:
             root = Path(raw)
             corrupt = root / "embeddings.refs-corrupt.db"
             corrupt.write_bytes(b"retain corrupt generation")
@@ -451,7 +453,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
 
     def test_worker_protection_preserves_stale_descriptor_and_uses_local_lease(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-semworker-readonly-") as raw:
+        with fixture_tree(prefix="agrep-semworker-readonly-") as raw:
             root = Path(raw)
             descriptor = root / ".semantic-worker.json"
             descriptor.write_bytes(b"{stale descriptor")
@@ -506,7 +508,7 @@ class ReadOnlySemanticTests(unittest.TestCase):
 
     def test_an_unrecordable_rebuild_does_not_latch_a_corrupt_verdict(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-semantic-latch-") as raw:
+        with fixture_tree(prefix="agrep-semantic-latch-") as raw:
             root = Path(raw)
             before = _census(root)
             with (

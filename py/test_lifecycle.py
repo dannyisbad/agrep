@@ -141,8 +141,14 @@ class LifecycleTests(unittest.TestCase):
         lock.__enter__()
         replacement = "pid=999999 start=unknown token=replacement label=test\n"
         common.INDEX_LOCK_PATH.write_text(replacement, encoding="utf-8")
-        lock.__exit__(None, None, None)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            lock.__exit__(None, None, None)
         self.assertEqual(common.INDEX_LOCK_PATH.read_text(encoding="utf-8"), replacement)
+        # a displaced record is disclosed and flagged, never a failure of the finished work
+        self.assertIn("index lock was displaced while held", lock.displaced)
+        self.assertIn("pid=999999", lock.displaced)
+        self.assertIn("another writer may have run alongside this one", stderr.getvalue())
 
     def test_index_lock_keeps_live_owner_when_birth_is_unreadable(self) -> None:
         body = f"pid={os.getpid()} start=known-owner token=owner label=test\n"
@@ -1790,6 +1796,107 @@ class LifecycleTests(unittest.TestCase):
             self.skipTest("explicit AGREP_EMBED_CHECK_S override")
         self.assertEqual(indexd.indexer.EMBED_CHECK_S, 30.0)
 
+    def test_daemon_tick_reaps_stale_coordination_namespaces_without_a_worker(
+            self) -> None:
+        # Only the worker reaped, so a keyword-only box (embeddings off) kept
+        # every namespace any data dir ever minted. The hourly tick does it too.
+        watcher = mock.Mock()
+        watcher._last_event_wall = 0.0
+        owner = self._test_indexer(watcher)
+        with tempfile.TemporaryDirectory(prefix="agrep-reap-") as raw:
+            base = Path(raw)
+            prefix = f"agrep-semantic-v{semworker._COORDINATION_NAMESPACE_VERSION}-1-"
+            stale = base / f"{prefix}stale"
+            stale.mkdir(mode=0o700)
+            old = time.time() - 2 * semworker._STALE_NAMESPACE_S
+            os.utime(stale, (old, old))
+            with (mock.patch.object(semworker, "_coordination_base_path",
+                                    return_value=base),
+                  mock.patch.object(semworker, "_ephemeral_coordination_dir",
+                                    return_value=base / f"{prefix}live"),
+                  mock.patch.object(common, "setting", return_value="off"),
+                  mock.patch.object(
+                      indexd_runtime, "derived_writer_mutation_info",
+                      return_value=mock.Mock(writable=True)),
+                  mock.patch.object(owner, "_reassert_teach"),
+                  mock.patch.object(owner, "_capture_archive"),
+                  mock.patch.object(owner, "_refresh_embeddings") as embed):
+                # the tick clock of a host booted five seconds ago, as a fresh CI
+                # runner is: the first tick must reap all the same
+                young = 5.0
+                owner._run_housekeeping(young)
+                self.assertFalse(stale.exists())
+                stale.mkdir(mode=0o700)
+                os.utime(stale, (old, old))
+                owner._run_housekeeping(young + 1.0)
+                self.assertTrue(stale.exists(), "reaped twice inside one cadence")
+                owner._run_housekeeping(young + indexd.indexer.COORDINATION_REAP_S)
+                self.assertFalse(stale.exists())
+        embed.assert_not_called()
+
+    def test_first_tick_runs_every_cadence_on_a_young_host(self) -> None:
+        """time.monotonic() counts from boot: a baseline that reads as "ran at
+        boot" would hold each job until uptime passes its interval."""
+        watcher = mock.Mock()
+        watcher._last_event_wall = 0.0
+        owner = self._test_indexer(watcher)
+        young = 5.0
+        with (mock.patch.object(
+                  indexd_runtime, "derived_writer_mutation_info",
+                  return_value=mock.Mock(writable=True)),
+              mock.patch.object(common, "setting", return_value="auto"),
+              mock.patch.object(semantic, "read_embed_state", return_value={}),
+              mock.patch.object(
+                  indexd.indexer, "_embedding_resources",
+                  return_value=(False, 0.9, 0.1)),
+              mock.patch.object(owner, "_reassert_teach") as teach,
+              mock.patch.object(owner, "_capture_archive") as archive,
+              mock.patch.object(owner, "_reap_coordination_namespaces") as reap,
+              mock.patch.object(owner, "_refresh_embeddings") as embed):
+            owner._run_housekeeping(young)
+        for job in (teach, archive, reap, embed):
+            job.assert_called_once()
+        with mock.patch.object(
+                indexd_runtime, "derived_writes_permitted",
+                return_value=False) as permitted:
+            owner._check_derived_health(young)
+        permitted.assert_called_once()
+        with mock.patch.object(indexd_runtime, "warm_store_census") as census:
+            owner._maybe_warm_store_census(0.5)
+        census.assert_called_once()
+
+    def test_forced_rechecks_after_an_index_run_fire_on_a_young_host(self) -> None:
+        """A clean run re-verifies on the next tick and a repair run re-checks
+        health on the next tick, whatever the host's uptime."""
+        owner = self._test_indexer(mock.Mock())
+        owner._repair = corpusdb.RepairPlan("torn-generation", "full", "fixture")
+        process = mock.Mock(pid=4242, returncode=0)
+        process.communicate.return_value = ("", "")
+        with (
+            mock.patch.object(semantic, "source_generation", return_value=None),
+            mock.patch.object(
+                owner, "_launch_index_process", return_value=(process, None)),
+            mock.patch.object(
+                indexd.indexer.common,
+                "process_start_identity", return_value="birth"),
+            mock.patch.object(
+                owner, "_refresh_search_index", return_value=True),
+            mock.patch.object(indexd.indexer.common, "_close_event_reader"),
+            mock.patch.object(owner, "_run_post_index_hooks"),
+            mock.patch.object(
+                indexd.indexer.indexd_runtime, "record_auto_index_health"),
+        ):
+            owner._index()
+        young = 5.0
+        with mock.patch.object(
+                indexd_runtime, "derived_writes_permitted",
+                return_value=False) as permitted:
+            owner._check_derived_health(young)
+        permitted.assert_called_once()
+        with mock.patch.object(indexd_runtime, "stamp_verified_current") as verify:
+            owner._maybe_verify_current(young)
+        verify.assert_called_once()
+
     def test_active_tiny_semantic_tail_is_the_only_deferred_shape(self) -> None:
         searchable = {
             "coherent": False, "searchable": True, "state": "partial",
@@ -1887,8 +1994,7 @@ class LifecycleTests(unittest.TestCase):
             spawn_env={
                 "AGREP_SEM_THREADS": "2", "AGREP_SEM_BG_NICE": "15",
                 "AGREP_SEM_BG_POLICY": "polite",
-            },
-            ignore_battery=False)
+            })
         self.assertEqual(owner._embed_defer_started_mono, 0.0)
         self.assertNotIn("semantic_refresh", owner.state)
 
@@ -1916,34 +2022,46 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(owner._embed_defer_started_mono, 0.0)
         self.assertNotIn("semantic_refresh", owner.state)
 
-    def test_battery_bootstrap_uses_the_bounded_indexd_policy(self) -> None:
+    def _spawned_embed(self, owner, policy, coherence) -> tuple[list, dict]:
+        """(argv, child env) of the embed.py the daemon tick actually spawns."""
+        with (mock.patch.object(semantic, "embedding_coherence",
+                                return_value=coherence),
+              mock.patch.object(semantic, "runtime_dependencies_available",
+                                return_value=True),
+              mock.patch.object(semantic, "embed_running", return_value=False),
+              mock.patch.object(semantic, "read_embed_state", return_value={}),
+              mock.patch.object(embedder, "ensure_model"),
+              mock.patch.object(semantic, "_needs_unverified_bundle_rebuild",
+                                return_value=False),
+              mock.patch.object(semantic.subprocess, "Popen") as popen):
+            owner._refresh_embeddings(policy)
+        popen.assert_called_once()
+        return popen.call_args.args[0], popen.call_args.kwargs["env"]
+
+    def test_daemon_bootstrap_of_an_unsearchable_lane_runs_through_pressure(
+            self) -> None:
+        # A busy or battery-powered box used to leave a stale lane unqueryable
+        # for hours: the tick spawned a bounded pass that then deferred itself.
         watcher = mock.Mock()
         watcher._last_event_wall = 0.0
         owner = self._test_indexer(watcher)
-        calls: dict[str, object] = {}
-
-        def capture(max_new=None, spawn_env=None, ignore_battery=False, **_kw):
-            calls.update(max_new=max_new, spawn_env=spawn_env,
-                         ignore_battery=ignore_battery)
-            return {"state": "running"}
-
         policy = indexd.indexer._embedding_backfill_policy(
             {"state": "missing", "indexed": 0, "total": 20_000},
             recently_active=False, on_battery=True,
-            memory_fraction=0.60, cpu_fraction=0.10)
-        with (mock.patch.object(
-                semantic, "embedding_coherence",
-                return_value={"coherent": False, "searchable": False,
-                              "state": "missing"}),
-              mock.patch.object(semantic, "ensure_fresh_async",
-                                side_effect=capture)):
-            owner._refresh_embeddings(policy)
-        self.assertEqual(calls["max_new"], 128)
-        env = calls["spawn_env"]
-        self.assertEqual(env["AGREP_SEM_THREADS"], "2")
-        self.assertEqual(env["AGREP_SEM_BG_NICE"], "15")
-        self.assertEqual(env["AGREP_SEM_BG_POLICY"], "polite")
-        self.assertTrue(calls["ignore_battery"])
+            memory_fraction=0.60, cpu_fraction=3.0)
+        for state in ("missing-embeddings", "stale"):
+            with self.subTest(state=state):
+                argv, env = self._spawned_embed(owner, policy, {
+                    "coherent": False, "searchable": False, "state": state})
+                self.assertEqual(env["AGREP_EMBED_IGNORE_BATTERY"], "1")
+                self.assertEqual(env["AGREP_EMBED_IGNORE_LOAD"], "1")
+                self.assertEqual(argv[argv.index("--max-new") + 1], "128")
+                self.assertLessEqual(
+                    int(argv[argv.index("--max-new") + 1]),
+                    semantic.SEMANTIC_BOOTSTRAP_MAX_NEW)
+                self.assertEqual(env["AGREP_SEM_THREADS"], "2")
+                self.assertEqual(env["AGREP_SEM_BG_NICE"], "15")
+                self.assertEqual(env["AGREP_SEM_BG_POLICY"], "polite")
 
     def test_critical_memory_prevents_even_a_stale_bootstrap(self) -> None:
         watcher = mock.Mock()
@@ -1974,22 +2092,13 @@ class LifecycleTests(unittest.TestCase):
         policy = indexd.indexer._embedding_backfill_policy(
             {"state": "partial", "indexed": 128, "total": 20_000},
             recently_active=False, on_battery=True,
-            memory_fraction=0.60, cpu_fraction=0.10)
-        calls: dict[str, object] = {}
-
-        def capture(**kwargs):
-            calls.update(kwargs)
-            return {"state": "running"}
-
-        with (mock.patch.object(
-                semantic, "embedding_coherence",
-                return_value={"coherent": False, "searchable": True,
-                              "state": "partial"}),
-              mock.patch.object(
-                semantic, "ensure_fresh_async", side_effect=capture)):
-            owner._refresh_embeddings(policy)
-        self.assertEqual(calls["max_new"], 128)
-        self.assertFalse(calls["ignore_battery"])
+            memory_fraction=0.60, cpu_fraction=3.0)
+        argv, env = self._spawned_embed(owner, policy, {
+            "coherent": False, "searchable": True, "state": "partial",
+            "coverage": {"indexed": 128, "total": 20_000, "pending": 19_872}})
+        self.assertEqual(argv[argv.index("--max-new") + 1], "128")
+        self.assertNotIn("AGREP_EMBED_IGNORE_BATTERY", env)
+        self.assertNotIn("AGREP_EMBED_IGNORE_LOAD", env)
 
     def test_single_embed_crash_backs_off_seconds_not_the_cap(self) -> None:
         failed = {"state": "failed", "finished_at": time.time(),
@@ -2348,7 +2457,7 @@ class LifecycleTests(unittest.TestCase):
               mock.patch.object(
                   semworker.time, "monotonic", return_value=100.0)):
             exited, found, acknowledged = semworker._request_and_drain_worker(
-                lock, None, 0.1)
+                lock, None, 0.1, bound=True)
         self.assertTrue(exited)
         self.assertEqual(found, (descriptor, snapshot))
         self.assertTrue(acknowledged)
@@ -2661,12 +2770,13 @@ class LifecycleTests(unittest.TestCase):
             grandchild = (
                 "import os,signal,time; from pathlib import Path; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                f"Path({str(pid_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(pid_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(pid_path) + '.tmp'!r},{str(pid_path)!r}); "
                 "time.sleep(60)")
             root = (
                 "import os,sys,time\n"
                 f"os.spawnv(os.P_NOWAIT,sys.executable,[sys.executable,'-c',{grandchild!r}])\n"
-                "deadline=time.monotonic()+5\n"
+                "deadline=time.monotonic()+60\n"
                 f"while not os.path.exists({str(pid_path)!r}) and "
                 "time.monotonic()<deadline: time.sleep(0.01)\n"
                 f"raise SystemExit(0 if os.path.exists({str(pid_path)!r}) else 2)\n")
@@ -2701,6 +2811,66 @@ class LifecycleTests(unittest.TestCase):
         killpg.assert_not_called()
 
     @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
+    def test_owned_drain_outwaits_a_slowly_reaped_killed_group(self) -> None:
+        """After SIGKILL only the kernel's reaping remains; a loaded host may
+        keep the group visible for seconds and the drain must wait it out."""
+        process = mock.Mock(pid=4242, returncode=0)
+        process.poll.return_value = 0
+        clock = [100.0]
+        killed_at: list[float] = []
+
+        def killpg(group, sig):
+            if sig == signal.SIGKILL:
+                killed_at.append(clock[0])
+
+        def active(_group):
+            # Members stay visible for 2.5 s after the kill, then vanish.
+            return not killed_at or clock[0] - killed_at[0] < 2.5
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(native.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(native.time, "sleep", side_effect=sleep), \
+                mock.patch.object(native, "_posix_group_active", side_effect=active), \
+                mock.patch.object(native, "_reaped_owner_group_gone", return_value=False), \
+                mock.patch.object(native.process_util, "pid_alive", return_value=True), \
+                mock.patch.object(native.os, "killpg", create=True, side_effect=killpg):
+            self.assertTrue(native._drain_owned(process))
+        self.assertEqual(len(killed_at), 1)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
+    def test_owned_drain_ends_the_reap_wait_once_the_pgid_is_reused(self) -> None:
+        """A stranger inheriting the pgid right after the kill keeps the group
+        'active'; the wait ends the moment the original group is provably gone."""
+        process = mock.Mock(pid=4242, returncode=0)
+        process.poll.return_value = 0
+        clock = [100.0]
+        killed_at: list[float] = []
+
+        def killpg(group, sig):
+            if sig == signal.SIGKILL:
+                killed_at.append(clock[0])
+
+        def pid_alive(_pid):
+            # the pid is occupied again 0.1 s after the kill
+            return bool(killed_at) and clock[0] - killed_at[0] >= 0.1
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(native.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(native.time, "sleep", side_effect=sleep), \
+                mock.patch.object(native, "_posix_group_active", return_value=True), \
+                mock.patch.object(native.process_util, "pid_alive", side_effect=pid_alive), \
+                mock.patch.object(
+                    native.process_util, "process_start_identity", return_value=None), \
+                mock.patch.object(native.os, "killpg", create=True, side_effect=killpg):
+            self.assertTrue(native._drain_owned(process))
+        self.assertEqual(len(killed_at), 1)
+        self.assertLess(clock[0] - killed_at[0], 1.0)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
     def test_owned_drain_still_reaps_true_orphans_of_a_dead_leader(self) -> None:
         process = mock.Mock(pid=4242, returncode=0)
         process.poll.return_value = 0
@@ -2733,10 +2903,11 @@ class LifecycleTests(unittest.TestCase):
         watcher = mock.Mock()
         watcher.sessions = {}
         with mock.patch.object(
-                capture, "_agent_new_session_argv",
-                return_value=[sys.executable, "-c", "pass"]), \
+                native, "new_session_exe",
+                return_value=("codex", sys.executable)), \
                 mock.patch("hookless.live.watcher", return_value=watcher):
-            self.assertEqual(capture.run_captured("codex", [], cwd=os.getcwd()), 0)
+            self.assertEqual(
+                capture.run_captured("codex", ["-c", "pass"], cwd=os.getcwd()), 0)
         self.assertEqual(len(watcher.sessions), 1)
         session = next(iter(watcher.sessions.values()))
         self.assertFalse(session["working"])
@@ -2748,7 +2919,8 @@ class LifecycleTests(unittest.TestCase):
             pid_path = Path(td) / "child.pid"
             child = (
                 "import os,time; from pathlib import Path; "
-                f"Path({str(pid_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(pid_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(pid_path) + '.tmp'!r},{str(pid_path)!r}); "
                 "time.sleep(60)")
             driver = (
                 "from hookless import native; import os,sys; "
@@ -2774,7 +2946,8 @@ class LifecycleTests(unittest.TestCase):
             pid_path = Path(td) / "launch-window.pid"
             child = (
                 "import os,time; from pathlib import Path; "
-                f"Path({str(pid_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(pid_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(pid_path) + '.tmp'!r},{str(pid_path)!r}); "
                 "time.sleep(60)")
             original = native._launch_owned
 
@@ -2799,7 +2972,8 @@ class LifecycleTests(unittest.TestCase):
             grandchild = (
                 "import os,signal,time; from pathlib import Path; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                f"Path({str(pid_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(pid_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(pid_path) + '.tmp'!r},{str(pid_path)!r}); "
                 "time.sleep(60)")
             hook = (
                 "import os,sys,time; "
@@ -2826,11 +3000,13 @@ class LifecycleTests(unittest.TestCase):
             grandchild = (
                 "import os,signal,time; from pathlib import Path; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                f"Path({str(grandchild_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(grandchild_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(grandchild_path) + '.tmp'!r},{str(grandchild_path)!r}); "
                 "time.sleep(60)")
             hook = (
                 "import os,sys,time; from pathlib import Path; "
-                f"Path({str(root_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(root_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(root_path) + '.tmp'!r},{str(root_path)!r}); "
                 f"os.spawnv(os.P_NOWAIT,sys.executable,[sys.executable,'-c',{grandchild!r}]); "
                 "time.sleep(60)")
             owner = self._test_indexer(mock.Mock())
@@ -2921,11 +3097,13 @@ class LifecycleTests(unittest.TestCase):
             grandchild = (
                 "import os,signal,time; from pathlib import Path; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                f"Path({str(grandchild_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(grandchild_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(grandchild_path) + '.tmp'!r},{str(grandchild_path)!r}); "
                 "time.sleep(60)")
             hook = (
                 "import os,sys,time; from pathlib import Path; "
-                f"Path({str(hook_path)!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"Path({str(hook_path) + '.tmp'!r}).write_text(str(os.getpid()),encoding='ascii'); "
+                f"os.replace({str(hook_path) + '.tmp'!r},{str(hook_path)!r}); "
                 f"os.spawnv(os.P_NOWAIT,sys.executable,[sys.executable,'-c',{grandchild!r}]); "
                 "time.sleep(60)")
             driver = (

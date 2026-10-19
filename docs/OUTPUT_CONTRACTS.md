@@ -22,6 +22,18 @@ copyable search invocation, the refusal appends the exact
 `agrep search <word> ...` escape hatch instead of silently reinterpreting the
 command. Versioned machine-mode validation errors keep their structured shape.
 
+`agrep setup` is the command installers run unattended, so its exit status is
+a contract: 0 when the box is set up, including when nothing needed changing;
+1 when a step it attempted did not complete (the output names the step and
+the fix, and the remaining steps still ran); 2 for an argument error; 3 when
+it declined without changing anything and a retry declines the same way until
+the cause is resolved. Today the one such cause is a data dir a newer agrep
+owns: setup writes no agent files, starts no daemon and enables no archive
+capture there, names the owner and the fix (upgrade agrep, or point
+`AGREP_DATA_DIR` elsewhere), and exits 0 instead when a corpus is searchable,
+because searches work read-only. The npm postinstall cannot read setup's
+output, so it keys its one-line summary on these codes.
+
 - **Never routed.** No lane substitution, semantic escalation, or interactive
   content-term recovery. A script gets the same shape every time.
   Caller-window exclusion is renderer-independent: once the calling session
@@ -64,6 +76,9 @@ command. Versioned machine-mode validation errors keep their structured shape.
   how a parser reports 40 for 1,765. `tool_rows` counts matching ROWS that are
   tool output whatever the unit: under `-l` (unit `chat`) the stderr line says
   `N matching rows are tool output` beside the chat total, never `of them`.
+  A lane that excluded tool rows (`tools_excluded` set) omits `tool_rows`: it
+  never counted them, so no number stands in for them, and its floor notes drop
+  the `-c counts exactly` lever because `-c` is a floor there too.
   Emitter and checker share `surface_policy.completeness_disclosure`; pinned in
   `test_machine_completeness.py`.
 - **Indexed JSON hits are directly inspectable.** Each search row carries a
@@ -89,6 +104,48 @@ command. Versioned machine-mode validation errors keep their structured shape.
   and a handle) or time slice (`kind: time`). Time is always labelled an
   estimate; exits follow search: 0 something reported, 1 proven nothing,
   2 unverified. Pinned in `py/test_summary.py`.
+- **Pending reads what the ingest kept, never a guess at what it lost.** A
+  turn's reply text is exactly what 0.4.2 published (assistant text blocks
+  joined with one space, cut at 64,000 characters with `…`), so every reply
+  digest, handle, embedding hash and FTS row is unchanged across releases
+  except for Gemini reply rows reconstructed by the Gemini lineage pass; those
+  rows may change text, digest, and handles when lineage is recovered.
+  The block structure travels beside it in `replies.jsonl` and, keyed like the
+  agent row, in corpus.db's `reply_shape` table (read by key for the rows a
+  briefing classifies; `summary time` reads none; the session signature the
+  incremental refresh compares covers it, so a capped reply whose frozen text
+  gains a later block still refreshes its ending): `reply_breaks`, the offsets
+  (Unicode scalar values, Python `str` indices) of the joining spaces;
+  `reply_worked`, per join, 1 when the agent made a work call (a tool or a
+  delegation, never todo/task bookkeeping) between the two blocks, 0 when none,
+  2 when the index holds no order for it (every adapter records its store's
+  order; a row restored from an older cache has none); `reply_lead`, the same
+  for the join before the first block, which for a compaction recap row is the
+  work since the previous row's last block (absent when unrecorded; a
+  single-block recap reply keeps its `reply_shape` row for it); and for a
+  capped reply `reply_end`, the latest block's last 8,000 characters, with
+  `reply_end_cut` when that tail is itself cut. A next-steps list in a block
+  the agent then worked after was a plan it executed: the terminal block
+  decides as 0.4.2 decides a turn's ending. With no work after the list block,
+  later sign-offs keep the list (high) and other prose keeps it at medium with
+  the start of that block quoted (`a later reply block may report this done:
+  '…'`). Where the order is unrecorded, later sign-offs alone keep the list at
+  medium (`whether work followed this list is not recorded; a later block:
+  '…'`) and any other later block hands the turn to its terminal block, as
+  0.4.2 read it; prose in the list's own block keeps 0.4.2's rule. A `To do:`
+  heading counts like `Todo:`. A capped reply classifies by its kept ending;
+  an ending cut past that tail, or one the index does not hold (a row not yet
+  reparsed), is
+  `unknown`, which the signal says. Every tool event carries `after_reply=1`
+  in `meta` when no reply text of its turn followed it, so a turn that stopped
+  after a call reads `agent_work_incomplete` while a call answered by a final
+  reply does not; a todo, task or `yield` call after the final text is
+  bookkeeping. Todo/plan/task writes carry their list facts whole in `state`
+  beside the 800-character display input, and a Claude `TaskList` result its
+  whole listing, so task state never depends on the display cap. What the
+  source never recorded (a result that never came back, a run with no text)
+  stays unknown or incomplete, as before. Pinned in `py/test_summary.py` and
+  the adapter unit tests.
 - **Why JSON is one versioned verdict.** `why --json` prints one object with
   `version` (1), `reference`, `verdict`, `exit`, `summary`, `candidates`,
   `evidence` and `next_action`; every evidence line names the file it came
@@ -106,8 +163,219 @@ command. Versioned machine-mode validation errors keep their structured shape.
   holds resolves there when search serves it, and a torn `sessions.jsonl`
   falls back to the rows `messages.jsonl` derives, as resume does. A moved
   store-wide intake key (one database holding many chats) is a caveat, never a
-  verdict against an untouched chat. `why` never indexes or writes. Pinned in
-  `py/test_why.py`.
+  verdict against an untouched chat. A token store of several databases
+  (crush) is judged database by database: the census lists the conversations
+  of every database it could open beside an issue naming each it could not,
+  so a chat in a readable database is current, stale or deleted on its own
+  token while a sibling database is unreadable. A registered database a
+  stat cannot reach (its directory unsearchable, a symlink loop, a link
+  pointing at a file) is unreadable, never absent: the index keeps its
+  published chats, refuses a cold `--full`, and `why` says so; one a stat
+  proves gone (a real parent now a file, a name too long, a volume
+  unmounted) is a deletion candidate under the same two-observation
+  protocol as a Stat store root: the first pass keeps its chats (disclosed
+  as `source-root-unavailable`; `why` calls them unprovable rather than
+  deleted and says to mount the store before the next index, which prunes
+  whatever is still absent - no pass can tell an unmounted volume from a
+  removed one), a database that returns in between leaves them untouched, a
+  second agreeing preflight confirms the removal, and `--full`, which
+  inherits no older expectation, converges a genuine deletion at once.
+  Cursor lists every chat; while a workspace source it attributes chats
+  through cannot be read, a chat keeps the project the last index published
+  and a chat that never had one carries `cursor`, both disclosed as
+  provisional (attribution is part of the token, so repair relabels only
+  what the source changes, in one reparse), and `why` calls them indexed
+  with the pending source named. That gap is attribution-only
+  (`attribution-unreadable`): every chat was read, so it never holds the
+  other agents' publication back, even with no parse cache, where the pass
+  takes each chat's project from the published `messages.jsonl` instead
+  (unreadable, the gap stays unadmitted); it settles nothing but itself, so
+  a parse that fails on the same store is judged on its own. It is no
+  freshness failure either: drift alone decides whether the index is
+  behind (the record is neither a store member nor a census row of its
+  own), and doctor's agent-stores line and `why` carry the provisional
+  note, never "unreadable". A token chat that grew and whose parse then
+  panicked keeps its last good tally; the read-failure record the index
+  wrote names that conversation (`session`, absent from older records and
+  from a failure no conversation owns), and only for it does `why` name
+  the panic with the build update that can mend it, not "written after
+  the last index". A sibling that grew since, even through the store's
+  WAL with the file's times unmoved, was never tried and stays written
+  after the last index; a record naming no conversation is charged to
+  none. A chat whose stored rows do not parse completely (a Cursor
+  composer, a crush session) fails whole: none of its rows publish, its
+  record names it, and doctor's agent-stores line and the status freshness
+  reason name it beside its store. A last good parse stays served, even
+  one cached under the path its database had before it moved; with none,
+  it holds nothing back unless a published generation may hold it, so
+  neither a first index nor a new malformed chat stops its siblings or
+  the other agents from publishing, and it is never cached as read. A
+  failed chat settles only in its own database: a crush session id two
+  databases share names two conversations. A
+  store whose read fails mid-pass (the preflight saw it readable)
+  contributes nothing past its last good rows and holds back only what a
+  published generation may hold, under `--emit-rows` too when nothing is
+  published yet. Material a published generation holds that turns
+  unreadable with no complete cache fallback (the parse cache lost or
+  discarded, `--full`'s cold parse, or a pass killed between its cache
+  commit and publication, whose rows seen go are still published) holds
+  every agent back: a chat, a per-file transcript or a store alike. The
+  pass keeps the old generation and exits 1, naming each conversation or
+  source (the first three, then how many more). A rebuild may leave it
+  out only when the failure is durable and stable. Durable: content that
+  does not parse, a denied permission on a file or any SQLite sidecar
+  (`-wal`, `-journal`, `-shm`), pages SQLite reads as corrupt or as no
+  database, or a hot rollback journal no writer holds, which needs
+  recovery by the agent that wrote it. Never durable, however often it
+  repeats: a live writer's lock, a generation that moved, a file
+  replaced, changed or shrinking under the read, an open that is
+  otherwise unavailable; these refuse "and will retry". An empty or idle
+  journal no writer holds is no failure: the store is read as usual. A
+  failed open names its cause in the record and the refusal (the
+  journal, the writer, the defect). Where a writer's lock cannot be
+  probed (Windows), a journal is named as present with how its agent
+  recovers it ("if the agent that wrote it is not running, opening it
+  once in that agent recovers it"), promised no retry, and never dropped.
+  Stable: each source-health record carries the failing item's identity
+  (a SQLite store's database, `-journal` and `-wal` each by device,
+  inode, size, modification time and a head/tail digest, as the census
+  names them: no ctime, which agrep's own hard-link snapshot moves; any
+  other file by device, inode, size, change times and a content digest,
+  so one torn, whole and torn again at one length and stamp is two
+  failures; a token conversation by a digest of its own stored rows, so
+  one stuck chat in a busy database stays the same), and a durable
+  failure is stable only when an earlier pass recorded it for the same
+  item, failing the same way with the same identity. A failure observed
+  while the file (or a SQLite sidecar) was modified or changed within a
+  timestamp tick of the pass (granule-aware, as the parse cache judges
+  racy stamps: a whole-second stamp is two seconds wide) is recorded but
+  proves nothing persists, since two catches of one torn state on a
+  1-second clock share an identity; a later pass past that tick starts
+  the count. A denied stamp
+  read, of a store or a sidecar, is durable too. An empty session file
+  is durable content ("file is empty"), stable once it stays so. A first
+  observation is retried: the refusal ends "and will
+  retry; if it persists, `agrep reindex --full` rebuilds without it",
+  and nothing is marked or dropped, under the consent too. Once stable,
+  the refusal gives the remedy "fix or remove it in <agent>, or run
+  `agrep reindex --full` to rebuild without it (it is indexed again once
+  readable)", in the plural for several. A corrupt database its agent
+  keeps rewriting never stabilizes; its refusal says to stop that agent,
+  and once agrep has seen it unchanged, `agrep reindex --full` rebuilds
+  without it. Source health marks each persistent
+  record (`blocks_publication`), so doctor's agent-stores line, `agrep
+  audit` and `why` of the held chat give that remedy instead of a retry,
+  and status says new chats are not being indexed (freshness code
+  `unreadable-holds-index`). A record of a retryable or moving failure
+  carries `retry` however often it repeats. Neither a mark nor `retry`
+  outlives its cause: while one stands no pass takes the unchanged-source
+  shortcut, so the next pass, the daemon's included, reads the material
+  again and keeps either only if it still holds. The
+  daemon's pass, `agrep index`, `agrep index --full` and a bare
+  `agrep-rs index` keep failing closed. `agrep reindex --full` alone is
+  the user's consent to rebuild from what is readable now: it runs
+  `agrep-rs index --full --drop-unreadable`, a flag no other caller
+  passes and that needs `--full`. When the only thing holding publication
+  back is persistent unreadable material with no complete cache
+  fallback, it publishes everything readable,
+  drops that material's rows, names each on stdout ("rebuilt without
+  unreadable ..."), and keeps each disclosed on source health, unmarked.
+  It never publishes an empty generation over a published one: with
+  nothing readable left it refuses, naming the material, and no pass
+  offers that consent. Then no rebuild can help, so the refusal names the
+  agent's own fix ("and will retry; if it persists, fix or remove it in
+  <agent>" on a first observation, "fix or remove it in <agent>" once
+  stable; for a denied permission alone, that the index recovers once the
+  source is readable). So does a first index whose only material is a
+  chat it cannot read. Once stable the record carries `rebuild: false`:
+  status (freshness code `unreadable-holds-everything`), doctor, audit
+  and `why` give that same fix. Anything else holding the pass back (a source
+  gone or transiently incomplete, a parser panic) still refuses it. The
+  consent's commit point is recorded right after its parse cache commits,
+  before it writes the event store or any derived file. A consented
+  rebuild that fails or is killed before that point is rolled back, there
+  or by the next pass, which restores the source health it found, marks
+  included, and discards the parse cache it committed; the event store and
+  every published file are still the prior generation's, so every pass
+  still holds until a consent publishes. One that stops after it (killed
+  during its event write or promotion, an event store or marker it cannot
+  write) stays recorded with its cache and source health, and every later
+  pass trusts none of its outputs: it rewrites the event store and its
+  proof and publishes the whole generation again without what it dropped,
+  failing as any pass does while the obstacle stays, and only then clears
+  the record; each says which it did. A consented rebuild may rebuild
+  and prune the event store as a complete safe pass does, since what it
+  publishes without is consented. While a record holds publication, the
+  event store's interrupted-pass row and line give the hold's remedy
+  instead of promising that `agrep index` publishes; the search index's
+  say that `agrep index` rolls its journal back, which any pass does,
+  one the hold refuses included, though new chats wait on the hold; and
+  `agrep reindex` skipped by corpus.db's journal names the interrupted
+  pass and `agrep index`, which rolls it back first. What it dropped was never
+  cached as read, so it is indexed again once readable: an explicit pass
+  retries it, and any pass does after it changes; until then it holds no
+  later pass back, since no published generation holds it any more.
+  `agrep index --full` (the daemon's own escalation included) parses
+  without the parse cache, so material only that cache still serves fails
+  there alone: its refusal ("could not read a source ... without the parse
+  cache") names it, says the cache this --full pass skipped still serves
+  it, gives "run `agrep index`, which publishes with it", and marks
+  nothing. That cache is judged as a plain pass decodes it under the index
+  lock (one whose journal is unreadable serves nothing), and a token
+  conversation as the writer serves it: from its own database, or from one
+  no longer present. So --full and a plain pass always agree, and only
+  material no complete cache serves is ever marked. A
+  refusal names the material the published generation holds before a
+  failed chat that was never published. Where `reindex --full` would also
+  redo meaning search (embeddings on, their runtime installed), the
+  surfaces' consent remedy says so ("the rebuild also redoes meaning
+  search, which can take a while"), with the rendered invocation, `why`'s
+  included. Under a newer agrep's anchor, where this build refuses
+  `reindex --full` and `agrep index`, they, audit included, give "update
+  agrep to rebuild without it" for held material (freshness code
+  `unreadable-holds-newer-owner`) and "update agrep to index it again" for
+  any other failure, interrupted pass or `why` action whose remedy would run
+  this build's index. While records hold publication, every row and line
+  that gives the hold's remedy (doctor's agent-stores and freshness rows,
+  audit, setup, the interrupted-pass lines, status and bare `agrep`) names
+  every held agent in one clause, as the ingest's refusal does ("fix or
+  remove them in claude, crush, or run `<cmd> reindex --full` to rebuild
+  without them ..."), beside each other record's own remedy. Each such
+  line says the rebuild's cost, so doctor and status may say it on more
+  than one line; setup says it once, in its receipt, and audit once, in
+  its degraded line, which names a held source past its first three rows
+  by that clause too. `agrep setup`
+  reports the hold and its remedy instead of a fresh index and "setup
+  complete", and `why` of a chat known only to source health (never
+  published, or left out by a consent) names its standing failure with
+  doctor's remedy for it.
+  A pass refuses to publish an empty generation when its
+  only material was a chat or token store it could not read and let
+  through as never published, a crush registry too corrupt to name any
+  database included, or when the consent would drop all that was
+  published. Two empty generations do publish: a first index
+  whose only store fails mid-pass (the failure disclosed), and a deletion
+  confirmed by two observations, which may empty what was published.
+  While any read failure stands, chat or store, status, doctor, the census
+  and `why` name it and the verified-current record never vouches for it;
+  `agrep audit` cannot certify a store it could not read and exits 2, its
+  problem naming each failure (the chat where one failed) with the remedy
+  doctor gives. The source snapshot published beside a failure records
+  the files the pass read, not the failure. The record stays until a pass
+  reads the source again: every pass does once its content or identity
+  changes, and the explicit passes
+  (`agrep index`, `agrep reindex`, setup's index step, which run `agrep-rs
+  index --retry-failed-sources`) do with nothing changed, so "make the
+  file readable, then `agrep index`" is a true remedy. An automatic pass
+  over an unchanged source takes the unchanged-source shortcut and keeps
+  the disclosure it finds. A parser panic's remedy stays "update agrep,
+  then `agrep index`": the same build panics the same way on a retry.
+  Without the parse cache the census cannot tell which project each pending
+  chat kept, so it lists no token for them and `why` calls them unprovable
+  until the source is readable, never "written after". Only a reference
+  nothing discovered matches stays unprovable while a database is unread,
+  because that database may hold it; no census can rule that out. `why`
+  never indexes or writes. Pinned in `py/test_why.py`.
 - **Every surface states why it is empty.** A zero from a filter selecting a
   dimension the index holds no value for is not the same answer as a zero
   from a search that looked and found nothing, and the two must not render
@@ -150,6 +418,16 @@ command. Versioned machine-mode validation errors keep their structured shape.
   Event payloads and their database generation commit before the external event
   marker. Readers compare the database generation with that marker and recheck
   identities, so the database-commit/marker-publication gap cannot serve mixed events.
+- **Rollback-journal event writes are readable at their last commit.** The
+  event store is published in SQLite `DELETE` mode and a direct read during a
+  writer transaction serves the last committed events. A non-hot `-journal` is
+  not an unavailable or empty event set; hot journals left by an interrupted
+  writer are different: read-only SQLite correctly refuses them, and surfaces
+  disclose that tool events are unavailable until the next index pass rolls the
+  journal back (waiting never clears it; without a background indexer that pass
+  is an explicit `agrep index`). `around` never labels such a blocked read as an
+  exact zero, and keyword search and recall in the transcript scan serve prose
+  with `tools_excluded.reason` `events-unavailable`.
 - **Parser-policy exclusions can remove previously cached material.** A complete
   empty reparse of the same source identity, mtime and size replaces its old rows
   and exact event ownership without a source-health warning. A complete empty
@@ -226,7 +504,13 @@ set (hit-rate by mechanism class), not on contract stability.
 
 Finite `recall` and `pack` `--budget` values cap UTF-8 bytes actually written,
 including ANSI control bytes and the final newline; fitting never splits a
-code point. A zero budget remains uncapped.
+code point. A zero budget remains uncapped. The fixed minimum is 64 bytes, and
+a page may need more: text pages render every hit's own turn before any block
+widens, the first hit's head line (its handle) is never cut, omitted hits are
+counted in a trailing `[+N hit(s) over budget - … see --json omitted_hits]`
+line, and a budget below the first block's head plus that line is refused
+with exit 2 naming the bytes the page needs. `--json` pages carry
+`omitted_hits` instead.
 
 Compact output stays silent when an exact page is exhausted. Every
 incomplete compact page emits one line from
@@ -389,6 +673,22 @@ filter it supplies `retry_argv` for direct process execution and says why the
 copyable form is missing. As with `tail`, a still-scanning or degraded snapshot
 is disclosed rather than rendered as an idle box: absence of rows is not
 evidence that nothing is running.
+
+Interactively, `agrep board` (and `agrep live`) owns the terminal while it runs
+and hands it back as it found it on every exit: `q`, the end of input, Ctrl-C
+(however many, also on a terminal slow to take output), SIGTERM, SIGHUP,
+SIGQUIT and a job stopped and continued. That covers its modes, the main
+screen, the cursor and default colours. A fatal signal ends the board even
+when its terminal has stopped taking output; the main screen comes back once
+the terminal takes output again, a second signal arriving meanwhile changes
+nothing, and the exit status names the first signal handled (of two arriving
+together, CPython handles the lower-numbered first). A restore that hangs
+anyway ends after 5 seconds with SIGALRM. On a POSIX terminal the board turns
+on bracketed paste, so a paste arrives as one inert key: no letter or line
+break in it acts, and input still unread at exit is discarded rather than
+reaching the shell. A Windows console delivers a paste as typed keys, so that
+guarantee is POSIX-only; there Ctrl-Break hands the console back and exits
+with code 3.
 
 Live discovery is deliberately bounded. A new watcher seeds journal-backed
 sessions whose stores moved within the last 90 seconds; a session already quiet

@@ -6,10 +6,14 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CHILD_SCHEDULING_WATCHDOG: Duration = Duration::from_secs(15);
+/// A waiter announces its lock wait on stderr WAIT_NOTICE_MS after sitting down on the lock;
+/// this is the whole budget for it to start, publish its claim, preflight and say so.
+const LOCK_WAIT_NOTICE_BUDGET: Duration = Duration::from_secs(60);
 const WARM_EXIT_BUDGET: Duration = Duration::from_secs(2);
 const CHILD_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
@@ -72,6 +76,40 @@ fn start_index_for(home: &std::path::Path, data: &std::path::Path, agent: &str) 
 
 fn start_index(home: &std::path::Path, data: &std::path::Path) -> Child {
     start_index_for(home, data, "claude")
+}
+
+/// Returns once the index waiter has reported waiting for the lock: by then it has published
+/// its derived-adoption claim (whose `<slot>.tmp.<pid>.<nanos>` staging files come and go at the
+/// data root), run its preflight and sat on `.index.lock` with nothing left to write, so the
+/// tree can be read without racing the publication. A fixed pause read it mid-publication on a
+/// loaded host. The reader thread keeps collecting stderr for the final report.
+fn await_lock_wait_notice(index: &mut Child) -> thread::JoinHandle<String> {
+    let stderr = index.stderr.take().unwrap();
+    let (notices, waited) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut collected = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            let _ = notices.send(line.ends_with("; waiting..."));
+            collected.push_str(&line);
+            collected.push('\n');
+        }
+        collected
+    });
+    let deadline = Instant::now() + LOCK_WAIT_NOTICE_BUDGET;
+    loop {
+        match waited.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(true) => return reader,
+            Ok(false) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the index never reported waiting for the lock")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let stderr = reader.join().unwrap();
+                panic!("the index stopped before waiting for the lock: {stderr}")
+            }
+        }
+    }
 }
 
 fn release_holder(holder: &mut Child) {
@@ -235,9 +273,14 @@ fn unchanged_generation_does_not_queue_behind_corpusdb() {
     let data = temp_dir("warm-lock-bypass");
     ingest_into("claude", &home, &data, false);
     let before = durable_tree(&data);
+    // A publication is a checkpointed DELETE-mode store: no WAL sidecar family beside it.
     assert!(before
         .keys()
-        .any(|name| { name.replace('\\', "/") == "f:events/.store.sqlite3-shm" }));
+        .any(|name| { name.replace('\\', "/") == "f:events/.store.sqlite3" }));
+    assert!(!before.keys().any(|name| {
+        name.replace('\\', "/")
+            .starts_with("f:events/.store.sqlite3-")
+    }));
     let mut holder = start_holder(&home, &data, &current_corpusdb_label(&data));
     let mut index = start_index(&home, &data);
     if !wait_for_exit(&mut index, Duration::from_secs(2)) {
@@ -415,17 +458,13 @@ fn stale_event_proof_preflight_is_read_only() {
         let before = durable_tree(&data);
         let mut holder = start_holder(&home, &data, &current_corpusdb_label(&data));
         let mut index = start_index(&home, &data);
-        thread::sleep(Duration::from_millis(1200));
+        let stderr = await_lock_wait_notice(&mut index);
         assert!(index.try_wait().unwrap().is_none());
         assert_eq!(durable_tree(&data), before);
         fs::write(&proof_path, original).unwrap();
         release_holder(&mut holder);
         let output = index.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "{}", stderr.join().unwrap());
         assert_no_temp_residue(&data);
         let _ = fs::remove_dir_all(data);
     }
@@ -436,24 +475,22 @@ fn missing_event_shm_preflight_does_not_open_sqlite() {
     let home = fixture_home("claude");
     let data = temp_dir("warm-lock-event-shm");
     ingest_into("claude", &home, &data, false);
+    // An earlier build's WAL-mode family with its SHM gone: the preflight must not open SQLite
+    // (which would recreate the SHM) while the lock is held.
     let shm = data.join("events").join(".store.sqlite3-shm");
-    let saved = data.with_extension("saved-event-shm");
-    fs::rename(&shm, &saved).unwrap();
+    let wal = data.join("events").join(".store.sqlite3-wal");
+    fs::write(&wal, b"").unwrap();
     let before = durable_tree(&data);
     let mut holder = start_holder(&home, &data, &current_corpusdb_label(&data));
     let mut index = start_index(&home, &data);
-    thread::sleep(Duration::from_millis(1200));
+    let stderr = await_lock_wait_notice(&mut index);
     assert!(index.try_wait().unwrap().is_none());
     assert_eq!(durable_tree(&data), before);
     assert!(!shm.exists(), "read-only preflight recreated SQLite SHM");
-    fs::rename(&saved, &shm).unwrap();
+    fs::remove_file(&wal).unwrap();
     release_holder(&mut holder);
     let output = index.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", stderr.join().unwrap());
     assert_no_temp_residue(&data);
     let _ = fs::remove_dir_all(data);
 }
@@ -463,25 +500,23 @@ fn nonzero_event_wal_preflight_does_not_open_sqlite() {
     let home = fixture_home("claude");
     let data = temp_dir("warm-lock-event-wal");
     ingest_into("claude", &home, &data, false);
+    // A WAL sidecar with uncommitted bytes beside the published store: not a publication the
+    // preflight may read, so it waits for the lock without opening SQLite.
     let wal = data.join("events").join(".store.sqlite3-wal");
-    let saved = data.with_extension("saved-event-wal");
-    fs::rename(&wal, &saved).unwrap();
+    let shm = data.join("events").join(".store.sqlite3-shm");
     fs::write(&wal, b"uncommitted").unwrap();
+    fs::write(&shm, vec![0_u8; 32768]).unwrap();
     let before = durable_tree(&data);
     let mut holder = start_holder(&home, &data, &current_corpusdb_label(&data));
     let mut index = start_index(&home, &data);
-    thread::sleep(Duration::from_millis(1200));
+    let stderr = await_lock_wait_notice(&mut index);
     assert!(index.try_wait().unwrap().is_none());
     assert_eq!(durable_tree(&data), before);
     fs::remove_file(&wal).unwrap();
-    fs::rename(&saved, &wal).unwrap();
+    fs::remove_file(&shm).unwrap();
     release_holder(&mut holder);
     let output = index.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", stderr.join().unwrap());
     assert_no_temp_residue(&data);
     let _ = fs::remove_dir_all(data);
 }

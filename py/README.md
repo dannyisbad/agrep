@@ -81,7 +81,10 @@ One pinned model, two engines that can run it:
   current. Background passes use resource-adaptive low-priority threads and
   publish/yield at 500-row boundaries if an active transcript advances. An idle
   AC-powered machine runs bounded catch-up passes back-to-back; battery,
-  activity, CPU load, and memory pressure shrink or pause them. A delta
+  activity, CPU load, and memory pressure shrink or pause them. The one
+  exception is a lane nobody can query (stale, missing, or unbound after an
+  upgrade): its bounded bootstrap or rebind runs through battery and CPU load,
+  still niced and thread-limited, and only memory pressure defers it. A delta
   publication writes only new segment and shadow artifacts; compaction is a
   separate bounded operation.
 - `semantic.py` - the local engine every semantic owner calls: generation-exact
@@ -148,6 +151,8 @@ python embed.py                # incremental embed of the active data dir
 | `explore.py` / `conceptpair.py` | read-only search, window, and enrichment data layers. |
 | `indexer.py` / `indexd.py` / `indexd_runtime.py` | auto-indexing, embedding freshness, daemon ownership, and client-side health checks. |
 | `audit.py` | `agrep audit`: per-file intake accounting vs an independent raw census. |
+| `derived_anchor.py` | whether a newer agrep owns the data dir, read from the derived-store ownership anchor for every surface that defers to that agrep. |
+| `source_health.py` | the last index pass's source health record and the one remedy wording doctor, status, audit, and the CLI give for its issues. |
 | `doctor.py` / `teach.py` / `archive.py` / `resume.py` / `livetui.py` / `tail.py` | setup checks, agent teaching, store snapshots, native resume, live views. |
 | `nudge_default.md` / `nudge_codex.md` | the taught instruction blocks `teach.py` installs. Selftest hash-pins the default block against its version number and checks both blocks still name every command they route to. |
 | `postcompact.py` | `agrep postcompact`: the exact pre-boundary root tail of the calling session family, as a bounded supplement to a lossy provider summary. |

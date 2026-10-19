@@ -1,3 +1,6 @@
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 import hashlib
 import io
 import json

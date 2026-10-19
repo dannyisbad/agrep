@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -15,6 +16,7 @@ from proc import WIN
 FileIdentity = tuple[int, int, int, int, int]
 _WINDOWS_IDENTITY_API = None
 _WINDOWS_USN_API = None
+_TIMESTAMP_CLOCK_LAG_NS: int | None = None
 
 
 def _windows_identity_api():
@@ -198,6 +200,62 @@ def file_identity_fd(fd: int) -> FileIdentity:
         int(info.st_dev), int(info.st_ino), int(info.st_size),
         int(info.st_mtime_ns), int(info.st_ctime_ns),
     )
+
+
+RACY_FUTURE_SLACK_NS = 2_000_000_000
+
+
+def _timestamp_clock_lag_ns() -> int:
+    global _TIMESTAMP_CLOCK_LAG_NS
+    if _TIMESTAMP_CLOCK_LAG_NS is not None:
+        return _TIMESTAMP_CLOCK_LAG_NS
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            class _Timespec(ctypes.Structure):
+                _fields_ = [("seconds", ctypes.c_long),
+                            ("nanoseconds", ctypes.c_long)]
+
+            resolution = _Timespec()
+            clock_getres = ctypes.CDLL(None).clock_getres
+            clock_getres.argtypes = [ctypes.c_int, ctypes.POINTER(_Timespec)]
+            clock_getres.restype = ctypes.c_int
+            if clock_getres(5, ctypes.byref(resolution)) == 0:
+                tick = (int(resolution.seconds) * 1_000_000_000
+                        + int(resolution.nanoseconds))
+                if 1 <= tick <= 1_000_000_000:
+                    _TIMESTAMP_CLOCK_LAG_NS = tick
+                    return tick
+        except (AttributeError, OSError, TypeError):
+            pass
+        _TIMESTAMP_CLOCK_LAG_NS = 10_000_000
+    elif sys.platform == "darwin":
+        _TIMESTAMP_CLOCK_LAG_NS = 0
+    else:
+        _TIMESTAMP_CLOCK_LAG_NS = 20_000_000
+    return _TIMESTAMP_CLOCK_LAG_NS
+
+
+def _racy_margin_ns(stamp_ns: int) -> int:
+    granule = 1
+    while granule < 1_000_000_000 and stamp_ns % (granule * 10) == 0:
+        granule *= 10
+    if granule == 1_000_000_000:
+        granule = 2_000_000_000
+    return granule + _timestamp_clock_lag_ns()
+
+
+def racy_identity(identity: FileIdentity, scan_start_ns: int, now_ns: int) -> bool:
+    """Whether a stat identity is too recent to trust as a cached observation."""
+    if WIN:
+        return False
+    for stamp_ns in identity[3:5]:
+        margin = _racy_margin_ns(stamp_ns)
+        if (stamp_ns > scan_start_ns - margin
+                and stamp_ns <= now_ns + max(margin, RACY_FUTURE_SLACK_NS)):
+            return True
+    return False
 
 
 def file_identity(path: Path) -> FileIdentity:

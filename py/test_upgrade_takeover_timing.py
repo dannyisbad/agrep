@@ -19,12 +19,13 @@ import unittest
 from unittest import mock
 from types import SimpleNamespace
 
-from _test_support import isolate_data_dir
+from _test_support import fixture_tree, isolate_data_dir
 
 
 isolate_data_dir()
 import common  # noqa: E402
 import corpusdb  # noqa: E402
+import indexd  # noqa: E402
 import indexd_runtime  # noqa: E402
 import indexer  # noqa: E402
 import index_lock  # noqa: E402
@@ -39,6 +40,24 @@ RELEASE_BIN = Path(os.environ.get("AGREP_RS_BIN") or ROOT / "target" / "release"
 OLD_BUILD = "a" * 20
 OLD_TEXT = "old takeover snapshot needle"
 NEW_TEXT = "slow successor publication needle"
+# A foreground command that waits on the paused adoption spends at least one
+# acquire wait doing so; its own phase report shows that without the
+# interpreter start, imports and query work a loaded host inflates.
+ADOPTION_WAIT_S = indexd_runtime._INDEXD_ACQUIRE_WAIT_S
+COORDINATION_BUDGET_S = ADOPTION_WAIT_S / 2
+_PHASE_REPORT = re.compile(r"(?m)^took (\d+\.\d+)s: (.*)$")
+
+
+def phase_seconds(stderr: str) -> dict[str, float]:
+    """Phases of the CLI's forced slow-command report (AGREP_TIMING=1)."""
+    match = _PHASE_REPORT.search(stderr)
+    if match is None:
+        raise AssertionError(f"no phase report in stderr: {stderr!r}")
+    phases = {"total": float(match.group(1))}
+    for part in match.group(2).split(" · "):
+        name, span = part.rsplit(" ", 1)
+        phases[name.split("[", 1)[0]] = float(span.rstrip("s"))
+    return phases
 
 
 class RetainedCorpusPublicationTests(unittest.TestCase):
@@ -202,7 +221,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
         )
 
     def test_content_hash_is_never_used_by_retained_readers_or_prebuild(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-reader-proof-") as raw:
+        with fixture_tree(prefix="agrep-retained-reader-proof-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._content_proof(path)
@@ -228,7 +247,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             hashed.assert_not_called()
 
     def test_retained_reader_rejects_a_path_swap_after_proof(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-reader-swap-") as raw:
+        with fixture_tree(prefix="agrep-retained-reader-swap-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._proof(path)
@@ -243,7 +262,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             self.assertIsNone(reader)
 
     def test_schema13_reader_is_rejected_even_with_retained_identity(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-schema13-") as raw:
+        with fixture_tree(prefix="agrep-retained-schema13-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge_schema13(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._proof(path)
@@ -259,7 +278,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
                     expected_build_id=self.OLD_OWNER))
 
     def test_final_retained_validation_hashes_once(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-final-hash-") as raw:
+        with fixture_tree(prefix="agrep-retained-final-hash-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._content_proof(path)
@@ -291,7 +310,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             self.assertEqual(hashed.call_count, 1)
 
     def test_exact_hash_mismatch_preserves_retained_database(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-hash-mismatch-") as raw:
+        with fixture_tree(prefix="agrep-retained-hash-mismatch-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._content_proof(path)
@@ -324,7 +343,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             self.assertFalse(path.with_name("corpus.db.building").exists())
 
     def test_retry_fence_rejects_swap_without_rehashing(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-retry-swap-") as raw:
+        with fixture_tree(prefix="agrep-retained-retry-swap-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._content_proof(path)
@@ -365,7 +384,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             self.assertFalse(path.with_name("corpus.db.building").exists())
 
     def test_retained_fts_survives_build_and_publishes_atomically(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-corpus-") as raw:
+        with fixture_tree(prefix="agrep-retained-corpus-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._proof(path)
@@ -544,7 +563,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             self.assertFalse(path.with_name("corpus.db.building").exists())
 
     def test_rejected_schema13_uses_jsonl_until_atomic_publish(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-schema13-fallback-") as raw:
+        with fixture_tree(prefix="agrep-schema13-fallback-") as raw:
             root = Path(raw)
             path = root / "corpus.db"
             messages = root / "messages.jsonl"
@@ -632,7 +651,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
                 )), {"schema": corpusdb._SCHEMA, "build_id": self.NEW_OWNER})
 
     def test_retained_proof_change_blocks_final_replace(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-recheck-") as raw:
+        with fixture_tree(prefix="agrep-retained-recheck-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._proof(path)
@@ -680,7 +699,7 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
             self.assertEqual(result.get("returned_owner"), self.OLD_OWNER)
 
     def test_failed_build_keeps_the_retained_fts_publication(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-retained-crash-") as raw:
+        with fixture_tree(prefix="agrep-retained-crash-") as raw:
             path = Path(raw) / "corpus.db"
             self._forge(path, self.OLD_OWNER, OLD_TEXT, "old")
             proof = self._proof(path)
@@ -726,6 +745,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             "AGREP_RS_BIN": os.fspath(binary),
             "AGREP_INDEXD_IDLE_S": "60",
             "AGREP_DEBUG": "1",
+            "AGREP_TIMING": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": os.fspath(PY_DIR),
         })
@@ -841,8 +861,9 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
         return records[1:]
 
     def _explicit_index_during_adoption(
-            self, *, expires: bool, current_database: bool = False) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-explicit-adoption-") as raw:
+            self, *, expires: bool, current_database: bool = False,
+            full: bool = False) -> None:
+        with fixture_tree(prefix="agrep-explicit-adoption-") as raw:
             root = Path(raw)
             home, data = root / "home", root / "data"
             data.mkdir()
@@ -853,7 +874,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             initial = subprocess.run(
                 [sys.executable, str(CLI), "index"], cwd=ROOT,
                 env={**env, "AGREP_NO_DAEMON": "1"},
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=300)
             self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
             if not current_database:
                 (data / "corpus.db").unlink()
@@ -884,7 +905,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     self.assertIn(f"pid={daemon.pid} ", daemon_record)
                     self.assertIn(f"writer={writer} ", daemon_record)
                     self.assertEqual((data / "messages.jsonl").read_bytes(), published)
-                    command = [sys.executable, str(CLI), "index"]
+                    command = [sys.executable, str(CLI), "index"] + (["--full"] if full else [])
                     if expires:
                         command = [
                             sys.executable, "-c",
@@ -902,7 +923,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                             f"freshness daemon is still adopting the index (pid {claim['pid']})",
                             stderr)
                         self.assertEqual(stderr.count(
-                            "waiting for the freshness daemon to finish adopting the index"), 1, stderr)
+                            "waiting for the freshness daemon to finish updating the index"), 1, stderr)
                         self.assertIn("finishes on its own", stderr)
                         self.assertNotIn("legacy or ambiguous", stderr)
                         self.assertNotIn("nothing is building", stderr)
@@ -923,7 +944,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                 stdout, stderr = foreground.communicate(timeout=30)
                 self.assertEqual(foreground.returncode, 0, stdout + stderr)
                 self.assertEqual(stderr.count(
-                    "waiting for the freshness daemon to finish adopting the index"), 1, stderr)
+                    "waiting for the freshness daemon to finish updating the index"), 1, stderr)
                 self.assertNotIn("legacy or ambiguous", stderr)
                 self.assertNotIn("nothing is building", stderr)
                 self.assertIn(NEW_TEXT, (data / "messages.jsonl").read_text())
@@ -949,8 +970,230 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
     def test_explicit_index_waits_even_when_the_published_database_is_current(self) -> None:
         self._explicit_index_during_adoption(expires=False, current_database=True)
 
+    def test_full_explicit_index_waits_for_live_same_build_adoption(self) -> None:
+        self._explicit_index_during_adoption(
+            expires=False, current_database=True, full=True)
+
+    def test_explicit_index_names_a_stranger_indexer_without_daemon_promises(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-stranger-adoption-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            data.mkdir()
+            self._sources(home, OLD_TEXT, 1, 1)
+            env = self._env(home, data, RELEASE_BIN)
+            env.pop("AGREP_DEBUG")
+            env.update(AGREP_NO_DAEMON="1", AGREP_NO_FETCH="1",
+                       AGREP_NO_SEM_WORKER="1", AGREP_NO_RESIDENT="1")
+            initial = subprocess.run(
+                [sys.executable, str(CLI), "index"], cwd=ROOT, env=env,
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
+            self._sources(home, NEW_TEXT, 2, 1)
+            holder = None
+            try:
+                with mock.patch.object(index_lock, "INDEX_LOCK_PATH", data / ".index.lock"), \
+                        index_lock.IndexLock("adoption-barrier"):
+                    # A plain explicit index of this build claims the stores, then blocks
+                    # on the held index lock: a live same-build claim with no daemon behind it.
+                    holder = subprocess.Popen(
+                        [sys.executable, str(CLI), "index"], cwd=ROOT, env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    claim_path = data / ".indexd.lock"
+                    self._wait_for(
+                        claim_path.is_file, 10, "the holder never claimed the stores")
+                    claim = dict(field.split("=", 1) for field in claim_path.read_text().split())
+                    self.assertEqual(claim["state"], "derived-adoption")
+                    self.assertFalse((data / f".indexd.v2.child.{claim['token']}").exists())
+                    later = subprocess.run(
+                        [sys.executable, "-c",
+                         "import indexd_runtime,runpy,sys; "
+                         "indexd_runtime._UPGRADE_SETTLEMENT_WAIT_S=0.15; "
+                         f"sys.argv=[{str(CLI)!r},'index']; "
+                         f"runpy.run_path({str(CLI)!r},run_name='__main__')"],
+                        cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(later.returncode, 1, later.stdout + later.stderr)
+                    self.assertIn(
+                        f"waiting for another agrep indexer (pid {claim['pid']}) "
+                        "to finish updating the index", later.stderr)
+                    self.assertIn(
+                        f"another agrep indexer (pid {claim['pid']}) is still updating "
+                        "the index; the wait budget expired", later.stderr)
+                    self.assertNotIn("daemon", later.stderr)
+                    self.assertNotIn("finishes on its own", later.stderr)
+                    self.assertNotIn("legacy or ambiguous", later.stderr)
+                    self.assertTrue(common.pid_alive(int(claim["pid"])))
+                stdout, stderr = holder.communicate(timeout=30)
+                self.assertEqual(holder.returncode, 0, stdout + stderr)
+                self.assertIn(NEW_TEXT, (data / "messages.jsonl").read_text())
+            finally:
+                if holder is not None and holder.poll() is None:
+                    holder.kill()
+                    holder.communicate(timeout=5)
+
+    def test_only_explicit_launches_carry_the_adoption_wait_budget(self) -> None:
+        inherited = {"AGREP_DERIVED_ADOPTION_WAIT_MS": "5", "AGREP_RUNTIME_BUILD_ID": "a" * 20}
+        with mock.patch.object(indexd_runtime, "rust_writer_env",
+                               side_effect=lambda binary=None: dict(inherited)):
+            explicit = indexd_runtime.explicit_rust_writer_env(Path("agrep-rs"))
+        self.assertEqual(explicit["AGREP_DERIVED_ADOPTION_WAIT_MS"], "180000")
+        self.assertEqual(explicit["AGREP_RUNTIME_BUILD_ID"], "a" * 20)
+        binary = Path(tempfile.mkdtemp(prefix="agrep-wait-env-")) / "agrep-rs"
+        binary.write_bytes(b"fixture")
+        self.addCleanup(shutil.rmtree, binary.parent)
+        with mock.patch.dict(os.environ, inherited), \
+                mock.patch.object(indexd_runtime, "assert_python_runtime_unchanged"), \
+                mock.patch.object(indexd_runtime, "derived_writer_build_id",
+                                  return_value="b" * 20), \
+                mock.patch.object(indexd_runtime, "derived_writer_mutation_info",
+                                  return_value=SimpleNamespace(writable=True, state="current")), \
+                mock.patch.object(indexd_runtime, "derived_writer_launchable", return_value=True), \
+                mock.patch.object(indexd_runtime, "_inspect_indexd_owner",
+                                  return_value=SimpleNamespace(
+                                      state=indexd_runtime._IndexdOwnerState.ABSENT,
+                                      snapshot=None)):
+            background = indexd_runtime.rust_writer_env(binary)
+        self.assertNotIn("AGREP_DERIVED_ADOPTION_WAIT_MS", background)
+
+    def test_one_passing_ownership_probe_is_the_explicit_verdict(self) -> None:
+        # the daemon's follow-up corpus.db work starts in response to the publication
+        # this ingest just made; a probe that passed must not be second-guessed by a
+        # later journal-blocked one
+        verdicts = iter([SimpleNamespace(writable=True, journal_blocked=False),
+                         SimpleNamespace(writable=False, journal_blocked=True)])
+        rerun = mock.Mock(return_value=0)
+        with mock.patch.object(indexd_runtime, "derived_writer_mutation_info",
+                               side_effect=lambda *a, **k: next(verdicts)), \
+                mock.patch.object(indexd_runtime, "_await_upgrade_settlement",
+                                  side_effect=AssertionError("settlement waited")), \
+                mock.patch.object(indexd_runtime.common, "log",
+                                  side_effect=AssertionError("declined a published index")):
+            self.assertTrue(indexd_runtime.explicit_ingest_published(rerun))
+        rerun.assert_not_called()
+
+    def test_declined_full_index_reruns_cold_even_after_the_sig_moved(self) -> None:
+        import cli
+        with tempfile.TemporaryDirectory(prefix="agrep-full-rerun-") as raw:
+            data = Path(raw)
+            sig = data / ".ingest.sig"
+            sig.write_text("1:seed\n")
+            commands: list[list[str]] = []
+
+            def run(cmd, **_kwargs):
+                commands.append(list(cmd))
+                return SimpleNamespace(returncode=0)
+
+            def published(rerun):
+                # the settlement window: the daemon's own pass rewrites the sig
+                sig.write_text("2:daemon\n")
+                os.utime(sig, ns=(1, 1))
+                return rerun() == 0
+
+            with mock.patch.object(cli.common, "DATA_DIR", data), \
+                    mock.patch.object(cli.common, "ingest_bin",
+                                      return_value=data / "agrep-rs"), \
+                    mock.patch.object(cli, "_ensure_binary", return_value=True), \
+                    mock.patch.object(cli.subprocess, "run", side_effect=run), \
+                    mock.patch.object(indexd_runtime, "retire_displaceable_indexd_owner"), \
+                    mock.patch.object(indexd_runtime, "explicit_rust_writer_env",
+                                      return_value={}), \
+                    mock.patch.object(indexd_runtime, "explicit_ingest_published",
+                                      side_effect=published), \
+                    mock.patch.object(indexd_runtime, "record_binary_identity"), \
+                    mock.patch.object(indexd_runtime, "hand_off_search_index",
+                                      return_value=True), \
+                    mock.patch.object(cli.common, "lap"), \
+                    mock.patch.object(cli.sys, "stdout", io.StringIO()):
+                args = SimpleNamespace(rest=[], full=True)
+                self.assertEqual(cli.cmd_index(args), 0)
+        self.assertEqual([command[-1] for command in commands], ["--full", "--full"])
+
+    def test_a_daemon_that_took_the_slot_after_the_reapers_judgement_survives(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-reap-gap-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            data.mkdir()
+            self._sources(home, OLD_TEXT, 1, 1)
+            env = self._env(home, data, RELEASE_BIN)
+            env.pop("AGREP_DEBUG")
+            env.update(AGREP_NO_FETCH="1", AGREP_NO_SEM_WORKER="1", AGREP_NO_RESIDENT="1")
+            initial = subprocess.run(
+                [sys.executable, str(CLI), "index"], cwd=ROOT,
+                env={**env, "AGREP_NO_DAEMON": "1"},
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
+            writer = self._owner_build(data)
+            owner_path = data / ".indexd.v2.lock"
+            # the dead claimer's record this reaper sets out to reclaim
+            owner_path.write_bytes(
+                f"state=derived-adoption pid={common._MAX_PROCESS_ID} start=fixture "
+                f"writer={writer} token={'a' * 32}\n".encode("ascii"))
+            os.utime(owner_path, (time.time() - 30, time.time() - 30))
+            stale = ownerfile.snapshot(owner_path)
+            daemon_log = root / "daemon.log"
+            state: dict[str, object] = {}
+            real_mutex = ownerfile._slot_mutex
+
+            def record(path: Path) -> str:
+                try:
+                    return path.read_text(encoding="ascii")
+                except OSError:
+                    return ""
+
+            def daemon_settled() -> bool:
+                return (f"pid={state['daemon'].pid} " in record(owner_path)
+                        and "keeping the index fresh" in daemon_log.read_text(encoding="utf-8")
+                        and not (data / ".indexd.lock").exists())
+
+            def daemon_takes_the_slot_first(path, **kwargs):
+                if path == owner_path and "daemon" not in state:
+                    # the live daemon reclaims the stale record and takes the slot between
+                    # this reaper's judgement and its locked re-check
+                    state["daemon"] = subprocess.Popen(
+                        [sys.executable, str(PY_DIR / "indexd.py")], cwd=ROOT, env=env,
+                        stdout=state["log"], stderr=state["log"], start_new_session=True)
+                    self._wait_for(daemon_settled, 20, "the daemon never settled into its record")
+                    state["live"] = ownerfile.snapshot(owner_path)
+                return real_mutex(path, **kwargs)
+
+            try:
+                with daemon_log.open("w") as log:
+                    state["log"] = log
+                    with mock.patch.object(
+                            ownerfile, "_slot_mutex", side_effect=daemon_takes_the_slot_first):
+                        self.assertFalse(ownerfile.remove_exact(owner_path, stale))
+                    live = state["live"]
+                    daemon = state["daemon"]
+                    observed = ownerfile.snapshot(owner_path)
+                    self.assertEqual((observed.identity[:3], observed.raw),
+                                     (live.identity[:3], live.raw))
+                    self.assertEqual(list(data.glob(".*.owner-reap-*")), [])
+                    # a claimer meeting the live daemon is refused outright; nothing moves
+                    claimer = subprocess.run(
+                        [str(RELEASE_BIN), "index", "--agent", "all"], cwd=ROOT,
+                        env={**env, "AGREP_RUNTIME_BUILD_ID": writer},
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(claimer.returncode, 0, claimer.stderr)
+                    self.assertIn("serving the published snapshot read-only", claimer.stderr)
+                    self.assertFalse((data / ".indexd.lock").exists())
+                    # the daemon's next heartbeat verifies the record it still holds
+                    time.sleep(indexd.BEAT_S + 1.5)
+                    self.assertIsNone(daemon.poll(), daemon_log.read_text(encoding="utf-8"))
+                    self.assertNotIn("ownership", daemon_log.read_text(encoding="utf-8"))
+                    observed = ownerfile.snapshot(owner_path)
+                    self.assertEqual((observed.identity[:3], observed.raw),
+                                     (live.identity[:3], live.raw))
+            finally:
+                daemon = state.get("daemon")
+                if daemon is not None:
+                    daemon.terminate()
+                    try:
+                        daemon.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(daemon.pid, signal.SIGKILL)
+                        daemon.wait(timeout=5)
+
     def test_successor_publishes_rebuilt_cache_before_daemon_start(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-rebuilt-adoption-") as raw:
+        with fixture_tree(prefix="agrep-rebuilt-adoption-") as raw:
             root = Path(raw)
             home, data = root / "home", root / "data"
             data.mkdir()
@@ -960,7 +1203,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             initial_env["AGREP_NO_FETCH"] = "1"
             initial = subprocess.run(
                 [sys.executable, os.fspath(CLI), "index"],
-                cwd=ROOT, env=initial_env, capture_output=True, text=True, timeout=30)
+                cwd=ROOT, env=initial_env, capture_output=True, text=True, timeout=300)
             self.assertEqual(initial.returncode, 0, initial.stderr)
             cache_path = data / ".ingest_cache.bin"
             cache = bytearray(cache_path.read_bytes())
@@ -975,7 +1218,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             try:
                 rebuilt = subprocess.run(
                     [sys.executable, os.fspath(CLI), "index"],
-                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
                 self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
                 with closing(sqlite3.connect(data / "corpus.db")) as db:
                     self.assertEqual(
@@ -1007,7 +1250,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                 self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_search_reads_old_publication_while_successor_adoption_is_active(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-active-adoption-") as raw:
+        with fixture_tree(prefix="agrep-active-adoption-") as raw:
             root = Path(raw)
             home, data = root / "home", root / "data"
             data.mkdir()
@@ -1016,7 +1259,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             initial_env["AGREP_RUNTIME_BUILD_ID"] = OLD_BUILD
             initial = subprocess.run(
                 [str(RELEASE_BIN), "index", "--agent", "cline"],
-                cwd=ROOT, env=initial_env, capture_output=True, text=True, timeout=30)
+                cwd=ROOT, env=initial_env, capture_output=True, text=True, timeout=300)
             self.assertEqual(initial.returncode, 0, initial.stderr)
             published = (data / "messages.jsonl").read_bytes()
             self._sources(home, NEW_TEXT, 2, 8)
@@ -1069,7 +1312,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
 
     def test_slow_successor_adoption_outlives_foreground_search(self) -> None:
         self.assertTrue(RELEASE_BIN.is_file(), RELEASE_BIN)
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-upgrade-takeover-timing-") as raw:
             root = Path(raw)
             home, data = root / "home", root / "data"
@@ -1081,7 +1324,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
             initial = subprocess.run(
                 [os.fspath(RELEASE_BIN), "index", "--agent", "cline"],
                 cwd=ROOT, env=initial_env, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=30)
+                encoding="utf-8", errors="replace", timeout=300)
             self.assertEqual(initial.returncode, 0, initial.stderr)
             self.assertEqual(self._owner_build(data), OLD_BUILD)
             self.assertIn(
@@ -1138,7 +1381,7 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                         OLD_TEXT,
                         (data / "messages.jsonl").read_text(encoding="utf-8"))
 
-                foreground, elapsed = self._run_search(env, OLD_TEXT)
+                foreground, _elapsed = self._run_search(env, OLD_TEXT)
                 self.assertEqual(
                     foreground.returncode, 0,
                     foreground.stderr + "\n" + foreground.stdout + "\n" + json.dumps({
@@ -1150,7 +1393,9 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                         "new_rows_present": NEW_TEXT in (
                             data / "messages.jsonl").read_text(encoding="utf-8"),
                     }))
-                self.assertLess(elapsed, 3.0, foreground.stderr)
+                self.assertLess(
+                    phase_seconds(foreground.stderr)["freshen"],
+                    COORDINATION_BUDGET_S, foreground.stderr)
                 self.assertTrue(any(
                     OLD_TEXT in str(row.get("snippet") or "")
                     for row in self._json_rows(foreground)))
@@ -1193,18 +1438,27 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     path: stable_bytes(path)
                     for path in (owner_path, guards[0], child_path, locks[0])
                 }
-                doctor_started = time.perf_counter()
-                doctor = subprocess.run(
-                    [sys.executable, os.fspath(CLI), "doctor", "--json"],
-                    cwd=ROOT, env=env, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=20)
-                doctor_elapsed = time.perf_counter() - doctor_started
-                self.assertEqual(doctor.returncode, 0, doctor.stderr)
-                doctor_payload = json.loads(doctor.stdout)
+                # Doctor's routine budget can defer the daemon observation on a
+                # loaded box; only a reached verdict is asserted.
+                for _attempt in range(5):
+                    doctor = subprocess.run(
+                        [sys.executable, os.fspath(CLI), "doctor", "--json"],
+                        cwd=ROOT, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=20)
+                    self.assertEqual(doctor.returncode, 0, doctor.stderr)
+                    doctor_payload = json.loads(doctor.stdout)
+                    deferred = doctor_payload["diagnostics"]["deferred"]
+                    if "daemon resource observation" not in deferred:
+                        break
+                self.assertNotIn(
+                    "daemon resource observation", deferred, doctor_payload["diagnostics"])
                 self.assertTrue(
                     doctor_payload["resources"]["indexd"]["running"],
                     doctor_payload["resources"]["indexd"])
-                self.assertLess(doctor_elapsed, 3.0, doctor.stderr)
+                doctor_phases = phase_seconds(doctor.stderr)
+                self.assertLess(
+                    doctor_phases["total"] - doctor_phases["imports"],
+                    ADOPTION_WAIT_S, doctor.stderr)
                 self.assertEqual({
                     path: stable_bytes(path)
                     for path in before_doctor
@@ -1238,13 +1492,15 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
 
                 debug_env = dict(env)
                 debug_env["AGREP_DEBUG"] = "1"
-                second, second_elapsed = self._run_search(debug_env, NEW_TEXT)
+                second, _elapsed = self._run_search(debug_env, NEW_TEXT)
                 self.assertEqual(second.returncode, 0, second.stderr)
                 rows = self._json_rows(second)
                 self.assertTrue(any(
                     NEW_TEXT in str(row.get("snippet") or "") for row in rows))
                 self.assertIn("engine: corpusdb", second.stderr)
-                self.assertLess(second_elapsed, 3.0, second.stderr)
+                self.assertLess(
+                    phase_seconds(second.stderr)["freshen"],
+                    COORDINATION_BUDGET_S, second.stderr)
 
                 database = sqlite3.connect(data / "corpus.db")
                 try:

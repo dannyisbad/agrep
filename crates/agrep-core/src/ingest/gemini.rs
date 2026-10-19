@@ -1,4 +1,6 @@
-//! Gemini CLI adapter: ~/.gemini/tmp/<projectHash>/chats/session-*.jsonl (and legacy .json)
+//! Gemini CLI adapter: ~/.gemini/tmp/<project>/chats/session-*.jsonl (and legacy .json), plus
+//! each subagent's chat at chats/<parent session id>/<agent id>.jsonl (a side session of its
+//! parent; the parent's invoke_agent call record names the agent id)
 //!
 //! Shapes follow google-gemini/gemini-cli packages/core/src/services/chatRecordingService.ts
 //! (fb972b2). Since #23749 a session is JSONL: a metadata line `{ sessionId, projectHash,
@@ -26,8 +28,8 @@
 //!                     `model`, `toolCalls[]`, plus `thoughts` (reasoning, excluded) and `tokens`
 //!   type=="info"   -> CLI system notices (auth flow, etc.) - not the user, skipped
 //! a toolCall is `{ id, name, args, result: [{functionResponse:{response:{output}}}],
-//! status }`. projectHash is a SHA256 of the project dir with no reverse map in the store,
-//! so project attribution falls back to "gemini" (see collect).
+//! status, agentId? }`. The project: `<project>/.project_root` names the project path (the
+//! registry marker gemini-cli writes before any chat; see `Projects`), the fallback is "gemini".
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -143,6 +145,52 @@ fn with_recorded_reply(parts: &Value, reply: String) -> Value {
         }
     }
     Value::Array(out)
+}
+
+/// New `content` for a message in the map, as a `$patch` or a record under the same id writes
+/// it. Upstream records a model turn's reply cleaned since 0.53 (`responseText`, geminiChat.ts
+/// 1547-1659 at fb972b2) and as written before, and a re-sync writes back the history's raw
+/// parts (chatRecordingService.ts 1364-1381): when those read the same (see `visible_text`), the
+/// turn keeps the reply it recorded, among the parts' calls (see `with_recorded_reply`), and
+/// `copied` stays false. A turn without one takes the content: after Esc its calls have a record
+/// of their own (1133-1157), which a copy of the turn then pairs with. `reply` caches the
+/// visible text: patches that write the same back can come by the hundred thousand.
+fn absorb(
+    message: &mut serde_json::Map<String, Value>,
+    reply: &mut Option<String>,
+    copied: &mut bool,
+    content: &Value,
+) {
+    let gemini = message.get("type").and_then(Value::as_str) == Some("gemini");
+    let visible = |content: &Value| visible_text(&part_text(content));
+    let kept = gemini && {
+        let new = visible(content);
+        let old =
+            reply.get_or_insert_with(|| message.get("content").map(visible).unwrap_or_default());
+        let same = *old == new;
+        *old = new;
+        same
+    };
+    if !kept {
+        message.insert("content".to_string(), content.clone());
+        *copied = gemini && content.is_array();
+    } else if reply.as_ref().is_some_and(|reply| !reply.is_empty())
+        && parts_of(content)
+            .iter()
+            .any(|part| part.get("functionCall").is_some())
+    {
+        let slot = message.entry("content").or_insert(Value::Null);
+        // a copy's parts already split its prose as the history does, which pairing keys
+        let same = slot.is_array()
+            && (parts_of(slot).iter().filter_map(prose))
+                .eq(parts_of(content).iter().filter_map(prose));
+        if same {
+            *slot = content.clone();
+        } else {
+            let recorded = recorded_text(std::mem::take(slot));
+            *slot = with_recorded_reply(content, recorded);
+        }
+    }
 }
 
 /// A PartListUnion as its parts: a lone string or part is a list of one.
@@ -283,19 +331,40 @@ fn file_stem(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Where a session file sits in the store: the project its chats belong to (see `Projects`)
+/// and, for a subagent's file, the session it nests under.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Place {
+    project: String,
+    parent: String,
+}
+
+/// Whether a message's content is the history's parts rather than the reply upstream's own
+/// recorder saved: a re-sync records a model turn's raw stream as an array of parts, which the
+/// UI would have shown cleaned (`responseText`, since gemini-cli 0.53), while a recorded reply
+/// is a string saved exactly as shown, cleaned or not by the version that wrote it.
+fn is_history_copy(message: &Value) -> bool {
+    message.get("type").and_then(Value::as_str) == Some("gemini")
+        && message.get("content").is_some_and(Value::is_array)
+}
+
 /// One session's messages as rows and events; a message flagged `true` only repeats an earlier
-/// one. Callers have already counted every message as seen; each one here lands in exactly one
-/// row, agent row or named skip.
+/// one and a message flagged `true` second carries a history copy's parts (see `is_history_copy`).
+/// Callers have already counted every message as seen; each one here lands in exactly one row,
+/// agent row or named skip.
 fn emit_messages<'a>(
     session: &str,
-    messages: impl IntoIterator<Item = (&'a Value, bool)>,
+    place: &Place,
+    messages: impl IntoIterator<Item = (&'a Value, bool, bool)>,
     tally: &Tally,
 ) -> (Vec<Message>, Vec<Event>) {
     let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     let mut recap_turns: Vec<u32> = Vec::new();
     let mut turn = 0u32;
-    for (message_ordinal, (m, replay)) in messages.into_iter().enumerate() {
+    // a message's prose precedes its calls: the calls join it to the next block
+    let mut worked = false;
+    for (message_ordinal, (m, replay, copied)) in messages.into_iter().enumerate() {
         if replay {
             tally.skip(Skip::Replay);
             continue;
@@ -325,10 +394,12 @@ fn emit_messages<'a>(
                 tally.row();
                 if is_state_snapshot(&text) {
                     recap_turns.push(turn);
+                } else {
+                    worked = false;
                 }
                 out.push(crate::model::RawMessage {
                     agent: "gemini",
-                    project: "gemini".to_string(),
+                    project: place.project.clone(),
                     session: session.to_string(),
                     ts,
                     turn,
@@ -336,14 +407,17 @@ fn emit_messages<'a>(
                     model: String::new(),
                     reply: String::new(),
                     reply_chars: 0,
-                    side: false,
-                    parent: String::new(),
+                    side: !place.parent.is_empty(),
+                    parent: place.parent.clone(),
+                    reply_shape: Default::default(),
                 });
                 turn += 1;
             }
             "gemini" => {
-                // prose reply -> the user turn it answers (thoughts are reasoning, excluded)
+                // prose reply -> the user turn it answers (thoughts are reasoning, excluded); a
+                // history copy's raw stream reads as upstream shows it, a recorded reply as saved
                 let txt = m.get("content").map(part_text).unwrap_or_default();
+                let txt = if copied { visible_text(&txt) } else { txt };
                 // canned CLI text: a copy may land away from the snapshot it acknowledged
                 let canned = m.get("toolCalls").is_none()
                     && matches!(txt.trim(), COMPRESSION_ACK | INTERRUPTED_PLACEHOLDER);
@@ -353,12 +427,9 @@ fn emit_messages<'a>(
                 }
                 if !txt.trim().is_empty() {
                     if let Some(last) = out.last_mut() {
-                        let chars = crate::ingest::append_capped(
-                            &mut last.reply,
-                            &txt,
-                            crate::ingest::REPLY_CAP,
-                        );
-                        last.reply_chars += chars;
+                        crate::ingest::append_reply(last, &txt);
+                        crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, worked);
+                        worked = false;
                     }
                 }
                 if let Some(last) = out.last_mut() {
@@ -374,11 +445,32 @@ fn emit_messages<'a>(
                 if let Some(calls) = m.get("toolCalls").and_then(|c| c.as_array()) {
                     for (call_ordinal, tc) in calls.iter().enumerate() {
                         let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                        worked |= !crate::ingest::is_bookkeeping_tool(name);
                         let (input, input_chars) = tc
                             .get("args")
                             .map(summarize_tool_input_with_chars)
                             .unwrap_or_default();
                         let (output, output_chars, output_bytes, ok) = tool_result(tc);
+                        // an invoke_agent record names the subagent it ran (geminiChat.ts
+                        // recordCompletedToolCalls at fb972b2): that agent's own session. The
+                        // call completes only once the run ended, so its status is the run's.
+                        let child = tc
+                            .get("agentId")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        let meta = if child.is_empty() {
+                            String::new()
+                        } else {
+                            let status = match tc.get("status").and_then(Value::as_str) {
+                                Some("success") => "completed".to_string(),
+                                Some(status) => status.to_string(),
+                                None => "unknown".to_string(),
+                            };
+                            format!("delegation={status}")
+                        };
                         tally.event();
                         events.push(Event {
                             agent: "gemini",
@@ -400,8 +492,9 @@ fn emit_messages<'a>(
                                 .unwrap_or_else(|| {
                                     format!("gemini:{message_ordinal}:{call_ordinal}")
                                 }),
-                            child_session: String::new(),
-                            meta: String::new(),
+                            child_session: child,
+                            meta,
+                            state: crate::ingest::task_state(name, tc.get("args")),
                         });
                     }
                 }
@@ -427,7 +520,12 @@ fn emit_messages<'a>(
 }
 
 /// A legacy whole-session document; seen = elements of its messages array.
-fn parse_document(root: &Value, path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>) {
+fn parse_document(
+    root: &Value,
+    path: &Path,
+    place: &Place,
+    tally: &Tally,
+) -> (Vec<Message>, Vec<Event>) {
     let session = root
         .get("sessionId")
         .and_then(|s| s.as_str())
@@ -437,7 +535,12 @@ fn parse_document(root: &Value, path: &Path, tally: &Tally) -> (Vec<Message>, Ve
         return (Vec::new(), Vec::new());
     };
     tally.seen_n(messages.len() as u64);
-    emit_messages(&session, messages.iter().map(|m| (m, false)), tally)
+    emit_messages(
+        &session,
+        place,
+        messages.iter().map(|m| (m, false, false)),
+        tally,
+    )
 }
 
 /// JS `typeof value === 'object' && value !== null`, the test upstream applies to `$set`/`$patch`.
@@ -507,12 +610,36 @@ struct Entry {
     slot: Option<usize>,
     /// The `Fold::epoch` in which the entry entered the map.
     entered: u64,
-    /// A model turn's visible reply, once `update` has read it: patches that write the same back
+    /// A model turn's visible reply, once `absorb` has read it: patches that write the same back
     /// can come by the hundred thousand.
     reply: Option<String>,
     /// Opens an exchange (see `opens_exchange`): fixed when recorded and cleared when paired as a
     /// copy, so the boundaries `undo_answers` scans between never appear later.
     row: bool,
+    /// The calls record upstream split off this model turn's text on Esc (see `split_key`), once
+    /// both left the map together: a copy of the turn repeats the two as one.
+    partner: Option<usize>,
+    /// The content is the history's parts, not a recorded reply (see `is_history_copy`); a patch
+    /// that keeps the recorded reply among the parts leaves this false.
+    copied: bool,
+}
+
+/// Whether `text` and `calls`, consecutive model records, are the two an Esc'd turn leaves: the
+/// UI records the cancellation notice between the turn's text and its cancelled call, so
+/// `recordToolCalls` starts a record of its own for the call (chatRecordingService.ts 1133-1157
+/// at fb972b2). A copy of the turn carries the text and the call as one message.
+fn is_split(text: &CopyKey, calls: &CopyKey) -> bool {
+    text.0 == "gemini"
+        && calls.0 == "gemini"
+        && !text.1.is_empty()
+        && text.2.is_empty()
+        && calls.1.is_empty()
+        && !calls.2.is_empty()
+}
+
+/// The key a copy of the Esc'd turn carries: the text record's text with the calls record's calls.
+fn split_key(text: &CopyKey, calls: &CopyKey) -> CopyKey {
+    (text.0.clone(), text.1.clone(), calls.2.clone())
 }
 
 /// A prompt or a snapshot, as `emit_messages` reads a row's message: the model turns after it, up
@@ -623,6 +750,17 @@ fn key_hash(key: &CopyKey) -> u64 {
 /// walk crossed a gap, so no gap is walked twice.
 /// Every non-blank line and every message inside a `messages` array is one seen unit, and each
 /// leaves through exactly one counter below or as one transcript entry.
+///
+/// Limits, measured with the recorder fuzz driver (fixtures/gemini_flows/recorder: 29 of 1,642
+/// flows over realistic, resume-heavy and Esc-heavy mixes differ from its oracle):
+/// - a copy carries no id of what it repeats, only its content, so pairing is by content and
+///   position: a rewrite repeating a turn byte-identical to another candidate in the same window
+///   (two compressions whose snapshots read the same: 20; a prompt typed twice with the same
+///   reply: 6) can pair with the other one or merge the two;
+/// - coalesced, a compression's acknowledgement can join the reply before it in one model copy,
+///   which then reads as that reply plus the canned text on the recap row (2);
+/// - a decline after `/chat resume`, `--resume`, masking and `/rewind` can lose its prompt and
+///   cancelled call (1).
 #[derive(Default)]
 struct Fold {
     session_id: Option<Value>,
@@ -741,8 +879,10 @@ impl Fold {
     }
 
     /// A message record: a rewrite of a message in the map replaces it in place; anything else
-    /// enters the map at its end, a dropped message returning to it.
-    fn put(&mut self, id: String, message: Value) {
+    /// enters the map at its end, a dropped message returning to it. A model turn recorded again
+    /// under its id with the history's raw parts (gemini-cli 0.45-0.52's `/chat resume` of a turn
+    /// compression dropped) keeps the reply it saved when both read the same (see `absorb`).
+    fn put(&mut self, id: String, mut message: Value) {
         if let Some(index) = self.by_id.get(&id).copied() {
             let epoch = self.epoch;
             if let Some(entry) = self
@@ -751,8 +891,23 @@ impl Fold {
                 .filter(|entry| entry.state != State::Deleted)
             {
                 let was_turn = !is_notice(&entry.message);
+                let raw = is_history_copy(&message)
+                    && entry.message.get("type").and_then(Value::as_str) == Some("gemini");
+                match (&mut entry.message, &mut message) {
+                    (Value::Object(old), Value::Object(new)) if raw => {
+                        if let Some(content) = new.get("content").cloned() {
+                            absorb(old, &mut entry.reply, &mut entry.copied, &content);
+                        }
+                        if let Some(kept) = old.get("content").cloned() {
+                            new.insert("content".to_string(), kept);
+                        }
+                    }
+                    _ => {
+                        entry.copied = is_history_copy(&message);
+                        entry.reply = None;
+                    }
+                }
                 entry.message = message;
-                entry.reply = None;
                 let turn = !is_notice(&entry.message);
                 let revived = entry.state == State::Dropped;
                 if revived {
@@ -776,6 +931,7 @@ impl Fold {
         let index = self.entries.len();
         self.by_id.insert(id, index);
         let row = opens_exchange(&message);
+        let copied = is_history_copy(&message);
         self.entries.push(Entry {
             message,
             state: State::Live,
@@ -783,6 +939,8 @@ impl Fold {
             slot: None,
             entered: self.epoch,
             reply: None,
+            partner: None,
+            copied,
             row,
         });
         self.enter(index);
@@ -1156,17 +1314,31 @@ impl Fold {
     }
 
     /// Mark messages already out of the map dropped, and pool them, by `keys` where given, for
-    /// later whole rewrites.
+    /// later whole rewrites: an Esc'd turn's two records pool as one under the copy's key too.
     fn mark_dropped(&mut self, dropped: &[usize], keys: &[Option<CopyKey>]) {
         for (position, index) in dropped.iter().enumerate() {
             if let Some(entry) = self.entries.get_mut(*index) {
                 entry.state = State::Dropped;
+                entry.partner = None;
             }
-            if let Some(Some(key)) = keys.get(position) {
-                self.dropped
-                    .entry(key_hash(key))
-                    .or_default()
-                    .insert(*index);
+            let Some(Some(key)) = keys.get(position) else {
+                continue;
+            };
+            self.dropped
+                .entry(key_hash(key))
+                .or_default()
+                .insert(*index);
+            let next = position + 1;
+            if let (Some(Some(calls)), Some(partner)) = (keys.get(next), dropped.get(next)) {
+                if is_split(key, calls) {
+                    if let Some(entry) = self.entries.get_mut(*index) {
+                        entry.partner = Some(*partner);
+                    }
+                    self.dropped
+                        .entry(key_hash(&split_key(key, calls)))
+                        .or_default()
+                        .insert(*index);
+                }
             }
         }
     }
@@ -1231,10 +1403,23 @@ impl Fold {
                 .filter(|key| !context(key))
                 .map(|key| (key, slot))
         });
+        // an Esc'd turn's text record followed by its calls record, keyed as the copy repeats them
+        let mut splits: HashMap<CopyKey, Vec<usize>> = HashMap::new();
+        for (position, keys) in removed_keys.windows(2).enumerate() {
+            if let [Some(text), Some(calls)] = keys {
+                if is_split(text, calls) {
+                    splits
+                        .entry(split_key(text, calls))
+                        .or_default()
+                        .push(position);
+                }
+            }
+        }
         let front = opens
             || (whole
                 && lead.is_some_and(|(key, slot)| {
                     at.contains_key(key)
+                        || splits.contains_key(key)
                         || Self::run(wanted(slot), &removed_parts, &stale, &starts, 0, true)
                             .is_some()
                         || self.dropped_original(key, 0).is_some()
@@ -1251,25 +1436,25 @@ impl Fold {
             let Some(Some(key)) = copy_keys.get(slot) else {
                 continue;
             };
-            let positions = at.get(key).map(Vec::as_slice).unwrap_or_default();
-            let found = if front {
-                positions.get(positions.partition_point(|p| *p < bound))
-            } else {
-                let below = positions.partition_point(|p| *p < bound);
-                below.checked_sub(1).and_then(|p| positions.get(p))
+            // the nearest of the candidates in pairing order: one removed turn, an Esc'd turn's
+            // two records, or a coalesced run; the longest of those starting (ending) together
+            let nearest = |positions: &[usize], len: usize| -> Option<(usize, usize)> {
+                let start = if front {
+                    *positions.get(positions.partition_point(|p| *p < bound))?
+                } else {
+                    let below = positions.partition_point(|p| p + len <= bound);
+                    *positions.get(below.checked_sub(1)?)?
+                };
+                Some((start, start + len))
             };
+            let found = nearest(at.get(key).map(Vec::as_slice).unwrap_or_default(), 1);
+            let split = nearest(splits.get(key).map(Vec::as_slice).unwrap_or_default(), 2);
             let run = Self::run(wanted(slot), &removed_parts, &stale, edges, bound, front);
-            // the nearer of the two in pairing order
-            let span = match (found.copied(), run) {
-                (Some(at), Some((start, end)))
-                    if (front && at < start) || (!front && at >= end) =>
-                {
-                    Some((at, at + 1))
-                }
-                (_, Some(span)) => Some(span),
-                (Some(at), None) => Some((at, at + 1)),
-                (None, None) => None,
+            let rank = |(start, end): &(usize, usize)| {
+                let away = if front { *start } else { removed.len() - *end };
+                (away, std::cmp::Reverse(end - start))
             };
+            let span = [found, split, run].into_iter().flatten().min_by_key(rank);
             if let Some((start, end)) = span {
                 bound = if front { end } else { start };
                 if let Some(cell) = originals.get_mut(slot) {
@@ -1281,10 +1466,11 @@ impl Fold {
             if !(front && whole) {
                 continue;
             }
-            if let Some(found) = self.dropped_original(key, dropped_bound) {
+            if let Some((found, partner)) = self.dropped_original(key, dropped_bound) {
                 dropped_bound = found + 1;
                 if let Some(original) = originals.get_mut(slot) {
                     original.push(found);
+                    original.extend(partner);
                 }
             }
         }
@@ -1376,9 +1562,12 @@ impl Fold {
         })
     }
 
-    /// The oldest dropped entry at or after `bound` that `key` repeats, pruning entries that are
-    /// no longer dropped, or repeat a turn since undone through another copy of it.
-    fn dropped_original(&mut self, key: &CopyKey, bound: usize) -> Option<usize> {
+    /// The oldest dropped entry at or after `bound` that `key` repeats, with the calls record
+    /// split off it when the copy repeats the two (see `partner`), pruning entries that are no
+    /// longer dropped, repeat a turn since undone through another copy of it, or no longer key
+    /// to this pool (revived with other content; a split whose partner left): a slot is walked
+    /// past unpruned only on a hash collision, so a scan never crosses a stale slot twice.
+    fn dropped_original(&mut self, key: &CopyKey, bound: usize) -> Option<(usize, Option<usize>)> {
         let hash = key_hash(key);
         let mut cursor = bound;
         loop {
@@ -1391,16 +1580,34 @@ impl Fold {
                 };
                 entry.state == State::Dropped && !entry.originals.iter().any(deleted)
             });
-            if !usable {
-                if let Some(set) = self.dropped.get_mut(&hash) {
-                    set.remove(&index);
-                }
-                continue;
+            let own = usable.then(|| self.copy_key(index)).flatten();
+            if own.as_ref() == Some(key) {
+                return Some((index, None));
             }
-            if self.copy_key(index).as_ref() == Some(key) {
-                return Some(index);
+            let dropped = |index: usize| {
+                self.entries
+                    .get(index)
+                    .is_some_and(|entry| entry.state == State::Dropped)
+            };
+            let partner = self.entries.get(index).and_then(|entry| entry.partner);
+            let split = own
+                .as_ref()
+                .zip(partner.filter(|p| dropped(*p)))
+                .and_then(|(text, p)| {
+                    let calls = self.copy_key(p)?;
+                    is_split(text, &calls).then(|| (split_key(text, &calls), p))
+                });
+            if let Some((split, partner)) = split.as_ref().filter(|(split, _)| split == key) {
+                debug_assert_eq!(key_hash(split), hash);
+                return Some((index, Some(*partner)));
             }
-            cursor = index + 1;
+            let belongs = own.as_ref().is_some_and(|own| key_hash(own) == hash)
+                || split.is_some_and(|(split, _)| key_hash(&split) == hash);
+            if belongs {
+                cursor = index + 1;
+            } else if let Some(set) = self.dropped.get_mut(&hash) {
+                set.remove(&index);
+            }
         }
     }
 
@@ -1427,13 +1634,8 @@ impl Fold {
         Some((kind.to_string(), text, tools))
     }
 
-    /// Upstream `applySinglePatch` on a message in the map: replace `content`; give gemini tool
-    /// calls a result by id, only where none was recorded. Upstream records a model turn's reply
-    /// cleaned (`responseText`, geminiChat.ts 1547-1659 at fb972b2), and a re-sync writes back the
-    /// history's raw parts (chatRecordingService.ts 1364-1381): when those read the same (see
-    /// `visible_text`), the turn keeps the reply it recorded, among the parts' calls (see
-    /// `with_recorded_reply`). A turn without one keeps its content: after Esc its calls have a
-    /// record of their own (1133-1157), which a copy of the turn then pairs with.
+    /// Upstream `applySinglePatch` on a message in the map: replace `content` (see `absorb`);
+    /// give gemini tool calls a result by id, only where none was recorded.
     fn update(&mut self, patch: &Value) {
         let Some(index) = patch
             .get("id")
@@ -1445,41 +1647,14 @@ impl Fold {
         let Some(Entry {
             message: Value::Object(message),
             reply,
+            copied,
             ..
         }) = self.entries.get_mut(index)
         else {
             return;
         };
         if let Some(content) = patch.get("content") {
-            let gemini = message.get("type").and_then(Value::as_str) == Some("gemini");
-            let visible = |content: &Value| visible_text(&part_text(content));
-            let kept = gemini && {
-                let new = visible(content);
-                let old = reply
-                    .get_or_insert_with(|| message.get("content").map(visible).unwrap_or_default());
-                let same = *old == new;
-                *old = new;
-                same
-            };
-            if !kept {
-                message.insert("content".to_string(), content.clone());
-            } else if reply.as_ref().is_some_and(|reply| !reply.is_empty())
-                && parts_of(content)
-                    .iter()
-                    .any(|part| part.get("functionCall").is_some())
-            {
-                let slot = message.entry("content").or_insert(Value::Null);
-                // a copy's parts already split its prose as the history does, which pairing keys
-                let same = slot.is_array()
-                    && (parts_of(slot).iter().filter_map(prose))
-                        .eq(parts_of(content).iter().filter_map(prose));
-                if same {
-                    *slot = content.clone();
-                } else {
-                    let recorded = recorded_text(std::mem::take(slot));
-                    *slot = with_recorded_reply(content, recorded);
-                }
-            }
+            absorb(message, reply, copied, content);
         }
         let Some(Value::Array(calls)) = patch.get("toolCalls") else {
             return;
@@ -1531,31 +1706,37 @@ impl Fold {
         }
     }
 
-    /// The transcript in order, each message flagged when it only repeats another.
-    fn messages(&self) -> impl Iterator<Item = (&Value, bool)> {
+    /// The transcript in order, each message flagged when it only repeats another and when its
+    /// content is a history copy's parts.
+    fn messages(&self) -> impl Iterator<Item = (&Value, bool, bool)> {
         self.entries
             .iter()
             .filter(|entry| entry.state != State::Deleted)
-            .map(|entry| (&entry.message, !entry.originals.is_empty()))
+            .map(|entry| (&entry.message, !entry.originals.is_empty(), entry.copied))
     }
 }
 
 /// `Undone` when the read is empty because the file itself undid what it held: rolled back or
 /// rewound in records the read saw whole. Upstream only appends complete lines, so an error-free
 /// read ending on one is the session as it stood; a torn or foreign read never qualifies.
-fn parse_jsonl(data: &str, path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
+fn parse_jsonl(
+    data: &str,
+    path: &Path,
+    place: &Place,
+    tally: &Tally,
+) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
     let fold = Fold::read(data);
     if !fold.complete() {
         if let Ok(root) = serde_json::from_str::<Value>(data) {
             if root.get("sessionId").is_some() {
-                let (messages, events) = parse_document(&root, path, tally);
+                let (messages, events) = parse_document(&root, path, place, tally);
                 return (messages, events, ReadOutcome::Complete);
             }
         }
     }
     fold.record(tally);
     let session = fold.session().unwrap_or_else(|| file_stem(path));
-    let (messages, events) = emit_messages(&session, fold.messages(), tally);
+    let (messages, events) = emit_messages(&session, place, fold.messages(), tally);
     let undone = messages.is_empty()
         && events.is_empty()
         && fold.complete()
@@ -1573,11 +1754,15 @@ fn parse_jsonl(data: &str, path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Eve
     (messages, events, outcome)
 }
 
-fn parse_file(path: &Path) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
-    parse_with_tally(path, &crate::intake::file("gemini", path))
+fn parse_file(path: &Path, projects: &Projects) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
+    parse_with_tally(path, projects, &crate::intake::file("gemini", path))
 }
 
-fn parse_with_tally(path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
+fn parse_with_tally(
+    path: &Path,
+    projects: &Projects,
+    tally: &Tally,
+) -> (Vec<Message>, Vec<Event>, ReadOutcome) {
     let data = match crate::ingest::read_lossy(path) {
         Ok(d) => d,
         Err(e) => {
@@ -1588,30 +1773,156 @@ fn parse_with_tally(path: &Path, tally: &Tally) -> (Vec<Message>, Vec<Event>, Re
             );
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
-            return (Vec::new(), Vec::new(), ReadOutcome::Skipped);
+            return (Vec::new(), Vec::new(), crate::ingest::read_failure_outcome(&e));
         }
     };
+    let place = place_of(path, projects);
     if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-        return parse_jsonl(&data, path, tally);
+        return parse_jsonl(&data, path, &place, tally);
     }
     match serde_json::from_str::<Value>(&data) {
         Ok(root) => {
-            let (messages, events) = parse_document(&root, path, tally);
+            let (messages, events) = parse_document(&root, path, &place, tally);
             (messages, events, ReadOutcome::Complete)
         }
         Err(e) => {
-            // whole-file failure: the file itself is the one seen-and-errored record
+            // whole-file failure: the file itself is the one seen-and-errored record. Text that
+            // does not parse, an empty file included, is its content: a rewrite caught mid-way
+            // changes the file's identity, so only a file that stays so persists.
             tally.seen();
             tally.error(&format!("{e}: {}", crate::intake::clip(&data, 80)));
-            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+            if data.trim().is_empty() {
+                crate::ingest::note_read_failure(path, "file is empty".to_owned());
+            }
+            (Vec::new(), Vec::new(), ReadOutcome::Invalid)
         }
     }
 }
 
-/// A main-session file name. Subagent chats nest as `chats/<parent>/<id>.jsonl` and activity
-/// logs live at `logs/session-<id>.jsonl`; neither is a top-level conversation here.
+/// A main-session file name: `session-<time>-<short id>.json(l)`. Activity logs live at
+/// `logs/session-<id>.jsonl`, outside `chats`.
 fn is_session_name(name: &str) -> bool {
     name.starts_with("session-") && (name.ends_with(".json") || name.ends_with(".jsonl"))
+}
+
+/// The session a subagent's file nests under: `tmp/<project>/chats/<parent session id>/<agent
+/// id>.jsonl` (chatRecordingService.ts 757-799 at fb972b2; the directory is the parent id,
+/// sanitized to `[A-Za-z0-9_-]`, which a UUID already is). A main session's file sits in `chats`
+/// itself, and the `tmp` anchor keeps a project slugged `chats` from reading its `logs/` as one.
+fn side_parent(path: &Path) -> Option<String> {
+    if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let container = path.parent()?;
+    let parent = container.file_name()?.to_str()?;
+    let chats = container.parent()?;
+    if parent == "chats" || chats.file_name()? != "chats" {
+        return None;
+    }
+    let store = chats.parent()?.parent()?;
+    (store.file_name()? == "tmp").then(|| parent.to_string())
+}
+
+/// The directory under the store root that holds a session file's project: `chats`' parent.
+fn project_dir(path: &Path) -> Option<&Path> {
+    let mut dir = path.parent()?;
+    if side_parent(path).is_some() {
+        dir = dir.parent()?;
+    }
+    (dir.file_name()? == "chats")
+        .then(|| dir.parent())
+        .flatten()
+}
+
+/// Upstream's ownership marker: each project directory under `tmp` holds the absolute project
+/// path in `.project_root` (projectRegistry.ts 24, 372-412 at fb972b2), written before any chat.
+/// A marker or a registry key longer than a path can be is foreign and names nothing: what it
+/// named would be stamped on every row of its project.
+const PROJECT_ROOT_MARKER: &str = ".project_root";
+const PROJECT_PATH_MAX_BYTES: u64 = 4096;
+const PROJECT_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The project path a marker file names, when it is a plain file no longer than a path.
+fn marker_path(marker: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(marker).ok()?;
+    if !meta.is_file() || metadata_is_link(&meta) || meta.len() > PROJECT_PATH_MAX_BYTES {
+        return None;
+    }
+    let text = crate::ingest::read_lossy(marker).ok()?;
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// Projects by store directory name, read once per pass: each directory's own marker, the slugs
+/// `~/.gemini/projects.json` registers (projectRegistry.ts 16-22: `{projects: {path: slug}}`)
+/// and, for the hash-named directories gemini-cli wrote before 2026-02 and copies on migration
+/// (storage.ts 310-324), the SHA256 of every known project path.
+#[derive(Default)]
+struct Projects(HashMap<String, String>);
+
+impl Projects {
+    /// From the markers under `root` (`~/.gemini/tmp`) and the registry beside it.
+    fn discover(root: &Path) -> Self {
+        let mut projects = HashMap::new();
+        let mut paths: Vec<String> = Vec::new();
+        if let Ok(dirs) = fs::read_dir(root) {
+            for entry in dirs.flatten() {
+                let Some(path) = marker_path(&entry.path().join(PROJECT_ROOT_MARKER)) else {
+                    continue;
+                };
+                if let Some(dir) = entry.file_name().to_str() {
+                    projects.insert(dir.to_string(), crate::ingest::project_name(&path));
+                }
+                paths.push(path);
+            }
+        }
+        if let Some(registry) = root.parent().map(|dir| dir.join("projects.json")) {
+            if let Some(text) = marker_path_file(&registry) {
+                if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&text) {
+                    let listed = fields.get("projects").and_then(Value::as_object);
+                    for (path, slug) in listed.into_iter().flatten() {
+                        if path.len() as u64 > PROJECT_PATH_MAX_BYTES {
+                            continue;
+                        }
+                        if let Some(slug) = slug.as_str().filter(|slug| !slug.is_empty()) {
+                            projects
+                                .entry(slug.to_string())
+                                .or_insert_with(|| crate::ingest::project_name(path));
+                        }
+                        paths.push(path.clone());
+                    }
+                }
+            }
+        }
+        for path in paths {
+            use sha2::Digest;
+            let hash = format!("{:x}", sha2::Sha256::digest(path.as_bytes()));
+            projects
+                .entry(hash)
+                .or_insert_with(|| crate::ingest::project_name(&path));
+        }
+        Self(projects)
+    }
+}
+
+/// The whole text of a plain, small file.
+fn marker_path_file(path: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || metadata_is_link(&meta) || meta.len() > PROJECT_FILE_MAX_BYTES {
+        return None;
+    }
+    crate::ingest::read_lossy(path).ok()
+}
+
+/// A session file's project: what `projects` knows of its project directory's name (its own
+/// marker first), else the adapter's own name, as for the hash directories of a project never
+/// opened by a gemini-cli with the registry. Its parent, for a subagent's file.
+fn place_of(path: &Path, projects: &Projects) -> Place {
+    let parent = side_parent(path).unwrap_or_default();
+    let project = project_dir(path)
+        .and_then(|dir| projects.0.get(dir.file_name()?.to_str()?).cloned())
+        .unwrap_or_else(|| "gemini".to_string());
+    Place { project, parent }
 }
 
 /// A legacy `X.json` with a plain `X.jsonl` beside it: resuming migrated the whole record
@@ -1625,11 +1936,69 @@ fn superseded(path: &Path) -> bool {
     fs::symlink_metadata(&sibling).is_ok_and(|meta| meta.is_file() && !metadata_is_link(&meta))
 }
 
-/// Walk every `~/.gemini/tmp/<projectHash>/chats/session-*.json(l)` and collect the user's
-/// Gemini CLI turns + tool events, returning superseded legacy files separately so the cache
-/// forgets them. Project attribution is the constant "gemini": the store keys sessions by an
-/// opaque SHA256 projectHash with no path recorded, so unlike the other adapters there is no
-/// readable working dir to bucket by (a hash->path map is a follow-up).
+/// A plain directory entry, or None with the skip warned: links are never followed.
+fn plain_dir_entry(entry: &fs::DirEntry) -> Option<PathBuf> {
+    let path = entry.path();
+    match plain_entry_metadata(entry) {
+        Ok(Some(meta)) if meta.is_dir() => Some(path),
+        Ok(None) => {
+            crate::ingest::warn_source_skip("gemini", &path, "symlink sources are not followed");
+            None
+        }
+        Ok(Some(_)) => None,
+        Err(error) => {
+            crate::ingest::warn_source_skip("gemini", &path, &error);
+            None
+        }
+    }
+}
+
+/// A plain file entry, or None with the skip warned.
+fn plain_file_entry(entry: &fs::DirEntry) -> Option<PathBuf> {
+    let path = entry.path();
+    match plain_entry_metadata(entry) {
+        Ok(Some(meta)) if meta.is_file() => Some(path),
+        Ok(None) => {
+            crate::ingest::warn_source_skip("gemini", &path, "symlink sources are not followed");
+            None
+        }
+        Ok(Some(_)) => None,
+        Err(error) => {
+            crate::ingest::warn_source_skip("gemini", &path, &error);
+            None
+        }
+    }
+}
+
+/// The subagent files under one `chats/<parent session id>` directory: every plain `.jsonl`.
+fn subagent_files(container: &Path, files: &mut Vec<PathBuf>) {
+    let rd = match fs::read_dir(container) {
+        Ok(rd) => rd,
+        Err(error) => {
+            crate::ingest::warn_source_skip("gemini", container, &error);
+            return;
+        }
+    };
+    for file in rd {
+        let file = match file {
+            Ok(file) => file,
+            Err(error) => {
+                crate::ingest::warn_source_skip("gemini", container, &error);
+                continue;
+            }
+        };
+        if let Some(path) = plain_file_entry(&file) {
+            if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+}
+
+/// Walk every `~/.gemini/tmp/<project>/chats/session-*.json(l)` and each subagent chat nested
+/// under it as `chats/<parent session id>/<agent id>.jsonl`, returning superseded legacy files
+/// separately so the cache forgets them. `logs/` and `tool-outputs/` beside `chats` are
+/// telemetry; symlinked projects, directories and files are never followed.
 fn session_files(root: &Path) -> (Vec<PathBuf>, HashSet<PathBuf>) {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut retired: HashSet<PathBuf> = HashSet::new();
@@ -1660,23 +2029,9 @@ fn session_files(root: &Path) -> (Vec<PathBuf>, HashSet<PathBuf>) {
                 continue;
             }
         };
-        let project = entry.path();
-        match plain_entry_metadata(&entry) {
-            Ok(Some(meta)) if meta.is_dir() => {}
-            Ok(None) => {
-                crate::ingest::warn_source_skip(
-                    "gemini",
-                    &project,
-                    "symlink sources are not followed",
-                );
-                continue;
-            }
-            Ok(Some(_)) => continue,
-            Err(error) => {
-                crate::ingest::warn_source_skip("gemini", &project, &error);
-                continue;
-            }
-        }
+        let Some(project) = plain_dir_entry(&entry) else {
+            continue;
+        };
         let chats = project.join("chats");
         match fs::symlink_metadata(&chats) {
             Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
@@ -1711,22 +2066,17 @@ fn session_files(root: &Path) -> (Vec<PathBuf>, HashSet<PathBuf>) {
                 }
             };
             let path = file.path();
-            match plain_entry_metadata(&file) {
-                Ok(Some(meta)) if meta.is_file() => {}
-                Ok(None) => {
-                    crate::ingest::warn_source_skip(
-                        "gemini",
-                        &path,
-                        "symlink sources are not followed",
-                    );
-                    continue;
-                }
-                Ok(Some(_)) => continue,
-                Err(error) => {
-                    crate::ingest::warn_source_skip("gemini", &path, &error);
-                    continue;
-                }
+            let is_dir = match plain_entry_metadata(&file) {
+                Ok(Some(meta)) => meta.is_dir(),
+                _ => false,
+            };
+            if is_dir {
+                subagent_files(&path, &mut files);
+                continue;
             }
+            let Some(path) = plain_file_entry(&file) else {
+                continue;
+            };
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy())
@@ -1747,8 +2097,14 @@ fn session_files(root: &Path) -> (Vec<PathBuf>, HashSet<PathBuf>) {
 pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
     let root = crate::ingest::home().join(".gemini").join("tmp");
     let (files, retired) = session_files(&root);
+    let projects = Projects::discover(&root);
     let pass = crate::ingest_cache::collect_cached_retiring_for(
-        cache, "gemini", &root, &files, &retired, parse_file,
+        cache,
+        "gemini",
+        &root,
+        &files,
+        &retired,
+        |path| parse_file(path, &projects),
     );
     (pass.messages, pass.events)
 }
@@ -1769,7 +2125,11 @@ impl crate::ingest::registry::Adapter for Gemini {
         vec![crate::ingest::home().join(".gemini").join("tmp")]
     }
     fn store_content(&self, path: &std::path::Path) -> bool {
-        // chats/session-*.json(l) is the conversation; logs/ and tool-outputs/ are telemetry
+        // chats/session-*.json(l) and chats/<parent>/<agent>.jsonl are conversations (see
+        // `session_files`); logs/ and tool-outputs/ are telemetry
+        if side_parent(path).is_some() {
+            return true;
+        }
         path.file_name()
             .and_then(|x| x.to_str())
             .is_some_and(is_session_name)
@@ -1783,7 +2143,9 @@ impl crate::ingest::registry::Adapter for Gemini {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_with_tally, session_files, visible_text, Gemini};
+    use super::{
+        parse_with_tally, session_files, visible_text, Gemini, Projects, PROJECT_PATH_MAX_BYTES,
+    };
     use crate::ingest::registry::Adapter;
     use crate::ingest_cache::ReadOutcome;
     use crate::intake::{Skip, Tally};
@@ -1804,7 +2166,7 @@ mod tests {
 
     fn parse(path: &Path) -> (Vec<crate::model::Message>, Vec<crate::model::Event>, Tally) {
         let tally = Tally::default();
-        let (messages, events, outcome) = parse_with_tally(path, &tally);
+        let (messages, events, outcome) = parse_with_tally(path, &Projects::default(), &tally);
         let undone = outcome == ReadOutcome::Undone && messages.is_empty() && events.is_empty();
         assert!(outcome == ReadOutcome::Complete || undone, "{outcome:?}");
         (messages, events, tally)
@@ -2076,6 +2438,109 @@ mod tests {
         assert_eq!(tally.test_record_counts(Skip::Unreferenced).3, 4);
     }
 
+    /// gemini-cli before 0.53 saved replies exactly as shown, so a recorded string keeps its
+    /// comments, code and joiners; only a re-sync's copy of the history (an array of parts, the
+    /// raw stream) reads as upstream shows it, cleaned.
+    #[test]
+    fn saved_replies_publish_as_written_and_history_copies_read_cleaned() {
+        let root = temp_root("as-written");
+        let saved = "open with `<!--` and close with `-->`\n```html\n<!-- Navigation -->\n```\n\
+                     family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} and \u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}";
+        let record = serde_json::json!(saved).to_string();
+        let path = root.join("session-2026-07-01T09-00-74747474.jsonl");
+        let lines = [
+            r#"{"sessionId":"74747474-0000-4000-8000-000000000013","projectHash":"h"}"#.to_string(),
+            r#"{"id":"u1","timestamp":"2026-07-01T09:00:01.000Z","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+            format!(r#"{{"id":"g1","timestamp":"2026-07-01T09:00:02.000Z","type":"gemini","content":{record}}}"#),
+            r#"{"id":"u2","timestamp":"2026-07-01T09:01:01.000Z","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+            format!(r#"{{"id":"g2","timestamp":"2026-07-01T09:01:02.000Z","type":"gemini","content":{record}}}"#),
+            r#"{"$rewindTo":"u2"}"#.to_string(),
+            r#"{"id":"c1","timestamp":"2026-07-01T09:02:00.000Z","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+            format!(r#"{{"id":"c2","timestamp":"2026-07-01T09:02:00.000Z","type":"gemini","content":[{{"text":{record}}}]}}"#),
+            r#"{"id":"c3","timestamp":"2026-07-01T09:02:00.000Z","type":"user","content":[{"text":"bison"}]}"#.to_string(),
+            format!(r#"{{"id":"c4","timestamp":"2026-07-01T09:02:00.000Z","type":"gemini","content":[{{"text":{record}}}]}}"#),
+            r#"{"$patch":{"removeIds":["u1","g1"]}}"#.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (messages, _, _) = parse(&path);
+        let replies: Vec<&str> = messages.iter().map(|m| &*m.reply).collect();
+        // the saved reply as written; the rewound turn's /chat resume copy cleaned, as shown
+        assert_eq!(replies, vec![saved, &visible_text(saved)]);
+        assert_eq!(
+            visible_text(saved),
+            "open with ``\n```html\n\n```\nfamily \u{1F468}\u{1F469}\u{1F467} and \u{645}\u{6CC}\u{62E}\u{648}\u{627}\u{647}\u{645}"
+        );
+        let legacy = root.join("session-2026-02-01T09-00-75757575.json");
+        std::fs::write(
+            &legacy,
+            format!(
+                r#"{{"sessionId":"75757575-0000-4000-8000-000000000014","projectHash":"h","messages":[
+                {{"id":"u1","timestamp":"2026-02-01T09:00:01.000Z","type":"user","content":"alpaca"}},
+                {{"id":"g1","timestamp":"2026-02-01T09:00:02.000Z","type":"gemini","content":{record}}},
+                {{"id":"u2","timestamp":"2026-02-01T09:01:01.000Z","type":"user","content":[{{"text":"bison"}}]}},
+                {{"id":"g2","timestamp":"2026-02-01T09:01:02.000Z","type":"gemini","content":[{{"text":{record}}}]}}
+            ]}}"#
+            ),
+        )
+        .unwrap();
+        let (messages, _, _) = parse(&legacy);
+        let _ = std::fs::remove_dir_all(&root);
+        let replies: Vec<&str> = messages.iter().map(|m| &*m.reply).collect();
+        assert_eq!(replies, vec![saved, saved]);
+    }
+
+    /// gemini-cli 0.45-0.52's `/chat resume` records a turn compression dropped again under its
+    /// original id, with the history's raw parts: a reply those versions saved as written keeps
+    /// its text when the parts read the same; a record whose parts read differently is the
+    /// history's, cleaned.
+    #[test]
+    fn a_turn_re_recorded_under_its_id_keeps_the_reply_it_saved() {
+        let root = temp_root("re-recorded");
+        let saved = "see <!-- note --> here \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let cleaned = visible_text(saved);
+        assert_eq!(cleaned, "see  here \u{1F468}\u{1F469}\u{1F467}");
+        let session = |reply: &str, again: &str| {
+            let saved = serde_json::json!(reply).to_string();
+            let raw = serde_json::json!(again).to_string();
+            [
+                r#"{"sessionId":"76767676-0000-4000-8000-000000000015","projectHash":"h"}"#.to_string(),
+                r#"{"id":"u1","timestamp":"2026-07-01T09:00:01.000Z","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                format!(r#"{{"id":"g1","timestamp":"2026-07-01T09:00:02.000Z","type":"gemini","content":{saved}}}"#),
+                r#"{"$set":{"sessionId":"76767676-0000-4000-8000-000000000015"}}"#.to_string(),
+                r#"{"id":"s1","timestamp":"2026-07-01T09:01:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n<overall_goal>alpaca</overall_goal>\n</state_snapshot>"}]}"#.to_string(),
+                r#"{"id":"a1","timestamp":"2026-07-01T09:01:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}"#.to_string(),
+                r#"{"$patch":{"removeIds":["u1","g1"]}}"#.to_string(),
+                r#"{"$set":{"sessionId":"76767676-0000-4000-8000-000000000015"}}"#.to_string(),
+                r#"{"id":"u1","timestamp":"2026-07-01T09:00:01.000Z","type":"user","content":[{"text":"alpaca"}]}"#.to_string(),
+                format!(r#"{{"id":"g1","timestamp":"2026-07-01T09:00:02.000Z","type":"gemini","content":[{{"text":{raw}}}]}}"#),
+                r#"{"$patch":{"removeIds":["s1","a1"]}}"#.to_string(),
+            ]
+            .join("\n")
+        };
+        let replies = |name: &str, body: String| -> Vec<String> {
+            let path = root.join(format!("session-2026-07-01T09-00-{name}.jsonl"));
+            std::fs::write(&path, body).unwrap();
+            let (messages, _, _) = parse(&path);
+            messages.iter().map(|m| m.reply.to_string()).collect()
+        };
+        // pre-0.53: saved as written, brought back raw: the saved text stays
+        assert_eq!(
+            replies("76767676", session(saved, saved)),
+            vec![saved.to_string(), String::new()]
+        );
+        // 0.53+: saved cleaned, brought back raw: the same text either way
+        assert_eq!(
+            replies("77777777", session(&cleaned, saved)),
+            vec![cleaned.clone(), String::new()]
+        );
+        // a record under the id whose parts read differently is the history's, shown cleaned
+        assert_eq!(
+            replies("78787878", session(saved, "see <!-- x --> there \u{200B}")),
+            vec!["see  there".to_string(), String::new()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_prompt_retyped_between_two_rewrites_stays_its_own_turn() {
         let root = temp_root("retyped");
@@ -2167,33 +2632,43 @@ mod tests {
     }
 
     /// Every session upstream's recorders wrote in tests/fixtures/gemini_flows reads as its
-    /// `expected.json` transcript, with the tool events it pins and each record accounted for.
+    /// `expected.json` transcript, with the tool events it pins and each record accounted for. A
+    /// subagent's session (`parent` in its entry) reads as a side session of that parent, and the
+    /// parent's invoke_agent event names it.
     #[test]
     fn every_recorded_flow_reads_its_expected_transcript() {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../agrep-cli/tests/fixtures/gemini_flows");
         let expected: serde_json::Value =
             serde_json::from_slice(&std::fs::read(fixture.join("expected.json")).unwrap()).unwrap();
-        let chats = fixture.join("home/.gemini/tmp/hash8888synthetic/chats");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&chats)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
+        let (mut files, retired) = session_files(&fixture.join("home/.gemini/tmp"));
+        assert!(retired.is_empty());
         files.sort();
-        assert_eq!(files.len(), 196);
+        assert_eq!(files.len(), expected.as_object().unwrap().len());
         let mut failures = Vec::new();
+        let mut linked: Vec<(String, String)> = Vec::new();
         for path in files {
             let (messages, events, tally) = parse(&path);
             let body = std::fs::read_to_string(&path).unwrap();
             let meta: serde_json::Value =
                 serde_json::from_str(body.lines().next().unwrap()).unwrap();
             let case = &expected[meta["sessionId"].as_str().unwrap()];
+            let parent = case["parent"].as_str().unwrap_or("");
             let rows: Vec<serde_json::Value> = messages
                 .iter()
-                .map(|m| serde_json::json!([&*m.who, &*m.text, &*m.reply]))
+                .map(|m| {
+                    let who = if m.side { "subagent" } else { &*m.who };
+                    serde_json::json!([who, &*m.text, &*m.reply])
+                })
                 .collect();
             if serde_json::Value::Array(rows.clone()) != case["rows"] {
                 failures.push(format!("{}: {rows:?}", case["flow"]));
+            }
+            if messages
+                .iter()
+                .any(|m| &*m.parent != parent || m.side != !parent.is_empty())
+            {
+                failures.push(format!("{}: parent {parent:?} not carried", case["flow"]));
             }
             let mut calls: Vec<&str> = events.iter().map(|e| e.call_id.as_str()).collect();
             calls.sort_unstable();
@@ -2203,10 +2678,36 @@ mod tests {
             {
                 failures.push(format!("{}: events {calls:?}", case["flow"]));
             }
+            for event in events.iter().filter(|e| !e.child_session.is_empty()) {
+                assert_eq!(event.meta, "delegation=completed", "{}", case["flow"]);
+                linked.push((event.session.clone(), event.child_session.clone()));
+            }
             let (seen, rows, agent_rows, skips, errors) = identity(&tally);
             assert_eq!(seen, rows + agent_rows + skips + errors, "{}", case["flow"]);
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+        // every invoke_agent event points at a recorded subagent session of its own session; a
+        // rewound call loses its event, never the subagent's own chat
+        let children: Vec<(String, String)> = expected
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, case)| Some((case["parent"].as_str()?.to_string(), id.clone())))
+            .collect();
+        assert!(
+            linked.iter().all(|link| children.contains(link)),
+            "{linked:?}"
+        );
+        let kept: Vec<&(String, String)> = children
+            .iter()
+            .filter(|(parent, _)| {
+                expected[parent]["flow"]
+                    .as_str()
+                    .is_some_and(|flow| flow.ends_with("/subagent"))
+            })
+            .collect();
+        assert_eq!(kept.len(), 4);
+        assert!(kept.iter().all(|link| linked.contains(link)), "{linked:?}");
     }
 
     /// Tool events follow the turns: an aborted turn's calls and a rewound one's go with them.
@@ -2255,200 +2756,342 @@ mod tests {
     /// reply that read the same, half with a call, which would compare or copy it each time,
     /// `/rewind` to each prompt from the last, whose answers a scan past undone rows would cross
     /// again each time, and prompts patched out of being rows and back before each `/rewind`,
-    /// which a scan reading their content would cross again each time. Naively each takes minutes.
+    /// which a scan reading their content would cross again each time. Each shape is parsed at
+    /// a quarter of its size and whole, and the parse time may grow at most eightfold: linear
+    /// work quadruples, each of these routes grows sixteenfold, and the ratio holds whatever
+    /// else the host is running.
     #[test]
     fn hostile_re_syncs_parse_in_linear_time() {
         let root = temp_root("hostile");
-        let path = root.join("session-2026-04-25T09-00-6c6c6c6c.jsonl");
-        let messages = 20_000;
-        let mut body = String::from(
-            r#"{"sessionId":"6c6c6c6c-0000-4000-8000-000000000009","projectHash":"h"}"#,
-        );
-        body.push('\n');
-        for n in 0..messages {
-            body.push_str(&format!(
-                r#"{{"id":"m{n}","type":"user","content":[{{"text":"p{n}"}}]}}"#
-            ));
-            body.push('\n');
-        }
-        let dense = "<!--x-->a".repeat(80_000);
-        for id in ["c1", "c2", "c1copy", "c2copy"] {
-            body.push_str(&format!(
-                r#"{{"id":"{id}","type":"user","content":[{{"text":"{dense}"}}]}}"#
-            ));
-            body.push('\n');
-        }
-        body.push_str(r#"{"$patch":{"removeIds":["c1","c2"]}}"#);
-        body.push('\n');
-        for n in 0..messages {
-            body.push_str(&format!(r#"{{"$patch":{{"removeIds":["m{n}"]}}}}"#));
-            body.push('\n');
-        }
-        std::fs::write(&path, &body).unwrap();
-        let started = std::time::Instant::now();
-        let (rows, _, tally) = parse(&path);
-        let elapsed = started.elapsed();
-        assert_eq!(rows.len(), messages + 2);
-        assert_eq!(tally.test_record_counts(Skip::Replay).3, 2);
-        assert!(body.len() > 3_000_000);
-        assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
 
-        let path = root.join("session-2026-04-26T09-00-6d6d6d6d.jsonl");
-        let (stable, rounds) = (400_000, 400_000);
-        let mut body = String::from(
-            r#"{"sessionId":"6d6d6d6d-0000-4000-8000-00000000000a","projectHash":"h"}"#,
-        );
-        body.push('\n');
-        for n in 0..stable {
-            body.push_str(&format!("{{\"id\":\"a{n}\"}}\n"));
-        }
-        for n in 0..rounds {
-            body.push_str(&format!("{{\"id\":\"b{n}\"}}\n"));
-            if n > 0 {
-                let before = n - 1;
+        // one id removed per re-sync from a long map; comment-dense prompts through a rewrite
+        assert_linear(&root, "6c6c6c6c", 20_000, |messages| {
+            let mut body = String::from(
+                r#"{"sessionId":"6c6c6c6c-0000-4000-8000-000000000009","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            for n in 0..messages {
                 body.push_str(&format!(
-                    "{{\"$patch\":{{\"removeIds\":[\"b{before}\"]}}}}\n"
+                    r#"{{"id":"m{n}","type":"user","content":[{{"text":"p{n}"}}]}}"#
+                ));
+                body.push('\n');
+            }
+            let dense = "<!--x-->a".repeat(4 * messages);
+            for id in ["c1", "c2", "c1copy", "c2copy"] {
+                body.push_str(&format!(
+                    r#"{{"id":"{id}","type":"user","content":[{{"text":"{dense}"}}]}}"#
+                ));
+                body.push('\n');
+            }
+            body.push_str(r#"{"$patch":{"removeIds":["c1","c2"]}}"#);
+            body.push('\n');
+            for n in 0..messages {
+                body.push_str(&format!(r#"{{"$patch":{{"removeIds":["m{n}"]}}}}"#));
+                body.push('\n');
+            }
+            assert!(body.len() > 150 * messages);
+            (
+                body,
+                Box::new(move |rows, _, tally| {
+                    assert_eq!(rows.len(), messages + 2);
+                    assert_eq!(tally.test_record_counts(Skip::Replay).3, 2);
+                }),
+            )
+        });
+
+        // one-in-one-out re-syncs behind a long map
+        assert_linear(&root, "6d6d6d6d", 400_000, |stable| {
+            let rounds = stable;
+            let mut body = String::from(
+                r#"{"sessionId":"6d6d6d6d-0000-4000-8000-00000000000a","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            for n in 0..stable {
+                body.push_str(&format!("{{\"id\":\"a{n}\"}}\n"));
+            }
+            for n in 0..rounds {
+                body.push_str(&format!("{{\"id\":\"b{n}\"}}\n"));
+                if n > 0 {
+                    let before = n - 1;
+                    body.push_str(&format!(
+                        "{{\"$patch\":{{\"removeIds\":[\"b{before}\"]}}}}\n"
+                    ));
+                }
+            }
+            assert!(body.len() > 30 * (stable + rounds));
+            (
+                body,
+                Box::new(move |_, _, tally| {
+                    let (seen, rows, agent_rows, skips, errors) = identity(tally);
+                    assert_eq!(seen, (stable + 2 * rounds) as u64);
+                    assert_eq!(seen, rows + agent_rows + skips + errors);
+                }),
+            )
+        });
+
+        // coalesced-looking copies ending like a removed turn with a huge part
+        assert_linear(&root, "6e6e6e6e", 150_000, |copies| {
+            let mut body = String::from(
+                r#"{"sessionId":"6e6e6e6e-0000-4000-8000-00000000000c","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            let huge = "x".repeat(56 * copies);
+            body.push_str(&format!(
+                r#"{{"id":"r","type":"user","content":[{{"text":"{huge}"}},{{"text":"a"}}]}}"#
+            ));
+            body.push('\n');
+            for n in 0..copies {
+                body.push_str(&format!(
+                    "{{\"id\":\"c{n}\",\"type\":\"user\",\"content\":[{{\"text\":\"b\"}},{{\"text\":\"a\"}}]}}\n"
                 ));
             }
-        }
-        std::fs::write(&path, &body).unwrap();
-        let started = std::time::Instant::now();
-        let (_, _, tally) = parse(&path);
-        let elapsed = started.elapsed();
-        let (seen, rows, agent_rows, skips, errors) = identity(&tally);
-        assert_eq!(seen, (stable + 2 * rounds) as u64);
-        assert_eq!(seen, rows + agent_rows + skips + errors);
-        assert!(body.len() > 25_000_000);
-        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+            body.push_str(r#"{"$patch":{"removeIds":["r"]}}"#);
+            (
+                body,
+                Box::new(move |rows, _, _| assert_eq!(rows.len(), copies + 1)),
+            )
+        });
 
-        let path = root.join("session-2026-04-27T09-00-6e6e6e6e.jsonl");
-        let copies = 150_000;
-        let mut body = String::from(
-            r#"{"sessionId":"6e6e6e6e-0000-4000-8000-00000000000c","projectHash":"h"}"#,
-        );
-        body.push('\n');
-        let huge = "x".repeat(8 << 20);
-        body.push_str(&format!(
-            r#"{{"id":"r","type":"user","content":[{{"text":"{huge}"}},{{"text":"a"}}]}}"#
-        ));
-        body.push('\n');
-        for n in 0..copies {
+        // patches of a long reply that read the same, half with a call
+        assert_linear(&root, "6f6f6f6f", 200_000, |patches| {
+            let mut body = String::from(
+                r#"{"sessionId":"6f6f6f6f-0000-4000-8000-00000000000e","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            body.push_str(r#"{"id":"u","type":"user","content":"read"}"#);
+            body.push('\n');
+            let comment = format!("ok<!--{}-->", "x".repeat(21 * patches));
             body.push_str(&format!(
-                "{{\"id\":\"c{n}\",\"type\":\"user\",\"content\":[{{\"text\":\"b\"}},{{\"text\":\"a\"}}]}}\n"
+                r#"{{"id":"g","type":"gemini","content":"{comment}"}}"#
             ));
-        }
-        body.push_str(r#"{"$patch":{"removeIds":["r"]}}"#);
-        std::fs::write(&path, &body).unwrap();
-        let started = std::time::Instant::now();
-        let (rows, _, _) = parse(&path);
-        let elapsed = started.elapsed();
-        assert_eq!(rows.len(), copies + 1);
-        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+            body.push('\n');
+            for n in 0..patches {
+                let call = if n % 2 == 0 {
+                    r#",{"functionCall":{"id":"c","name":"read_file"}}"#
+                } else {
+                    ""
+                };
+                body.push_str(&format!(
+                    "{{\"$patch\":{{\"updates\":[{{\"id\":\"g\",\"content\":[{{\"text\":\"ok\"}}{call}]}}]}}}}\n"
+                ));
+            }
+            (
+                body,
+                Box::new(|rows, _, _| {
+                    assert_eq!(rows.len(), 1);
+                    assert!(
+                        rows[0].reply.starts_with("ok<!--xxx"),
+                        "the recorded reply is kept"
+                    );
+                }),
+            )
+        });
 
-        let path = root.join("session-2026-04-28T09-00-6f6f6f6f.jsonl");
-        let patches = 200_000;
-        let mut body = String::from(
-            r#"{"sessionId":"6f6f6f6f-0000-4000-8000-00000000000e","projectHash":"h"}"#,
-        );
-        body.push('\n');
-        body.push_str(r#"{"id":"u","type":"user","content":"read"}"#);
-        body.push('\n');
-        let comment = format!("ok<!--{}-->", "x".repeat(4 << 20));
-        body.push_str(&format!(
-            r#"{{"id":"g","type":"gemini","content":"{comment}"}}"#
-        ));
-        body.push('\n');
-        for n in 0..patches {
-            let call = if n % 2 == 0 {
-                r#",{"functionCall":{"id":"c","name":"read_file"}}"#
-            } else {
-                ""
-            };
+        // `/rewind` to each prompt from the last, past its undone answers
+        assert_linear(&root, "70707070", 50_000, |prompts| {
+            let mut body = String::from(
+                r#"{"sessionId":"70707070-0000-4000-8000-00000000000f","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            let mut answers = Vec::new();
+            for n in 0..prompts {
+                body.push_str(&format!(
+                    "{{\"id\":\"u{n}\",\"type\":\"user\",\"content\":\"p{n}\"}}\n\
+                     {{\"id\":\"g{n}\",\"type\":\"gemini\",\"content\":\"r{n}\",\
+                     \"toolCalls\":[{{\"id\":\"c{n}\",\"name\":\"read_file\"}}]}}\n"
+                ));
+                answers.push(format!("\"g{n}\""));
+            }
             body.push_str(&format!(
-                "{{\"$patch\":{{\"updates\":[{{\"id\":\"g\",\"content\":[{{\"text\":\"ok\"}}{call}]}}]}}}}\n"
+                "{{\"$patch\":{{\"removeIds\":[{}]}}}}\n",
+                answers.join(",")
             ));
-        }
-        std::fs::write(&path, &body).unwrap();
-        let started = std::time::Instant::now();
-        let (rows, _, _) = parse(&path);
-        let elapsed = started.elapsed();
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].reply.starts_with("ok<!--xxx"),
-            "the recorded reply is kept"
-        );
-        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+            for n in (0..prompts).rev() {
+                body.push_str(&format!("{{\"$rewindTo\":\"u{n}\"}}\n"));
+            }
+            (
+                body,
+                Box::new(|rows, events, _| {
+                    assert!(
+                        rows.is_empty() && events.is_empty(),
+                        "{} {}",
+                        rows.len(),
+                        events.len()
+                    );
+                }),
+            )
+        });
 
-        let path = root.join("session-2026-04-29T09-00-70707070.jsonl");
-        let prompts = 50_000;
-        let mut body = String::from(
-            r#"{"sessionId":"70707070-0000-4000-8000-00000000000f","projectHash":"h"}"#,
-        );
-        body.push('\n');
-        let mut answers = Vec::new();
-        for n in 0..prompts {
+        // prompts patched out of being rows and back before each `/rewind`
+        assert_linear(&root, "71717171", 20_000, |prompts| {
+            let turns = prompts;
+            let mut body = String::from(
+                r#"{"sessionId":"71717171-0000-4000-8000-000000000010","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            for n in 0..prompts {
+                body.push_str(&format!(
+                    "{{\"id\":\"u{n}\",\"type\":\"user\",\"content\":\"p{n}\"}}\n"
+                ));
+            }
+            for n in 0..turns {
+                body.push_str(&format!(
+                    "{{\"id\":\"g{n}\",\"type\":\"gemini\",\"content\":\"\"}}\n"
+                ));
+            }
+            let emptied: Vec<String> = (1..prompts)
+                .map(|n| format!("{{\"id\":\"u{n}\",\"content\":\"\"}}"))
+                .collect();
             body.push_str(&format!(
-                "{{\"id\":\"u{n}\",\"type\":\"user\",\"content\":\"p{n}\"}}\n\
-                 {{\"id\":\"g{n}\",\"type\":\"gemini\",\"content\":\"r{n}\",\
-                 \"toolCalls\":[{{\"id\":\"c{n}\",\"name\":\"read_file\"}}]}}\n"
+                "{{\"$patch\":{{\"updates\":[{}]}}}}\n",
+                emptied.join(",")
             ));
-            answers.push(format!("\"g{n}\""));
-        }
-        body.push_str(&format!(
-            "{{\"$patch\":{{\"removeIds\":[{}]}}}}\n",
-            answers.join(",")
-        ));
-        for n in (0..prompts).rev() {
-            body.push_str(&format!("{{\"$rewindTo\":\"u{n}\"}}\n"));
-        }
-        std::fs::write(&path, &body).unwrap();
-        let started = std::time::Instant::now();
-        let (rows, events, _) = parse(&path);
-        let elapsed = started.elapsed();
-        assert!(
-            rows.is_empty() && events.is_empty(),
-            "{} {}",
-            rows.len(),
-            events.len()
-        );
-        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+            for n in 1..prompts {
+                body.push_str(&format!(
+                    "{{\"$patch\":{{\"updates\":[{{\"id\":\"u{n}\",\"content\":\"p{n}\"}}],\
+                     \"orderIds\":[\"u{n}\"]}}}}\n{{\"$rewindTo\":\"u{n}\"}}\n"
+                ));
+            }
+            (body, Box::new(|rows, _, _| assert_eq!(rows.len(), 1)))
+        });
 
-        let path = root.join("session-2026-04-30T09-00-71717171.jsonl");
-        let (prompts, turns) = (20_000, 20_000);
-        let mut body = String::from(
-            r#"{"sessionId":"71717171-0000-4000-8000-000000000010","projectHash":"h"}"#,
-        );
-        body.push('\n');
-        for n in 0..prompts {
+        // stale pool slots (a dropped message revived with other content and dropped again; an Esc'd
+        // text record whose calls record re-entered the map) must be pruned, or every missing copy
+        // of a front, whole rewrite rescans them; the opening copy makes these pair from the front
+        assert_linear(&root, "72727272", 8_000, |stale| {
+            let mut body = String::from(
+                r#"{"sessionId":"72727272-0000-4000-8000-000000000011","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            for n in 0..stale {
+                body.push_str(&format!(
+                    "{{\"id\":\"e{n}\",\"type\":\"user\",\"content\":\"a\"}}\n"
+                ));
+            }
+            body.push_str("{\"id\":\"keep\",\"type\":\"user\",\"content\":\"z\"}\n");
+            let all: Vec<String> = (0..stale).map(|n| format!("\"e{n}\"")).collect();
             body.push_str(&format!(
-                "{{\"id\":\"u{n}\",\"type\":\"user\",\"content\":\"p{n}\"}}\n"
+                "{{\"$patch\":{{\"removeIds\":[{}]}}}}\n",
+                all.join(",")
             ));
-        }
-        for n in 0..turns {
+            for n in 0..stale {
+                body.push_str(&format!(
+                    "{{\"id\":\"e{n}\",\"type\":\"user\",\"content\":\"b\"}}\n"
+                ));
+            }
+            // dropped again, as "b", behind a prompt that keeps this a rewrite
+            body.push_str("{\"id\":\"keep2\",\"type\":\"user\",\"content\":\"y\"}\n");
             body.push_str(&format!(
-                "{{\"id\":\"g{n}\",\"type\":\"gemini\",\"content\":\"\"}}\n"
+                "{{\"$patch\":{{\"removeIds\":[{}]}}}}\n",
+                all.join(",")
             ));
-        }
-        let emptied: Vec<String> = (1..prompts)
-            .map(|n| format!("{{\"id\":\"u{n}\",\"content\":\"\"}}"))
-            .collect();
-        body.push_str(&format!(
-            "{{\"$patch\":{{\"updates\":[{}]}}}}\n",
-            emptied.join(",")
-        ));
-        for n in 1..prompts {
+            body.push_str("{\"id\":\"copy\",\"type\":\"user\",\"content\":\"z\"}\n");
+            for n in 0..stale {
+                body.push_str(&format!(
+                    "{{\"id\":\"x{n}\",\"type\":\"user\",\"content\":\"a\"}}\n"
+                ));
+            }
+            body.push_str("{\"$patch\":{\"removeIds\":[\"keep\",\"keep2\"]}}\n");
+            (
+                body,
+                Box::new(move |rows, _, _| assert_eq!(rows.len(), 2 * stale + 2)),
+            )
+        });
+
+        assert_linear(&root, "73737373", 8_000, |stale| {
+            let mut body = String::from(
+                r#"{"sessionId":"73737373-0000-4000-8000-000000000012","projectHash":"h"}"#,
+            );
+            body.push('\n');
+            let calls = r#""toolCalls":[{"id":"k","name":"read_file","status":"cancelled"}]"#;
+            for n in 0..stale {
+                body.push_str(&format!(
+                    "{{\"id\":\"p{n}\",\"type\":\"user\",\"content\":\"p\"}}\n\
+                     {{\"id\":\"t{n}\",\"type\":\"gemini\",\"content\":\"I will read.\"}}\n\
+                     {{\"id\":\"c{n}\",\"type\":\"gemini\",\"content\":\"\",{calls}}}\n\
+                     {{\"$patch\":{{\"removeIds\":[\"t{n}\",\"c{n}\"]}}}}\n\
+                     {{\"id\":\"c{n}\",\"type\":\"gemini\",\"content\":\"\",{calls}}}\n"
+                ));
+            }
+            body.push_str("{\"id\":\"copy\",\"type\":\"user\",\"content\":\"p\"}\n");
+            for n in 0..stale {
+                body.push_str(&format!(
+                    "{{\"id\":\"x{n}\",\"type\":\"gemini\",\"content\":[{{\"text\":\"I will read.\"}},\
+                     {{\"functionCall\":{{\"id\":\"k\",\"name\":\"read_file\"}}}}]}}\n"
+                ));
+            }
+            let all: Vec<String> = (0..stale)
+                .flat_map(|n| [format!("\"p{n}\""), format!("\"c{n}\"")])
+                .collect();
             body.push_str(&format!(
-                "{{\"$patch\":{{\"updates\":[{{\"id\":\"u{n}\",\"content\":\"p{n}\"}}],\
-                 \"orderIds\":[\"u{n}\"]}}}}\n{{\"$rewindTo\":\"u{n}\"}}\n"
+                "{{\"$patch\":{{\"removeIds\":[{}]}}}}\n",
+                all.join(",")
             ));
-        }
-        std::fs::write(&path, &body).unwrap();
-        let started = std::time::Instant::now();
-        let (rows, _, _) = parse(&path);
-        let elapsed = started.elapsed();
+            (
+                body,
+                Box::new(move |rows, _, _| assert_eq!(rows.len(), stale)),
+            )
+        });
+
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(rows.len(), 1);
-        assert!(elapsed < std::time::Duration::from_secs(8), "{elapsed:?}");
+    }
+
+    type Check<'a> = Box<dyn Fn(&[crate::model::Message], &[crate::model::Event], &Tally) + 'a>;
+
+    /// Parse `shape(size / 4)` and `shape(size)`, interleaved three times, and assert the best
+    /// time grows at most eightfold: every axis of a shape grows with `size`, so linear work
+    /// quadruples while a route that re-reads or re-walks per record grows sixteenfold, and
+    /// either stays a factor of two clear of the bound. The parse is timed on its own thread's
+    /// CPU clock where there is one, so other load on the host does not stretch it; a run too
+    /// short to time proves nothing and passes. Each parse's rows must also check out at its size.
+    fn assert_linear<'a>(
+        root: &Path,
+        session: &str,
+        size: usize,
+        shape: impl Fn(usize) -> (String, Check<'a>),
+    ) {
+        let floor = std::time::Duration::from_millis(20);
+        let path = root.join(format!("session-2026-04-25T09-00-{session}.jsonl"));
+        let mut best = [std::time::Duration::MAX; 2];
+        for _ in 0..3 {
+            for (slot, divisor) in [(0, 4), (1, 1)] {
+                let (body, check) = shape(size / divisor);
+                std::fs::write(&path, &body).unwrap();
+                let started = thread_time();
+                let (rows, events, tally) = parse(&path);
+                best[slot] = best[slot].min(thread_time().saturating_sub(started));
+                check(&rows, &events, &tally);
+            }
+        }
+        let [quarter, whole] = best;
+        eprintln!(
+            "{session}: {quarter:?} at size {} -> {whole:?} at size {size}",
+            size / 4
+        );
+        assert!(
+            whole < floor
+                || whole.as_secs_f64() < 8.0 * quarter.as_secs_f64().max(floor.as_secs_f64()),
+            "{session}: {quarter:?} at size {} grew to {whole:?} at size {size}",
+            size / 4
+        );
+    }
+
+    /// This thread's CPU time where the platform reports it, so a loaded host's preemption does
+    /// not count; wall time since the first call elsewhere.
+    fn thread_time() -> std::time::Duration {
+        #[cfg(unix)]
+        {
+            let mut spec = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `spec` is a valid, writable timespec for the duration of the call.
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } == 0 {
+                return std::time::Duration::new(spec.tv_sec as u64, spec.tv_nsec as u32);
+            }
+        }
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
     }
 
     /// A read is proven empty (`ReadOutcome::Undone`) only when the file undid what it held in
@@ -2476,7 +3119,7 @@ mod tests {
             (vec![prompt, reply, rewind], "\n", ReadOutcome::Complete),
         ] {
             std::fs::write(&path, format!("{}{end}", lines.join("\n"))).unwrap();
-            let (_, _, outcome) = parse_with_tally(&path, &Tally::default());
+            let (_, _, outcome) = parse_with_tally(&path, &Projects::default(), &Tally::default());
             assert_eq!(outcome, want, "{lines:?} {end:?}");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -2632,7 +3275,7 @@ mod tests {
 
     #[test]
     fn a_jsonl_sibling_supersedes_its_legacy_json() {
-        let root = temp_root("supersede");
+        let root = temp_root("supersede").join("tmp");
         let chats = root.join("hash/chats");
         std::fs::create_dir_all(chats.join("parent-session")).unwrap();
         std::fs::create_dir_all(root.join("hash/logs")).unwrap();
@@ -2642,29 +3285,141 @@ mod tests {
         for path in [&migrated, &current, &legacy] {
             std::fs::write(path, "{}").unwrap();
         }
-        std::fs::write(chats.join("parent-session/6f6f6f6f.jsonl"), "{}").unwrap();
+        let child = chats.join("parent-session/6f6f6f6f.jsonl");
+        std::fs::write(&child, "{}").unwrap();
+        std::fs::write(chats.join("parent-session/notes.json"), "{}").unwrap();
         let log = root.join("hash/logs/session-6d6d6d6d.jsonl");
         std::fs::write(&log, "{}").unwrap();
 
         let (mut files, retired) = session_files(&root);
         files.sort();
-        assert_eq!(files, vec![current.clone(), legacy.clone()]);
+        assert_eq!(files, vec![child.clone(), current.clone(), legacy.clone()]);
         assert_eq!(
             retired.into_iter().collect::<Vec<_>>(),
             vec![migrated.clone()]
         );
         assert!(Gemini.store_content(&current));
         assert!(Gemini.store_content(&legacy));
+        assert!(Gemini.store_content(&child));
+        assert!(!Gemini.store_content(&chats.join("parent-session/notes.json")));
         assert!(!Gemini.store_content(&migrated));
         assert!(!Gemini.store_content(&log));
+        assert_eq!(
+            super::side_parent(&child).as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(super::side_parent(&current), None);
 
         std::fs::remove_file(&current).unwrap();
         assert!(Gemini.store_content(&migrated));
         let (mut files, retired) = session_files(&root);
         files.sort();
-        assert_eq!(files, vec![migrated, legacy]);
+        assert_eq!(files, vec![child, migrated, legacy]);
         assert!(retired.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// A project slugged `chats` (projectRegistry.ts slugify of a directory so named) keeps its
+    /// telemetry out: only `tmp/<project>/chats/<parent>/<agent>.jsonl` is a subagent's chat.
+    #[test]
+    fn only_a_chats_nested_jsonl_under_tmp_is_a_subagent_source() {
+        let root = temp_root("chats-slug").join("tmp");
+        let logged = root.join("chats/logs/session-6d6d6d6d.jsonl");
+        let nested = root.join("chats/chats/6d6d6d6d-0000-4000-8000-000000000001/6e6e6e6e.jsonl");
+        for path in [&logged, &nested] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        let (files, _) = session_files(&root);
+        assert_eq!(files, vec![nested.clone()]);
+        assert!(Gemini.store_content(&nested));
+        assert!(!Gemini.store_content(&logged));
+        assert_eq!(super::side_parent(&logged), None);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The project is the marker's path, bucketed like every other adapter's working dir; a
+    /// hash-named directory resolves through the SHA256 of a sibling marker's path or of a
+    /// registered one; without any of those the bucket is "gemini". A subagent's file carries
+    /// its parent and its project both.
+    #[test]
+    fn projects_come_from_the_registry_markers_or_fall_back_to_gemini() {
+        use sha2::Digest;
+        let home = temp_root("projects");
+        let root = home.join(".gemini/tmp");
+        let body = concat!(
+            r#"{"sessionId":"71717171-0000-4000-8000-000000000012","projectHash":"h"}"#,
+            "\n",
+            r#"{"id":"u1","timestamp":"2026-04-20T09:00:01.000Z","type":"user","content":"alpaca"}"#,
+            "\n"
+        );
+        let hash = |path: &str| format!("{:x}", sha2::Sha256::digest(path.as_bytes()));
+        let slug = root.join("zoo/chats/session-2026-04-20T09-00-71717171.jsonl");
+        let child = root.join("zoo/chats/71717171-0000-4000-8000-000000000012/72727272.jsonl");
+        let legacy = root
+            .join(hash("/work/zoo"))
+            .join("chats/session-2026-04-20T09-00-71717171.jsonl");
+        let listed = root
+            .join(hash("/srv/farm"))
+            .join("chats/session-2026-04-20T09-00-71717171.jsonl");
+        let orphan = root
+            .join(hash("/tmp/lost"))
+            .join("chats/session-2026-04-20T09-00-71717171.jsonl");
+        for path in [&slug, &child, &legacy, &listed, &orphan] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        std::fs::write(root.join("zoo/.project_root"), "/work/zoo\n").unwrap();
+        std::fs::write(
+            home.join(".gemini/projects.json"),
+            r#"{"projects":{"/work/zoo":"zoo","/srv/farm":"farm"}}"#,
+        )
+        .unwrap();
+        let projects = Projects::discover(&root);
+        let project = |path: &Path| {
+            let (messages, _, _) = parse_with_tally(path, &projects, &Tally::default());
+            let message = &messages[0];
+            (
+                message.project.to_string(),
+                message.parent.to_string(),
+                message.side,
+            )
+        };
+        assert_eq!(project(&slug), ("zoo".into(), String::new(), false));
+        assert_eq!(
+            project(&child),
+            (
+                "zoo".into(),
+                "71717171-0000-4000-8000-000000000012".into(),
+                true
+            )
+        );
+        assert_eq!(project(&legacy), ("zoo".into(), String::new(), false));
+        assert_eq!(project(&listed), ("farm".into(), String::new(), false));
+        assert_eq!(project(&orphan), ("gemini".into(), String::new(), false));
+        // the registry is optional: a marker alone names its own directory's project
+        std::fs::remove_file(home.join(".gemini/projects.json")).unwrap();
+        let markers_only = Projects::discover(&root);
+        let bucket = |path: &Path, projects: &Projects| {
+            parse_with_tally(path, projects, &Tally::default()).0[0]
+                .project
+                .to_string()
+        };
+        assert_eq!(bucket(&slug, &markers_only), "zoo");
+        assert_eq!(bucket(&listed, &markers_only), "gemini");
+        // a marker or a registry key longer than a path names nothing, so an oversized one is
+        // never stamped on every row of its project
+        let long = format!("/work/{}", "a".repeat(PROJECT_PATH_MAX_BYTES as usize));
+        std::fs::write(root.join("zoo/.project_root"), format!("{long}\n")).unwrap();
+        std::fs::write(
+            home.join(".gemini/projects.json"),
+            format!(r#"{{"projects":{{"{long}":"zoo","/srv/farm":"farm"}}}}"#),
+        )
+        .unwrap();
+        let oversized = Projects::discover(&root);
+        assert_eq!(bucket(&slug, &oversized), "gemini");
+        assert_eq!(bucket(&listed, &oversized), "farm");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]
@@ -2673,11 +3428,13 @@ mod tests {
         use std::os::unix::fs::symlink;
         let root = temp_root("links");
         let outside = root.with_extension("outside");
-        std::fs::create_dir_all(root.join("safe/chats")).unwrap();
-        std::fs::create_dir_all(outside.join("chats")).unwrap();
+        std::fs::create_dir_all(root.join("safe/chats/parent")).unwrap();
+        std::fs::create_dir_all(outside.join("chats/parent")).unwrap();
         std::fs::write(root.join("safe/chats/session-safe.json"), "{}").unwrap();
         let outside_file = outside.join("chats/session-outside.json");
         std::fs::write(&outside_file, "{}").unwrap();
+        let outside_child = outside.join("chats/parent/child.jsonl");
+        std::fs::write(&outside_child, "{}").unwrap();
         symlink(&outside, root.join("linked-project")).unwrap();
         std::fs::create_dir_all(root.join("linked-chats-project")).unwrap();
         symlink(
@@ -2688,6 +3445,13 @@ mod tests {
         symlink(&outside_file, root.join("safe/chats/session-linked.json")).unwrap();
         // a symlinked .jsonl must not retire the real .json it would shadow
         symlink(&outside_file, root.join("safe/chats/session-safe.jsonl")).unwrap();
+        // neither a linked subagent directory nor a linked file inside a real one is followed
+        symlink(
+            outside.join("chats/parent"),
+            root.join("safe/chats/linked-parent"),
+        )
+        .unwrap();
+        symlink(&outside_child, root.join("safe/chats/parent/linked.jsonl")).unwrap();
 
         let (files, retired) = session_files(&root);
         assert_eq!(files, vec![root.join("safe/chats/session-safe.json")]);

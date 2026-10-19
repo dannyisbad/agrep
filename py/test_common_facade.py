@@ -1,6 +1,9 @@
 """Structural budget for the compatibility facade."""
 
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import ast
 import io
@@ -16,6 +19,7 @@ COMMON_PATH = Path(__file__).with_name("common.py")
 DEFINITION_LINES = {
     "ingest_bin": 2,
     "data_dir_usage": 2,
+    "data_dir_mutable": 7,
     "open_bounded_log": 4,
     "index_summary": 77,
     "detected_stores": 45,
@@ -30,11 +34,12 @@ ASSIGNMENT_SHAPES = {
     "SEMANTIC_DEFAULT_EXCLUDED_ROLES":
         "surface.SEMANTIC_DEFAULT_EXCLUDED_ROLES",
     "_INGEST_SIGNATURE_MAX_BYTES": "4096",
+    "derived_writes_permitted": "None",
     "INGEST_SIG_PATH": "DATA_DIR / '.ingest.sig'",
 }
 ASSIGNMENT_LINES = {name: 1 for name in ASSIGNMENT_SHAPES}
-EXECUTABLE_LINE_BUDGET = 187
-STATEMENT_BUDGET = 148
+EXECUTABLE_LINE_BUDGET = 195
+STATEMENT_BUDGET = 155
 
 
 def _docstring_nodes(tree: ast.AST) -> set[ast.Expr]:

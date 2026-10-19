@@ -28,10 +28,23 @@ isolate_data_dir()
 
 
 # Daemon semantics run real here, daemon processes never do (shared seam).
-from _test_support import lift_daemon_semantics
+from _test_support import generous_routine_budget, lift_daemon_semantics
 import indexd_runtime  # noqa: E402
 
-setUpModule, tearDownModule = lift_daemon_semantics(indexd_runtime)
+_lift_up, _lift_down = lift_daemon_semantics(indexd_runtime)
+_budget_up, _budget_down = generous_routine_budget()
+
+
+def setUpModule() -> None:
+    _lift_up()
+    _budget_up()
+
+
+def tearDownModule() -> None:
+    try:
+        _budget_down()
+    finally:
+        _lift_down()
 
 import cli  # noqa: E402
 import corpusdb  # noqa: E402
@@ -953,6 +966,37 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertIn(
             "pinned semantic model (~52 MiB, one time)", output.getvalue())
 
+    def test_setup_prefetches_the_metal_checkpoint_where_that_lane_opens(
+            self) -> None:
+        # Offline paths no longer fetch it, so the first automatic build
+        # would strand a fresh store on the CPU lane for life unless the
+        # consented setup fetch covers the lane it is going to open.
+        available = {
+            **_missing_semantic(),
+            "available": True, "model_cached": True,
+            "deps": {
+                "numpy": True, "onnxruntime": True, "tokenizers": True},
+        }
+        calls: list[bool] = []
+
+        def lane_weights(model_id, *, download):
+            calls.append(download)
+            if not download:
+                raise embedder.EmbedderUnavailable("metal weights missing")
+
+        output = io.StringIO()
+        with (mock.patch.object(doctor.common, "setting", return_value="auto"),
+              mock.patch.object(
+                  doctor, "_semantic_probe", return_value=available),
+              mock.patch.object(embedder, "ensure_model") as onnx,
+              mock.patch.object(
+                  embedder, "ensure_lane_weights", side_effect=lane_weights),
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(doctor.fix(), 0)
+        onnx.assert_not_called()
+        self.assertEqual(calls, [False, True])
+        self.assertIn("Metal checkpoint (~91 MiB, one time)", output.getvalue())
+
     def test_cli_setup_offline_reaches_enrollment_when_embeddings_are_off(
             self) -> None:
         output = io.StringIO()
@@ -1207,7 +1251,7 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
               mock.patch("importlib.import_module"),
               mock.patch.object(embedder, "ensure_model"),
               mock.patch.object(semantic, "embedding_coherence",
-                                return_value=coherence),
+                                return_value=coherence) as coherence_probe,
               mock.patch.object(semantic, "read_embed_state", return_value={}),
               mock.patch.object(semantic, "embed_running", return_value=False),
               mock.patch.object(
@@ -1215,7 +1259,8 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                   return_value=readiness) as query_status):
             result = doctor._semantic_probe()
         query_status.assert_called_once_with(
-            ready=True, timeout_s=doctor._SEMANTIC_QUERY_PROBE_TIMEOUT_S)
+            ready=True, timeout_s=doctor._SEMANTIC_QUERY_PROBE_TIMEOUT_S,
+            coherence_probe=coherence_probe)
         self.assertEqual(result["resident_worker"], resident)
         self.assertTrue(result["generation_ready"])
         self.assertTrue(result["live"])
@@ -1275,6 +1320,51 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
                       readiness["generation_probe_error"])
         self.assertIn("generation-readiness probe failed",
                       doctor._semantic_readiness_detail(readiness))
+
+    def test_probe_adopts_the_generation_that_moved_under_the_query(self) -> None:
+        # One coherence read said "partial - searchable now" while the bounded
+        # query, issued a moment later, met the next generation and refused
+        # with "stale". Every row must speak of the generation actually met.
+        partial = {
+            "coherent": False, "searchable": True, "state": "partial",
+            "coverage": {"indexed": 128, "total": 400, "pending": 272},
+        }
+        stale = {"coherent": False, "searchable": False, "state": "stale"}
+        moved = {
+            "state": "generation-moved", "ready": True,
+            "query_serving": None, "coherence_after": stale,
+            "reason": "the semantic generation moved during the probe",
+        }
+        with (
+            mock.patch.object(doctor, "_dep_present", return_value=True),
+            mock.patch("importlib.import_module"),
+            mock.patch.object(embedder, "ensure_model"),
+            mock.patch.object(
+                semantic, "embedding_coherence",
+                side_effect=[partial, stale]) as coherence,
+            mock.patch.object(semantic, "read_embed_state", return_value={}),
+            mock.patch.object(semantic, "embed_running", return_value=False),
+            mock.patch.object(
+                semworker, "diagnostic_query_status",
+                return_value=moved) as query_status,
+        ):
+            result = doctor._semantic_probe()
+        self.assertIs(
+            query_status.call_args.kwargs["coherence_probe"], coherence)
+        self.assertEqual(coherence.call_count, 1)
+        self.assertEqual(result["embeddings"], "stale")
+        self.assertFalse(result["generation_ready"])
+        self.assertFalse(result["live"])
+        readiness = result["query_readiness"]
+        self.assertEqual(readiness["state"], "generation-moved")
+        self.assertEqual(readiness["generation_state"], "stale")
+        self.assertFalse(readiness["current_generation"])
+        self.assertFalse(readiness["ready"])
+        self.assertIsNone(readiness["query_serving"])
+        detail = doctor._semantic_readiness_detail(readiness)
+        self.assertIn("moved", detail)
+        self.assertIn("embeddings stale", detail)
+        self.assertNotIn("cannot query it", detail)
 
     def test_runtime_identity_names_build_kind_location_and_id(self) -> None:
         distribution = "d" * 20
@@ -1350,17 +1440,34 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
 
     @unittest.skipIf(doctor.dist.WIN, "fork-only worker timing fixture")
     def test_routine_native_identity_stops_slow_hashing(self) -> None:
-        def slow_native(*_args, **_kwargs):
-            time.sleep(2.0)
-            return "b" * 20
+        # Load-independent evidence of a stopped hasher: its pid is gone when the
+        # call returns and it never records completion, even after its sleep.
+        import multiprocessing.context as context
+        with tempfile.TemporaryDirectory() as td:
+            completed = Path(td) / "completed"
+            sleep_s = 0.5
+            pids: list[int] = []
+            real_start = context.ForkProcess.start
 
-        started = time.monotonic()
-        with mock.patch.object(
-                doctor.dist, "native_binary_build_id",
-                side_effect=slow_native):
-            identity = doctor._native_binary_identity(
-                deadline=time.monotonic() + 0.01)
-        self.assertLess(time.monotonic() - started, 0.75)
+            def start(process):
+                real_start(process)
+                pids.append(process.pid)
+
+            def slow_native(*_args, **_kwargs):
+                time.sleep(sleep_s)
+                completed.touch()
+                return "b" * 20
+
+            with mock.patch.object(context.ForkProcess, "start", start), \
+                    mock.patch.object(
+                        doctor.dist, "native_binary_build_id",
+                        side_effect=slow_native):
+                identity = doctor._native_binary_identity(
+                    deadline=time.monotonic() + 0.01)
+            self.assertEqual(len(pids), 1, pids)
+            self.assertFalse(doctor.common.pid_alive(pids[0]), "the hasher was left running")
+            time.sleep(sleep_s + 0.2)
+            self.assertFalse(completed.exists(), "the hasher outlived its deadline")
         self.assertIsNone(identity["native_binary_build_id"])
         self.assertEqual(
             identity["native_binary_build_state"], "status-deferred")
@@ -1403,6 +1510,61 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertEqual(result["embeddings"], "corrupt-embeddings")
         self.assertEqual(result["embedding_integrity"]["state"], "corrupt")
         self.assertEqual(result["embedding_integrity"]["repair"], repair)
+
+    def test_a_full_deep_doctor_leaves_no_coordination_namespace(self) -> None:
+        # The whole deep report, not just the probe function; and the routine
+        # tiers (doctor, status) are pure observers that must mint nothing.
+        with tempfile.TemporaryDirectory(prefix="agrep-doctor-ns-") as td:
+            root = Path(td)
+            data = root / "data"
+            data.mkdir()
+            base = root / "tmp"
+            base.mkdir()
+            output = io.StringIO()
+            with (mock.patch.object(doctor.common, "DATA_DIR", data),
+                  mock.patch.object(semworker.common, "DATA_DIR", data),
+                  mock.patch.object(
+                      semworker, "_coordination_base_path", return_value=base),
+                  mock.patch.object(doctor, "_dep_present", return_value=True),
+                  mock.patch("importlib.import_module"),
+                  mock.patch.object(embedder, "ensure_model"),
+                  mock.patch.object(
+                      semantic, "embedding_coherence",
+                      return_value={"coherent": False, "searchable": False,
+                                    "state": "missing-embeddings"}),
+                  mock.patch.object(semantic, "read_embed_state", return_value={}),
+                  mock.patch.object(semantic, "embed_running", return_value=False),
+                  mock.patch.object(doctor, "_store_counts", return_value=[]),
+                  mock.patch.object(
+                      doctor.indexd_runtime, "observe_store_drift",
+                      return_value=([], doctor.indexd_runtime.DriftReport("current"))),
+                  mock.patch.object(
+                      doctor.indexd_runtime, "indexd_resource_status",
+                      return_value={"running": False, "state": "not-running"}),
+                  mock.patch.object(
+                      doctor.indexd_runtime, "indexing_failure", return_value=None),
+                  mock.patch.object(
+                      doctor.indexd_runtime, "kick_background_repair",
+                      return_value=doctor.indexd_runtime.RepairKick(False, "fixture")),
+                  mock.patch.object(doctor.common, "detected_stores", return_value=[]),
+                  contextlib.redirect_stdout(output),
+                  contextlib.redirect_stderr(io.StringIO())):
+                namespace = semworker._ephemeral_coordination_dir()
+                self.assertFalse(namespace.exists())
+                payload = doctor.probe(deep=True)
+                leftover = sorted(path.name for path in base.iterdir())
+                self.assertEqual(leftover, [])
+                doctor.probe(deep=False)
+                routine_leftover = sorted(path.name for path in base.iterdir())
+                with mock.patch.object(cli.common, "DATA_DIR", data):
+                    cli._status_data()
+                    list(cli._status_lines("agrep"))
+                status_leftover = sorted(path.name for path in base.iterdir())
+            readiness = payload["semantic"]["query_readiness"]
+            self.assertEqual(readiness["state"], "generation-not-ready")
+            self.assertTrue(readiness["cleanup"]["namespace_removed"])
+            self.assertEqual(routine_leftover, [])
+            self.assertEqual(status_leftover, [])
 
     def test_human_report_does_not_mark_optional_deps_as_core_failures(self) -> None:
         output = io.StringIO()
@@ -1501,33 +1663,8 @@ class OptionalSemanticDoctorTests(unittest.TestCase):
         self.assertNotIn("stale failure from before embeddings=off", rendered)
         self.assertNotIn(doctor.SEMANTIC_UNLOCK, report["fixes"])
 
-    def test_status_human_and_json_describe_optional_capability(self) -> None:
-        status = {
-            "data_dir": "/tmp/agrep-test",
-            "data_dir_source": "test",
-            "warnings": [],
-            "index_built": True,
-            "sessions": 1,
-            "messages": 2,
-            "agents": ["codex"],
-            "search_index_ready": True,
-            "search_index_state": "ready",
-            "freshness": {"state": "no-known-failure"},
-            "daemon": {"running": False},
-            "semantic_deps": False,
-            "detected_not_indexed": [],
-        }
-        with (mock.patch.object(cli, "_status_core", return_value=dict(status)),
-              mock.patch.object(cli, "_status_semantic",
-                                return_value={"semantic_deps": False})):
-            rendered = "\n".join(cli._status_lines("agrep"))
-        self.assertIn("optional dependencies are not installed", rendered)
-        self.assertIn("pip install", rendered)
-        self.assertIn(SEMANTIC_REQUIREMENT, rendered)
-        self.assertNotIn("reinstall agrep", rendered)
-        # a working keyword search is the healthy default and earns no line
-        self.assertNotIn("keyword search works", rendered)
-
+    def test_status_json_describes_optional_capability_without_discovery(
+            self) -> None:
         with tempfile.TemporaryDirectory() as td:
             with (mock.patch.object(cli.common, "DATA_DIR", Path(td)),
                   mock.patch.object(

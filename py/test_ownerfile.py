@@ -191,27 +191,165 @@ result.write_text(str(handle.release()), encoding="ascii")
             self.assertEqual(result.read_text(encoding="ascii"), "False")
             self.assertEqual(path.read_bytes(), body)
 
-    def test_default_release_restores_replacement_after_precheck(self) -> None:
+    def _mutex_gap(self, path: Path, land):
+        """Patch the slot-mutex seam so `land()` runs after the caller's judgement and
+        before the locked re-check; returns the patch and a call counter."""
+        real_mutex = ownerfile._slot_mutex
+        calls = []
+
+        def gap_then_lock(record, **kwargs):
+            if record == path:
+                calls.append(record)
+                land()
+            return real_mutex(record, **kwargs)
+
+        return mock.patch.object(ownerfile, "_slot_mutex", side_effect=gap_then_lock), calls
+
+    def test_default_release_leaves_a_same_body_replacement_untouched(self) -> None:
         path = self.root / "precheck-owner.lock"
         replacement = self.root / "precheck-replacement"
         handle = ownerfile.create_exclusive(path, b"same-owner-body")
         replacement.write_bytes(b"same-owner-body")
-        real_replace = ownerfile.os.replace
-        swaps = 0
-
-        def swap_before_tomb(source, target):
-            nonlocal swaps
-            if Path(source) == path and ".owner-reap-" in Path(target).name:
-                swaps += 1
-                real_replace(replacement, path)
-            return real_replace(source, target)
-
-        with mock.patch.object(
-                ownerfile.os, "replace", side_effect=swap_before_tomb):
+        patch, swaps = self._mutex_gap(path, lambda: os.replace(replacement, path))
+        with patch:
             self.assertFalse(handle.release())
-        self.assertEqual(swaps, 1)
+        self.assertEqual(len(swaps), 1)
         self.assertEqual(path.read_bytes(), b"same-owner-body")
         self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
+        self.assertFalse((self.root / ownerfile.SLOT_MUTEX_NAME).exists())
+
+    def test_a_live_record_swapped_in_after_the_judgement_is_never_removed(self) -> None:
+        path = self.root / "gap-owner.lock"
+        live = self.root / "gap-live"
+        stale = ownerfile.create_exclusive(path, b"stale-owner").snapshot
+        live.write_bytes(b"live-owner")
+        identity = {}
+
+        def swap_in_the_live_record() -> None:
+            os.replace(live, path)
+            identity["live"] = ownerfile.snapshot(path).identity[:3]
+
+        patch, _calls = self._mutex_gap(path, swap_in_the_live_record)
+        with patch:
+            self.assertFalse(ownerfile.remove_exact(path, stale))
+        observed = ownerfile.snapshot(path)
+        self.assertEqual((observed.identity[:3], observed.raw), (identity["live"], b"live-owner"))
+        self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
+
+    def test_removals_in_a_directory_are_serialized_by_its_mutex(self) -> None:
+        path = self.root / "serialized-owner.lock"
+        stale = ownerfile.create_exclusive(path, b"stale-owner").snapshot
+        with mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.05):
+            with ownerfile._SlotMutex(self.root) as held:
+                self.assertEqual(held.state, "held")
+                with ownerfile._SlotMutex(self.root) as contender:
+                    self.assertEqual(contender.state, "busy")
+                self.assertFalse(ownerfile.remove_exact(path, stale))
+                self.assertEqual(path.read_bytes(), b"stale-owner")
+            self.assertTrue(ownerfile.remove_exact(path, stale))
+        self.assertFalse(path.exists())
+        self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
+        self.assertTrue((self.root / ownerfile.SLOT_MUTEX_NAME).is_file())
+
+    def test_unsupported_mutex_falls_back_to_the_tomb_protocol(self) -> None:
+        path = self.root / "fallback-owner.lock"
+        handle = ownerfile.create_exclusive(path, b"fallback-owner")
+        renames = []
+        real_replace = ownerfile.os.replace
+
+        def record_rename(source, target):
+            renames.append((Path(source).name, Path(target).name))
+            return real_replace(source, target)
+
+        with mock.patch.object(ownerfile, "_lock_descriptor", return_value="unsupported"), \
+                mock.patch.object(ownerfile.os, "replace", side_effect=record_rename):
+            self.assertTrue(handle.release())
+        self.assertFalse(path.exists())
+        self.assertEqual(len(renames), 1)
+        self.assertIn(".owner-reap-", renames[0][1])
+        self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
+
+    def test_removal_renames_aside_under_the_mutex(self) -> None:
+        path = self.root / "aside-owner.lock"
+        stale = ownerfile.create_exclusive(path, b"stale-owner").snapshot
+        real_unlink = Path.unlink
+        seen = {}
+
+        def observe_unlink(target: Path, *args, **kwargs):
+            if ".owner-reap-" in target.name:
+                with mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.05):
+                    with ownerfile._SlotMutex(self.root) as contender:
+                        seen["mutex"] = contender.state
+                seen["slot"] = path.exists()
+                seen["tomb"] = target.read_bytes()
+            return real_unlink(target, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=observe_unlink):
+            self.assertTrue(ownerfile.remove_exact(path, stale))
+        # the slot is free, and the mutex still held, while the tomb is unlinked
+        self.assertEqual(seen, {"mutex": "busy", "slot": False, "tomb": b"stale-owner"})
+        self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
+
+    def test_a_failed_create_never_mints_the_mutex_but_honours_one(self) -> None:
+        path = self.root / "unfinished-owner.lock"
+        short_write = mock.patch.object(os, "write", return_value=0)
+        with short_write:
+            with self.assertRaisesRegex(OSError, "short write"):
+                ownerfile.create_exclusive(path, b"unfinished-owner")
+        self.assertEqual(os.listdir(self.root), [])
+
+        # a reap minted the mutex: the creator's cleanup then waits on it like any remover
+        stale = ownerfile.create_exclusive(path, b"stale-owner").snapshot
+        self.assertTrue(ownerfile.remove_exact(path, stale))
+        with mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.05), \
+                ownerfile._SlotMutex(self.root) as held:
+            self.assertEqual(held.state, "held")
+            with short_write:
+                with self.assertRaisesRegex(OSError, "short write"):
+                    ownerfile.create_exclusive(path, b"unfinished-owner")
+            self.assertEqual(path.read_bytes(), b"")
+        partial = ownerfile.snapshot(path)
+        self.assertTrue(ownerfile.remove_exact(
+            path, partial, tombstone=False, mint_mutex=False))
+        self.assertEqual(os.listdir(self.root), [ownerfile.SLOT_MUTEX_NAME])
+
+    def test_remove_record_dir_treats_a_lone_mutex_as_empty(self) -> None:
+        namespace = self.root / "namespace"
+        namespace.mkdir()
+        self.assertTrue(ownerfile.remove_record_dir(namespace))
+        self.assertFalse(namespace.exists())
+        namespace.mkdir()
+        path = namespace / "worker.lock"
+        stale = ownerfile.create_exclusive(path, b"stale-owner").snapshot
+        self.assertFalse(ownerfile.remove_record_dir(namespace))
+        self.assertTrue(ownerfile.remove_exact(path, stale))
+        self.assertEqual(os.listdir(namespace), [ownerfile.SLOT_MUTEX_NAME])
+        with mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.05):
+            with ownerfile._SlotMutex(namespace) as held:
+                self.assertEqual(held.state, "held")
+                # a remover is active in the directory: nothing is touched
+                self.assertFalse(ownerfile.remove_record_dir(namespace))
+                self.assertEqual(os.listdir(namespace), [ownerfile.SLOT_MUTEX_NAME])
+        self.assertTrue(ownerfile.remove_record_dir(namespace))
+        self.assertFalse(namespace.exists())
+        self.assertFalse(ownerfile.remove_record_dir(namespace))
+
+    def test_a_delete_pending_slot_is_contention_only_on_windows(self) -> None:
+        path = self.root / "pending-owner.lock"
+        denied = PermissionError(13, "Access is denied")
+        with mock.patch.object(ownerfile.os, "open", side_effect=denied), \
+                mock.patch.object(Path, "lstat", side_effect=PermissionError(13, "pending")):
+            with mock.patch.object(ownerfile, "_WINDOWS", True):
+                with self.assertRaises(FileExistsError):
+                    ownerfile.create_exclusive(path, b"owner")
+            with mock.patch.object(ownerfile, "_WINDOWS", False):
+                with self.assertRaisesRegex(PermissionError, "Access is denied"):
+                    ownerfile.create_exclusive(path, b"owner")
+        with mock.patch.object(ownerfile.os, "open", side_effect=denied), \
+                mock.patch.object(ownerfile, "_WINDOWS", True):
+            # an absent entry refused by the directory itself is still a real error
+            with self.assertRaisesRegex(PermissionError, "Access is denied"):
+                ownerfile.create_exclusive(path, b"owner")
 
     def test_oversized_create_fails_before_publishing_an_entry(self) -> None:
         path = self.root / "oversized-owner.lock"
@@ -221,6 +359,45 @@ result.write_text(str(handle.release()), encoding="ascii")
         self.assertFalse(path.exists())
         handle = ownerfile.create_exclusive(path, b"owner")
         self.assertTrue(handle.release())
+
+    def test_create_held_registers_the_token_before_the_create(self) -> None:
+        path = self.root / "held-owner.lock"
+        start = "birth"
+        seen = {}
+        real_create = ownerfile.create_exclusive
+
+        def observe(target, raw, **kwargs):
+            # a sibling thread judging the fresh record in the create window finds the token held
+            seen["during"] = ownerfile.stranded_own_record(
+                os.getpid(), start, "a" * 32, process_start=lambda _pid: start)
+            return real_create(target, raw, **kwargs)
+
+        with mock.patch.object(ownerfile, "create_exclusive", side_effect=observe):
+            handle = ownerfile.create_held(path, b"owner", token="a" * 32)
+        self.assertEqual(handle.token, "a" * 32)
+        self.assertEqual(seen, {"during": False})
+        self.assertFalse(ownerfile.stranded_own_record(
+            os.getpid(), start, "a" * 32, process_start=lambda _pid: start))
+        with mock.patch.object(ownerfile, "_lock_descriptor", return_value="busy"), \
+                mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.01):
+            (self.root / ownerfile.SLOT_MUTEX_NAME).touch()
+            self.assertFalse(handle.release())
+        # a release that gave up leaves the record stranded, and only its own process sees that
+        self.assertEqual(path.read_bytes(), b"owner")
+        self.assertTrue(ownerfile.stranded_own_record(
+            os.getpid(), start, "a" * 32, process_start=lambda _pid: start))
+        self.assertFalse(ownerfile.stranded_own_record(
+            os.getpid() + 1, start, "a" * 32, process_start=lambda _pid: start))
+        self.assertFalse(ownerfile.stranded_own_record(
+            os.getpid(), "other-birth", "a" * 32, process_start=lambda _pid: start))
+        self.assertFalse(ownerfile.stranded_own_record(
+            os.getpid(), "unknown", "a" * 32, process_start=lambda _pid: "unknown"))
+        self.assertFalse(ownerfile.stranded_own_record(
+            os.getpid(), start, None, process_start=lambda _pid: start))
+        with self.assertRaises(FileExistsError):
+            ownerfile.create_held(path, b"owner", token="b" * 32)
+        self.assertNotIn("b" * 32, ownerfile._HELD_TOKENS)
+        path.unlink()
 
     def test_full_record_retained_fd_and_exact_release(self) -> None:
         path = self.root / "retained.lock"
@@ -492,58 +669,50 @@ result.write_text(str(handle.release()), encoding="ascii")
         self.assertFalse(path.exists())
         self.assertFalse(handle.release(tombstone=True))
 
-    def test_release_recovers_transient_faults_after_tombstone_move(self) -> None:
-        path = self.root / "retry-tomb-release.lock"
-        handle = ownerfile.create_exclusive(path, b"same-owner-body")
-        real_snapshot = ownerfile.snapshot
-        real_link = ownerfile.os.link
-        tomb_reads = 0
-        restore_attempts = 0
-
-        def transient_snapshot(target: Path, **kwargs):
-            nonlocal tomb_reads
-            if ".owner-reap-" in target.name:
-                tomb_reads += 1
-                if tomb_reads <= 3:
-                    raise PermissionError(13, "sharing violation")
-            return real_snapshot(target, **kwargs)
-
-        def transient_link(source, target, **kwargs):
-            nonlocal restore_attempts
-            restore_attempts += 1
-            if restore_attempts <= 2:
-                raise PermissionError(13, "sharing violation")
-            return real_link(source, target, **kwargs)
-
-        with mock.patch.object(
-                ownerfile, "snapshot", side_effect=transient_snapshot), \
-                mock.patch.object(
-                    ownerfile.os, "link", side_effect=transient_link):
-            self.assertTrue(handle.release(tombstone=True))
-        self.assertGreaterEqual(tomb_reads, 4)
-        self.assertEqual(restore_attempts, 3)
-        self.assertFalse(path.exists())
-        self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
-
-    def test_release_reuses_tomb_until_transient_unlink_clears(self) -> None:
-        path = self.root / "retry-tomb-unlink.lock"
+    def test_release_with_transient_unlink_failures_never_touches_a_new_owner(self) -> None:
+        path = self.root / "retry-unlink-release.lock"
         handle = ownerfile.create_exclusive(path, b"same-owner-body")
         real_unlink = Path.unlink
-        tomb_unlinks = 0
+        attempts = 0
+        newcomer = {}
 
         def transient_unlink(target: Path, *args, **kwargs):
-            nonlocal tomb_unlinks
-            if ".owner-reap-" in target.name:
-                tomb_unlinks += 1
-                if tomb_unlinks <= 6:
-                    raise PermissionError(13, "sharing violation")
-            return real_unlink(target, *args, **kwargs)
+            nonlocal attempts
+            if ".owner-reap-" not in target.name:
+                return real_unlink(target, *args, **kwargs)
+            attempts += 1
+            if attempts == 1:
+                # the record is already out of the slot: a newcomer takes it at once
+                newcomer["handle"] = ownerfile.create_exclusive(path, b"new-owner-body")
+            if attempts <= 3:
+                raise PermissionError(13, "sharing violation")
+            real_unlink(target, *args, **kwargs)
 
         with mock.patch.object(Path, "unlink", new=transient_unlink):
             self.assertTrue(handle.release(tombstone=True))
-        self.assertGreaterEqual(tomb_unlinks, 8)
-        self.assertFalse(path.exists())
+        self.assertEqual(attempts, 4)
+        self.assertEqual(path.read_bytes(), b"new-owner-body")
+        newcomer["handle"].verify()
         self.assertEqual(list(self.root.glob(".*.owner-reap-*")), [])
+
+    def test_release_gives_up_rather_than_disturb_the_slot(self) -> None:
+        path = self.root / "stuck-unlink-release.lock"
+        handle = ownerfile.create_exclusive(path, b"same-owner-body")
+        real_unlink = Path.unlink
+
+        def stuck_unlink(target: Path, *args, **kwargs):
+            if ".owner-reap-" in target.name:
+                raise PermissionError(13, "sharing violation")
+            return real_unlink(target, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=stuck_unlink):
+            self.assertFalse(handle.release(tombstone=True))
+        # the record is back in its slot, the same entry it always was
+        restored = ownerfile.snapshot(path)
+        self.assertEqual(restored.raw, b"same-owner-body")
+        self.assertEqual(restored.identity[:3], handle.snapshot.identity[:3])
+        for tomb in self.root.glob(".*.owner-reap-*"):
+            self.assertEqual(ownerfile.snapshot(tomb).identity[:3], restored.identity[:3])
 
     def test_release_never_removes_after_ambiguous_close_error(self) -> None:
         path = self.root / "close-error.lock"

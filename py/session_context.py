@@ -708,6 +708,7 @@ def read_session_family_census(
             time.sleep(delay)
             budget_check()
         try:
+            scan_start_ns = time.time_ns()
             before = _session_family_file_identity(sessions_path)
             budget_check()
             meta_snapshot = ownerfile.snapshot(
@@ -723,7 +724,12 @@ def read_session_family_census(
                 before, meta_before, signature_before,
             )
             cached = _SESSION_FAMILY_CENSUS.get("value")
-            if _SESSION_FAMILY_CENSUS.get("key") == key and cached is not None:
+            native_before = (
+                before[3], before[4], before[0], before[1], before[2])
+            cache_racy = fileops.racy_identity(
+                native_before, scan_start_ns, time.time_ns())
+            if (_SESSION_FAMILY_CENSUS.get("key") == key
+                    and cached is not None and not cache_racy):
                 after = _session_family_file_identity(sessions_path)
                 budget_check()
                 meta_after = ownerfile.snapshot(
@@ -813,7 +819,11 @@ def read_session_family_census(
             census = SessionFamilyCensus(
                 proof, frozenset(seen), MappingProxyType(parents),
                 MappingProxyType(aliases))
-            _SESSION_FAMILY_CENSUS.update(key=key, value=census)
+            native_after = (
+                after[3], after[4], after[0], after[1], after[2])
+            if not fileops.racy_identity(
+                    native_after, scan_start_ns, time.time_ns()):
+                _SESSION_FAMILY_CENSUS.update(key=key, value=census)
             return census
         except TimeoutError:
             raise

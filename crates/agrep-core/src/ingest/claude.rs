@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::ingest::parse_timestamp;
-use crate::ingest::registry::{metadata_is_link, plain_entry_metadata};
+use crate::ingest::registry::{metadata_is_link, plain_entry_metadata, StoreLink};
 use crate::ingest::{
     cap_event_output, cap_str_with_chars, is_wrapper, project_name,
     summarize_tool_input_with_chars, EVENT_CAP,
@@ -415,6 +415,7 @@ fn push_task_notifications(
             call_id,
             child_session: task_id.and_then(agent_task_session).unwrap_or_default(),
             meta: String::new(),
+            state: String::new(),
         });
     }
 }
@@ -611,9 +612,9 @@ fn directory_project(path: &Path) -> String {
 }
 
 /// Text of a tool_result's `content`: a plain string, or an array of text blocks.
-fn tool_result_text(content: &serde_json::Value) -> (String, usize, usize) {
+fn tool_result_full_text(content: &serde_json::Value) -> String {
     match content {
-        serde_json::Value::String(s) => cap_event_output(s),
+        serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(blocks) => {
             let mut out = String::new();
             for b in blocks {
@@ -626,8 +627,16 @@ fn tool_result_text(content: &serde_json::Value) -> (String, usize, usize) {
                     }
                 }
             }
-            cap_event_output(&out)
+            out
         }
+        _ => String::new(),
+    }
+}
+
+fn tool_result_text(content: &serde_json::Value) -> (String, usize, usize) {
+    match content {
+        serde_json::Value::String(s) => cap_event_output(s),
+        serde_json::Value::Array(_) => cap_event_output(&tool_result_full_text(content)),
         _ => (String::new(), 0, 0),
     }
 }
@@ -678,11 +687,7 @@ fn parse_file_with_tally(
             );
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
-            return (
-                Vec::new(),
-                Vec::new(),
-                crate::ingest_cache::ReadOutcome::Skipped,
-            );
+            return (Vec::new(), Vec::new(), crate::ingest::read_failure_outcome(&e));
         }
     };
     if is_throwaway_path(path) {
@@ -707,6 +712,7 @@ fn parse_file_with_tally(
     let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut recap_turns = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    let mut order = crate::ingest::ReplyOrder::new();
     // tool_use id -> index into `events`, so the later tool_result line can pair up.
     let mut pending: HashMap<String, usize> = HashMap::new();
     let mut turn = 0u32;
@@ -805,12 +811,23 @@ fn parse_file_with_tally(
                     // parse the RawValue into a DOM once.
                     let content_val: Option<serde_json::Value> =
                         m.content.and_then(|r| serde_json::from_str(r.get()).ok());
+                    // events recorded before the row's last text block were answered by it
+                    let mut text_at: Option<usize> = None;
                     if let Some(content) = &content_val {
                         collect_tool_paths(content, &mut tool_paths);
                         // tool_use blocks -> events (inline sidechain lines never reach
                         // here; the subagents/ child transcript is their one source)
                         if let serde_json::Value::Array(blocks) = content {
                             for (block_ordinal, b) in blocks.iter().enumerate() {
+                                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    if b.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .is_some_and(|t| !t.trim().is_empty())
+                                    {
+                                        text_at = Some(events.len());
+                                    }
+                                    continue;
+                                }
                                 if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
                                     continue;
                                 }
@@ -842,6 +859,7 @@ fn parse_file_with_tally(
                                     pending.insert(call_id.clone(), events.len());
                                 }
                                 let meta = call_meta(&name, b.get("input"));
+                                let state = crate::ingest::task_state(&name, b.get("input"));
                                 tally.event();
                                 events.push(Event {
                                     agent: "claude",
@@ -858,6 +876,7 @@ fn parse_file_with_tally(
                                     call_id,
                                     child_session: String::new(),
                                     meta,
+                                    state,
                                 });
                             }
                         }
@@ -883,6 +902,7 @@ fn parse_file_with_tally(
                             call_id: format!("claude:{file_session}:{record_ordinal}:api-error"),
                             child_session: String::new(),
                             meta: String::new(),
+                            state: String::new(),
                         });
                     }
                     if let Some(last) = out.last_mut() {
@@ -897,12 +917,12 @@ fn parse_file_with_tally(
                             }
                         }
                         if let Some(txt) = &text {
-                            let chars = crate::ingest::append_capped(
-                                &mut last.reply,
-                                txt,
-                                crate::ingest::REPLY_CAP,
-                            );
-                            last.reply_chars += chars;
+                            let chars = crate::ingest::append_reply(last, txt);
+                            if chars > 0 {
+                                let at = text_at.unwrap_or(events.len());
+                                order.joined(&mut last.reply_shape, &events, at);
+                                order.reply(at);
+                            }
                         }
                     }
                 }
@@ -937,6 +957,9 @@ fn parse_file_with_tally(
                         let ev = &mut events[i];
                         if let Some(c) = b.get("content") {
                             (ev.output, ev.output_chars, ev.output_bytes) = tool_result_text(c);
+                            if ev.name == "TaskList" {
+                                ev.state = crate::ingest::task_listing(&tool_result_full_text(c));
+                            }
                         }
                         ev.ok = Some(b.get("is_error").and_then(|v| v.as_bool()) != Some(true));
                         if ev.kind == "subagent_start" || ev.name == "SendMessage" {
@@ -1015,6 +1038,8 @@ fn parse_file_with_tally(
         tally.row();
         if l.is_compact_summary == Some(true) {
             recap_turns.push(turn);
+        } else {
+            order.prompt(&mut events);
         }
         out.push(crate::model::RawMessage {
             agent: "claude",
@@ -1028,9 +1053,11 @@ fn parse_file_with_tally(
             reply_chars: 0,
             side: is_side,
             parent: side_parent.clone().unwrap_or_default(),
+            reply_shape: Default::default(),
         });
         turn += 1;
     }
+    order.finish(&mut events);
     // One project for the whole session: where the work actually happened.
     let project = primary_project(
         &cwd_counts,
@@ -1096,6 +1123,7 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
             }
         };
         if let Some(dirs) = dirs {
+            let mut links = Vec::new();
             for entry in dirs {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -1106,18 +1134,17 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
                 };
                 let dir = entry.path();
                 match plain_entry_metadata(&entry) {
-                    Ok(Some(meta)) if meta.is_dir() => gather_jsonl(&dir, &mut files, 0),
-                    Ok(None) => crate::ingest::warn_source_skip(
-                        "claude",
-                        &dir,
-                        "symlink sources are not followed",
-                    ),
+                    Ok(Some(meta)) if meta.is_dir() => {
+                        gather_jsonl(&dir, &mut files, &mut links, 0)
+                    }
+                    Ok(None) => links.push(dir),
                     Ok(Some(_)) => {}
                     Err(error) => crate::ingest::warn_source_skip("claude", &dir, &error),
                 }
             }
+            files.sort_unstable();
+            warn_foreign_links(&root, &files, links);
         }
-        files.sort_unstable();
         files
     });
 
@@ -1134,7 +1161,13 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
 /// Recursively gather every transcript jsonl under a project dir (sessions,
 /// subagents/ side transcripts, nested project-slug dirs). Deliberately skipped
 /// worker transcripts remain in this set so freshness and intake accounting see them.
-fn gather_jsonl(dir: &Path, files: &mut Vec<std::path::PathBuf>, depth: u8) {
+/// Links are collected for `warn_foreign_links`, which needs the finished file set.
+fn gather_jsonl(
+    dir: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+    links: &mut Vec<std::path::PathBuf>,
+    depth: u8,
+) {
     if depth > 5 {
         return;
     }
@@ -1168,7 +1201,7 @@ fn gather_jsonl(dir: &Path, files: &mut Vec<std::path::PathBuf>, depth: u8) {
         let metadata = match plain_entry_metadata(&entry) {
             Ok(Some(metadata)) => metadata,
             Ok(None) => {
-                crate::ingest::warn_source_skip("claude", &p, "symlink sources are not followed");
+                links.push(p);
                 continue;
             }
             Err(error) => {
@@ -1177,9 +1210,24 @@ fn gather_jsonl(dir: &Path, files: &mut Vec<std::path::PathBuf>, depth: u8) {
             }
         };
         if metadata.is_dir() {
-            gather_jsonl(&p, files, depth + 1);
+            gather_jsonl(&p, files, links, depth + 1);
         } else if metadata.is_file() && p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             files.push(p);
+        }
+    }
+}
+
+/// agrep's own resume links (aliases of gathered transcripts, or dangling inside the
+/// store) are skipped silently, like the registry walk; any other link is warned about.
+fn warn_foreign_links(root: &Path, files: &[std::path::PathBuf], links: Vec<std::path::PathBuf>) {
+    let accepts = |path: &Path| path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+    for link in links {
+        match crate::ingest::registry::classify_store_link(&link, root, &accepts) {
+            StoreLink::Alias(walked) if files.binary_search(&walked).is_ok() => {}
+            StoreLink::Dangling => {}
+            _ => {
+                crate::ingest::warn_source_skip("claude", &link, "symlink sources are not followed")
+            }
         }
     }
 }
@@ -1602,6 +1650,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn gather_skips_resume_alias_links_and_keeps_the_target() {
+        use crate::ingest::registry::StoreLink;
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+        let root = std::env::temp_dir().join(format!(
+            "agrep-claude-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let recorded = root.join("-work-app");
+        let launch = root.join("-home-user");
+        std::fs::create_dir_all(&recorded).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        let transcript = recorded.join("s1.jsonl");
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        symlink(&transcript, launch.join("s1.jsonl")).unwrap();
+        symlink(recorded.join("gone.jsonl"), launch.join("gone.jsonl")).unwrap();
+        let mut files = Vec::new();
+        let mut links = Vec::new();
+        for dir in [&recorded, &launch] {
+            super::gather_jsonl(dir, &mut files, &mut links, 0);
+        }
+        files.sort_unstable();
+        assert_eq!(files, std::slice::from_ref(&transcript));
+        assert_eq!(links.len(), 2);
+        let accepts = |path: &Path| path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        let kinds: Vec<&str> = links
+            .iter()
+            .map(
+                |link| match crate::ingest::registry::classify_store_link(link, &root, &accepts) {
+                    StoreLink::Alias(walked) => {
+                        assert!(files.binary_search(&walked).is_ok());
+                        "alias"
+                    }
+                    StoreLink::Dangling => "dangling",
+                    StoreLink::Foreign => "foreign",
+                },
+            )
+            .collect();
+        let mut kinds = kinds;
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["alias", "dangling"]);
+        super::warn_foreign_links(&root, &files, links);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn project_root_skips_code_containers_but_keeps_real_segments() {
         let root = |dir: &str| super::project_root(dir);
@@ -1929,13 +2028,18 @@ mod tests {
         );
         let (_, events, outcome) = parse_file(&path);
         assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
+        // no reply text follows any of these calls, so each trails its turn
         let linked: Vec<_> = events
             .iter()
             .map(|e| {
+                let meta = e
+                    .meta
+                    .strip_suffix(crate::ingest::AFTER_REPLY_META)
+                    .expect("a call no reply followed carries the fact");
                 (
                     e.call_id.as_str(),
                     e.child_session.as_str(),
-                    e.meta.as_str(),
+                    meta.trim_end(),
                 )
             })
             .collect();
@@ -2387,5 +2491,223 @@ mod tests {
         ] {
             assert_eq!(agent_task_session(task_id).as_deref(), session, "{task_id}");
         }
+    }
+
+    fn blocks(ts: &str, content: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "assistant", "sessionId": "s-main", "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-sonnet-4", "content": content}})
+    }
+
+    fn tool_result(ts: &str, id: &str, content: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "user", "sessionId": "s-main", "timestamp": ts,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "is_error": false, "content": content}]}})
+    }
+
+    #[test]
+    fn calls_after_a_rows_last_text_block_trail_until_the_next_prompt() {
+        let root = scratch("reply-order");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00Z", "run it"),
+                // text before the call in one row: the call trails; a later row answers it
+                blocks(
+                    "2026-05-01T10:00:05Z",
+                    serde_json::json!([
+                    {"type": "text", "text": "Running it."},
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "make"}}]),
+                ),
+                tool_result("2026-05-01T10:00:09Z", "t1", serde_json::json!("ok")),
+                blocks(
+                    "2026-05-01T10:00:10Z",
+                    serde_json::json!([
+                    {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "a"}},
+                    {"type": "text", "text": "Read it."}]),
+                ),
+                tool_result("2026-05-01T10:00:11Z", "t2", serde_json::json!("body")),
+                // a compact summary continues the turn: calls after the last text still trail
+                serde_json::json!({"type": "user", "userType": "external", "sessionId": "s-main",
+                    "isCompactSummary": true, "timestamp": "2026-05-01T10:01:00Z",
+                    "message": {"role": "user", "content": "Summary so far."}}),
+                blocks(
+                    "2026-05-01T10:01:05Z",
+                    serde_json::json!([
+                    {"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "make 2"}}]),
+                ),
+                prompt("2026-05-01T10:10:00Z", "and again"),
+                blocks(
+                    "2026-05-01T10:10:05Z",
+                    serde_json::json!([
+                    {"type": "text", "text": "  "},
+                    {"type": "tool_use", "id": "t4", "name": "Bash", "input": {"command": "make 3"}}]),
+                ),
+                blocks(
+                    "2026-05-01T10:10:09Z",
+                    serde_json::json!([{"type": "text", "text": "Done."}]),
+                ),
+            ],
+        );
+        let (messages, events, _) = parse_file(&path);
+        assert_eq!(
+            messages.iter().map(|m| &*m.reply).collect::<Vec<_>>(),
+            ["Running it. Read it.", "", "Done."]
+        );
+        let facts: Vec<(&str, bool)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.call_id.as_str(),
+                    e.meta.contains(crate::ingest::AFTER_REPLY_META),
+                )
+            })
+            .collect();
+        assert_eq!(
+            facts,
+            [("t1", false), ("t2", false), ("t3", true), ("t4", false)]
+        );
+        // the join between "Running it." and "Read it." had t1 and t2 before the text
+        let shapes: Vec<(Vec<u32>, Vec<u8>)> = messages
+            .iter()
+            .map(|m| (m.reply_shape.breaks.clone(), m.reply_shape.worked.clone()))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                (vec![11], vec![crate::model::WORKED_YES]),
+                (vec![], vec![]),
+                (vec![], vec![])
+            ]
+        );
+        // a closing block with no call between: the join records no work
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T11:00:00Z", "plan it"),
+                blocks(
+                    "2026-05-01T11:00:05Z",
+                    serde_json::json!([
+                    {"type": "text", "text": "Next steps:\n- a\n- b"}]),
+                ),
+                blocks(
+                    "2026-05-01T11:00:09Z",
+                    serde_json::json!([
+                    {"type": "text", "text": "Thanks!"}]),
+                ),
+            ],
+        );
+        let (messages, _, _) = parse_file(&path);
+        assert_eq!(messages[0].reply_shape.worked, [crate::model::WORKED_NO]);
+        // a delegation is work; across a compaction the recap row's lead join records the
+        // work since the previous row's last block (the Agent call and the Edit after the recap)
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T12:00:00Z", "fix it"),
+                blocks(
+                    "2026-05-01T12:00:05Z",
+                    serde_json::json!([
+                    {"type": "text", "text": "Next steps:\n- a\n- b"},
+                    {"type": "tool_use", "id": "a1", "name": "Agent",
+                     "input": {"prompt": "do a", "subagent_type": "worker"}}]),
+                ),
+                tool_result("2026-05-01T12:00:30Z", "a1", serde_json::json!("did a")),
+                serde_json::json!({"type": "user", "userType": "external", "sessionId": "s-main",
+                    "isCompactSummary": true, "timestamp": "2026-05-01T12:01:00Z",
+                    "message": {"role": "user", "content": "Summary so far."}}),
+                blocks(
+                    "2026-05-01T12:01:05Z",
+                    serde_json::json!([
+                    {"type": "tool_use", "id": "e1", "name": "Edit", "input": {"file_path": "b"}}]),
+                ),
+                tool_result("2026-05-01T12:01:06Z", "e1", serde_json::json!("ok")),
+                blocks(
+                    "2026-05-01T12:01:09Z",
+                    serde_json::json!([{"type": "text", "text": "Fixed a and b."}]),
+                ),
+            ],
+        );
+        let (messages, _, _) = parse_file(&path);
+        let leads: Vec<(&str, u8)> = messages
+            .iter()
+            .map(|m| (&*m.who, m.reply_shape.lead))
+            .collect();
+        assert_eq!(
+            leads,
+            [
+                ("user", crate::model::WORKED_NO),
+                ("recap", crate::model::WORKED_YES)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn todo_writes_and_task_listings_keep_their_facts_past_the_display_cap() {
+        let root = scratch("task-state");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let todos: Vec<serde_json::Value> = (0..12)
+            .map(|n| {
+                serde_json::json!({"content": format!("port module {n} {}", "x".repeat(70)),
+                                        "status": "pending", "activeForm": "Porting"})
+            })
+            .collect();
+        let listing = (1..=14)
+            .map(|n| {
+                format!(
+                    "#{n} [pending] Port module {n} of the service {}",
+                    "y".repeat(40)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00Z", "port them"),
+                blocks(
+                    "2026-05-01T10:00:05Z",
+                    serde_json::json!([
+                    {"type": "tool_use", "id": "w1", "name": "TodoWrite", "input": {"todos": todos}},
+                    {"type": "tool_use", "id": "u1", "name": "TaskUpdate", "input":
+                        {"taskId": "3", "status": "completed", "description": "Ported it."}},
+                    {"type": "tool_use", "id": "l1", "name": "TaskList", "input": {}},
+                    {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "ls"}}]),
+                ),
+                tool_result(
+                    "2026-05-01T10:00:06Z",
+                    "w1",
+                    serde_json::json!("Todos have been modified successfully."),
+                ),
+                tool_result(
+                    "2026-05-01T10:00:07Z",
+                    "u1",
+                    serde_json::json!("Updated task #3 status, description"),
+                ),
+                tool_result(
+                    "2026-05-01T10:00:08Z",
+                    "l1",
+                    serde_json::json!([{"type": "text", "text": listing}]),
+                ),
+                tool_result("2026-05-01T10:00:09Z", "b1", serde_json::json!("ok")),
+            ],
+        );
+        let (_, events, _) = parse_file(&path);
+        let by_id = |id: &str| events.iter().find(|e| e.call_id == id).unwrap();
+        let write = by_id("w1");
+        assert!(write.input.ends_with('…') && write.input_chars > crate::ingest::EVENT_CAP);
+        let state: serde_json::Value = serde_json::from_str(&write.state).unwrap();
+        assert_eq!(state["todos"].as_array().unwrap().len(), 12);
+        assert_eq!(state["todos"][11]["status"], "pending");
+        assert!(state["todos"][0].get("activeForm").is_none());
+        assert_eq!(by_id("u1").input, "Ported it.");
+        assert_eq!(by_id("u1").state, r#"{"status":"completed","taskId":"3"}"#);
+        let list = by_id("l1");
+        assert!(list.output.ends_with('…') && list.output_chars > crate::ingest::EVENT_CAP);
+        let state: serde_json::Value = serde_json::from_str(&list.state).unwrap();
+        assert_eq!(state["listing"], listing);
+        assert_eq!(by_id("b1").state, "");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

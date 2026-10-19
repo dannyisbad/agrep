@@ -105,6 +105,50 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
         self.assertFalse(readiness["current_generation"])
         self.assertFalse(readiness["complete"])
 
+    def test_every_searchable_coherence_state_keeps_the_full_governor(
+            self) -> None:
+        # The scheduler's catch-up governor keys on surface's searchable set;
+        # every state real coherence can serve queries from must be in it.
+        import surface_policy as surface
+
+        source = _source("current")
+        self._publish(source)
+        seen = {}
+        with mock.patch.object(semantic, "source_generation", return_value=source):
+            seen["current"] = semantic.embedding_coherence()
+        self.meta.unlink()
+        for path in (self.root / embedding_segments.SEGMENT_DIR).iterdir():
+            path.unlink()
+        self._publish(source, total=3)
+        with mock.patch.object(semantic, "source_generation", return_value=source):
+            seen["partial"] = semantic.embedding_coherence()
+        publication = common.FamilyPublication(
+            signature="committed", signature_sha256=source["ingest_signature"],
+            stamp="stable", moving=True)
+        with mock.patch.object(
+                common, "transcript_generation",
+                side_effect=common.TranscriptPublicationRace("mid-publish")), \
+                mock.patch.object(
+                    common, "read_family_publication",
+                    return_value=publication):
+            seen["published"] = semantic.embedding_coherence()
+        with mock.patch.object(
+                semantic, "source_generation", return_value=_source("newer")):
+            seen["stale"] = semantic.embedding_coherence()
+        for label, coherence in seen.items():
+            with self.subTest(state=label):
+                self.assertEqual(coherence["state"], label)
+                self.assertEqual(
+                    coherence["state"] in surface.SEMANTIC_SEARCHABLE_STATES,
+                    bool(coherence["searchable"]))
+        probes = (lambda: 0.9, lambda: (True, 10), lambda: 30.0)
+        for state in surface.SEMANTIC_SEARCHABLE_STATES:
+            with self.subTest(state=state):
+                self.assertEqual(
+                    surface.lane_semantic_deferral(state, *probes).code,
+                    "battery")
+        self.assertIsNone(surface.lane_semantic_deferral("stale", *probes))
+
     def test_v2_stale_corrupt_and_movement_fail_closed(self) -> None:
         source = _source("published")
         self._publish(source)
@@ -151,6 +195,17 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
         self.assertTrue(flat["searchable"])
         self.assertEqual(flat["layout"], "flat-v1")
         self.assertTrue(flat["migration_pending"])
+        # The flat layout re-opens the metadata for its profile; an open a
+        # publisher's replace denies is movement, never an unavailable profile.
+        with mock.patch.object(semantic, "source_generation", return_value=source), \
+                mock.patch.object(semantic, "_WINDOWS", True), \
+                mock.patch.dict(semantic._DENIED_OPEN, {"since": None, "last": None}), \
+                mock.patch.object(
+                    common, "read_index_meta",
+                    side_effect=PermissionError(13, "Access is denied")):
+            denied = semantic.embedding_coherence()
+        self.assertFalse(denied["searchable"])
+        self.assertEqual(denied["state"], "unstable-embeddings")
 
     def test_current_flat_layout_schedules_background_migration(self) -> None:
         coherence = {

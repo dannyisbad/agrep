@@ -25,10 +25,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import generous_routine_budget, isolate_data_dir
 
 isolate_data_dir()
 import cli  # noqa: E402
+
+setUpModule, tearDownModule = generous_routine_budget()
 import dist  # noqa: E402
 import indexd_runtime  # noqa: E402
 import surface_policy as surface  # noqa: E402
@@ -62,6 +64,45 @@ class IdentityRecordTests(unittest.TestCase):
                 # a replaced binary must never inherit the old record
                 binary.write_bytes(b"different ingest binary bytes")
                 self.assertIsNone(runtime.recorded_binary_identity(binary))
+
+
+@contextlib.contextmanager
+def _recording_worker_pids():
+    """Pids of every fork-context multiprocessing worker started inside the block."""
+    import multiprocessing.context as context
+    pids: list[int] = []
+    process_type = context.ForkProcess
+    real_start = process_type.start
+
+    def start(self):
+        real_start(self)
+        pids.append(self.pid)
+    with mock.patch.object(process_type, "start", start):
+        yield pids
+
+
+@contextlib.contextmanager
+def _pinned_identity_clock(*, expire_after: int | None = None):
+    """A clock for cli's identity deadline that a loaded host cannot move.
+
+    The first reading sets the deadline; every later reading sits far before
+    it, so each poll blocks until the worker answers however slow the fork is.
+    After ``expire_after`` results the clock jumps past the deadline instead,
+    for a deterministic timeout. Only cli's view of ``time`` is replaced."""
+    import itertools
+    import types
+    before = (itertools.repeat(-1e6) if expire_after is None
+              else itertools.repeat(-1e6, expire_after))
+    readings = itertools.chain([0.0], before, itertools.repeat(1e9))
+
+    def monotonic() -> float:
+        return next(readings)
+
+    fake = types.SimpleNamespace(**{
+        name: getattr(time, name) for name in dir(time) if not name.startswith("_")})
+    fake.monotonic = monotonic
+    with mock.patch.object(cli, "time", fake):
+        yield
 
 
 class BuildIdentityTests(unittest.TestCase):
@@ -373,45 +414,70 @@ class BuildIdentityTests(unittest.TestCase):
 
     @unittest.skipIf(cli.WIN, "fork-only worker timing fixture")
     def test_writer_identity_worker_enforces_its_deadline(self) -> None:
-        def slow_writer(*_args, **_kwargs):
-            time.sleep(2.0)
-            return "a" * 20
+        # Load-independent evidence of a stopped worker: its pid is gone the moment
+        # the call returns, and its slow function never records completion even
+        # after the sleep it was interrupted in has elapsed.
+        with tempfile.TemporaryDirectory() as td:
+            completed = Path(td) / "completed"
+            sleep_s = 0.5
 
-        started = time.monotonic()
-        with mock.patch.object(
-                indexd_runtime, "derived_writer_build_id",
-                side_effect=slow_writer), self.assertRaises(TimeoutError):
-            cli._bounded_binary_identity(
-                cli.common.ingest_bin(), timeout_s=0.01)
-        self.assertLess(time.monotonic() - started, 0.75)
+            def slow_writer(*_args, **_kwargs):
+                time.sleep(sleep_s)
+                completed.touch()
+                return "a" * 20
+
+            with _recording_worker_pids() as pids, mock.patch.object(
+                    indexd_runtime, "derived_writer_build_id",
+                    side_effect=slow_writer), self.assertRaises(TimeoutError):
+                cli._bounded_binary_identity(
+                    cli.common.ingest_bin(), timeout_s=0.01)
+            self.assertEqual(len(pids), 1, pids)
+            self.assertFalse(cli.common.pid_alive(pids[0]), "the worker was left running")
+            time.sleep(sleep_s + 0.2)
+            self.assertFalse(completed.exists(), "the worker outlived its deadline")
 
     @unittest.skipIf(cli.WIN, "fork-only worker timing fixture")
     def test_native_timeout_preserves_a_verified_writer_identity(self) -> None:
-        def slow_native(*_args, **_kwargs):
-            time.sleep(2.0)
-            return "b" * 20
+        # The writer answers inside the deadline, the native hasher blocks far
+        # past it: the pinned clock expires right after the writer's result, so
+        # a slow fork on a loaded host cannot turn this into a writer timeout.
+        with tempfile.TemporaryDirectory() as td:
+            completed = Path(td) / "completed"
 
-        started = time.monotonic()
-        with mock.patch.object(
-                indexd_runtime, "derived_writer_build_id",
-                return_value="a" * 20), mock.patch.object(
-                    cli.dist, "native_binary_build_id",
-                    side_effect=slow_native):
-            identity = cli._bounded_binary_identity(
-                cli.common.ingest_bin(), timeout_s=0.01)
-        self.assertLess(time.monotonic() - started, 0.75)
-        self.assertEqual(identity["writer_build_id"], "a" * 20)
-        self.assertEqual(identity["writer_build_state"], "verified")
-        self.assertIsNone(identity["native_binary_build_id"])
-        self.assertEqual(
-            identity["native_binary_build_state"], "unavailable")
+            def slow_native(*_args, **_kwargs):
+                time.sleep(30.0)
+                completed.touch()
+                return "b" * 20
+
+            with _recording_worker_pids() as pids, mock.patch.object(
+                    indexd_runtime, "derived_writer_build_id",
+                    return_value="a" * 20), mock.patch.object(
+                        cli.dist, "native_binary_build_id",
+                        side_effect=slow_native), \
+                    _pinned_identity_clock(expire_after=1):
+                identity = cli._bounded_binary_identity(
+                    cli.common.ingest_bin(), timeout_s=2.0)
+            self.assertIn("exceeded 2.00s deadline",
+                          identity["native_binary_build_detail"])
+            self.assertEqual(identity["writer_build_id"], "a" * 20)
+            self.assertEqual(identity["writer_build_state"], "verified")
+            self.assertIsNone(identity["native_binary_build_id"])
+            self.assertEqual(
+                identity["native_binary_build_state"], "unavailable")
+            self.assertEqual(len(pids), 1, pids)
+            self.assertFalse(cli.common.pid_alive(pids[0]), "the worker was left running")
+            self.assertFalse(completed.exists(), "the hasher completed inside the deadline")
 
     @unittest.skipIf(cli.WIN, "fork-only worker patch fixture")
     def test_malformed_native_identity_does_not_erase_writer_identity(self) -> None:
+        # Both results are immediate once the fork lands; the pinned clock
+        # waits for them instead of racing the host, which at load 50+ spent
+        # a 0.10 s deadline on the fork alone.
         with mock.patch.object(
                 indexd_runtime, "derived_writer_build_id",
                 return_value="a" * 20), mock.patch.object(
-                    cli.dist, "native_binary_build_id", return_value="bad"):
+                    cli.dist, "native_binary_build_id", return_value="bad"), \
+                _pinned_identity_clock():
             identity = cli._bounded_binary_identity(
                 cli.common.ingest_bin(), timeout_s=0.1)
         self.assertEqual(identity["writer_build_id"], "a" * 20)
@@ -645,6 +711,74 @@ class StatusDegradedStateTests(unittest.TestCase):
         self.assertOneCommandLine(rendered, "agrep doctor")
         self.assertIn("another agrep version", rendered)
 
+    def test_a_corpus_journal_is_an_index_pass_never_another_version(self) -> None:
+        # A killed pass's journal and a live same-version pass both used to read as
+        # 'another agrep version is using the search index'.
+        rendered = render(
+            index_state="interrupted-pass", search_index_ready=False,
+            search_index_state="interrupted-pass")
+        self.assertOneCommandLine(rendered, "agrep index")
+        self.assertIn(surface.SEARCH_INDEX_INTERRUPTED, rendered)
+        self.assertNotIn("another agrep version", rendered)
+        writing = render(
+            index_state="busy", search_index_ready=False, search_index_state="busy",
+            search_index_code="index-pass-writing")
+        self.assertEqual(self.problem_lines(writing), [])
+
+    def test_a_newer_agrep_is_named_with_its_remedies(self) -> None:
+        # [W16 round 2] the one foreign owner the reader can end was
+        # rendered as a generic "another agrep version" pointer
+        newer = {"state": "newer-agrep", "version": 2, "format": 1,
+                 "detail": "the data dir was written by a newer agrep (...)"}
+        rendered = render(
+            index_state="owned-elsewhere", search_index_ready=False,
+            search_index_state="owned-elsewhere",
+            daemon={"running": False, "blocked": True, "state": "incompatible"},
+            derived_owner=newer)
+        self.assertOneCommandLine(rendered, "agrep doctor")
+        self.assertIn(
+            "a newer agrep owns this index (ownership record version 2, "
+            "format 1): upgrade agrep, or point AGREP_DATA_DIR elsewhere",
+            rendered)
+        self.assertNotIn("another agrep version", rendered)
+
+        # [round 3] `agrep setup` declines under this owner, so the enrolment
+        # hint is withheld with the index hint; both return without it
+        untaught = dict(
+            index_built=False, index_state="never-built",
+            search_index_ready=False, search_index_state="missing",
+            search_index_defect=None, agents_taught=False,
+            _repair=indexd_runtime.RepairKick(
+                False, "newer-anchor", newer["detail"]))
+        rendered = render(**untaught, derived_owner={**newer, "format": None})
+        self.assertOneCommandLine(rendered, "agrep doctor")
+        self.assertIn(
+            "no index yet - a newer agrep owns this location (ownership "
+            "record version 2): upgrade agrep, or point AGREP_DATA_DIR "
+            "elsewhere", rendered)
+        self.assertNotIn("agrep setup", rendered)
+        self.assertNotIn("do not know about agrep yet", rendered)
+        self.assertIn("do not know about agrep yet", render(
+            **{**untaught, "_repair": indexd_runtime.RepairKick(
+                False, "no-binary")}))
+        rendered = render(
+            index_state="owned-elsewhere", search_index_ready=False,
+            search_index_state="owned-elsewhere", agents_taught=False,
+            daemon={"running": False, "blocked": True, "state": "incompatible"},
+            derived_owner=newer)
+        self.assertOneCommandLine(rendered, "agrep doctor")
+        self.assertNotIn("do not know about agrep yet", rendered)
+
+        # drift under the same fence: `agrep index` would decline, so the
+        # owner line is the one line
+        rendered = render(
+            index_state="owned-elsewhere", search_index_ready=False,
+            search_index_state="owned-elsewhere",
+            freshness={"state": "index-behind"}, daemon={"running": False},
+            derived_owner=newer)
+        self.assertOneCommandLine(rendered, "agrep doctor")
+        self.assertNotIn("`agrep index`", rendered)
+
     def test_active_repair_keeps_another_running_version_quiet(self) -> None:
         rendered = render(
             index_state="owned-elsewhere", search_index_ready=False,
@@ -745,6 +879,149 @@ class IndexingAdviceTests(unittest.TestCase):
             surface.FreshnessFailure("consecutive-failures", "x", 42), "agrep")
         self.assertIn("42 attempts in a row", line)
         self.assertNotIn("streak", line)
+
+
+class StatusInterruptedPassTests(unittest.TestCase):
+    """Without a daemon a killed pass's hot event-store journal waits for `agrep index`; only
+    the read surfaces said so, and the status page stayed silent."""
+
+    def _core(self, data: Path) -> dict:
+        drift = indexd_runtime.DriftReport("current")
+        with (mock.patch.object(cli.common, "DATA_DIR", data),
+              mock.patch.object(cli.common, "INDEX_LOCK_PATH", data / ".index.lock"),
+              mock.patch.object(indexd_runtime, "indexd_resource_status",
+                                return_value={"running": False, "state": "fixture"}),
+              mock.patch.object(indexd_runtime, "observe_store_drift",
+                                return_value=([], drift)),
+              mock.patch.object(indexd_runtime, "indexing_failure", return_value=None),
+              mock.patch.object(cli.common, "index_summary", return_value=None)):
+            return cli._status_core()
+
+    @unittest.skipUnless(os.name == "posix", "needs SIGKILL")
+    def test_a_killed_passs_hot_event_journal_earns_one_line_with_the_fix(self) -> None:
+        import sqlite3
+        from _test_support import kill_mid_write
+        with tempfile.TemporaryDirectory() as raw:
+            data = Path(raw)
+            (data / "events").mkdir()
+            store = data / "events" / cli.common.EVENT_STORE_NAME
+            db = sqlite3.connect(store)
+            try:
+                db.execute("CREATE TABLE event_sessions(name TEXT PRIMARY KEY, payload BLOB)")
+                db.execute("INSERT INTO event_sessions VALUES('s1', x'00')")
+                db.commit()
+            finally:
+                db.close()
+            self.assertEqual(self._core(data)["warnings"], [])
+            kill_mid_write(store, "UPDATE event_sessions SET payload = payload || zeroblob(400000)")
+            core = self._core(data)
+        lines = [line for line in core["warnings"] if "tool events" in line]
+        self.assertEqual(len(lines), 1, core["warnings"])
+        self.assertTrue(lines[0].startswith(
+            "tool events are unavailable right now - an interrupted index pass left the event "
+            "store unreadable until the next one: `"), lines[0])
+        self.assertTrue(lines[0].endswith(" index`"), lines[0])
+        for term in DENY:
+            self.assertNotIn(term, lines[0].lower())
+        rendered = render(warnings=core["warnings"])
+        self.assertEqual(rendered.count("an interrupted index pass"), 1, rendered)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+        "chmod 000 must deny this user")
+    def test_a_journal_this_user_cannot_use_earns_one_line_with_its_fix(self) -> None:
+        # It read as 'another agrep version is using the search index', or as nothing.
+        with tempfile.TemporaryDirectory() as raw:
+            data = Path(raw)
+            (data / "events").mkdir()
+            journal = data / "events" / f"{cli.common.EVENT_STORE_NAME}-journal"
+            (data / "events" / cli.common.EVENT_STORE_NAME).write_bytes(b"x")
+            journal.write_bytes(bytes(512))
+            journal.chmod(0)
+            try:
+                core = self._core(data)
+            finally:
+                journal.chmod(0o600)
+        lines = [line for line in core["warnings"] if "cannot be updated" in line]
+        self.assertEqual(lines, [
+            f"the event store cannot be updated - its rollback journal at {journal} is not "
+            "readable and writable by you, so no index pass can use it: "
+            f"`chmod u+rw {journal}`, then `{cli.common.cli_name()} index`"])
+        rendered = render(warnings=core["warnings"], search_index_ready=False,
+                          search_index_state="sidecar-blocked", index_state="sidecar-blocked")
+        self.assertEqual(rendered.count("cannot be updated"), 1, rendered)
+        self.assertNotIn("another agrep", rendered)
+        self.assertNotIn("the index is unreadable", rendered)
+
+    SIDECAR = {"store": "search index", "kind": "rollback journal",
+               "path": "/d/corpus.db-journal", "access": "owner", "owner": "root"}
+
+    def test_a_block_comes_first_and_its_fix_is_given_once(self) -> None:
+        # `index` declines while a sidecar blocks it, so 'not searchable yet: `agrep index`'
+        # and 'out of date: `agrep index`' sent the reader to a refusal; then each repeated it.
+        import source_health
+        line = source_health.inaccessible_sidecar_line(self.SIDECAR, "agrep index")
+        with mock.patch.object(source_health, "store_sidecars_blocked",
+                               return_value=[self.SIDECAR]):
+            behind = render(warnings=[line], freshness={"state": "index-behind"},
+                            daemon={"running": False})
+            stale = render(warnings=[line], search_index_ready=False,
+                           search_index_state="stale")
+        self.assertNotIn("not searchable yet", behind)
+        self.assertIn("the search index is out of date; index updates wait on the file named "
+                      "above", stale)
+        for rendered in (behind, stale):
+            self.assertEqual(rendered.count("sudo chown $USER"), 1, rendered)
+            self.assertNotIn("`agrep index`;", rendered)
+        # with nothing blocked both lines keep their command
+        with mock.patch.object(source_health, "store_sidecars_blocked", return_value=[]):
+            self.assertIn("the search index is out of date: `agrep index`",
+                          render(search_index_ready=False, search_index_state="stale"))
+            self.assertIn("new chats since the last index are not searchable yet: `agrep index`",
+                          render(freshness={"state": "index-behind"},
+                                 daemon={"running": False}))
+
+    def test_the_block_is_listed_before_a_holds_advice(self) -> None:
+        import source_health
+        drift = indexd_runtime.DriftReport("current")
+        with tempfile.TemporaryDirectory() as raw, \
+                mock.patch.object(cli.common, "DATA_DIR", Path(raw)), \
+                mock.patch.object(cli.common, "INDEX_LOCK_PATH", Path(raw) / ".index.lock"), \
+                mock.patch.object(indexd_runtime, "indexd_resource_status",
+                                  return_value={"running": False, "state": "fixture"}), \
+                mock.patch.object(indexd_runtime, "observe_store_drift",
+                                  return_value=([], drift)), \
+                mock.patch.object(indexd_runtime, "indexing_failure",
+                                  return_value=surface.FreshnessFailure("held", "x")), \
+                mock.patch.object(surface, "indexing_advice_line", return_value="HOLD ADVICE"), \
+                mock.patch.object(source_health, "store_sidecars_blocked",
+                                  return_value=[self.SIDECAR]), \
+                mock.patch.object(cli.common, "index_summary", return_value=None):
+            warnings = cli._status_core()["warnings"]
+        self.assertEqual(len(warnings), 2, warnings)
+        self.assertTrue(warnings[0].startswith("the search index cannot be updated"), warnings)
+        self.assertEqual(warnings[1], "HOLD ADVICE")
+
+    def test_readers_name_the_block_and_any_hold_behind_it(self) -> None:
+        # With the event store blocked no pass ran, so no failure was recorded and search,
+        # around and recall showed only the generic footer.
+        import source_health
+        sidecar = {"store": "event store", "kind": "rollback journal",
+                   "path": "/d/events/.store.sqlite3-journal", "access": "mode", "owner": None}
+        with mock.patch.object(source_health, "store_sidecars_blocked", return_value=[sidecar]), \
+                mock.patch.object(source_health, "held_publication_remedy",
+                                  return_value="fix sc1 in crush"):
+            story = indexd_runtime.freshness_story()
+            promise = indexd_runtime.rebuild_promise()
+        self.assertEqual((story.state, story.code), ("unverified", "sidecar-blocked"))
+        line = surface.freshness_story_line(story)
+        self.assertTrue(line.startswith(
+            "history may be stale: the event store cannot be updated - its rollback journal at "
+            "/d/events/.store.sqlite3-journal is not readable and writable by you"), line)
+        self.assertTrue(line.endswith(" index`; fix sc1 in crush"), line)
+        self.assertTrue(promise.startswith(
+            "; index updates wait on /d/events/.store.sqlite3-journal: `chmod u+rw "), promise)
+        self.assertNotIn("rebuild on the next", promise)
 
 
 class CrashBoundaryTests(unittest.TestCase):

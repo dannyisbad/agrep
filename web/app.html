@@ -932,7 +932,9 @@
       const shown = state.hits.length;
       const total = Math.max(shown, Number(payload.total || 0));
       const exact = payload.totals_exact !== false;
-      const tools = payload.tools_excluded ? " · tool output still indexing" : "";
+      const eventsDown = payload.tools_excluded?.reason === "events-unavailable";
+      const tools = !payload.tools_excluded ? ""
+        : eventsDown ? " · tool events are unavailable right now" : " · tool output still indexing";
       if (!exact && total === 0) return `no returned hits · total unknown${meaningSuffix(payload.semantic)}${tools}`;
       const noun = total === 1 ? "hit" : "hits";
       const base = total > shown
@@ -951,7 +953,9 @@
         return `No meaning matches in ${Number(semantic.indexed || 0).toLocaleString()} of ${Number(semantic.total).toLocaleString()} indexed rows.`;
       }
       if (payload.tools_excluded) {
-        return "No prose hits; tool output is still indexing.";
+        return payload.tools_excluded.reason === "events-unavailable"
+          ? "No prose hits; tool events are unavailable right now."
+          : "No prose hits; tool output is still indexing.";
       }
       if (payload.totals_exact === false) {
         return "No hits were returned; this search did not prove there are none.";
@@ -1038,6 +1042,9 @@
           windowData.omitted_events ? `${windowData.omitted_events} tool events` : ""
         ].filter(Boolean).join(" · ");
         head.append(node("div", "cut", `view clipped${omitted ? ` · ${omitted} omitted` : ""}`));
+      }
+      if (windowData.events_unavailable) {
+        head.append(node("div", "cut", "tool events are unavailable right now · the event store is locked by an index pass, or a crashed pass left it unreadable until the next one (`agrep index` runs one where no background indexer does)"));
       }
       const turnNumbers = (windowData.turns || [])
         .map(turn => Number(turn.turn)).filter(Number.isFinite);

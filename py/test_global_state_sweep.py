@@ -43,11 +43,76 @@ class SourceInventoryTests(unittest.TestCase):
         self._tmp.cleanup()
 
     @staticmethod
-    def _state(tree: set[str]) -> dict:
+    def _state(tree: set[str], namespaces: set[str] = frozenset()) -> dict:
         return {
             "signals": {}, "env": {}, "cwd": "repo", "syspath": set(),
             "locale": "C", "limits": {}, "atexit": 0, "tree": tree,
+            "namespaces": set(namespaces),
         }
+
+    def test_a_namespace_minted_in_the_shared_base_is_a_leak(self) -> None:
+        tree = sweep._python_source_inventory(self.repo)
+        kept = {"agrep-semantic-v1-501-" + "a" * 20}
+        minted = {"agrep-semantic-v1-501-" + "b" * 20}
+        self.assertEqual(sweep._leaks(
+            self._state(tree, kept), self._state(tree, kept | minted)), [
+                "semantic coordination namespace left in the shared base: "
+                + next(iter(minted)),
+            ])
+        # One removed by the module (the harness scrubbing its own) is not a leak.
+        self.assertEqual(sweep._leaks(
+            self._state(tree, kept | minted), self._state(tree, kept)), [])
+
+    def test_only_registered_data_dirs_are_observed(self) -> None:
+        """A stranger minting in the shared base during a module is never
+        attributed to it; a data dir this process handed out is."""
+        import _test_support
+        base = _test_support.coordination_base_path()
+        with tempfile.TemporaryDirectory(prefix="agrep-sweep-attrib-") as raw:
+            root = Path(raw)
+            (root / "mine").mkdir()
+            mine = _test_support.register_data_dir(root / "mine").name
+            # A stranger's data dir is not under any fixture tree this process made.
+            theirs = _test_support.coordination_namespace_for(
+                Path("/nonexistent/other-worktree/data")).name
+            before = sweep._coordination_namespaces()
+            self.assertNotIn(mine, before)
+            try:
+                (base / theirs).mkdir(mode=0o700)   # a concurrent stranger
+                (base / mine).mkdir(mode=0o700)     # this module's own data dir
+                after = sweep._coordination_namespaces()
+                self.assertIn(mine, after - before)
+                self.assertNotIn(theirs, after)
+            finally:
+                for name in (mine, theirs):
+                    try:
+                        (base / name).rmdir()
+                    except OSError:
+                        pass
+
+    def test_namespace_leak_line_names_its_data_dir_and_module(self) -> None:
+        """A namespace minted late by module A's detached process surfaces while
+        module B runs; the line must still point at A's data dir and A."""
+        import _test_support
+        base = _test_support.coordination_base_path()
+        with tempfile.TemporaryDirectory(prefix="agrep-sweep-origin-") as raw:
+            data_dir = Path(raw) / "data"
+            data_dir.mkdir()
+            with _test_support.registering_for("test_module_a"):
+                name = _test_support.register_data_dir(data_dir).name
+            before = sweep._snapshot()
+            self.assertNotIn(name, before["namespaces"])
+            try:
+                with _test_support.registering_for("test_module_b"):
+                    (base / name).mkdir(mode=0o700)
+                    after = sweep._snapshot()
+                    lines = [line for line in sweep._leaks(before, after) if name in line]
+            finally:
+                (base / name).rmdir()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(str(data_dir), lines[0])
+        self.assertIn("test_module_a", lines[0])
+        self.assertNotIn("test_module_b", lines[0])
 
     def test_inventory_excludes_ignored_dependency_trees(self) -> None:
         for directory in (".venv", "build"):

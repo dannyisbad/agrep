@@ -22,7 +22,7 @@ import surface_policy as surface
 from session_context import SessionPrefixIndex, session_prefix_index
 
 
-SNAPSHOT_VERSION = 6
+SNAPSHOT_VERSION = 7
 DEFAULT_TTL_S = 300
 MAX_TTL_S = 900
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
@@ -93,6 +93,8 @@ class CompactPage:
     # the query was narrowed to one chat, so this page spreads over nothing
     # and the diversity caps stay off it (their own pages and continuations).
     chat_scoped: bool = False
+    # the lane excluded tool rows, so -c is a floor too and never the exact lever
+    count_floor: bool = False
 
     @property
     def lines(self) -> list[str]:
@@ -120,6 +122,7 @@ class _SnapshotData:
     total_floor: int | None = None
     total_uncounted: bool = False
     chat_scoped: bool = False
+    count_floor: bool = False
 
 
 def profile_enabled(*, classic: bool = False, json_mode: bool = False,
@@ -632,7 +635,8 @@ def _save_snapshot(records: Sequence[dict], generation_token: str, ranking_versi
                    deeper_covered: int = 0,
                    total_floor: int | None = None,
                    total_uncounted: bool = False,
-                   chat_scoped: bool = False) -> str:
+                   chat_scoped: bool = False,
+                   count_floor: bool = False) -> str:
     current = time.time() if now is None else float(now)
     ttl = max(1, min(int(ttl_s), MAX_TTL_S))
     frozen = _validate_records(list(records))
@@ -662,6 +666,7 @@ def _save_snapshot(records: Sequence[dict], generation_token: str, ranking_versi
         "total_floor": total_floor,
         "total_uncounted": total_uncounted,
         "chat_scoped": bool(chat_scoped),
+        "count_floor": bool(count_floor),
         "deeper_argv": list(argv) if argv is not None else None,
         "more_unknown": more_unknown,
         "shown_before": shown_before,
@@ -707,7 +712,8 @@ def save_snapshot(records: Sequence[dict], generation: object, ranking_version: 
                   shown_before: int = 0,
                   total_floor: int | None = None,
                   total_uncounted: bool = False,
-                  chat_scoped: bool = False) -> str:
+                  chat_scoped: bool = False,
+                  count_floor: bool = False) -> str:
     """Publish a private immutable continuation snapshot."""
     return _save_snapshot(records, generation_fingerprint(generation), ranking_version,
                           ttl_s=ttl_s, data_dir=data_dir, now=now,
@@ -716,7 +722,7 @@ def save_snapshot(records: Sequence[dict], generation: object, ranking_version: 
                           more_unknown=more_unknown,
                           shown_before=shown_before, total_floor=total_floor,
                           total_uncounted=total_uncounted,
-                          chat_scoped=chat_scoped)
+                          chat_scoped=chat_scoped, count_floor=count_floor)
 
 
 # A well-formed handle with no file behind it is an expiry far more often than
@@ -763,8 +769,8 @@ def _load_snapshot(handle: str, expected_generation: object | None, ranking_vers
     required = {
         "version", "created", "expires", "generation", "ranking_version",
         "corpus_more", "query", "exact_total", "total_floor",
-        "total_uncounted", "chat_scoped", "deeper_argv", "more_unknown",
-        "shown_before", "deeper_covered", "records",
+        "total_uncounted", "chat_scoped", "count_floor", "deeper_argv",
+        "more_unknown", "shown_before", "deeper_covered", "records",
     }
     if set(payload) != required:
         raise CompactError("continuation snapshot is corrupt")
@@ -812,7 +818,8 @@ def _load_snapshot(handle: str, expected_generation: object | None, ranking_vers
         _validate_total_floor(payload.get("total_floor"), exact_total),
         _validate_total_uncounted(payload.get("total_uncounted"),
                                   exact_total, payload.get("total_floor")),
-        _validate_flag(payload.get("chat_scoped"), "chat scope"))
+        _validate_flag(payload.get("chat_scoped"), "chat scope"),
+        _validate_flag(payload.get("count_floor"), "count basis"))
 
 
 def load_snapshot(handle: str, expected_generation: object | None, ranking_version: str,
@@ -871,7 +878,8 @@ def _page(records: Sequence[dict],
           deeper_covered: int = 0,
           total_floor: int | None = None,
           total_uncounted: bool = False,
-          chat_scoped: bool = False) -> CompactPage:
+          chat_scoped: bool = False,
+          count_floor: bool = False) -> CompactPage:
     indices, reason = _compose_page(records, byte_budget,
                                     terms_reserve=terms_reserve,
                                     requested_rows=requested_rows,
@@ -907,7 +915,7 @@ def _page(records: Sequence[dict],
                 shown_before=shown_before + len(chosen),
                 deeper_covered=deeper_covered + len(chosen),
                 total_floor=total_floor, total_uncounted=total_uncounted,
-                chat_scoped=chat_scoped)
+                chat_scoped=chat_scoped, count_floor=count_floor)
         except OSError:
             if not tolerate_save_failure:
                 raise
@@ -923,7 +931,7 @@ def _page(records: Sequence[dict],
                        tuple(deeper_argv) if deeper_argv is not None else None,
                        more_unknown or continuation_lost, shown_before,
                        requested_rows, total_floor, total_uncounted,
-                       chat_scoped)
+                       chat_scoped, count_floor)
 
 
 def start_compact(ranked_hits: Sequence[dict], render_row: Callable[[dict], str],
@@ -943,7 +951,8 @@ def start_compact(ranked_hits: Sequence[dict], render_row: Callable[[dict], str]
                   deeper_covered: int = 0,
                   total_floor: int | None = None,
                   total_uncounted: bool = False,
-                  chat_scoped: bool = False) -> CompactPage:
+                  chat_scoped: bool = False,
+                  count_floor: bool = False) -> CompactPage:
     """Create a first page, resolving a generation loader only for continuation."""
     ordered = (list(ranked_hits) if preordered
                else diversify_hits(ranked_hits, family_key))
@@ -961,7 +970,8 @@ def start_compact(ranked_hits: Sequence[dict], render_row: Callable[[dict], str]
                  tool_rescue_page=tool_rescue_page,
                  deeper_covered=deeper_covered,
                  total_floor=total_floor, total_uncounted=total_uncounted,
-                 chat_scoped=chat_scoped, tolerate_save_failure=True)
+                 chat_scoped=chat_scoped, count_floor=count_floor,
+                 tolerate_save_failure=True)
 
 
 def fixed_compact(ranked_hits: Sequence[dict], render_row: Callable[[dict], str], *,
@@ -1005,7 +1015,8 @@ def continue_compact(handle: str, expected_generation: object | None, ranking_ve
                  tolerate_save_failure=True,
                  total_floor=snapshot.total_floor,
                  total_uncounted=snapshot.total_uncounted,
-                 chat_scoped=snapshot.chat_scoped)
+                 chat_scoped=snapshot.chat_scoped,
+                 count_floor=snapshot.count_floor)
 
 
 def _common_prefix_len(a: str, b: str) -> int:

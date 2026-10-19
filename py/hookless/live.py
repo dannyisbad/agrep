@@ -79,6 +79,19 @@ def _source_reparse(found: os.stat_result) -> bool:
                 & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
+def _source_cause(error: OSError) -> str:
+    """The error without its path: the notice already names the path once,
+    and a repeated long path pushed the cause itself off the board."""
+    cause = str(getattr(error, "strerror", None) or "")
+    if cause:
+        return cause
+    text = str(error) or type(error).__name__
+    filename = getattr(error, "filename", None)
+    if filename:
+        text = text.replace(f": {filename!r}", "").replace(f": {filename}", "")
+    return text
+
+
 def _probe_source(path: str) -> os.stat_result:
     before = os.lstat(path)
     if stat.S_ISLNK(before.st_mode) or _source_reparse(before):
@@ -321,30 +334,52 @@ def _project_of(cwd: str) -> str:
     return leaf
 
 
-_ROOT_SKIP = {"users", _USER_SEG, "desktop", "documents", "downloads", "onedrive",
-              "home", "tmp", "temp", "appdata", "src"}
+# the container names the Rust ingest's project_root skips; test_live_parity_edges
+# pins this set against crates/agrep-core/src/ingest/claude.rs
+_ROOT_SKIP = frozenset({
+    "desktop", "documents", "downloads", "onedrive", "tmp", "temp", "private", "var",
+    "appdata", "local", "locallow", "roaming", "src", "projects", "project", "code",
+    "repos", "repositories", "git", "github", "work", "dev", "workspace", "workspaces",
+})
 
 
 def _project_root(path: str) -> str:
-    """Project ROOT for an arbitrary path (mirrors the Rust ingest's project_root):
-    ``~/Desktop/agrep/py/module.py`` maps to ``agrep``. Empty means no signal."""
-    p = path.replace("\\", "/")
-    home = HOME.replace("\\", "/").lower()
-    if p.lower().startswith(home):
-        p = p[len(home):]
-    skip_user = False
-    for raw in p.split("/"):
-        seg = raw.strip('"\' ')
+    """Project ROOT for an arbitrary path, an exact port of the Rust ingest's
+    ``project_root``: ``~/Desktop/projects/shop/src`` maps to ``shop``; a bare home or
+    container is "" (no signal). Live rows must spell projects like indexed rows."""
+    text = path.replace("\\", "/")
+    segs = [s for s in text.split("/") if s]
+    # UNC/WSL paths (//wsl.localhost/Ubuntu/..., //server/share/...) lead with host and share
+    if text.startswith("//"):
+        del segs[:2]
+    home_segs = [s for s in HOME.replace("\\", "/").split("/") if s]
+    if (len(segs) >= len(home_segs)
+            and all(a.lower() == b.lower() for a, b in zip(segs, home_segs))):
+        del segs[:len(home_segs)]
+    # the segment after a Users/home container is a username on ANY machine
+    after_user_container = False
+    # macOS TMPDIR: /private/var/folders/<2 chars>/<random>/T/<name>
+    after_folders = 0
+    for seg in segs:
         lower = seg.lower()
-        if skip_user:
-            skip_user = False
+        if lower.endswith(":"):
+            continue
+        if after_user_container:
+            after_user_container = False
+            continue
+        if after_folders:
+            after_folders -= 1
             continue
         if lower in ("users", "home"):
-            skip_user = True
+            after_user_container = True
             continue
-        if not seg or seg.endswith(":") or lower in _ROOT_SKIP:
+        if lower == _USER_SEG:
             continue
-        return seg
+        if lower == "folders":
+            after_folders = 3
+            continue
+        if lower not in _ROOT_SKIP:
+            return seg
     return ""
 
 
@@ -819,7 +854,7 @@ class LiveWatcher(threading.Thread):
             except FileNotFoundError:
                 continue
             except OSError as error:
-                problems[(agent, path)] = str(error)
+                problems[(agent, path)] = _source_cause(error)
         with self._state_lock:
             for key in tuple(self._degraded_sources):
                 if key[0] == agent:
@@ -829,7 +864,7 @@ class LiveWatcher(threading.Thread):
 
     def _record_source_error(self, agent: str, path: str, error: OSError) -> None:
         with self._state_lock:
-            self._degraded_sources[(agent, path)] = str(error)
+            self._degraded_sources[(agent, path)] = _source_cause(error)
 
     def _source_entries(self, agent: str, path: str):
         try:

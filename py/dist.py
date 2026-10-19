@@ -326,6 +326,16 @@ def semantic_install_hint(**values: str | None) -> str:
             "from a shell-safe path")
 
 
+def semantic_runtime_installed() -> bool:
+    """Whether the optional semantic runtime's packages are importable, without importing them."""
+    import importlib.util
+    try:
+        return all(importlib.util.find_spec(name) is not None
+                   for name in ("numpy", "onnxruntime", "tokenizers"))
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
 def runtime_build_id(*names: str) -> str:
     """Cheap identity for a resident Python component.
 

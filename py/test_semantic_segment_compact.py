@@ -409,6 +409,77 @@ class SegmentCompactionTests(unittest.TestCase):
                 compact._create_refs(Path("unused"))
         connection.close.assert_called_once_with()
 
+    def _governor_under(self, env: dict, *, memory: float, load: float,
+                        battery: tuple) -> str | None:
+        import embed
+
+        with (mock.patch.dict(os.environ, env, clear=True),
+              mock.patch.object(embed, "_normalized_load", return_value=load),
+              mock.patch.object(embed, "_battery_state", return_value=battery),
+              mock.patch.object(embed.common, "available_memory_fraction",
+                                return_value=memory)):
+            return compact._governor_reason()
+
+    def test_governor_honours_the_unblocking_pass_overrides(self) -> None:
+        # A lane at the 16-delta cap can only become searchable once this
+        # child runs; the bounded pass it unblocks ran through battery and
+        # load, so the compaction must too (memory still gates it).
+        overrides = {"AGREP_EMBED_IGNORE_BATTERY": "1",
+                     "AGREP_EMBED_IGNORE_LOAD": "1"}
+        self.assertIsNone(self._governor_under(
+            overrides, memory=0.9, load=30.0, battery=(True, 10)))
+        self.assertEqual(
+            self._governor_under(
+                overrides, memory=0.01, load=0.1, battery=(False, None)),
+            "memory pressure (1% available)")
+
+    def test_governor_stays_full_for_routine_compaction(self) -> None:
+        self.assertEqual(
+            self._governor_under(
+                {}, memory=0.9, load=30.0, battery=(False, None)),
+            "load 30.0/core")
+        self.assertEqual(
+            self._governor_under(
+                {"AGREP_EMBED_IGNORE_LOAD": "1"},
+                memory=0.9, load=0.1, battery=(True, 10)),
+            "on battery (10%)")
+
+    def test_compaction_at_the_cap_runs_under_load_with_the_overrides(
+            self) -> None:
+        import embed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            meta = root / "embeddings.meta"
+            vectors = np.asarray([[1, 0], [0, 1]], dtype=np.float32)
+            artifacts, hashes, refs = _inputs(
+                root, "base", ["a", "b"], vectors, [1, 2])
+            embedding_segments.publish_base(
+                meta, source={"ingest_signature": "one"}, model_id="model", dim=2,
+                artifacts=artifacts, ids=["a", "b"], hashes=hashes,
+                refs=refs, coverage={"total": 2})
+            overrides = {"AGREP_EMBED_IGNORE_BATTERY": "1",
+                         "AGREP_EMBED_IGNORE_LOAD": "1"}
+            with (mock.patch.dict(os.environ, overrides, clear=True),
+                  mock.patch.object(embed, "_normalized_load", return_value=30.0),
+                  mock.patch.object(embed, "_battery_state",
+                                    return_value=(True, 10)),
+                  mock.patch.object(embed.common, "available_memory_fraction",
+                                    return_value=0.9),
+                  mock.patch.object(compact, "_derive_artifacts",
+                                    side_effect=_derived)):
+                result = compact.compact(meta, force=True)
+            self.assertEqual(result["state"], "compacted", result)
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(embed, "_normalized_load", return_value=30.0),
+                  mock.patch.object(embed, "_battery_state",
+                                    return_value=(False, None)),
+                  mock.patch.object(embed.common, "available_memory_fraction",
+                                    return_value=0.9)):
+                routine = compact.compact(meta, force=True)
+            self.assertEqual(routine["state"], "deferred")
+            self.assertEqual(routine["reason"], "load 30.0/core")
+
     def test_compaction_streams_live_rows_and_preserves_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

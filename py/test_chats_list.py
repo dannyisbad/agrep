@@ -549,7 +549,10 @@ class ChatsDamagedAggregateTests(unittest.TestCase):
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = resume.main(["-l"])
         self.assertEqual(rc, 0, err.getvalue())
-        self.assertEqual(len(out.getvalue().splitlines()), len(SESSIONS))
+        # the side chat (agent-a…) resumes through its parent, so the list skips it
+        self.assertEqual(len(out.getvalue().splitlines()),
+                         sum(1 for row in SESSIONS if not row["parent"]))
+        self.assertNotIn("agent-a0000000", out.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
     def test_a_reply_digest_mutant_never_poisons_reply_expansion(self) -> None:

@@ -227,11 +227,13 @@ fn parse_with_tally(
             );
             tally.seen();
             tally.error(&format!("cannot read: {error}"));
-            return (
-                Vec::new(),
-                Vec::new(),
-                crate::ingest_cache::ReadOutcome::Skipped,
-            );
+            // A compressed session's decode and size-limit failures are its content, not a race.
+            let outcome = if path.to_string_lossy().ends_with(".jsonl.gz") {
+                crate::ingest_cache::ReadOutcome::Skipped
+            } else {
+                crate::ingest::read_failure_outcome(&error)
+            };
+            return (Vec::new(), Vec::new(), outcome);
         }
     };
     let mut records: Vec<Record> = Vec::new();
@@ -278,6 +280,7 @@ fn parse_with_tally(
     }
     let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    let mut order = crate::ingest::ReplyOrder::new();
     let mut recap_turns: Vec<u32> = Vec::new();
     let mut turn = 0u32;
     let mut model = String::new();
@@ -325,6 +328,7 @@ fn parse_with_tally(
                     reply_chars: 0,
                     side,
                     parent: parent.clone(),
+                    reply_shape: Default::default(),
                 });
                 turn += 1;
             }
@@ -363,6 +367,7 @@ fn parse_with_tally(
                         continue;
                     }
                     tally.row();
+                    order.prompt(&mut events);
                     out.push(crate::model::RawMessage {
                         agent,
                         project: project.clone(),
@@ -375,6 +380,7 @@ fn parse_with_tally(
                         reply_chars: 0,
                         side,
                         parent: parent.clone(),
+                        reply_shape: Default::default(),
                     });
                     turn += 1;
                 } else if is_role(message, "assistant") {
@@ -404,18 +410,18 @@ fn parse_with_tally(
                                 reply_chars: 0,
                                 side,
                                 parent: parent.clone(),
+                                reply_shape: Default::default(),
                             });
                             turn += 1;
                         }
                     } else {
                         if let Some(last) = out.last_mut() {
                             if !reply.trim().is_empty() {
-                                let chars = crate::ingest::append_capped(
-                                    &mut last.reply,
-                                    &reply,
-                                    crate::ingest::REPLY_CAP,
-                                );
-                                last.reply_chars += chars;
+                                let chars = crate::ingest::append_reply(last, &reply);
+                                if chars > 0 {
+                                    order.joined(&mut last.reply_shape, &events, events.len());
+                                    order.reply(events.len());
+                                }
                             }
                             if last.model.is_empty() {
                                 last.model = model.clone();
@@ -439,6 +445,7 @@ fn parse_with_tally(
                             .get("arguments")
                             .map(summarize_tool_input_with_chars)
                             .unwrap_or_default();
+                        let state = crate::ingest::task_state(name, block.get("arguments"));
                         let call_id = block
                             .get("id")
                             .and_then(|i| i.as_str())
@@ -465,6 +472,7 @@ fn parse_with_tally(
                             call_id,
                             child_session: String::new(),
                             meta: String::new(),
+                            state,
                         });
                     }
                 } else if is_role(message, "bashExecution") {
@@ -509,7 +517,10 @@ fn parse_with_tally(
                             .unwrap_or_else(|| format!("{agent}:bash:{}", record.ordinal)),
                         child_session: String::new(),
                         meta: String::new(),
+                        state: String::new(),
                     });
+                    // the user ran this (`!cmd`): never the agent's unfinished work
+                    order.exclude(events.len() - 1);
                     tally.agent_row();
                 } else {
                     // toolResult rows were consumed above; developer/custom
@@ -520,6 +531,7 @@ fn parse_with_tally(
             _ => tally.skip(crate::intake::Skip::Meta),
         }
     }
+    order.finish(&mut events);
     (
         out.into_iter()
             .map(|raw| {
@@ -864,6 +876,39 @@ mod tests {
         assert_eq!(&*messages[1].text, "earlier context recap");
         assert_eq!(&*messages[1].project, "/work/app");
         assert_eq!(&*messages[1].session, "s1");
+    }
+
+    #[test]
+    fn a_users_bash_execution_after_the_reply_never_trails_the_turn() {
+        let path = write(concat!(
+            r#"{"type":"session","id":"s9","version":3,"cwd":"/work/app"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"Fix the kilo parser test."}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Running it."},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"make test"}}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-01-02T03:04:08.000Z","message":{"role":"toolResult","toolCallId":"c1","content":[{"type":"text","text":"ok"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-01-02T03:04:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixed the kilo parser; all 12 tests pass."}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m5","parentId":"m4","timestamp":"2026-01-02T03:04:10.000Z","message":{"role":"bashExecution","command":"git status","output":"clean","exitCode":0}}"#,
+            "\n",
+            r#"{"type":"message","id":"m6","parentId":"m5","timestamp":"2026-01-02T03:04:11.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"bash","arguments":{"command":"make lint"}}]}}"#,
+            "\n",
+        ));
+        let (_messages, events, _outcome) = parse_with("pi", &path, None);
+        let _ = std::fs::remove_file(&path);
+        let facts: Vec<(&str, bool)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.call_id.as_str(),
+                    e.meta.contains(crate::ingest::AFTER_REPLY_META),
+                )
+            })
+            .collect();
+        // the user's `!git status` never trails; the agent's unanswered call after it does
+        assert_eq!(facts, [("c1", false), ("m5", false), ("c2", true)]);
     }
 
     #[test]

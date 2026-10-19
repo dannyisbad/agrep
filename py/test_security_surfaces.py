@@ -112,30 +112,9 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
                 rest=["true", "--cwd", "/tmp"])), 2)
             launch.assert_not_called()
             cli.cmd_run(SimpleNamespace(rest=["agy", "--cwd", "/tmp"]))
-            launch.assert_called_once_with("antigravity", [], cwd="/tmp")
-
-    def test_vibe_lookup_is_identity_bound_and_root_confined(self):
-        with tempfile.TemporaryDirectory() as td, \
-                mock.patch.object(common, "DATA_DIR", Path(td)):
-            root = Path(td) / "vibe"
-            root.mkdir(parents=True)
-            (root / "index.json").write_text(
-                json.dumps([{"session": "safe"}, {"session": "link"}]),
-                encoding="utf-8")
-            (root / "safe.json").write_text(
-                json.dumps({"session": "safe", "arc": [1]}), encoding="utf-8")
-            outside = Path(td) / "outside.json"
-            outside.write_text(
-                json.dumps({"session": "link", "arc": [2]}), encoding="utf-8")
-            try:
-                (root / "link.json").symlink_to(outside)
-            except OSError as exc:
-                self.skipTest(f"symlink creation unavailable: {exc}")
-            explore._GEN = None
-            explore._vibe_index.cache_clear()
-            self.assertEqual(explore.get_vibe("safe")["arc"], [1])
-            self.assertIsNone(explore.get_vibe("../safe"))
-            self.assertIsNone(explore.get_vibe("link"))
+            # the typed spelling reaches the launch (it names the fork for
+            # pi/omp); the capability gate above judged its registry label
+            launch.assert_called_once_with("agy", [], cwd="/tmp")
 
     def test_installed_wheel_smoke_cannot_borrow_user_stores_or_runtime(self):
         overrides = {

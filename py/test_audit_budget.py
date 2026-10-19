@@ -60,6 +60,30 @@ def _store_snapshot(
     }
 
 
+def _newest_stamp_ns(*paths: Path) -> int:
+    return max(
+        stamp for path in paths
+        for stamp in (path.stat().st_mtime_ns, path.stat().st_ctime_ns))
+
+
+def _settled_ns(*paths: Path) -> int:
+    """A wall clock past every path's racy window; coarse Linux ctime keeps fresh files inside it."""
+    return _newest_stamp_ns(*paths) + 3_000_000_000
+
+
+class _Clock:
+    """A monotonic clock the test advances: deadlines expire where the test says, not the host."""
+
+    def __init__(self, now: float = 1_000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class AuditBudgetTests(unittest.TestCase):
     @staticmethod
     def _cache_fixture_is_private(path: Path):
@@ -71,7 +95,10 @@ class AuditBudgetTests(unittest.TestCase):
 
     def _run(
             self, source: Path, book: dict, cache: Path, *argv: str,
-            census_side_effect=None) -> tuple[int, dict, str]:
+            census_side_effect=None,
+            observed_ns: int | None = None) -> tuple[int, dict, str]:
+        if observed_ns is None:
+            observed_ns = _settled_ns(source)
         stdout = io.StringIO()
         stderr = io.StringIO()
         census_patch = (
@@ -89,6 +116,7 @@ class AuditBudgetTests(unittest.TestCase):
                     return_value=[("codex", str(source))]), \
                 mock.patch.object(audit, "_indexed_agents", return_value=set()), \
                 mock.patch.object(audit, "_live_tokens", return_value={}), \
+                mock.patch.object(audit.time, "time_ns", return_value=observed_ns), \
                 census_patch as census, \
                 redirect_stdout(stdout), redirect_stderr(stderr):
             rc = audit.main(["--json", *argv])
@@ -100,6 +128,8 @@ class AuditBudgetTests(unittest.TestCase):
             self, *, final_boundary: str = "b" * 64,
             cached_prefix: int = 7,
             census_success_limit: int | None = None,
+            racy: bool = False,
+            source_join_limit: int = 2,
             ) -> tuple[int, dict, list[str], dict, bytes]:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -126,6 +156,9 @@ class AuditBudgetTests(unittest.TestCase):
                         "identity_sha256": witness,
                         "nonblank_lines": 1,
                     }
+            rollouts = sorted(root.glob("rollout-*.jsonl"))
+            observed_ns = (
+                _newest_stamp_ns(*rollouts) - 1 if racy else _settled_ns(*rollouts))
             with self._cache_fixture_is_private(cache):
                 self.assertTrue(audit._write_census_cache(cache, cached))
             original_cache = cache.read_bytes()
@@ -147,7 +180,7 @@ class AuditBudgetTests(unittest.TestCase):
                 del deadline
                 if label == "per-source tally join":
                     source_joins += 1
-                    if source_joins > 2:
+                    if source_joins > source_join_limit:
                         raise audit.AuditRoutineBudget(
                             "synthetic accounting cutoff")
 
@@ -177,6 +210,8 @@ class AuditBudgetTests(unittest.TestCase):
                     mock.patch.object(
                         audit, "_census_jsonl",
                         side_effect=observed_census), \
+                    mock.patch.object(
+                        audit.time, "time_ns", return_value=observed_ns), \
                     redirect_stdout(stdout):
                 rc = audit.main(["--json"])
             payload = json.loads(stdout.getvalue())
@@ -238,6 +273,69 @@ class AuditBudgetTests(unittest.TestCase):
         self.assertEqual(payload["census"]["recounted_files"], 1)
         self.assertEqual(payload["census"]["pending_files"], 0)
         self.assertEqual(payload["_census_calls"], 1)
+
+    @unittest.skipIf(audit.fileops.WIN, "Windows identities carry a change token; no racy window")
+    def test_racy_identity_window_covers_the_stamp_granule_before_the_scan(self):
+        lag = 4_000_000
+        nanosecond = 1_791_640_127_901_638_897
+        whole_second = 1_791_640_127_000_000_000
+        old = nanosecond - 3_600_000_000_000
+
+        def racy(stamp, scan_start, *, ctime=None):
+            identity = (1, 2, 3, stamp, stamp if ctime is None else ctime)
+            return audit.fileops.racy_identity(identity, scan_start, scan_start)
+
+        with mock.patch.object(
+                audit.fileops, "_timestamp_clock_lag_ns", return_value=lag):
+            self.assertTrue(racy(nanosecond, nanosecond + 1))
+            self.assertTrue(racy(nanosecond, nanosecond + lag))
+            self.assertFalse(racy(nanosecond, nanosecond + lag + 1))
+            self.assertTrue(racy(old, nanosecond + 1, ctime=nanosecond))
+            # Whole-second stamps (HFS+, FAT) get a 2 s window.
+            self.assertTrue(racy(whole_second, whole_second + 1_500_000_000))
+            self.assertTrue(racy(whole_second, whole_second + 2_000_000_000 + lag - 1))
+            self.assertFalse(racy(whole_second, whole_second + 2_000_000_000 + lag))
+            self.assertFalse(racy(nanosecond + 3_000_000_000, nanosecond))
+
+    @unittest.skipIf(audit.fileops.WIN, "Windows identities carry a change token; no racy window")
+    def test_full_audit_withholds_a_racy_count_until_the_window_passes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "rollout.jsonl"
+            cache = root / "cache" / "audit.json"
+            source.write_text("{}\n", encoding="utf-8", newline="\n")
+            book = {str(source): _entry(source, seen=1)}
+            racy_rc, racy, _ = self._run(
+                source, book, cache, "--full",
+                observed_ns=_newest_stamp_ns(source) - 1)
+            racy_files = audit._read_census_cache(cache) if cache.exists() else {}
+            settled_rc, settled, _ = self._run(source, book, cache, "--full")
+            settled_files = audit._read_census_cache(cache)
+        self.assertEqual(racy_rc, 0, racy)
+        self.assertEqual(racy["census"]["recounted_files"], 1)
+        self.assertNotIn(str(source), racy_files)
+        self.assertEqual(settled_rc, 0, settled)
+        self.assertEqual(settled_files[str(source)]["nonblank_lines"], 1)
+
+    @unittest.skipIf(audit.fileops.WIN, "Windows identities carry a change token; no racy window")
+    def test_racy_source_record_is_rechecked_after_the_window(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "rollout.jsonl"
+            cache = root / "cache" / "audit.json"
+            source.write_text("{}\n", encoding="utf-8", newline="\n")
+            stamp = source.stat().st_mtime_ns
+            book = {str(source): _entry(source, seen=1)}
+            first_rc, first, _ = self._run(
+                source, book, cache, observed_ns=stamp - 1)
+            second_rc, second, _ = self._run(source, book, cache)
+        self.assertEqual(first_rc, 0, first)
+        self.assertEqual(first["census"]["recounted_files"], 1)
+        self.assertEqual(first["census"]["recounted_bytes"], 3)
+        self.assertEqual(second_rc, 0, second)
+        self.assertEqual(second["census"]["cached_files"], 0)
+        self.assertEqual(second["census"]["recounted_files"], 1)
+        self.assertEqual(second["census"]["recounted_bytes"], 3)
 
     def test_optional_and_sqlite_boundaries_use_change_sensitive_identity(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -319,6 +417,36 @@ class AuditBudgetTests(unittest.TestCase):
         self.assertNotEqual(
             restored_members["-wal"][4], wal_members["-wal"][4])
 
+    def test_default_routine_budget_binds_main_without_an_explicit_deadline(self):
+        """main() derives the routine deadline itself; a census that outlives
+        the budget on an injected clock must leave the rest pending."""
+        clock = [3000.0]
+        stall_s = 1.5  # past the 0.9 s routine budget; a fixed figure, not derived
+
+        def stalled_census(path, *, deadline=None):
+            # The census itself completes; only main()'s own shared deadline,
+            # re-checked after it, can leave the file pending.
+            clock[0] += stall_s
+            return 1
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "rollout.jsonl"
+            cache = root / "cache" / "audit.json"
+            source.write_text("{}\n", encoding="utf-8")
+            book = {str(source): _entry(source, seen=1)}
+            with mock.patch.object(audit.time, "monotonic", side_effect=lambda: clock[0]):
+                rc, payload, _ = self._run(
+                    source, book, cache, census_side_effect=stalled_census)
+            cache_created = cache.exists()
+        self.assertEqual(rc, 1, payload)
+        self.assertEqual(payload["census"]["pending_files"], 1)
+        self.assertEqual(payload["census"]["recounted_files"], 0)
+        self.assertEqual(payload["census"]["cache"], "unchanged")
+        self.assertFalse(cache_created)
+        self.assertTrue(any("shared observation budget" in line
+                            for line in payload["gap_details"]), payload["gap_details"])
+
     def test_routine_budget_expiry_is_a_visible_pending_census(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -348,28 +476,52 @@ class AuditBudgetTests(unittest.TestCase):
             with mock.patch.object(audit, "_CENSUS_CHUNK_BYTES", 3):
                 self.assertEqual(audit._census_jsonl(str(source)), 3)
 
-    def test_source_change_during_recount_is_an_error_and_is_not_cached(self):
+    def test_source_change_during_recount_is_live_retried_and_not_cached(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             source = root / "rollout.jsonl"
             cache = root / "cache" / "audit.json"
             source.write_text("{}\n", encoding="utf-8")
-            book = {str(source): _entry(source, seen=1)}
+            rounds = []
+
+            def current_book(**_kwargs):
+                # The index keeps up: every round sees a fresh tally for the grown file.
+                return {str(source): _entry(source, seen=len(rounds) + 1)}
 
             def mutate_during_census(_path, *, deadline=None):
                 del deadline
-                source.write_text("{}\n{}\n", encoding="utf-8")
-                return 2
+                rounds.append(source.stat().st_size)
+                with source.open("a", encoding="utf-8") as stream:
+                    stream.write("{}\n")
+                return len(rounds)
 
-            rc, payload, _stderr = self._run(
-                source, book, cache, "--full",
-                census_side_effect=mutate_during_census)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(audit, "_LIVE_SETTLE_S", 0.0), \
+                    mock.patch.object(
+                        audit, "_census_cache_path", return_value=cache), \
+                    self._cache_fixture_is_private(cache), \
+                    mock.patch.object(audit, "_book", side_effect=current_book), \
+                    mock.patch.object(
+                        audit, "_discovered",
+                        return_value=[("codex", str(source))]), \
+                    mock.patch.object(audit, "_indexed_agents", return_value=set()), \
+                    mock.patch.object(audit, "_live_tokens", return_value={}), \
+                    mock.patch.object(
+                        audit, "_census_jsonl", side_effect=mutate_during_census), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = audit.main(["--json", "--full"])
+            payload = json.loads(stdout.getvalue())
 
-            self.assertEqual(rc, 2, payload)
-            self.assertTrue(any(
-                "source changed while census evidence was collected" in problem
-                for problem in payload["problems"]))
+            self.assertEqual(rc, 1, payload)
+            self.assertEqual(payload["problems"], [])
+            self.assertEqual(len(rounds), 1 + audit._LIVE_SETTLE_ROUNDS)
+            self.assertEqual(payload["live"], 1)
+            self.assertIn(str(source), payload["live_details"][0])
+            self.assertEqual(payload["agents"]["codex"]["live"], 1)
+            self.assertEqual(payload["census"]["recounted_files"], 0)
             self.assertFalse(cache.exists())
+            self.assertIn("settling", stderr.getvalue())
 
     def test_cache_substitution_during_snapshot_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -527,6 +679,8 @@ class AuditBudgetTests(unittest.TestCase):
                     mock.patch.dict(
                         os.environ,
                         {"AGREP_DATA_READONLY": str(protected)}, clear=False), \
+                    mock.patch.object(
+                        audit.time, "time_ns", return_value=_settled_ns(source)), \
                     mock.patch.object(audit, "_book", return_value=book), \
                     mock.patch.object(
                         audit, "_discovered",
@@ -723,20 +877,33 @@ class AuditBudgetTests(unittest.TestCase):
             "synthetic priority census cutoff",
             payload["routine"]["deferred_reason"])
 
-    def test_priority_census_cache_update_is_withheld_on_boundary_change(self):
+    def test_priority_census_publishes_held_still_records_despite_boundary_movement(self):
         rc, payload, census_paths, stored, original = (
             self._run_priority_census_fixture(final_boundary="c" * 64))
-        self.assertEqual(rc, 2, payload)
+        self.assertEqual(rc, 1, payload)
+        self.assertEqual(payload["problems"], [])
         self.assertEqual(len(census_paths), 1)
-        self.assertEqual(
-            stored,
-            json.loads(original.decode("utf-8")))
+        self.assertIn(census_paths[0], stored["files"])
+        self.assertNotIn(census_paths[0], json.loads(original.decode("utf-8"))["files"])
         self.assertEqual(
             payload["census"]["cache"],
-            "update withheld: store boundary was not stable")
-        self.assertTrue(any(
-            "store source evidence changed during audit" in problem
-            for problem in payload["problems"]))
+            "updated with completed identity-bound evidence")
+        self.assertEqual(payload["live"], 1)
+        self.assertIn("boundary moved", payload["live_details"][0])
+
+    @unittest.skipIf(audit.fileops.WIN, "Windows identities carry a change token; no racy window")
+    def test_racy_priority_census_is_reported_once_and_not_recorded(self):
+        rc, payload, census_paths, stored, _original = (
+            self._run_priority_census_fixture(racy=True, source_join_limit=8))
+        self.assertEqual(rc, 0, payload)
+        self.assertEqual(len(census_paths), 1)
+        self.assertTrue(census_paths[0].endswith("rollout-7.jsonl"))
+        self.assertEqual(payload["census"]["cached_files"], 7)
+        self.assertEqual(payload["census"]["recounted_files"], 1)
+        self.assertEqual(payload["census"]["recounted_bytes"], 3)
+        self.assertEqual(payload["census"]["pending_files"], 0)
+        self.assertNotIn(census_paths[0], stored["files"])
+        self.assertEqual(len(stored["files"]), 7)
 
     def test_real_combined_snapshot_matches_legacy_path_and_token_sets(self):
         binary = ROOT / "target" / "release" / (
@@ -905,11 +1072,13 @@ class AuditBudgetTests(unittest.TestCase):
                 with database.open("wb") as stream:
                     stream.write(header)
                     stream.truncate(size)
-                    # Time the refusal, not write-back of the fixture's own zero fill.
                     stream.flush()
                     os.fsync(stream.fileno())
-                started = time.monotonic()
-                with mock.patch.object(audit.common, "DATA_DIR", root), \
+                # The mocks are the proof that no snapshot or content hash happened;
+                # the deadline is a fake clock so host load cannot expire it first.
+                clock = _Clock()
+                with mock.patch.object(audit.time, "monotonic", clock), \
+                        mock.patch.object(audit.common, "DATA_DIR", root), \
                         mock.patch.object(
                             audit.events, "open_sqlite_snapshot",
                             side_effect=AssertionError(
@@ -920,11 +1089,11 @@ class AuditBudgetTests(unittest.TestCase):
                                 "a size refusal proved file content")):
                     with self.assertRaisesRegex(
                             audit.AuditRoutineBudget, phrase):
-                        audit._indexed_agents(
-                            deadline=time.monotonic() + 0.5)
-                self.assertLess(time.monotonic() - started, 0.2)
+                        audit._indexed_agents(deadline=clock() + 0.5)
 
     def test_distinct_progress_handler_interrupts_at_deadline(self):
+        clock = _Clock()
+
         class InterruptibleDb:
             def __init__(self):
                 self.progress = None
@@ -937,12 +1106,24 @@ class AuditBudgetTests(unittest.TestCase):
                     self.cleared = True
 
             def execute(self, _query):
-                while self.progress is not None and not self.progress():
-                    pass
-                raise sqlite3.OperationalError("interrupted")
+                # The deadline passes only while the query runs and polls its handler;
+                # without a handler the query cannot be interrupted at all.
+                if self.progress is None:
+                    raise sqlite3.OperationalError("interrupted")
+                for _poll in range(3):
+                    if self.progress():
+                        raise sqlite3.OperationalError("interrupted")
+                    clock.advance(1.0)
+                raise AssertionError("the progress handler did not interrupt the query")
 
             def close(self):
                 self.closed = True
+
+        def stalled_open(path, timeout_s):
+            # Wall time spent before the query must not expire the deadline.
+            del path, timeout_s
+            time.sleep(0.02)
+            return connection
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -950,14 +1131,14 @@ class AuditBudgetTests(unittest.TestCase):
             database.write_bytes(
                 b"SQLite format 3\0\x00\x00\x01\x01")
             connection = InterruptibleDb()
-            with mock.patch.object(audit.common, "DATA_DIR", root), \
+            with mock.patch.object(audit.time, "monotonic", clock), \
+                    mock.patch.object(audit.common, "DATA_DIR", root), \
                     mock.patch.object(
                         audit.events, "open_sqlite_snapshot",
-                        return_value=connection):
+                        side_effect=stalled_open):
                 with self.assertRaisesRegex(
                         audit.AuditRoutineBudget, "DISTINCT census"):
-                    audit._indexed_agents(
-                        deadline=time.monotonic() + 0.005)
+                    audit._indexed_agents(deadline=clock() + 0.005)
         self.assertTrue(connection.cleared)
         self.assertTrue(connection.closed)
 
@@ -991,24 +1172,50 @@ class AuditBudgetTests(unittest.TestCase):
                     }},
                     indexed_agents=audit._indexed_cache_record(
                         identity, {"codex"})))
-            stdout = io.StringIO()
-            with mock.patch.object(audit.common, "DATA_DIR", root), \
-                    mock.patch.object(audit, "BOOK_PATH", book_path), \
-                    mock.patch.object(
-                        audit, "_census_cache_path", return_value=cache), \
-                    self._cache_fixture_is_private(cache), \
-                    mock.patch.object(
-                        audit, "_discovered",
-                        return_value=[("codex", str(source))]), \
-                    mock.patch.object(audit, "_live_tokens", return_value={}), \
-                    mock.patch.object(
-                        audit.events, "open_sqlite_snapshot",
-                        side_effect=AssertionError("DISTINCT query was rerun")), \
-                    redirect_stdout(stdout):
-                rc = audit.main(["--json"])
-        payload = json.loads(stdout.getvalue())
-        self.assertEqual(rc, 0, payload)
-        self.assertTrue(payload["routine"]["indexed_agents_from_cache"])
+            settled_ns = _settled_ns(source, database)
+            racy_ns = identity[0][1][3] - 1
+
+            def audit_at(observed_ns, **distinct):
+                stdout = io.StringIO()
+                with mock.patch.object(audit.common, "DATA_DIR", root), \
+                        mock.patch.object(audit, "BOOK_PATH", book_path), \
+                        mock.patch.object(
+                            audit, "_census_cache_path", return_value=cache), \
+                        self._cache_fixture_is_private(cache), \
+                        mock.patch.object(
+                            audit, "_discovered",
+                            return_value=[("codex", str(source))]), \
+                        mock.patch.object(audit, "_live_tokens", return_value={}), \
+                        mock.patch.object(
+                            audit.events, "open_sqlite_snapshot",
+                            **distinct) as opened, \
+                        mock.patch.object(
+                            audit.time, "time_ns", return_value=observed_ns), \
+                        redirect_stdout(stdout):
+                    rc = audit.main(["--json"])
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(rc, 0, payload)
+                return payload["routine"]["indexed_agents_from_cache"], opened.call_count
+
+            from_cache, _calls = audit_at(
+                settled_ns, side_effect=AssertionError("DISTINCT query was rerun"))
+            self.assertTrue(from_cache)
+            if audit.fileops.WIN:
+                return  # Windows identities carry a change token; there is no racy window.
+            from_cache, distinct_calls = audit_at(
+                racy_ns, wraps=audit.events.open_sqlite_snapshot)
+            self.assertFalse(from_cache)
+            self.assertEqual(distinct_calls, 1)
+
+            files_only = audit._read_census_cache(cache)
+            with self._cache_fixture_is_private(cache):
+                self.assertTrue(audit._write_census_cache(cache, files_only))
+            from_cache, distinct_calls = audit_at(
+                racy_ns, wraps=audit.events.open_sqlite_snapshot)
+            self.assertFalse(from_cache)
+            self.assertEqual(distinct_calls, 1)
+            _files, indexed_after = audit._read_audit_cache(cache)
+            self.assertIsNone(indexed_after)
 
     def test_unrelated_error_still_publishes_completed_file_census(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1070,16 +1277,18 @@ class AuditBudgetTests(unittest.TestCase):
                     redirect_stdout(stdout):
                 rc = audit.main(["--json"])
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(rc, 2, payload)
+        self.assertEqual(rc, 1, payload)
+        self.assertEqual(payload["problems"], [])
         self.assertEqual(book_reader.call_count, 1)
         self.assertEqual(indexed_reader.call_count, 1)
         self.assertTrue(any(
-            "evidence book changed" in item for item in payload["problems"]))
+            "evidence book was republished" in item
+            for item in payload["live_details"]))
         self.assertTrue(any(
-            "indexed-row evidence changed" in item
-            for item in payload["problems"]))
+            "indexed rows were republished" in item
+            for item in payload["live_details"]))
 
-    def test_final_change_time_movement_is_an_evidence_error(self):
+    def test_final_change_time_movement_is_live_not_an_error(self):
         book_before = (1, 2, 3, 4, 5)
         book_after = (1, 2, 3, 4, 6)
         indexed_before = (("", (7, 8, 9, 10, 11)),)
@@ -1102,15 +1311,66 @@ class AuditBudgetTests(unittest.TestCase):
                     redirect_stdout(stdout):
                 rc = audit.main(["--json"])
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(rc, 2, payload)
+        self.assertEqual(rc, 1, payload)
+        self.assertEqual(payload["problems"], [])
         self.assertTrue(any(
-            "evidence book changed" in item for item in payload["problems"]))
+            "evidence book was republished" in item
+            for item in payload["live_details"]))
         self.assertTrue(any(
-            "indexed-row evidence changed" in item
-            for item in payload["problems"]))
+            "indexed rows were republished" in item
+            for item in payload["live_details"]))
         self.assertFalse(payload["routine"]["indexed_agents_from_cache"])
 
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(audit.common, "DATA_DIR", root), \
+                    mock.patch.object(audit, "_census_cache_path", return_value=None), \
+                    mock.patch.object(audit, "_book", return_value={}), \
+                    mock.patch.object(audit, "_indexed_agents", return_value=set()), \
+                    mock.patch.object(audit, "_discovered", return_value=[]), \
+                    mock.patch.object(audit, "_live_tokens", return_value={}), \
+                    mock.patch.object(
+                        audit, "_optional_plain_identity",
+                        side_effect=(book_before, book_after)), \
+                    mock.patch.object(
+                        audit, "_sqlite_family_identity",
+                        side_effect=(indexed_before, indexed_after)), \
+                    redirect_stdout(stdout):
+                strict_rc = audit.main(["--json", "--strict"])
+        self.assertEqual(strict_rc, 2, stdout.getvalue())
+
     def test_thousands_of_gaps_keep_exact_total_and_bounded_details(self):
+        discovered = [
+            ("codex", f"/missing/source-{index:05d}.jsonl")
+            for index in range(5_000)
+        ]
+        stdout = io.StringIO()
+        with mock.patch.object(audit, "_census_cache_path", return_value=None), \
+                mock.patch.object(audit, "_book", return_value={}), \
+                mock.patch.object(
+                    audit, "_discovered", return_value=discovered), \
+                mock.patch.object(audit, "_indexed_agents", return_value=set()), \
+                mock.patch.object(audit, "_live_tokens", return_value={}), \
+                mock.patch.object(
+                    audit, "_stat_evidence",
+                    return_value=("s:1:3", (1, 2, 3, 1_000_000, 1_000_000))), \
+                redirect_stdout(stdout):
+            rc = audit.main(["--json"])
+        rendered = stdout.getvalue()
+        payload = json.loads(rendered)
+        self.assertEqual(rc, 1, payload)
+        self.assertEqual(payload["gaps"], 5_000)
+        self.assertEqual(
+            len(payload["gap_details"]), audit._GAP_SAMPLE_LIMIT)
+        self.assertEqual(
+            payload["gap_details_omitted"],
+            5_000 - audit._GAP_SAMPLE_LIMIT)
+        self.assertLess(len(rendered.encode("utf-8")), 128 * 1024)
+
+    def test_thousands_of_live_sources_keep_exact_total_and_bounded_details(self):
+        # Discovered paths that are gone by the time they are observed were
+        # rotated during the audit: live, one bounded sample list, exact total.
         discovered = [
             ("codex", f"/missing/source-{index:05d}.jsonl")
             for index in range(5_000)
@@ -1127,19 +1387,27 @@ class AuditBudgetTests(unittest.TestCase):
         rendered = stdout.getvalue()
         payload = json.loads(rendered)
         self.assertEqual(rc, 1, payload)
-        self.assertEqual(payload["gaps"], 5_000)
+        self.assertEqual(payload["gaps"], 0)
+        self.assertEqual(payload["live"], 5_000)
         self.assertEqual(
-            len(payload["gap_details"]), audit._GAP_SAMPLE_LIMIT)
+            len(payload["live_details"]), audit._LIVE_SAMPLE_LIMIT)
         self.assertEqual(
-            payload["gap_details_omitted"],
-            5_000 - audit._GAP_SAMPLE_LIMIT)
+            payload["live_details_omitted"],
+            5_000 - audit._LIVE_SAMPLE_LIMIT)
+        self.assertIn("removed during the audit", payload["live_details"][0])
         self.assertLess(len(rendered.encode("utf-8")), 128 * 1024)
 
     def test_join_cutoff_is_one_warning_and_accounts_untouched_sources(self):
+        clock = _Clock()
+        consumed = []
+
         class SlowBook:
             def items(self):
                 for index in range(100):
-                    time.sleep(0.002)
+                    # Each tally costs 2 ms of the fake clock, so the 50 ms work
+                    # deadline lands inside this join whatever the host is doing.
+                    clock.advance(0.002)
+                    consumed.append(index)
                     token = audit._TOKEN_ID_PREFIX + json.dumps(
                         [f"/source-{index}.jsonl", f"session-{index}"])
                     yield token, {
@@ -1152,7 +1420,8 @@ class AuditBudgetTests(unittest.TestCase):
             ("codex", f"/source-{index}.jsonl") for index in range(100)
         ]
         stdout = io.StringIO()
-        with mock.patch.object(audit, "_ROUTINE_BUDGET_S", 0.08), \
+        with mock.patch.object(audit.time, "monotonic", clock), \
+                mock.patch.object(audit, "_ROUTINE_BUDGET_S", 0.08), \
                 mock.patch.object(
                     audit, "_ROUTINE_FINAL_SNAPSHOT_RESERVE_S", 0.03), \
                 mock.patch.object(audit, "_census_cache_path", return_value=None), \
@@ -1162,12 +1431,11 @@ class AuditBudgetTests(unittest.TestCase):
                 mock.patch.object(audit, "_indexed_agents", return_value=set()), \
                 mock.patch.object(audit, "_live_tokens", return_value={}), \
                 redirect_stdout(stdout):
-            started = time.monotonic()
             rc = audit.main(["--json", "--strict"])
-            elapsed = time.monotonic() - started
         payload = json.loads(stdout.getvalue())
         self.assertEqual(rc, 1, payload)
-        self.assertLess(elapsed, 0.3)
+        self.assertLess(len(consumed), 100)
+        self.assertLessEqual(clock() - 1_000.0, 0.08)
         self.assertEqual(payload["problem_count"], 0)
         self.assertEqual(payload["gaps"], 1)
         self.assertEqual(payload["census"]["pending_files"], 100)

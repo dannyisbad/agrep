@@ -47,24 +47,34 @@ _C = surface.PALETTE
 # the caller one stderr line naming the cheaper form - never a truncation.
 _PULL_WARN_BYTES = 30_000
 _stdout_bytes = 0
+# how the pull rendered tool events: "" none, "flag" via --full/--tool-output (droppable),
+# "selected" via --who tool or a tool-result handle (--no-tools would be refused)
+_tools_rendered = ""
 
 
 def _stdout_print(value: object = "") -> None:
-    """Print one stdout line and count its rendered bytes."""
+    """Print one stdout line and count its rendered (UTF-8) bytes."""
     global _stdout_bytes
     print(value)
-    _stdout_bytes += len(str(value)) + 1
+    _stdout_bytes += len(str(value).encode("utf-8", "replace")) + 1
 
 
 def _warn_if_oversized(argv: list[str] | None) -> None:
-    """One stderr line when a window ran large; silent for bounded pulls."""
+    """One stderr line when a window ran large; silent for bounded pulls or when
+    no lever the same pull accepts would make it smaller."""
     argv = list(argv or [])
     whole = "--whole" in argv or "all" in argv
-    if _stdout_bytes < _PULL_WARN_BYTES or "--no-tools" in argv or (
-            whole and "--who" in argv):
+    if _stdout_bytes < _PULL_WARN_BYTES:
         return
-    cheaper = ("`--who user` keeps the user's turns only" if whole
-               else "`--no-tools` keeps the conversation only")
+    if whole:
+        if "--who" in argv:
+            return
+        cheaper = "`--who user` keeps the user's turns only"
+    elif _tools_rendered == "flag":
+        flag = next((f for f in ("--full", "--tool-output") if f in argv), "--full")
+        cheaper = f"dropping `{flag}` keeps the conversation only"
+    else:
+        return
     print(f"large pull: ~{_stdout_bytes // 1024}KB rendered - {cheaper}",
           file=sys.stderr)
 
@@ -703,7 +713,8 @@ def _around_scope(
         "render_order": "chronological",
         "family_widened": False,
         "project_or_folder_ranked": False,
-        "counts_state": "exact",
+        "counts_state": (
+            "events_unavailable" if window.get("events_unavailable") else "exact"),
         "tools": {
             "mode": tool_mode,
             "available": tools_available,
@@ -768,6 +779,7 @@ def _note_freshness(json_output: bool, *, checked: bool = True) -> None:
 
 
 def _main(argv: list[str] | None = None) -> int:
+    global _tools_rendered
     common.utf8_stdio()
 
     ap = surface.ArgumentParser(
@@ -942,14 +954,18 @@ def _main(argv: list[str] | None = None) -> int:
                     rescue.candidates, common.cli_name()),
                 candidates=list(rescue.candidates))
             return rc
-        if rescue.outcome == "absent":
+        # A tool handle's claim cannot be checked while the event store is unreadable: serve its
+        # turn and say why its event is missing, instead of calling the handle stale.
+        unverifiable = (rescue.outcome == "absent" and handle_event_identity is not None
+                        and bool(w.get("events_unavailable")))
+        if rescue.outcome == "absent" and not unverifiable:
             rc = _fail(
                 args.json, "content-missing",
                 "result handle no longer names the cited content; "
                 "rerun the search for a current handle",
                 session=w["session"], turn=center)
             return rc
-        found = rescue.turn
+        found = center if unverifiable else rescue.turn
         if handle_event_identity is None:
             handle_event_identity = rescue.event_identity
         if found != center:
@@ -1032,6 +1048,8 @@ def _main(argv: list[str] | None = None) -> int:
     else:
         tool_mode = "excluded"
 
+    if tool_mode != "excluded" and w.get("events_unavailable"):
+        _serve(notes, args.json, "events_unavailable")
     events_by_turn: dict[int, list[dict]] = {}
     if tool_mode != "excluded" and args.who in (None, "tool"):
         for event in w["events"]:
@@ -1113,6 +1131,9 @@ def _main(argv: list[str] | None = None) -> int:
                 if cap and len(text) > cap:
                     render_truncated_rows += 1
     shown_events = [event for events in events_by_turn.values() for event in events]
+    _tools_rendered = ("" if not shown_events else
+                       "selected" if args.who == "tool" or handle_event_identity is not None
+                       else "flag")
     selected_record_role = (
         "none" if not is_handle else
         "tool" if handle_event_identity is not None else
@@ -1283,8 +1304,8 @@ def _main(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _stdout_bytes
-    _stdout_bytes = 0
+    global _stdout_bytes, _tools_rendered
+    _stdout_bytes, _tools_rendered = 0, ""
     rc = _main(argv)
     if rc == 0:
         _warn_if_oversized(argv)
