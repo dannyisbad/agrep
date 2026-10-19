@@ -410,7 +410,7 @@ class RetainedSurfaceSecurityTest(unittest.TestCase):
         self.assertNotIn("node npm/publish.js", npm_privileged)
 
         npm_verify = _workflow_job(text, "verify-npm-release")
-        self.assertIn("--require-complete --wait-seconds 120", npm_verify)
+        self.assertIn("--require-complete --wait-seconds 1800", npm_verify)
         self.assertIn(
             "artifact-ids: ${{ needs.seal-npm-packages.outputs.artifact-id }}",
             npm_verify)

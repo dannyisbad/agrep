@@ -257,6 +257,7 @@ const CORPUS_DB_TRIGGER_NAMES: [&str; 7] = [
 ];
 const DERIVED_ADOPTION_OWNER_TOKEN_ENV: &str = "AGREP_DERIVED_ADOPTION_OWNER_TOKEN";
 const DERIVED_ADOPTION_CLAIM_TOKEN_ENV: &str = "AGREP_DERIVED_ADOPTION_CLAIM_TOKEN";
+const DERIVED_ADOPTION_WAIT_MS_ENV: &str = "AGREP_DERIVED_ADOPTION_WAIT_MS";
 const DERIVED_WRITER_IDENTITY_BLOCKED_ENV: &str = "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED";
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -892,7 +893,13 @@ fn read_daemon_owner_fields(path: &Path, name: &str) -> Result<HashMap<String, S
         }
     };
     let text = match std::str::from_utf8(&body) {
-        Ok(text) if text.ends_with('\n') => text,
+        Ok(text)
+            if text.ends_with('\n')
+                && text.bytes().filter(|byte| *byte == b'\n').count() == 1
+                && !text.contains('\0') =>
+        {
+            text
+        }
         _ => return Err(format!("freshness-daemon owner {name} is malformed")),
     };
     let mut fields = HashMap::new();
@@ -909,15 +916,85 @@ fn read_daemon_owner_fields(path: &Path, name: &str) -> Result<HashMap<String, S
     Ok(fields)
 }
 
-fn adoption_daemon_fence(data: &Path) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+enum AdoptionFence {
+    LiveSameWriter(u32),
+    Refused(String),
+}
+
+impl From<String> for AdoptionFence {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl std::fmt::Display for AdoptionFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LiveSameWriter(pid) => {
+                write!(f, "this build is already adopting the index (pid {pid})")
+            }
+            Self::Refused(reason) => f.write_str(reason),
+        }
+    }
+}
+
+fn live_same_writer_adoption(owners: &[(String, PathBuf)], writer: &str) -> Option<u32> {
+    let mut claim = None;
+    for (name, path) in owners {
+        if !matches!(name.as_str(), ".indexd.lock" | ".indexd.v2.lock") {
+            return None;
+        }
+        let fields = read_daemon_owner_fields(path, name).ok()?;
+        let pid_text = fields.get("pid")?;
+        if !pid_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let pid = pid_text.parse::<u32>().ok()?;
+        let start = fields.get("start")?;
+        let token = fields.get("token")?;
+        if pid == 0
+            || pid > index_lock::MAX_PID
+            || !index_lock::process_is_exact_live(pid, start)
+            || fields.get("writer").map(String::as_str) != Some(writer)
+            || token.len() != 32
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        if fields.get("state").map(String::as_str) == Some("derived-adoption") {
+            if fields.len() != 5 {
+                return None;
+            }
+            let identity = (pid, token.clone());
+            if claim.as_ref().is_some_and(|prior| prior != &identity) {
+                return None;
+            }
+            claim = Some(identity);
+        } else if name != ".indexd.v2.lock"
+            || fields.get("protocol").map(String::as_str) != Some("2")
+            || std::env::var(DERIVED_ADOPTION_OWNER_TOKEN_ENV).as_deref() != Ok(token.as_str())
+        {
+            return None;
+        }
+    }
+    claim.map(|(pid, _)| pid)
+}
+
+fn adoption_daemon_fence(data: &Path) -> Option<AdoptionFence> {
     let entries = match fs::read_dir(data) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            return Some(format!(
-                "cannot inspect freshness-daemon ownership in {}: {error}",
-                data.display()
-            ));
+            return Some(
+                format!(
+                    "cannot inspect freshness-daemon ownership in {}: {error}",
+                    data.display()
+                )
+                .into(),
+            );
         }
     };
     let mut owners = Vec::new();
@@ -925,10 +1002,13 @@ fn adoption_daemon_fence(data: &Path) -> Option<String> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                return Some(format!(
-                    "cannot inspect freshness-daemon ownership in {}: {error}",
-                    data.display()
-                ));
+                return Some(
+                    format!(
+                        "cannot inspect freshness-daemon ownership in {}: {error}",
+                        data.display()
+                    )
+                    .into(),
+                );
             }
         };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -941,10 +1021,13 @@ fn adoption_daemon_fence(data: &Path) -> Option<String> {
                 Ok(false) => owners.push((name, path)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return Some(format!(
-                        "cannot inspect freshness-daemon owner {}: {error}",
-                        path.display()
-                    ));
+                    return Some(
+                        format!(
+                            "cannot inspect freshness-daemon owner {}: {error}",
+                            path.display()
+                        )
+                        .into(),
+                    );
                 }
             }
         }
@@ -979,25 +1062,34 @@ fn adoption_daemon_fence(data: &Path) -> Option<String> {
     if external.is_empty() {
         return None;
     }
+    if let Some(pid) = live_same_writer_adoption(&external, &current) {
+        return Some(AdoptionFence::LiveSameWriter(pid));
+    }
     if external.len() != 1 || external[0].0 == ".indexd.lock" {
-        return Some(format!(
-            "legacy or ambiguous freshness-daemon ownership is present ({})",
-            external
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        return Some(
+            format!(
+                "legacy or ambiguous freshness-daemon ownership is present ({})",
+                external
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into(),
+        );
     }
     let fields = match read_daemon_owner_fields(&external[0].1, &external[0].0) {
         Ok(fields) => fields,
-        Err(reason) => return Some(reason),
+        Err(reason) => return Some(reason.into()),
     };
     if fields.get("writer").map(String::as_str) != Some(current.as_str()) {
-        return Some(format!(
-            "freshness-daemon owner {} belongs to a different writing build",
-            external[0].0
-        ));
+        return Some(
+            format!(
+                "freshness-daemon owner {} belongs to a different writing build",
+                external[0].0
+            )
+            .into(),
+        );
     }
     let expected_token = match std::env::var(DERIVED_ADOPTION_OWNER_TOKEN_ENV) {
         Ok(value)
@@ -1009,17 +1101,23 @@ fn adoption_daemon_fence(data: &Path) -> Option<String> {
             value
         }
         _ => {
-            return Some(format!(
-                "freshness-daemon owner {} is not authorized for this derived write",
-                external[0].0
-            ));
+            return Some(
+                format!(
+                    "freshness-daemon owner {} is not authorized for this derived write",
+                    external[0].0
+                )
+                .into(),
+            );
         }
     };
     if fields.get("token").map(String::as_str) != Some(expected_token.as_str()) {
-        return Some(format!(
-            "freshness-daemon owner {} belongs to a different writing generation",
-            external[0].0
-        ));
+        return Some(
+            format!(
+                "freshness-daemon owner {} belongs to a different writing generation",
+                external[0].0
+            )
+            .into(),
+        );
     }
     None
 }
@@ -1033,7 +1131,7 @@ struct AdoptionClaim {
 }
 
 impl AdoptionClaim {
-    fn acquire(data: &Path) -> Result<Self, String> {
+    fn acquire(data: &Path) -> Result<Self, AdoptionFence> {
         if let Some(reason) = adoption_daemon_fence(data) {
             return Err(reason);
         }
@@ -1073,7 +1171,8 @@ impl AdoptionClaim {
                     return Err(format!(
                         "cannot publish derived-adoption claim {}: {error}",
                         path.display()
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -5136,54 +5235,85 @@ fn index_cmd(agent: &str, full: bool) -> anyhow::Result<()> {
         disclose_read_only_ownership(&format!("derived writer identity is unavailable: {reason}"));
         return Ok(());
     }
-    // A rollback journal blocks the ownership probe itself and nothing on the
-    // box would ever clear it. Reclaim it first, under the index lock the
-    // writer takes anyway, then read ownership for real.
-    let corpus = data.join("corpus.db");
-    let corpus_missing = matches!(
-        agrep_core::ingest::registry::regular_file_edge_snapshot(&corpus, 0),
-        Ok(None)
-    );
-    if !corpus_missing && hot_rollback_journal(&corpus).map_or(true, |journal| journal.is_some()) {
-        let mut journal_lock = acquire_index_lock()?;
-        let reclaimed = reclaim_cold_rollback_journal(&corpus);
-        journal_lock.release()?;
-        if let Err(detail) = reclaimed {
-            disclose_read_only_ownership(&detail);
+    let wait_budget = std::env::var(DERIVED_ADOPTION_WAIT_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|millis| std::time::Duration::from_millis(millis.min(180_000)));
+    let mut waiting_since = None;
+    let mut wait_on_adoption = |fence: &AdoptionFence| -> anyhow::Result<bool> {
+        let (AdoptionFence::LiveSameWriter(pid), Some(budget)) = (fence, wait_budget) else {
+            return Ok(false);
+        };
+        let started = waiting_since.get_or_insert_with(|| {
+            eprintln!(
+                "waiting for the freshness daemon to finish adopting the index (pid {pid}) ..."
+            );
+            Instant::now()
+        });
+        let remaining = budget.saturating_sub(started.elapsed());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "freshness daemon is still adopting the index (pid {pid}); \
+             the wait budget expired, but this adoption finishes on its own; \
+             run `agrep index` again after it completes"
+        );
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+        Ok(true)
+    };
+    let (adoption_claim, ownership_was_current) = loop {
+        // The incumbent may be replacing ownership artifacts or holding a SQLite
+        // journal; wait before probing that family or taking its index lock.
+        if wait_budget.is_some() {
+            if let Some(fence) = adoption_daemon_fence(&data) {
+                if wait_on_adoption(&fence)? {
+                    continue;
+                }
+            }
+        }
+        // A rollback journal blocks the ownership probe itself and nothing on the
+        // box would ever clear it. Reclaim it first, under the index lock the
+        // writer takes anyway, then read ownership for real.
+        let corpus = data.join("corpus.db");
+        let corpus_missing = matches!(
+            agrep_core::ingest::registry::regular_file_edge_snapshot(&corpus, 0),
+            Ok(None)
+        );
+        if !corpus_missing
+            && hot_rollback_journal(&corpus).map_or(true, |journal| journal.is_some())
+        {
+            let mut journal_lock = acquire_index_lock()?;
+            let reclaimed = reclaim_cold_rollback_journal(&corpus);
+            journal_lock.release()?;
+            if let Err(detail) = reclaimed {
+                disclose_read_only_ownership(&detail);
+                return Ok(());
+            }
+        }
+        let ownership = derived_write_ownership(&data);
+        if let DerivedWriteOwnership::Refused(reason)
+        | DerivedWriteOwnership::PostAdoptionClobber(reason) = &ownership
+        {
+            disclose_read_only_ownership(reason);
             return Ok(());
         }
-    }
-    let initial_ownership = derived_write_ownership(&data);
-    let ownership_was_current = initial_ownership == DerivedWriteOwnership::Current;
-    let adoption_claim = match initial_ownership {
-        DerivedWriteOwnership::Refused(reason)
-        | DerivedWriteOwnership::PostAdoptionClobber(reason) => {
-            disclose_read_only_ownership(&reason);
-            return Ok(());
-        }
-        // A foreign family may only converge under the index lock; the claim proves no
-        // live daemon holds it, and the locked section performs the successor takeover.
-        DerivedWriteOwnership::Foreign(reason) => match AdoptionClaim::acquire(&data) {
-            Ok(claim) => Some(claim),
+        // Retry the exclusive claim before taking .index.lock; waiting with either
+        // lock held would prevent the incumbent from completing its publication.
+        match AdoptionClaim::acquire(&data) {
+            Ok(claim) => {
+                break (Some(claim), ownership == DerivedWriteOwnership::Current);
+            }
             Err(fence) => {
-                disclose_read_only_ownership(&format!("{reason}; {fence}"));
-                return Ok(());
-            }
-        },
-        DerivedWriteOwnership::Adoption => match AdoptionClaim::acquire(&data) {
-            Ok(claim) => Some(claim),
-            Err(reason) => {
+                if wait_on_adoption(&fence)? {
+                    continue;
+                }
+                let reason = match ownership {
+                    DerivedWriteOwnership::Foreign(reason) => format!("{reason}; {fence}"),
+                    _ => fence.to_string(),
+                };
                 disclose_read_only_ownership(&reason);
                 return Ok(());
             }
-        },
-        DerivedWriteOwnership::Current => match AdoptionClaim::acquire(&data) {
-            Ok(claim) => Some(claim),
-            Err(reason) => {
-                disclose_read_only_ownership(&reason);
-                return Ok(());
-            }
-        },
+        }
     };
     let lock_path = data.join(".index.lock");
     if ownership_was_current && !full && !agrep_core::emit::on() {
@@ -5252,7 +5382,7 @@ fn index_cmd_locked(
                 return Ok(());
             }
             if let Some(reason) = adoption_daemon_fence(&data) {
-                disclose_read_only_ownership(&reason);
+                disclose_read_only_ownership(&reason.to_string());
                 return Ok(());
             }
             consume_retained_corpus_owner(&data)?;
@@ -5266,7 +5396,7 @@ fn index_cmd_locked(
                 return Ok(());
             }
             if let Some(reason) = adoption_daemon_fence(&data) {
-                disclose_read_only_ownership(&reason);
+                disclose_read_only_ownership(&reason.to_string());
                 return Ok(());
             }
             false
@@ -7852,6 +7982,77 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn same_writer_adoption_remains_fenced_with_an_exact_busy_diagnosis() {
+        let pid = std::process::id();
+        let start = super::index_lock::current_process_start_identity().unwrap();
+        let writer = agrep_core::ingest_cache::current_cache_writer_build_id();
+        let token = "c".repeat(32);
+        let data = std::env::temp_dir().join(format!(
+            "agrep-exact-adoption-{pid}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let legacy = data.join(".indexd.lock");
+        let current = data.join(".indexd.v2.lock");
+        let raw = format!(
+            "state=derived-adoption pid={pid} start={start} writer={writer} token={token}\n"
+        );
+        std::fs::write(&legacy, &raw).unwrap();
+        std::fs::write(&current, &raw).unwrap();
+        assert_eq!(
+            super::adoption_daemon_fence(&data),
+            Some(super::AdoptionFence::LiveSameWriter(pid))
+        );
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), raw);
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), raw);
+        std::fs::write(&current, raw.replace(&token, &"d".repeat(32))).unwrap();
+        assert!(matches!(
+            super::adoption_daemon_fence(&data),
+            Some(super::AdoptionFence::Refused(_))
+        ));
+
+        std::fs::remove_file(&current).unwrap();
+        for untrusted in [
+            raw.replace(&format!("start={start}"), "start=unknown"),
+            raw.replace(&format!("pid={pid}"), &format!("pid=+{pid}")),
+            raw.replace("state=derived-adoption", "state=legacy"),
+            raw.replace(&format!("token={token}"), "token=invalid"),
+            raw.replace('\n', &format!(" pid={pid}\n")),
+            raw.replace('\n', " extra=untrusted\n"),
+            raw.replace('\n', "\n\n"),
+            raw.replace('\n', "\0\n"),
+        ] {
+            std::fs::write(&legacy, &untrusted).unwrap();
+            let reason = super::adoption_daemon_fence(&data).unwrap();
+            assert!(
+                matches!(reason, super::AdoptionFence::Refused(_)),
+                "{untrusted}: {reason}"
+            );
+            assert_eq!(std::fs::read_to_string(&legacy).unwrap(), untrusted);
+        }
+        std::fs::write(&legacy, &raw).unwrap();
+        let unknown = data.join(".indexd.v3.lock");
+        std::fs::write(&unknown, &raw).unwrap();
+        assert!(super::adoption_daemon_fence(&data)
+            .unwrap()
+            .to_string()
+            .contains("legacy or ambiguous"));
+        std::fs::remove_file(unknown).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&legacy, &current).unwrap();
+            assert!(matches!(
+                super::adoption_daemon_fence(&data),
+                Some(super::AdoptionFence::Refused(_))
+            ));
+        }
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
