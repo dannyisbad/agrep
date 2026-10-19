@@ -1,14 +1,23 @@
 # agrep
 
-**agrep - agentic grep.** Memory for your AI coding agents. Eleven supported
-agent tools keep their session records on disk - Claude Code, Codex,
+**agrep - agentic grep.** Search everything you and your AI agents have done.
+Eleven agent tools keep their session records on disk - Claude Code, Codex,
 opencode, Antigravity, Kimi CLI, Cline, Gemini CLI, crush, Cursor, pi, and
 oh-my-pi (a pi fork sharing its format) - and none of them can search the
-others. agrep reads them all into one local, ranked index, so you (and your
-agents) can ask "have I hit this before?" and get the actual session back:
-search it, read the conversation around a hit, or resume it in its own
-agent. What each tool retains is up to that tool; agrep indexes what is on
-disk when it reads.
+others. agrep reads them all into one local, ranked index of every
+conversation, tool call and result, so you can:
+
+- **find** where something happened - a decision, an error, a command's
+  output, a file an agent wrote: `agrep "rate limit"`, `agrep chats "retry backoff"`
+- **open** a hit at its source, with the conversation around it:
+  `agrep around @3f2a91c4:88.d1e0`
+- **resume** that chat in its own agent, from any handle, id or project name
+  agrep printed: `agrep resume @3f2a91c4:88.d1e0`, `agrep resume payments`
+- **watch** what every agent is doing right now, across tools: `agrep board`
+
+Your agents search the same index: a short instruction block tells them agrep
+exists, so they look things up instead of re-deriving them. What each tool
+retains is up to that tool; agrep indexes what is on disk when it reads.
 
 Indexing and search are local and read-only over agent stores. Transcript content
 is never uploaded.
@@ -21,10 +30,12 @@ $ agrep recall "why the retry backoff was capped at 30s"
        what tripped the account-level throttle in us-east-1 ...
 $ agrep around @3f2a91c4:88.d1e0
     ... that turn at its source, with a surrounding window on request ...
+$ agrep resume @3f2a91c4:88.d1e0
+    ... reopens that chat in claude, in the directory it ran in ...
 ```
 
-An answer that was about to be re-derived from scratch by the agent that
-solved it twelve days ago.
+The decision, its evidence, and the chat to jump back into - twelve days
+later, in three commands.
 
 ## Quickstart
 
@@ -184,9 +195,22 @@ family, retaining whichever root or child holds the strongest evidence; this
 prevents one large agent swarm from consuming the result page without deleting
 the child answers from the index. Meaning search returns up to 10 confident
 conversation families by default (`-n` overrides the cap; weak nearest-neighbor
-tail rows stay silent). `--all-side-chats` expands sibling children into independent ranked
-slots; ordinary keyword search is already exhaustive. Codex's automatic guardian
-approval-review rollouts are internal control traffic and are not indexed as chats.
+tail rows stay silent). Codex's automatic guardian approval-review rollouts are
+internal control traffic and are not indexed as chats.
+
+Three flags touch side chats and mean three different things: `--no-side`
+(search, recall) hides side-chat *sessions* - the same set `chats` hides by
+default and `chats --side` includes; `--no-who subagent` drops only the rows a
+subagent *spoke* and leaves its chat listed; `--all-side-chats` (with `-s`) is a
+ranking switch that lets sibling children take separate slots instead of one
+best hit per family.
+
+`--project` matches a chat's stored project label exactly, or its last path
+segment, case-insensitively - so `--project shop` reaches both a pi label of
+`~/projects/shop` and a claude label of `shop`, and not
+`shop-admin`. `*` or `?` in the value make it a glob (`--project 'shop*'`);
+`--exclude-project` follows the same rule, and `--here` is shorthand for
+`--project <basename of the current directory>`.
 
 ## `around`
 
@@ -198,6 +222,8 @@ transcript:
 agrep around 11111111 144        # ±4 turns around turn 144 of that session
 agrep around 11111111:144 -C 10  # wider window; colon form pastes from --json
 agrep around @11111111:144       # compact result handle
+agrep around 11111111 --whole --who user   # the entire chat as the user's turns
+agrep around 11111111 144 -C 0 --max-chars 0   # one turn with its text uncapped
 agrep around 11111111 144 --full # same-window all-event forensic view
 ```
 
@@ -206,7 +232,10 @@ context inside human recall results; generic tool and delegated-workflow events
 stay out of the agent's attention path. A selected tool-result handle keeps that
 exact event visible and centers its preview on an input or output match.
 `--who tool` or `--tool-output N` explicitly opts into tool evidence, while
-`--full` restores the same-window forensic stream.
+`--full` restores the same-window forensic stream. `--whole` (also `-C all`)
+reads every turn of a chat under the usual per-message cap; a capped message
+ends in `[+N chars - agrep around <session> <turn> -C 0 --max-chars 0]`, the
+one pointer `around` and `recall` share for printing that message whole.
 Ingest safety caps remain labeled.
 
 ## `postcompact`
@@ -226,9 +255,52 @@ agrep postcompact --json          # one bounded structured packet
 
 The compaction integrations (installed by setup, `--no-hook` to skip) make the
 summary itself carry the recovery route, so resumed agents reach for it without
-being told. The pi/oh-my-pi extension also exports the exact live session ID,
-lets their summarizer carry the same recovery schema, and injects hidden
-next-turn guidance only when it observes a real compaction boundary.
+being told. The pi/oh-my-pi extension also names the live session for every
+`agrep` call made from its tool shells (it publishes the session per process,
+so search and recall can hide that session's live context window and label
+its older turns `~self`), lets their summarizer carry the same recovery
+schema, and injects hidden next-turn guidance only when it observes a real
+compaction boundary.
+
+## `summary`
+
+A per-project briefing from your history - what was worked on, what is still
+open, and roughly how long it took - for a status update or before a call:
+
+```
+agrep summary                           # last 7 days, most active project first
+agrep summary --project shop --since 30d
+agrep summary pending                   # open items across projects, most confident first
+agrep summary time --group week         # estimated active time per project
+```
+
+Open items come from each chat's last turn: the agent asked you something,
+left unchecked next steps or todo items, or never finished. Each carries a
+confidence label and a handle to open it. Time is estimated from turn
+timestamps with a 20-minute idle cap and counts a chat and its side chats
+once; it is never elapsed span or billable time. An agent calling `summary`
+does not see its own current session.
+
+## `why`
+
+When a chat you know exists doesn't show up, `agrep why` says why:
+
+```
+agrep why 4f3c2a1b                            # a session id, prefix or printed handle
+agrep why ~/.claude/projects/x/abc.jsonl      # or the transcript file itself
+```
+
+The answer is one of: indexed (also under an alias or as a side chat), written
+after the last index, behind in the search database, outside every store agrep
+reads, discovered but every record skipped (with counts by reason), or
+unreadable - each with the file the answer came from and the next step.
+"Indexed" means what `agrep search` would serve: while the search database is
+still building, missing, busy under a writer's lock, of another schema or
+unreadable, searches scan the transcripts directly, so a chat they publish is
+indexed and `why` says why (pointing at `agrep doctor` when the database is
+damaged); a chat whose transcript vanished but which the lagging search
+database still serves is reported from those stored rows. It never indexes or
+changes anything.
 
 
 ## Meaning search
@@ -260,10 +332,12 @@ Embeddings maintain themselves newest-first in the background:
 the first searchable publication is capped at 128 rows, then reports partial
 coverage until the backfill finishes. Background work adapts its batch size, priority,
 and CPU use to activity, battery, and memory pressure. Old or mismatched vectors
-are never served. The model is English-only and embeds the first 1,024 model tokens
-of each message or reply row; keyword search still indexes full text. If semantic
-artifacts are incomplete, automatic recall falls back to keyword results rather
-than waiting.
+are never served. The model is English-only with a 1,024-token window; a message
+or reply longer than one window embeds as several overlapping chunks (about 4,096
+characters each, 10% overlap, capped at 32 chunks per row with the tail sampled),
+so a phrase deep in a long reply is still reachable by meaning. Keyword search
+indexes full text regardless. If semantic artifacts are incomplete, automatic
+recall falls back to keyword results rather than waiting.
 
 ## Agentic-first design
 
@@ -309,9 +383,10 @@ was omitted, and a compacted `session_start` queues hidden recovery for the next
 turn. The extension exports their exact session ID so bare `agrep postcompact`
 resolves the right conversation; it never hooks ordinary user messages.
 
-Both blocks stay short and delegate the full command surface to
-`agrep --help` (and each command's own `--help`), which lists the options
-shipped with the installed version.
+Both blocks stay short and carry the flags agents reach for most inline (the
+per-command count flags, around's context and tool-output caps, recall's
+budget), so a first call needs no help lookup; `agrep <command> --help` lists
+the rest of the options shipped with the installed version.
 
 [cc]: https://www.anthropic.com/constitution
 [tcw]: https://www.anthropic.com/research/teaching-claude-why
@@ -429,7 +504,7 @@ syntax).
 | Antigravity | `~/.gemini/antigravity-cli/brain/<uuid>/` |
 | Kimi CLI | `~/.kimi/sessions/<workdir-hash>/<uuid>/` |
 | Cline | each editor's `globalStorage/saoudrizwan.claude-dev/tasks/`, plus `~/.cline/data/` |
-| Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.json` |
+| Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.jsonl`, plus legacy `session-*.json` (a `.json` with a `.jsonl` beside it was migrated into it and is skipped) |
 | crush | `~/.local/share/crush/crush.db` (SQLite; also legacy `~/.crush/`), plus each per-project `crush.db` at the `data_dir` its registry (`projects.json`) names - wherever that directory lives |
 | Cursor | `Cursor/User/globalStorage/state.vscdb` under the editor's per-OS app-data dir (SQLite) |
 | pi / oh-my-pi | `~/.pi/agent/sessions/<cwd-slug>/*.jsonl` and `~/.omp/agent/sessions/<cwd-slug>/*.jsonl` |
@@ -517,6 +592,8 @@ agrep resume <id>        # reopen a past session in its own agent, cd'd there
 agrep run <agent> [-- <args...>] # launch captured; pass agent arguments through
 agrep tail               # live agent events as JSON lines (--snapshot: state now)
 agrep chats [topic]      # indexed chats; topic searches identity + contents
+agrep summary            # per-project briefing: worked on, open items, estimated time
+agrep why <ref>          # why a chat is or isn't indexed, with evidence
 agrep board              # bounded live-activity window across agents
 agrep ui                 # private read-only History + live Board explorer
 agrep serve              # serve that explorer without opening a browser

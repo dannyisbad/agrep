@@ -13,6 +13,7 @@ structurally.
 """
 from __future__ import annotations
 
+import builtins
 import json
 import tempfile
 import unittest
@@ -43,6 +44,57 @@ class CapabilityGate(unittest.TestCase):
             ok, reason = mlx_embed.available()
         self.assertFalse(ok)
         self.assertIn("off", reason)
+
+    def test_a_failed_import_is_never_asked_twice_in_one_process(self) -> None:
+        # Metal-less boxes: the first `import mlx.core` raises, the second
+        # aborts the interpreter inside nanobind - doctor asks twice per run.
+        real_import = builtins.__import__
+        attempts = []
+
+        def failing_import(name, *args, **kwargs):
+            if name == "mlx.core" or name.startswith("mlx."):
+                attempts.append(name)
+                raise ImportError(
+                    "[metal::load_device] No Metal device available")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(mlx_embed, "_apple_silicon", return_value=True), \
+                mock.patch.dict("os.environ", {"AGREP_MLX": ""}), \
+                mock.patch.object(mlx_embed, "_IMPORT_VERDICT", None), \
+                mock.patch.object(builtins, "__import__", failing_import):
+            first = mlx_embed.available()
+            second = mlx_embed.available()
+        self.assertEqual(first, second)
+        self.assertFalse(first[0])
+        self.assertIn("no metal device", first[1])
+        self.assertIn("No Metal device available", first[1])
+        self.assertEqual(len(attempts), 1)
+
+    def test_a_missing_package_reads_as_missing_not_as_no_device(self) -> None:
+        real_import = builtins.__import__
+
+        def absent_import(name, *args, **kwargs):
+            if name == "mlx.core" or name.startswith("mlx."):
+                raise ModuleNotFoundError("No module named 'mlx'")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(mlx_embed, "_apple_silicon", return_value=True), \
+                mock.patch.dict("os.environ", {"AGREP_MLX": ""}), \
+                mock.patch.object(mlx_embed, "_IMPORT_VERDICT", None), \
+                mock.patch.object(builtins, "__import__", absent_import):
+            ok, reason = mlx_embed.available()
+        self.assertFalse(ok)
+        self.assertIn("mlx missing", reason)
+
+    def test_the_off_switch_and_platform_gate_precede_the_import(self) -> None:
+        # Neither gate may spend the one import this process gets.
+        with mock.patch.object(mlx_embed, "_import_verdict") as verdict:
+            with mock.patch.object(mlx_embed, "_apple_silicon", return_value=False):
+                mlx_embed.available()
+            with mock.patch.object(mlx_embed, "_apple_silicon", return_value=True), \
+                    mock.patch.dict("os.environ", {"AGREP_MLX": "off"}):
+                mlx_embed.available()
+        verdict.assert_not_called()
 
 
 class _FakeLane:
@@ -385,31 +437,57 @@ class LaneDisclosure(unittest.TestCase):
         import doctor
         metal = embedder.profile_string(embedder.LANE_METAL)
         with mock.patch.object(doctor, "_store_embedding_identity",
-                               return_value=metal):
-            row = doctor._store_lane_notice()
-        self.assertIsNotNone(row)
+                               return_value=metal), \
+                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")):
+            severity, row = doctor._store_lane_notice()
+        self.assertEqual(severity, doctor.OPT)
         self.assertIn(embedder.LANE_METAL, row)
         self.assertIn("near-threshold", row)
         self.assertIn("cpu", row)
 
-    def test_doctor_names_the_cpu_lane_and_the_upgrade_when_one_exists(self) -> None:
-        # A cpu store used to say nothing, so the case needing the disclosure
-        # most was the silent one. "approximate" belongs to metal alone.
+    def test_a_metal_store_this_box_cannot_open_is_the_only_warning(self) -> None:
+        # The row used to render WARN for every lane string, so a healthy box
+        # carried a permanent `!!`; only a lane mismatch refuses queries.
+        import doctor
+        metal = embedder.profile_string(embedder.LANE_METAL)
+        with mock.patch.object(doctor, "_store_embedding_identity",
+                               return_value=metal), \
+                mock.patch.object(mlx_embed, "available",
+                                  return_value=(False, "disabled by AGREP_MLX=off")):
+            severity, row = doctor._store_lane_notice()
+        self.assertEqual(severity, doctor.WARN)
+        self.assertIn("does not open here (disabled by AGREP_MLX=off)", row)
+        self.assertIn("refused", row)
+        self.assertIn("reindex --full", row)
+
+        # Deep already paid the model load: its probed lane outranks the gate.
+        declined = {"runtime_lane": embedder.LANE_CPU,
+                    "runtime_lane_refusal": "its parity cosine 0.90000 is below 0.97"}
+        with mock.patch.object(doctor, "_store_embedding_identity",
+                               return_value=metal), \
+                mock.patch.object(mlx_embed, "available", return_value=(True, "ok")):
+            severity, row = doctor._store_lane_notice(declined)
+        self.assertEqual(severity, doctor.WARN)
+        self.assertIn("parity cosine 0.90000", row)
+        with mock.patch.object(doctor, "_store_embedding_identity",
+                               return_value=metal), \
+                mock.patch.object(mlx_embed, "available", return_value=(False, "no")):
+            severity, _row = doctor._store_lane_notice(
+                {"runtime_lane": embedder.LANE_METAL})
+        self.assertEqual(severity, doctor.OPT)
+
+    def test_cpu_or_absent_store_does_not_raise_lane_warnings(self) -> None:
         import doctor
         cpu = embedder.PROFILE_STRING
         with mock.patch.object(doctor, "_store_embedding_identity", return_value=cpu), \
                 mock.patch.object(mlx_embed, "available", return_value=(True, "ok")):
-            upgradable = doctor._store_lane_notice()
-        self.assertIn("cpu lane", upgradable)
-        self.assertIn("metal", upgradable)
-        self.assertIn("reindex --full", upgradable)
-        self.assertNotIn("near-threshold", upgradable)
+            severity, _ = doctor._store_lane_notice()
+        self.assertEqual(severity, doctor.OPT)
 
         with mock.patch.object(doctor, "_store_embedding_identity", return_value=cpu), \
                 mock.patch.object(mlx_embed, "available", return_value=(False, "no")):
-            plain = doctor._store_lane_notice()
-        self.assertIn("cpu lane", plain)
-        self.assertNotIn("reindex", plain)
+            severity, _ = doctor._store_lane_notice()
+        self.assertEqual(severity, doctor.OPT)
 
         # No store, nothing to disclose.
         for identity in (None, ""):

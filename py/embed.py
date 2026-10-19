@@ -23,10 +23,12 @@ import argparse
 import heapq
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from collections import ChainMap, OrderedDict
 from collections.abc import Iterator, Mapping
@@ -58,7 +60,7 @@ _Q8_REQUIRED_ROWS = 100_000
 GOVERNOR_BATTERY_FLOOR_PCT = surface.SEMANTIC_GOVERNOR.battery_floor_pct
 GOVERNOR_MEMORY_FLOOR = surface.SEMANTIC_GOVERNOR.memory_floor
 GOVERNOR_LOAD_LIMIT = surface.SEMANTIC_GOVERNOR.load_limit_per_core
-_PENDING_PLAN_SCHEMA = "2"
+_PENDING_PLAN_SCHEMA = "3"
 _PENDING_PLAN_BUFFER = 4096
 
 
@@ -761,8 +763,9 @@ def _resolve_pending_messages(rows: list[tuple]) -> list[common.Message] | None:
         try:
             for mid, expected_hash, _ts, _seq in rows:
                 mid = str(mid)
-                reply = mid.endswith("#r")
-                base = mid[:-2] if reply else mid
+                logical, _chunk = common.semantic_chunk_split(mid)
+                reply = logical.endswith("#r")
+                base = logical[:-2] if reply else logical
                 try:
                     agent, tail = base.split(":", 1)
                     session, turn_raw = tail.rsplit(":", 1)
@@ -1015,7 +1018,16 @@ def _publish_state(state: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
-_text_hash = common.semantic_text_hash
+def _text_hash(text: str, _memo: list = [None, ""]) -> str:  # noqa: B006 - deliberate slot
+    """``common.semantic_text_hash`` with a one-slot identity memo.
+
+    Chunk expansion presents one long row's identical text object once per
+    store id; the memo makes those repeats O(1) instead of rehashing
+    megabytes per '#cN' sibling."""
+    if _memo[0] is not text:
+        _memo[0] = text
+        _memo[1] = common.semantic_text_hash(text)
+    return _memo[1]
 
 
 def _read_hashes(n_expected: int) -> "list[str] | None":
@@ -1046,6 +1058,117 @@ def _retained_embedding_rows(old_mat, keep: list[int] | None, *, has_pending: bo
     all_rows = (len(keep) == old_mat.shape[0]
                 and all(index == value for index, value in enumerate(keep)))
     return old_mat if all_rows else old_mat[keep]
+
+
+# Long-row chunking: the embedder truncates at PROFILE["max_seq"] tokens, so
+# rows beyond one window embed as several store rows - unsuffixed head chunk
+# plus '#cN' siblings ('#r' extended); every id hashes the FULL source text.
+
+# Pinned NFC byte-level BPE emits <=1 token/UTF-8 byte plus CLS/SEP; common CJK uses 3 bytes/char, emoji 4.
+# Measuring normalized bytes also bounds NFC expansion and needs no tokenizer cache during planning.
+_CHUNK_BYTES = int(embedder.PROFILE["max_seq"]) - 2
+_CHUNK_OVERLAP_CHARS = _CHUNK_BYTES // 10
+# Bounded vector-store cost: one pathological multi-megabyte row must not
+# dominate the matrix with thousands of rows. The head chunks stay contiguous
+# (openings carry the request); the remainder is sampled evenly.
+_MAX_ROW_CHUNKS = 32
+_HEAD_ROW_CHUNKS = 8
+
+# One underlined section heading: a short title line over a `===` rule. pi/omp
+# recaps are section documents (FILES/HISTORY-style headings); the resume
+# instructions are exactly the un-sectioned prose before the first heading.
+_RECAP_SECTION_HEADING = re.compile(
+    r"^[^\S\n]*\S[^\n]{0,80}\n={3,}[^\S\n]*$", re.MULTILINE)
+_RECAP_PREAMBLE_SCAN_CHARS = 4096
+
+
+def _strip_recap_preamble(text: str) -> str:
+    """Strip a pi harness preamble only when a setext heading appears in the first 4096 characters."""
+    match = _RECAP_SECTION_HEADING.search(text, 0, _RECAP_PREAMBLE_SCAN_CHARS)
+    return text[match.start():] if match else text
+
+
+def _embeddable_row_text(agent: str, who: str, text: str) -> str:
+    return _strip_recap_preamble(text) if agent == "pi" and who == "recap" else text
+
+
+def _row_chunk_spans(content: str) -> list[tuple[int, int]]:
+    """Byte-budgeted overlapping windows, split at line boundaries where possible."""
+    spans: list[tuple[int, int]] = []
+    total = len(content)
+    start = 0
+    while True:
+        end = min(start + _CHUNK_BYTES, total)
+        while True:
+            if end < total:
+                newline = content.rfind("\n", start + (end - start) // 2, end)
+                if newline >= 0:
+                    end = newline + 1
+            chunk = content[start:end]
+            size = (len(chunk) if chunk.isascii()
+                    else len(unicodedata.normalize("NFC", chunk).encode("utf-8")))
+            if size <= _CHUNK_BYTES:
+                break
+            end = start + (end - start) * _CHUNK_BYTES // size
+        spans.append((start, end))
+        if end >= total:
+            return spans
+        start = end - min(_CHUNK_OVERLAP_CHARS, (end - start) // 2)
+
+
+def _capped_chunk_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if len(spans) <= _MAX_ROW_CHUNKS:
+        return spans
+    head = spans[:_HEAD_ROW_CHUNKS]
+    tail = spans[_HEAD_ROW_CHUNKS:]
+    sampled = _MAX_ROW_CHUNKS - _HEAD_ROW_CHUNKS
+    # Even endpoints-inclusive sampling; spacing >= 1 keeps picks distinct.
+    return head + [
+        tail[(index * (len(tail) - 1)) // (sampled - 1)]
+        for index in range(sampled)
+    ]
+
+
+def _row_chunks(agent: str, who: str, text: str) -> list[str]:
+    """The texts one logical row embeds, index-aligned with its store ids."""
+    content = _embeddable_row_text(agent, who, text)
+    return [content[start:end]
+            for start, end in _capped_chunk_spans(_row_chunk_spans(content))]
+
+
+def _row_chunk_count(agent: str, who: str, text: str) -> int:
+    content = _embeddable_row_text(agent, who, text)
+    return min(len(_row_chunk_spans(content)), _MAX_ROW_CHUNKS)
+
+
+def _expand_source_message(message: common.Message) -> Iterator[common.Message]:
+    """One logical row as its store rows: the base id plus '#cN' siblings.
+
+    Expanded rows keep the full source text, so every store id shares the
+    logical row's text hash and metadata fingerprint; only the embedded
+    input (``_embed_input``) differs per chunk."""
+    yield message
+    for ordinal in range(
+            1, _row_chunk_count(message.agent, message.who, message.text)):
+        yield message._replace(id=f"{message.id}#c{ordinal}")
+
+
+def _embed_input(message: common.Message,
+                 _memo: list = [None, None]) -> str:  # noqa: B006 - deliberate slot
+    """The text this store row actually embeds: its chunk of the logical row."""
+    base, ordinal = common.semantic_chunk_split(message.id)
+    if (ordinal == 0 and message.who != "recap"
+            and len(message.text) <= _CHUNK_BYTES and message.text.isascii()):
+        return message.text
+    key = (base, message.agent, message.who, message.text)
+    if _memo[0] != key:
+        _memo[0] = key
+        _memo[1] = _row_chunks(message.agent, message.who, message.text)
+    chunks = _memo[1]
+    if ordinal >= len(chunks):
+        raise RuntimeError(
+            f"semantic chunk {message.id} exceeds its row's chunk count")
+    return chunks[ordinal]
 
 
 def iter_reply_messages(
@@ -1106,16 +1229,18 @@ def iter_reply_messages(
 
 
 def _iter_source_messages() -> Iterator[common.Message]:
-    """Stream users and replies while retaining only reply metadata for parent rows."""
+    """Stream users and replies as STORE rows (base ids plus '#cN' siblings),
+    retaining only reply metadata for parent rows."""
     base_rows = _ReplyContextCatalog() if REPLIES_PATH.exists() else None
     try:
         for message in common.iter_messages(path=common.MESSAGES_PATH):
             if base_rows is not None:
                 base_rows.add(message.id, _reply_context(message))
-            yield message
+            yield from _expand_source_message(message)
         if base_rows is not None:
             base_rows.finish()
-            yield from iter_reply_messages(base_rows)
+            for reply in iter_reply_messages(base_rows):
+                yield from _expand_source_message(reply)
     finally:
         if base_rows is not None:
             base_rows.close()
@@ -1361,19 +1486,26 @@ def _load_retained_rows(manifest: dict, keep: list[int] | None, *, has_pending: 
 def _messages_for_ids(ids: list[str], hashes: list[str]) -> list[common.Message]:
     expected = dict(zip(ids, hashes, strict=True))
     wanted = set(ids)
+    by_logical: dict[str, list[str]] = {}
+    for mid in wanted:
+        by_logical.setdefault(common.semantic_chunk_split(mid)[0], []).append(mid)
+    wanted_replies = {logical for logical in by_logical
+                      if logical.endswith("#r")}
+    reply_bases = {logical[:-2] for logical in wanted_replies}
     found: dict[str, common.Message] = {}
-    reply_bases = {
-        mid[:-2] for mid in wanted if mid.endswith("#r")
-    }
+
+    def record(message: common.Message) -> None:
+        for mid in by_logical.get(message.id, ()):
+            found[mid] = (message if mid == message.id
+                          else message._replace(id=mid))
+
     base_rows: dict[str, _ReplyContext] = {}
     for message in common.iter_messages(path=common.MESSAGES_PATH):
-        if message.id in wanted:
-            found[message.id] = message
+        record(message)
         if message.id in reply_bases:
             base_rows[message.id] = _reply_context(message)
-    for message in iter_reply_messages(base_rows, wanted):
-        if message.id in wanted:
-            found[message.id] = message
+    for message in iter_reply_messages(base_rows, wanted_replies):
+        record(message)
     if set(found) != wanted:
         raise RuntimeError("semantic segment source rows are missing")
     for mid, message in found.items():
@@ -2528,7 +2660,7 @@ def _run_smoke(args) -> int:
         download=not bool(getattr(args, "no_model_download", False)),
         lane=_active_lane())
     vectors = np.asarray(
-        model.embed_texts([message.text for message in selected]),
+        model.embed_texts([_embed_input(message) for message in selected]),
         dtype=np.float32)
     expected = (len(selected), int(embedder.PROFILE["dim"]))
     if vectors.shape != expected or not np.all(np.isfinite(vectors)):
@@ -2629,7 +2761,8 @@ def _materialize_pending_vectors(
                 f"embedder produces '{model.profile_string}'")
         inference_started = time.perf_counter()
         parts, embedded_n, source_moved = _embed_pending_chunks(
-            model, [message.text for message in inference_messages], source,
+            model, [_embed_input(message) for message in inference_messages],
+            source,
             background=bool(getattr(args, "background", False)),
             bootstrap=bool(getattr(args, "bootstrap_pass", False)),
             progress=lambda done, total: _publish_state(
@@ -3148,10 +3281,12 @@ def _stamp(source: dict | None, *, indexed_ids: list[str],
                 remaining.discard(message.id)
 
             for message in common.iter_messages(path=common.MESSAGES_PATH):
-                validate(message)
+                for row in _expand_source_message(message):
+                    validate(row)
             # Timestamp inheritance is irrelevant to generation validation.
             for message in iter_reply_messages({}):
-                validate(message)
+                for row in _expand_source_message(message):
+                    validate(row)
             if semantic.source_generation() != marker_source:
                 common.log("transcript kept moving during embedding validation; "
                            "marker not stamped (the next pass converges).")

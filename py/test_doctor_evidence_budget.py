@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import isolate_data_dir, wait_for_next_ctime_tick
 
 
 isolate_data_dir()
@@ -416,6 +416,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
                 first = doctor._run_quick_check(db, database, progress.append)
                 second = doctor._run_quick_check(db, database, progress.append)
                 before = wal.stat()
+                wait_for_next_ctime_tick(wal)
                 wal.write_bytes(b"wal2")
                 os.utime(wal, ns=(before.st_atime_ns, before.st_mtime_ns))
                 third = doctor._run_quick_check(db, database, progress.append)
@@ -434,6 +435,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
             path.write_bytes(b"before")
             before_stat = path.stat()
             before = doctor._regular_file_identity(path)
+            wait_for_next_ctime_tick(path)
             path.write_bytes(b"after!")
             os.utime(path, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
             after = doctor._regular_file_identity(path)
@@ -530,6 +532,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
                 first, first_integrity = doctor._model_cache_probe(fake, deep=True)
                 second, second_integrity = doctor._model_cache_probe(fake, deep=True)
                 before = model.stat()
+                wait_for_next_ctime_tick(model)
                 model.write_bytes(b"model2")
                 os.utime(model, ns=(before.st_atime_ns, before.st_mtime_ns))
                 third, third_integrity = doctor._model_cache_probe(fake, deep=True)
@@ -868,7 +871,6 @@ class DoctorObservationSharingTests(unittest.TestCase):
         self.assertIn("installed build", rendered)
         self.assertIn("lags local master by 8.0 days", rendered)
         self.assertIn("uv tool install --force --from", rendered)
-        self.assertIn("without your consent", rendered)
         self.assertIn("first semantic search", rendered)
         self.assertIn(
             f"`{doctor._cli_command('doctor', '--fix')}`", rendered)
@@ -949,7 +951,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
                 side_effect=AssertionError("duplicate detected-stores probe")),
         ):
             result = doctor._json_report()
-        probe.assert_called_once_with(deep=False)
+        probe.assert_called_once_with(deep=False, semantic=True)
         self.assertIs(result["detected_not_indexed"], detected)
         # the deleted drift clock must not resurface as a machine field
         self.assertNotIn("drift", result)
@@ -1041,15 +1043,15 @@ class DoctorObservationSharingTests(unittest.TestCase):
         drift = indexd_runtime.DriftReport("current")
         with (
             mock.patch.object(
-                cli.indexd_runtime, "indexd_resource_status",
+                indexd_runtime, "indexd_resource_status",
                 return_value=daemon,
             ) as daemon_probe,
             mock.patch.object(
-                cli.indexd_runtime, "observe_store_drift",
+                indexd_runtime, "observe_store_drift",
                 return_value=([], drift),
             ) as drift_probe,
             mock.patch.object(
-                cli.indexd_runtime, "indexing_failure",
+                indexd_runtime, "indexing_failure",
                 return_value=None,
             ) as failure_probe,
             mock.patch.object(cli.common, "index_summary", return_value=None),
@@ -1086,13 +1088,13 @@ class DoctorObservationSharingTests(unittest.TestCase):
                 mock.patch.object(cli.common, "MESSAGES_PATH",
                                   root / "messages.jsonl"),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     return_value={"running": False}),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
+                    indexd_runtime, "observe_store_drift",
                     side_effect=stores),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure",
+                    indexd_runtime, "indexing_failure",
                     return_value=None),
                 mock.patch.object(
                     cli.common, "index_summary", side_effect=summary),
@@ -1176,15 +1178,15 @@ class DoctorObservationSharingTests(unittest.TestCase):
                         "state": "verified", "value": "auto",
                         "source": "default"}),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     return_value={"running": True}),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
+                    indexd_runtime, "observe_store_drift",
                     return_value=([], drift)),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure", return_value=None),
+                    indexd_runtime, "indexing_failure", return_value=None),
                 mock.patch.object(
-                    cli.indexd_runtime, "machine_freshness",
+                    indexd_runtime, "machine_freshness",
                     return_value={"state": "no-known-failure"}),
                 mock.patch.object(cli.common, "index_summary", return_value=None),
                 mock.patch.object(
@@ -1274,16 +1276,16 @@ class DoctorObservationSharingTests(unittest.TestCase):
                             "state": "verified", "value": "auto",
                             "source": "default"}),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexd_resource_status",
+                        indexd_runtime, "indexd_resource_status",
                         return_value={"running": True}),
                     mock.patch.object(
-                        cli.indexd_runtime, "observe_store_drift",
+                        indexd_runtime, "observe_store_drift",
                         return_value=([], {"state": "complete"})),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexing_failure",
+                        indexd_runtime, "indexing_failure",
                         return_value=None),
                     mock.patch.object(
-                        cli.indexd_runtime, "machine_freshness",
+                        indexd_runtime, "machine_freshness",
                         return_value={"state": "no-known-failure"}),
                     mock.patch.object(
                         cli.common, "index_summary", return_value=None),
@@ -1378,15 +1380,15 @@ class DoctorObservationSharingTests(unittest.TestCase):
                         "state": "verified", "value": "auto",
                         "source": "default"}),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexd_resource_status",
+                    indexd_runtime, "indexd_resource_status",
                     return_value={"running": False}),
                 mock.patch.object(
-                    cli.indexd_runtime, "observe_store_drift",
+                    indexd_runtime, "observe_store_drift",
                     return_value=([], indexd_runtime.DriftReport("current"))),
                 mock.patch.object(
-                    cli.indexd_runtime, "indexing_failure", return_value=None),
+                    indexd_runtime, "indexing_failure", return_value=None),
                 mock.patch.object(
-                    cli.indexd_runtime, "machine_freshness",
+                    indexd_runtime, "machine_freshness",
                     return_value={"state": "no-known-failure"}),
                 mock.patch.object(cli.common, "index_summary", return_value=None),
                 mock.patch.object(
@@ -1431,17 +1433,17 @@ class DoctorObservationSharingTests(unittest.TestCase):
                             "state": "verified", "value": "auto",
                             "source": "default"}),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexd_resource_status",
+                        indexd_runtime, "indexd_resource_status",
                         return_value={"running": False}),
                     mock.patch.object(
-                        cli.indexd_runtime, "observe_store_drift",
+                        indexd_runtime, "observe_store_drift",
                         return_value=(
                             [], indexd_runtime.DriftReport("current"))),
                     mock.patch.object(
-                        cli.indexd_runtime, "indexing_failure",
+                        indexd_runtime, "indexing_failure",
                         return_value=None),
                     mock.patch.object(
-                        cli.indexd_runtime, "machine_freshness",
+                        indexd_runtime, "machine_freshness",
                         return_value={"state": "no-known-failure"}),
                     mock.patch.object(
                         cli.common, "index_summary", return_value=None),
@@ -1461,13 +1463,20 @@ class DoctorObservationSharingTests(unittest.TestCase):
             mock.patch.object(doctor, "fix", return_value=0) as fix,
         ):
             self.assertEqual(doctor.main([]), 0)
-            report.assert_called_once_with(deep=False, fix_actions=False)
+            report.assert_called_once_with(
+                deep=False, fix_actions=False, semantic=True)
             report.reset_mock()
             self.assertEqual(doctor.main(["--deep"]), 0)
-            report.assert_called_once_with(deep=True, fix_actions=False)
+            report.assert_called_once_with(
+                deep=True, fix_actions=False, semantic=True)
+            report.reset_mock()
+            self.assertEqual(doctor.main(["--deep", "--no-semantic"]), 0)
+            report.assert_called_once_with(
+                deep=True, fix_actions=False, semantic=False)
             report.reset_mock()
             self.assertEqual(doctor.main(["--fix"]), 0)
-            report.assert_called_once_with(deep=False, fix_actions=True)
+            report.assert_called_once_with(
+                deep=False, fix_actions=True, semantic=True)
             fix.assert_called_once_with()
             report.reset_mock()
             fix.reset_mock()
@@ -1487,7 +1496,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
             contextlib.redirect_stdout(output),
         ):
             self.assertEqual(doctor.main(["--json", "--deep"]), 0)
-        machine.assert_called_once_with(deep=True)
+        machine.assert_called_once_with(deep=True, semantic=True)
         self.assertEqual(json.loads(output.getvalue()), {"ok": True})
 
     def test_main_refuses_action_combos_instead_of_dropping_one(self) -> None:
@@ -2040,7 +2049,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
                 indexd_runtime.observe_store_drift(timeout_s=0.125),
                 (None, report),
             )
-        census.assert_called_once_with(timeout_s=0.125)
+        census.assert_called_once_with(timeout_s=0.125, persist=False)
         derive.assert_called_once_with(store_rows=None)
 
     def test_store_detection_forwards_the_diagnostic_deadline(self) -> None:

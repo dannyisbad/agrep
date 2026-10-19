@@ -25,9 +25,14 @@ def main() -> int:
     bundled = PKG / "_bin" / exe
     if bundled.exists():
         os.environ.setdefault("AGREP_RS_BIN", str(bundled))
-    # py/ first so flat `import common` wins; PKG so `import cli` finds cli.py
-    sys.path.insert(0, str(PKG / "py"))
-    sys.path.insert(0, str(PKG))
+    root = PKG if (PKG / "cli.py").is_file() else PKG.parent
+    # py/ first so flat imports resolve in both wheels and source checkouts.
+    sys.path.insert(0, str(root))
+    sys.path.insert(0, str(root / "py"))
+    import resident
+    result = resident.try_run()
+    if result is not None:
+        return result
     import cli  # noqa: PLC0415 -- bundled module, resolvable only after the path setup
     return cli.main()
 

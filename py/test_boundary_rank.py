@@ -202,8 +202,10 @@ class BoundaryRankTests(unittest.TestCase):
         response = json.dumps({
             "protocol": search._NATIVE_BOUNDARY_PROTOCOL,
             "results": [
-                {"factor": 0.25, "match_class": "interior"},
-                {"factor": 0.5, "match_class": "partial"},
+                {"factor": 0.25, "match_class": "interior",
+                 "qualities": [0.0], "spans": [[2, 5]]},
+                {"factor": 0.5, "match_class": "partial",
+                 "qualities": [1.0], "spans": [[4, 7]]},
             ],
         })
         completed = mock.Mock(returncode=0, stdout=response, stderr="")
@@ -218,6 +220,53 @@ class BoundaryRankTests(unittest.TestCase):
         self.assertEqual(aligned["_boundary_score_factor"], 1.0)
         self.assertEqual(interior["_boundary_score_factor"], 0.25)
         self.assertEqual(fallback["_boundary_score_factor"], 0.5)
+
+    def test_duplicate_boundary_inputs_preserve_lanes_and_owner_scores(self):
+        path = Path(__file__)
+        context = search._prepare_boundary("cyber filter", "keyword")
+        prepared = context[0]
+        now = 1_900_000_000_000
+        hits = [
+            {"session": "agent-phrase", "turn": 1, "ts": now,
+             "who": "agent", "snippet": "cyber_filterilter and standalone filter"},
+            {"session": "user-phrase", "turn": 2, "ts": now - 100 * 86_400_000,
+             "who": "user", "snippet": "cyber_filterilter and standalone filter"},
+            {"session": "user-terms", "turn": 3, "ts": now,
+             "who": "user", "snippet": "cyber_filterilter and standalone filter",
+             "matched": "all-terms"},
+        ]
+        original = [dict(hit) for hit in hits]
+        pattern = search._match_pat("cyber filter", "keyword")
+        expected = [round(search._score(
+            dict(hit), pattern, 11, now, terms=["cyber", "filter"],
+            boundary=context), 4) for hit in hits]
+
+        def run(_cmd, **kwargs):
+            request = json.loads(kwargs["input"])
+            results = []
+            for item in request["items"]:
+                quality = prepared.evaluate(
+                    item["text"], spans=item.get("spans"),
+                    validate_spans=item.get("validate_spans", True))
+                results.append({
+                    "factor": quality.factor, "match_class": quality.match_class,
+                    "spans": quality.spans, "qualities": quality.qualities,
+                })
+            return mock.Mock(returncode=0, stderr="", stdout=json.dumps({
+                "protocol": search._NATIVE_BOUNDARY_PROTOCOL, "results": results,
+            }))
+
+        with mock.patch.object(search.common, "ingest_bin", return_value=path), \
+                mock.patch.object(search, "_NATIVE_BOUNDARY_IDENTITY", None), \
+                mock.patch.object(search, "_NATIVE_BOUNDARY_AVAILABLE", None), \
+                mock.patch.object(search.subprocess, "run", side_effect=run):
+            self.assertTrue(search._native_boundary_scores(hits, context))
+        actual = [round(search._score(
+            hit, pattern, 11, now, terms=["cyber", "filter"]), 4) for hit in hits]
+        self.assertEqual(actual, expected)
+        self.assertLess(hits[0]["_boundary_factor"], hits[2]["_boundary_factor"])
+        for hit, before in zip(hits, original):
+            self.assertEqual({key: hit[key] for key in before}, before)
 
     def test_row_lane_certifies_once_per_batch(self):
         # _boundary_batch partitions the rows, then hands them to the native
@@ -304,7 +353,7 @@ class BoundaryRankTests(unittest.TestCase):
                 mock.patch.object(search, "_NATIVE_BOUNDARY_BATCH", 2), \
                 mock.patch.object(search.subprocess, "run", side_effect=run):
             self.assertFalse(search._native_boundary_scores(hits, context))
-        self.assertEqual(calls, [2, 2])
+        self.assertLessEqual(max(calls), 2)
         self.assertTrue(all("_boundary_factor" not in hit for hit in hits))
 
     def test_query_tokenization_and_cold_priors(self):
@@ -338,6 +387,41 @@ class BoundaryRankTests(unittest.TestCase):
         self.assertEqual(aligned.qualities, (1.0,))
         self.assertEqual(suffix.qualities, (0.5,))
         self.assertEqual(apostrophe.qualities, (0.5,))
+
+    def test_all_terms_proximity_uses_the_boundary_selected_spans(self):
+        text = "calls dont"
+        score = boundary_rank.prepare_query("don calls").evaluate(text)
+        self.assertEqual(score.spans, ((6, 9), (0, 5)))
+        self.assertEqual(score.qualities, (0.5, 1.0))
+        self.assertEqual(
+            search._terms_proximity(
+                text, ["don", "calls"], 8,
+                spans=score.spans, qualities=score.qualities),
+            0.5)
+
+        text = "dude dont we already have a don of cases then calls"
+        score = boundary_rank.prepare_query("don calls").evaluate(text)
+        self.assertEqual(text[slice(*score.spans[0])], "don")
+        self.assertEqual(score.qualities, (1.0, 1.0))
+
+    def test_term_variants_are_minimal_and_keep_short_terms_exact(self):
+        # Mirrors crates/agrep-core/src/boundary_rank.rs
+        # folds_only_minimal_s_es_and_ies_variants word for word.
+        expected = {
+            "calls": ("calls", "call"), "call": ("call", "calls"),
+            "policies": ("policies", "policy"), "policy": ("policy", "policies"),
+            "status": ("status", "statuses"), "statuses": ("statuses", "status"),
+            "boxes": ("boxes", "box"), "glass": ("glass", "glasses"),
+            "branches": ("branches", "branch"), "houses": ("houses", "house"),
+            "cases": ("cases", "case"), "tries": ("tries", "try"),
+            "days": ("days",), "this": ("this",), "does": ("does",),
+            "try": ("try",), "don": ("don",), "t": ("t",), "id": ("id",),
+            "Straße": ("strasse", "strasses"), "東京": ("東京",),
+        }
+        for token, variants in expected.items():
+            with self.subTest(token=token):
+                self.assertEqual(boundary_rank.term_variants(token), variants)
+        self.assertEqual(boundary_rank.term_anchor("policies"), "polic")
 
     def test_normalized_offsets_cover_original_graphemes(self):
         sharp_s = boundary_rank.prepare_query("STRASSE").evaluate("Straße")

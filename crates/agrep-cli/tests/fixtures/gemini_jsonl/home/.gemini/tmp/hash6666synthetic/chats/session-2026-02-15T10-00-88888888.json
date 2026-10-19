@@ -1,0 +1,10 @@
+{
+  "sessionId": "88888888-8888-4888-8888-888888888888",
+  "projectHash": "hash6666synthetic",
+  "startTime": "2026-02-15T10:00:00.000Z",
+  "lastUpdated": "2026-02-15T10:00:04.000Z",
+  "messages": [
+    {"id": "p1", "timestamp": "2026-02-15T10:00:01.000Z", "type": "user", "content": [{"text": "rename the verbose flag to --debug"}]},
+    {"id": "p2", "timestamp": "2026-02-15T10:00:04.000Z", "type": "gemini", "content": "Renamed --verbose to --debug.", "model": "gemini-2.5-pro"}
+  ]
+}

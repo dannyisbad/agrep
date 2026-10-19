@@ -30,8 +30,8 @@ def retire_removed_explorer() -> None:
     _REMOVED_EXPLORER_CHECKED = True
     path = DATA_DIR / ".server"
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        info = json.loads(raw)
+        raw = path.read_bytes()
+        info = json.loads(raw.decode("utf-8", errors="replace"))
         pid = int(info["pid"])
         port = int(info.get("port") or 0)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):

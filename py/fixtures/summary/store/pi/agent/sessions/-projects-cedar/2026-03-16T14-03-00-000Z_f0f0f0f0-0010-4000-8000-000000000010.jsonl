@@ -1,0 +1,5 @@
+{"type":"session","id":"f0f0f0f0-0010-4000-8000-000000000010","version":3,"cwd":"{{home}}/projects/cedar","timestamp":"2026-03-16T14:03:00.000Z"}
+{"type":"message","id":"pi-0","parentId":null,"timestamp":"2026-03-16T14:03:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Check the cedar lantern wiring."}]}}
+{"type":"message","id":"pi-1","parentId":"pi-0","timestamp":"2026-03-16T14:03:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The cedar lantern wiring is sound."}],"model":"gpt-5"}}
+{"type":"message","id":"pi-2","parentId":"pi-1","timestamp":"2026-03-16T14:10:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Note the cedar wiring result."}]}}
+{"type":"message","id":"pi-3","parentId":"pi-2","timestamp":"2026-03-16T14:10:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Noted the cedar wiring result."}],"model":"gpt-5"}}

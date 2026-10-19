@@ -29,7 +29,7 @@ shared per-user model cache instead; `AGREP_MODEL_DIR` overrides its root.
 | `data/embedding-segments/seg-<generation>.f32` | little-endian normalized `f32` vectors retained for incremental publication and compatibility checks. The production Granite profile is 384-dimensional; its 1,024 value is the token cap, not the vector width. |
 | `data/embedding-segments/seg-<generation>.q8` / `.q8g` | native int8 candidate index and root-family grouping used for bounded top-k retrieval. |
 | `data/embedding-segments/seg-<generation>.f16` | exact-rerank source for candidates returned by the q8 index. |
-| `data/embedding-segments/seg-<generation>.ids` / `.hashes` | row ids and source-text fingerprints aligned to each immutable segment. Reply ids use `#r`. |
+| `data/embedding-segments/seg-<generation>.ids` / `.hashes` | row ids and source-text fingerprints aligned to each immutable segment. Reply ids use `#r`. Rows longer than the model window embed as several vectors: the unsuffixed id keeps the head chunk and `#cN` siblings carry the rest, each fingerprinting the full source text. |
 | `data/embedding-segments/seg-<generation>.refs.sqlite` | sealed source locators and filter metadata for resolving only winning rows. |
 
 The reader still recognizes the earlier flat `embeddings.f32/.ids/.hashes`
@@ -62,10 +62,10 @@ One pinned model, two engines that can run it:
   encoder lives here rather than in `mlx-embeddings` precisely so CLS is the only
   pooling it can do (that library's ModernBERT defaults to MEAN and measured
   0.878 mean cosine against this contract while every shape and finiteness check
-  passed), and `embedder._start_metal_lane` refuses to open below 0.995 cosine
-  against the ONNX vectors for a fixed probe set spanning short and long rows.
-  Shared-weight arithmetic drift measured 0.99875 there; a pooling mismatch
-  scores about 0.77. Weights are pinned by size and SHA-256 like the ONNX
+  passed), and `embedder._start_metal_lane` refuses to open below 0.97 cosine
+  against the ONNX int8 vectors for a fixed probe set spanning short and long
+  rows. The guard permits quantization drift, not interchangeable rankings:
+  near-threshold results can differ between lanes. Weights are pinned by size and SHA-256 like the ONNX
   artifacts and live under the shared model root, so an accelerator is not a
   softer path into the model directory. On Apple silicon the GPU is also the
   display compositor, so a backfill paces itself: `_embedding_backfill_policy`

@@ -12,8 +12,8 @@
 //! where a repeated tuple is byte-identical - so the result is order-independent and the cache
 //! is transparent. Claude and Codex are one-file-per-session; for any session that does
 //! span files, its unchanged sibling files are re-parsed too so its event file stays complete.
-//! A schema bump (`CACHE_VERSION`), a missing/corrupt cache, or `--full` fall back to a clean
-//! full parse.
+//! Supported schema bumps retain last-good rows during reparse. Missing, corrupt, or
+//! unsupported caches and `--full` fall back to a clean full parse.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -27,33 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Event, Message};
 
-/// Bump when the cached struct layout OR the parse semantics change; old caches are then
-/// ignored (full reparse). 4->5: every adapter's timestamp parsing moved to
-/// ingest::parse_timestamp, so every store is re-read once through the consolidated path
-/// rather than served from an entry parsed by the old scattered sites. 5->6: intern_agent
-/// resolves against the registry (cursor/crush cached entries round-tripped as "unknown");
-/// the reparse re-materializes every session so the corpus delta carries the relabel. 6->7:
-/// Codex forked rollouts gain child-owned boundaries instead of collapsing into the parent.
-/// 7->8: entry shape settled as (mtime, size, msgs) - the one legacy wire generation with a
-/// migration path; v7 and earlier, plus abandoned v9/v10 caches, cold-reparse instead.
-/// 8->9: exact per-source event ownership and nanosecond stat keys; v8 is migrated through an
-/// explicit wire type and force-reparsed once before any exact incremental prune is allowed.
-/// 9->10: Codex guardian approval-review rollouts become counted internal sidechain skips.
-/// 10->11: Stat keys include filesystem change/replacement identity, detecting preserved-mtime
-/// edits on Unix and same-name replacements on Windows without reading every source file.
-/// 11->12: SQLite Stat keys include committed WAL metadata instead of blessing main-file hits.
-/// 12->13: reply source lengths disclose ingest-cap loss in detail and recall views.
-/// 13->14: Codex encrypted send_message payloads become non-searchable control events.
-/// 14->15: event ownership migrates to collision-safe hashed filenames after one forced reparse.
-/// 15->16: cache identities retain exact source/token keys; Windows stat keys use file USNs.
-/// 16->17: Windows source keys use stable file IDs and retain exact UTF-16 paths.
-/// 17->18: Claude compact-summary provenance replaces recap text-prefix inference.
-/// 18->19: token intake identities migrate from ambiguous separators to canonical JSON tuples.
-/// 19->20: event outputs retain original UTF-8 byte counts before preview truncation.
-/// 20->21: codex human turns require the rollout's own submission log, dropping the
-/// harness-composed role:user input (AGENTS.md, environment, catalogs) cached as lived.
-/// 21->22: nested oh-my-pi advisor and worker sessions link to their root chat.
-pub const CACHE_VERSION: u32 = 22;
+/// Increment when entry layout or parse semantics change.
+/// Supported prior generations retain last-good entries until their source reparse completes.
+pub const CACHE_VERSION: u32 = 37;
 
 const CACHE_BASE_MAGIC: &[u8; 8] = b"AGRPCB01";
 const CACHE_JOURNAL_MAGIC: &[u8; 8] = b"AGRPCJ01";
@@ -91,7 +67,7 @@ const STAGED_WRITE_CHUNK: usize = 256 * 1024;
 const PYTHON_RUNTIME_BUILD_ID_ENV: &str = "AGREP_PYTHON_RUNTIME_BUILD_ID";
 static CACHE_COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 struct CMsg {
     agent: String,
     project: std::sync::Arc<str>,
@@ -356,21 +332,10 @@ pub fn current_cache_writer_build_id() -> String {
     WriterBuildId::current().as_str().to_owned()
 }
 
-/// Successor takeover: re-own a dead foreign writer's parse cache instead of
-/// discarding it. The base decodes through the full validation path (header,
-/// length, payload digest, storage version) and only committed journal frames
-/// replay, so the adopted entries are exactly what the dead writer last
-/// published; a fresh base then lands atomically under the current identity
-/// and the foreign journal is retired with it. Only a fully current
-/// generation adopts - an older generation reparses anyway, so the caller's
-/// discard loses nothing. Any refusal returns Err and the caller falls back
-/// to the discard path unchanged.
+/// Atomically re-own validated entries, preserving any required source reparse.
 pub fn adopt_foreign_cache(path: &Path) -> Result<usize, &'static str> {
-    let (entries, generation, _backing) = decode_cache_owned(path, WriterBuildId::current(), true)
+    let (entries, _generation, _backing) = decode_cache_owned(path, WriterBuildId::current(), true)
         .map_err(CacheDecodeRefusal::label)?;
-    if generation != CacheGeneration::Current {
-        return Err("cache generation predates this format; a reparse is due anyway");
-    }
     let adopted = entries.len();
     let cache = IngestCache::base(entries, CacheBacking::Rewrite);
     cache
@@ -524,6 +489,248 @@ impl CMsg {
     }
 }
 
+/// A row's text as a map key: equal only to the same text whole, but hashed by its length and
+/// 16 bytes at its start, middle and end alone, so a long text costs no more than a short one.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Text<'a>(&'a str);
+
+impl std::hash::Hash for Text<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let bytes = self.0.as_bytes();
+        let sample = |at: usize| &bytes[at..bytes.len().min(at + 16)];
+        state.write_usize(bytes.len());
+        state.write(sample(0));
+        state.write(sample(bytes.len() / 2));
+        state.write(sample(bytes.len().saturating_sub(16)));
+    }
+}
+
+/// Rows counted by `(session, timestamp, text)`.
+#[derive(Default)]
+struct RowCounts<'a>(HashMap<(&'a str, i64, Text<'a>), usize>);
+
+impl<'a> RowCounts<'a> {
+    fn add(&mut self, (session, ts, text): (&'a str, i64, &'a str), count: usize) {
+        *self.0.entry((session, ts, Text(text))).or_default() += count;
+    }
+
+    fn count(&self, (session, ts, text): (&'a str, i64, &'a str)) -> usize {
+        self.0.get(&(session, ts, Text(text))).copied().unwrap_or(0)
+    }
+
+    /// Takes one row bearing `key`, if one is left.
+    fn take(&mut self, (session, ts, text): (&'a str, i64, &'a str)) -> bool {
+        let left = self
+            .0
+            .get_mut(&(session, ts, Text(text)))
+            .filter(|count| **count > 0);
+        left.map(|count| *count -= 1).is_some()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = ((&'a str, i64, &'a str), usize)> + '_ {
+        let counts = self.0.iter();
+        counts.map(|(&(session, ts, Text(text)), &count)| ((session, ts, text), count))
+    }
+}
+
+/// A cached row of the agent a published generation is judged for.
+struct CachedRow<'a> {
+    row: &'a CMsg,
+    /// Its source lies outside the scopes the preflight failed to read.
+    beside: bool,
+    /// Its entry is the base's own.
+    unchanged: bool,
+}
+
+/// The rows publication keeps of `rows`, counted: of rows sharing a session, raw turn and
+/// text, dedupe keeps the canonical one. A tie it may break either way, if the tied rows'
+/// timestamps differ, counts for neither.
+fn published_counts<'a>(rows: impl IntoIterator<Item = &'a CMsg>) -> RowCounts<'a> {
+    use std::collections::hash_map::Entry as Slot;
+
+    let rows = rows.into_iter();
+    let mut kept: HashMap<(&str, u32, Text), Option<&CMsg>> =
+        HashMap::with_capacity(rows.size_hint().0);
+    for row in rows {
+        let mut slot = match kept.entry((row.session.as_ref(), row.turn, Text(&row.text))) {
+            Slot::Vacant(slot) => {
+                slot.insert(Some(row));
+                continue;
+            }
+            Slot::Occupied(slot) => slot,
+        };
+        let Some(prior) = *slot.get() else {
+            continue;
+        };
+        let order = crate::ingest::registry::canonical_message_cmp(&row.to_msg(), &prior.to_msg());
+        if order.is_gt() {
+            slot.insert(Some(row));
+        } else if order.is_eq() && row.ts != prior.ts {
+            slot.insert(None);
+        }
+    }
+    let mut counts = RowCounts(HashMap::with_capacity(kept.len()));
+    for ((session, _, Text(text)), row) in kept {
+        if let Some(row) = row {
+            counts.add((session, row.ts, text), 1);
+        }
+    }
+    counts
+}
+
+/// Of one agent, what passes since the published generation saw go beside the scopes they
+/// failed to read: rows this pass's base held, rows only an earlier pass's record names, by
+/// `(session, timestamp)` and [`crate::cache::text_digest`], and sessions gone whole.
+#[derive(Default)]
+struct Released<'a> {
+    rows: RowCounts<'a>,
+    recorded: HashMap<(&'a str, i64), Vec<(crate::cache::TextDigest, usize)>>,
+    sessions: HashSet<&'a str>,
+}
+
+impl<'a> Released<'a> {
+    /// Takes one row bearing `key`, if one is left.
+    fn take(&mut self, key: (&'a str, i64, &'a str)) -> bool {
+        if self.rows.take(key) {
+            return true;
+        }
+        let (session, ts, text) = key;
+        let Some(recorded) = self.recorded.get_mut(&(session, ts)) else {
+            return false;
+        };
+        let digest = crate::cache::text_digest(text);
+        let left = recorded
+            .iter_mut()
+            .find(|(held, count)| *count > 0 && *held == digest);
+        left.map(|(_, count)| *count -= 1).is_some()
+    }
+
+    fn record(&self) -> ReleasedRows {
+        let mut rows = HashMap::new();
+        for ((session, ts, text), count) in self.rows.iter() {
+            let digest = crate::cache::text_digest(text);
+            *rows.entry((session.to_owned(), ts, digest)).or_default() += count;
+        }
+        for (&(session, ts), recorded) in &self.recorded {
+            for &(digest, count) in recorded.iter().filter(|(_, count)| *count > 0) {
+                *rows.entry((session.to_owned(), ts, digest)).or_default() += count;
+            }
+        }
+        let sessions = self.sessions.iter().map(|session| (*session).to_owned());
+        ReleasedRows {
+            rows,
+            sessions: sessions.collect(),
+        }
+    }
+}
+
+/// [`Released`] as the cache stages it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReleasedRows {
+    rows: HashMap<(String, i64, crate::cache::TextDigest), usize>,
+    sessions: HashSet<String>,
+}
+
+/// Every agent's [`ReleasedRows`] against `seal`'s generation, sorted so equal records pack equal.
+#[derive(Deserialize, Serialize)]
+struct PackedReleased {
+    seal: String,
+    agents: std::collections::BTreeMap<String, PackedAgent>,
+}
+
+/// One agent's rows as `(session, timestamp, digest, count)`, then its sessions gone whole.
+type PackedAgent = (Vec<(String, i64, String, usize)>, Vec<String>);
+
+/// One reserved key packs every record staged with the cache, so the base's entry count stays its
+/// count of sources. Every key under `\0released` is a record, and only this pass's survives it.
+const RELEASED_KEY: &str = "\0released\0";
+
+fn released_key(key: &str) -> bool {
+    key.starts_with("\0released")
+}
+
+fn released_entry() -> Entry {
+    Entry {
+        mtime: 0,
+        size: 0,
+        identity: None,
+        msgs: Vec::new(),
+        event_keys: Vec::new(),
+        legacy_had_events: false,
+        legacy_needs_reparse: false,
+    }
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hex16(text: &str) -> Option<[u8; 16]> {
+    let mut bytes = [0; 16];
+    if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// The record key of `released`, against the generation `seal` names; None when it records nothing.
+fn pack_released(seal: &str, released: &HashMap<String, ReleasedRows>) -> Option<String> {
+    let mut agents = std::collections::BTreeMap::new();
+    for (agent, records) in released {
+        if records.rows.is_empty() && records.sessions.is_empty() {
+            continue;
+        }
+        let rows = records.rows.iter();
+        let mut rows: Vec<_> = rows
+            .map(|((session, ts, digest), count)| (session.clone(), *ts, hex16(digest), *count))
+            .collect();
+        rows.sort_unstable();
+        let mut sessions: Vec<String> = records.sessions.iter().cloned().collect();
+        sessions.sort_unstable();
+        agents.insert(agent.clone(), (rows, sessions));
+    }
+    if agents.is_empty() {
+        return None;
+    }
+    let packed = PackedReleased {
+        seal: seal.to_owned(),
+        agents,
+    };
+    serde_json::to_string(&packed)
+        .ok()
+        .map(|json| format!("{RELEASED_KEY}{json}"))
+}
+
+/// The [`ReleasedRows`] of each agent `entries` record against the generation `seal` names; none
+/// unless exactly one record names it.
+fn recorded_released_rows(
+    entries: &HashMap<String, Entry>,
+    seal: &str,
+) -> HashMap<String, ReleasedRows> {
+    let mut packs = entries
+        .keys()
+        .filter_map(|key| key.strip_prefix(RELEASED_KEY))
+        .filter_map(|json| serde_json::from_str::<PackedReleased>(json).ok())
+        .filter(|packed| packed.seal == seal);
+    let (Some(packed), None) = (packs.next(), packs.next()) else {
+        return HashMap::new();
+    };
+    let mut released: HashMap<String, ReleasedRows> = HashMap::new();
+    for (agent, (rows, sessions)) in packed.agents {
+        let records = released.entry(agent).or_default();
+        for (session, ts, digest, count) in rows {
+            if let Some(digest) = parse_hex16(&digest).filter(|_| count > 0) {
+                *records.rows.entry((session, ts, digest)).or_default() += count;
+            }
+        }
+        records.sessions.extend(sessions);
+    }
+    released
+}
+
 pub struct IngestCache {
     entries: HashMap<String, Entry>,
     dirty: HashSet<String>,
@@ -564,6 +771,11 @@ pub struct IngestCache {
     /// Agents whose clean ENOENT absence two complete preflights observed; whole-root loss
     /// needs the same absent preflight on two runs, not merely one stable walk.
     repeated_absent_agents: HashSet<String>,
+    /// The same two-observation witness for single store roots of a still-present agent.
+    repeated_absent_roots: Vec<(String, PathBuf)>,
+    /// Epoch nanoseconds before this run's first source stat; stamps not safely older are
+    /// recorded racy. `None` keeps every stamp trusted for callers that never set it.
+    racy_scan_start_ns: Option<i64>,
     /// Recovery started from no last-good rows because the on-disk base was discarded. Absence
     /// of prior material is then a missing witness, never proof, so whole-store deletion still
     /// needs the repeated observation a cached generation would otherwise have supplied.
@@ -579,6 +791,35 @@ pub struct IngestCache {
     /// Scopes the published inventory could not enumerate, so it contributed no path for them
     /// whether or not they held material. Absence under such a scope proves nothing.
     published_blind_scopes: HashSet<(String, PathBuf)>,
+    /// The inventory was rebuilt from this cache. Every Stat and token row reaches the cache
+    /// before it publishes, but a whole store's need not, nor a partial read of an older build.
+    published_from_cache: bool,
+    /// Decoded from an older cache generation, whose builds published partial reads uncached.
+    legacy_generation: bool,
+    /// Agents no publication can drop anything of: the verified published generation holds no
+    /// row or event of theirs, or this pass serves every one of them it holds.
+    unpublished_agents: HashSet<String>,
+    /// Agents whose snapshot this pass seeded from a read that missed part of their store: not
+    /// yet published, it vouches for nothing the read missed.
+    seeded_snapshots: HashSet<String>,
+    /// `(agent, root)` of whole-store reads that failed with no last-good snapshot to serve:
+    /// output only once the inventory or a read of the published generation proves it empty.
+    unvouched_reads: HashSet<(String, PathBuf)>,
+    /// For each per-file agent whose failed read this cache cannot answer for alone, whether the
+    /// pass holds every row the published generation does; None where that could not be read.
+    published_rows: HashMap<String, Option<bool>>,
+    /// The base's own version of each entry changed since [`Self::mark_base_rows`], None where it
+    /// held none: the base is the current entries with these put back.
+    displaced: HashMap<String, Option<Entry>>,
+    /// The scopes the preflight failed to read, which no count of rows seen go looks under.
+    failed_scopes: Vec<PathBuf>,
+    /// The published generation this pass compares with and stages released rows against.
+    published_seal: Option<crate::cache::GenerationSeal>,
+    /// What passes since that generation saw go, by agent: [`Self::record_released_rows`].
+    released: HashMap<String, ReleasedRows>,
+    /// `(agent, database namespace)` of every token conversation the published generation may
+    /// hold rows or events of. `None` is unknown: every token database counts as material.
+    published_token_namespaces: Option<HashSet<(String, String)>>,
     /// This cache decoded a last-good generation, so "no entry under X" is a positive fact
     /// about what was published rather than a missing witness.
     last_good_base: bool,
@@ -695,6 +936,115 @@ fn source_relative(path: &Path, root: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
+/// Whether `path`, NotFound beneath `root`, may still exist behind an ancestor no walk follows: a
+/// link (a day directory moved onto a drive since unmounted) or anything not proven a directory.
+/// Only beneath directories proven real is NotFound a deletion.
+fn absence_unproven(root: &Path, path: &Path) -> bool {
+    let Some(relative) = source_relative(path, root) else {
+        return false;
+    };
+    let mut ancestor = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            return false;
+        }
+        ancestor.push(component);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            _ => return true,
+        }
+    }
+    false
+}
+
+pub(crate) fn epoch_ns(time: std::time::SystemTime) -> Option<i64> {
+    let since = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_nanos()).ok()
+}
+
+/// Racy: a same-size rewrite could still receive this stamp, because it is not safely older
+/// than the scan start. Far-future stamps are not: a later write stamps the present, and
+/// re-verifying a future-dated file would repeat every run. The slack absorbs NFS clock skew.
+#[cfg(not(windows))]
+pub(crate) fn racy_stamp(mtime_ns: i64, scan_start_ns: i64, now_ns: i64) -> bool {
+    const FUTURE_SLACK_NS: i64 = 2_000_000_000;
+    let margin = racy_margin_ns(mtime_ns);
+    mtime_ns > scan_start_ns.saturating_sub(margin)
+        && mtime_ns <= now_ns.saturating_add(margin.max(FUTURE_SLACK_NS))
+}
+
+/// Windows identity is the change journal's USN or a content digest, never a timestamp.
+#[cfg(windows)]
+pub(crate) fn racy_stamp(_mtime_ns: i64, _scan_start_ns: i64, _now_ns: i64) -> bool {
+    false
+}
+
+/// A later write can share a stamp only within one timestamp granule plus however far the
+/// stamping clock lags the scan clock. A stamp ending in k zeros may come from a filesystem
+/// that coarse (10 ms exFAT, 1 s HFS+/ext3); whole seconds may be FAT's 2 s granules.
+#[cfg(not(windows))]
+fn racy_margin_ns(mtime_ns: i64) -> i64 {
+    const SECOND: i64 = 1_000_000_000;
+    let mut granule = 1_i64;
+    while granule < SECOND && mtime_ns % (granule * 10) == 0 {
+        granule *= 10;
+    }
+    if granule == SECOND {
+        granule = 2 * SECOND;
+    }
+    granule.saturating_add(timestamp_clock_lag_ns())
+}
+
+/// Linux stamps files from the coarse clock, which trails CLOCK_REALTIME by under one tick
+/// and never leads it: a write after the scan start stamps later than `start - tick`.
+#[cfg(target_os = "linux")]
+fn timestamp_clock_lag_ns() -> i64 {
+    static TICK: std::sync::LazyLock<i64> =
+        std::sync::LazyLock::new(|| coarse_clock_tick_ns().unwrap_or(10_000_000));
+    *TICK
+}
+
+#[cfg(target_os = "linux")]
+fn coarse_clock_tick_ns() -> Option<i64> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: std::ffi::c_long,
+        tv_nsec: std::ffi::c_long,
+    }
+    unsafe extern "C" {
+        fn clock_getres(clock: std::ffi::c_int, resolution: *mut Timespec) -> std::ffi::c_int;
+    }
+    const CLOCK_REALTIME_COARSE: std::ffi::c_int = 5;
+    let mut resolution = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_getres writes one timespec through a valid, exclusively borrowed pointer.
+    if unsafe { clock_getres(CLOCK_REALTIME_COARSE, &mut resolution) } != 0 {
+        return None;
+    }
+    // c_long is i64 on 64-bit Linux, where clippy calls this a no-op, but i32 on 32-bit targets.
+    #[allow(clippy::useless_conversion)]
+    let tick = i64::from(resolution.tv_sec)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(resolution.tv_nsec));
+    (1..=1_000_000_000).contains(&tick).then_some(tick)
+}
+
+/// Apple filesystems stamp from the precise clock: a later write always gets a later stamp.
+#[cfg(target_vendor = "apple")]
+fn timestamp_clock_lag_ns() -> i64 {
+    0
+}
+
+/// Other kernels: assume a coarse clock with a tick up to 20 ms (HZ=50).
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+fn timestamp_clock_lag_ns() -> i64 {
+    20_000_000
+}
+
 fn normalized_source_entries(entries: HashMap<String, Entry>) -> HashMap<String, Entry> {
     entries
 }
@@ -711,6 +1061,34 @@ fn cached_event_keys(events: &[Event]) -> Vec<CEventKey> {
     keys.sort_unstable();
     keys.dedup();
     keys
+}
+
+/// Whether a partial read kept everything a cached entry holds: each of its rows, whose reply may
+/// only have grown, and each session it owns events of. Replacing the entry then loses nothing.
+fn partial_read_extends(prev: &Entry, fresh: &[Message], fresh_events: &[Event]) -> bool {
+    if prev.legacy_had_events {
+        return false;
+    }
+    let rows: HashMap<(&str, u32, &str), &str> = fresh
+        .iter()
+        .map(|row| {
+            (
+                (row.session.as_ref(), row.turn, row.text.as_ref()),
+                row.reply.as_ref(),
+            )
+        })
+        .collect();
+    let sessions: HashSet<&str> = fresh_events
+        .iter()
+        .map(|event| event.session.as_str())
+        .collect();
+    prev.msgs.iter().all(|row| {
+        rows.get(&(row.session.as_ref(), row.turn, row.text.as_ref()))
+            .is_some_and(|reply| reply.starts_with(row.reply.as_ref()))
+    }) && prev
+        .event_keys
+        .iter()
+        .all(|key| sessions.contains(key.session.as_str()))
 }
 
 #[cfg(not(windows))]
@@ -818,6 +1196,11 @@ impl std::fmt::Display for CacheDecodeRefusal {
     }
 }
 
+/// These generations share the current entry layout but require current parser semantics.
+fn reparse_compatible_cache_version(version: u32) -> bool {
+    matches!(version, 18..=19 | 21..=36)
+}
+
 /// Decode current/reparse-compatible entries or migrate the exact v8 wire shape.
 fn decode_cache_payload(
     bytes: &[u8],
@@ -833,25 +1216,23 @@ fn decode_cache_payload(
             }) {
                 return Err(CacheDecodeRefusal::PayloadShape);
             }
-            let generation = if cache
+            // Takeover re-encodes an older generation at this version with every entry flagged:
+            // it reparses whole. Once a pass has made any entry current, the entries it could not
+            // reparse keep their flag and rows and reparse one by one on warm passes.
+            let mut held = cache
                 .entries
-                .values()
-                .any(|entry| entry.legacy_needs_reparse)
-            {
-                CacheGeneration::LegacyReparse
-            } else {
-                CacheGeneration::Current
-            };
+                .iter()
+                .filter(|(key, _)| !released_key(key))
+                .peekable();
+            let generation =
+                if held.peek().is_some() && held.all(|(_, entry)| entry.legacy_needs_reparse) {
+                    CacheGeneration::LegacyReparse
+                } else {
+                    CacheGeneration::Current
+                };
             return Ok((cache.entries, generation, true));
         }
-        if cache.version.checked_add(1) == Some(CACHE_VERSION) {
-            let mut entries = cache.entries;
-            for entry in entries.values_mut() {
-                entry.legacy_needs_reparse = true;
-            }
-            return Ok((entries, CacheGeneration::LegacyReparse, true));
-        }
-        if matches!(cache.version, 18..=19) {
+        if reparse_compatible_cache_version(cache.version) {
             let mut entries = cache.entries;
             for entry in entries.values_mut() {
                 entry.legacy_needs_reparse = true;
@@ -1050,10 +1431,7 @@ fn base_writer_build_id(bytes: &[u8]) -> Result<Option<WriterBuildId>, CacheDeco
 fn parse_base_header(bytes: &[u8]) -> Result<BaseHeader, CacheDecodeRefusal> {
     let semantic_version = read_u32(bytes, 0).ok_or(CacheDecodeRefusal::BaseHeader)?;
     let writer_build_id = base_writer_build_id(bytes)?;
-    if semantic_version != CACHE_VERSION
-        && semantic_version.checked_add(1) != Some(CACHE_VERSION)
-        && !matches!(semantic_version, 18..=19)
-    {
+    if semantic_version != CACHE_VERSION && !reparse_compatible_cache_version(semantic_version) {
         return Err(CacheDecodeRefusal::StorageVersion);
     }
     let storage_version = read_u32(bytes, 20).ok_or(CacheDecodeRefusal::BaseHeader)?;
@@ -1801,6 +2179,13 @@ fn decode_cache_owned(
         return Ok((entries, generation, CacheBacking::Rewrite));
     }
     let cursor = replay_journal(&cache_journal_path(path), instance, &mut entries);
+    if read_u32(payload.as_ref(), 0).is_some_and(reparse_compatible_cache_version) {
+        for key in &cursor.upserts {
+            if let Some(entry) = entries.get_mut(key) {
+                entry.legacy_needs_reparse = true;
+            }
+        }
+    }
     let backing = if generation == CacheGeneration::Current {
         CacheBacking::Delta {
             instance,
@@ -2155,6 +2540,39 @@ impl Drop for StagedCache {
     }
 }
 
+/// `(source path, agent, session)`: one cached file's claim on an indexed session.
+pub type SessionSource = (PathBuf, &'static str, Arc<str>);
+
+fn session_sources_of(entries: &HashMap<String, Entry>) -> Vec<SessionSource> {
+    let mut out = Vec::new();
+    for (key, entry) in entries {
+        let Some(path) = source_path_from_key(key) else {
+            continue;
+        };
+        let first = out.len();
+        for msg in &entry.msgs {
+            if out[first..]
+                .iter()
+                .any(|(_, _, session)| session == &msg.session)
+            {
+                continue;
+            }
+            out.push((path.clone(), intern_agent(&msg.agent), msg.session.clone()));
+        }
+    }
+    out
+}
+
+/// Read-only [`IngestCache::session_sources`] of the cache at `path`, accepting a foreign owner:
+/// a diagnostic describes what was published and never stages over another build's cache.
+pub fn session_sources_at(
+    path: &Path,
+) -> Result<Vec<SessionSource>, CacheDecodeRefusal> {
+    let (entries, _generation, _backing) =
+        decode_cache_owned(path, WriterBuildId::current(), true)?;
+    Ok(session_sources_of(&entries))
+}
+
 impl IngestCache {
     /// Cold-mode field defaults; every load mode states only its deltas via struct update.
     fn base(entries: HashMap<String, Entry>, backing: CacheBacking) -> Self {
@@ -2174,13 +2592,26 @@ impl IngestCache {
             repair_mode: false,
             allow_stable_deletions: false,
             repeated_absent_agents: HashSet::new(),
+            repeated_absent_roots: Vec::new(),
+            racy_scan_start_ns: None,
             discarded_base: false,
             discarded_base_confirmed: false,
             #[cfg(test)]
             provisional_deletions: false,
             published_material: None,
             published_blind_scopes: HashSet::new(),
+            published_from_cache: false,
+            unpublished_agents: HashSet::new(),
+            seeded_snapshots: HashSet::new(),
+            unvouched_reads: HashSet::new(),
+            published_rows: HashMap::new(),
+            displaced: HashMap::new(),
+            failed_scopes: Vec::new(),
+            published_seal: None,
+            released: HashMap::new(),
+            published_token_namespaces: None,
             last_good_base: false,
+            legacy_generation: false,
             repair_expected_agents: HashSet::new(),
             repair_expected_paths: HashSet::new(),
             current_snapshot_complete: false,
@@ -2201,13 +2632,17 @@ impl IngestCache {
     }
 
     fn put_entry(&mut self, key: String, entry: Entry) {
-        self.entries.insert(key.clone(), entry);
+        let base = self.entries.insert(key.clone(), entry);
+        self.displaced.entry(key.clone()).or_insert(base);
         self.deleted.remove(&key);
         self.dirty.insert(key);
     }
 
     fn remove_entry(&mut self, key: &str) -> Option<Entry> {
         let entry = self.entries.remove(key)?;
+        if !self.displaced.contains_key(key) {
+            self.displaced.insert(key.to_owned(), Some(entry.clone()));
+        }
         self.dirty.remove(key);
         self.deleted.insert(key.to_string());
         Some(entry)
@@ -2228,6 +2663,9 @@ impl IngestCache {
         let Some(entry) = self.entries.get_mut(key) else {
             return false;
         };
+        if !self.displaced.contains_key(key) {
+            self.displaced.insert(key.to_owned(), Some(entry.clone()));
+        }
         update(entry);
         self.deleted.remove(key);
         self.dirty.insert(key.to_string());
@@ -2260,6 +2698,7 @@ impl IngestCache {
                 warm: generation != CacheGeneration::LegacyReparse,
                 force_reparse: generation != CacheGeneration::Current,
                 last_good_base: true,
+                legacy_generation: generation == CacheGeneration::LegacyReparse,
                 ..Self::base(entries, backing)
             },
             Err(CacheDecodeRefusal::ForeignOwner) => Self::foreign_owned(),
@@ -2285,15 +2724,23 @@ impl IngestCache {
         writer_build_id: WriterBuildId,
     ) -> (Self, Option<CacheDecodeRefusal>) {
         match decode_cache_for(path, writer_build_id) {
-            Ok((entries, _generation, _backing)) => (
-                IngestCache {
-                    force_reparse: true,
-                    repair_mode: true,
-                    last_good_base: true,
-                    ..Self::base(entries, CacheBacking::Rewrite)
-                },
-                None,
-            ),
+            Ok((mut entries, generation, _backing)) => {
+                // This pass rebuilds every entry's events; one it cannot re-read keeps the flag,
+                // so its first good read rebuilds them rather than hitting an unchanged stamp.
+                for entry in entries.values_mut() {
+                    entry.legacy_needs_reparse = true;
+                }
+                (
+                    IngestCache {
+                        force_reparse: true,
+                        repair_mode: true,
+                        last_good_base: true,
+                        legacy_generation: generation == CacheGeneration::LegacyReparse,
+                        ..Self::base(entries, CacheBacking::Rewrite)
+                    },
+                    None,
+                )
+            }
             Err(CacheDecodeRefusal::ForeignOwner) => (
                 IngestCache {
                     force_reparse: true,
@@ -2338,6 +2785,7 @@ impl IngestCache {
                     repair_mode: true,
                     allow_stable_deletions: true,
                     last_good_base: true,
+                    legacy_generation: generation == CacheGeneration::LegacyReparse,
                     ..Self::base(entries, backing)
                 },
                 None,
@@ -2452,10 +2900,52 @@ impl IngestCache {
         self.repeated_absent_agents = agents;
     }
 
+    /// The per-root form of [`Self::allow_repeated_missing_roots`]: `(agent, store root)` pairs
+    /// two consecutive complete, issue-free preflights saw empty. Only that root's rows converge;
+    /// the agent's other roots keep the ordinary guards.
+    pub fn allow_repeated_missing_store_roots(&mut self, roots: HashSet<(String, PathBuf)>) {
+        debug_assert!(self.repair_mode || !self.warm);
+        self.repeated_absent_roots = roots.into_iter().collect();
+    }
+
+    fn repeated_absence_covers(&self, agent: &str, root: &Path) -> bool {
+        self.repeated_absent_agents.contains(agent)
+            || self
+                .repeated_absent_roots
+                .iter()
+                .any(|(owner, absent)| owner == agent && source_path_eq(absent, root))
+    }
+
+    /// Name the instant before this run's first source stat (the preflight, when one feeds the
+    /// cache). Entries whose stamp is not safely older are recorded racy and reparse next run.
+    pub fn set_scan_start(&mut self, start: std::time::SystemTime) {
+        self.racy_scan_start_ns = epoch_ns(start);
+    }
+
     /// Whether recovery began with no last-good rows because the on-disk base was discarded.
     /// Callers use it to keep deletion evidence at the standard a cached generation set.
     pub fn discarded_base(&self) -> bool {
         self.discarded_base
+    }
+
+    /// Whether this cache decoded an on-disk generation rather than starting empty.
+    pub fn decoded_last_good_base(&self) -> bool {
+        self.last_good_base
+    }
+
+    /// No publication recorded an inventory (a release held every snapshot back): stand in
+    /// with this decoded cache. It names the Stat sources with rows; see `published_from_cache`.
+    pub fn set_published_material_from_cache(&mut self) {
+        let paths = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
+            })
+            .filter_map(|(key, _)| source_path_from_key(key))
+            .collect();
+        self.published_material = Some(paths);
+        self.published_from_cache = true;
     }
 
     /// Supply the second stable source observation (a byte-identical preflight pair) that
@@ -2477,8 +2967,13 @@ impl IngestCache {
         !self.guarded_stale
     }
 
+    /// Checked after admission: a read of the published generation can still vouch for a store.
     pub fn output_complete(&self) -> bool {
         !self.output_incomplete
+            && self
+                .unvouched_reads
+                .iter()
+                .all(|(agent, root)| self.published_proves_empty(agent, root))
     }
 
     pub fn source_read_issues(&self) -> &[SourceReadIssue] {
@@ -2498,6 +2993,477 @@ impl IngestCache {
         self.published_blind_scopes = scopes;
     }
 
+    /// Token-store agents whose verified published generation was read and holds none of their
+    /// rows or events: no database of theirs can lose published material, whatever is listed.
+    pub fn set_unpublished_token_agents(&mut self, agents: HashSet<String>) {
+        self.unpublished_agents = agents;
+    }
+
+    /// Whole-store agents with a failed read neither a last-good snapshot nor the inventory
+    /// covers: each pays one read of the published generation, `published`, and one that holds
+    /// no row or event of it has nothing a publication could drop.
+    pub fn admit_unpublished_whole_store_agents(
+        &mut self,
+        mut published: impl FnMut(&str) -> bool,
+    ) {
+        let uncovered: HashSet<&'static str> = self
+            .source_read_issues
+            .iter()
+            .filter(|read| crate::ingest::registry::whole_store_agent(read.agent))
+            .filter(|read| !self.unreadable_scope_covered(read.agent, &read.path))
+            .map(|read| read.agent)
+            .collect();
+        for agent in uncovered {
+            if !published(agent) {
+                self.unpublished_agents.insert(agent.to_owned());
+            }
+        }
+    }
+
+    /// In an older generation's cache-derived inventory, an adapter that can read partially is
+    /// silent; a failed read of one pays a read of the published generation, `published`, and
+    /// one holding no row or event of it could have published nothing uncached either.
+    pub fn admit_unpublished_partial_read_agents<'a>(
+        &mut self,
+        preflight_agents: impl IntoIterator<Item = &'a str>,
+        mut published: impl FnMut(&str) -> bool,
+    ) {
+        if !self.legacy_cache_inventory() {
+            return;
+        }
+        let failed: HashSet<String> = preflight_agents
+            .into_iter()
+            .chain(self.source_read_issues.iter().map(|read| read.agent))
+            .filter(|agent| crate::ingest::registry::partial_read_agent(agent))
+            .map(str::to_owned)
+            .collect();
+        for agent in failed {
+            if !self.unpublished_agents.contains(&agent) && !published(&agent) {
+                self.unpublished_agents.insert(agent);
+            }
+        }
+    }
+
+    /// Whole stores whose failed read seeded a snapshot this pass: a read of the published
+    /// generation, `published`, admits one whose every row, with its attribution, and every event
+    /// session the seed serves. Only a failed unit yields nothing, so each failure must be one.
+    pub fn admit_fully_served_whole_store_agents<'a>(
+        &mut self,
+        preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        mut published: impl FnMut(&str) -> Option<crate::cache::PublishedAgentRows>,
+    ) {
+        let unit_scoped = crate::ingest::registry::unit_scoped_read_issue;
+        let mut agent_wide: HashSet<String> = preflight_issues
+            .into_iter()
+            .filter(|(agent, path)| !unit_scoped(agent, path))
+            .map(|(agent, _)| agent.to_owned())
+            .collect();
+        agent_wide.extend(
+            self.source_read_issues
+                .iter()
+                .filter(|read| !unit_scoped(read.agent, &read.path))
+                .map(|read| read.agent.to_owned()),
+        );
+        let seeded: Vec<String> = self
+            .seeded_snapshots
+            .iter()
+            .filter(|agent| !self.unpublished_agents.contains(*agent))
+            .filter(|agent| !agent_wide.contains(*agent))
+            .filter(|agent| crate::ingest::registry::whole_store_agent(agent))
+            .filter(|agent| !crate::ingest::registry::partial_read_agent(agent))
+            .cloned()
+            .collect();
+        for agent in seeded {
+            let Some(seed) = self.entries.get(&format!("\x00snapshot\x00{agent}")) else {
+                continue;
+            };
+            let turns: HashMap<(&str, u32), &CMsg> = seed
+                .msgs
+                .iter()
+                .map(|message| ((message.session.as_ref(), message.turn), message))
+                .collect();
+            let sessions: HashSet<&str> = turns.keys().map(|(session, _)| *session).collect();
+            let event_sessions: HashSet<&str> = seed
+                .event_keys
+                .iter()
+                .map(|key| key.session.as_str())
+                .collect();
+            let attributed = |message: &CMsg, row: &crate::cache::PublishedTurn| {
+                *message.project == *row.project
+                    && row
+                        .model
+                        .as_deref()
+                        .is_none_or(|model| *message.model == *model)
+            };
+            let served = published(&agent).is_some_and(|rows| {
+                rows.turns.iter().all(|((session, turn), row)| {
+                    turns
+                        .get(&(session.as_str(), *turn))
+                        .is_some_and(|message| attributed(message, row))
+                }) && rows
+                    .sessions
+                    .iter()
+                    .all(|session| sessions.contains(session.as_str()))
+                    && rows
+                        .event_sessions
+                        .iter()
+                        .all(|session| event_sessions.contains(session.as_str()))
+            });
+            if served {
+                self.unpublished_agents.insert(agent);
+            }
+        }
+    }
+
+    /// A per-file agent's failed read the cache alone cannot answer for pays one read of the
+    /// published generation, `published`: an older generation's partial read may have published
+    /// uncached, and a listed file this cache never held may have published rows only there.
+    pub fn record_published_rows<'a>(
+        &mut self,
+        preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        mut published: impl FnMut(&str) -> Option<crate::cache::PublishedAgentRows>,
+    ) {
+        let issues: Vec<(&str, &Path)> = preflight_issues.into_iter().collect();
+        let mut needed: HashSet<String> = issues
+            .iter()
+            .filter(|(agent, scope)| self.cache_cannot_answer_for(agent, scope))
+            .map(|(agent, _)| (*agent).to_owned())
+            .collect();
+        needed.extend(
+            self.source_read_issues
+                .iter()
+                .filter(|read| self.cache_cannot_answer_for(read.agent, &read.path))
+                .map(|read| read.agent.to_owned()),
+        );
+        for agent in needed {
+            let held = published(&agent).map(|rows| self.holds_published_rows(&agent, &rows));
+            self.published_rows.insert(agent, held);
+        }
+    }
+
+    /// Whether this pass publishes, or saw go, every row and session of `agent` that `published`
+    /// holds. Rows match by session, timestamp and text, one for one: turn-collision repair
+    /// renumbers turns but changes none of those, so no other row can stand in for a lost one.
+    fn holds_published_rows(
+        &self,
+        agent: &str,
+        published: &crate::cache::PublishedAgentRows,
+    ) -> bool {
+        let changed = self.changed_entries();
+        let rows = self.cached_rows(agent, &changed, |_| true);
+        let touched = Self::touched_sessions(agent, &changed);
+        let mut released = self.released_rows(agent, &changed, &touched, &rows);
+        let mut output = published_counts(rows.iter().map(|row| row.row));
+        let rows_held = published.turns.iter().all(|((session, _), row)| {
+            let key = (session.as_str(), row.ts, row.text.as_str());
+            output.take(key) || released.take(key)
+        });
+        let event_sessions = self
+            .entries
+            .values()
+            .flat_map(|entry| &entry.event_keys)
+            .filter(|key| key.agent == agent)
+            .map(|key| key.session.as_str());
+        let sessions: HashSet<&str> = rows
+            .iter()
+            .map(|row| row.row.session.as_ref())
+            .chain(event_sessions)
+            .chain(released.sessions.iter().copied())
+            .collect();
+        rows_held
+            && published
+                .sessions
+                .iter()
+                .chain(&published.event_sessions)
+                .all(|session| sessions.contains(session.as_str()))
+    }
+
+    fn under_failed_scope(&self, key: &str) -> bool {
+        source_path_from_key(key).is_some_and(|path| {
+            self.failed_scopes
+                .iter()
+                .any(|scope| source_path_within(&path, scope))
+        })
+    }
+
+    /// The entries whose rows or events this pass changed, each with the base's version.
+    fn changed_entries(&self) -> HashMap<&str, (Option<&Entry>, Option<&Entry>)> {
+        fn held(entry: Option<&Entry>) -> (&[CMsg], &[CEventKey]) {
+            entry.map_or((&[], &[]), |entry| (&entry.msgs, &entry.event_keys))
+        }
+        let mut changed = HashMap::new();
+        for (key, base) in &self.displaced {
+            let (base, current) = (base.as_ref(), self.entries.get(key));
+            let same = held(base) == held(current);
+            if !same {
+                changed.insert(key.as_str(), (base, current));
+            }
+        }
+        changed
+    }
+
+    /// Sessions of `agent` a `changed` entry holds, or held in the base.
+    fn touched_sessions<'a>(
+        agent: &str,
+        changed: &HashMap<&str, (Option<&'a Entry>, Option<&'a Entry>)>,
+    ) -> HashSet<&'a str> {
+        let mut touched = HashSet::new();
+        for (base, current) in changed.values() {
+            for entry in base.iter().chain(current) {
+                let rows = entry.msgs.iter().filter(|row| row.agent == agent);
+                touched.extend(rows.map(|row| row.session.as_ref()));
+                let events = entry.event_keys.iter().filter(|event| event.agent == agent);
+                touched.extend(events.map(|event| event.session.as_str()));
+            }
+        }
+        touched
+    }
+
+    /// The cached rows of `agent` in the sessions `within` accepts.
+    fn cached_rows(
+        &self,
+        agent: &str,
+        changed: &HashMap<&str, (Option<&Entry>, Option<&Entry>)>,
+        within: impl Fn(&str) -> bool,
+    ) -> Vec<CachedRow<'_>> {
+        let mut rows = Vec::new();
+        for (key, entry) in &self.entries {
+            let mut place = None;
+            for row in &entry.msgs {
+                if row.agent != agent || !within(&row.session) {
+                    continue;
+                }
+                let (beside, unchanged) = *place.get_or_insert_with(|| {
+                    (
+                        !self.under_failed_scope(key),
+                        !changed.contains_key(key.as_str()),
+                    )
+                });
+                rows.push(CachedRow {
+                    row,
+                    beside,
+                    unchanged,
+                });
+            }
+        }
+        rows
+    }
+
+    /// What this pass, after the passes since the published generation, saw go of `agent` beside
+    /// the scopes the preflight failed to read. Base and current entries differ only in `touched`
+    /// sessions, so `rows` need hold only the cached rows of those.
+    fn released_rows<'a>(
+        &'a self,
+        agent: &str,
+        changed: &HashMap<&'a str, (Option<&'a Entry>, Option<&'a Entry>)>,
+        touched: &HashSet<&'a str>,
+        rows: &[CachedRow<'a>],
+    ) -> Released<'a> {
+        let beside = rows
+            .iter()
+            .filter(|row| row.beside && touched.contains(row.row.session.as_ref()));
+        let mut base: Vec<&CMsg> = Vec::new();
+        let mut sessions: HashSet<&str> = HashSet::new();
+        if self.last_good_base {
+            base.extend(
+                beside
+                    .clone()
+                    .filter(|row| row.unchanged)
+                    .map(|row| row.row),
+            );
+            for (key, (entry, _)) in changed {
+                let Some(entry) = entry.filter(|_| !self.under_failed_scope(key)) else {
+                    continue;
+                };
+                for row in entry.msgs.iter().filter(|row| row.agent == agent) {
+                    base.push(row);
+                    sessions.insert(row.session.as_ref());
+                }
+                let events = entry.event_keys.iter().filter(|event| event.agent == agent);
+                sessions.extend(events.map(|event| event.session.as_str()));
+            }
+        }
+        let base = published_counts(base);
+        let beside = published_counts(beside.map(|row| row.row));
+        let mut released = Released::default();
+        if let Some(prior) = self.released.get(agent) {
+            for ((session, ts, digest), count) in &prior.rows {
+                let recorded = released.recorded.entry((session.as_str(), *ts));
+                recorded.or_default().push((*digest, *count));
+            }
+            sessions.extend(prior.sessions.iter().map(String::as_str));
+        }
+        // In the touched sessions, what the base held and earlier passes recorded, less what this
+        // pass holds there; elsewhere, the records alone.
+        let only_beside = beside.iter().filter(|(key, _)| base.count(*key) == 0);
+        for (key, _) in base.iter().chain(only_beside) {
+            let mut recorded = 0;
+            if let Some(records) = released.recorded.get_mut(&(key.0, key.1)) {
+                let digest = crate::cache::text_digest(key.2);
+                for (_, count) in records.iter_mut().filter(|(held, _)| *held == digest) {
+                    recorded += std::mem::take(count);
+                }
+            }
+            let gone = (base.count(key) + recorded).saturating_sub(beside.count(key));
+            if gone > 0 {
+                released.rows.add(key, gone);
+            }
+        }
+        for entry in self.entries.values() {
+            if sessions.is_empty() {
+                break;
+            }
+            for row in entry.msgs.iter().filter(|row| row.agent == agent) {
+                sessions.remove(row.session.as_ref());
+            }
+            for event in entry.event_keys.iter().filter(|event| event.agent == agent) {
+                sessions.remove(event.session.as_str());
+            }
+        }
+        released.sessions = sessions;
+        released
+    }
+
+    /// Before ingest mutates this decoded base, take it as what the pass's changes count from, and
+    /// adopt what passes since the published generation, sealed `published`, saw go before a kill
+    /// left it published. No count of rows seen go looks under the scopes the preflight failed.
+    pub fn mark_base_rows<'a>(
+        &mut self,
+        preflight_issues: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        published: Option<crate::cache::GenerationSeal>,
+    ) {
+        self.displaced.clear();
+        self.failed_scopes = preflight_issues
+            .into_iter()
+            .map(|(_, scope)| scope.to_path_buf())
+            .collect();
+        self.published_seal = published.filter(|_| self.last_good_base);
+        self.released = match &self.published_seal {
+            Some(seal) => recorded_released_rows(&self.entries, &hex16(seal)),
+            None => HashMap::new(),
+        };
+    }
+
+    /// Stage with the cache what this pass and those since the published generation saw go: a kill
+    /// between the cache commit and that generation's replacement leaves the cache short of rows
+    /// still published. Records against any other generation go.
+    pub fn record_released_rows(&mut self) {
+        let mut released: HashMap<String, ReleasedRows> = HashMap::new();
+        let mut sealed = None;
+        if let Some(seal) = self.published_seal.as_ref().map(hex16) {
+            let changed = self.changed_entries();
+            let mut agents: HashSet<&str> = self.released.keys().map(String::as_str).collect();
+            for (base, current) in changed.values() {
+                for entry in base.iter().chain(current) {
+                    agents.extend(entry.msgs.iter().map(|row| row.agent.as_str()));
+                    agents.extend(entry.event_keys.iter().map(|event| event.agent.as_str()));
+                }
+            }
+            for agent in agents
+                .into_iter()
+                .filter(|agent| Self::per_file_agent(agent))
+            {
+                let touched = Self::touched_sessions(agent, &changed);
+                let rows = self.cached_rows(agent, &changed, |session| touched.contains(session));
+                let record = self
+                    .released_rows(agent, &changed, &touched, &rows)
+                    .record();
+                released.insert(agent.to_owned(), record);
+            }
+            sealed = Some(seal);
+        }
+        let record = sealed.and_then(|seal| pack_released(&seal, &released));
+        let stale: Vec<String> = self
+            .entries
+            .keys()
+            .filter(|key| released_key(key) && Some(*key) != record.as_ref())
+            .cloned()
+            .collect();
+        for key in stale {
+            self.remove_entry(&key);
+        }
+        if let Some(key) = record {
+            let staged = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| !entry.legacy_needs_reparse);
+            if !staged {
+                self.put_entry(key, released_entry());
+            }
+        }
+    }
+
+    fn per_file_agent(agent: &str) -> bool {
+        !crate::ingest::registry::whole_store_agent(agent)
+            && !crate::ingest::registry::token_store_agent(agent)
+    }
+
+    fn cache_cannot_answer_for(&self, agent: &str, scope: &Path) -> bool {
+        Self::per_file_agent(agent)
+            && !self.published_rows.contains_key(agent)
+            && ((self.legacy_generation && crate::ingest::registry::partial_read_agent(agent))
+                || self.listed_files_cached(scope) == Some(false))
+    }
+
+    /// Whether this cache holds an entry, with rows or none, for every file the published
+    /// inventory lists under `scope`; None when it lists none there.
+    fn listed_files_cached(&self, scope: &Path) -> Option<bool> {
+        let published = self.published_material.as_ref()?;
+        let mut listed = published
+            .iter()
+            .filter(|path| source_path_within(path, scope))
+            .peekable();
+        listed.peek()?;
+        let cached: Vec<PathBuf> = self
+            .entries
+            .keys()
+            .filter_map(|key| source_path_from_key(key))
+            .filter(|path| source_path_within(path, scope))
+            .collect();
+        let exact: HashSet<&Path> = cached.iter().map(PathBuf::as_path).collect();
+        Some(listed.all(|path| {
+            exact.contains(path.as_path())
+                || (cfg!(windows) && cached.iter().any(|held| source_path_eq(held, path)))
+        }))
+    }
+
+    /// Whether this pass holds every row and session of `agent` the published generation does, as
+    /// [`Self::record_published_rows`] judged it; None when it was not read.
+    fn cache_holds_published_rows(&self, agent: &str) -> Option<bool> {
+        self.published_rows.get(agent).copied().flatten()
+    }
+
+    /// An inventory rebuilt from a cache an older generation wrote.
+    fn legacy_cache_inventory(&self) -> bool {
+        self.published_from_cache && self.legacy_generation
+    }
+
+    /// The token databases the published generation may hold material of; see
+    /// [`Self::token_namespaces`]. `None` when that record is missing or describes another one.
+    pub fn set_published_token_namespaces(
+        &mut self,
+        namespaces: Option<HashSet<(String, String)>>,
+    ) {
+        self.published_token_namespaces = namespaces;
+    }
+
+    /// `(agent, database namespace)` of every cached token conversation with rows or events.
+    /// Every token row a pass publishes is served from such an entry, so recorded before the
+    /// derived writes this names each database the publication can hold material of.
+    pub fn token_namespaces(&self) -> HashSet<(String, String)> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
+            })
+            .filter_map(|(key, _)| key.strip_prefix("\0tok\0")?.split_once('\0'))
+            .map(|(agent, cache_id)| {
+                let namespace = crate::ingest::registry::token_namespace(agent, cache_id);
+                (agent.to_owned(), namespace)
+            })
+            .collect()
+    }
+
     /// Sessions the last-good rows attribute to `scope`. Read before ingest, this is the
     /// per-scope row census a publication may not silently shrink while `scope` is unreadable.
     pub fn sessions_under(&self, scope: &Path) -> HashSet<String> {
@@ -2510,6 +3476,12 @@ impl IngestCache {
             .collect()
     }
 
+    /// `(source path, agent, session)` for every cached file with rows: the identities the
+    /// store's own filenames carry, resolved against the header ids at publication.
+    pub fn session_sources(&self) -> Vec<SessionSource> {
+        session_sources_of(&self.entries)
+    }
+
     fn published_inventory_blind_to(&self, agent: &str, scope: &Path) -> bool {
         self.published_blind_scopes
             .iter()
@@ -2519,6 +3491,76 @@ impl IngestCache {
             })
     }
 
+    /// Whether a cache-derived inventory is silent on `scope`: a whole store, which admission
+    /// decides, or, in an older generation, a source whose partial read published uncached.
+    /// Older generations cached every other Stat read they published; a failed read published none.
+    fn cache_inventory_silent_on(&self, agent: &str, scope: &Path) -> bool {
+        self.published_from_cache
+            && crate::ingest::registry::token_prefix(agent, scope).is_none()
+            && (crate::ingest::registry::whole_store_agent(agent)
+                || (self.legacy_cache_inventory()
+                    && crate::ingest::registry::partial_read_agent(agent)))
+    }
+
+    /// Whether this cache holds conversations with rows or events of the token store database
+    /// at `scope`: a pass that held its snapshot back may still have published them.
+    fn holds_token_entries(&self, agent: &str, scope: &Path) -> bool {
+        let Some(prefix) = crate::ingest::registry::token_prefix(agent, scope) else {
+            return false;
+        };
+        let prefix = format!("\0tok\0{agent}\0{prefix}");
+        self.entries.iter().any(|(key, entry)| {
+            key.starts_with(&prefix)
+                && (!entry.msgs.is_empty()
+                    || !entry.event_keys.is_empty()
+                    || entry.legacy_had_events)
+        })
+    }
+
+    /// Whether the token store database at `scope` may hold published or cached material: its
+    /// namespace is recorded as published, that record is unknown, or this cache holds it.
+    fn token_scope_material(&self, agent: &str, scope: &Path) -> bool {
+        let Some(prefix) = crate::ingest::registry::token_prefix(agent, scope) else {
+            return false;
+        };
+        let recorded = |(owner, namespace): &(String, String)| {
+            owner == agent && (prefix.starts_with(namespace) || namespace.starts_with(&prefix))
+        };
+        self.holds_token_entries(agent, scope)
+            || self
+                .published_token_namespaces
+                .as_ref()
+                .is_none_or(|published| published.iter().any(recorded))
+    }
+
+    /// A scope with nothing at stake: no publication can drop anything of its agent, and it is a
+    /// whole store, a source an older generation's inventory is silent on, or a token database
+    /// this cache holds no conversation of.
+    fn unpublished_scope(&self, agent: &str, scope: &Path) -> bool {
+        self.unpublished_agents.contains(agent)
+            && match crate::ingest::registry::token_prefix(agent, scope) {
+                Some(_) => !self.holds_token_entries(agent, scope),
+                None => {
+                    crate::ingest::registry::whole_store_agent(agent)
+                        || (self.legacy_cache_inventory()
+                            && crate::ingest::registry::partial_read_agent(agent))
+                }
+            }
+    }
+
+    /// Whether `agent`'s whole-store snapshot holds material an earlier pass published.
+    fn snapshot_witnesses(&self, agent: &str) -> bool {
+        !self.seeded_snapshots.contains(agent)
+            && self
+                .entries
+                .get(&format!("\x00snapshot\x00{agent}"))
+                .is_some_and(|entry| {
+                    !entry.msgs.is_empty()
+                        || !entry.event_keys.is_empty()
+                        || entry.legacy_had_events
+                })
+    }
+
     /// Would publishing without `scope` (an unobservable subtree of `agent`'s store) drop
     /// material the last published generation held and this pass cannot serve?
     ///
@@ -2526,28 +3568,69 @@ impl IngestCache {
     /// whose job is proving absence must not be satisfiable by absence of its own input.
     /// An inventory blind to `scope` is likewise unknown unless retained rows still answer.
     pub fn published_material_under(&self, agent: &str, scope: &Path) -> MaterialVerdict {
+        // A read of the published generation itself, not an absent input.
+        if self.unpublished_scope(agent, scope) {
+            return MaterialVerdict::Retained;
+        }
         let Some(published) = self.published_material.as_ref() else {
             return MaterialVerdict::Unknown;
         };
         let has_material = |entry: &Entry| {
             !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
         };
-        // An Always adapter's last-good snapshot carries its whole store, path keys and all.
-        let snapshot_key = format!("\x00snapshot\x00{agent}");
-        let retained_here = self.entries.get(&snapshot_key).is_some_and(has_material)
-            || self.entries.iter().any(|(key, entry)| {
+        let per_file = !crate::ingest::registry::whole_store_agent(agent)
+            && !crate::ingest::registry::token_store_agent(agent);
+        if per_file {
+            if self.legacy_generation && crate::ingest::registry::partial_read_agent(agent) {
+                // An older build published a partial read uncached, under any entry or none.
+                return match self.cache_holds_published_rows(agent) {
+                    Some(true) => MaterialVerdict::Retained,
+                    Some(false) => MaterialVerdict::Drops,
+                    None => MaterialVerdict::Unknown,
+                };
+            }
+            // A failed read re-emits a cached file's entry, rows or none; a listed file the cache
+            // never held may have published rows only that generation holds, unless it shows none.
+            match self.listed_files_cached(scope) {
+                Some(true) => return MaterialVerdict::Retained,
+                Some(false) => {
+                    return match self.cache_holds_published_rows(agent) {
+                        Some(true) => MaterialVerdict::Retained,
+                        _ => MaterialVerdict::Drops,
+                    };
+                }
+                None => {}
+            }
+            let retained_rows = self.entries.iter().any(|(key, entry)| {
                 source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
                     && has_material(entry)
             });
-        if retained_here {
-            return MaterialVerdict::Retained;
-        }
-        if published.iter().any(|path| source_path_within(path, scope)) {
-            return MaterialVerdict::Drops;
+            if retained_rows {
+                return MaterialVerdict::Retained;
+            }
+        } else {
+            // An Always adapter's last-good snapshot carries its whole store, path keys and
+            // all; a token collect serves every cached conversation of a database it cannot read.
+            let retained_here = self.snapshot_witnesses(agent)
+                || self.holds_token_entries(agent, scope)
+                || self.entries.iter().any(|(key, entry)| {
+                    source_path_from_key(key).is_some_and(|path| source_path_within(&path, scope))
+                        && has_material(entry)
+                });
+            if retained_here {
+                return MaterialVerdict::Retained;
+            }
+            if published.iter().any(|path| source_path_within(path, scope))
+                || self.token_scope_material(agent, scope)
+            {
+                return MaterialVerdict::Drops;
+            }
         }
         // No path here, and nothing retained. Only an inventory that could actually read the
         // scope turns that silence into the positive claim "it held nothing".
-        if self.published_inventory_blind_to(agent, scope) && !self.last_good_base {
+        if self.cache_inventory_silent_on(agent, scope)
+            || (self.published_inventory_blind_to(agent, scope) && !self.last_good_base)
+        {
             return MaterialVerdict::Unknown;
         }
         MaterialVerdict::Retained
@@ -2562,22 +3645,32 @@ impl IngestCache {
     /// Always-adapter's stale per-file entries are never re-emitted, so their
     /// Retained verdict must not license publishing without their rows.
     pub fn unreadable_scope_covered(&self, agent: &str, scope: &Path) -> bool {
-        let snapshot_key = format!("\x00snapshot\x00{agent}");
-        let has_material = |entry: &Entry| {
-            !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
-        };
-        if self.entries.get(&snapshot_key).is_some_and(has_material) {
+        if self.snapshot_witnesses(agent) {
             return true;
         }
         self.published_proves_empty(agent, scope)
     }
 
+    /// Did this pass still publish what `scope` held although it could not read it? Covered,
+    /// or (outside whole stores, whose stale per-file entries go unserved) its cached rows,
+    /// which the per-file and token lanes re-emit for every read that fails.
+    pub fn unread_scope_served(&self, agent: &str, scope: &Path) -> bool {
+        self.unreadable_scope_covered(agent, scope)
+            || (!crate::ingest::registry::whole_store_agent(agent)
+                && self.published_material_under(agent, scope) == MaterialVerdict::Retained)
+    }
+
     /// The published inventory's positive claim that `scope` held no material.
     fn published_proves_empty(&self, agent: &str, scope: &Path) -> bool {
+        if self.unpublished_scope(agent, scope) {
+            return true;
+        }
         match self.published_material.as_ref() {
             Some(paths) => {
                 !paths.iter().any(|path| source_path_within(path, scope))
+                    && !self.token_scope_material(agent, scope)
                     && !self.published_inventory_blind_to(agent, scope)
+                    && !self.cache_inventory_silent_on(agent, scope)
             }
             None => false,
         }
@@ -2648,6 +3741,40 @@ impl IngestCache {
         }
     }
 
+    /// Seed a whole store's first last-good snapshot from a read that missed part of it. It is
+    /// no witness this pass, and it publishes only where nothing published is at stake.
+    fn seed_snapshot(
+        &mut self,
+        agent: &str,
+        root: &Path,
+        key: String,
+        fresh: &[Message],
+        event_keys: Vec<CEventKey>,
+    ) {
+        self.seeded_snapshots.insert(agent.to_owned());
+        self.unvouched_reads
+            .insert((agent.to_owned(), root.to_path_buf()));
+        let sessions: Vec<String> = fresh
+            .iter()
+            .map(|message| message.session.to_string())
+            .chain(event_keys.iter().map(|event| event.session.clone()))
+            .collect();
+        self.touched.extend(sessions);
+        self.touch_event_keys(&event_keys);
+        self.put_entry(
+            key,
+            Entry {
+                mtime: 0,
+                size: 0,
+                identity: None,
+                msgs: fresh.iter().map(CMsg::from).collect(),
+                event_keys,
+                legacy_had_events: false,
+                legacy_needs_reparse: false,
+            },
+        );
+    }
+
     /// Last-good fallback for full-parse adapters: never let a transient empty
     /// result (store locked/absent/unreadable) become an emitted empty - that cascades to
     /// session-index rewrite -> corpus removal-reconciliation -> event-file unlink. A
@@ -2671,11 +3798,14 @@ impl IngestCache {
             if let Some(entry) = self.entries.get(&key) {
                 return (entry.msgs.iter().map(CMsg::to_msg).collect(), true);
             }
-            if source_outcome == ReadOutcome::Invalid && !self.published_proves_empty(agent, root) {
-                // No snapshot and published material at stake: may not replace the
-                // generation. A provably-empty store has nothing to lose, so it
-                // publishes with disclosure instead of freezing every other agent.
-                self.output_incomplete = true;
+            // No snapshot: may replace the generation only where nothing published is at stake.
+            // What did parse seeds the last-good snapshot later failed reads serve; its events
+            // stay unwritten, like the rest of this lossy read.
+            if fresh.is_empty() {
+                self.unvouched_reads
+                    .insert((agent.to_owned(), root.to_path_buf()));
+            } else {
+                self.seed_snapshot(agent, root, key, &fresh, Vec::new());
             }
             return (fresh, true);
         }
@@ -2686,25 +3816,7 @@ impl IngestCache {
                     self.output_incomplete = true;
                     return (fresh, true);
                 }
-                let fresh_sessions: HashSet<String> = fresh
-                    .iter()
-                    .map(|message| message.session.to_string())
-                    .chain(fresh_events.iter().map(|event| event.session.clone()))
-                    .collect();
-                self.touched.extend(fresh_sessions);
-                self.touch_event_keys(&fresh_event_keys);
-                self.put_entry(
-                    key,
-                    Entry {
-                        mtime: 0,
-                        size: 0,
-                        identity: None,
-                        msgs: fresh.iter().map(CMsg::from).collect(),
-                        event_keys: fresh_event_keys,
-                        legacy_had_events: false,
-                        legacy_needs_reparse: false,
-                    },
-                );
+                self.seed_snapshot(agent, root, key, &fresh, fresh_event_keys);
                 return (fresh, false);
             };
             let fresh_sessions: HashSet<String> = fresh
@@ -2753,11 +3865,10 @@ impl IngestCache {
             );
             return (merged, false);
         }
+        // The reparse flag marks a format upgrade, not material: a flagged entry with no rows or
+        // events holds nothing a publication could drop, so it guards nothing.
         let prior_material = self.entries.get(&key).map(|entry| {
-            !entry.msgs.is_empty()
-                || !entry.event_keys.is_empty()
-                || entry.legacy_had_events
-                || entry.legacy_needs_reparse
+            !entry.msgs.is_empty() || !entry.event_keys.is_empty() || entry.legacy_had_events
         });
         // A complete preflight with no files/tokens proves clean ENOENT absence.
         // Permission/share failures remain incomplete; legacy expectations without prior rows
@@ -3412,6 +4523,7 @@ mod tests {
             ok: Some(true),
             call_id: call_id.into(),
             child_session: String::new(),
+            meta: String::new(),
         }
     }
 
@@ -3498,6 +4610,70 @@ mod tests {
         assert!(!cache.adapter_required("kimi"));
     }
 
+    /// A reparse-compatible upgrade flags every cached entry for reparse. An Always store's empty
+    /// snapshot entry still holds nothing, so its absent store publishes; flagged material guards.
+    #[test]
+    fn upgraded_empty_always_snapshot_does_not_guard_an_absent_store() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-upgraded-empty-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let store = root.join("store");
+        let cache_path = root.join("cache.bin");
+        let mut published = IngestCache::cold();
+        for (agent, fresh) in [
+            ("kimi", Vec::new()),
+            ("cline", vec![test_message("cline row")]),
+        ] {
+            published.guard_never_empty(agent, &store, fresh, &[], ReadOutcome::Complete);
+        }
+        published.guard_never_empty(
+            "antigravity",
+            &store,
+            Vec::new(),
+            &[test_event("brain", "call")],
+            ReadOutcome::Complete,
+        );
+        let reparse_compatible = CACHE_VERSION - 1;
+        assert!(super::reparse_compatible_cache_version(reparse_compatible));
+        fs::write(
+            &cache_path,
+            bincode::serialize(&super::CacheFileRef {
+                version: reparse_compatible,
+                entries: &published.entries,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut empty = IngestCache::load(&cache_path);
+        let flagged = empty
+            .entries
+            .values()
+            .all(|entry| entry.legacy_needs_reparse);
+        assert!(flagged);
+        let (rows, guarded) =
+            empty.guard_never_empty("kimi", &store, Vec::new(), &[], ReadOutcome::Complete);
+        assert!(rows.is_empty());
+        assert!(!guarded, "an empty upgraded snapshot guarded");
+        assert!(empty.source_snapshot_safe());
+        assert!(empty.output_complete());
+
+        for agent in ["cline", "antigravity"] {
+            let mut material = IngestCache::load(&cache_path);
+            let (_, guarded) =
+                material.guard_never_empty(agent, &store, Vec::new(), &[], ReadOutcome::Complete);
+            assert!(guarded, "{agent}: upgraded material stopped guarding");
+            assert!(!material.source_snapshot_safe());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn source_stamp(path: &std::path::Path) -> crate::ingest::registry::SourceStatStamp {
         let metadata = fs::symlink_metadata(path).unwrap();
         let modified = metadata
@@ -3519,6 +4695,108 @@ mod tests {
             file_identity: Some(file_identity),
             content_hashed: false,
         }
+    }
+
+    /// One indexing run against a cache file, with the preflight stamp injected so a test can
+    /// reproduce what Linux's coarse clock does: a same-size rewrite that keeps the stat key.
+    #[cfg(not(windows))]
+    fn racy_run(
+        cache_path: &std::path::Path,
+        source: &std::path::Path,
+        stamp: &crate::ingest::registry::SourceStatStamp,
+        scan_start: std::time::SystemTime,
+    ) -> (Vec<String>, usize) {
+        let root = source.parent().unwrap();
+        let mut cache = IngestCache::load(cache_path);
+        cache
+            .source_stamps
+            .insert(source.to_path_buf(), stamp.clone());
+        cache.set_scan_start(scan_start);
+        let pass = collect_cached(&mut cache, root, &[source.to_path_buf()], |path| {
+            let text = fs::read_to_string(path).unwrap();
+            (vec![test_message(&text)], Vec::<Event>::new())
+        });
+        cache.save(cache_path).unwrap();
+        let texts = pass.messages.iter().map(|m| m.text.to_string()).collect();
+        (texts, pass.parsed)
+    }
+
+    #[cfg(not(windows))]
+    fn racy_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-racy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("store")).unwrap();
+        let source = root.join("store").join("session.jsonl");
+        fs::write(&source, b"first!").unwrap();
+        (root.clone(), root.join("cache.bin"), source)
+    }
+
+    /// A rewrite in the very tick the scan began keeps size, mtime and ctime. The racy entry is
+    /// re-verified on the next run even though its stat key matches, then trusted while quiet.
+    #[cfg(not(windows))]
+    #[test]
+    fn racy_entry_catches_a_same_tick_rewrite_then_is_trusted() {
+        let (root, cache_path, source) = racy_fixture("same-tick");
+        let stamp = source_stamp(&source);
+        let stamped = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos(u64::try_from(stamp.mtime_ns).unwrap());
+        let later = |secs| stamped + std::time::Duration::from_secs(secs);
+
+        assert_eq!(
+            racy_run(&cache_path, &source, &stamp, stamped),
+            (vec!["first!".to_string()], 1)
+        );
+        fs::write(&source, b"second").unwrap();
+        assert_eq!(
+            racy_run(&cache_path, &source, &stamp, later(10)),
+            (vec!["second".to_string()], 1),
+            "a same-tick same-size rewrite was served from the cache"
+        );
+        assert_eq!(
+            racy_run(&cache_path, &source, &stamp, later(20)),
+            (vec!["second".to_string()], 0),
+            "a quiet, re-verified file was not trusted"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Racy protection costs nothing for a file whose stamp predates the scan: it is trusted
+    /// on the very next run, so a quiescent store never re-verifies anything.
+    #[cfg(not(windows))]
+    #[test]
+    fn settled_stamp_is_trusted_on_the_next_run() {
+        let (root, cache_path, source) = racy_fixture("settled");
+        let stamp = source_stamp(&source);
+        let after = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos(u64::try_from(stamp.mtime_ns).unwrap())
+            + std::time::Duration::from_secs(10);
+        assert_eq!(racy_run(&cache_path, &source, &stamp, after).1, 1);
+        assert_eq!(racy_run(&cache_path, &source, &stamp, after).1, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn racy_window_tracks_timestamp_granularity_and_ignores_far_future_stamps() {
+        let second = 1_000_000_000_i64;
+        let start = 1_800_000_000 * second + 123_456_789;
+        let now = start + second;
+        assert!(!super::racy_stamp(start - 60 * second, start, now));
+        assert!(super::racy_stamp(start, start, now));
+        assert!(super::racy_stamp(start + 1_000, start, now));
+        // Whole seconds may be FAT's 2 s granules: a later write can share them for two seconds.
+        assert!(super::racy_stamp(1_800_000_000 * second, start, now));
+        assert!(super::racy_stamp(1_799_999_999 * second, start, now));
+        assert!(!super::racy_stamp(1_799_999_990 * second, start, now));
+        // A fine stamp a whole second before the scan is settled on every clock in use.
+        assert!(!super::racy_stamp(start - second, start, now));
+        assert!(!super::racy_stamp(now + 3_600 * second, start, now));
     }
 
     #[test]
@@ -4033,6 +5311,7 @@ mod tests {
             calls.fetch_add(1, Ordering::Relaxed);
             (vec![test_message("before")], Vec::new())
         });
+        crate::ingest::registry::wait_for_next_ctime_tick(&source);
 
         fs::write(&source, b"after!").unwrap();
         fs::OpenOptions::new()
@@ -4051,6 +5330,47 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(pass.parsed, 1);
         assert_eq!(pass.messages[0].text.as_ref(), "after!");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_retired_source_is_forgotten_like_a_deletion_instead_of_re_added() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-cache-retired-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("session.json");
+        let current = root.join("session.jsonl");
+        fs::write(&legacy, b"legacy").unwrap();
+        let mut cache = IngestCache::cold();
+        collect_cached(&mut cache, &root, std::slice::from_ref(&legacy), |_| {
+            (vec![test_message("legacy row")], Vec::<Event>::new())
+        });
+        // a present cached file the walker did not list is served again, not dropped
+        let omitted = collect_cached(&mut cache, &root, &[], |_| {
+            (vec![test_message("legacy row")], Vec::<Event>::new())
+        });
+        assert_eq!(omitted.messages.len(), 1);
+
+        fs::write(&current, b"current").unwrap();
+        let retired = std::collections::HashSet::from([legacy.clone()]);
+        let pass = super::collect_cached_retiring_for(
+            &mut cache,
+            "ingest",
+            &root,
+            std::slice::from_ref(&current),
+            &retired,
+            |_| (vec![test_message("current row")], Vec::<Event>::new()),
+        );
+        let texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        assert_eq!(texts, vec!["current row"]);
+        assert!(!cache.entries.contains_key(&source_key(&legacy)));
+        assert!(cache.entries.contains_key(&source_key(&current)));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4242,6 +5562,290 @@ mod tests {
     }
 
     #[test]
+    fn policy_empty_reparse_prunes_unchanged_source_material() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"unchanged input").unwrap();
+        let mut initial = IngestCache::cold();
+        collect_cached(&mut initial, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("excluded by current policy")],
+                vec![test_event("session", "old-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        initial.save(&cache_path).unwrap();
+
+        let (mut repair, refusal) = IngestCache::repair(&cache_path);
+        assert!(refusal.is_none());
+        repair.set_repair_expectations(
+            HashSet::from(["claude".to_string()]),
+            HashSet::from([source.clone()]),
+        );
+        let pass = collect_cached(&mut repair, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+        });
+        assert!(pass.messages.is_empty());
+        assert!(pass.events.is_empty());
+        assert!(repair.source_snapshot_safe());
+        assert_eq!(
+            repair.event_prune_files(&repair.live_event_files()),
+            HashSet::from([crate::cache::event_fname("claude", "session")])
+        );
+        repair.save(&cache_path).unwrap();
+        let mut reloaded = IngestCache::load(&cache_path);
+        let pass = collect_cached(
+            &mut reloaded,
+            &root,
+            std::slice::from_ref(&source),
+            |_| -> (Vec<Message>, Vec<Event>) { panic!("completed empty read was not cached") },
+        );
+        assert!(pass.messages.is_empty());
+        assert!(reloaded.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_empty_reparse_preserves_replaced_source_material() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        fs::write(&source, b"old").unwrap();
+        let original_mtime = fs::metadata(&source).unwrap().modified().unwrap();
+        let mut cache = IngestCache::cold();
+        collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("last good")],
+                vec![test_event("session", "last-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        crate::ingest::registry::wait_for_next_ctime_tick(&source);
+        let replacement = root.join("replacement.jsonl");
+        fs::write(&replacement, b"new").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+
+        let pass = collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "last good");
+        assert!(!cache.source_snapshot_safe());
+        assert!(cache
+            .event_prune_files(&cache.live_event_files())
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A read the parser proves empty (`ReadOutcome::Undone`) publishes the emptiness over
+    /// last-good rows and events once the file grew, as an append-only log that recorded its own
+    /// undo does; a file that shrank may be mid-rewrite, so last-good still wins there.
+    #[test]
+    fn undone_reparse_publishes_empty_only_after_growth() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-undone-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        for (before, after, kept) in [
+            (&b"prompt\n"[..], &b"prompt\nrewind\n"[..], false),
+            (&b"prompt\nrewind\n"[..], &b"rewind\n"[..], true),
+        ] {
+            fs::write(&source, before).unwrap();
+            let mut cache = IngestCache::cold();
+            collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+                (
+                    vec![test_message("rewound")],
+                    vec![test_event("session", "rewound-call")],
+                    ReadOutcome::Complete,
+                )
+            });
+            fs::write(&source, after).unwrap();
+            let pass = collect_cached(&mut cache, &root, std::slice::from_ref(&source), |_| {
+                (Vec::new(), Vec::new(), ReadOutcome::Undone)
+            });
+            assert_eq!(pass.messages.len(), usize::from(kept));
+            assert!(pass.events.is_empty());
+            assert_eq!(cache.source_snapshot_safe(), !kept);
+            let pruned = cache.event_prune_files(&cache.live_event_files());
+            assert_eq!(pruned.is_empty(), kept);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_empty_reparse_preserves_unattributed_legacy_events() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-legacy-events-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"unchanged input").unwrap();
+        let mut initial = IngestCache::cold();
+        collect_cached(&mut initial, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("legacy material")],
+                Vec::new(),
+                ReadOutcome::Complete,
+            )
+        });
+        initial
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .legacy_had_events = true;
+        initial.save(&cache_path).unwrap();
+        let (mut repair, _) = IngestCache::repair(&cache_path);
+        let pass = collect_cached(&mut repair, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Complete)
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "legacy material");
+        assert!(!repair.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_empty_sibling_does_not_block_complete_session_events() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-sibling-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let changed = root.join("changed.jsonl");
+        let sibling = root.join("sibling.jsonl");
+        fs::write(&changed, b"old").unwrap();
+        fs::write(&sibling, b"unchanged").unwrap();
+        let files = [changed.clone(), sibling.clone()];
+        let mut cache = IngestCache::cold();
+        collect_cached(&mut cache, &root, &files, |_| {
+            (
+                vec![test_message("old material")],
+                vec![test_event("session", "old-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        fs::write(&changed, b"changed and larger").unwrap();
+        let pass = collect_cached(&mut cache, &root, &files, |path| {
+            if path == sibling {
+                (Vec::new(), Vec::new(), ReadOutcome::Complete)
+            } else {
+                (
+                    vec![test_message("fresh")],
+                    vec![test_event("session", "fresh-call")],
+                    ReadOutcome::Complete,
+                )
+            }
+        });
+        assert_eq!(
+            pass.messages
+                .iter()
+                .map(|message| message.text.as_ref())
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
+        assert_eq!(
+            pass.events
+                .iter()
+                .map(|event| event.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fresh-call"]
+        );
+        assert!(cache.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_takeover_preserves_fallback_rows_and_required_reparse() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-policy-adoption-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("session.jsonl");
+        let cache_path = root.join("cache.bin");
+        fs::write(&source, b"unchanged input").unwrap();
+        let mut initial = IngestCache::cold();
+        collect_cached(&mut initial, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("last good")],
+                vec![test_event("session", "old-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        fs::write(
+            &cache_path,
+            bincode::serialize(&super::CacheFileRef {
+                version: CACHE_VERSION - 1,
+                entries: &initial.entries,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        super::adopt_foreign_cache(&cache_path).unwrap();
+
+        let mut guarded = IngestCache::load(&cache_path);
+        let pass = collect_cached(&mut guarded, &root, std::slice::from_ref(&source), |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "last good");
+        assert!(!guarded.source_snapshot_safe());
+        let mut retry = IngestCache::load(&cache_path);
+        let pass = collect_cached(&mut retry, &root, std::slice::from_ref(&source), |_| {
+            (
+                vec![test_message("current policy")],
+                vec![test_event("session", "new-call")],
+                ReadOutcome::Complete,
+            )
+        });
+        assert_eq!(pass.messages[0].text.as_ref(), "current policy");
+        assert_eq!(pass.events[0].call_id, "new-call");
+        assert!(retry.source_snapshot_safe());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cold_read_failure_keeps_readable_sibling_and_arms_retry() {
         let root = std::env::temp_dir().join(format!(
             "agrep-partial-cold-{}-{}",
@@ -4317,7 +5921,18 @@ mod tests {
         assert!(guarded);
         assert!(!always.source_snapshot_safe());
 
+        // A partial cold read publishes only past an inventory proving nothing was at stake.
+        let mut unknown = IngestCache::cold();
+        unknown.guard_never_empty(
+            "cline",
+            std::path::Path::new("/fixture-store"),
+            vec![test_message("readable sibling")],
+            &[],
+            ReadOutcome::Skipped,
+        );
+        assert!(!unknown.output_complete());
         let mut partial = IngestCache::cold();
+        partial.set_published_material(HashSet::new());
         let (readable, guarded) = partial.guard_never_empty(
             "cline",
             std::path::Path::new("/fixture-store"),
@@ -4709,6 +6324,930 @@ mod tests {
         assert!(warm.output_complete());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_token_conversations_are_served_but_never_prove_their_database_empty() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let chats = Path::new("/fixture/chats/crush.db");
+        let empty = Path::new("/fixture/empty/crush.db");
+        let prefix = crate::ingest::registry::token_prefix("crush", chats).unwrap();
+        let mut cache = IngestCache::cold();
+        cache.collect_token_cached_keyed_partial(
+            "crush",
+            Some(vec![(
+                format!("{prefix}session"),
+                "session".into(),
+                "v1".into(),
+            )]),
+            &[],
+            false,
+            true,
+            |_, _| (vec![test_message("cached chat")], Vec::new()),
+        );
+        cache.set_published_material(HashSet::new());
+        cache.set_published_token_namespaces(Some(HashSet::new()));
+        assert_eq!(
+            cache.token_namespaces(),
+            HashSet::from([("crush".to_string(), prefix.clone())])
+        );
+        // Cached conversations are served, so publishing past the database drops none of them;
+        // they never prove it held nothing.
+        assert_eq!(
+            cache.published_material_under("crush", chats),
+            MaterialVerdict::Retained
+        );
+        assert!(!cache.unreadable_scope_covered("crush", chats));
+        assert_eq!(
+            cache.published_material_under("crush", empty),
+            MaterialVerdict::Retained
+        );
+        assert!(cache.unreadable_scope_covered("crush", empty));
+        // A Stat agent's scope never reads token entries.
+        assert_eq!(
+            cache.published_material_under("claude", chats),
+            MaterialVerdict::Retained
+        );
+        // A recorded or unknown published namespace keeps a database without cached rows.
+        let empty_prefix = crate::ingest::registry::token_prefix("crush", empty).unwrap();
+        for namespaces in [Some(HashSet::from([("crush".into(), empty_prefix)])), None] {
+            cache.set_published_token_namespaces(namespaces);
+            assert_eq!(
+                cache.published_material_under("crush", empty),
+                MaterialVerdict::Drops
+            );
+            assert!(!cache.unreadable_scope_covered("crush", empty));
+            assert_eq!(
+                cache.published_material_under("claude", empty),
+                MaterialVerdict::Retained
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_token_agent_relaxes_only_listed_databases_without_cached_rows() {
+        use super::MaterialVerdict;
+        use std::path::{Path, PathBuf};
+
+        let chats = Path::new("/fixture/chats/crush.db");
+        let listed = Path::new("/fixture/listed/crush.db");
+        let transcript = Path::new("/fixture/claude/chat.jsonl");
+        let prefix = crate::ingest::registry::token_prefix("crush", chats).unwrap();
+        let mut cache = IngestCache::cold();
+        // No inventory at all: only the read of the published generation can answer.
+        cache.set_unpublished_token_agents(HashSet::from(["crush".to_string()]));
+        assert_eq!(
+            cache.published_material_under("crush", listed),
+            MaterialVerdict::Retained
+        );
+        cache.set_published_material(HashSet::from([
+            PathBuf::from(listed),
+            PathBuf::from(transcript),
+        ]));
+        cache.set_published_blind_scopes(HashSet::from([("crush".into(), listed.into())]));
+        assert_eq!(
+            cache.published_material_under("crush", listed),
+            MaterialVerdict::Retained
+        );
+        assert!(cache.unreadable_scope_covered("crush", listed));
+        cache.collect_token_cached_keyed_partial(
+            "crush",
+            Some(vec![(
+                format!("{prefix}session"),
+                "session".into(),
+                "v1".into(),
+            )]),
+            &[],
+            false,
+            true,
+            |_, _| (vec![test_message("cached, not yet published")], Vec::new()),
+        );
+        assert_eq!(
+            cache.published_material_under("crush", chats),
+            MaterialVerdict::Retained
+        );
+        assert!(!cache.unreadable_scope_covered("crush", chats));
+        // Stat scopes and other token agents keep the listed inventory.
+        cache.set_unpublished_token_agents(HashSet::from(["claude".to_string()]));
+        assert_eq!(
+            cache.published_material_under("claude", transcript),
+            MaterialVerdict::Drops
+        );
+        assert_eq!(
+            cache.published_material_under("crush", listed),
+            MaterialVerdict::Drops
+        );
+    }
+
+    #[test]
+    fn a_snapshot_seeded_from_a_partial_read_never_covers_its_own_pass() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let root = Path::new("/fixture/.kimi");
+        let lost = Path::new("/fixture/.kimi/sessions/a/lost");
+        let published = || HashSet::from([lost.join("context.jsonl")]);
+        let skipped = |cache: &mut IngestCache| {
+            let fresh = vec![test_message("a sibling session still parses")];
+            cache.guard_never_empty("kimi", root, fresh, &[], ReadOutcome::Skipped)
+        };
+
+        let mut lost_cache = IngestCache::cold();
+        lost_cache.set_published_material(published());
+        assert_eq!(skipped(&mut lost_cache).0.len(), 1);
+        assert!(!lost_cache.output_complete());
+        assert!(!lost_cache.unreadable_scope_covered("kimi", lost));
+        assert_eq!(
+            lost_cache.published_material_under("kimi", lost),
+            MaterialVerdict::Drops
+        );
+
+        let mut last_good = IngestCache::cold();
+        last_good.set_published_material(published());
+        let mut row = test_message("the lost session's last good row");
+        row.session = "lost".into();
+        last_good.guard_never_empty("kimi", root, vec![row], &[], ReadOutcome::Complete);
+        let served = skipped(&mut last_good).0;
+        assert!(served.iter().any(|message| &*message.session == "lost"));
+        assert!(last_good.output_complete());
+        assert!(last_good.unreadable_scope_covered("kimi", lost));
+
+        let mut first = IngestCache::cold();
+        first.set_published_material(HashSet::new());
+        skipped(&mut first);
+        assert!(first.output_complete());
+        assert!(first.unreadable_scope_covered("kimi", lost));
+    }
+
+    #[test]
+    fn only_an_unpublished_whole_store_agent_is_admitted_past_its_failed_read() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let lost = Path::new("/fixture/.kimi/sessions/a/lost");
+        let transcript = Path::new("/fixture/.claude/projects/p/chat.jsonl");
+        let mut cache = IngestCache::cold();
+        cache.set_published_material(HashSet::from([lost.join("wire.jsonl"), transcript.into()]));
+        cache.record_source_read_issue("kimi", lost, "source-read-failed", "parser panicked");
+        cache.record_source_read_issue(
+            "claude",
+            transcript,
+            "source-read-failed",
+            "parser panicked",
+        );
+        cache.admit_unpublished_whole_store_agents(|_| true);
+        assert!(!cache.unreadable_scope_covered("kimi", lost));
+
+        let mut read = Vec::new();
+        cache.admit_unpublished_whole_store_agents(|agent| {
+            read.push(agent.to_owned());
+            false
+        });
+        assert_eq!(read, ["kimi"]);
+        assert!(cache.unreadable_scope_covered("kimi", lost));
+        assert_eq!(
+            cache.published_material_under("kimi", lost),
+            MaterialVerdict::Retained
+        );
+        assert!(!cache.unreadable_scope_covered("claude", transcript));
+    }
+
+    #[test]
+    fn an_older_generation_admits_a_partial_read_agent_only_past_an_unpublished_generation() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let store = Path::new("/fixture/.local/share/opencode");
+        let project = Path::new("/fixture/.claude/projects/locked");
+        let legacy = || {
+            let mut cache = IngestCache::cold();
+            cache.legacy_generation = true;
+            cache.set_published_material_from_cache();
+            cache
+        };
+
+        // The release may have published this store's rows uncached: silent until proven.
+        let mut published = legacy();
+        assert_eq!(
+            published.published_material_under("opencode", store),
+            MaterialVerdict::Unknown
+        );
+        published.admit_unpublished_partial_read_agents(["opencode"], |_| true);
+        assert_eq!(
+            published.published_material_under("opencode", store),
+            MaterialVerdict::Unknown
+        );
+        assert!(!published.unreadable_scope_covered("opencode", store));
+
+        let mut unpublished = legacy();
+        let mut read = Vec::new();
+        unpublished.admit_unpublished_partial_read_agents(["opencode", "claude"], |agent| {
+            read.push(agent.to_owned());
+            false
+        });
+        assert_eq!(read, ["opencode"], "only a silenced agent pays the read");
+        assert_eq!(
+            unpublished.published_material_under("opencode", store),
+            MaterialVerdict::Retained
+        );
+        assert!(unpublished.unreadable_scope_covered("opencode", store));
+        assert_eq!(
+            unpublished.published_material_under("claude", project),
+            MaterialVerdict::Retained
+        );
+
+        // A current inventory is never silent, so nothing is read or admitted.
+        let mut current = IngestCache::cold();
+        current.set_published_material_from_cache();
+        current.admit_unpublished_partial_read_agents(["opencode"], |_| unreachable!());
+        assert!(current.unpublished_agents.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_read_without_a_snapshot_seeds_one_that_covers_only_later_passes() {
+        use std::path::Path;
+
+        let root = Path::new("/fixture/.cline/data");
+        let task = Path::new("/fixture/.cline/data/tasks/1/api_conversation_history.json");
+        let invalid = |cache: &mut IngestCache, rows: Vec<Message>| {
+            cache.guard_never_empty("cline", root, rows, &[], ReadOutcome::Invalid)
+        };
+
+        let mut first = IngestCache::cold();
+        first.set_published_material(HashSet::new());
+        let (rows, guarded) = invalid(&mut first, vec![test_message("readable task")]);
+        assert_eq!(rows.len(), 1);
+        assert!(guarded);
+        assert!(first.output_complete());
+
+        // Published material at stake: the seed licenses nothing until a read of the
+        // published generation finds none of this agent's rows.
+        let mut at_stake = IngestCache::cold();
+        at_stake.set_published_material(HashSet::from([task.to_path_buf()]));
+        invalid(&mut at_stake, vec![test_message("readable task")]);
+        at_stake.record_source_read_issue("cline", task, "source-invalid", "torn");
+        assert!(!at_stake.output_complete());
+        assert!(!at_stake.unreadable_scope_covered("cline", task));
+        at_stake.admit_unpublished_whole_store_agents(|_| true);
+        assert!(!at_stake.output_complete());
+        at_stake.admit_unpublished_whole_store_agents(|_| false);
+        assert!(at_stake.output_complete());
+
+        let dir = std::env::temp_dir().join(format!(
+            "agrep-seeded-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join(".ingest_cache.bin");
+        first.save(&cache_path).unwrap();
+        let mut next = IngestCache::load(&cache_path);
+        next.set_published_material(HashSet::from([task.to_path_buf()]));
+        let (served, guarded) = invalid(&mut next, Vec::new());
+        assert_eq!(
+            served.len(),
+            1,
+            "the seed did not serve the next failed read"
+        );
+        assert!(guarded);
+        assert!(next.output_complete());
+        assert!(next.unreadable_scope_covered("cline", task));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn cached_entry(rows: &[crate::model::Message]) -> super::Entry {
+        super::Entry {
+            mtime: 1,
+            size: 1,
+            identity: None,
+            msgs: rows.iter().map(CMsg::from).collect(),
+            event_keys: Vec::new(),
+            legacy_had_events: false,
+            legacy_needs_reparse: true,
+        }
+    }
+
+    #[test]
+    fn a_per_file_scope_is_served_only_when_the_cache_holds_every_file_listed_under_it() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/p");
+        let chat = scope.join("chat.jsonl");
+        let summary = scope.join("summary.jsonl");
+        let listed = || HashSet::from([chat.clone(), summary.clone()]);
+        // Each cached file, with a row or with none, and the rows a read of the published
+        // generation finds should the scope pay one.
+        let verdict = |files: &[(&Path, bool)], published: &[(&str, &str)]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(listed());
+            for (path, with_row) in files {
+                let rows = if *with_row {
+                    vec![test_message("a cached row")]
+                } else {
+                    Vec::new()
+                };
+                cache.put_entry(path.to_string_lossy().into_owned(), cached_entry(&rows));
+            }
+            let mut read = false;
+            cache.record_published_rows([("claude", scope)], |_| {
+                read = true;
+                Some(published_rows(published))
+            });
+            (cache.published_material_under("claude", scope), read)
+        };
+
+        // A file read whole that published nothing is served as surely as one with rows.
+        assert_eq!(
+            verdict(
+                &[(&chat, true), (&summary, false)],
+                &[("session", "a cached row")]
+            ),
+            (MaterialVerdict::Retained, false)
+        );
+        // Of a listed file the cache never held, only the published generation can tell.
+        assert_eq!(
+            verdict(&[(&chat, true)], &[("session", "a cached row")]),
+            (MaterialVerdict::Retained, true)
+        );
+        assert_eq!(
+            verdict(
+                &[(&chat, true)],
+                &[
+                    ("session", "a cached row"),
+                    ("uncached", "a row only published")
+                ]
+            ),
+            (MaterialVerdict::Drops, true)
+        );
+        assert_eq!(
+            verdict(&[(&summary, false)], &[("session", "a cached row")]),
+            (MaterialVerdict::Drops, true)
+        );
+    }
+
+    /// Published rows, as `(session, text)`, each stamped as `test_message` stamps its rows.
+    fn published_rows(rows: &[(&str, &str)]) -> crate::cache::PublishedAgentRows {
+        crate::cache::PublishedAgentRows {
+            turns: rows
+                .iter()
+                .enumerate()
+                .map(|(turn, (session, text))| {
+                    let row = crate::cache::PublishedTurn {
+                        project: "project".into(),
+                        model: None,
+                        ts: 1,
+                        text: (*text).to_owned(),
+                    };
+                    (((*session).to_owned(), turn as u32), row)
+                })
+                .collect(),
+            sessions: rows
+                .iter()
+                .map(|(session, _)| (*session).to_owned())
+                .collect(),
+            event_sessions: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn a_row_the_base_held_and_this_pass_dropped_is_not_lost_behind_a_failed_scope() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let deleted = Path::new("/fixture/.claude/projects/gone/chat.jsonl");
+        let mut row = test_message("a row this pass deletes");
+        row.session = "gone".into();
+        // Whether the base census runs, and the sessions the published generation holds.
+        let verdict = |census: bool, published: &[(&str, &str)]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), deleted.into()]));
+            let key = deleted.to_string_lossy().into_owned();
+            cache.put_entry(key.clone(), cached_entry(std::slice::from_ref(&row)));
+            if census {
+                cache.mark_base_rows([("claude", scope)], None);
+            }
+            cache.remove_entry(&key);
+            let mut once = Some(published_rows(published));
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+
+        let gone = ("gone", "a row this pass deletes");
+        assert_eq!(verdict(true, &[gone]), MaterialVerdict::Retained);
+        assert_eq!(verdict(false, &[gone]), MaterialVerdict::Drops);
+        // A row the base never held is one only the published generation can still serve.
+        assert_eq!(
+            verdict(true, &[gone, ("never-read", "a never-read row")]),
+            MaterialVerdict::Drops
+        );
+    }
+
+    #[test]
+    fn a_row_the_base_held_under_a_failed_scope_counts_only_while_this_pass_holds_it() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.codex/sessions/2026/01/03");
+        let under = scope.join("rollout-a.jsonl");
+        let never_read = Path::new("/fixture/.codex/sessions/2026/01/06/rollout-c.jsonl");
+        let mut row = test_message("a prompt only the unreadable rollout holds");
+        row.agent = "codex";
+        row.session = "split".into();
+        // Whether this pass still holds the rollout's entry after ingest.
+        let verdict = |kept: bool| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([under.clone(), never_read.into()]));
+            let key = under.to_string_lossy().into_owned();
+            cache.put_entry(key.clone(), cached_entry(std::slice::from_ref(&row)));
+            let issues = [("codex", scope), ("codex", never_read.parent().unwrap())];
+            cache.mark_base_rows(issues, None);
+            if !kept {
+                cache.remove_entry(&key);
+            }
+            let held = ("split", "a prompt only the unreadable rollout holds");
+            let mut once = Some(published_rows(&[held]));
+            cache.record_published_rows(issues, |_| once.take());
+            cache.published_material_under("codex", never_read.parent().unwrap())
+        };
+
+        assert_eq!(verdict(true), MaterialVerdict::Retained);
+        assert_eq!(verdict(false), MaterialVerdict::Drops);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_absent_only_beneath_directories_proven_real() {
+        use std::path::Path;
+
+        let root = std::env::temp_dir().join(format!(
+            "agrep-absence-unproven-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let day = root.join("2026/01/03");
+        fs::create_dir_all(&day).unwrap();
+        let drive = root.join("drive");
+        fs::create_dir_all(drive.join("05")).unwrap();
+        std::os::unix::fs::symlink(drive.join("05"), root.join("2026/01/05")).unwrap();
+        std::os::unix::fs::symlink(drive.join("gone"), root.join("2026/01/06")).unwrap();
+        fs::write(root.join("2026/01/07"), b"a file where a day directory was").unwrap();
+        let unproven = |relative: &str| super::absence_unproven(&root, &root.join(relative));
+
+        assert!(!unproven("2026/01/03/rollout.jsonl"), "real directories");
+        assert!(!unproven("2026/01/04/rollout.jsonl"), "its directory gone");
+        assert!(unproven("2026/01/05/rollout.jsonl"), "a resolving link");
+        assert!(unproven("2026/01/06/rollout.jsonl"), "a dangling link");
+        assert!(unproven("2026/01/07/rollout.jsonl"), "no directory");
+        assert!(!unproven("rollout.jsonl"), "directly beneath the root");
+        let elsewhere = Path::new("/elsewhere/rollout.jsonl");
+        assert!(!super::absence_unproven(&root, elsewhere));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_published_row_is_held_only_by_as_many_cached_rows_of_its_session_time_and_text() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.codex/sessions/2026/01/03");
+        let lost = scope.join("rollout-a.jsonl");
+        let resumed = Path::new("/fixture/.codex/sessions/2026/01/05/rollout-b.jsonl");
+        // The resumed rollout's rows as `(ts, text)`, its raw turns counted from 0, against the
+        // session's published rows as `(turn, ts, text)`, renumbered by turn-collision repair.
+        let verdict = |cached: &[(i64, &str)], published: &[(u32, i64, &str)]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([lost.clone(), resumed.into()]));
+            let rows: Vec<_> = (0..)
+                .zip(cached)
+                .map(|(turn, (ts, text))| {
+                    let mut row = test_message(text);
+                    (row.agent, row.session, row.turn, row.ts) =
+                        ("codex", "split".into(), turn, *ts);
+                    row
+                })
+                .collect();
+            let key = resumed.to_string_lossy().into_owned();
+            cache.put_entry(key, cached_entry(&rows));
+            let turns = published.iter().map(|(turn, ts, text)| {
+                let row = crate::cache::PublishedTurn {
+                    project: "project".into(),
+                    model: None,
+                    ts: *ts,
+                    text: (*text).to_owned(),
+                };
+                (("split".to_owned(), *turn), row)
+            });
+            let mut once = Some(crate::cache::PublishedAgentRows {
+                turns: turns.collect(),
+                sessions: HashSet::from(["split".to_owned()]),
+                event_sessions: HashSet::new(),
+            });
+            cache.record_published_rows([("codex", scope)], |_| once.take());
+            cache.published_material_under("codex", scope)
+        };
+        let resumed_rows = [(11, "three"), (12, "four")];
+
+        // Held by content, whatever turn repair gave it.
+        let renumbered = [(2, 11, "three"), (3, 12, "four")];
+        assert_eq!(
+            verdict(&resumed_rows, &renumbered),
+            MaterialVerdict::Retained
+        );
+        assert_eq!(
+            verdict(&resumed_rows, &[(3, 12, "five")]),
+            MaterialVerdict::Drops
+        );
+        assert_eq!(
+            verdict(&resumed_rows, &[(3, 13, "four")]),
+            MaterialVerdict::Drops
+        );
+        // The lost rollout's rows sort first, onto turns the resumed rollout's raw rows bear.
+        let split = [
+            (0, 9, "one"),
+            (1, 10, "two"),
+            (2, 11, "three"),
+            (3, 12, "four"),
+        ];
+        assert_eq!(verdict(&resumed_rows, &split), MaterialVerdict::Drops);
+        // A lost row at the very time of a held one, renumbered onto that one's raw turn.
+        let same_time = [(0, 11, "a lost prompt"), (1, 11, "three")];
+        assert_eq!(
+            verdict(&[(11, "three")], &same_time),
+            MaterialVerdict::Drops
+        );
+        // A row published twice is held only by two.
+        let twice = [(3, 5, "continue"), (7, 5, "continue")];
+        assert_eq!(verdict(&[(5, "continue")], &twice), MaterialVerdict::Drops);
+        let held_twice = [(5, "continue"), (5, "continue")];
+        assert_eq!(verdict(&held_twice, &twice), MaterialVerdict::Retained);
+    }
+
+    #[test]
+    fn a_row_both_the_base_and_this_pass_hold_counts_once() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let old = Path::new("/fixture/.claude/projects/p/old.jsonl");
+        let new = Path::new("/fixture/.claude/projects/p/new.jsonl");
+        let row = test_message("continue");
+        // Where this pass holds the base's row after ingest, against how often it was published.
+        let verdict = |after: Option<&Path>, published: usize| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), old.into()]));
+            let entry = || cached_entry(std::slice::from_ref(&row));
+            cache.put_entry(old.to_string_lossy().into_owned(), entry());
+            cache.mark_base_rows([("claude", scope)], None);
+            cache.remove_entry(&old.to_string_lossy());
+            if let Some(path) = after {
+                cache.put_entry(path.to_string_lossy().into_owned(), entry());
+            }
+            let rows = vec![("session", "continue"); published];
+            let mut once = Some(published_rows(&rows));
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+
+        assert_eq!(verdict(Some(old), 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(Some(new), 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(None, 1), MaterialVerdict::Retained);
+        // Its file renamed, the one row does not stand in for a second the published generation
+        // holds behind the locked directory.
+        assert_eq!(verdict(Some(new), 2), MaterialVerdict::Drops);
+        assert_eq!(verdict(Some(old), 2), MaterialVerdict::Drops);
+    }
+
+    #[test]
+    fn a_cached_row_publication_folds_into_another_holds_nothing() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let original = Path::new("/fixture/.claude/projects/p/original.jsonl");
+        let replay = Path::new("/fixture/.claude/projects/p/replay.jsonl");
+        // A replay of the original's turn at a later time: dedupe publishes the earlier one.
+        let at = |ts: i64| {
+            let mut row = test_message("continue");
+            row.ts = ts;
+            cached_entry(&[row])
+        };
+        let verdict = |published: &[i64]| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.set_published_material(HashSet::from([never_read.clone(), original.into()]));
+            cache.put_entry(original.to_string_lossy().into_owned(), at(5));
+            cache.put_entry(replay.to_string_lossy().into_owned(), at(6));
+            let turns = (0..).zip(published).map(|(turn, ts)| {
+                let row = crate::cache::PublishedTurn {
+                    project: "project".into(),
+                    model: None,
+                    ts: *ts,
+                    text: "continue".to_owned(),
+                };
+                (("session".to_owned(), turn), row)
+            });
+            let mut once = Some(crate::cache::PublishedAgentRows {
+                turns: turns.collect(),
+                sessions: HashSet::from(["session".to_owned()]),
+                event_sessions: HashSet::new(),
+            });
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+
+        assert_eq!(verdict(&[5]), MaterialVerdict::Retained);
+        // The later time, published by a file behind the locked directory, is one this pass drops.
+        assert_eq!(verdict(&[5, 6]), MaterialVerdict::Drops);
+    }
+
+    #[test]
+    fn rows_a_killed_pass_saw_go_count_once_while_its_generation_stays_published() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let chat = Path::new("/fixture/.claude/projects/p/chat.jsonl");
+        let copy = Path::new("/fixture/.claude/projects/p/copy.jsonl");
+        let key = |path: &Path| path.to_string_lossy().into_owned();
+        let sealed = [1; 16];
+        // A pass over `entries` against the generation `sealed` names: it makes `change`, stages
+        // what it saw go with its cache, and is killed before replacing that generation.
+        let killed = |entries: &HashMap<String, super::Entry>,
+                      change: &dyn Fn(&mut IngestCache)| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.entries = entries.clone();
+            cache.mark_base_rows([("claude", scope)], Some(sealed));
+            change(&mut cache);
+            cache.record_released_rows();
+            cache.entries
+        };
+        // The next pass over `entries`, against the generation `seal` names, which holds the
+        // chat's first row `published` times.
+        let verdict = |entries: &HashMap<String, super::Entry>,
+                       seal: crate::cache::GenerationSeal,
+                       published: usize| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.entries = entries.clone();
+            cache.set_published_material(HashSet::from([never_read.clone(), chat.into()]));
+            cache.mark_base_rows([("claude", scope)], Some(seal));
+            let rows = vec![("session", "as first written"); published];
+            let mut once = Some(published_rows(&rows));
+            cache.record_published_rows([("claude", scope)], |_| once.take());
+            cache.published_material_under("claude", scope)
+        };
+        let first = || cached_entry(&[test_message("as first written")]);
+        let written = HashMap::from([(key(chat), first())]);
+        let rewritten = killed(&written, &|cache| {
+            cache.put_entry(key(chat), cached_entry(&[test_message("as rewritten")]));
+        });
+
+        assert_eq!(verdict(&rewritten, sealed, 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(&rewritten, sealed, 2), MaterialVerdict::Drops);
+        // A pass that replaced that generation published what its cache held instead.
+        assert_eq!(verdict(&rewritten, [2; 16], 1), MaterialVerdict::Drops);
+        // Another killed pass carries the record on; one that brings the row back holds it itself.
+        let carried = killed(&rewritten, &|_| {});
+        assert_eq!(verdict(&carried, sealed, 1), MaterialVerdict::Retained);
+        let restored = killed(&rewritten, &|cache| cache.put_entry(key(copy), first()));
+        assert_eq!(verdict(&restored, sealed, 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(&restored, sealed, 2), MaterialVerdict::Drops);
+        // The chat deleted, its session with it.
+        let deleted = killed(&written, &|cache| {
+            cache.remove_entry(&key(chat));
+        });
+        assert_eq!(verdict(&deleted, sealed, 1), MaterialVerdict::Retained);
+        assert_eq!(verdict(&deleted, [2; 16], 1), MaterialVerdict::Drops);
+        // The records serve nothing: no row, event, source or published material. However many
+        // rows a pass saw go, they take one entry, so the base's entry count stays its sources.
+        let mut records = IngestCache::cold();
+        records.entries = deleted;
+        assert_eq!(records.entries.len(), 1);
+        assert!(records.entries.keys().all(|key| super::released_key(key)));
+        assert!(records.session_sources().is_empty() && records.live_event_files().is_empty());
+        records.set_published_material_from_cache();
+        assert_eq!(records.published_material, Some(HashSet::new()));
+    }
+
+    #[test]
+    fn a_released_record_leaves_a_cache_awaiting_its_whole_reparse() {
+        let released = HashMap::from([(
+            "claude".to_owned(),
+            super::ReleasedRows {
+                rows: HashMap::new(),
+                sessions: HashSet::from(["session".to_owned()]),
+            },
+        )]);
+        let record = super::pack_released(&super::hex16(&[1; 16]), &released).unwrap();
+        let entries = HashMap::from([
+            (
+                "\0snapshot\0cline".to_owned(),
+                cached_entry(&[test_message("a row awaiting reparse")]),
+            ),
+            (record, super::released_entry()),
+        ]);
+        let payload = bincode::serialize(&super::CacheFileRef {
+            version: CACHE_VERSION,
+            entries: &entries,
+        })
+        .unwrap();
+        let Ok((decoded, generation, _)) =
+            super::decode_cache_payload(&payload, std::path::Path::new("cache.bin"))
+        else {
+            panic!("the cache did not decode");
+        };
+        assert_eq!(decoded.len(), 2);
+        assert!(generation == super::CacheGeneration::LegacyReparse);
+    }
+
+    #[test]
+    fn judging_a_large_agent_against_its_published_rows_stays_fast() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let scope = Path::new("/fixture/.claude/projects/locked");
+        let never_read = scope.join("never-read.jsonl");
+        let mut cache = IngestCache::cold();
+        cache.last_good_base = true;
+        let mut listed = HashSet::from([never_read]);
+        let mut published = crate::cache::PublishedAgentRows::default();
+        for file in 0..6_000 {
+            let path = PathBuf::from(format!("/fixture/.claude/projects/p/{file}.jsonl"));
+            let session = format!("session-{file}");
+            let rows: Vec<_> = (0..10_u32)
+                .map(|turn| {
+                    let mut row =
+                        test_message(&format!("{file}:{turn} {}", "row text ".repeat(48)));
+                    (row.session, row.turn) = (session.as_str().into(), turn);
+                    let turn_row = crate::cache::PublishedTurn {
+                        project: "project".into(),
+                        model: None,
+                        ts: row.ts,
+                        text: row.text.to_string(),
+                    };
+                    published.turns.insert((session.clone(), turn), turn_row);
+                    row
+                })
+                .collect();
+            published.sessions.insert(session);
+            cache.put_entry(path.to_string_lossy().into_owned(), cached_entry(&rows));
+            listed.insert(path);
+        }
+        cache.set_published_material(listed);
+        cache.mark_base_rows([("claude", scope)], None);
+        let started = std::time::Instant::now();
+        let mut once = Some(published);
+        cache.record_published_rows([("claude", scope)], |_| once.take());
+        cache.record_released_rows();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            cache.published_material_under("claude", scope),
+            MaterialVerdict::Retained
+        );
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_legacy_partial_read_agent_is_served_only_where_its_published_rows_are_cached() {
+        use super::MaterialVerdict;
+        use std::path::Path;
+
+        let store = Path::new("/fixture/.local/share/opencode");
+        let stable = store.join("opencode.db");
+        let mut cached = test_message("a cached channel");
+        cached.agent = "opencode";
+        cached.session = "stable".into();
+        let project = Path::new("/fixture/.claude/projects/p");
+        let verdict = |rows: Option<crate::cache::PublishedAgentRows>, record: bool| {
+            let mut cache = IngestCache::cold();
+            cache.last_good_base = true;
+            cache.legacy_generation = true;
+            cache.set_published_material(HashSet::from([stable.clone()]));
+            cache.put_entry(
+                stable.to_string_lossy().into_owned(),
+                cached_entry(std::slice::from_ref(&cached)),
+            );
+            let mut once = Some(rows);
+            let mut read = 0;
+            if record {
+                cache.record_published_rows([("opencode", store), ("claude", project)], |agent| {
+                    assert_eq!(agent, "opencode", "only a partial-read agent pays the read");
+                    read += 1;
+                    once.take().flatten()
+                });
+                assert_eq!(read, 1);
+            }
+            cache.published_material_under("opencode", store)
+        };
+
+        assert_eq!(
+            verdict(
+                Some(published_rows(&[("stable", "a cached channel")])),
+                true
+            ),
+            MaterialVerdict::Retained
+        );
+        // A second channel's rows, published uncached beside a cached one.
+        assert_eq!(
+            verdict(
+                Some(published_rows(&[
+                    ("stable", "a cached channel"),
+                    ("nightly", "a nightly channel"),
+                ])),
+                true
+            ),
+            MaterialVerdict::Drops
+        );
+        assert_eq!(verdict(None, true), MaterialVerdict::Unknown);
+        assert_eq!(
+            verdict(
+                Some(published_rows(&[("stable", "a cached channel")])),
+                false
+            ),
+            MaterialVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn a_seed_is_admitted_only_past_failed_units_and_with_the_attribution_it_published() {
+        use std::path::{Path, PathBuf};
+
+        let root = std::env::var_os("CLINE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::ingest::home().join(".cline"))
+            .join("data");
+        let torn_task = root.join("tasks/2/api_conversation_history.json");
+        let history = root.join("state/taskHistory.json");
+        let published = |project: &str, model: Option<&str>| crate::cache::PublishedAgentRows {
+            turns: HashMap::from([(
+                ("session".to_owned(), 0),
+                crate::cache::PublishedTurn {
+                    project: project.to_owned(),
+                    model: model.map(str::to_owned),
+                    ts: 1,
+                    text: "a readable task".to_owned(),
+                },
+            )]),
+            sessions: HashSet::from(["session".to_owned()]),
+            event_sessions: HashSet::new(),
+        };
+        let admitted = |issue: &Path, rows: crate::cache::PublishedAgentRows| {
+            let mut cache = IngestCache::cold();
+            cache.set_published_material(HashSet::from([torn_task.clone()]));
+            let mut row = test_message("a readable task");
+            row.agent = "cline";
+            row.project = "delta".into();
+            row.model = "claude-fable-5".into();
+            cache.guard_never_empty("cline", &root, vec![row], &[], ReadOutcome::Invalid);
+            cache.record_source_read_issue("cline", issue, "source-invalid", "torn");
+            let mut once = Some(rows);
+            let mut read = false;
+            cache.admit_fully_served_whole_store_agents(std::iter::empty(), |_| {
+                read = true;
+                once.take()
+            });
+            (cache.output_complete(), read)
+        };
+
+        assert_eq!(
+            admitted(&torn_task, published("delta", Some("claude-fable-5"))),
+            (true, true)
+        );
+        assert_eq!(admitted(&torn_task, published("delta", None)), (true, true));
+        assert_eq!(
+            admitted(&torn_task, published("cline", Some("claude-fable-5"))),
+            (false, true),
+            "a seed that re-attributes a published row is not that row"
+        );
+        assert_eq!(
+            admitted(&torn_task, published("delta", Some("another-model"))),
+            (false, true)
+        );
+        // An index every task draws on failed: the seed's attribution proves nothing.
+        assert_eq!(
+            admitted(&history, published("delta", Some("claude-fable-5"))),
+            (false, false)
+        );
     }
 
     #[test]
@@ -5508,7 +8047,9 @@ mod tests {
             "kept"
         );
         assert_eq!(
-            reopened.entries[&source_key(&adopted)].msgs[0].text.as_ref(),
+            reopened.entries[&source_key(&adopted)].msgs[0]
+                .text
+                .as_ref(),
             "adopted"
         );
 
@@ -6601,6 +9142,273 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_read_is_cached_and_refreshed_only_by_a_read_that_loses_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "agrep-partial-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("store.db");
+        fs::write(&source, b"store").unwrap();
+        let row = |session: &str, text: &str| {
+            let mut row = test_message(text);
+            row.session = session.into();
+            row
+        };
+        let texts = |pass: &super::Pass| {
+            let mut texts: Vec<String> = pass.messages.iter().map(|m| m.text.to_string()).collect();
+            texts.sort_unstable();
+            texts
+        };
+        let mut cache = IngestCache::cold();
+        let read = |cache: &mut IngestCache,
+                    rows: Vec<Message>,
+                    events: Vec<Event>,
+                    outcome: ReadOutcome| {
+            collect_cached(cache, &dir, std::slice::from_ref(&source), move |_| {
+                (rows.clone(), events.clone(), outcome)
+            })
+        };
+
+        let first = read(
+            &mut cache,
+            vec![row("a", "first")],
+            vec![],
+            ReadOutcome::Partial,
+        );
+        assert_eq!(texts(&first), ["first"]);
+        let entry = &cache.entries[&source_key(&source)];
+        assert_eq!(entry.msgs.len(), 1);
+        assert!(entry.identity.is_none(), "a partial entry must retry");
+
+        let rows = vec![row("a", "first"), row("b", "second")];
+        let events = vec![test_event("a", "old-a"), test_event("b", "new-b")];
+        let grown = read(&mut cache, rows, events, ReadOutcome::Partial);
+        assert_eq!(texts(&grown), ["first", "second"]);
+        let sessions: Vec<&str> = grown.events.iter().map(|e| e.session.as_str()).collect();
+        assert_eq!(
+            sessions,
+            ["b"],
+            "events of a session the entry held were rewritten"
+        );
+
+        let lost = read(
+            &mut cache,
+            vec![row("b", "second")],
+            vec![],
+            ReadOutcome::Partial,
+        );
+        assert_eq!(texts(&lost), ["first", "second"]);
+        let failed = read(&mut cache, vec![], vec![], ReadOutcome::Invalid);
+        assert_eq!(texts(&failed), ["first", "second"]);
+
+        let complete = read(
+            &mut cache,
+            vec![row("c", "third")],
+            vec![],
+            ReadOutcome::Complete,
+        );
+        assert_eq!(texts(&complete), ["third"]);
+        assert!(cache.entries[&source_key(&source)].identity.is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leftover_flagged_entries_reparse_one_by_one_on_a_warm_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "agrep-leftover-reparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join(".ingest_cache.bin");
+        let current = dir.join("current.jsonl");
+        let leftover = dir.join("leftover.jsonl");
+        fs::write(&current, b"current").unwrap();
+        fs::write(&leftover, b"leftover").unwrap();
+        let sources = [current.clone(), leftover.clone()];
+        // One session per source, so no reparse re-reads the other as a sibling.
+        let row = |path: &std::path::Path, text: &str| {
+            crate::model::RawMessage {
+                agent: "claude",
+                project: "project".into(),
+                session: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                ts: 1,
+                turn: 0,
+                text: text.into(),
+                model: String::new(),
+                reply: String::new(),
+                reply_chars: 0,
+                side: false,
+                parent: String::new(),
+            }
+            .freeze()
+        };
+        let mut cold = IngestCache::cold();
+        collect_cached(&mut cold, &dir, &sources, |path| {
+            let text = format!("{} row", path.file_stem().unwrap().to_string_lossy());
+            (vec![row(path, &text)], Vec::new(), ReadOutcome::Complete)
+        });
+        let flagged = |keys: &[&std::path::Path]| {
+            let mut entries = cold.entries.clone();
+            for key in keys {
+                entries
+                    .get_mut(&source_key(key))
+                    .unwrap()
+                    .legacy_needs_reparse = true;
+            }
+            IngestCache::base(entries, super::CacheBacking::Rewrite)
+                .save(&cache_path)
+                .unwrap();
+        };
+
+        // Every entry flagged is an older generation takeover re-encoded: it reparses whole.
+        flagged(&[&current, &leftover]);
+        let adopted = IngestCache::load(&cache_path);
+        assert!(!adopted.warm && adopted.force_reparse);
+
+        flagged(&[&leftover]);
+        let mut warm = IngestCache::load(&cache_path);
+        assert!(warm.warm && !warm.force_reparse);
+        let pass = collect_cached(&mut warm, &dir, &sources, |_| {
+            (Vec::new(), Vec::new(), ReadOutcome::Invalid)
+        });
+        assert_eq!(pass.parsed, 1, "only the flagged entry reparses");
+        let mut texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["current row", "leftover row"]);
+        assert!(warm.entries[&source_key(&leftover)].legacy_needs_reparse);
+        assert!(!warm.entries[&source_key(&current)].legacy_needs_reparse);
+
+        let pass = collect_cached(&mut warm, &dir, &sources, |path| {
+            (
+                vec![row(path, "leftover reparsed")],
+                Vec::new(),
+                ReadOutcome::Complete,
+            )
+        });
+        assert_eq!(pass.parsed, 1);
+        let mut texts: Vec<&str> = pass.messages.iter().map(|m| m.text.as_ref()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["current row", "leftover reparsed"]);
+        assert!(!warm.entries[&source_key(&leftover)].legacy_needs_reparse);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn takeover_adopts_released_cache_versions_with_last_good_rows() {
+        for (version, journaled) in [
+            (36_u32, false),
+            (36, true),
+            (35, false),
+            (35, true),
+            (34, false),
+            (34, true),
+            (33, false),
+            (33, true),
+            (32, false),
+            (32, true),
+            (31, false),
+            (31, true),
+            (30, false),
+            (30, true),
+            (29, false),
+            (29, true),
+            (28, false),
+            (28, true),
+            (27, false),
+            (27, true),
+            (26, false),
+            (26, true),
+            (25, false),
+            (25, true),
+            (24, false),
+            (24, true),
+            (22, false),
+            (22, true),
+            (21, false),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "agrep-adopt-v{version}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("session.jsonl");
+            fs::write(&source, b"last-good transcript").unwrap();
+            let cache_path = dir.join(".ingest_cache.bin");
+            let mut cache = IngestCache::cold();
+            collect_cached(&mut cache, &dir, std::slice::from_ref(&source), |_| {
+                (vec![test_message("released last-good row")], Vec::<Event>::new())
+            });
+            let payload = bincode::serialize(&super::CacheFileRef {
+                version,
+                entries: &cache.entries,
+            })
+            .unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            bytes.extend_from_slice(super::CACHE_BASE_MAGIC);
+            bytes.extend_from_slice(&super::CACHE_BASE_STORAGE_VERSION.to_le_bytes());
+            bytes.extend_from_slice(b"ffffffffffffffffffff");
+            bytes.extend_from_slice(&[7_u8; 16]);
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&super::cache_digest(&payload));
+            bytes.extend_from_slice(&super::CACHE_CODEC_NONE.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            fs::write(&cache_path, bytes).unwrap();
+            let expected = if journaled {
+                let mut entry = cache.entries[&source_key(&source)].clone();
+                entry.msgs[0].text = "released journal row".into();
+                let delta = super::JournalDelta {
+                    upserts: vec![(source_key(&source), entry)],
+                    deletes: Vec::new(),
+                };
+                let mut journal = super::encode_journal_header([7_u8; 16]);
+                journal.extend_from_slice(&super::encode_journal_frame(0, 1, &delta).unwrap());
+                fs::write(super::cache_journal_path(&cache_path), journal).unwrap();
+                "released journal row"
+            } else {
+                "released last-good row"
+            };
+            assert!(matches!(
+                super::probe_cache_owner(&cache_path),
+                super::CacheOwnerProbe::Foreign { .. }
+            ));
+
+            assert_eq!(super::adopt_foreign_cache(&cache_path), Ok(1), "v{version}");
+            assert!(matches!(
+                super::probe_cache_owner(&cache_path),
+                super::CacheOwnerProbe::Current { .. }
+            ));
+            let mut reloaded = IngestCache::load(&cache_path);
+            assert!(reloaded.force_reparse, "v{version}");
+            assert!(reloaded.entries[&source_key(&source)].legacy_needs_reparse);
+            let pass = collect_cached(&mut reloaded, &dir, &[source], |_| {
+                (Vec::new(), Vec::new(), ReadOutcome::Skipped)
+            });
+            assert_eq!(pass.parsed, 1);
+            assert_eq!(pass.messages.len(), 1);
+            assert_eq!(pass.messages[0].text.as_ref(), expected);
+            assert!(!reloaded.source_snapshot_safe());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
     fn takeover_refuses_to_adopt_a_corrupt_foreign_cache() {
         let dir = std::env::temp_dir().join(format!(
             "agrep-adopt-corrupt-{}-{}",
@@ -7122,6 +9930,10 @@ pub enum ReadOutcome {
     /// license deletion, so last-good wins; with no last-good there is nothing to lose and
     /// what parsed is published.
     Partial,
+    /// A complete read that came back empty because the source itself undid what it held: rolled
+    /// back or rewound in records the read saw whole. Where an empty read of a changed file may be
+    /// torn, this one proves the emptiness, so a file that only grew may publish it over last-good.
+    Undone,
 }
 
 impl ReadOutcome {
@@ -7136,15 +9948,26 @@ impl ReadOutcome {
 
     /// Whether this read may replace a cached entry wholesale (and so publish deletions).
     fn licenses_replacement(self) -> bool {
-        self == Self::Complete
+        matches!(self, Self::Complete | Self::Undone)
+    }
+
+    /// An `Undone` read is otherwise the complete read it also is.
+    fn settled(self) -> Self {
+        if self == Self::Undone {
+            Self::Complete
+        } else {
+            self
+        }
     }
 }
 
-fn read_issue_reason(outcome: Option<ReadOutcome>) -> &'static str {
-    if outcome == Some(ReadOutcome::Partial) {
-        "source parser could not cover part of the read"
+fn read_issue_reason(outcome: Option<ReadOutcome>, panicked: Option<String>) -> String {
+    if let Some(reason) = panicked {
+        reason
+    } else if outcome == Some(ReadOutcome::Partial) {
+        "source parser could not cover part of the read".to_owned()
     } else {
-        "source parser could not complete the read"
+        "source parser could not complete the read".to_owned()
     }
 }
 
@@ -7175,6 +9998,31 @@ impl IntoParsed for (Vec<Message>, Vec<Event>, ReadOutcome) {
     }
 }
 
+type IsolatedParse = (
+    Vec<Message>,
+    Vec<Event>,
+    Option<ReadOutcome>,
+    Option<String>,
+);
+
+/// A parser that panics reads as an unreadable (skipped) source, with the panic's disclosable
+/// reason carried for its issue; see [`crate::ingest::parse_guard`].
+fn parse_isolated<R: IntoParsed>(
+    agent: &'static str,
+    path: &Path,
+    parse: impl FnOnce() -> R,
+) -> IsolatedParse {
+    match crate::ingest::parse_guard::isolate(agent, path, || parse().into_parsed()) {
+        Ok((messages, events, outcome)) => (messages, events, outcome, None),
+        Err(panic) => (
+            Vec::new(),
+            Vec::new(),
+            Some(ReadOutcome::Skipped),
+            Some(panic.reason),
+        ),
+    }
+}
+
 type IdentifiedStat = std::io::Result<Option<(String, i64, u64, CacheIdentity)>>;
 type ObservedFile = (PathBuf, Option<String>, IdentifiedStat);
 type ParsedMiss = (
@@ -7186,6 +10034,7 @@ type ParsedMiss = (
     Vec<Message>,
     Vec<Event>,
     Option<ReadOutcome>,
+    Option<String>,
 );
 type ParsedSibling = (
     String,
@@ -7193,6 +10042,7 @@ type ParsedSibling = (
     Vec<Message>,
     Vec<Event>,
     Option<ReadOutcome>,
+    Option<String>,
 );
 
 /// Parse `files`, pulling unchanged ones from `cache`. Updates the cache in place.
@@ -7253,6 +10103,44 @@ where
     F: Fn(&Path, i64, u64) -> R + Sync,
     R: IntoParsed,
 {
+    collect_cached_stamped_retiring_for(cache, agent, root, files, &HashSet::new(), parse)
+}
+
+/// [`collect_cached_for`] for a store where a file that still exists can stop being a source
+/// because a newer sibling supersedes it: `retired` paths are forgotten exactly like deletions
+/// instead of being re-added from the cache or the coverage snapshot, and so is their tally.
+pub fn collect_cached_retiring_for<F, R>(
+    cache: &mut IngestCache,
+    agent: &'static str,
+    root: &Path,
+    files: &[PathBuf],
+    retired: &HashSet<PathBuf>,
+    parse: F,
+) -> Pass
+where
+    F: Fn(&Path) -> R + Sync,
+    R: IntoParsed,
+{
+    collect_cached_stamped_retiring_for(cache, agent, root, files, retired, |path, _, _| {
+        parse(path)
+    })
+}
+
+fn collect_cached_stamped_retiring_for<F, R>(
+    cache: &mut IngestCache,
+    agent: &'static str,
+    root: &Path,
+    files: &[PathBuf],
+    retired: &HashSet<PathBuf>,
+    parse: F,
+) -> Pass
+where
+    F: Fn(&Path, i64, u64) -> R + Sync,
+    R: IntoParsed,
+{
+    for path in retired {
+        crate::intake::forget(path);
+    }
     // Windows walkers transiently omit entries (`read_dir` errors under live writers/AV), so
     // re-add cached paths: only metadata NotFound confirms deletion; other stat errors guard.
     let mut cached_paths: HashMap<String, PathBuf> = cache
@@ -7268,13 +10156,15 @@ where
         }
     }
     for path in &cache.coverage_expected_paths {
-        if source_path_within(path, root) && !listed_paths.contains(path) {
+        if source_path_within(path, root) && !listed_paths.contains(path) && !retired.contains(path)
+        {
             reconciled_files.push(path.clone());
             listed_paths.insert(path.clone());
         }
     }
     for path in cached_paths.values() {
-        if !source_path_within(path, root) || listed_paths.contains(path) {
+        if !source_path_within(path, root) || listed_paths.contains(path) || retired.contains(path)
+        {
             continue;
         }
         match fs::symlink_metadata(path) {
@@ -7282,7 +10172,9 @@ where
                 reconciled_files.push(path.clone());
                 listed_paths.insert(path.clone());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !absence_unproven(root, path) => {}
             Err(_) => {
                 reconciled_files.push(path.clone());
                 listed_paths.insert(path.clone());
@@ -7304,7 +10196,7 @@ where
         && (cached_material_root || expected_missing_root)
         && (!root.exists()
             || (!cache.stable_deletions_provable() && (cache.warm || expected_missing_root)))
-        && !cache.repeated_absent_agents.contains(agent)
+        && !cache.repeated_absence_covers(agent, root)
     {
         cache.mark_guarded_stale();
         cache.record_source_read_issue(
@@ -7520,7 +10412,7 @@ where
     let miss_parsed: Vec<ParsedMiss> = misses
         .par_iter()
         .map(|(p, key, mtime, size, identity)| {
-            let (m, e, healthy) = parse(p, *mtime, *size).into_parsed();
+            let (m, e, healthy, panicked) = parse_isolated(agent, p, || parse(p, *mtime, *size));
             crate::emit::file_done(&m);
             (
                 key.clone(),
@@ -7531,6 +10423,7 @@ where
                 m,
                 e,
                 healthy,
+                panicked,
             )
         })
         .collect();
@@ -7538,7 +10431,7 @@ where
     // sessions touched: from the fresh parses AND from the OLD cache entries of changed files
     // (so a session that moved between files is fully refreshed)
     let mut affected: HashSet<std::sync::Arc<str>> = HashSet::new();
-    for (_, _, _, _, _, m, events, _) in &miss_parsed {
+    for (_, _, _, _, _, m, events, _, _) in &miss_parsed {
         for msg in m {
             affected.insert(msg.session.clone());
         }
@@ -7599,9 +10492,9 @@ where
     let sib_parsed: Vec<ParsedSibling> = siblings
         .par_iter()
         .map(|(p, key, mtime, size)| {
-            let (m, e, healthy) = parse(p, *mtime, *size).into_parsed();
+            let (m, e, healthy, panicked) = parse_isolated(agent, p, || parse(p, *mtime, *size));
             crate::emit::file_done(&m);
-            (key.clone(), p.clone(), m, e, healthy)
+            (key.clone(), p.clone(), m, e, healthy, panicked)
         })
         .collect();
 
@@ -7676,19 +10569,57 @@ where
         crate::emit::rows_only(&chunk);
         messages.append(&mut chunk);
     }
+    // A racy entry keeps no identity, so its unchanged stat key still misses and reparses once.
+    let now_ns = epoch_ns(std::time::SystemTime::now()).unwrap_or(i64::MAX);
+    let racy_start = cache.racy_scan_start_ns;
+    let racy = |mtime: i64| racy_start.is_some_and(|start| racy_stamp(mtime, start, now_ns));
     // fresh: changed files (messages + events) + sibling files (messages cached-equal + events)
-    for (key, path, mt, sz, identity, m, e, healthy) in miss_parsed {
+    for (key, path, mt, sz, identity, m, e, healthy, panicked) in miss_parsed {
+        // only a proven-empty read (see `ReadOutcome::Undone`) differs from a complete one
+        let undone = healthy == Some(ReadOutcome::Undone);
+        let healthy = healthy.map(ReadOutcome::settled);
         // A failed, skipped or partial reparse retains the prior entry instead of publishing
-        // deletion. Only a partial read with no prior entry falls through and publishes.
+        // deletion; a partial one that lost nothing the entry held refreshes it instead.
         if healthy.is_some_and(|outcome| !outcome.licenses_replacement()) {
             cache.mark_guarded_stale();
             cache.record_source_read_issue(
                 agent,
                 &path,
                 "source-read-failed",
-                read_issue_reason(healthy),
+                read_issue_reason(healthy, panicked),
             );
             if let Some(prev) = cache.entries.get(&key) {
+                if healthy == Some(ReadOutcome::Partial) && partial_read_extends(prev, &m, &e) {
+                    // Events already stored for its sessions stay as written: this read
+                    // may have missed some of them.
+                    blocked_event_sessions
+                        .extend(prev.msgs.iter().map(|message| message.session.clone()));
+                    blocked_event_sessions.extend(
+                        prev.event_keys
+                            .iter()
+                            .map(|event| std::sync::Arc::from(event.session.as_str())),
+                    );
+                    let mut event_keys = prev.event_keys.clone();
+                    event_keys.extend(cached_event_keys(&e));
+                    event_keys.sort_unstable();
+                    event_keys.dedup();
+                    let legacy_needs_reparse = prev.legacy_needs_reparse;
+                    cache.put_entry(
+                        key,
+                        Entry {
+                            mtime: mt,
+                            size: sz,
+                            identity: None,
+                            msgs: m.iter().map(CMsg::from).collect(),
+                            event_keys,
+                            legacy_had_events: false,
+                            legacy_needs_reparse,
+                        },
+                    );
+                    messages.extend(m);
+                    events.extend(e);
+                    continue;
+                }
                 blocked_event_sessions
                     .extend(prev.msgs.iter().map(|message| message.session.clone()));
                 blocked_event_sessions.extend(
@@ -7709,10 +10640,16 @@ where
             }
         }
         if m.is_empty() && e.is_empty() {
-            let had_material = cache.entries.get(&key).is_some_and(|prev| {
-                !prev.msgs.is_empty() || !prev.event_keys.is_empty() || prev.legacy_had_events
+            let keep_prior = cache.entries.get(&key).is_some_and(|prev| {
+                prev.legacy_had_events
+                    || ((!prev.msgs.is_empty() || !prev.event_keys.is_empty())
+                        && !(undone && prev.size < sz)
+                        && (healthy != Some(ReadOutcome::Complete)
+                            || prev.mtime != mt
+                            || prev.size != sz
+                            || prev.identity.as_ref() != Some(&identity)))
             });
-            if had_material {
+            if keep_prior {
                 cache.mark_guarded_stale();
                 cache.record_source_read_issue(
                     agent,
@@ -7733,30 +10670,40 @@ where
                     continue;
                 }
             } else if cache.repair_mode
+                && healthy != Some(ReadOutcome::Complete)
                 && cache
                     .repair_expected_paths
                     .iter()
                     .any(|expected| source_path_eq(expected, &path))
             {
-                // A Complete read that truthfully yields nothing has no rows to
-                // lose and nothing to retry - guarding it wedges every repair pass
-                // forever. Only a non-Complete outcome is a silent read failure.
-                if !matches!(healthy, Some(ReadOutcome::Complete)) {
-                    cache.mark_guarded_stale();
-                    cache.output_incomplete = true;
-                    cache.record_source_read_issue(
-                        agent,
-                        &path,
-                        "source-read-failed",
-                        "source parser could not complete the read",
-                    );
-                }
+                cache.mark_guarded_stale();
+                cache.output_incomplete = true;
+                cache.record_source_read_issue(
+                    agent,
+                    &path,
+                    "source-read-failed",
+                    "source parser could not complete the read",
+                );
                 continue;
             }
         }
         if healthy == Some(ReadOutcome::Partial) {
-            // Publish recoverable cold rows for this pass, but retry until a complete read
-            // produces the first cacheable entry.
+            // Cached so a later failed read serves these rows and the cache names this source as
+            // published; no identity, so every pass retries it until a read completes.
+            if !m.is_empty() || !e.is_empty() {
+                cache.put_entry(
+                    key,
+                    Entry {
+                        mtime: mt,
+                        size: sz,
+                        identity: None,
+                        msgs: m.iter().map(CMsg::from).collect(),
+                        event_keys: cached_event_keys(&e),
+                        legacy_had_events: false,
+                        legacy_needs_reparse: false,
+                    },
+                );
+            }
             messages.extend(m);
             events.extend(e);
             continue;
@@ -7767,7 +10714,7 @@ where
             Entry {
                 mtime: mt,
                 size: sz,
-                identity: Some(identity),
+                identity: (!racy(mt)).then_some(identity),
                 msgs: m.iter().map(CMsg::from).collect(),
                 event_keys,
                 legacy_had_events: false,
@@ -7777,7 +10724,8 @@ where
         messages.extend(m);
         events.extend(e);
     }
-    for (key, path, m, e, healthy) in sib_parsed {
+    for (key, path, m, e, healthy, panicked) in sib_parsed {
+        let healthy = healthy.map(ReadOutcome::settled);
         // A sibling read can fail independently after its successful stat. Serving its cached
         // rows mirrors the changed-file last-good guard; its session event files remain untouched
         // because `events` cannot be reconstructed completely without this sibling.
@@ -7787,7 +10735,7 @@ where
                 agent,
                 &path,
                 "source-read-failed",
-                read_issue_reason(healthy),
+                read_issue_reason(healthy, panicked),
             );
             if let Some(prev) = cache.entries.get(&key) {
                 blocked_event_sessions
@@ -7810,10 +10758,12 @@ where
             }
         }
         if m.is_empty() && e.is_empty() {
-            let had_material = cache.entries.get(&key).is_some_and(|prev| {
-                !prev.msgs.is_empty() || !prev.event_keys.is_empty() || prev.legacy_had_events
+            let keep_prior = cache.entries.get(&key).is_some_and(|prev| {
+                prev.legacy_had_events
+                    || ((!prev.msgs.is_empty() || !prev.event_keys.is_empty())
+                        && healthy != Some(ReadOutcome::Complete))
             });
-            if had_material {
+            if keep_prior {
                 cache.mark_guarded_stale();
                 cache.record_source_read_issue(
                     agent,
@@ -7867,9 +10817,14 @@ where
                     .iter()
                     .any(|listed| source_path_eq(listed, path))
         });
+    // Two agreeing clean-absence preflights - of the agent or of this root - are the repeated
+    // witness a discarded base lacks; unrelated churn in other stores must not veto them.
+    let repeated_whole_store_absence =
+        file_count == 0 && cache.repeated_absence_covers(agent, root);
     if cache.repair_mode
         && (missing_material_source || missing_expected_source)
         && !cache.stable_deletions_provable()
+        && !repeated_whole_store_absence
     {
         cache.mark_guarded_stale();
         if missing_expected_source && !cached_material_root {

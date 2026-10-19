@@ -1,0 +1,11 @@
+{"sessionId":"6e6e0001-0414-4000-8000-000000000414","projectHash":"5f0c2a7e9b1d3f5a7c9e0b2d4f6a8c1e3f5a7b9d0c2e4f6a8b1d3f5a7c9e0b2d","startTime":"2026-04-14T09:00:00.000Z","lastUpdated":"2026-04-14T09:00:00.000Z","kind":"main"}
+{"id":"env","timestamp":"2026-04-14T09:00:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI. We are setting up the context for our chat.\n</session_context>"}]}
+{"id":"u1","timestamp":"2026-04-14T09:00:00.000Z","type":"user","content":[{"text":"Port the env and yaml loaders to the quokka config API and update the loader docs."}]}
+{"$set":{"lastUpdated":"2026-04-14T09:00:00.000Z"}}
+{"id":"g1","timestamp":"2026-04-14T09:00:20.000Z","type":"gemini","content":"","model":"gemini-2.5-pro","thoughts":[{"subject":"Plan","description":"split the port into three steps","timestamp":"2026-04-14T09:00:10.000Z"}]}
+{"id":"g1","timestamp":"2026-04-14T09:00:20.000Z","type":"gemini","content":"","model":"gemini-2.5-pro","thoughts":[{"subject":"Plan","description":"split the port into three steps","timestamp":"2026-04-14T09:00:10.000Z"}],"toolCalls":[{"id":"write_todos-1","name":"write_todos","args":{"todos":[{"description":"Port the env loader","status":"completed"},{"description":"Port the yaml loader","status":"in_progress"},{"description":"Update the loader docs","status":"pending"}]},"result":[{"functionResponse":{"id":"write_todos-1","name":"write_todos","response":{"output":"Successfully updated the todo list."}}}],"status":"success","timestamp":"2026-04-14T09:00:20.000Z"}]}
+{"id":"r1","timestamp":"2026-04-14T09:00:21.000Z","type":"user","content":[{"functionResponse":{"id":"write_todos-1","name":"write_todos","response":{"output":"Successfully updated the todo list."}}}]}
+{"id":"g2","timestamp":"2026-04-14T09:03:00.000Z","type":"gemini","content":"Ported the env loader to the quokka config API.","model":"gemini-2.5-pro"}
+{"id":"u2","timestamp":"2026-04-14T09:15:00.000Z","type":"user","content":[{"text":"also delete the zeppelin shim"}]}
+{"$rewindTo":"u2"}
+{"$set":{"lastUpdated":"2026-04-14T09:03:00.000Z"}}

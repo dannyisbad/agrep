@@ -1,0 +1,16 @@
+{"timestamp":"{{t-2d+3h}}","type":"session_meta","payload":{"id":"55555555-5555-4555-8555-555555555555","cwd":"{{home}}/projects/cedar"}}
+{"timestamp":"{{t-2d+3h+1m}}","type":"turn_context","payload":{"model":"gpt-5","turn_id":"cedar-codex-turn"}}
+{"timestamp":"{{t-2d+3h+2m}}","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Audit the copper lantern deployment manifest for cedar."}]}}
+{"timestamp":"{{t-2d+3h+2m+1s}}","type":"event_msg","payload":{"type":"user_message","message":"Audit the copper lantern deployment manifest for cedar."}}
+{"timestamp":"{{t-2d+3h+3m}}","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The copper lantern manifest names the amber gate and west dock."}]}}
+{"timestamp":"{{t-2d+3h+5m}}","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Use beacon-blue to identify the isolated worker queue."}]}}
+{"timestamp":"{{t-2d+3h+5m+1s}}","type":"event_msg","payload":{"type":"user_message","message":"Use beacon-blue to identify the isolated worker queue."}}
+{"timestamp":"{{t-2d+3h+6m}}","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"beacon-blue identifies the worker queue; keychain is not a whole-word key."}]}}
+{"timestamp":"{{t-2d+3h+8m}}","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect the deployment manifest and retain the command result."}]}}
+{"timestamp":"{{t-2d+3h+8m+1s}}","type":"event_msg","payload":{"type":"user_message","message":"Inspect the deployment manifest and retain the command result."}}
+{"timestamp":"{{t-2d+3h+9m}}","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect the manifest without changing its contents."}]}}
+{"timestamp":"{{t-2d+3h+10m}}","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"manifest-call","arguments":"{\"cmd\":\"cat manifest.txt\"}"}}
+{"timestamp":"{{t-2d+3h+10m+1s}}","type":"response_item","payload":{"type":"function_call_output","call_id":"manifest-call","output":"{\"output\":\"toolproof-codex: copper lantern manifest verified\",\"metadata\":{\"exit_code\":0}}"}}
+{"timestamp":"{{t-2d+3h+11m}}","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Summarize the codex lantern decision for the release lead."}]}}
+{"timestamp":"{{t-2d+3h+11m+1s}}","type":"event_msg","payload":{"type":"user_message","message":"Summarize the codex lantern decision for the release lead."}}
+{"timestamp":"{{t-2d+3h+12m}}","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The codex lantern decision keeps the west dock closed until sunrise."}]}}

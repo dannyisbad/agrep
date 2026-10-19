@@ -133,6 +133,11 @@ from session identities; only `around` retains the printed sigil long enough
 to distinguish its explicit latest-chat shorthand from an unprefixed session
 that still requires a turn.
 
+A source-backed filename alias resolves to the canonical header session before
+row verification. This changes only session addressing: the turn, content digest,
+and tool-event selector still have to verify. A header rewrite does not authorize
+serving different content under an old citation.
+
 ## Interaction with the NUDGE
 
 Stage 1 has landed, so every minted handle now carries the `.digest` suffix.

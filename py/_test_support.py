@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 
 _TEST_ROOT_ENV = "AGREP_TEST_DATA_ROOT"
@@ -54,6 +55,9 @@ def isolate_data_dir() -> Path:
     # the shared sandbox after their test; suites about either opt back in.
     os.environ["AGREP_NO_DAEMON"] = "1"
     os.environ["AGREP_NO_SEM_WORKER"] = "1"
+    # A live agent process above the test runner publishes its caller record;
+    # identity tests must see only what they write themselves.
+    os.environ["AGREP_CALLER_PUBLICATION_DIR"] = str(_DATA_ROOT / "caller")
     # Tree purity: the venv's editable .pth serves the MAIN checkout's cli.py
     # to worktree runs, which then prepends ITS py/ and mixes two source
     # trees. This tree's root goes first; a crossing resolution is an error.
@@ -71,6 +75,27 @@ def isolate_data_dir() -> Path:
     if loaded is not None and Path(loaded.DATA_DIR) != root:
         raise RuntimeError("test isolation was requested after common initialized real paths")
     return root
+
+
+def wait_for_next_ctime_tick(path: Path) -> None:
+    """Linux stamps ctime from the coarse tick clock; a rewrite in the same tick
+    as ``path``'s last change keeps its identity."""
+    if os.name == "nt":
+        # Windows stat ctime is creation time; change identities there are the USN or a content proof.
+        return
+    before = os.stat(path).st_ctime_ns
+    probe = Path(f"{path}.ctime-probe")
+    deadline = time.monotonic() + 5.0
+    try:
+        while True:
+            probe.write_bytes(b"tick")
+            if probe.stat().st_ctime_ns > before:
+                return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"ctime never advanced past {path} within 5 s")
+            time.sleep(0.001)
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 def publish_derived_generation(
@@ -146,7 +171,7 @@ def publish_derived_generation(
         "version": corpusdb_api._DERIVED_PROOF_VERSION,
         "signature": signature, "files": proof_rows,
     }, separators=(",", ":")), encoding="utf-8")
-    (root / ".ingest.sig").write_text(signature + "\n", encoding="utf-8")
+    (root / ".ingest.sig").write_bytes((signature + "\n").encode("utf-8"))
     (root / "settings.json").write_text(
         '{"tools":"off"}', encoding="utf-8")
     if mode is not None:

@@ -10,10 +10,11 @@
 //! the parse cache keep the tally from the run that actually parsed them, and the
 //! accounting stays complete across incremental runs.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -213,14 +214,87 @@ type OpenTally = (String, Option<String>, &'static str, String, Arc<Tally>);
 struct Run {
     /// Tallies opened this run, with the fingerprint captured at open time.
     open: Mutex<Vec<OpenTally>>,
+    /// Book ids whose source an adapter stopped reading while the file stays on disk.
+    forgotten: Mutex<Vec<String>>,
 }
 
-static RUN: OnceLock<Run> = OnceLock::new();
+static RUN: LazyLock<Run> = LazyLock::new(|| Run {
+    open: Mutex::new(Vec::new()),
+    forgotten: Mutex::new(Vec::new()),
+});
 
-fn run() -> &'static Run {
-    RUN.get_or_init(|| Run {
-        open: Mutex::new(Vec::new()),
-    })
+thread_local! {
+    /// Tallies opened by each guarded parse running on this thread, innermost last.
+    static GUARDED: RefCell<Vec<Vec<Arc<Tally>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `parse`, which must not unwind, and return the tallies it opened on this thread.
+pub(crate) fn scoped<T>(parse: impl FnOnce() -> T) -> (T, Vec<Arc<Tally>>) {
+    GUARDED.with(|scopes| scopes.borrow_mut().push(Vec::new()));
+    let value = parse();
+    let opened = GUARDED.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        let opened = scopes.pop().unwrap_or_default();
+        if let Some(outer) = scopes.last_mut() {
+            outer.extend(opened.iter().cloned());
+        }
+        opened
+    });
+    (value, opened)
+}
+
+/// Withdraw the tallies of a parse that never finished: a half-counted tally would otherwise
+/// replace the book entry of the run that last parsed the source, whose rows are still served.
+pub(crate) fn discard(tallies: &[Arc<Tally>]) {
+    if tallies.is_empty() {
+        return;
+    }
+    RUN.open
+        .lock()
+        .unwrap()
+        .retain(|(.., tally)| !tallies.iter().any(|gone| Arc::ptr_eq(gone, tally)));
+}
+
+/// Serializes unit tests that inspect or drain the process-wide run book.
+#[cfg(test)]
+pub(crate) static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn is_open(tally: &Arc<Tally>) -> bool {
+    RUN.open
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(.., open)| Arc::ptr_eq(open, tally))
+}
+
+fn opened(tally: &Arc<Tally>) {
+    // try_with: thread teardown has no guarded parse left to attribute the tally to.
+    let _ = GUARDED.try_with(|scopes| {
+        if let Some(scope) = scopes.borrow_mut().last_mut() {
+            scope.push(Arc::clone(tally));
+        }
+    });
+}
+
+/// Panics the parse that opens a tally for the source `AGREP_TEST_PARSE_PANIC` names, after the
+/// tally is registered, quoting store text the way std's `unwrap` of a hostile-input error does.
+#[cfg(feature = "parse-panic-injection")]
+fn inject_parse_panic(source: &str) {
+    if std::env::var_os("AGREP_TEST_PARSE_PANIC").is_some_and(|target| target == source) {
+        let excerpt: Result<(), String> = Err("injected transcript excerpt".to_owned());
+        std::hint::black_box(excerpt).unwrap();
+    }
+}
+
+/// Drop `path`'s entry at the next [`commit`]. For a file that still exists but is no longer a
+/// source (a newer sibling supersedes it): commit keeps every unparsed entry, and audit reads a
+/// present, undiscovered, tallied path as a coverage gap.
+pub fn forget(path: &Path) {
+    RUN.forgotten
+        .lock()
+        .unwrap()
+        .push(path.to_string_lossy().to_string());
 }
 
 /// Stat-file fingerprint. Deliberately weaker than the ingest cache's staleness key: the
@@ -264,11 +338,13 @@ pub fn file_stamped(agent: &'static str, path: &Path, mtime_ns: i64, size: u64) 
 /// Open the tally for one caller-defined keyed unit.
 pub fn keyed(agent: &'static str, id: &str, fingerprint: String) -> Arc<Tally> {
     let t = Arc::new(Tally::default());
-    run()
-        .open
+    RUN.open
         .lock()
         .unwrap()
         .push((id.to_string(), None, agent, fingerprint, Arc::clone(&t)));
+    opened(&t);
+    #[cfg(feature = "parse-panic-injection")]
+    inject_parse_panic(id);
     t
 }
 
@@ -299,11 +375,13 @@ pub fn keyed_token(
     let id = token_id(path, session);
     let legacy = legacy_token_id(path, session);
     let tally = Arc::new(Tally::default());
-    run()
-        .open
+    RUN.open
         .lock()
         .unwrap()
         .push((id, Some(legacy), agent, fingerprint, Arc::clone(&tally)));
+    opened(&tally);
+    #[cfg(feature = "parse-panic-injection")]
+    inject_parse_panic(&path.to_string_lossy());
     tally
 }
 
@@ -331,10 +409,27 @@ fn publish(path: &Path, book: &Book) -> anyhow::Result<()> {
     crate::cache::write_bytes_atomic(path, &body)
 }
 
+/// The persisted book as [`commit`] wrote it: `None` before any ingest, an error for an
+/// unreadable, malformed, or differently versioned file. Diagnostics read it; only commit writes.
+pub fn read_book(path: &Path) -> anyhow::Result<Option<BTreeMap<String, FileEntry>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let book: Book = serde_json::from_str(&text)?;
+    anyhow::ensure!(
+        book.version == BOOK_VERSION,
+        "intake book version {} is not {BOOK_VERSION}",
+        book.version
+    );
+    Ok(Some(book.files))
+}
+
 /// Fold this run's tallies into the persisted book at `path`: parsed units replace
-/// their old entries, unparsed-but-still-present entries survive (their source was
-/// served from the parse cache), entries whose source vanished are dropped by the
-/// audit rather than here (path existence is adapter-specific). Returns per-agent
+/// their old entries, ids passed to [`forget`] leave, unparsed-but-still-present entries survive
+/// (their source was served from the parse cache), entries whose source vanished are dropped
+/// by the audit rather than here (path existence is adapter-specific). Returns per-agent
 /// rollups of THIS run for the stdout summary.
 pub fn commit(path: &Path) -> anyhow::Result<BTreeMap<&'static str, AgentSummary>> {
     let mut book: Book = std::fs::read_to_string(path)
@@ -345,7 +440,10 @@ pub fn commit(path: &Path) -> anyhow::Result<BTreeMap<&'static str, AgentSummary
     book.version = BOOK_VERSION;
 
     let mut summaries: BTreeMap<&'static str, AgentSummary> = BTreeMap::new();
-    let opened = std::mem::take(&mut *run().open.lock().unwrap());
+    let opened = std::mem::take(&mut *RUN.open.lock().unwrap());
+    for id in std::mem::take(&mut *RUN.forgotten.lock().unwrap()) {
+        book.files.remove(&id);
+    }
     for (id, legacy_id, agent, fingerprint, t) in opened {
         let mut skips = BTreeMap::new();
         let mut skip_total = 0u64;
@@ -445,6 +543,9 @@ mod tests {
 
     #[test]
     fn identity_and_persistence_round_trip() {
+        let _run = RUN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let t = keyed("testagent", "x.jsonl", "s:1:2".into());
         t.seen_n(4);
         t.seen();
@@ -484,6 +585,17 @@ mod tests {
         let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(book.files["x.jsonl"].seen, 1);
         assert_eq!(book.files["x.jsonl"].rows, 1);
+
+        // a forgotten source leaves the book; one re-tallied in the same run stays
+        keyed("testagent", "y.jsonl", "s:3:3".into()).seen();
+        commit(&p).unwrap();
+        forget(Path::new("x.jsonl"));
+        forget(Path::new("y.jsonl"));
+        keyed("testagent", "y.jsonl", "s:4:4".into()).seen();
+        commit(&p).unwrap();
+        let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(!book.files.contains_key("x.jsonl"));
+        assert_eq!(book.files["y.jsonl"].key, "s:4:4");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

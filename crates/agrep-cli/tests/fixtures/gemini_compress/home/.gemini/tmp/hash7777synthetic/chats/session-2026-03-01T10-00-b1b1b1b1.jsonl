@@ -1,0 +1,27 @@
+{"sessionId":"b1b1b1b1-0301-4000-8000-000000000301","projectHash":"legacyhash","startTime":"2026-03-01T10:00:00.000Z","lastUpdated":"2026-03-01T10:03:05.000Z"}
+{"id":"i1","timestamp":"2026-03-01T10:00:00.000Z","type":"info","content":"Authentication succeeded"}
+{"id":"m1","timestamp":"2026-03-01T10:01:00.000Z","type":"user","content":[{"text":"audit the falcon parser"}]}
+{"id":"m2","timestamp":"2026-03-01T10:01:05.000Z","type":"gemini","content":"The falcon parser looks sound.","model":"gemini-2.5-pro"}
+{"id":"m3","timestamp":"2026-03-01T10:02:00.000Z","type":"user","content":[{"text":"audit the gecko lexer"}]}
+{"id":"m4","timestamp":"2026-03-01T10:02:05.000Z","type":"gemini","content":"The gecko lexer drops BOMs.","model":"gemini-2.5-pro"}
+{"id":"m5","timestamp":"2026-03-01T10:03:00.000Z","type":"user","content":"audit the heron emitter"}
+{"id":"m6","timestamp":"2026-03-01T10:03:05.000Z","type":"gemini","content":"The heron emitter is fine.","model":"gemini-2.5-pro"}
+{"$set":{"sessionId":"b1b1b1b1-0301-4000-8000-000000000301"}}
+{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-04-20T08:00:00.000Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI. We are setting up the context for our chat.\n</session_context>"}]}
+{"$patch":{"updates":[{"id":"m2","content":[{"text":"The falcon parser looks sound."}]},{"id":"m4","content":[{"text":"The gecko lexer drops BOMs."}]},{"id":"m5","content":[{"text":"audit the heron emitter"}]},{"id":"m6","content":[{"text":"The heron emitter is fine."}]}],"removeIds":["i1"],"orderIds":["d04923d38bb0f6017037e74183378ef4","m1","m2","m3","m4","m5","m6"]}}
+{"$set":{"lastUpdated":"2026-04-20T08:00:00.000Z"}}
+{"id":"b1b1b1b1-0000-4000-8000-000000000001","timestamp":"2026-04-20T08:01:00.000Z","type":"user","content":[{"text":"audit the ibis printer"}]}
+{"$set":{"lastUpdated":"2026-04-20T08:01:00.000Z"}}
+{"id":"b1b1b1b1-0000-4000-8000-000000000002","timestamp":"2026-04-20T08:01:05.000Z","type":"gemini","content":"The ibis printer needs tests.","thoughts":[{"subject":"Plan","description":"weighing the next step","timestamp":"2026-04-20T08:01:05.000Z"}],"tokens":{"input":900,"output":40,"cached":0,"thoughts":0,"tool":0,"total":940},"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-20T08:01:05.000Z"}}
+{"$set":{"sessionId":"b1b1b1b1-0301-4000-8000-000000000301"}}
+{"id":"b1b1b1b1-0000-4000-8000-000000000003","timestamp":"2026-04-20T08:02:00.000Z","type":"user","content":[{"text":"<state_snapshot>\n    <overall_goal>Review the falcon to ibis modules.</overall_goal>\n    <key_knowledge>The zoo loaders share one config API.</key_knowledge>\n</state_snapshot>"}]}
+{"id":"b1b1b1b1-0000-4000-8000-000000000004","timestamp":"2026-04-20T08:02:00.000Z","type":"gemini","content":[{"text":"Got it. Thanks for the additional context!"}]}
+{"id":"b1b1b1b1-0000-4000-8000-000000000005","timestamp":"2026-04-20T08:02:00.000Z","type":"user","content":[{"text":"audit the ibis printer"}]}
+{"id":"b1b1b1b1-0000-4000-8000-000000000006","timestamp":"2026-04-20T08:02:00.000Z","type":"gemini","content":[{"text":"weighing the next step","thought":true},{"text":"The ibis printer needs tests."}]}
+{"$patch":{"removeIds":["m1","m2","m3","m4","m5","m6","b1b1b1b1-0000-4000-8000-000000000001","b1b1b1b1-0000-4000-8000-000000000002"]}}
+{"$set":{"lastUpdated":"2026-04-20T08:02:00.000Z"}}
+{"id":"b1b1b1b1-0000-4000-8000-000000000007","timestamp":"2026-04-20T08:03:00.000Z","type":"user","content":[{"text":"audit the jackal linker"}]}
+{"$set":{"lastUpdated":"2026-04-20T08:03:00.000Z"}}
+{"id":"b1b1b1b1-0000-4000-8000-000000000008","timestamp":"2026-04-20T08:03:05.000Z","type":"gemini","content":"The jackal linker is fine.","thoughts":[{"subject":"Plan","description":"weighing the next step","timestamp":"2026-04-20T08:03:05.000Z"}],"tokens":{"input":900,"output":40,"cached":0,"thoughts":0,"tool":0,"total":940},"model":"gemini-2.5-pro"}
+{"$set":{"lastUpdated":"2026-04-20T08:03:05.000Z"}}

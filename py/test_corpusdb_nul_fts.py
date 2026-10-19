@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -119,6 +120,50 @@ class EmbeddedNulFts(unittest.TestCase):
         self.assertEqual(self._ids("msgs_fts", "ijk"), [])
         self.assertIn("\\u0000", json.dumps({"text": stored[0][0]}))
         self._assert_integrity()
+
+    def test_regex_required_runs_preserve_python_matches(self) -> None:
+        rows = [
+            _row("zeta", 2, "agent", "ALPHA backend"),
+            _row("zeta", 1, "user", "alpha\0bacKend"),
+            _row("plain", 1, "user", "alpha backend"),
+            _row("left", 1, "user", "alpha"),
+            _row("right", 1, "user", "backend"),
+            _row("branch", 1, "user", "gamma"),
+            _row("group", 1, "user", "omega backend"),
+            _row("optional", 1, "user", "alpha backen"),
+            _row("escaped", 1, "user", "alpha.*backend"),
+            _row("newline", 1, "user", "alpha\nbackend"),
+            _row("tool", 1, "tool", "alpha backend"),
+        ]
+        self._publish(rows)
+        patterns = (
+            r"alpha.*backend",
+            r"alpha.*backend?",
+            r"alpha.*(?:backend)?",
+            r"(?:alpha|omega).*backend",
+            r"alpha.*backend|gamma",
+            r"alpha\.\*backend",
+            r"alpha(?= backend).*backend",
+            r"(?-i:ALPHA).*backend",
+            r"(?s)alpha.*backend",
+        )
+        ordered = sorted(rows, key=lambda row: (
+            row[0], row[1], row[8] == "agent"))
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                rx = re.compile(pattern, re.I)
+                expected = []
+                for row in ordered:
+                    if row[8] != "tool" and (match := rx.search(row[9])):
+                        expected.append((row[0], row[1], row[8], match.span()))
+                result = corpusdb.regex(
+                    self.db, pattern, len(rows), {"include_tools": False})
+                self.assertEqual([
+                    (hit["session"], hit["turn"], hit["who"], hit["_match_span"])
+                    for hit in result["hits"]], expected)
+                self.assertEqual(result["total"], len(expected))
+                self.assertEqual(
+                    result["chats"], len({row[0] for row in expected}))
 
     def test_incremental_tool_prose_text_and_delete_transitions(self) -> None:
         first = _row("moving", 1, "tool", "before abc\0def suffix")

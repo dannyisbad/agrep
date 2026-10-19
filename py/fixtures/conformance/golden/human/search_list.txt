@@ -1,0 +1,9 @@
+exit: 0
+--- stdout ---
+pi · cedar  [@33333333:3.3bfd · 5 hits · 17h]
+codex · cedar  [@55555555:3.a301 · 5 hits · 1d]
+claude · cedar  [@11111111:6.063c · 8 hits · 2d]
+pi · maple  [@22222222:2.adc8 · 5 hits · 4d]
+pi · cedar · [side chat]  [@44444444:0.9bdf · 2 hits · 17h]
+claude · birch  [@66666666:2.e007 · 4 hits · 6d]
+--- stderr ---

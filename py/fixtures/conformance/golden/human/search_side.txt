@@ -1,0 +1,7 @@
+exit: 0
+--- stdout ---
+44444444-4444-4444-8444-444444444444	pi	cedar	0	agent	Sidecar lantern verdict: the rollback plan preserves the amber gate.
+44444444-4444-4444-8444-444444444444	pi	cedar	0	subagent	Check the sidecar lantern rollback plan for the cedar lead.
+33333333-3333-4333-8333-333333333333	pi	cedar	0	user	Review the cedar lantern plan with a sidecar advisor.
+33333333-3333-4333-8333-333333333333	pi	cedar	0	agent	The sidecar advisor will inspect the cedar lantern rollback plan.
+--- stderr ---

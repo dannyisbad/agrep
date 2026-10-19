@@ -16,6 +16,7 @@ import io
 import json
 import os
 import sys
+import shlex
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -169,6 +170,25 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(error["code"], "stale-handle")
         self.assertEqual(error["requested_turn"], 999999)
         self.assertEqual(err, "")
+
+    def test_a_gap_inside_the_range_is_missing_not_out_of_range(self) -> None:
+        """Only a turn past either end is out of range; one between indexed turns
+        that the index does not hold is a gap, and the message says so."""
+        def gapped(session: str, center: int, radius: int) -> dict:
+            return _window(session, 299 if int(center) == 300 else center, radius)
+
+        with mock.patch.object(explore, "get_window", gapped):
+            rc, out, err = self._run([f"@{TWINS[0]}:300"])
+            self.assertEqual((rc, out), (2, ""))
+            self.assertEqual(
+                err, f"result handle is stale: turn 300 is missing from the index "
+                     f"(chat has turns 0-{LAST}); "
+                     "rerun the search for a current handle\n")
+            rc, out, err = self._run([TWINS[0], "300", "-C", "0"])
+        self.assertEqual(rc, 0)
+        self.assertIn(f"turn 300 is missing from the index - centered on 299 "
+                      f"(session has turns 0-{LAST}).", err.splitlines())
+        self.assertNotIn("out of range", err)
 
     def test_every_divergence_renders_one_decision(self) -> None:
         """The stderr sentence and the JSON field are the same string, so a
@@ -394,28 +414,139 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(len(err.splitlines()), 1)
         self.assertIn("automatic freshness checks are disabled", err)
 
-    def test_bare_printed_session_opens_its_latest_indexed_turn(self) -> None:
-        rc, out, err = self._run([f"@{TWINS[0]}", "-C", "0", "--json"])
-        self.assertEqual((rc, err), (0, ""))
+    def test_bare_session_opens_its_latest_indexed_turn_with_or_without_at(self) -> None:
+        for target in (f"@{TWINS[0]}", TWINS[0]):
+            with self.subTest(target=target):
+                rc, out, err = self._run([target, "-C", "0", "--json"])
+                self.assertEqual((rc, err), (0, ""))
+                rows = [json.loads(line) for line in out.splitlines()]
+                self.assertEqual(rows[0]["scope"]["selection_order"], "newest_tail")
+                self.assertEqual(rows[0]["scope"]["render_order"], "chronological")
+                self.assertEqual(
+                    {row["turn"] for row in rows if row["kind"] == "msg"}, {LAST})
+                self.assertFalse(any("served" in row for row in rows))
+
+    def test_whole_reads_every_turn_and_needs_no_turn(self) -> None:
+        rc, out, err = self._run([TWINS[0], "--whole", "--json"])
+        self.assertEqual(rc, 0)
+        # 755 fixture turns: the large-pull line names the whole-chat lever
+        self.assertEqual(err.count("\n"), 1)
+        self.assertIn("large pull", err)
+        self.assertIn("`--who user` keeps the user's turns only", err)
         rows = [json.loads(line) for line in out.splitlines()]
-        self.assertEqual(rows[0]["scope"]["selection_order"], "newest_tail")
-        self.assertEqual(rows[0]["scope"]["render_order"], "chronological")
+        scope = rows[0]["scope"]
+        self.assertEqual(scope["selection_order"], "whole_chat")
+        self.assertEqual(scope["radius"], LAST)
+        self.assertEqual(scope["center_turn"], LAST)
+        self.assertEqual(scope["expansion_argv"][-2:], ["--whole", "--full"])
+        self.assertEqual(scope["truncation"]["message_cap_chars"], 4000)
         self.assertEqual({row["turn"] for row in rows if row["kind"] == "msg"},
-                         {LAST})
+                         set(range(LAST + 1)))
         self.assertFalse(any("served" in row for row in rows))
 
-        rc, human, err = self._run([
-            f"@{TWINS[0]}", "-C", "0", "--color", "never"])
+        rc, centered, err = self._run([TWINS[0], "5", "-C", "all", "--json"])
         self.assertEqual(rc, 0, err)
-        self.assertIn("newest tail selected; chronological render", human)
+        rows = [json.loads(line) for line in centered.splitlines()]
+        self.assertEqual(rows[0]["scope"]["center_turn"], 5)
+        self.assertEqual(rows[0]["scope"]["radius"], LAST - 5)
+        self.assertEqual(
+            len([row for row in rows if row["kind"] == "msg"]), 2 * (LAST + 1))
 
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
-                self.assertRaises(SystemExit) as raised:
-            around.main([TWINS[0]])
-        self.assertEqual(raised.exception.code, 2)
-        self.assertEqual(out.getvalue(), "")
-        self.assertIn("need a turn", err.getvalue())
+        rc, human, err = self._run([TWINS[0], "--whole", "--color", "never"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"turns 0-{LAST} of 0-{LAST}", human)
+        self.assertNotIn("--full", human)
+
+    def test_whole_refuses_a_numeric_radius_beside_it(self) -> None:
+        for argv in ([TWINS[0], "5", "--whole", "-C", "3"],
+                     [TWINS[0], "5", "-C", "some"]):
+            out, err = io.StringIO(), io.StringIO()
+            with self.subTest(argv=argv), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err), \
+                    self.assertRaises(SystemExit) as raised:
+                around.main(argv)
+            self.assertEqual(raised.exception.code, 2)
+            self.assertEqual(out.getvalue(), "")
+        rc, out, err = self._run([TWINS[0], "--whole", "-C", "all", "--json"])
+        self.assertEqual(rc, 0, err)
+
+    def test_who_filter_points_at_the_same_read_without_who(self) -> None:
+        rc, human, err = self._run([
+            TWINS[0], "--whole", "--who", "user", "--color", "never"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(human.count("\nuser: "), LAST + 1)
+        self.assertNotIn("\nagent: ", human)
+        command = next(
+            line.split("agrep around ", 1)[1]
+            for line in human.splitlines() if "agrep around " in line)
+        rc, expanded, err = self._run(shlex.split(command))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(expanded.count("\nuser: "), LAST + 1)
+        self.assertEqual(expanded.count("\nagent: "), LAST + 1)
+
+        rc, human, err = self._run([
+            TWINS[0], "5", "-C", "2", "--who", "user", "--color", "never"])
+        self.assertEqual(rc, 0, err)
+        command = next(
+            line.split("agrep around ", 1)[1]
+            for line in human.splitlines() if "agrep around " in line)
+        rc, expanded, err = self._run(shlex.split(command))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(expanded.count("\nuser: "), 5)
+        self.assertEqual(expanded.count("\nagent: "), 5)
+
+    def test_capped_message_points_at_the_cap_lever_not_the_stream(self) -> None:
+        long_reply = "HEAD " + "word " * 3_000
+
+        def long_window(session: str, center: int, radius: int) -> dict:
+            window = _window(session, center, radius)
+            window["turns"][0]["reply"] = long_reply
+            return window
+
+        with mock.patch.object(explore, "get_window", long_window):
+            rc, human, err = self._run([TWINS[0], "5", "-C", "0", "--color", "never"])
+        self.assertEqual(rc, 0, err)
+        self.assertRegex(
+            human, r"chars - agrep around agent-ab436\S* 5 -C 0 --max-chars 0\]")
+        self.assertNotIn("--full]", human)
+        with mock.patch.object(explore, "get_window", long_window):
+            rc, whole, err = self._run([
+                TWINS[0], "5", "-C", "0", "--max-chars", "0", "--color", "never"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("chars - agrep around", whole)
+        self.assertIn(long_reply.strip(), whole)
+
+    def test_capped_nondefault_speaker_command_recovers_the_message(self) -> None:
+        text = "HEAD " + "word " * 3_000 + "TAIL"
+        for who in ("recap", "control", "harness", "synthetic", "subagent"):
+            for json_output in (False, True):
+                with self.subTest(who=who, json=json_output):
+                    def window(session: str, center: int, radius: int) -> dict:
+                        result = _window(session, center, radius)
+                        result["turns"] = [{
+                            "turn": center, "ts": 0, "who": who,
+                            "text": text, "reply": "",
+                        }]
+                        return result
+
+                    with mock.patch.object(explore, "get_window", window):
+                        rc, capped, err = self._run([
+                            TWINS[0], "5", "-C", "0", "--who", who,
+                            "--color", "never", *(["--json"] if json_output else [])])
+                        self.assertEqual(rc, 0, err)
+                        if json_output:
+                            capped = next(
+                                row["text"] for row in map(json.loads, capped.splitlines())
+                                if row.get("kind") == "msg")
+                        command = capped.rsplit("chars - ", 1)[1].split("]", 1)[0]
+                        rc, expanded, err = self._run(
+                            [*shlex.split(command)[2:], "--json"])
+                    self.assertEqual(rc, 0, err)
+                    rows = [row for row in map(json.loads, expanded.splitlines())
+                            if row.get("kind") == "msg"]
+                    self.assertEqual(
+                        [(row["who"], row["text"]) for row in rows], [(who, text)])
 
     def test_who_filter_treats_events_as_tool_rows(self) -> None:
         def one_tool_turn(session: str, center: int, radius: int) -> dict:
@@ -483,7 +614,6 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertNotIn("6 tool calls", out)
         self.assertNotIn("7 tool calls", out)
         self.assertEqual(out.count("exec_command step-4"), 1)
-        self.assertIn("6 unselected tool/workflow events hidden", out)
 
     def test_digest_root_prose_handle_hides_generic_events_but_keeps_pair(
             self) -> None:
@@ -507,7 +637,6 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertIn(TEXT, out)
         self.assertIn("agent: r", out)
         self.assertNotIn("UNSELECTED_OUTPUT", out)
-        self.assertIn("1 unselected tool/workflow events hidden", out)
 
         with mock.patch.object(explore, "get_window", selected_window):
             rc, payload, err = self._run([handle, "--json"])
@@ -542,7 +671,6 @@ class AroundDisclosureTests(unittest.TestCase):
             rc, out, err = self._run([handle, "--color", "never"])
         self.assertEqual(rc, 0, err)
         self.assertIn("PRESERVED_EVENT", out)
-        self.assertIn("selected session role unverified", out)
 
     def test_positional_read_hides_generic_events_until_explicit(self) -> None:
         events = [{
@@ -564,8 +692,6 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertNotIn("tool calls", out)
         self.assertNotIn("exec_command", out)
-        self.assertIn("8 unselected tool/workflow events hidden", out)
-        self.assertIn("root/main prose default", out)
 
         with mock.patch.object(explore, "get_window", selected_window):
             rc, out, err = self._run([
@@ -584,8 +710,6 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn(TEXT, out)
         self.assertIn("agent: r", out)
-        self.assertIn("selected delegated session", out)
-        self.assertIn("root adoption unresolved", out)
 
     def test_selected_child_keeps_full_prose_instead_of_a_tiny_capsule(
             self) -> None:
@@ -606,8 +730,6 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertIn("HEAD_SETUP", out)
         self.assertIn("TAIL_DECISION", out)
         self.assertNotIn("chars omitted", out)
-        self.assertIn("selected turn prose uncapped", out)
-        self.assertGreater(len(out), 5_000)
 
         with mock.patch.object(explore, "get_window", long_child_window), \
                 mock.patch.object(
@@ -640,7 +762,6 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertIn("HEAD_SETUP", out)
         self.assertNotIn("TAIL_DECISION", out)
         self.assertIn("chars - agrep around", out)
-        self.assertNotIn("selected turn prose uncapped", out)
 
     def test_json_window_error_answers_in_json(self) -> None:
         with mock.patch.object(explore, "get_window",

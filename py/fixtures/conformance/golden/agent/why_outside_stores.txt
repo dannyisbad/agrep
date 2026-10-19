@@ -1,0 +1,8 @@
+exit: 1
+--- stdout ---
+not indexed: /nonexistent/agrep-why.jsonl is not a transcript agrep discovers
+  store census: 6 discovered file(s) across claude, codex, pi
+  agrep searches claude, codex, opencode, antigravity, kimi, cline, gemini, crush, cursor, pi stores; present here: claude (~/.claude/projects), codex (~/.codex/sessions), pi (~/.pi/agent/sessions)
+  the path is outside every one of them
+  filesystem: no file at /nonexistent/agrep-why.jsonl
+--- stderr ---

@@ -15,8 +15,15 @@ use serde_json::value::RawValue;
 
 use crate::ingest::parse_timestamp;
 use crate::ingest::registry::{metadata_is_link, plain_entry_metadata};
-use crate::ingest::{cap_event_output, is_wrapper, project_name, summarize_tool_input_with_chars};
+use crate::ingest::{
+    cap_event_output, cap_str_with_chars, is_wrapper, project_name,
+    summarize_tool_input_with_chars, EVENT_CAP,
+};
 use crate::model::{Event, Message};
+
+/// Control-event names for structural moments; they are never tool calls.
+pub const API_ERROR_MARKER: &str = "api_error";
+pub const TASK_NOTIFICATION_MARKER: &str = "task_notification";
 
 // Borrowed deserialization: scalar fields are Cow (borrow from the line when escape-free,
 // allocate only when JSON-escaped) and `content` stays a RawValue slice, parsed into a
@@ -41,6 +48,35 @@ struct Line<'a> {
     session_id: Option<Cow<'a, str>>,
     #[serde(borrow)]
     cwd: Option<&'a RawValue>,
+    // Raw so an unexpected shape degrades to "not a marker" instead of failing the row.
+    #[serde(rename = "isApiErrorMessage", borrow)]
+    is_api_error: Option<&'a RawValue>,
+    #[serde(borrow)]
+    origin: Option<&'a RawValue>,
+    #[serde(borrow)]
+    attachment: Option<&'a RawValue>,
+    // the tool's structured result beside its display text; raw, parsed only for agent calls
+    #[serde(rename = "toolUseResult", borrow)]
+    tool_use_result: Option<&'a RawValue>,
+}
+
+/// A `queued_command` attachment: a prompt queued while a turn ran and delivered into it.
+#[derive(Deserialize)]
+struct QueuedCommand<'a> {
+    #[serde(rename = "type", borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(rename = "commandMode", borrow)]
+    command_mode: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    origin: Option<&'a RawValue>,
+    #[serde(borrow)]
+    prompt: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct Origin<'a> {
+    #[serde(borrow)]
+    kind: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +140,285 @@ fn optional_cwd(value: Option<&RawValue>) -> Option<String> {
         .filter(|cwd| !cwd.is_empty())
 }
 
+fn is_api_error_row(line: &Line) -> bool {
+    line.is_api_error.is_some_and(|raw| raw.get() == "true")
+}
+
+fn is_task_notification_row(line: &Line) -> bool {
+    line.origin
+        .and_then(|raw| serde_json::from_str::<Origin>(raw.get()).ok())
+        .is_some_and(|origin| origin.kind.as_deref() == Some("task-notification"))
+}
+
+/// The prompt of a queued-command attachment carrying a task notification, the mid-turn form of
+/// an origin-tagged user row. As in Claude Code, a set origin decides; only a missing or null
+/// origin falls back to `commandMode`.
+fn queued_notification_prompt(attachment: Option<&RawValue>) -> Option<serde_json::Value> {
+    let queued: QueuedCommand = serde_json::from_str(attachment?.get()).ok()?;
+    if queued.ty.as_deref() != Some("queued_command") {
+        return None;
+    }
+    let kind = match queued.origin {
+        Some(raw) => serde_json::from_str::<Origin>(raw.get()).ok()?.kind,
+        None => queued.command_mode,
+    };
+    if kind.as_deref() != Some("task-notification") {
+        return None;
+    }
+    Some(
+        queued
+            .prompt
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or_default(),
+    )
+}
+
+/// One `<task-notification>` block's leading header tags. Claude Code writes `<task-id>`,
+/// `<tool-use-id>`, `<task-type>`, `<output-file>`, `<status>`, `<summary>` (each optional, in
+/// that order) before any body, so only that leading run is read: a result body can quote tags.
+#[derive(Debug, Default, PartialEq)]
+struct TaskNotification<'a> {
+    task_id: Option<&'a str>,
+    tool_use_id: Option<&'a str>,
+    status: Option<&'a str>,
+}
+
+/// The text blocks of a row's content. Each carries at most one notification, its first
+/// opening tag, so a notification quoted inside a result body is never read as another.
+fn content_texts(content: &serde_json::Value) -> Vec<&str> {
+    match content {
+        serde_json::Value::String(text) => vec![text.as_str()],
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn task_notification(text: &str) -> Option<TaskNotification<'_>> {
+    const OPEN: &str = "<task-notification";
+    let mut rest = text;
+    let after = loop {
+        let after = &rest[rest.find(OPEN)? + OPEN.len()..];
+        if after.starts_with(|c: char| c == '>' || c.is_whitespace()) {
+            break after;
+        }
+        rest = after;
+    };
+    let mut cursor = &after[after.find('>')? + 1..];
+    let mut found = TaskNotification::default();
+    while let Some((tag, value, next)) = leading_tag(cursor) {
+        let slot = match tag {
+            "task-id" => Some(&mut found.task_id),
+            "tool-use-id" => Some(&mut found.tool_use_id),
+            "status" => Some(&mut found.status),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            slot.get_or_insert(value);
+        }
+        cursor = next;
+    }
+    Some(found)
+}
+
+/// `<tag>value</tag>` at the start of `text` (after whitespace), with a markup-free value.
+fn leading_tag(text: &str) -> Option<(&str, &str, &str)> {
+    let text = text.trim_start().strip_prefix('<')?;
+    let end = text.find('>')?;
+    let tag = &text[..end];
+    if tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') {
+        return None;
+    }
+    let body = &text[end + 1..];
+    let stop = body.find('<')?;
+    let rest = body[stop..]
+        .strip_prefix("</")?
+        .strip_prefix(tag)?
+        .strip_prefix('>')?;
+    Some((tag, &body[..stop], rest))
+}
+
+/// A notification field kept in the compact marker input: one bounded token.
+fn notification_token(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|token| {
+        !token.is_empty()
+            && token.len() <= 200
+            && !token.contains('=')
+            && !token.chars().any(char::is_whitespace)
+    })
+}
+
+/// Claude Code writes a subagent transcript as `agent-<agentId>.jsonl`, and an agent's task id is
+/// its agent id: `a` + 16 hex (optionally `a<label>-` + 16 hex) or the older `a` + 7 hex. Every
+/// other task kind uses a one-letter prefix plus 8 base-36 chars, which never takes these shapes.
+fn agent_task_session(task_id: &str) -> Option<String> {
+    let hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let rest = task_id.strip_prefix('a')?;
+    let plain = matches!(rest.len(), 7 | 16) && hex(rest);
+    let labelled = rest.rsplit_once('-').is_some_and(|(label, tail)| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && tail.len() == 16
+            && hex(tail)
+    });
+    (plain || labelled).then(|| format!("agent-{task_id}"))
+}
+
+/// The side session a stored agent id names: Claude Code writes its transcript as
+/// `agent-<id>.jsonl`. None for an id that could not be a plain file stem.
+fn agent_session(agent_id: &str) -> Option<String> {
+    let id = notification_token(Some(agent_id))?;
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        .then(|| format!("agent-{id}"))
+}
+
+/// The `meta` token an agent call's or a message's own input carries: the name that makes the
+/// spawned agent addressable, or the recipient SendMessage was given.
+fn call_meta(name: &str, input: Option<&serde_json::Value>) -> String {
+    let key = match name {
+        "Task" | "Agent" => "name",
+        "SendMessage" => "to",
+        _ => return String::new(),
+    };
+    notification_token(
+        input
+            .and_then(|input| input.get(key))
+            .and_then(|value| value.as_str()),
+    )
+    .map(|token| format!("{key}={token}"))
+    .unwrap_or_default()
+}
+
+/// The `toolUseResult` fields that tie an agent call or a message to an agent's run. Raw, so one
+/// unexpected shape leaves the other fields readable.
+#[derive(Deserialize)]
+struct AgentOutcome<'a> {
+    #[serde(borrow)]
+    status: Option<&'a RawValue>,
+    #[serde(rename = "agentId", borrow)]
+    agent_id: Option<&'a RawValue>,
+    #[serde(rename = "resumedAgentId", borrow)]
+    resumed_agent_id: Option<&'a RawValue>,
+    #[serde(rename = "inlineHandback", borrow)]
+    inline_handback: Option<&'a RawValue>,
+    #[serde(borrow)]
+    message: Option<&'a RawValue>,
+}
+
+fn push_meta(event: &mut Event, token: &str) {
+    if !event.meta.is_empty() {
+        event.meta.push(' ');
+    }
+    event.meta.push_str(token);
+}
+
+/// Record, uncapped, the agent run a Task/Agent or SendMessage result names: `child_session` is
+/// that agent's transcript, and `meta` gains the call's status or the message's inline hand-back.
+fn apply_agent_outcome(event: &mut Event, raw: &RawValue) {
+    let Ok(outcome) = serde_json::from_str::<AgentOutcome>(raw.get()) else {
+        return;
+    };
+    let text = |value: Option<&RawValue>| {
+        value.and_then(|value| serde_json::from_str::<String>(value.get()).ok())
+    };
+    let agent_id = if event.kind == "subagent_start" {
+        if let Some(status) = notification_token(text(outcome.status).as_deref()) {
+            push_meta(event, &format!("status={status}"));
+        }
+        text(outcome.agent_id)
+    } else {
+        // 2.1.289 marks an inline result with `inlineHandback` and 2.1.199 in `message`; 2.1.240's
+        // `Resumed agent <id or name>. Result:` is left to summary's reading of the display text
+        let inline = outcome.inline_handback.is_some()
+            || text(outcome.message)
+                .is_some_and(|message| message.contains("ran to completion. Result:"));
+        if inline {
+            push_meta(event, "handback=inline");
+        }
+        text(outcome.resumed_agent_id)
+    };
+    if let Some(session) = agent_id.as_deref().and_then(agent_session) {
+        event.child_session = session;
+    }
+}
+
+fn notification_blocks(content: Option<&serde_json::Value>) -> Vec<TaskNotification<'_>> {
+    content
+        .map(content_texts)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(task_notification)
+        .collect()
+}
+
+/// One marker per notification block of a row. A block both the user-row content and a queued
+/// attachment carry is recorded once, under the user-row call id; a row with no block gets one.
+fn push_task_notifications(
+    events: &mut Vec<Event>,
+    tally: &crate::intake::Tally,
+    (session, ts, row_id): (&str, i64, &str),
+    user: Option<&[TaskNotification]>,
+    queued: Option<&[TaskNotification]>,
+) {
+    const USER: &str = "task-notification";
+    const QUEUED: &str = "queued-task-notification";
+    let empty = TaskNotification::default();
+    let user_blocks = user.unwrap_or_default();
+    let mut found: Vec<(&str, usize, &TaskNotification)> = user_blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (USER, index, block))
+        .collect();
+    for (index, block) in queued.unwrap_or_default().iter().enumerate() {
+        if !user_blocks.contains(block) {
+            found.push((QUEUED, index, block));
+        }
+    }
+    if found.is_empty() {
+        found.push((if user.is_some() { USER } else { QUEUED }, 0, &empty));
+    }
+    for (form, index, notification) in found {
+        let task_id = notification_token(notification.task_id);
+        let fields = [
+            ("status", notification_token(notification.status)),
+            ("task_id", task_id),
+            ("tool_use_id", notification_token(notification.tool_use_id)),
+        ];
+        let input = fields
+            .iter()
+            .filter_map(|(key, value)| value.map(|value| format!("{key}={value}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut call_id = format!("{row_id}:{form}");
+        if index > 0 {
+            call_id.push_str(&format!(":{index}"));
+        }
+        tally.event();
+        events.push(Event {
+            agent: "claude",
+            session: session.to_string(),
+            ts,
+            kind: "control",
+            name: TASK_NOTIFICATION_MARKER.to_string(),
+            input_chars: input.chars().count(),
+            input,
+            output: String::new(),
+            output_chars: 0,
+            output_bytes: 0,
+            ok: None,
+            call_id,
+            child_session: task_id.and_then(agent_task_session).unwrap_or_default(),
+            meta: String::new(),
+        });
+    }
+}
+
 /// Pull human text out of a `message.content` that may be a string or a block array.
 fn extract_text(content: &serde_json::Value) -> Option<String> {
     match content {
@@ -152,8 +467,9 @@ fn collect_tool_paths(content: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// Reduce a directory to its project ROOT bucket: strip the home prefix and any
-/// container segments (`Users/<name>/Desktop/...`), keep the first real segment.
-/// `~/Desktop/myproj/src` -> Some("myproj"); a bare home dir -> None (no signal).
+/// container segments (`Users/<name>/Desktop/...`, `projects/`, `repos/`), keep the
+/// first real segment. `~/Desktop/projects/myproj/src` -> Some("myproj"); a bare home
+/// dir or bare container -> None (no signal).
 fn project_root(dir: &str) -> Option<String> {
     let d = dir.replace('\\', "/");
     let mut segs: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
@@ -179,14 +495,29 @@ fn project_root(dir: &str) -> Option<String> {
     // (a migrated corpus's cwds carry another box's user) - home_leaf() only knows
     // this one's, so any post-Users/home segment is skipped unconditionally.
     let mut after_user_container = false;
+    // macOS TMPDIR: /private/var/folders/<2 chars>/<random>/T/<name>
+    let mut after_folders = 0u8;
     segs.into_iter()
         .find(|s| {
             let sl = s.to_ascii_lowercase();
-            if sl.ends_with(':') || std::mem::take(&mut after_user_container) || sl == user {
+            if sl.ends_with(':') || std::mem::take(&mut after_user_container) {
                 return false;
             }
+            if after_folders > 0 {
+                after_folders -= 1;
+                return false;
+            }
+            // Containers win over the home-leaf skip: a HOME ending in `home` or `users`
+            // must not hide the container and promote the username to the project.
             if matches!(sl.as_str(), "users" | "home") {
                 after_user_container = true;
+                return false;
+            }
+            if sl == user {
+                return false;
+            }
+            if sl == "folders" {
+                after_folders = 3;
                 return false;
             }
             !matches!(
@@ -197,11 +528,24 @@ fn project_root(dir: &str) -> Option<String> {
                     | "onedrive"
                     | "tmp"
                     | "temp"
+                    | "private"
+                    | "var"
                     | "appdata"
                     | "local"
                     | "locallow"
                     | "roaming"
                     | "src"
+                    | "projects"
+                    | "project"
+                    | "code"
+                    | "repos"
+                    | "repositories"
+                    | "git"
+                    | "github"
+                    | "work"
+                    | "dev"
+                    | "workspace"
+                    | "workspaces"
             )
         })
         .map(|s| s.to_string())
@@ -373,6 +717,7 @@ fn parse_file_with_tally(
     let f_msg = memmem::Finder::new(b"\"message\"");
     let f_cwd = memmem::Finder::new(b"\"cwd\"");
     let f_toolres = memmem::Finder::new(b"\"tool_result\"");
+    let f_queued = memmem::Finder::new(b"\"queued_command\"");
     // A side file's parent is decided ONCE, before any row is emitted: the first inner
     // sessionId (the parent's indexed identity, preferred since a dir stem can drift),
     // else the dir stem. A parent that flips mid-file splits one child across two ids.
@@ -385,6 +730,10 @@ fn parse_file_with_tally(
             side_parent = Some(pid.to_string());
         }
     }
+    let row_session = |l: &Line| match l.session_id.as_deref() {
+        Some(id) if !is_side => id.to_string(),
+        _ => file_session.clone(),
+    };
     for (record_ordinal, line) in data.lines().enumerate() {
         if line.is_empty() {
             continue;
@@ -392,6 +741,27 @@ fn parse_file_with_tally(
         tally.seen();
         let bytes = line.as_bytes();
         if !has_json_key(&f_msg, bytes) {
+            // a notification delivered mid-turn is an attachment row, which has no message
+            if f_queued.find(bytes).is_some() {
+                if let Ok(l) = serde_json::from_str::<Line>(line) {
+                    let inline_side = l.is_sidechain == Some(true) && side_parent.is_none();
+                    if let Some(prompt) = queued_notification_prompt(l.attachment) {
+                        if !inline_side {
+                            push_task_notifications(
+                                &mut events,
+                                &tally,
+                                (
+                                    &row_session(&l),
+                                    parse_timestamp::rfc3339(l.timestamp.as_deref()),
+                                    &format!("claude:{file_session}:{record_ordinal}"),
+                                ),
+                                None,
+                                Some(&notification_blocks(Some(&prompt))),
+                            );
+                        }
+                    }
+                }
+            }
             if has_json_key(&f_cwd, bytes) {
                 if let Ok(fields) = serde_json::from_str::<ProjectLine>(line) {
                     if let Some(cwd) = optional_cwd(fields.cwd) {
@@ -419,14 +789,7 @@ fn parse_file_with_tally(
             }
             *cwd_counts.entry(cwd).or_insert(0) += 1;
         }
-        let session = if is_side {
-            file_session.clone()
-        } else {
-            l.session_id
-                .as_deref()
-                .unwrap_or(file_session.as_str())
-                .to_string()
-        };
+        let session = row_session(&l);
         if l.is_sidechain == Some(true) && side_parent.is_none() {
             // inline sidechain rows duplicate the subagents/ child transcripts (their own
             // side sessions); dropping the whole line covers events and reply text too
@@ -478,6 +841,7 @@ fn parse_file_with_tally(
                                 if native_call_id.is_some() {
                                     pending.insert(call_id.clone(), events.len());
                                 }
+                                let meta = call_meta(&name, b.get("input"));
                                 tally.event();
                                 events.push(Event {
                                     agent: "claude",
@@ -493,9 +857,33 @@ fn parse_file_with_tally(
                                     ok: None,
                                     call_id,
                                     child_session: String::new(),
+                                    meta,
                                 });
                             }
                         }
+                    }
+                    let text = content_val.as_ref().and_then(extract_text);
+                    if is_api_error_row(&l) {
+                        // the text also stays in the reply, so stored replies and search keep it
+                        let error = text.as_deref().map_or("", str::trim);
+                        let (input, input_chars) = cap_str_with_chars(error, EVENT_CAP);
+                        tally.event();
+                        events.push(Event {
+                            agent: "claude",
+                            session: session.clone(),
+                            ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
+                            kind: "control",
+                            name: API_ERROR_MARKER.to_string(),
+                            input,
+                            output: String::new(),
+                            input_chars,
+                            output_chars: 0,
+                            output_bytes: 0,
+                            ok: None,
+                            call_id: format!("claude:{file_session}:{record_ordinal}:api-error"),
+                            child_session: String::new(),
+                            meta: String::new(),
+                        });
                     }
                     if let Some(last) = out.last_mut() {
                         if last.model.is_empty() {
@@ -508,10 +896,10 @@ fn parse_file_with_tally(
                                 }
                             }
                         }
-                        if let Some(txt) = content_val.as_ref().and_then(extract_text) {
+                        if let Some(txt) = &text {
                             let chars = crate::ingest::append_capped(
                                 &mut last.reply,
-                                &txt,
+                                txt,
                                 crate::ingest::REPLY_CAP,
                             );
                             last.reply_chars += chars;
@@ -535,8 +923,13 @@ fn parse_file_with_tally(
         if f_toolres.find(bytes).is_some() {
             content_val = raw_content.and_then(|r| serde_json::from_str(r.get()).ok());
             if let Some(serde_json::Value::Array(blocks)) = &content_val {
+                let is_result = |b: &serde_json::Value| {
+                    b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                };
+                // a row's toolUseResult belongs to its call only when it carries that one result
+                let lone = blocks.iter().filter(|b| is_result(b)).count() == 1;
                 for b in blocks {
-                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                    if !is_result(b) {
                         continue;
                     }
                     let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -546,10 +939,43 @@ fn parse_file_with_tally(
                             (ev.output, ev.output_chars, ev.output_bytes) = tool_result_text(c);
                         }
                         ev.ok = Some(b.get("is_error").and_then(|v| v.as_bool()) != Some(true));
+                        if ev.kind == "subagent_start" || ev.name == "SendMessage" {
+                            if let Some(raw) = l.tool_use_result.filter(|_| lone) {
+                                apply_agent_outcome(ev, raw);
+                            }
+                            // the result row is written once the call returned, after any run
+                            // it waited on had ended
+                            let returned = parse_timestamp::rfc3339(l.timestamp.as_deref());
+                            if returned > 0 {
+                                push_meta(ev, &format!("returned={returned}"));
+                            }
+                        }
                         pending.remove(id);
                     }
                 }
             }
+        }
+        let user_form = is_task_notification_row(&l);
+        let queued_prompt = queued_notification_prompt(l.attachment);
+        if user_form || queued_prompt.is_some() {
+            if user_form && content_val.is_none() {
+                content_val = raw_content.and_then(|r| serde_json::from_str(r.get()).ok());
+            }
+            let user = user_form.then(|| notification_blocks(content_val.as_ref()));
+            let queued = queued_prompt
+                .as_ref()
+                .map(|prompt| notification_blocks(Some(prompt)));
+            push_task_notifications(
+                &mut events,
+                &tally,
+                (
+                    &session,
+                    parse_timestamp::rfc3339(l.timestamp.as_deref()),
+                    &format!("claude:{file_session}:{record_ordinal}"),
+                ),
+                user.as_deref(),
+                queued.as_deref(),
+            );
         }
         if l.is_meta == Some(true) {
             tally.skip(crate::intake::Skip::Meta);
@@ -615,6 +1041,16 @@ fn parse_file_with_tally(
     for m in &mut out {
         m.project = project.clone();
     }
+    let read_outcome = if out.is_empty()
+        && events.is_empty()
+        && data
+            .lines()
+            .any(|line| !line.trim().is_empty() && serde_json::from_str::<&RawValue>(line).is_err())
+    {
+        crate::ingest_cache::ReadOutcome::Invalid
+    } else {
+        crate::ingest_cache::ReadOutcome::Complete
+    };
     (
         out.into_iter()
             .map(|raw| {
@@ -628,7 +1064,7 @@ fn parse_file_with_tally(
             })
             .collect(),
         events,
-        crate::ingest_cache::ReadOutcome::Complete,
+        read_outcome,
     )
 }
 
@@ -846,9 +1282,86 @@ impl crate::ingest::registry::Adapter for Claude {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_worker_temp_prefix, has_json_key, is_discovered_transcript, is_throwaway_name,
-        is_throwaway_name_for_prefixes, parse_file, parse_file_with_tally,
+        agent_task_session, claude_worker_temp_prefix, has_json_key, is_discovered_transcript,
+        is_throwaway_name, is_throwaway_name_for_prefixes, parse_file, parse_file_with_tally,
     };
+    use crate::ingest::parse_timestamp::rfc3339;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agrep-claude-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_rows(path: &std::path::Path, rows: &[serde_json::Value]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
+        std::fs::write(path, body.join("\n") + "\n").unwrap();
+    }
+
+    fn prompt(ts: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "userType": "external", "sessionId": "s-main",
+            "timestamp": ts, "message": {"role": "user", "content": text}})
+    }
+
+    fn assistant(ts: &str, text: &str, api_error: serde_json::Value) -> serde_json::Value {
+        let mut row = serde_json::json!({"type": "assistant", "sessionId": "s-main",
+            "timestamp": ts, "message": {"role": "assistant", "model": "<synthetic>",
+            "content": [{"type": "text", "text": text}]}});
+        if !api_error.is_null() {
+            row["isApiErrorMessage"] = api_error;
+        }
+        row
+    }
+
+    fn notification(
+        ts: &str,
+        origin: serde_json::Value,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut row = serde_json::json!({"type": "user", "userType": "external", "sessionId": "s-main",
+            "timestamp": ts, "message": {"role": "user", "content": content}});
+        if !origin.is_null() {
+            row["origin"] = origin;
+        }
+        row
+    }
+
+    type MarkerView<'a> = (
+        &'a str,
+        &'a str,
+        i64,
+        &'a str,
+        usize,
+        Option<bool>,
+        &'a str,
+        &'a str,
+    );
+
+    fn markers(events: &[crate::model::Event]) -> Vec<MarkerView<'_>> {
+        events
+            .iter()
+            .filter(|e| e.kind == "control")
+            .map(|e| {
+                assert!(e.output.is_empty() && e.output_chars == 0 && e.output_bytes == 0);
+                (
+                    e.name.as_str(),
+                    e.session.as_str(),
+                    e.ts,
+                    e.input.as_str(),
+                    e.input_chars,
+                    e.ok,
+                    e.call_id.as_str(),
+                    e.child_session.as_str(),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn throwaway_detector_matches_only_the_anchored_worker_temp_shape() {
@@ -1090,6 +1603,66 @@ mod tests {
     }
 
     #[test]
+    fn project_root_skips_code_containers_but_keeps_real_segments() {
+        let root = |dir: &str| super::project_root(dir);
+        assert_eq!(
+            root("/Users/runner/Desktop/projects/shop").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(
+            root("/Users/runner/Desktop/projects/shop/src/lib").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(root("/Users/runner/repos/api/tests").as_deref(), Some("api"));
+        assert_eq!(
+            root("/Users/runner\\code\\shop").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(root("/work/alpha").as_deref(), Some("alpha"));
+        assert_eq!(root("/Users/runner/Desktop/projects"), None);
+        assert_eq!(root("/Users/runner"), None);
+        assert_eq!(
+            root("/private/tmp/agrep-mirror").as_deref(),
+            Some("agrep-mirror")
+        );
+        assert_eq!(root("/private/tmp"), None);
+        assert_eq!(
+            root("/private/var/folders/zz/abc123/T/proj").as_deref(),
+            Some("proj")
+        );
+        assert_eq!(root("/private/var/folders/zz/abc123/T"), None);
+    }
+
+    #[test]
+    fn project_attribution_buckets_below_a_projects_container() {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-claude-projects-container-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = root.join("projects").join("fallback-slug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"},\"cwd\":\"/Users/runner/Desktop/projects/shop\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"two\"},\"cwd\":\"/Users/runner/Desktop/projects/shop/docs\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"three\"},\"cwd\":\"/Users/runner/Desktop/projects\"}\n",
+            ),
+        )
+        .unwrap();
+        let (messages, _, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|message| &*message.project == "shop"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn spaced_message_with_wrong_cwd_uses_the_directory_slug() {
         let root = std::env::temp_dir().join(format!(
             "agrep-claude-cwd-fallback-{}-{}",
@@ -1208,5 +1781,611 @@ mod tests {
             assert_eq!(&*m.parent, "11111111-aaaa-4bbb-8ccc-222222222222");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_calls_and_messages_keep_the_stored_link_to_their_run() {
+        let root = scratch("agent-outcome");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let call = |ts: &str, id: &str, name: &str, input: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "sessionId": "s-main", "timestamp": ts,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": input}]}})
+        };
+        let result = |ts: &str, ids: &[&str], stored: serde_json::Value| {
+            let blocks: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": [
+                        {"type": "text", "text": format!("{} done\nagentId: ab", "x".repeat(900))}]})
+                })
+                .collect();
+            serde_json::json!({"type": "user", "sessionId": "s-main", "timestamp": ts,
+                "message": {"role": "user", "content": blocks}, "toolUseResult": stored})
+        };
+        let agent = "a0123456789abcdef";
+        write_rows(
+            &path,
+            &[
+                prompt("2026-07-01T09:00:00Z", "port the writers"),
+                call(
+                    "2026-07-01T09:00:01Z",
+                    "t1",
+                    "Agent",
+                    serde_json::json!({"prompt": "p", "name": "docs-writer"}),
+                ),
+                result(
+                    "2026-07-01T09:05:00Z",
+                    &["t1"],
+                    serde_json::json!({"status": "completed",
+                    "prompt": "p", "agentId": agent, "content": [], "totalDurationMs": 297000.4}),
+                ),
+                call(
+                    "2026-07-01T09:05:01Z",
+                    "t2",
+                    "Task",
+                    serde_json::json!({"prompt": "p", "run_in_background": true}),
+                ),
+                result(
+                    "2026-07-01T09:05:02Z",
+                    &["t2"],
+                    serde_json::json!({"isAsync": true,
+                    "status": "async_launched", "agentId": "a1111111111111111"}),
+                ),
+                call(
+                    "2026-07-01T09:06:00Z",
+                    "t3",
+                    "SendMessage",
+                    serde_json::json!({"to": "docs-writer", "message": "m".repeat(900)}),
+                ),
+                result(
+                    "2026-07-01T09:07:00Z",
+                    &["t3"],
+                    serde_json::json!({"success": true,
+                    "message": "Resumed agent. Its final report is not in this message.",
+                    "inlineHandback": {"displayName": "docs-writer", "content": []}}),
+                ),
+                call(
+                    "2026-07-01T09:08:00Z",
+                    "t4",
+                    "SendMessage",
+                    serde_json::json!({"to": agent, "message": "again"}),
+                ),
+                result(
+                    "2026-07-01T09:08:01Z",
+                    &["t4"],
+                    serde_json::json!({"success": true,
+                    "message": "Resuming agent a012345", "resumedAgentId": agent}),
+                ),
+                call(
+                    "2026-07-01T09:09:00Z",
+                    "t5",
+                    "SendMessage",
+                    serde_json::json!({"to": "two words", "message": "m"}),
+                ),
+                result(
+                    "2026-07-01T09:09:01Z",
+                    &["t5"],
+                    serde_json::json!({"success": true,
+                    "message": "Agent \"x\" was stopped (completed); resumed it with your message \
+                                and ran to completion. Result:\n\ndone"}),
+                ),
+                // an error result, two results sharing one row, an id that is no file stem and a
+                // tool that is no agent call: none of them is linked
+                call(
+                    "2026-07-01T09:10:00Z",
+                    "t6",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                result(
+                    "2026-07-01T09:10:01Z",
+                    &["t6"],
+                    serde_json::json!("Error: denied"),
+                ),
+                call(
+                    "2026-07-01T09:11:00Z",
+                    "t7",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                call(
+                    "2026-07-01T09:11:00Z",
+                    "t8",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                result(
+                    "2026-07-01T09:12:00Z",
+                    &["t7", "t8"],
+                    serde_json::json!({
+                    "status": "completed", "agentId": "a2222222222222222"}),
+                ),
+                call(
+                    "2026-07-01T09:13:00Z",
+                    "t9",
+                    "Agent",
+                    serde_json::json!({"prompt": "p"}),
+                ),
+                result(
+                    "2026-07-01T09:13:01Z",
+                    &["t9"],
+                    serde_json::json!({
+                    "status": "completed", "agentId": "../a3333333333333333"}),
+                ),
+                call(
+                    "2026-07-01T09:14:00Z",
+                    "t10",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                ),
+                result(
+                    "2026-07-01T09:14:01Z",
+                    &["t10"],
+                    serde_json::json!({
+                    "status": "completed", "agentId": "a4444444444444444"}),
+                ),
+            ],
+        );
+        let (_, events, outcome) = parse_file(&path);
+        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
+        let linked: Vec<_> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.call_id.as_str(),
+                    e.child_session.as_str(),
+                    e.meta.as_str(),
+                )
+            })
+            .collect();
+        let session = format!("agent-{agent}");
+        let returned = |ts: &str| format!("returned={}", rfc3339(Some(ts)));
+        let expected = [
+            (
+                "t1",
+                session.as_str(),
+                format!(
+                    "name=docs-writer status=completed {}",
+                    returned("2026-07-01T09:05:00Z")
+                ),
+            ),
+            (
+                "t2",
+                "agent-a1111111111111111",
+                format!("status=async_launched {}", returned("2026-07-01T09:05:02Z")),
+            ),
+            (
+                "t3",
+                "",
+                format!(
+                    "to=docs-writer handback=inline {}",
+                    returned("2026-07-01T09:07:00Z")
+                ),
+            ),
+            (
+                "t4",
+                session.as_str(),
+                format!("to={agent} {}", returned("2026-07-01T09:08:01Z")),
+            ),
+            (
+                "t5",
+                "",
+                format!("handback=inline {}", returned("2026-07-01T09:09:01Z")),
+            ),
+            ("t6", "", returned("2026-07-01T09:10:01Z")),
+            ("t7", "", returned("2026-07-01T09:12:00Z")),
+            ("t8", "", returned("2026-07-01T09:12:00Z")),
+            (
+                "t9",
+                "",
+                format!("status=completed {}", returned("2026-07-01T09:13:01Z")),
+            ),
+            ("t10", "", String::new()),
+        ];
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(id, child, meta)| (*id, *child, meta.as_str()))
+            .collect();
+        assert_eq!(linked, expected);
+        // the display text stays capped; the link never depended on it
+        assert!(events[0].output.ends_with('…') && events[0].output_chars > 800);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn api_error_rows_become_markers_and_stay_in_the_reply() {
+        let root = scratch("api-error-marker");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let long = format!("API Error: 400 {}", "x".repeat(900));
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00.000Z", "port the loader"),
+                assistant(
+                    "2026-05-01T10:01:00.000Z",
+                    "API Error: Repeated 529 Overloaded errors",
+                    true.into(),
+                ),
+                assistant("2026-05-01T10:02:00.000Z", "Retried fine.", false.into()),
+                assistant("2026-05-01T10:03:00.000Z", "odd flag", "true".into()),
+                prompt("2026-05-01T10:05:00.000Z", "continue"),
+                assistant(
+                    "2026-05-01T10:06:00.000Z",
+                    &format!("  {long}\n"),
+                    true.into(),
+                ),
+            ],
+        );
+        let (messages, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(
+            messages.iter().map(|m| &*m.reply).collect::<Vec<_>>(),
+            [
+                "API Error: Repeated 529 Overloaded errors Retried fine. odd flag",
+                long.as_str()
+            ]
+        );
+        let capped = format!("{}…", &long[..800]);
+        assert_eq!(
+            markers(&events),
+            [
+                (
+                    "api_error",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:01:00.000Z")),
+                    "API Error: Repeated 529 Overloaded errors",
+                    41,
+                    None,
+                    "claude:session:1:api-error",
+                    "",
+                ),
+                (
+                    "api_error",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:06:00.000Z")),
+                    capped.as_str(),
+                    long.chars().count(),
+                    None,
+                    "claude:session:5:api-error",
+                    "",
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_api_error_marker_belongs_to_the_side_session() {
+        let root = scratch("side-api-error-marker");
+        let path = root
+            .join("slug")
+            .join("s-main")
+            .join("subagents")
+            .join("agent-a0123456789abcdef.jsonl");
+        let mut ask = prompt("2026-05-01T10:00:00.000Z", "audit the caches");
+        ask["isSidechain"] = true.into();
+        let mut error = assistant(
+            "2026-05-01T10:01:30.000Z",
+            "API Error: Rate limit reached",
+            true.into(),
+        );
+        error["isSidechain"] = true.into();
+        write_rows(&path, &[ask, error]);
+        let (messages, events, _) = parse_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(&*messages[0].reply, "API Error: Rate limit reached");
+        assert_eq!(
+            markers(&events),
+            [(
+                "api_error",
+                "agent-a0123456789abcdef",
+                rfc3339(Some("2026-05-01T10:01:30.000Z")),
+                "API Error: Rate limit reached",
+                29,
+                None,
+                "claude:agent-a0123456789abcdef:1:api-error",
+                "",
+            )]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_notification_rows_become_markers_and_stay_out_of_messages() {
+        let root = scratch("task-notification-marker");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let origin = serde_json::json!({"kind": "task-notification"});
+        let agent = concat!(
+            "<task-notification>\n<task-id>a0123456789abcdef</task-id>\n",
+            "<tool-use-id>toolu_01ABC</tool-use-id>\n<output-file>/tmp/out.txt</output-file>\n",
+            "<status>completed</status>\n<summary>Agent \"audit\" finished</summary>\n",
+            "<result>quoted <task-id>a1111111111111111</task-id> and ",
+            "<task-notification><task-id>a2222222222222222</task-id></task-notification></result>\n",
+            "</task-notification>",
+        );
+        let shell = concat!(
+            "<system-reminder>\nheader\n<task-notification>\n<task-id>b1a2b3c4d</task-id>\n",
+            "<tool-use-id>toolu_02</tool-use-id>\n<task-type>local_bash</task-type>\n",
+            "<status>failed</status>\n<summary>x</summary>\n</task-notification>\n</system-reminder>",
+        );
+        let batch = concat!(
+            "<task-notification><status>completed</status>",
+            "<summary>3 background commands completed</summary></task-notification>",
+        );
+        let unsafe_values =
+            "<task-notification>\n<task-id>has space</task-id>\n<status>killed</status>";
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00.000Z", "audit in the background"),
+                notification("2026-05-01T10:10:00.000Z", origin.clone(), agent.into()),
+                notification(
+                    "2026-05-01T10:11:00.000Z",
+                    origin.clone(),
+                    serde_json::json!([{"type": "text", "text": shell}, {"type": "text", "text": batch}]),
+                ),
+                notification("2026-05-01T10:12:00.000Z", origin, unsafe_values.into()),
+                notification(
+                    "2026-05-01T10:13:00.000Z",
+                    "task-notification".into(),
+                    agent.into(),
+                ),
+                notification(
+                    "2026-05-01T10:14:00.000Z",
+                    serde_json::Value::Null,
+                    agent.into(),
+                ),
+                assistant(
+                    "2026-05-01T10:15:00.000Z",
+                    "The audit finished.",
+                    serde_json::Value::Null,
+                ),
+            ],
+        );
+        let (messages, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (&*m.text, &*m.reply))
+                .collect::<Vec<_>>(),
+            [("audit in the background", "The audit finished.")]
+        );
+        let agent_input = "status=completed task_id=a0123456789abcdef tool_use_id=toolu_01ABC";
+        let shell_input = "status=failed task_id=b1a2b3c4d tool_use_id=toolu_02";
+        assert_eq!(
+            markers(&events),
+            [
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:10:00.000Z")),
+                    agent_input,
+                    agent_input.len(),
+                    None,
+                    "claude:session:1:task-notification",
+                    "agent-a0123456789abcdef",
+                ),
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:11:00.000Z")),
+                    shell_input,
+                    shell_input.len(),
+                    None,
+                    "claude:session:2:task-notification",
+                    "",
+                ),
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:11:00.000Z")),
+                    "status=completed",
+                    16,
+                    None,
+                    "claude:session:2:task-notification:1",
+                    "",
+                ),
+                (
+                    "task_notification",
+                    "s-main",
+                    rfc3339(Some("2026-05-01T10:12:00.000Z")),
+                    "status=killed",
+                    13,
+                    None,
+                    "claude:session:3:task-notification",
+                    "",
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn queued(ts: &str, attachment: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "attachment", "isSidechain": false, "userType": "external",
+            "sessionId": "s-main", "timestamp": ts, "attachment": attachment})
+    }
+
+    fn notified(prompt: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "queued_command", "prompt": prompt,
+            "commandMode": "task-notification", "timestamp": "2026-05-01T09:00:00.000Z"})
+    }
+
+    #[test]
+    fn queued_task_notifications_become_markers_and_stay_out_of_messages() {
+        let root = scratch("queued-notification-marker");
+        let path = root.join("projects").join("slug").join("session.jsonl");
+        let origin = serde_json::json!({"kind": "task-notification"});
+        let agent = concat!(
+            "<task-notification>\n<task-id>a0123456789abcdef</task-id>\n",
+            "<tool-use-id>toolu_01ABC</tool-use-id>\n<output-file>/tmp/out.txt</output-file>\n",
+            "<status>completed</status>\n<summary>Agent \"audit\" finished</summary>\n",
+            "<result>quoted <task-notification><task-id>a2222222222222222</task-id>",
+            "</task-notification></result>\n</task-notification>",
+        );
+        let shell = concat!(
+            "<task-notification>\n<task-id>b1a2b3c4d</task-id>\n<tool-use-id>toolu_02</tool-use-id>\n",
+            "<task-type>local_bash</task-type>\n<status>failed</status>\n</task-notification>",
+        );
+        let batch = "<task-notification><status>completed</status></task-notification>";
+        let image = serde_json::json!({"type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let mut typed = notified(agent.into());
+        typed["commandMode"] = "prompt".into();
+        let mut human = notified(agent.into());
+        human["origin"] = serde_json::json!({"kind": "human"});
+        let mut null_origin = notified(agent.into());
+        null_origin["origin"] = serde_json::Value::Null;
+        let mut sidechain = queued("2026-05-01T10:07:00.000Z", notified(agent.into()));
+        sidechain["isSidechain"] = true.into();
+        let read_back = serde_json::json!({"type": "user", "userType": "external",
+            "sessionId": "s-main", "timestamp": "2026-05-01T10:08:00.000Z",
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "toolu_read", "content": queued("t", notified(agent.into())).to_string()}]}});
+        let mut both = notification("2026-05-01T10:09:00.000Z", origin.clone(), agent.into());
+        both["attachment"] = notified(serde_json::json!([
+            {"type": "text", "text": agent},
+            {"type": "text", "text": shell},
+        ]));
+        write_rows(
+            &path,
+            &[
+                prompt("2026-05-01T10:00:00.000Z", "audit in the background"),
+                queued("2026-05-01T10:01:00.000Z", notified(agent.into())),
+                queued(
+                    "2026-05-01T10:02:00.000Z",
+                    notified(serde_json::json!([{"type": "text", "text": shell}, image])),
+                ),
+                queued(
+                    "2026-05-01T10:03:00.000Z",
+                    serde_json::json!({"type": "queued_command", "prompt": batch, "origin": origin}),
+                ),
+                queued("2026-05-01T10:04:00.000Z", null_origin),
+                queued("2026-05-01T10:05:00.000Z", typed),
+                queued("2026-05-01T10:06:00.000Z", human),
+                sidechain,
+                read_back,
+                both,
+                notification("2026-05-01T10:10:00.000Z", origin, shell.into()),
+                queued(
+                    "2026-05-01T10:11:00.000Z",
+                    serde_json::json!({"type": "queued_command", "commandMode": "task-notification"}),
+                ),
+                assistant(
+                    "2026-05-01T10:12:00.000Z",
+                    "The audit finished.",
+                    serde_json::Value::Null,
+                ),
+            ],
+        );
+        let (messages, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (&*m.text, &*m.reply))
+                .collect::<Vec<_>>(),
+            [("audit in the background", "The audit finished.")]
+        );
+        let agent_input = "status=completed task_id=a0123456789abcdef tool_use_id=toolu_01ABC";
+        let shell_input = "status=failed task_id=b1a2b3c4d tool_use_id=toolu_02";
+        let found: Vec<_> = markers(&events)
+            .into_iter()
+            .map(|(name, session, ts, input, chars, ok, call_id, child)| {
+                assert_eq!(
+                    (name, session, chars, ok),
+                    ("task_notification", "s-main", input.len(), None)
+                );
+                (
+                    ts,
+                    input,
+                    call_id.strip_prefix("claude:session:").unwrap_or(call_id),
+                    child,
+                )
+            })
+            .collect();
+        let at = |minute: &str| rfc3339(Some(&format!("2026-05-01T10:{minute}:00.000Z")));
+        let agent_child = "agent-a0123456789abcdef";
+        assert_eq!(
+            found,
+            [
+                (
+                    at("01"),
+                    agent_input,
+                    "1:queued-task-notification",
+                    agent_child
+                ),
+                (at("02"), shell_input, "2:queued-task-notification", ""),
+                (
+                    at("03"),
+                    "status=completed",
+                    "3:queued-task-notification",
+                    ""
+                ),
+                (
+                    at("04"),
+                    agent_input,
+                    "4:queued-task-notification",
+                    agent_child
+                ),
+                (at("09"), agent_input, "9:task-notification", agent_child),
+                (at("09"), shell_input, "9:queued-task-notification:1", ""),
+                (at("10"), shell_input, "10:task-notification", ""),
+                (at("11"), "", "11:queued-task-notification", ""),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_queued_notification_belongs_to_the_side_session() {
+        let root = scratch("side-queued-notification");
+        let path = root
+            .join("slug")
+            .join("s-main")
+            .join("subagents")
+            .join("agent-a0123456789abcdef.jsonl");
+        let mut ask = prompt("2026-05-01T10:00:00.000Z", "scan the caches");
+        ask["isSidechain"] = true.into();
+        let shell = "<task-notification><task-id>b1a2b3c4d</task-id><status>completed</status>";
+        let mut done = queued("2026-05-01T10:01:00.000Z", notified(shell.into()));
+        done["isSidechain"] = true.into();
+        write_rows(&path, &[ask, done]);
+        let (messages, events, _) = parse_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            markers(&events),
+            [(
+                "task_notification",
+                "agent-a0123456789abcdef",
+                rfc3339(Some("2026-05-01T10:01:00.000Z")),
+                "status=completed task_id=b1a2b3c4d",
+                34,
+                None,
+                "claude:agent-a0123456789abcdef:1:queued-task-notification",
+                "",
+            )]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_claude_agent_ids_name_a_side_session() {
+        for (task_id, session) in [
+            ("a0123456789abcdef", Some("agent-a0123456789abcdef")),
+            ("a1b2c3d4", Some("agent-a1b2c3d4")),
+            (
+                "acompact-0123456789abcdef",
+                Some("agent-acompact-0123456789abcdef"),
+            ),
+            ("b1a2b3c4d", None),
+            ("a1b2c3d4e", None),
+            ("a0123456789ABCDEF", None),
+            ("a-0123456789abcdef", None),
+            ("ca07side01", None),
+        ] {
+            assert_eq!(agent_task_session(task_id).as_deref(), session, "{task_id}");
+        }
     }
 }

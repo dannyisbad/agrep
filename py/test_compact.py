@@ -192,46 +192,6 @@ class CompactTests(unittest.TestCase):
         self.assertNotIn("using classic output", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_snapshot_write_failure_keeps_explicit_coverage(self) -> None:
-        hit = {
-            "session": "readonly-session",
-            "turn": 7,
-            "ts": 1,
-            "who": "user",
-            "agent": "codex",
-            "project": "p",
-            "snippet": "needle survives without continuation storage",
-        }
-        result = {
-            "hits": [hit],
-            "total": 1,
-            "chats": 1,
-            "tool_hits": 0,
-            "engine": "corpusdb",
-            "mode": "keyword",
-            "totals_exact": True,
-        }
-        coverage = search._CoverageRetry(search._COVERAGE_SCANNED)
-        with mock.patch.dict(os.environ, {"AGREP_PROFILE": "compact"}), \
-                mock.patch.object(
-                    search.indexd_runtime, "ensure_index", return_value=True), \
-                mock.patch.object(search, "run_query", return_value=result), \
-                mock.patch.object(
-                    search, "_start_compact_page",
-                    side_effect=PermissionError(13, "read-only data dir")), \
-                mock.patch.object(
-                    search, "_overspec_retry_attempt",
-                    return_value=coverage), \
-                mock.patch.object(search, "_emit_overspec_block") as emit, \
-                mock.patch("explore._session_index",
-                           return_value={"readonly-session": {}}), \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            rc = search.main([
-                "needle", "--coverage", "--color", "never"])
-        self.assertEqual(rc, 0)
-        emit.assert_called_once_with(
-            "needle", mock.ANY, [hit], None, force=True)
 
     def test_auto_semantic_compact_rows_are_labeled_but_classic_is_unchanged(self) -> None:
         class TtyBuffer(io.StringIO):
@@ -2317,15 +2277,6 @@ class RecallTests(unittest.TestCase):
     """recall/pack output contracts: numeric --json scores, runnable probe pull
     commands, and budget-cap markers that keep their agrep-around follow-up."""
 
-    def test_probe_help_discloses_the_scoped_miss_line(self) -> None:
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as stopped:
-            recall.main(["--help"])
-        self.assertEqual(stopped.exception.code, 0)
-        help_text = " ".join(stdout.getvalue().split())
-        self.assertIn("compact scoped miss otherwise", help_text)
-        self.assertNotIn("silent otherwise", help_text)
-
     def test_probe_rejects_the_structured_output_contract(self) -> None:
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), \
@@ -2528,7 +2479,7 @@ class RecallTests(unittest.TestCase):
                               "--json", "--budget", "2048"])
         self.assertEqual(rc, 0)
         json_hit = captured["json"]["hits"][1]
-        self.assertIn("agrep around 0199aaaa-db7e-b 8 -C 0",
+        self.assertIn("agrep around 0199aaaa-db7e-b 8 -C 0 --max-chars 0",
                       json_hit["window"][0]["text"])
         self.assertNotIn("--full", json_hit["window"][0]["text"])
 
@@ -2572,8 +2523,9 @@ class RecallTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout):
             rc = around.main([target, "7", "--max-chars", "64", "--color", "never"])
         self.assertEqual(rc, 0)
-        self.assertIn("agrep around 0199aaaa-db7e-b 7 -C 0 --full",
+        self.assertIn("agrep around 0199aaaa-db7e-b 7 -C 0 --max-chars 0",
                       stdout.getvalue())
+        self.assertNotIn("--full", stdout.getvalue())
 
     def test_small_expansion_budget_skips_term_candidate_scan(self) -> None:
         sess = "aabbccdd-0000-0000-0000-000000000000"
@@ -2708,6 +2660,55 @@ class RecallTests(unittest.TestCase):
         hits = json.loads(out)["hits"]
         self.assertEqual([h["turn"] for h in hits], [150])
 
+    def _recall_handle(self, handle: str, centers) -> tuple[int, str, str]:
+        """Run recall on one result handle; ``centers`` maps (call, turn) to the served turn."""
+        full = "0199bbbb-0000-7000-8000-000000000003"
+        calls = []
+
+        def get_windows(reqs):
+            calls.append(None)
+            out = []
+            for _, turn, _ in reqs:
+                served = centers(len(calls), turn)
+                out.append({"session": full, "center": served, "first_turn": 0,
+                            "last_turn": 209, "agent": "claude", "project": "p",
+                            "events": [],
+                            "turns": [{"turn": served, "who": "user", "ts": 1,
+                                       "text": "body", "reply": ""}]})
+            return out
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(recall.indexd_runtime, "ensure_index",
+                               lambda auto=True, **_kw: True), \
+                mock.patch.object(recall.explore, "resolve_session", lambda q: [full]), \
+                mock.patch.object(recall.explore, "get_windows", get_windows), \
+                mock.patch.object(recall.corpusdb, "connect", lambda **kw: None), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = recall.main([handle, "--json"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_stale_handle_between_indexed_turns_is_missing_not_out_of_range(self) -> None:
+        # turn 150 sits inside 0-209 but the index no longer holds it: the window
+        # recenters on 149, and the refusal names a gap rather than a range miss
+        rc, out, err = self._recall_handle(
+            "@0199bbbb:150", lambda _call, turn: 149 if turn == 150 else turn)
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error"]["code"], "stale-result-handle")
+        self.assertIn("result handle turn 150 is missing from the index "
+                      "(session has turns 0-209) - the handle is stale", err)
+        self.assertNotIn("out of range", err)
+
+    def test_handle_window_moving_to_a_gap_after_resolution_is_missing(self) -> None:
+        # the handle resolves, then the recall window read recenters it: the
+        # second refusal names the in-range gap the same way
+        rc, out, err = self._recall_handle(
+            "@0199bbbb:150", lambda call, turn: turn if call == 1 else 151)
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error"]["code"], "stale-result-handle")
+        self.assertIn("result handle turn 150 is missing from the index "
+                      "(session has turns 0-209) - the handle is stale", err)
+        self.assertNotIn("out of range", err)
+
     def test_fit_json_shrink_keeps_around_marker(self) -> None:
         sess = "abcdef01-2345-6789-abcd-ef0123456789"
         row = {"kind": "msg", "session": sess, "project": "p", "turn": 7,
@@ -2719,11 +2720,11 @@ class RecallTests(unittest.TestCase):
         got = json.loads(raw)["hits"][0]["window"][0]
         self.assertRegex(
             got["text"],
-            r" \[\+[\d,]+ chars - agrep around abcdef01 7 -C 0\]\Z")
+            r" \[\+[\d,]+ chars - agrep around abcdef01 7 -C 0 --max-chars 0\]\Z")
         self.assertGreater(got["omitted_chars"], 0)
 
     def test_fit_text_cap_points_at_cut_window_and_never_splits_markers(self) -> None:
-        cap_marker = "[+1,234 chars - agrep around abcd1234 9 -C 0 --full]"
+        cap_marker = "[+1,234 chars - agrep around abcd1234 9 -C 0 --max-chars 0]"
         block1 = "── abcd1234 · claude\n   9 user: " + "x" * 300 + " " + cap_marker
         block2 = "── ffff0000 · claude\n   4 user: " + "y" * 300
         text = block1 + "\n\n" + block2

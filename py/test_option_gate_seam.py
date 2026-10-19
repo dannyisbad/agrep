@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import io
+import shlex
 import sys
 import unittest
 from pathlib import Path
 from typing import NamedTuple
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "py"))
@@ -175,14 +178,15 @@ _SEARCH_INERT = {
     "--color": "one number has nothing to style",
 }
 _SEARCH_HONORED = frozenset({
-    "-E", "-w", "--agent", "--project", "--exclude-project", "--model",
-    "--soft", "--who", "--no-who", "--chat", "--since", "--until",
-    "--no-self", "--no-auto",
+    "-E", "-w", "--agent", "--project", "--here", "--exclude-project",
+    "--model", "--soft", "--who", "--no-who", "--no-side", "--chat",
+    "--since", "--until", "--no-self", "--no-auto",
 })
 _ROW_SURFACE_HONORED = frozenset({
     "-E", "-w", "-n", "-s", "--sort", "--lexical", "--agent", "--project",
-    "--exclude-project", "--model", "--soft", "--who", "--no-who", "--chat",
-    "--since", "--until", "--no-self", "--no-meta", "--no-auto", "--color",
+    "--here", "--exclude-project", "--model", "--soft", "--who", "--no-who",
+    "--no-side", "--chat", "--since", "--until", "--no-self", "--no-meta",
+    "--no-auto", "--color",
 })
 # --more's generic refusal names the option class, not the base flag
 _ROW_SURFACE_ELSEWHERE = {**_SEMANTIC_ONLY, "--more": "output options"}
@@ -209,7 +213,8 @@ SURFACES = (
     Surface(recall.main, ["deadlock", "--probe"], "--probe",
             frozenset({"--hits", "--json"}), {},
             frozenset({"--budget", "-C", "-s", "--lexical", "--self",
-                       "--no-self", "--all-side-chats", "--agent", "--project",
+                       "--no-self", "--all-side-chats", "--no-side", "--agent",
+                       "--project", "--here", "--exclude-project",
                        "--model", "--soft", "--who", "--no-who", "--no-meta",
                        "--chat", "--since", "--until", "--no-auto", "--color"})),
     Surface(resume.main, ["-l"], "-l",
@@ -392,6 +397,166 @@ class OptionGateTests(unittest.TestCase):
                 self.assertIsNone(surface.option_gate_error(args, [gate]))
 
 
+class GateRemedyTests(unittest.TestCase):
+    HANDLE = "@11111111:174.82c5~a8f797767b0f558d5d5c67e6:214-222"
+
+    def assertRemedy(self, entry, argv, expected, gates, command):
+        rc, error = _exit_code(entry, argv)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("; run: ", error)
+        rendered = error.split("; run: ", 1)[1].rstrip("\n")
+        self.assertEqual(shlex.split(rendered), [*command, *expected])
+        if self.HANDLE in expected and sys.platform != "win32":
+            self.assertIn(f" {self.HANDLE} ", f" {rendered} ")
+        parser = _parser(entry, expected)
+        parsed = surface.parse_args_with_presence(parser, shlex.split(rendered)[len(command):])
+        self.assertIsNone(surface.option_gate_error(parsed, gates))
+        return rendered
+
+    def test_around_removes_only_the_refused_value_option(self) -> None:
+        import around
+        for refused, blocker in (
+                (["--max-chars", "4000", "--max-chars=60"], "--full"),
+                (["--tool-output=0"], "--no-tools")):
+            expected = [self.HANDLE, "-C", "0", blocker, "--no-auto", "--color", "never"]
+            with self.subTest(refused=refused):
+                self.assertRemedy(
+                    around.main, [*expected, *refused], expected,
+                    surface.AROUND_OPTION_GATES, ["agrep", "around"])
+
+    def test_around_correction_clears_every_simultaneous_conflict(self) -> None:
+        import around
+        expected = [self.HANDLE, "-C", "0", "--full", "--no-tools", "--no-auto",
+                    "--color", "never"]
+        self.assertRemedy(
+            around.main,
+            [*expected, "--max-chars", "10", "--tool-output", "5"], expected,
+            surface.AROUND_OPTION_GATES, ["agrep", "around"])
+
+    def test_doctor_correction_clears_chained_action_conflicts(self) -> None:
+        message = surface.doctor_action_conflict(["--json", "--fix", "--setup"])
+        rendered = message.split("; run: ", 1)[1]
+        corrected = shlex.split(rendered)[2:]
+        self.assertEqual(corrected, ["--json"])
+        self.assertIsNone(surface.doctor_action_conflict(corrected))
+
+    def test_search_removes_aliases_attached_values_and_short_clusters(self) -> None:
+        base = ["two words", "--project", "project with spaces", "--chat", self.HANDLE]
+        for supplied, kept in (
+                (["--count", "--json"], ["--count"]),
+                (["-ilc"], ["-ic"]),
+                (["--chats", "--count"], ["--count"]),
+                (["--flat", "--json"], ["--json"]),
+                (["--classic", "--flat"], ["--flat"]),
+                (["--count", "--sort=score"], ["--count"]),
+                (["-cin3", "--max=5", "-n", "8"], ["-ci"]),
+                (["--model-soft", "--soft"], [])):
+            with self.subTest(supplied=supplied):
+                self.assertRemedy(
+                    search.main, [*base, *supplied], [*base, *kept],
+                    surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+
+    def test_search_preserves_option_looking_values_and_the_terminator(self) -> None:
+        expected = ["-c", "--project=--json", "--", "--json", "two words", self.HANDLE]
+        self.assertRemedy(
+            search.main, ["--json", *expected], expected,
+            surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+
+    def test_recall_and_pack_keep_queries_filters_and_the_surface_name(self) -> None:
+        recall_args = [self.HANDLE, "--project", "project with spaces", "--probe", "-C", "0"]
+        self.assertRemedy(
+            recall.main, [*recall_args, "--hits=2"], recall_args,
+            surface.RECALL_OPTION_GATES, ["agrep", "recall"])
+        pack_args = ["two words", self.HANDLE, "--project", "project with spaces", "-C", "0"]
+        self.assertRemedy(
+            lambda argv: recall.main(argv, prog="pack"),
+            [*pack_args, "--model-soft"], pack_args,
+            surface.RECALL_OPTION_GATES, ["agrep", "pack"])
+
+    def test_missing_model_remedy_stays_on_the_requested_surface(self) -> None:
+        expected = ["two words", self.HANDLE, "--no-auto", "--lexical"]
+        for prog in ("recall", "pack"):
+            with self.subTest(prog=prog):
+                self.assertRemedy(
+                    lambda argv: recall.main(argv, prog=prog),
+                    [*expected, "--model-soft"], expected,
+                    surface.RECALL_OPTION_GATES, ["agrep", prog])
+
+    def test_tail_keeps_the_substring_and_repeated_agent_filters(self) -> None:
+        import tail
+        expected = ["--chat", "chat with spaces", "--agent", "claude",
+                    "--snapshot", "--agent", "codex"]
+        self.assertRemedy(
+            tail.main, [*expected, "--events=done"], expected,
+            surface.TAIL_OPTION_GATES, ["agrep", "tail"])
+
+    def test_tail_substring_embedding_a_handle_is_corrected_only_where_a_shell_takes_it(self) -> None:
+        import tail
+        expected = ["--chat", f"chat with spaces {self.HANDLE}", "--snapshot"]
+        argv = [*expected, "--events=done"]
+        if sys.platform != "win32":
+            self.assertRemedy(
+                tail.main, argv, expected, surface.TAIL_OPTION_GATES, ["agrep", "tail"])
+        # cmd.exe has no quoting for `@` inside a value: the refusal is named, the paste withheld
+        with mock.patch.object(surface, "render_cli_argv",
+                               functools.partial(surface.render_cli_argv, windows=True)):
+            rc, error = _exit_code(tail.main, argv)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("--events", error)
+        self.assertIn("--snapshot", error)
+        self.assertNotIn("; run: ", error)
+
+    def test_doctor_repaired_commands_pass_its_action_parser(self) -> None:
+        import doctor
+        for argv, expected in (
+                (["--deep", "--fix", "--json", "--no-semantic", "--fix"],
+                 ["--deep", "--json", "--no-semantic"]),
+                (["--setup", "--fix", "--no-semantic"], ["--setup", "--no-semantic"]),
+                (["--json", "--setup"], ["--json"]),
+                (["--deep", "--setup", "--no-semantic"], ["--setup", "--no-semantic"])):
+            with self.subTest(argv=argv):
+                rc, error = _exit_code(doctor.main, argv)
+                self.assertEqual(rc, 2, error)
+                self.assertIn("; run: ", error)
+                repaired = shlex.split(error.split("; run: ", 1)[1])
+                self.assertEqual(repaired, ["agrep", "doctor", *expected])
+                self.assertIsNone(surface.doctor_action_conflict(repaired[2:]))
+                with mock.patch.object(doctor, "_json_report", return_value={}), \
+                        mock.patch.object(doctor, "setup", return_value=0):
+                    self.assertEqual(_exit_code(doctor.main, repaired[2:]), (0, ""))
+
+    def test_default_argv_is_retained_for_direct_module_entry(self) -> None:
+        import around
+        expected = [self.HANDLE, "-C", "0", "--full"]
+        with mock.patch.object(sys, "argv", ["around.py", *expected, "--max-chars", "60"]):
+            rc, error = _exit_code(lambda _argv: around.main(), [])
+        self.assertEqual(rc, 2, error)
+        self.assertIn("; run: ", error)
+        self.assertEqual(
+            shlex.split(error.split("; run: ", 1)[1]), ["agrep", "around", *expected])
+
+    def test_searching_a_command_word_stays_on_the_search_surface(self) -> None:
+        import cli
+        expected = ["doctor", "--count", "--no-auto"]
+        rendered = self.assertRemedy(
+            search.main, [*expected, "--json"], expected,
+            surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+        with mock.patch.object(sys, "argv", shlex.split(rendered)):
+            parser = _parser(lambda _argv: cli.main(), [])
+        parsed = surface.parse_args_with_presence(parser, expected)
+        self.assertEqual(parsed.pattern, ["doctor"])
+        self.assertTrue(parsed.count)
+        self.assertIsNone(surface.option_gate_error(parsed, surface.SEARCH_OPTION_GATES))
+
+    def test_resume_keeps_the_two_argument_gate_contract(self) -> None:
+        self.assertIsNotNone(_run(resume.main, ["-l", "zzzznope"]))
+        args = argparse.Namespace(list=True, id="zzzznope")
+        message = surface.option_gate_error(args, surface.RESUME_OPTION_GATES)
+        self.assertIn("-l", message)
+        self.assertIn("an id", message)
+        self.assertNotIn("; run: ", message)
+
+
 class ReportedCaseTests(unittest.TestCase):
     """The six verbatim seat cases: exit 2, and both flags in the sentence."""
 
@@ -509,9 +674,10 @@ class ReportedCaseTests(unittest.TestCase):
 # refusal live. -l beside --json is HONORED - one json row per chat
 # (selftest pins the shape) - a combined surface, not a drop.
 _MACHINE_HONORED = frozenset({
-    "-E", "-w", "--agent", "--project", "--exclude-project", "--model",
-    "--soft", "--who", "--no-who", "--chat", "--since", "--until",
-    "--no-self", "--no-auto", "-n", "--sort", "-s", "--no-meta",
+    "-E", "-w", "--agent", "--project", "--here", "--exclude-project",
+    "--model", "--soft", "--who", "--no-who", "--no-side", "--chat",
+    "--since", "--until", "--no-self", "--no-auto", "-n", "--sort", "-s",
+    "--no-meta",
 })
 _MACHINE_SELF_INERT = ("machine rows already include the calling family and "
                        "carry a per-row self field; the flag asks for the "
@@ -656,15 +822,16 @@ class ContinuationGateTests(unittest.TestCase):
                 self.assertIn("--deeper", err)
                 self.assertIn(flag, err)
 
-    def test_both_verbs_refuse_exclude_project(self) -> None:
+    def test_both_verbs_refuse_narrowing_flags(self) -> None:
         for verb in ("--more", "--deeper"):
-            with self.subTest(verb=verb):
-                rc, err = _exit_code(
-                    search.main,
-                    [verb, self.HANDLE, "--exclude-project", "work"])
-                self.assertEqual(rc, 2, err)
-                self.assertIn(verb, err)
-                self.assertIn("filter", err)
+            for narrowing in (["--exclude-project", "work"], ["--here"],
+                              ["--no-side"]):
+                with self.subTest(verb=verb, flag=narrowing[0]):
+                    rc, err = _exit_code(
+                        search.main, [verb, self.HANDLE, *narrowing])
+                    self.assertEqual(rc, 2, err)
+                    self.assertIn(verb, err)
+                    self.assertIn("filter", err)
 
 
 class NonsenseValueTests(unittest.TestCase):
@@ -681,6 +848,178 @@ class NonsenseValueTests(unittest.TestCase):
         for value in ("0", "3"):
             with self.subTest(value=value):
                 self.assertIsNone(_run(resume.main, ["-l", "-n", value]))
+
+
+class UnknownFlagCorrectionTests(unittest.TestCase):
+    """An option this command spells differently, or another command owns, is
+    refused with the same runnable correction the gates print; every printed
+    correction parses on the command it names. Agents pasted recall's --budget
+    into search and grep's --limit into every command, then guessed again."""
+
+    HANDLE = "@11111111:174.82c5~a8f797767b0f558d5d5c67e6:214-222"
+
+    @staticmethod
+    def _entries() -> dict:
+        import around
+        import livetui
+        import postcompact
+        return {
+            "search": search.main,
+            "recall": recall.main,
+            "pack": lambda argv: recall.main(argv, prog="pack"),
+            "chats": search.chats_main,
+            "around": around.main,
+            "postcompact": postcompact.main,
+            "board": livetui.main,
+        }
+
+    # past the parser these run against the empty sandbox and stop there;
+    # board and postcompact would start live machinery, so only their parsers run
+    RUNNABLE = frozenset({"search", "recall", "pack", "chats", "around"})
+
+    CASES = (
+        ("search", ["deadlock", "--limit", "5"], "search",
+         ["deadlock", "-n", "5"]),
+        ("search", ["deadlock", "--limit=5", "--side", "--here"], "search",
+         ["deadlock", "-n", "5", "--here"]),
+        ("search", ["two words", "--budget", "4000", "-n", "3"], "recall",
+         ["two words", "--budget", "4000", "--hits", "3"]),
+        ("search", ["deadlock", "--hits", "2", "--since", "7d"], "recall",
+         ["deadlock", "--hits", "2", "--since", "7d"]),
+        ("search", ["deadlock", "--probe", "--no-auto"], "recall",
+         ["deadlock", "--probe", "--no-auto"]),
+        ("search", ["deadlock", "-C", "3", "--limit", "2"], "recall",
+         ["deadlock", "-C", "3", "--hits", "2"]),
+        ("recall", ["deadlock", "--limit", "5"], "recall",
+         ["deadlock", "--hits", "5"]),
+        ("recall", ["deadlock", "-n5", "--side"], "recall",
+         ["deadlock", "--hits", "5"]),
+        ("recall", ["deadlock", "-l", "--since", "7d"], "search",
+         ["deadlock", "-l", "--since", "7d"]),
+        ("recall", ["deadlock", "--sort", "time", "--limit", "4"], "search",
+         ["deadlock", "--sort", "time", "-n", "4"]),
+        ("pack", ["unicode", "cp1252", "--limit", "2"], "pack",
+         ["unicode", "cp1252", "--hits", "2"]),
+        ("pack", ["index lock", "-E"], "search", ["index lock", "-E"]),
+        ("around", [HANDLE, "--limit", "3"], "around", [HANDLE, "-C", "3"]),
+        ("around", [HANDLE, "-n", "3", "--lexical", "--full"], "around",
+         [HANDLE, "-C", "3", "--full"]),
+        ("chats", ["webapp", "--limit", "4", "--lexical"], "chats",
+         ["webapp", "-n", "4"]),
+        ("chats", ["webapp", "--hits", "4", "--here"], "chats",
+         ["webapp", "-n", "4", "--here"]),
+        ("postcompact", ["--chat", "abcd1234", "--limit", "5"], "postcompact",
+         ["--session", "abcd1234"]),
+        ("postcompact", ["--json", "--budget", "4000", "--lexical"], "postcompact",
+         ["--json"]),
+        ("board", ["--once", "--limit", "3"], "board", ["--once", "-n", "3"]),
+        ("board", ["--once", "--json", "--hits", "3", "--lexical"], "board",
+         ["--once", "--json", "-n", "3"]),
+        # `--` ahead of the query keeps its place; the target's positional is
+        # still free to take what follows it
+        ("search", ["--limit", "3", "--", "-bar"], "search",
+         ["-n", "3", "--", "-bar"]),
+        # an explicit value for the target's own spelling wins over a renamed
+        # count, whichever order they were typed in
+        ("search", ["deadlock", "--hits", "3", "-n", "4"], "recall",
+         ["deadlock", "--hits", "3"]),
+        ("search", ["deadlock", "-n", "4", "--hits", "3"], "recall",
+         ["deadlock", "--hits", "3"]),
+        ("recall", ["deadlock", "--limit", "3", "--hits", "4"], "recall",
+         ["deadlock", "--hits", "4"]),
+        ("around", [HANDLE, "--limit", "3", "--radius", "5"], "around",
+         [HANDLE, "--radius", "5"]),
+        ("chats", ["webapp", "-n", "5", "--limit", "3"], "chats",
+         ["webapp", "-n", "5"]),
+        ("postcompact", ["--chat", "aaaa1111", "--session", "bbbb2222"],
+         "postcompact", ["--session", "bbbb2222"]),
+    )
+
+    def _parser_accepts(self, command: str, argv: list[str]) -> str | None:
+        parser = _parser(self._entries()[command], argv)
+
+        def refuse(_self, message):
+            raise _Refused(message)
+
+        original = surface.ArgumentParser.error
+        surface.ArgumentParser.error = refuse
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                surface.parse_args_with_presence(parser, argv)
+        except _Refused as exc:
+            return str(exc)
+        finally:
+            surface.ArgumentParser.error = original
+        return None
+
+    def test_each_mapping_prints_a_correction_its_target_accepts(self) -> None:
+        entries = self._entries()
+        for command, argv, target, expected in self.CASES:
+            with self.subTest(command=command, argv=argv):
+                rc, error = _exit_code(entries[command], argv)
+                self.assertEqual(rc, 2, error)
+                self.assertIn("unrecognized arguments: ", error)
+                self.assertIn("; run: ", error)
+                rendered = error.split("; run: ", 1)[1].rstrip("\n")
+                self.assertEqual(shlex.split(rendered), ["agrep", target, *expected])
+                self.assertIsNone(self._parser_accepts(target, expected))
+                if target in self.RUNNABLE:
+                    self.assertIsNone(_run(entries[target], expected))
+
+    def test_unmapped_conflicting_or_valueless_options_keep_argparse_text(self) -> None:
+        entries = self._entries()
+        for command, argv in (
+                ("search", ["deadlock", "--bogus"]),
+                ("search", ["deadlock", "--limit"]),
+                ("search", ["deadlock", "--limit", "--side"]),
+                ("search", ["deadlock", "--hits", "2", "-l"]),
+                ("recall", ["deadlock", "-l", "--budget", "100"]),
+                ("around", [self.HANDLE, "--limit", "3", "--bogus"]),
+                ("board", ["--once", "--since", "7d"]),
+                # `--` after the query: the target's positional is already
+                # consumed, so the tokens behind it would be refused
+                ("search", ["deadlock", "--limit", "3", "--", "-bar"]),
+                ("search", ["deadlock", "--hits", "3", "--", "-bar"]),
+                ("recall", ["deadlock", "--limit", "3", "--", "-bar"]),
+                # pack searches each query separately; search would join them
+                ("pack", ["retry backoff", "index lock", "-l"]),
+                ("pack", ["unicode", "cp1252", "-E"])):
+            with self.subTest(command=command, argv=argv):
+                rc, error = _exit_code(entries[command], argv)
+                self.assertEqual(rc, 2, error)
+                self.assertIn("unrecognized arguments: ", error)
+                self.assertNotIn("; run: ", error)
+
+    def test_a_flag_correction_outranks_the_command_word_search_hint(self) -> None:
+        rc, error = _exit_code(recall.main, ["deadlock", "-l"])
+        self.assertEqual(rc, 2, error)
+        self.assertNotIn('to search for the word "recall"', error)
+        self.assertEqual(
+            shlex.split(error.split("; run: ", 1)[1]),
+            ["agrep", "search", "deadlock", "-l"])
+
+    def test_switch_tables_cover_every_option_the_target_lacks(self) -> None:
+        # a switched command carries the source's other options along, so the
+        # target's table must answer each one the target parser does not know
+        entries = self._entries()
+        bases = {"search": ["deadlock"], "recall": ["deadlock"],
+                 "pack": ["deadlock"]}
+        spellings = {
+            name: {flag for action in _parser(entries[name], base)._actions
+                   for flag in action.option_strings}
+            for name, base in bases.items()}
+        for source, table in surface.FLAG_REWRITES.items():
+            for flag, rewrite in table.items():
+                if rewrite.command is None:
+                    continue
+                target_table = surface.FLAG_REWRITES[rewrite.command]
+                missing = {
+                    spelling for spelling in spellings[source]
+                    if spelling not in spellings[rewrite.command]
+                    and spelling not in target_table
+                    and spelling not in ("-h", "--help")}
+                with self.subTest(source=source, flag=flag):
+                    self.assertEqual(missing, set())
 
 
 if __name__ == "__main__":

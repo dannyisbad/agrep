@@ -430,6 +430,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                             ok: None,
                             call_id,
                             child_session: String::new(),
+                            meta: String::new(),
                         });
                     }
                     _ => {}
@@ -533,7 +534,17 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
 
     let pairs: Vec<DetailedRead> = work
         .par_iter()
-        .map(|(dir, meta)| parse_task(dir, meta.as_ref()))
+        .map(|(dir, meta)| {
+            crate::ingest::parse_guard::isolate("cline", dir, || parse_task(dir, meta.as_ref()))
+                .unwrap_or_else(|panic| {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        crate::ingest_cache::ReadOutcome::Skipped,
+                        vec![issue(dir, "source-read-failed", panic.reason)],
+                    )
+                })
+        })
         .collect();
     let mut msgs = Vec::new();
     let mut evts = Vec::new();
@@ -592,6 +603,13 @@ impl crate::ingest::registry::Adapter for Cline {
             path.file_name().and_then(|x| x.to_str()),
             Some("api_conversation_history.json" | "taskHistory.json")
         )
+    }
+    fn unit_scoped_read_issue(&self, path: &std::path::Path) -> bool {
+        // A task's own directory, never taskHistory.json, which attributes every task.
+        roots().into_iter().any(|root| {
+            path.strip_prefix(root.join("tasks"))
+                .is_ok_and(|task| task.components().next().is_some())
+        })
     }
     fn runtime_issue_root(&self) -> std::path::PathBuf {
         std::env::var_os("CLINE_DIR")

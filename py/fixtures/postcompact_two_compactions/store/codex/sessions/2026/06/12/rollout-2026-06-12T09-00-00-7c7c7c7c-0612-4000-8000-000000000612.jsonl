@@ -1,0 +1,19 @@
+{"timestamp":"2026-06-12T09:00:00.000Z","type":"session_meta","payload":{"id":"7c7c7c7c-0612-4000-8000-000000000612","cwd":"/work/heron"}}
+{"timestamp":"2026-06-12T09:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5","turn_id":"heron-turn-a"}}
+{"timestamp":"2026-06-12T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Rebuild the heron shards from the archive."}]}}
+{"timestamp":"2026-06-12T09:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"Rebuild the heron shards from the archive."}}
+{"timestamp":"2026-06-12T09:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","call_id":"heron-a","arguments":"{\"command\": \"make heron-shards\"}"}}
+{"timestamp":"2026-06-12T09:01:30.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"heron-a","output":"heron shards: 3 of 5 rebuilt"}}
+{"timestamp":"2026-06-12T09:20:00.000Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Summary: heron shard rebuild in progress."}]}]}}
+{"timestamp":"2026-06-12T09:21:00.000Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","call_id":"heron-b","arguments":"{\"command\": \"make heron-shards RESUME=1\"}"}}
+{"timestamp":"2026-06-12T09:21:30.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"heron-b","output":"heron shards: 5 of 5 rebuilt"}}
+{"timestamp":"2026-06-12T09:22:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"All five heron shards are rebuilt; the kestrel checksum still differs."}]}}
+{"timestamp":"2026-06-12T09:22:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"heron-turn-a","last_agent_message":"All five heron shards are rebuilt; the kestrel checksum still differs."}}
+{"timestamp":"2026-06-12T09:30:00.000Z","type":"turn_context","payload":{"model":"gpt-5","turn_id":"heron-turn-b"}}
+{"timestamp":"2026-06-12T09:30:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Track down the kestrel checksum mismatch."}]}}
+{"timestamp":"2026-06-12T09:30:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"Track down the kestrel checksum mismatch."}}
+{"timestamp":"2026-06-12T09:31:00.000Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","call_id":"heron-c","arguments":"{\"command\": \"make kestrel-verify\"}"}}
+{"timestamp":"2026-06-12T09:31:30.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"heron-c","output":"kestrel: shard four differs"}}
+{"timestamp":"2026-06-12T09:50:00.000Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Summary: kestrel checksum mismatch under investigation."}]}]}}
+{"timestamp":"2026-06-12T09:52:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Shard four was rebuilt twice, so the kestrel checksum moved."}]}}
+{"timestamp":"2026-06-12T09:52:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"heron-turn-b","last_agent_message":"Shard four was rebuilt twice, so the kestrel checksum moved."}}

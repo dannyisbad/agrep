@@ -22,9 +22,21 @@ class PiOmpExtensionLifecycleTests(unittest.TestCase):
             root = Path(td)
             module = root / "agrep-postcompact.mjs"
             module.write_bytes(EXTENSION.read_bytes())
+            publication_dir = root / "publication"
             runner = root / "runner.mjs"
             runner.write_text(
                 f"""
+import {{promises as fs}} from "node:fs";
+process.env.AGREP_CALLER_PUBLICATION_DIR = {json.dumps(str(publication_dir))};
+const publication = {json.dumps(str(publication_dir))} + "/" + process.pid + ".json";
+async function published() {{
+  try {{
+    return JSON.parse(await fs.readFile(publication, "utf8"));
+  }} catch (error) {{
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }}
+}}
 const {{default: install}} = await import({json.dumps(module.as_uri())});
 const handlers = new Map();
 const sent = [];
@@ -62,6 +74,16 @@ branch = [{{type: "message", role: "user"}}];
 await handlers.get("session_start")[0]({{type: "session_start"}}, ctx);
 check(process.env.AGREP_PI_SESSION_ID === sessionId, "identity not exported");
 check(sent.length === 0, "fresh session received recovery context");
+let record = await published();
+check(record !== null, "session start did not publish the caller record");
+check(record.pid === process.pid && record.version === 1,
+  "publication must name this process");
+check(JSON.stringify(record.sessions) === JSON.stringify([sessionId]),
+  "publication must list exactly the live session");
+check(record.cwd === process.cwd() && Number.isInteger(record.updated),
+  "publication must carry cwd and an integer timestamp");
+check(process.platform === "win32" || !((await fs.stat(publication)).mode & 0o077),
+  "publication must be private to the user");
 
 const compacting = await handlers.get("session.compacting")[0](
   {{type: "session.compacting", sessionId, messages: []}}, ctx);
@@ -109,10 +131,12 @@ check(sent.length === 0, "scoped recovery context was duplicated");
 branch = [{{type: "compaction", summary: "summary omitted the route"}}];
 await handlers.get("session_compact")[0]({{
   type: "session_compact", willRetry: true,
-  compactionEntry: {{summary: "route omitted"}},
+  compactionEntry: {{summary: "route omitted", timestamp: "2026-04-05T06:07:13.000Z"}},
 }}, ctx);
 check(sent.length === 1 && sent[0].options.deliverAs === "steer",
   "automatic retry did not receive steering recovery");
+check(sent[0].message.content.includes("--boundary-ms 1775369233000"),
+  "the hook omitted the compaction target while its source may still be flushing");
 sent.length = 0;
 await handlers.get("session_compact")[0]({{
   type: "session_compact", willRetry: false,
@@ -130,6 +154,9 @@ branch = [{{type: "compaction", summary: "legacy summary route"}}];
 await handlers.get("session_switch")[0]({{type: "session_switch"}}, ctx);
 check(process.env.AGREP_PI_SESSION_ID === sessionId,
   "session switch left stale identity");
+check(JSON.stringify((await published()).sessions)
+  === JSON.stringify([sessionId]),
+  "session switch must replace the previous session in the publication");
 check(sent.length === 1 && sent[0].message.content.includes(
   "agrep postcompact --session omp-session-two"),
   "compacted session switch did not receive exact scope");
@@ -147,9 +174,35 @@ await handlers.get("session_compact")[0]({{
 check(sent.length === 0, "blank compact queued unscoped recovery context");
 sessionId = "shutdown-session";
 await handlers.get("session_switch")[0]({{type: "session_switch"}}, ctx);
+check(JSON.stringify((await published()).sessions)
+  === JSON.stringify([sessionId]), "switch after blank did not republish");
+// several sessions in one process: advisor and subagents each install the
+// extension and start; the record is the union until the last one leaves
+const {{default: installAgain}} = await import({json.dumps(module.as_uri())});
+const second = new Map();
+installAgain({{
+  on(event, handler) {{ second.set(event, handler); }},
+  sendMessage() {{}},
+}});
+const advisor = {{sessionManager: {{
+  getSessionId: () => "advisor-session",
+  getBranch: () => [{{type: "message", role: "user"}}],
+}}}};
+await second.get("session_start")({{type: "session_start"}}, advisor);
+check(JSON.stringify((await published()).sessions.slice().sort())
+  === JSON.stringify(["advisor-session", "shutdown-session"]),
+  "second in-process session must join the publication, not replace it");
 await handlers.get("session_shutdown")[0]({{type: "session_shutdown"}}, ctx);
+check(process.env.AGREP_PI_SESSION_ID === "advisor-session",
+  "the env var belongs to the session still live in this process");
+check(JSON.stringify((await published()).sessions)
+  === JSON.stringify(["advisor-session"]),
+  "shutdown of one session must not remove the others");
+await second.get("session_shutdown")({{type: "session_shutdown"}}, advisor);
 check(!("AGREP_PI_SESSION_ID" in process.env),
   "shutdown leaked session identity");
+check((await published()) === null,
+  "the record must be deleted once the last session leaves");
 console.log(JSON.stringify({{ok: true, events: [...handlers.keys()]}}));
 """,
                 encoding="utf-8",

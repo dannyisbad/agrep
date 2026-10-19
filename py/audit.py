@@ -845,6 +845,22 @@ def _sqlite_family_identity(path: Path) -> tuple:
     return tuple(family)
 
 
+def _sqlite_family_sizes(path: Path) -> dict[str, int]:
+    """Member sizes from plain identities: a Windows change proof can hash the whole file."""
+    sizes = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        member = Path(f"{path}{suffix}")
+        try:
+            sizes[suffix] = fileops.file_identity(member)[2]
+        except FileNotFoundError:
+            if not suffix:
+                return {}
+        except OSError as error:
+            raise AuditEvidenceError(
+                f"cannot stat indexed-row evidence {member}: {error}") from error
+    return sizes
+
+
 def _indexed_cache_record(identity: tuple, agents: set[str]) -> dict:
     return {
         "identity": [
@@ -865,12 +881,8 @@ def _indexed_cache_matches(record: dict | None, identity: tuple) -> bool:
     return observed == identity
 
 
-def _sqlite_direct_read_eligible(path: Path, family: tuple) -> bool:
-    members = dict(family)
-    wal = members.get("-wal")
-    journal = members.get("-journal")
-    if ((wal is not None and wal[2] > 0)
-            or (journal is not None and journal[2] > 0)):
+def _sqlite_direct_read_eligible(path: Path, sizes: dict[str, int]) -> bool:
+    if sizes.get("-wal", 0) > 0 or sizes.get("-journal", 0) > 0:
         return False
     try:
         with _plain_binary(path) as stream:
@@ -898,17 +910,17 @@ def _indexed_agents(*, deadline: float | None = None) -> set[str]:
     progress_installed = False
     try:
         _deadline_check(deadline, "indexed-row snapshot")
-        family = _sqlite_family_identity(path)
         if deadline is not None:
-            family_bytes = sum(identity[2] for _suffix, identity in family)
-            direct = _sqlite_direct_read_eligible(path, family)
+            sizes = _sqlite_family_sizes(path)
+            family_bytes = sum(sizes.values())
+            direct = _sqlite_direct_read_eligible(path, sizes)
             if not direct and family_bytes > _ROUTINE_SQLITE_COPY_MAX_BYTES:
                 raise AuditRoutineBudget(
                     "routine indexed-row snapshot deferred: a live SQLite "
                     f"family of {_human_bytes(family_bytes)} exceeds the "
                     f"{_human_bytes(_ROUTINE_SQLITE_COPY_MAX_BYTES)} "
                     "routine copy tier; run agrep audit --full")
-            main_size = dict(family).get("", (0, 0, 0, 0, 0))[2]
+            main_size = sizes.get("", 0)
             if main_size > _ROUTINE_INDEXED_SCAN_MAX_BYTES:
                 raise AuditRoutineBudget(
                     "routine indexed-agent DISTINCT census deferred: "

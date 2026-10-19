@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agrep"
 dynamic = ["version"]
-description = "Search and watch your cross-agent coding chat history (Claude, Codex, opencode, Antigravity, Kimi, Cline, Gemini, Crush, Cursor, pi, oh-my-pi) in one place."
+description = "Find, open, resume and watch your AI agents' work across Claude, Codex, opencode, Antigravity, Kimi, Cline, Gemini, Crush, Cursor, pi and oh-my-pi - one local index."
 readme = "README.md"
 license = { file = "LICENSE" }
 license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]

@@ -1,0 +1,8 @@
+exit: 1
+--- stdout ---
+--- stderr ---
+'cedar' is ambiguous - 4 sessions match:
+  pi · <HOME>/projects/cedar  44444444  Check the sidecar lantern rollback plan for the cedar lead.
+  pi · <HOME>/projects/cedar  33333333  Review the cedar lantern plan with a sidecar advisor.
+  codex · cedar  55555555  Audit the copper lantern deployment manifest for cedar.
+  claude · cedar  11111111  Please map the copper lantern launch checklist for cedar.

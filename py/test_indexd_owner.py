@@ -28,6 +28,10 @@ from hookless import locators  # noqa: E402
 
 
 PY_DIR = Path(__file__).resolve().parent
+ROOT = PY_DIR.parent
+RELEASE_BIN = ROOT / "target" / "release" / (
+    "agrep-rs.exe" if os.name == "nt" else "agrep-rs")
+PREDECESSOR_WRITER = "a" * 20
 
 
 class IndexdOwnerTests(unittest.TestCase):
@@ -2836,6 +2840,176 @@ class IndexdOwnerTests(unittest.TestCase):
         self.assertIn(
             f"pid={os.getpid()}".encode(), replacement.snapshot.raw)
         self.assertTrue(self._release(replacement))
+
+    # --- explicit index beside a live predecessor daemon (real processes) ---
+
+    def _upgrade_sandbox(
+            self, label: str) -> tuple[Path, Path, dict[str, str], str]:
+        """A private home with one chat whose derived stores another writer published."""
+        binary = Path(os.environ.get("AGREP_RS_BIN") or RELEASE_BIN)
+        if not binary.is_file():
+            raise unittest.SkipTest(f"release ingest binary is required: {binary}")
+        root = self.root / label
+        home, data = root / "home", root / "data"
+        project = home / ".claude" / "projects" / "retire-proof"
+        project.mkdir(parents=True)
+        data.mkdir()
+        session = "77777777-7777-4777-8777-777777777777"
+        term = f"explicitindexretire{label}x7q9"
+        rows = [
+            {"type": "user", "userType": "external", "sessionId": session,
+             "timestamp": "2026-07-25T12:00:00.000Z", "cwd": str(root / "work"),
+             "message": {"role": "user", "content": term}},
+            {"type": "assistant", "sessionId": session,
+             "timestamp": "2026-07-25T12:00:01.000Z", "cwd": str(root / "work"),
+             "message": {"role": "assistant", "model": "retire-fixture",
+                         "content": [{"type": "text", "text": "reply"}]}},
+        ]
+        (project / f"{session}.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("AGREP_") and key not in {
+                "APPDATA", "CLINE_DIR", "HOME", "LOCALAPPDATA", "USERPROFILE",
+                "XDG_CONFIG_HOME", "XDG_DATA_HOME"}}
+        env.update({
+            "HOME": str(home), "USERPROFILE": str(home),
+            "APPDATA": str(home / "AppData" / "Roaming"),
+            "LOCALAPPDATA": str(home / "AppData" / "Local"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+            "AGREP_HOME": str(home), "AGREP_DATA_DIR": str(data),
+            "AGREP_DATA_DIR_SOURCE": "env", "AGREP_RS_BIN": str(binary),
+            "AGREP_CALLER_PUBLICATION_DIR": str(root / "callers"),
+            "AGREP_NO_DAEMON": "1", "AGREP_NO_FETCH": "1",
+            "AGREP_NO_SEM_WORKER": "1", "AGREP_NO_RESIDENT": "1",
+            "PYTHONDONTWRITEBYTECODE": "1", "RAYON_NUM_THREADS": "2",
+        })
+        seeded = subprocess.run(
+            [str(binary), "index", "--agent", "all"], cwd=ROOT,
+            env={**env, "AGREP_RUNTIME_BUILD_ID": PREDECESSOR_WRITER},
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60)
+        self.assertEqual(seeded.returncode, 0, seeded.stdout + seeded.stderr)
+        owner = json.loads(
+            (data / ".derived-owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["build_id"], PREDECESSOR_WRITER)
+        return home, data, env, term
+
+    def _stand_in_daemon(
+            self, *, private_session: bool) -> tuple[subprocess.Popen, str]:
+        """A live process for the owner record; only a private session passes the group proof."""
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            start_new_session=private_session)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        deadline = time.monotonic() + 5.0
+        start = common.process_start_identity(process.pid)
+        while start is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+            start = common.process_start_identity(process.pid)
+        self.assertIsNotNone(start)
+        if private_session:
+            self.assertEqual(os.getpgid(process.pid), process.pid)
+            self.assertEqual(os.getsid(process.pid), process.pid)
+        else:
+            self.assertEqual(os.getpgid(process.pid), os.getpgrp())
+        return process, start
+
+    def _sandbox_owner_state(
+            self, home: Path, data: Path,
+            lock: Path) -> indexd_runtime._IndexdOwnerState:
+        """Classify the planted record exactly as the sandboxed CLI will."""
+        with mock.patch.object(indexd_runtime, "INDEXD_LOCK_PATH", lock), \
+                mock.patch.object(common, "DATA_DIR", data), \
+                mock.patch.dict(os.environ, {"AGREP_HOME": str(home)}):
+            return indexd_runtime._inspect_indexd_owner().state
+
+    def _explicit_index(
+            self, env: dict[str, str], *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "cli.py"), "index", *args], cwd=ROOT,
+            env=env, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120)
+
+    def _assert_explicit_index_displaces_predecessor(
+            self, label: str, *args: str) -> None:
+        home, data, env, term = self._upgrade_sandbox(label)
+        standin, start = self._stand_in_daemon(private_session=True)
+        lock = data / self.path.name
+        lock.write_bytes(self._raw(
+            pid=standin.pid, process_start=start, build="older-build",
+            writer=PREDECESSOR_WRITER, group=standin.pid,
+            home=str(home), data=str(data), created_at=time.time()))
+        self.assertIs(
+            self._sandbox_owner_state(home, data, lock),
+            indexd_runtime._IndexdOwnerState.INCOMPATIBLE)
+        result = self._explicit_index(env, *args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("indexing declined", result.stderr)
+        self.assertIn(
+            term, (data / "messages.jsonl").read_text(encoding="utf-8"))
+        owner = json.loads(
+            (data / ".derived-owner.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(owner["build_id"], PREDECESSOR_WRITER)
+        self.assertIsNotNone(
+            standin.poll(), "the predecessor daemon survived the explicit index")
+        self.assertFalse(lock.exists())
+
+    @unittest.skipIf(common.WIN, "POSIX process-group proof")
+    def test_explicit_index_retires_an_exact_incompatible_predecessor(
+            self) -> None:
+        self._assert_explicit_index_displaces_predecessor("plain")
+
+    @unittest.skipIf(common.WIN, "POSIX process-group proof")
+    def test_full_explicit_index_retires_an_exact_incompatible_predecessor(
+            self) -> None:
+        self._assert_explicit_index_displaces_predecessor("full", "--full")
+
+    @unittest.skipIf(common.WIN, "POSIX process-group proof")
+    def test_explicit_index_leaves_this_builds_own_daemon_running(self) -> None:
+        home, data, env, term = self._upgrade_sandbox("current")
+        standin, start = self._stand_in_daemon(private_session=True)
+        lock = data / self.path.name
+        raw = self._raw(
+            pid=standin.pid, process_start=start, group=standin.pid,
+            home=str(home), data=str(data), created_at=time.time())
+        lock.write_bytes(raw)
+        self.assertIs(
+            self._sandbox_owner_state(home, data, lock),
+            indexd_runtime._IndexdOwnerState.COMPATIBLE)
+        result = self._explicit_index(env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            term, (data / "messages.jsonl").read_text(encoding="utf-8"))
+        self.assertIsNone(
+            standin.poll(), "the explicit index retired this build's own daemon")
+        self.assertEqual(lock.read_bytes(), raw)
+
+    @unittest.skipIf(common.WIN, "POSIX process-group proof")
+    def test_explicit_index_leaves_a_hostile_predecessor_and_declines(
+            self) -> None:
+        home, data, env, _term = self._upgrade_sandbox("hostile")
+        standin, start = self._stand_in_daemon(private_session=False)
+        lock = data / self.path.name
+        raw = self._raw(
+            pid=standin.pid, process_start=start, build="older-build",
+            writer=PREDECESSOR_WRITER, group=standin.pid,
+            home=str(home), data=str(data), created_at=time.time())
+        lock.write_bytes(raw)
+        self.assertIs(
+            self._sandbox_owner_state(home, data, lock),
+            indexd_runtime._IndexdOwnerState.HOSTILE)
+        result = self._explicit_index(env)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("indexing declined; nothing was rebuilt", result.stderr)
+        self.assertIsNone(
+            standin.poll(), "the explicit index retired a hostile owner")
+        self.assertEqual(lock.read_bytes(), raw)
+        owner = json.loads(
+            (data / ".derived-owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["build_id"], PREDECESSOR_WRITER)
 
     def test_timestamp_enablement_is_reversible_and_scoped_to_the_test(self) -> None:
         # P13: enable_log_timestamps() had no inverse, so a main() test left

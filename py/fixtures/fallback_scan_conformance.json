@@ -306,13 +306,31 @@
       "score": 0.0542
     },
     {
-      "name": "geometric-boundary-near-rounding-half",
+      "name": "geometric-boundary-with-partial-proximity",
       "query": "akd db",
       "event": {"ts": 1000, "kind": "tool", "name": "xakdx", "output": "xxdbxx"},
       "lane": "all_terms",
       "snippet": "xakdx xxdbxx",
       "now_ms": 1205913854,
-      "score": 0.0148
+      "score": 0.0095
+    },
+    {
+      "name": "fragment-adjacency-has-no-proximity-bonus",
+      "query": "don calls",
+      "event": {"ts": 1000, "kind": "tool", "name": "", "output": "calls dont"},
+      "lane": "all_terms",
+      "snippet": "calls dont",
+      "now_ms": 1000,
+      "score": 0.087
+    },
+    {
+      "name": "plural-query-matches-singular-evidence",
+      "query": "don calls",
+      "event": {"ts": 1000, "kind": "tool", "name": "", "output": "don before this call"},
+      "lane": "all_terms",
+      "snippet": "don before this call",
+      "now_ms": 1000,
+      "score": 0.154
     },
     {
       "name": "unrelated-unicode-outside-window",
@@ -321,6 +339,15 @@
       "lane": "phrase",
       "snippet": "…xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedle",
       "score": 0.1073
+    },
+    {
+      "name": "single-token-first-occurrence-inside-a-word",
+      "query": "the",
+      "event": {"ts": 1000, "kind": "tool", "name": "", "output": "do another review pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad and make sure the pipeline stays scaleable"},
+      "lane": "phrase",
+      "now_ms": 1000,
+      "snippet": "… pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad and make sure the pipeline stays scaleable",
+      "score": 0.11
     }
   ]
 }

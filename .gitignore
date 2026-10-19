@@ -89,4 +89,4 @@ Thumbs.db
 
 # prebuilt rust binary staged for wheel packaging (CI / local build)
 _bin/
-.codex/
+/.codex/

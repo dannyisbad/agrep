@@ -3,7 +3,7 @@
 //! `write_messages` emits compact JSON Lines with stable `agent:session:turn` identifiers. The
 //! Python search layer imports those rows and joins optional enrichment by the same identifier.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 #[cfg(windows)]
 use std::io;
@@ -209,9 +209,7 @@ pub fn write_messages(msgs: &[Message], path: &Path) -> anyhow::Result<()> {
     // writer is one of only two concurrent large publications, so 256KiB costs little memory
     // and materially reduces write syscalls on both APFS and Windows filesystems.
     write_atomic_buffered(path, 256 * 1024, |w| {
-        // JSON escaping dominates the changed-session rewrite even though the final file is
-        // only streamed once. Render bounded chunks across the existing rayon pool, then emit
-        // in canonical input order. The chunk cap avoids a second corpus-sized allocation.
+        // Chunked rendering bounds temporary storage and preserves row order.
         for batch in msgs.chunks(256) {
             let lines: Vec<serde_json::Result<Vec<u8>>> = batch
                 .par_iter()
@@ -273,12 +271,24 @@ struct SessionRecord<'a> {
     /// Parent session id for side sessions (subagent/Task children); empty for roots.
     #[serde(skip_serializing_if = "str::is_empty")]
     parent: &'a str,
+    /// A second id the source store carries for this session (its filename id after a header
+    /// rewrite); resolves to the same family. Empty when the store agrees with itself.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    alias: &'a str,
+}
+
+/// The id a store's own filename gives one session's transcript, gathered from the parse
+/// cache through `registry::session_alias` for every cached source.
+pub struct SessionAlias {
+    pub agent: &'static str,
+    pub alias: String,
+    pub session: std::sync::Arc<str>,
 }
 
 pub const SESSION_FAMILY_META_FILE: &str = "session_family.meta.json";
-// v2 reuses the existing MD5+FNV64 composite to avoid a dependency. It detects torn local
-// publications; the ingest signature remains the generation commit marker.
-const SESSION_FAMILY_META_VERSION: u32 = 2;
+// v3 adds each session's alias to the digested row. It detects torn local publications; the
+// ingest signature remains the generation commit marker.
+pub const SESSION_FAMILY_META_VERSION: u32 = 3;
 const SESSION_FAMILY_DIGEST_ALGORITHM: &str = "md5-fnv64-v1";
 
 #[derive(Serialize)]
@@ -298,9 +308,94 @@ struct SessionAggregate<'a> {
     last_ts: i64,
     first_text: String,
     parent: &'a str,
+    alias: &'a str,
 }
 
-fn aggregate_sessions<'a>(msgs: &'a [Message]) -> BTreeMap<&'a str, SessionAggregate<'a>> {
+/// Alias -> session for every claim that survives: an alias naming an indexed session or
+/// claimed by two sessions is ambiguous and dropped; a session keeps its first alias.
+fn resolve_aliases<'a>(
+    indexed: &HashSet<&str>,
+    aliases: &'a [SessionAlias],
+) -> BTreeMap<&'a str, &'a str> {
+    let mut ordered: Vec<&SessionAlias> = aliases
+        .iter()
+        .filter(|claim| {
+            !claim.alias.is_empty()
+                && claim.alias != *claim.session
+                && indexed.contains(&*claim.session)
+        })
+        .collect();
+    ordered.sort_by(|a, b| (&*a.session, &a.alias).cmp(&(&*b.session, &b.alias)));
+    ordered.dedup_by(|a, b| a.session == b.session && a.alias == b.alias);
+    let mut by_alias: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    for claim in &ordered {
+        if indexed.contains(claim.alias.as_str()) {
+            eprintln!(
+                "  ! session alias {} of {} names an indexed session; ignored",
+                crate::ingest::terminal_safe(&claim.alias),
+                crate::ingest::terminal_safe(&claim.session),
+            );
+            by_alias.insert(&claim.alias, None);
+            continue;
+        }
+        match by_alias.get(claim.alias.as_str()) {
+            None => {
+                by_alias.insert(&claim.alias, Some(claim.session.as_ref()));
+            }
+            Some(Some(other)) if *other != &*claim.session => {
+                eprintln!(
+                    "  ! session alias {} claimed by both {} and {}; ignored",
+                    crate::ingest::terminal_safe(&claim.alias),
+                    crate::ingest::terminal_safe(other),
+                    crate::ingest::terminal_safe(&claim.session),
+                );
+                by_alias.insert(&claim.alias, None);
+            }
+            Some(_) => {}
+        }
+    }
+    let mut resolved: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut aliased: HashSet<&str> = HashSet::new();
+    for (alias, session) in by_alias {
+        let Some(session) = session else { continue };
+        if !aliased.insert(session) {
+            eprintln!(
+                "  ! session {} carries a second alias {}; keeping the first",
+                crate::ingest::terminal_safe(session),
+                crate::ingest::terminal_safe(alias),
+            );
+            continue;
+        }
+        resolved.insert(alias, session);
+    }
+    resolved
+}
+
+/// The claims [`write_session_index`] will publish for `msgs`, resolved once so every
+/// consumer of the same generation sees one family layout and one warning per conflict.
+pub fn resolve_session_aliases(msgs: &[Message], claims: Vec<SessionAlias>) -> Vec<SessionAlias> {
+    if claims.is_empty() {
+        return claims;
+    }
+    let indexed: HashSet<&str> = msgs.iter().map(|m| &*m.session).collect();
+    let keep: Vec<bool> = {
+        let resolved = resolve_aliases(&indexed, &claims);
+        claims
+            .iter()
+            .map(|claim| resolved.get(claim.alias.as_str()) == Some(&&*claim.session))
+            .collect()
+    };
+    claims
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(claim, keep)| keep.then_some(claim))
+        .collect()
+}
+
+fn aggregate_sessions<'a>(
+    msgs: &'a [Message],
+    aliases: &'a [SessionAlias],
+) -> BTreeMap<&'a str, SessionAggregate<'a>> {
     let mut by: BTreeMap<&str, SessionAggregate> = BTreeMap::new();
     let mut parent_conflicts: u32 = 0;
     for m in msgs {
@@ -312,6 +407,7 @@ fn aggregate_sessions<'a>(msgs: &'a [Message]) -> BTreeMap<&'a str, SessionAggre
             last_ts: 0,
             first_text: String::new(),
             parent: &m.parent,
+            alias: "",
         });
         if !m.parent.is_empty() {
             if a.parent.is_empty() {
@@ -344,18 +440,34 @@ fn aggregate_sessions<'a>(msgs: &'a [Message]) -> BTreeMap<&'a str, SessionAggre
     if parent_conflicts > 1 {
         eprintln!("  ! {parent_conflicts} conflicting parent claims absorbed (first claim kept)");
     }
+    if aliases.is_empty() {
+        return by;
+    }
+    let indexed: HashSet<&str> = by.keys().copied().collect();
+    let resolved = resolve_aliases(&indexed, aliases);
+    if !resolved.is_empty() {
+        for aggregate in by.values_mut() {
+            if let Some(canonical) = resolved.get(aggregate.parent) {
+                aggregate.parent = canonical;
+            }
+        }
+        for (alias, session) in resolved {
+            if let Some(aggregate) = by.get_mut(session) {
+                aggregate.alias = alias;
+            }
+        }
+    }
     by
 }
 
-fn write_session_family_aggregate(
+fn session_family_aggregate_bytes(
     by: &BTreeMap<&str, SessionAggregate<'_>>,
-    family_meta_path: &Path,
     ingest_signature: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     let mut digest = Md5FnvDigest::new();
     digest.update(b"agrep-session-family-v1\0");
     for (session, aggregate) in by {
-        for value in [*session, aggregate.parent] {
+        for value in [*session, aggregate.parent, aggregate.alias] {
             let bytes = value.as_bytes();
             digest.update(&(bytes.len() as u64).to_le_bytes());
             digest.update(bytes);
@@ -368,36 +480,29 @@ fn write_session_family_aggregate(
         count: by.len(),
         digest: digest.finish(),
     };
-    // Meta comes first so the final ingest signature commits changed generations. Same-signature
-    // repairs retain the same family mapping; destructive readers still verify the census digest.
-    write_bytes_atomic(family_meta_path, &serde_json::to_vec(&meta)?)
+    Ok(serde_json::to_vec(&meta)?)
 }
 
-/// Publish only the parent-census proof for an already edge-proven session index.
-///
-/// The legacy upgrade uses this narrow path so it can generation-bind an
-/// unchanged v4 publication without replacing any of that publication's six
-/// proved artifacts.
-pub fn write_session_family_meta(
+/// Build a current family proof for an unchanged, edge-proven session index.
+/// Publish these bytes with the generation markers, without rewriting session rows.
+pub fn session_family_meta_bytes(
     msgs: &[Message],
-    family_meta_path: &Path,
+    aliases: &[SessionAlias],
     ingest_signature: &str,
-) -> anyhow::Result<usize> {
-    let by = aggregate_sessions(msgs);
-    write_session_family_aggregate(&by, family_meta_path, ingest_signature)?;
-    Ok(by.len())
+) -> anyhow::Result<Vec<u8>> {
+    session_family_aggregate_bytes(&aggregate_sessions(msgs, aliases), ingest_signature)
 }
 
-/// Write the per-session aggregate index. One pass over the already-deduped messages.
+/// Write the per-session aggregate index; returns the session count and the family proof
+/// bytes for `ingest_signature`, which the caller publishes with the generation markers.
 pub fn write_session_index(
     msgs: &[Message],
+    aliases: &[SessionAlias],
     path: &Path,
-    family_meta_path: &Path,
     ingest_signature: &str,
-) -> anyhow::Result<usize> {
-    let by = aggregate_sessions(msgs);
-    let n = by.len();
-    write_session_family_aggregate(&by, family_meta_path, ingest_signature)?;
+) -> anyhow::Result<(usize, Vec<u8>)> {
+    let by = aggregate_sessions(msgs, aliases);
+    let family_meta = session_family_aggregate_bytes(&by, ingest_signature)?;
     write_atomic(path, |w| {
         for (session, a) in &by {
             let rec = SessionRecord {
@@ -413,13 +518,14 @@ pub fn write_session_index(
                 last_ts: a.last_ts,
                 first_text: &a.first_text,
                 parent: a.parent,
+                alias: a.alias,
             };
             serde_json::to_writer(&mut *w, &rec)?;
             w.write_all(b"\n")?;
         }
         Ok(())
     })?;
-    Ok(n)
+    Ok((by.len(), family_meta))
 }
 
 /// One event row inside a per-session file. The file name already carries agent+session,
@@ -446,6 +552,8 @@ struct EventRecord<'a> {
     call_id: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     child: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    meta: &'a str,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2991,6 +3099,13 @@ fn publish_events_complete_trusted(dir: &Path, agents: &[&str]) -> anyhow::Resul
     Ok(true)
 }
 
+/// Whether every payload of `agents` matches the inventory the store's own writes keep. A crash
+/// leaves it so (each write is one transaction); only a full rebuild repairs a store that is not.
+pub fn event_store_consistent(dir: &Path, agents: &[&str]) -> anyhow::Result<bool> {
+    Ok(exact_event_inventories(dir, agents)?
+        .is_some_and(|inventories| inventories.iter().all(Option::is_some)))
+}
+
 /// Reuse a current proof or validate every payload once before establishing authority.
 pub fn publish_events_complete(dir: &Path, agents: &[&str]) -> anyhow::Result<bool> {
     if events_complete(dir, agents)? {
@@ -3016,6 +3131,17 @@ fn event_file_stats(agent: &str, events: &[&Event]) -> EventFileStats {
         ..EventFileStats::default()
     };
     for event in events {
+        // structural markers record a moment, never a call or a subagent
+        if event.kind == "control"
+            && matches!(
+                event.name.as_str(),
+                crate::ingest::claude::API_ERROR_MARKER
+                    | crate::ingest::claude::TASK_NOTIFICATION_MARKER
+                    | crate::ingest::codex::COMPACTED_MARKER
+            )
+        {
+            continue;
+        }
         if matches!(event.kind, "tool" | "control") {
             stats.calls += 1;
             let tool = stats.tools.entry(event.name.clone()).or_default();
@@ -3251,6 +3377,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
             left.input.as_str(),
             left.output.as_str(),
             left.child_session.as_str(),
+            left.meta.as_str(),
             left.ok,
             left.input_chars,
             left.output_chars,
@@ -3264,6 +3391,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
                 right.input.as_str(),
                 right.output.as_str(),
                 right.child_session.as_str(),
+                right.meta.as_str(),
                 right.ok,
                 right.input_chars,
                 right.output_chars,
@@ -3287,6 +3415,7 @@ fn render_event_group(group: &mut EventGroup<'_>) -> anyhow::Result<Option<Rende
             ok: event.ok,
             call_id: &event.call_id,
             child: &event.child_session,
+            meta: &event.meta,
         };
         serde_json::to_writer(&mut bytes, &record)?;
         bytes.push(b'\n');
@@ -3906,6 +4035,217 @@ pub fn event_fname(agent: &str, session: &str) -> String {
     )
 }
 
+/// Whether the published generation in `data` may hold rows or events of `agent`. False only
+/// when its sessions, messages and event stores were all read and none names the agent; the
+/// caller must have verified those files against their generation's derived proof.
+pub fn published_agent_material(data: &Path, agent: &str) -> bool {
+    let unnamed = || -> anyhow::Result<bool> {
+        // Compact serde output escapes every quote inside a value, so only the field matches.
+        let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
+        for name in ["sessions.jsonl", "messages.jsonl"] {
+            if file_contains(&data.join(name), needle.as_bytes())? {
+                return Ok(false);
+            }
+        }
+        let events = data.join("events");
+        // Every event name starts with the agent's readable name and '-'; '.' sorts next.
+        let readable = readable_name(agent, 20);
+        let prefix = format!("{readable}-");
+        if let Some(connection) = open_existing_event_store(&events)? {
+            let named: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM event_sessions WHERE name >= ?1 AND name < ?2)",
+                params![prefix, format!("{readable}.")],
+                |row| row.get(0),
+            )?;
+            if named {
+                return Ok(false);
+            }
+        }
+        let entries = match fs::read_dir(&events) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            if name.to_str().is_none_or(|name| name.starts_with(&prefix)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    !unnamed().unwrap_or(false)
+}
+
+/// What the published generation in `data` holds of one agent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PublishedAgentRows {
+    /// Every message row, by `(session, turn)`.
+    pub turns: HashMap<(String, u32), PublishedTurn>,
+    /// Every session with a session row.
+    pub sessions: HashSet<String>,
+    /// Every session with stored events.
+    pub event_sessions: HashSet<String>,
+}
+
+/// The attribution and content a published message row carries.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PublishedTurn {
+    pub project: String,
+    /// The model its source named; None where publication backfilled or labelled it.
+    pub model: Option<String>,
+    pub ts: i64,
+    pub text: String,
+}
+
+/// A collision-resistant digest of a row's text.
+pub type TextDigest = [u8; 16];
+
+/// SHA-256 of a row's text, truncated: how a record staged with the parse cache names a row
+/// without holding its text.
+pub fn text_digest(text: &str) -> TextDigest {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    let mut key = [0; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
+/// The identity of the published messages.jsonl, which differs once a pass replaces it; None when
+/// it is no regular file. The rows a record stands in for are that file's own.
+pub fn published_generation_seal(data: &Path) -> Option<GenerationSeal> {
+    use sha2::Digest as _;
+    let seal = file_identity_seal(&data.join("messages.jsonl")).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    for field in [
+        seal.device,
+        seal.inode,
+        seal.size,
+        seal.modified_ns,
+        seal.changed_ns,
+    ] {
+        hasher.update(field.to_le_bytes());
+    }
+    let mut seal = [0; 16];
+    seal.copy_from_slice(&hasher.finalize()[..16]);
+    Some(seal)
+}
+
+/// See [`published_generation_seal`].
+pub type GenerationSeal = [u8; 16];
+
+/// Every row and event session of `agent` the published generation in `data` holds; None when
+/// any of them cannot be read whole or named. The caller must have verified those files the way
+/// [`published_agent_material`] requires.
+pub fn published_agent_rows(data: &Path, agent: &str) -> Option<PublishedAgentRows> {
+    #[derive(Deserialize)]
+    struct Row {
+        agent: String,
+        session: String,
+        turn: Option<u32>,
+        #[serde(default)]
+        project: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        model_source: String,
+        #[serde(default)]
+        ts: i64,
+        #[serde(default)]
+        text: String,
+    }
+    let read = || -> anyhow::Result<PublishedAgentRows> {
+        let needle = format!("\"agent\":{}", serde_json::to_string(agent)?);
+        let mut rows = PublishedAgentRows::default();
+        for name in ["sessions.jsonl", "messages.jsonl"] {
+            let path = data.join(name);
+            anyhow::ensure!(
+                fs::symlink_metadata(&path)?.is_file(),
+                "{} is not a regular file",
+                path.display()
+            );
+            let file = std::io::BufReader::new(fs::File::open(&path)?);
+            for line in std::io::BufRead::lines(file) {
+                let line = line?;
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let row: Row = serde_json::from_str(&line)?;
+                if row.agent != agent {
+                    continue;
+                }
+                if name == "sessions.jsonl" {
+                    rows.sessions.insert(row.session);
+                    continue;
+                }
+                let turn = row
+                    .turn
+                    .ok_or_else(|| anyhow::anyhow!("a message row without a turn"))?;
+                let model = matches!(row.model_source.as_str(), "explicit" | "explicit_harness")
+                    .then_some(row.model);
+                let attribution = PublishedTurn {
+                    project: row.project,
+                    model,
+                    ts: row.ts,
+                    text: row.text,
+                };
+                rows.turns.insert((row.session, turn), attribution);
+            }
+        }
+        let events = data.join("events");
+        if let Some(connection) = open_existing_event_store(&events)? {
+            let mut statement =
+                connection.prepare("SELECT session FROM event_sessions WHERE agent = ?1")?;
+            for session in statement.query_map([agent], |row| row.get::<_, String>(0))? {
+                rows.event_sessions.insert(session?);
+            }
+        }
+        // Older generations stored events one file per session, named after a lossy prefix.
+        let prefix = format!("{}-", readable_name(agent, 20));
+        match fs::read_dir(&events) {
+            Ok(entries) => {
+                for entry in entries {
+                    let name = entry?.file_name();
+                    anyhow::ensure!(
+                        name.to_str().is_some_and(|name| !name.starts_with(&prefix)),
+                        "an event file of {agent} outside the event store"
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(rows)
+    };
+    read().ok()
+}
+
+/// Whether the regular file at `path` contains `needle`, read in bounded chunks.
+fn file_contains(path: &Path, needle: &[u8]) -> anyhow::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    let finder = memchr::memmem::Finder::new(needle);
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0_u8; 1 << 20];
+    let mut carried = 0;
+    loop {
+        let read = file.read(&mut buffer[carried..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let filled = carried + read;
+        if finder.find(&buffer[..filled]).is_some() {
+            return Ok(true);
+        }
+        carried = needle.len().saturating_sub(1).min(filled);
+        buffer.copy_within(filled - carried..filled, 0);
+    }
+}
+
 /// Aggregate per-agent call/fail counts, tool mix, and subagent totals while events are
 /// already in memory at index time.
 pub fn write_event_stats(events: &[Event], path: &Path) -> anyhow::Result<()> {
@@ -3953,6 +4293,7 @@ mod tests {
             ok: Some(true),
             call_id: "call-1".into(),
             child_session: String::new(),
+            meta: String::new(),
         }
     }
 
@@ -4074,6 +4415,54 @@ mod tests {
     }
 
     #[test]
+    fn marker_events_are_not_calls_tools_failures_or_subagents() {
+        let mut control = test_event();
+        control.kind = "control";
+        control.name = "send_message".into();
+        let mut events = vec![control];
+        for (agent, name, ok) in [
+            (
+                "claude",
+                crate::ingest::claude::API_ERROR_MARKER,
+                Some(false),
+            ),
+            (
+                "claude",
+                crate::ingest::claude::TASK_NOTIFICATION_MARKER,
+                None,
+            ),
+            ("codex", crate::ingest::codex::COMPACTED_MARKER, Some(false)),
+        ] {
+            let mut marker = test_event();
+            marker.agent = agent;
+            marker.kind = "control";
+            marker.name = name.into();
+            marker.ok = ok;
+            events.push(marker);
+        }
+        let path = tmp_path(&std::env::temp_dir().join("agrep-event-stats-markers"))
+            .join("event_stats.json");
+        write_event_stats(&events, &path).unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            (&stats["total"], &stats["fails"], &stats["subagents"]),
+            (&1.into(), &0.into(), &0.into())
+        );
+        assert_eq!(stats["by_agent"]["codex"]["calls"], 1);
+        assert_eq!(stats["by_agent"]["codex"]["known"], 1);
+        assert_eq!(stats["by_agent"]["claude"]["calls"], 0);
+        assert_eq!(stats["by_agent"]["claude"]["subagents"], 0);
+        let tools: Vec<_> = stats["by_tool"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].clone())
+            .collect();
+        assert_eq!(tools, vec![serde_json::json!("send_message")]);
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn event_filenames_are_bounded_and_preserve_distinct_identities() {
         let slash = event_fname("gemini", "a/b");
         let question = event_fname("gemini", "a?b");
@@ -4163,7 +4552,8 @@ mod tests {
 
     #[test]
     fn restoring_missing_event_row_refreshes_generation() {
-        let dir = tmp_path(&std::env::temp_dir().join("agrep-event-manifest-test"));
+        let root = tmp_path(&std::env::temp_dir().join("agrep-event-manifest-test"));
+        let dir = root.join("events");
         let events = [test_event()];
         let fname = event_fname("codex", "session-1");
         let keep = HashSet::from([fname.clone()]);
@@ -4204,7 +4594,7 @@ mod tests {
         assert_eq!(fs::read(&generation_path).unwrap(), generation_body);
         assert!(fs::metadata(&generation_path).unwrap().modified().unwrap() > pinned_mtime);
 
-        fs::remove_dir_all(dir).ok();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -6384,7 +6774,6 @@ mod tests {
         let root = tmp_path(&std::env::temp_dir().join("agrep-family-meta"));
         fs::create_dir_all(&root).unwrap();
         let sessions = root.join("sessions.jsonl");
-        let meta = root.join(SESSION_FAMILY_META_FILE);
         let mut messages = vec![Message {
             agent: "codex",
             project: "project".into(),
@@ -6400,35 +6789,32 @@ mod tests {
             side: true,
             parent: "root".into(),
         }];
-        write_session_index(&messages, &sessions, &meta, "1:first").unwrap();
-        let first: serde_json::Value = serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
+        let (_, meta) = write_session_index(&messages, &[], &sessions, "1:first").unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&meta).unwrap();
         assert_eq!(
             first["digest"],
-            "c1c7707327949139ce23522fdb772b08d9e8ff0345f42200"
+            "c2e7baea9bc8402efb6ddd59b11482b4158cdbe4544c6200"
         );
         assert_eq!(first["algorithm"], SESSION_FAMILY_DIGEST_ALGORITHM);
 
         messages[0].text = "different prose".into();
         messages[0].project = "different project".into();
-        write_session_index(&messages, &sessions, &meta, "1:second").unwrap();
-        let second: serde_json::Value = serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
+        let (_, meta) = write_session_index(&messages, &[], &sessions, "1:second").unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&meta).unwrap();
         assert_eq!(first["digest"], second["digest"]);
         assert_eq!(second["ingest_signature"], "1:second");
 
         messages[0].parent = "other-root".into();
-        write_session_index(&messages, &sessions, &meta, "1:third").unwrap();
-        let third: serde_json::Value = serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
+        let (_, meta) = write_session_index(&messages, &[], &sessions, "1:third").unwrap();
+        let third: serde_json::Value = serde_json::from_slice(&meta).unwrap();
         assert_ne!(second["digest"], third["digest"]);
         fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn session_family_meta_precedes_the_session_file() {
+    fn session_index_never_publishes_the_family_proof_itself() {
         let root = tmp_path(&std::env::temp_dir().join("agrep-family-order"));
         fs::create_dir_all(&root).unwrap();
-        let blocked = root.join("blocked");
-        fs::write(&blocked, b"not a directory").unwrap();
-        let sessions = blocked.join("sessions.jsonl");
         let meta = root.join(SESSION_FAMILY_META_FILE);
         let messages = vec![Message {
             agent: "codex",
@@ -6445,11 +6831,24 @@ mod tests {
             side: false,
             parent: "".into(),
         }];
-        assert!(write_session_index(&messages, &sessions, &meta, "1:order").is_err());
-        let published: serde_json::Value =
-            serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
-        assert_eq!(published["ingest_signature"], "1:order");
-        assert!(!sessions.exists());
+        let sessions = root.join("sessions.jsonl");
+        let (count, proof) = write_session_index(&messages, &[], &sessions, "1:order").unwrap();
+        assert_eq!(count, 1);
+        let returned: serde_json::Value = serde_json::from_slice(&proof).unwrap();
+        assert_eq!(returned["ingest_signature"], "1:order");
+        assert!(sessions.exists());
+        assert!(
+            !meta.exists(),
+            "the proof belongs to the marker commit, not the row write"
+        );
+
+        let blocked = root.join("blocked");
+        fs::write(&blocked, b"not a directory").unwrap();
+        assert!(
+            write_session_index(&messages, &[], &blocked.join("sessions.jsonl"), "1:order")
+                .is_err()
+        );
+        assert!(!meta.exists());
         fs::remove_dir_all(root).ok();
     }
 
@@ -6473,23 +6872,20 @@ mod tests {
             parent: parent.into(),
         };
         let first_sessions = root.join("first.jsonl");
-        let first_meta = root.join("first.meta.json");
         let first = vec![message(""), message("root")];
-        write_session_index(&first, &first_sessions, &first_meta, "2:first").unwrap();
+        let (_, first_meta) = write_session_index(&first, &[], &first_sessions, "2:first").unwrap();
 
         let second_sessions = root.join("second.jsonl");
-        let second_meta = root.join("second.meta.json");
         let second = vec![message("root"), message("")];
-        write_session_index(&second, &second_sessions, &second_meta, "2:second").unwrap();
+        let (_, second_meta) =
+            write_session_index(&second, &[], &second_sessions, "2:second").unwrap();
 
         let first_row: serde_json::Value =
             serde_json::from_slice(&fs::read(&first_sessions).unwrap()).unwrap();
         let second_row: serde_json::Value =
             serde_json::from_slice(&fs::read(&second_sessions).unwrap()).unwrap();
-        let first_proof: serde_json::Value =
-            serde_json::from_slice(&fs::read(&first_meta).unwrap()).unwrap();
-        let second_proof: serde_json::Value =
-            serde_json::from_slice(&fs::read(&second_meta).unwrap()).unwrap();
+        let first_proof: serde_json::Value = serde_json::from_slice(&first_meta).unwrap();
+        let second_proof: serde_json::Value = serde_json::from_slice(&second_meta).unwrap();
         assert_eq!(first_row["parent"], "root");
         assert_eq!(second_row["parent"], "root");
         assert_eq!(first_proof["digest"], second_proof["digest"]);
@@ -6519,13 +6915,144 @@ mod tests {
             parent: parent.into(),
         };
         let sessions = root.join("sessions.jsonl");
-        let meta = root.join(SESSION_FAMILY_META_FILE);
         let messages = vec![message("root-a"), message("root-b")];
-        let count = write_session_index(&messages, &sessions, &meta, "2:conflict").unwrap();
+        let (count, proof) = write_session_index(&messages, &[], &sessions, "2:conflict").unwrap();
         assert_eq!(count, 1);
         let row: serde_json::Value = serde_json::from_slice(&fs::read(&sessions).unwrap()).unwrap();
         assert_eq!(row["parent"], "root-a");
-        assert!(meta.exists());
+        assert!(!proof.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn family_message(session: &str, parent: &str) -> Message {
+        Message {
+            agent: "pi",
+            project: "project".into(),
+            session: session.into(),
+            ts: 1,
+            turn: 0,
+            text: "hello".into(),
+            who: "user".into(),
+            model: "".into(),
+            model_source: "unknown".into(),
+            reply: "".into(),
+            reply_chars: 0,
+            side: !parent.is_empty(),
+            parent: parent.into(),
+        }
+    }
+
+    fn alias(alias: &str, session: &str) -> SessionAlias {
+        SessionAlias {
+            agent: "pi",
+            alias: alias.into(),
+            session: session.into(),
+        }
+    }
+
+    fn session_rows(path: &Path) -> BTreeMap<String, serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                (row["session"].as_str().unwrap().to_string(), row)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_filename_alias_reattaches_the_children_and_is_published_on_the_root() {
+        // The root's header was rewritten to `header-id`; its sidechat container and every
+        // child still name the filename id. One family, both ids in the row.
+        let root = tmp_path(&std::env::temp_dir().join("agrep-family-alias"));
+        fs::create_dir_all(&root).unwrap();
+        let sessions = root.join("sessions.jsonl");
+        let messages = vec![
+            family_message("header-id", ""),
+            family_message("child", "file-id"),
+            family_message("later-child", "file-id"),
+        ];
+        let (_, plain) = write_session_index(&messages, &[], &sessions, "3:plain").unwrap();
+        let rows = session_rows(&sessions);
+        assert_eq!(rows["child"]["parent"], "file-id");
+        assert!(rows["header-id"].get("alias").is_none());
+
+        let (_, aliased) = write_session_index(
+            &messages,
+            &[alias("file-id", "header-id")],
+            &sessions,
+            "3:plain",
+        )
+        .unwrap();
+        let rows = session_rows(&sessions);
+        assert_eq!(rows["header-id"]["alias"], "file-id");
+        assert!(rows["header-id"].get("parent").is_none());
+        assert_eq!(rows["child"]["parent"], "header-id");
+        assert_eq!(rows["later-child"]["parent"], "header-id");
+        assert!(!rows.contains_key("file-id"));
+        let plain: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        let aliased: serde_json::Value = serde_json::from_slice(&aliased).unwrap();
+        assert_ne!(plain["digest"], aliased["digest"]);
+        assert_eq!(aliased["version"], SESSION_FAMILY_META_VERSION);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ambiguous_aliases_are_dropped_rather_than_guessed() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-family-alias-collide"));
+        fs::create_dir_all(&root).unwrap();
+        let sessions = root.join("sessions.jsonl");
+        let messages = vec![
+            family_message("root-a", ""),
+            family_message("root-b", ""),
+            family_message("root-c", ""),
+            family_message("child", "shared"),
+        ];
+        write_session_index(
+            &messages,
+            &[
+                // names another indexed session: never an alias
+                alias("root-b", "root-a"),
+                // two sessions claim it: ambiguous
+                alias("shared", "root-a"),
+                alias("shared", "root-b"),
+                // no rows to attach to
+                alias("orphan-file", "unindexed"),
+                // one session, two filename ids: the first survives
+                alias("second-name", "root-c"),
+                alias("first-name", "root-c"),
+            ],
+            &sessions,
+            "3:collide",
+        )
+        .unwrap();
+        let rows = session_rows(&sessions);
+        assert!(rows["root-a"].get("alias").is_none());
+        assert!(rows["root-b"].get("alias").is_none());
+        assert_eq!(rows["child"]["parent"], "shared");
+        assert_eq!(rows["root-c"]["alias"], "first-name");
+        assert!(!rows.contains_key("unindexed"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn the_generation_seal_follows_the_published_rows_not_the_session_index() {
+        let root = tmp_path(&std::env::temp_dir().join("agrep-generation-seal"));
+        fs::create_dir_all(&root).unwrap();
+        let replace = |name: &str, body: &str| {
+            let staged = root.join(format!("{name}.staged"));
+            fs::write(&staged, body).unwrap();
+            fs::rename(&staged, root.join(name)).unwrap();
+        };
+        replace("sessions.jsonl", "{\"session\":\"a\"}\n");
+        replace("messages.jsonl", "{\"text\":\"a\"}\n");
+        let sealed = published_generation_seal(&root).unwrap();
+        // A pass killed after replacing only sessions.jsonl leaves the old rows published.
+        replace("sessions.jsonl", "{\"session\":\"b\"}\n");
+        assert_eq!(published_generation_seal(&root), Some(sealed));
+        replace("messages.jsonl", "{\"text\":\"b\"}\n");
+        assert_ne!(published_generation_seal(&root), Some(sealed));
         fs::remove_dir_all(root).ok();
     }
 }
