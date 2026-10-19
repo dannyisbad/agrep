@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 — 2026-10-07
+
+### Index integrity and ownership
+
+- A pass killed after it replaced the published rows but before it recorded
+  its source inventory no longer costs rows later. That inventory never
+  listed a source the pass had added, and once such a source could not be
+  read (a Codex rollout gone mode 000, or its day directory locked with the
+  parse cache lost), `index --full` took its absence as proof it had
+  published nothing and exited 0 without its rows; plain passes then kept
+  them dropped. An `--emit-rows` pass, which publishes rows without an
+  inventory, left the same gap. The inventory is now sealed to the published
+  messages.jsonl and trusted only while it matches or no publication is in
+  flight, so such a pass keeps the rows from its cache or refuses, naming
+  the source, until it is readable again.
+
+### Status, doctor and setup
+
+- `agrep audit --full` no longer reports an accounting error for an agent
+  whose store was deleted. Its leftover tallies count among the tallied files
+  no longer on disk, as other deleted transcripts' do, instead of as that
+  agent having no fresh evidence.
+
 ## 0.4.0 — 2026-10-06
 
 ### Agent coverage

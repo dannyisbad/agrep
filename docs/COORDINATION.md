@@ -124,9 +124,16 @@ serialized and disclosed on source health, and an emit-rows handoff whose
 published-bytes residue is proven current is retired by the next run's all-hit
 shortcut. `.source_snapshot.bin` is the validated source generation
 and is committed last, after messages, replies, sessions, events, cache, and
-derived proofs. A first-use reader accepts the generation only when the pending
-marker is absent and the nonempty regular snapshot's identity and metadata stay
-stable across the coupled derived-publication health check.
+derived proofs; `.source_snapshot.seal` follows it, naming the identity of the
+messages.jsonl it inventories. The publication guard consults the snapshot as
+that generation's inventory only while no publication is pending or the seal
+names the published messages.jsonl; the all-hit shortcut, having proven the
+snapshot current, re-seals it. With neither, and no decodable cache to stand in,
+a never-published unreadable scope refuses publication until it is readable:
+held rows the snapshot never listed may lie under it. A first-use reader accepts
+the generation only when the pending marker is absent and the nonempty regular
+snapshot's identity and metadata stay stable across the coupled
+derived-publication health check.
 
 Family metadata stays staged while events and cache are updated. It is
 published with the derived proofs immediately before `.ingest.sig`. Family

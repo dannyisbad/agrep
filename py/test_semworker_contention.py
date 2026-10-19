@@ -1029,9 +1029,11 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         connection = mock.Mock()
         connection.sock = mock.Mock()
         connection.getresponse.side_effect = TimeoutError("expired")
+        # A frozen clock keeps a slow runner from expiring the 0.1 s budget before the request.
         with mock.patch.object(
                 semworker.http.client, "HTTPConnection",
                 return_value=connection), \
+                mock.patch.object(semworker.time, "monotonic", return_value=1_000.0), \
                 mock.patch.object(
                     semworker, "_cancel_timed_out_worker",
                     return_value=True) as cancel:

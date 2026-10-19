@@ -391,8 +391,8 @@ class ReleaseRepositoryPolicyTests(unittest.TestCase):
         preflight = jobs["release-preflight"]
         self.assertEqual(
             _job_field(preflight, "if"),
-            "${{ github.event_name != 'workflow_dispatch' "
-            "|| !inputs.recover_v030 }}")
+            "${{ github.repository == 'dannyisbad/agrep' "
+            "&& (github.event_name != 'workflow_dispatch' || !inputs.recover_v030) }}")
 
     def test_branch_dispatch_remains_available_for_read_only_builds(self):
         trigger = self.text[:self.text.index("\npermissions:\n")]
