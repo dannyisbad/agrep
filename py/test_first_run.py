@@ -18,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "py"))
 
+from _test_support import fixture_tree  # noqa: E402
+
 import proc as process_utils  # noqa: E402
 
 CLI = ROOT / "cli.py"
@@ -92,13 +94,16 @@ class FirstRunIntegrationTests(unittest.TestCase):
         return env
 
     def _run(
-        self, home: Path, data: Path, *args: str,
+        self, home: Path, data: Path, *args: str, timing: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.assertTrue(RELEASE_BIN.is_file(), f"release binary missing: {RELEASE_BIN}")
+        env = self._env(home, data)
+        if timing:
+            env["AGREP_TIMING"] = "1"
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
-            env=self._env(home, data),
+            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -106,6 +111,15 @@ class FirstRunIntegrationTests(unittest.TestCase):
             timeout=90,
             check=False,
         )
+
+    def _constant(self, home: Path, data: Path, name: str) -> float:
+        """A product timing constant, read in the sandboxed environment."""
+        probe = subprocess.run(
+            [sys.executable, "-c", f"import indexd_runtime; print(indexd_runtime.{name})"],
+            cwd=ROOT / "py", env=self._env(home, data), capture_output=True,
+            text=True, encoding="utf-8", timeout=60, check=False)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        return float(probe.stdout.strip())
 
     def _assert_publication(self, data: Path, term: str) -> None:
         required = (
@@ -186,14 +200,14 @@ class FirstRunIntegrationTests(unittest.TestCase):
                                         for row in windows))
 
     def test_explicit_index_requires_a_real_fts_publication(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-firstuse-fts-ok-") as raw:
+        with fixture_tree(prefix="agrep-firstuse-fts-ok-") as raw:
             home, data, term = self._fixture(Path(raw), "ftsok")
             result = self._run(home, data, "index")
             self.assertEqual(result.returncode, 0, result.stderr)
             self._assert_publication(data, term)
 
     def test_simultaneous_first_searches_never_fail_silently(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-firstuse-first-race-") as raw:
+        with fixture_tree(prefix="agrep-firstuse-first-race-") as raw:
             home, data, term = self._fixture(Path(raw), "race")
             command = [sys.executable, str(CLI), "search", "--json", term]
             workers = [subprocess.Popen(
@@ -226,7 +240,7 @@ class FirstRunIntegrationTests(unittest.TestCase):
 
     @unittest.skipIf(sys.platform == "win32", "POSIX signal delivery")
     def test_interrupted_cold_search_allows_an_immediate_retry(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-firstuse-first-interrupt-") as raw:
+        with fixture_tree(prefix="agrep-firstuse-first-interrupt-") as raw:
             home, data, term = self._fixture(Path(raw), "interrupt")
             source = next((home / ".claude" / "projects").rglob("*.jsonl"))
             original = source.read_text(encoding="utf-8")
@@ -292,17 +306,25 @@ class FirstRunIntegrationTests(unittest.TestCase):
                             break
 
             source.write_text(original, encoding="utf-8")
-            started = time.monotonic()
-            retry = self._run(home, data, "search", term, "--classic")
-            elapsed = time.monotonic() - started
+            retry = self._run(home, data, "search", term, "--classic", timing=True)
             self.assertEqual(retry.returncode, 0, retry.stderr)
             self.assertIn(term, retry.stdout)
             self.assertNotIn("another first-run indexer", retry.stderr.lower())
-            self.assertLess(elapsed, 5.0, f"immediate retry stalled for {elapsed:.2f}s")
+            # A retry that honours the interrupted run's claim waits out the
+            # startup grace inside the command; interpreter start and imports
+            # are host load, not a stall.
+            report = re.search(r"(?m)^took (\d+\.\d+)s: (.*)$", retry.stderr)
+            self.assertIsNotNone(report, retry.stderr)
+            imports = re.search(r"(?:^|· )imports (\d+\.\d+)s", report.group(2))
+            self.assertIsNotNone(imports, retry.stderr)
+            grace = self._constant(home, data, "_INDEXD_STARTUP_GRACE_S")
+            self.assertLess(
+                float(report.group(1)) - float(imports.group(1)), grace / 2,
+                f"immediate retry stalled: {report.group(0)}")
             self._assert_publication(data, term)
 
     def test_explicit_index_is_nonzero_when_real_fts_publication_fails(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-firstuse-fts-fail-") as raw:
+        with fixture_tree(prefix="agrep-firstuse-fts-fail-") as raw:
             home, data, term = self._fixture(Path(raw), "ftsfail")
             seeded = self._run(home, data, "index")
             self.assertEqual(seeded.returncode, 0, seeded.stderr)

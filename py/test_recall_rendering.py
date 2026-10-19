@@ -133,7 +133,7 @@ class _TTYBuffer(io.StringIO):
 
 def _run_recall(argv, run_query=None, agent_context=False, windows=None,
                 stderr_tty=False, self_scope_has_rows=None,
-                self_scope_has_matches=None, prog="recall"):
+                self_scope_has_matches=None, prog="recall", expand=None):
     stdout = io.StringIO()
     stderr = _TTYBuffer() if stderr_tty else io.StringIO()
     query = run_query or (
@@ -167,10 +167,13 @@ def _run_recall(argv, run_query=None, agent_context=False, windows=None,
             mock.patch.object(recall.explore, "get_windows",
                               side_effect=windows or _windows), \
             mock.patch.object(recall, "_expand",
-                              side_effect=lambda pairs, *a, **k: pairs), \
+                              side_effect=expand or (lambda pairs, *a, **k: pairs)), \
             contextlib.redirect_stdout(stdout), \
             contextlib.redirect_stderr(stderr):
-        rc = recall.main(argv, prog=prog)
+        try:
+            rc = recall.main(argv, prog=prog)
+        except SystemExit as exc:
+            rc = exc.code
     return rc, stdout.getvalue(), stderr.getvalue()
 
 
@@ -564,6 +567,50 @@ class RecallMetaTests(unittest.TestCase):
         self.assertNotRegex(err, r"\d+ hits? · ")
 
 
+class RecallEventsUnavailableTests(unittest.TestCase):
+    """A window whose event store could not be read was rendered as one with no tool
+    events, with nothing said; recall now says so the way around does."""
+
+    @staticmethod
+    def _windows(blind: str):
+        def windows(requests):
+            out = _windows(requests)
+            for window in out:
+                window["events_unavailable"] = window["session"] == blind
+            return out
+        return windows
+
+    def test_a_window_without_its_tool_events_is_disclosed(self):
+        rc, out, err = _run_recall(
+            ["needle", "--lexical", "--budget", "0", "--json"], windows=self._windows(WEAK))
+        self.assertEqual(rc, 0, err)
+        payload = json.loads(out)
+        flags = {hit["session"]: hit.get("events_unavailable") for hit in payload["hits"]}
+        self.assertEqual(flags, {STRONG: None, WEAK: True})
+        kinds = [note["kind"] for note in payload["served"]["divergences"]]
+        self.assertEqual(kinds, ["events_unavailable"])
+        self.assertIn("tool events are unavailable right now", err)
+
+        rc, _out, err = _run_recall(
+            ["needle", "--lexical", "--budget", "0"], windows=self._windows(WEAK))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("tool events are unavailable right now", err)
+
+    def test_readable_windows_disclose_nothing(self):
+        rc, out, err = _run_recall(
+            ["needle", "--lexical", "--budget", "0", "--json"], windows=self._windows(""))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("served", json.loads(out))
+        self.assertNotIn("tool events are unavailable", err)
+
+    def test_merged_windows_keep_the_flag_of_either_part(self):
+        first, second = _windows([(STRONG, 3, 1), (STRONG, 9, 1)])
+        second["events_unavailable"] = True
+        merged = recall._merge_chat_windows([(_hits()[0], first), (_hits()[0], second)])
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(merged[0][1]["events_unavailable"])
+
+
 class RecallColorTests(unittest.TestCase):
     def test_color_off_when_piped(self):
         _rc, out, _err = _run_recall(["needle", "--lexical", "--budget", "0"])
@@ -908,6 +955,430 @@ class RecallLapTests(unittest.TestCase):
         labels = [call.args[0] for call in lap.call_args_list]
         for phase in ("freshen", "query", "windows", "expand", "render"):
             self.assertIn(phase, labels)
+
+
+PACK_CHAT = "01990000-0000-7000-8000-00000000000a"
+
+
+def _pack_hit(query: str, turn: int) -> dict:
+    text = f"{query} evidence at turn {turn}"
+    return {"session": PACK_CHAT, "turn": turn, "ts": 1 + turn, "who": "user",
+            "agent": "codex", "project": "agrep", "score": 2.0,
+            "matched": "phrase", "snippet": text,
+            "content_digest": compact.content_digest(text)}
+
+
+def _pack_windows(requests):
+    out = []
+    for sess, center, context in requests:
+        turns = [{"turn": turn, "ts": 1 + turn, "who": "user",
+                  "text": (f"escprobe evidence at turn {turn}" if turn == 0 else
+                           f"metaprobe evidence at turn {turn}" if turn == 3 else
+                           f"context line {turn}"),
+                  "reply": f"reply {turn}"}
+                 for turn in range(max(0, center - context), center + context + 1)]
+        out.append({"session": sess, "center": center, "first_turn": 0,
+                    "last_turn": 40, "agent": "codex", "project": "agrep",
+                    "events": [], "turns": turns})
+    return out
+
+
+class PackSameChatTests(unittest.TestCase):
+    """pack dedupes by (session, turn): a chat may serve two queries at two turns."""
+
+    def _run_pack(self, argv, hits):
+        def query(q, mode="keyword", **kwargs):
+            if kwargs.get("who") == "tool":
+                return _result([])
+            return _result([dict(hit) for hit in hits.get(q, [])])
+        return _run_recall(
+            [*argv, "--lexical", "--budget", "0", "--color", "never"],
+            run_query=query, windows=_pack_windows, prog="pack")
+
+    def test_second_query_keeps_its_turn_in_an_already_chosen_chat(self):
+        hits = {"escprobe": [_pack_hit("escprobe", 0)],
+                "metaprobe": [_pack_hit("metaprobe", 3)]}
+        rc, out, err = self._run_pack(["escprobe", "metaprobe", "-C", "0"], hits)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("escprobe evidence at turn 0", out)
+        self.assertIn("metaprobe evidence at turn 3", out)
+        # one chronological block per chat, the gap between the hit turns marked
+        self.assertEqual(out.count("── "), 1)
+        self.assertIn("[turns 1-2 not shown]", out)
+        self.assertLess(out.index("escprobe evidence"), out.index("metaprobe evidence"))
+
+        rc, out, err = self._run_pack(
+            ["escprobe", "metaprobe", "-C", "0", "--json"], hits)
+        self.assertEqual(rc, 0, err)
+        payload = json.loads(out)
+        self.assertEqual([hit["turn"] for hit in payload["hits"]], [0])
+        rows = [(row["turn"], row["who"]) for hit in payload["hits"]
+                for row in hit["window"] if row["kind"] == "msg"]
+        self.assertEqual(rows, [(0, "user"), (0, "agent"), (3, "user"), (3, "agent")])
+
+    def test_overlapping_windows_in_one_chat_render_each_turn_once(self):
+        for second_turn, rows_shown in ((3, [0, 1, 2, 3, 4, 5]), (1, [0, 1, 2, 3])):
+            hits = {"escprobe": [_pack_hit("escprobe", 0)],
+                    "metaprobe": [_pack_hit("metaprobe", second_turn)]}
+            with self.subTest(second_turn=second_turn):
+                rc, out, err = self._run_pack(
+                    ["escprobe", "metaprobe", "-C", "2", "--json"], hits)
+                self.assertEqual(rc, 0, err)
+                payload = json.loads(out)
+                self.assertEqual(len(payload["hits"]), 1)
+                shown = [row["turn"] for row in payload["hits"][0]["window"]
+                         if row["kind"] == "msg" and row["who"] == "user"]
+                self.assertEqual(shown, rows_shown)
+
+                rc, out, err = self._run_pack(
+                    ["escprobe", "metaprobe", "-C", "2"], hits)
+                self.assertEqual(rc, 0, err)
+                self.assertNotIn("not shown", out)
+                for turn in rows_shown:
+                    self.assertEqual(out.count(f"\n  {turn:>4} user:"), 1, turn)
+
+    def test_a_single_query_still_takes_one_turn_per_chat(self):
+        hits = {"escprobe": [_pack_hit("escprobe", 0), _pack_hit("escprobe", 3)]}
+        rc, out, err = _run_recall(
+            ["escprobe", "--lexical", "--budget", "0", "-C", "0", "--json"],
+            run_query=lambda q, mode="keyword", **kw: _result(
+                [] if kw.get("who") == "tool" else [dict(h) for h in hits[q]]),
+            windows=_pack_windows)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(json.loads(out)["hits"]), 1)
+
+    def test_select_and_merge_contracts(self):
+        chosen = recall._select([
+            {"session": "a", "turn": 0, "_recall_query": 0},
+            {"session": "a", "turn": 3, "_recall_query": 1},
+            {"session": "a", "turn": 0, "_recall_query": 1},
+            {"session": "b", "turn": 7, "_recall_query": 1},
+        ], 4, 2, family_diverse=False)
+        self.assertEqual([(h["session"], h["turn"]) for h in chosen],
+                         [("a", 0), ("a", 3), ("b", 7)])
+
+        def window(center, turns):
+            return {"session": "a", "center": center,
+                    "turns": [{"turn": t} for t in turns],
+                    "events": [{"turn": t, "ts": t, "name": "x", "input": ""}
+                               for t in turns]}
+        pairs = recall._merge_chat_windows([
+            ({"turn": 3, "_recall_query": 1}, window(3, [2, 3, 4])),
+            ({"turn": 0, "_recall_query": 0}, window(0, [0, 1, 2])),
+        ])
+        self.assertEqual(len(pairs), 1)
+        merged = pairs[0][1]
+        self.assertEqual([t["turn"] for t in merged["turns"]], [0, 1, 2, 3, 4])
+        self.assertEqual([e["turn"] for e in merged["events"]], [0, 1, 2, 3, 4])
+        self.assertEqual(merged["hit_turns"], {0, 3})
+        self.assertEqual(merged["queries"], [1, 0])
+        self.assertEqual(recall._gap_line(2, 4), "       [turn 3 not shown]")
+        self.assertEqual(recall._gap_line(0, 9), "       [turns 1-8 not shown]")
+
+    def test_a_second_block_that_fits_the_remainder_is_not_over_budget(self):
+        # the block reserve (budget // judgeable block) once dropped a small second
+        # chat as "over budget" with most of the budget unused
+        other = "01990000-0000-7000-8000-00000000000b"
+        hits = [dict(_pack_hit("escprobe", 0)),
+                {**_pack_hit("escprobe", 0), "session": other, "score": 1.5}]
+        budget = recall._JUDGEABLE_BLOCK + 400
+        rc, out, err = _run_recall(
+            ["escprobe", "--lexical", "--budget", str(budget), "-C", "0",
+             "--color", "never"],
+            run_query=lambda q, mode="keyword", **kw: _result(
+                [] if kw.get("who") == "tool" else [dict(h) for h in hits]),
+            windows=_pack_windows)
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(out.encode("utf-8")), budget)
+        self.assertEqual(out.count("── "), 2)
+        self.assertNotIn("over budget", out)
+
+    def test_every_hit_turn_renders_before_any_block_widens(self):
+        # at a low budget one block's widening past -C 0 once beat the other hits
+        # ("9 turns at 599 bytes, +2 hits over budget")
+        sessions = ["01990000-0000-7000-8000-00000000000%x" % i for i in range(3)]
+        hits = [{**_pack_hit("escprobe", 0), "session": s, "score": 2.0 - i / 10}
+                for i, s in enumerate(sessions)]
+
+        def windows(requests):
+            out = []
+            for sess, center, context in requests:
+                turns = [{"turn": turn, "ts": 1 + turn, "who": "user",
+                          "text": f"escprobe evidence at turn {turn} in {sess[-1]}",
+                          "reply": f"reply {turn} " + "context " * 12}
+                         for turn in range(max(0, center - context), center + context + 1)]
+                out.append({"session": sess, "center": center, "first_turn": 0,
+                            "last_turn": 8, "agent": "codex", "project": "agrep",
+                            "events": [], "turns": turns})
+            return out
+
+        def widen(pairs, *_a, **_k):
+            # expansion offers the first chat whole, as a term scan would
+            first_hit, first = pairs[0]
+            whole = {**windows([(first["session"], 4, 4)])[0], "center": 0}
+            return [(first_hit, whole), *pairs[1:]]
+
+        budget = 1100
+        rc, out, err = _run_recall(
+            ["escprobe", "--lexical", "--budget", str(budget), "-C", "0",
+             "--hits", "3", "--color", "never"],
+            run_query=lambda q, mode="keyword", **kw: _result(
+                [] if kw.get("who") == "tool" else [dict(h) for h in hits]),
+            windows=windows, expand=widen)
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(out.encode("utf-8")), budget)
+        self.assertNotIn("over budget", out)
+        for sess in sessions:
+            self.assertIn(f"escprobe evidence at turn 0 in {sess[-1]}", out)
+
+    def test_a_big_block_is_cut_to_its_share_so_the_other_query_renders(self):
+        # one big bigprobe chat once filled --budget 400/600/900 whole and the
+        # escprobe chat vanished from the text page
+        big, small = PACK_CHAT, "01990000-0000-7000-8000-00000000000b"
+        hits = {"bigprobe": [{**_pack_hit("bigprobe", 1), "session": big}],
+                "escprobe": [{**_pack_hit("escprobe", 0), "session": small}]}
+
+        def windows(requests):
+            out = []
+            for sess, center, _context in requests:
+                if sess == big:
+                    turn = {"turn": 1, "ts": 2, "who": "user",
+                            "text": "bigprobe " + "lorem ipsum filler words " * 300,
+                            "reply": "big reply " + "more filler text " * 300}
+                else:
+                    turn = {"turn": 0, "ts": 1, "who": "user",
+                            "text": "escprobe found the module quickly",
+                            "reply": "escprobe confirmed"}
+                out.append({"session": sess, "center": center, "first_turn": turn["turn"],
+                            "last_turn": turn["turn"], "agent": "codex",
+                            "project": "agrep", "events": [], "turns": [turn]})
+            return out
+
+        def pack(budget):
+            return _run_recall(
+                ["bigprobe", "escprobe", "--lexical", "-C", "0", "--budget",
+                 str(budget), "--color", "never"],
+                run_query=lambda q, mode="keyword", **kw: _result(
+                    [] if kw.get("who") == "tool" else
+                    [dict(h) for h in hits.get(q, [])]),
+                windows=windows, prog="pack")
+
+        for budget in (600, 900):
+            with self.subTest(budget=budget):
+                rc, out, err = pack(budget)
+                self.assertEqual(rc, 0, err)
+                self.assertLessEqual(len(out.encode("utf-8")), budget)
+                self.assertEqual(out.count("── "), 2)
+                self.assertIn("escprobe found the module quickly", out)
+                self.assertNotIn("over budget", out)
+                self.assertIn("bigprobe", out)
+                self.assertIn("agrep around", out)
+        # too small for a judgeable share each: the big hit renders, the other is
+        # evicted and accounted for - its handle when it fits, else the count alone
+        rc, out, err = pack(400)
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(out.encode("utf-8")), 400)
+        self.assertEqual(out.count("── "), 1)
+        self.assertIn("bigprobe", out)
+        self.assertRegex(out, r"\[\+1 hit\(s\) over budget - (@" + small[:8]
+                         + r"|\+1 more \(see --json omitted_hits\))")
+        rc, out, err = pack(300)
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(out.encode("utf-8")), 300)
+        self.assertTrue(out.startswith("── @" + big[:8]))
+        self.assertRegex(out, r"\[\+1 hit\(s\) over budget")
+
+    def test_final_cap_names_every_block_it_evicts_whole(self):
+        blocks = [f"── @{chr(97 + i)}:1.0000 · codex · agrep\n     1 user: " + f"block {i} "
+                  + "evidence " * 20 for i in range(4)]
+        text = "\n\n".join(blocks)
+        ends, off = [], 0
+        for i, block in enumerate(blocks):
+            off += len(block)
+            ends.append((off, f"@{chr(97 + i)}:1.0000"))
+            off += 2
+        page = recall._fit_text_payload(text, 420, ends, "")
+        self.assertLessEqual(len(page.encode("utf-8")), 420)
+        self.assertIn("block 0", page)
+        self.assertRegex(page, r"\[\+\d+ hit\(s\) over budget - @c:1\.0000 @d:1\.0000\]")
+        self.assertIn("rest at @b:1.0000", page)
+        # a loop-built trailer keeps its count and gains the blocks the cap evicts
+        page = recall._fit_text_payload(
+            text, 420, ends, "[+2 hit(s) over budget - @e:1.0000 @f:1.0000]")
+        self.assertLessEqual(len(page.encode("utf-8")), 420)
+        self.assertRegex(page, r"\[\+\d+ hit\(s\) over budget - (@[a-f]:1\.0000 ?)+\]")
+        self.assertIn("@e:1.0000", page)
+        self.assertIn("@f:1.0000", page)
+        # the count is the loop's two plus the blocks the cap evicted
+        count = int(re.search(r"\[\+(\d+) hit\(s\) over budget", page).group(1))
+        named = re.findall(r"@[a-f]:1\.0000", page.rsplit("\n", 1)[-1])
+        self.assertEqual(count, 2 + (len(named) - 2))
+
+    def test_trailer_never_displaces_the_first_block(self):
+        # `pack manyprobe escprobe hugeprobe --budget 300 --hits 12` once printed a
+        # 259-byte handle list and no evidence at all
+        sessions = ["01990000-0000-7000-8000-0000000000%02x" % i for i in range(12)]
+        hits = {"manyprobe": [{**_pack_hit("manyprobe", 0), "session": s}
+                              for s in sessions[:10]],
+                "escprobe": [{**_pack_hit("escprobe", 0), "session": sessions[10]}],
+                "hugeprobe": [{**_pack_hit("hugeprobe", 0), "session": sessions[11]}]}
+
+        def windows(requests):
+            out = []
+            for sess, center, _context in requests:
+                huge = sess == sessions[11]
+                out.append({"session": sess, "center": center, "first_turn": 0,
+                            "last_turn": 0, "agent": "codex", "project": "agrep",
+                            "events": [], "turns": [{
+                                "turn": 0, "ts": 1, "who": "user",
+                                "text": ("hugeprobe " + "filler " * 400) if huge
+                                else f"probe evidence in {sess[-2:]}",
+                                "reply": "reply " + "words " * (200 if huge else 5)}]})
+            return out
+
+        for budget, blocks in ((300, 1), (500, 2), (900, 3)):
+            with self.subTest(budget=budget):
+                rc, out, err = _run_recall(
+                    ["manyprobe", "escprobe", "hugeprobe", "--lexical", "--budget",
+                     str(budget), "--hits", "12", "--color", "never"],
+                    run_query=lambda q, mode="keyword", **kw: _result(
+                        [] if kw.get("who") == "tool" else
+                        [dict(h) for h in hits.get(q, [])]),
+                    windows=windows, prog="pack")
+                self.assertEqual(rc, 0, err)
+                self.assertLessEqual(len(out.encode("utf-8")), budget)
+                self.assertTrue(out.startswith("── @" + sessions[0][:8]), out[:80])
+                self.assertIn("probe evidence in 00", out)
+                self.assertEqual(out.count("── "), blocks)
+                trailer = re.search(r"\[\+(\d+) hit\(s\) over budget - ([^\]]*)\]\s*\Z", out)
+                self.assertIsNotNone(trailer, out[-200:])
+                self.assertEqual(int(trailer.group(1)), 12 - blocks)
+                named = re.findall(r"@[0-9a-f-]+:\d+\.[0-9a-f]+", trailer.group(2))
+                more = re.search(r"\+(\d+) more \(see --json omitted_hits\)",
+                                 trailer.group(2))
+                # every omitted hit is accounted for: named, or counted in "+K more"
+                self.assertEqual(len(named) + (int(more.group(1)) if more else 0),
+                                 12 - blocks)
+                self.assertTrue(named or more)
+
+    def test_tiny_budgets_keep_the_first_head_or_refuse_with_the_bytes_needed(self):
+        # 64-200 bytes once printed nothing but a handle list (rc 0); now the bare
+        # count and the first block's head render, with its match line when it fits,
+        # and below the head's own cost the budget is refused naming the bytes needed
+        sessions = ["01990000-0000-7000-8000-0000000000%02x" % i for i in range(12)]
+        big_text = "bigprobe " + "lorem ipsum filler words " * 300
+
+        def windows(requests):
+            out = []
+            for sess, center, _context in requests:
+                big = sess == sessions[11]
+                out.append({"session": sess, "center": center, "first_turn": 0,
+                            "last_turn": 0, "agent": "codex", "project": "agrep",
+                            "events": [], "turns": [{
+                                "turn": 0, "ts": 1, "who": "user",
+                                "text": big_text if big else f"probe evidence in {sess[-2:]}",
+                                "reply": "reply " + "words " * (200 if big else 5)}]})
+            return out
+
+        scenarios = (
+            ("manyprobe", ["manyprobe", "--hits", "10"],
+             {"manyprobe": [{**_pack_hit("manyprobe", 0), "session": s}
+                            for s in sessions[:10]]}, 10),
+            ("three queries", ["manyprobe", "escprobe", "hugeprobe", "--hits", "12"],
+             {"manyprobe": [{**_pack_hit("manyprobe", 0), "session": s}
+                            for s in sessions[:10]],
+              "escprobe": [{**_pack_hit("escprobe", 0), "session": sessions[10]}],
+              "hugeprobe": [{**_pack_hit("hugeprobe", 0), "session": sessions[11]}]}, 12),
+            ("bigprobe/escprobe", ["bigprobe", "escprobe"],
+             {"bigprobe": [{**_pack_hit("bigprobe", 0), "session": sessions[11]}],
+              "escprobe": [{**_pack_hit("escprobe", 0), "session": sessions[10]}]}, 2),
+        )
+        for label, argv, hits, total in scenarios:
+            need = None
+            for budget in (64, 100, 150, 200):
+                with self.subTest(scenario=label, budget=budget):
+                    rc, out, err = _run_recall(
+                        [*argv, "--lexical", "--budget", str(budget), "--color", "never"],
+                        run_query=lambda q, mode="keyword", **kw: _result(
+                            [] if kw.get("who") == "tool" else
+                            [dict(h) for h in hits.get(q, [])]),
+                        windows=windows, prog="pack")
+                    refusal = re.search(r"need at least (\d+) bytes", err)
+                    if refusal:
+                        need = int(refusal.group(1))
+                        self.assertEqual((rc, out), (2, ""))
+                        self.assertGreater(need, budget)
+                        self.assertIn(f"agrep pack: --budget {budget} is too small", err)
+                        continue
+                    self.assertEqual(rc, 0, err)
+                    self.assertLessEqual(len(out.encode("utf-8")), budget)
+                    self.assertEqual(out.count("── "), 1)
+                    head = out.split("\n", 1)[0]
+                    self.assertRegex(head, r"^── @01990000-[0-9a-f-]+:0\.[0-9a-f]{4} · codex")
+                    self.assertTrue(out.rstrip().endswith(
+                        f"[+{total - 1} hit(s) over budget - see --json omitted_hits]"), out)
+                    if need is not None and budget >= need + 40:
+                        self.assertRegex(out, r"\n     0 user: \S+")
+            self.assertIsNotNone(need, label)
+
+    def test_single_hit_pages_keep_the_whole_head_or_refuse(self):
+        # `recall hugeprobe --budget 64` once printed a lone '─' and at 80 cut the
+        # handle mid-digest, exit 0; the head is the floor for one hit too
+        sess = PACK_CHAT
+        hits = [{**_pack_hit("hugeprobe", 0), "session": sess}]
+
+        def windows(requests):
+            return [{"session": sess, "center": 0, "first_turn": 0, "last_turn": 0,
+                     "agent": "codex", "project": "agrep", "events": [], "turns": [{
+                         "turn": 0, "ts": 1, "who": "user",
+                         "text": "hugeprobe " + "filler " * 400,
+                         "reply": "reply " + "words " * 200}]}
+                    for _req in requests]
+
+        need = None
+        for budget in (64, 80, 100, 150, 200):
+            with self.subTest(budget=budget):
+                rc, out, err = _run_recall(
+                    ["hugeprobe", "--lexical", "--budget", str(budget), "--color", "never"],
+                    run_query=lambda q, mode="keyword", **kw: _result(
+                        [] if kw.get("who") == "tool" else [dict(h) for h in hits]),
+                    windows=windows)
+                refusal = re.search(r"need at least (\d+) bytes", err)
+                if refusal:
+                    need = int(refusal.group(1))
+                    self.assertEqual((rc, out), (2, ""))
+                    self.assertGreater(need, budget)
+                    self.assertIn(f"agrep recall: --budget {budget} is too small", err)
+                    continue
+                self.assertEqual(rc, 0, err)
+                self.assertLessEqual(len(out.encode("utf-8")), budget)
+                head = out.split("\n", 1)[0]
+                self.assertRegex(head, r"^── @" + sess + r":0\.[0-9a-f]{4} · codex · agrep")
+        self.assertIsNotNone(need)
+        self.assertLess(need, 150)
+
+    def test_the_cap_never_cuts_inside_a_later_blocks_head(self):
+        # two blocks, so no third block's eviction can move the cut by accident
+        blocks = [f"── @{chr(97 + i)}:1.0000 · codex · agrep\n     1 user: " + f"block {i} "
+                  + "evidence " * 12 for i in range(2)]
+        text = "\n\n".join(blocks)
+        ends, off = [], 0
+        for i, block in enumerate(blocks):
+            off += len(block)
+            ends.append((off, f"@{chr(97 + i)}:1.0000"))
+            off += 2
+        marker = len("\n[output truncated to --budget - rest at @b:1.0000]")
+        # budgets whose raw cut lands inside block 2's head line
+        for budget in range(len(blocks[0]) + 2 + marker + 4,
+                            len(blocks[0]) + 2 + marker + 30, 5):
+            with self.subTest(budget=budget):
+                page = recall._fit_text_payload(text, budget, ends, "")
+                self.assertLessEqual(len(page.encode("utf-8")), budget)
+                for m in re.finditer(r"@[ab]:1", page):
+                    self.assertIn(page[m.start():m.start() + 9], ("@a:1.0000", "@b:1.0000"))
+                self.assertNotRegex(page, r"── @b:1\.0{0,3}\n")
+                self.assertIn("block 0", page)
+                self.assertRegex(page, r"\[\+1 hit\(s\) over budget - @b:1\.0000\]")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,9 @@ chat templated relative to now, which proves the default 7d window.
 """
 
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import contextlib
 from datetime import datetime, timedelta, timezone
@@ -26,6 +29,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "py" / "fixtures" / "summary"
 TIME_TEMPLATE = re.compile(r"\{\{t((?:[+-]\d+[dhms])+)\}\}")
+# `{{repeat:z:70000}}`: a block past the 64,000-char reply cap, without a 70 KB fixture file
+REPEAT_TEMPLATE = re.compile(r"\{\{repeat:([^:}]+):(\d+)\}\}")
 MINUTE = 60_000
 
 S1 = "a1a1a1a1-0001-4000-8000-000000000001"  # atlas: 5m gap, 2h gap capped, 1m event tail
@@ -140,8 +145,30 @@ MX_CLAUDE_NOTIFIED_BY_AGENT = "ca000030-0530-4000-8000-000000000530"
 MX_CLAUDE_NOTIFIED_BY_LAUNCH = "ca000031-0531-4000-8000-000000000531"
 MX_CLAUDE_NOTIFIED_UNLINKED = "ca000032-0532-4000-8000-000000000532"
 MX_CLAUDE_NOTIFIED_UNLINKED_SIDE = "agent-ca32side01"
-# a next-steps list whose last bullet swallowed a later one-sentence reply block
+# a next-steps list, then a later reply block: a completion, or only a sign-off
 MX_CLAUDE_GLUED_BULLET = "ca000033-0533-4000-8000-000000000533"
+MX_CLAUDE_LIST_THEN_SIGN_OFF = "ca000035-0535-4000-8000-000000000535"
+# claude: commentary, a tool call, then nothing; a tool call, then the final text; the final
+# text, then only a todo write closing the list
+MX_CLAUDE_TOOL_AFTER_TEXT = "ca000036-0536-4000-8000-000000000536"
+MX_CLAUDE_TEXT_AFTER_TOOL = "ca000037-0537-4000-8000-000000000537"
+MX_CLAUDE_TODO_AFTER_TEXT = "ca000041-0541-4000-8000-000000000541"
+# replies past the 64,000-char cap: the final block asks, finishes, or ran past the kept tail
+MX_CLAUDE_CAPPED_QUESTION = "ca000038-0538-4000-8000-000000000538"
+MX_CLAUDE_CAPPED_DONE = "ca000039-0539-4000-8000-000000000539"
+MX_CLAUDE_CAPPED_TAIL_CUT = "ca000040-0540-4000-8000-000000000540"
+# a background agent whose todo list was captured in an unknown shape
+MX_CLAUDE_SIDE_TODO_UNKNOWN = "ca000042-0542-4000-8000-000000000542"
+MX_CLAUDE_SIDE_TODO_UNKNOWN_SIDE = "agent-ca42side01"
+# codex: commentary then a shell call and nothing more; a shell call then the final reply; the
+# same shapes inside one millisecond; a commentary row without a timestamp; a rollout whose first
+# file ends mid-work and whose resumed file replays it and finishes
+MX_CODEX_TOOL_AFTER_TEXT = "cx000014-0554-4000-8000-000000000554"
+MX_CODEX_TEXT_AFTER_TOOL = "cx000015-0555-4000-8000-000000000555"
+MX_CODEX_SAME_MS_TOOL_LAST = "cx000016-0556-4000-8000-000000000556"
+MX_CODEX_SAME_MS_TEXT_LAST = "cx000017-0557-4000-8000-000000000557"
+MX_CODEX_UNTIMED_TEXT = "cx000018-0558-4000-8000-000000000558"
+MX_CODEX_RESUMED_SPLIT = "cx000020-0560-4000-8000-000000000560"
 # the agent finished while the root was still editing: its notification is a queued attachment row
 MX_CLAUDE_NOTIFIED_QUEUED = "ca000034-0534-4000-8000-000000000534"
 # codex: 09:00 prompt, 09:05 shell, 09:07 text, 09:15 compaction, shells 09:20/09:30/09:38, no reply
@@ -162,6 +189,11 @@ TASKS_AFTER_TODOWRITE = "ct000005-0705-4000-8000-000000000705"  # resumed with t
 TODOWRITE_AFTER_TASKS = "ct000006-0706-4000-8000-000000000706"  # resumed with task tools off
 GEMINI_TODOS_OPEN = "9e000001-0713-4000-8000-000000000713"
 GEMINI_TODOS_DONE = "9e000002-0714-4000-8000-000000000714"
+GEMINI_PLAN_WORK_CLOSER = "9e000003-0715-4000-8000-000000000715"
+GEMINI_TODO_SIGN_OFF = "9e000004-0716-4000-8000-000000000716"
+MX_CLAUDE_PLAN_COMPACT_CLOSER = "ca000053-0553-4000-8000-000000000553"
+MX_CODEX_PLAN_COMPACT_CLOSER = "cx000031-0571-4000-8000-000000000571"
+MX_OMP_PLAN_COMPACT_CLOSER = "om000011-0531-4000-8000-000000000531"
 # one task list per Claude session, shared with its subagents: a subagent closes the root's tasks
 # (the root's TaskList confirms), creates tasks the root closes, or closes them as the root's last
 # step; a TaskList also restores a list an unresolved id made unknown
@@ -204,6 +236,14 @@ CURSOR_MERGE_STATUS = "k1000001-0715-4000-8000-000000000715"
 CURSOR_MERGE_CONTENT = "k2000002-0716-4000-8000-000000000716"
 CURSOR_MERGE_UNMATCHED = "k3000003-0717-4000-8000-000000000717"
 CURSOR_MERGE_CAPPED = "k4000004-0718-4000-8000-000000000718"  # the last merge passes the event cap
+CURSOR_PLAN_EDIT_DONE = "k5000005-0719-4000-8000-000000000719"
+CURSOR_PLAN_EDIT_SIGN_OFF = "k6000006-0720-4000-8000-000000000720"
+# the ingest keeps a TaskList's listing and a TaskUpdate's fields whole beside the capped display
+# text: a listing past the cap, one whose last subject ends in an ellipsis, an update that also
+# carries a description
+TASKS_LISTED_LONG = "ct000030-0730-4000-8000-000000000730"
+TASKS_LISTED_ELLIPSIS = "ct000031-0731-4000-8000-000000000731"
+TASKS_UPDATE_DESCRIBED = "ct000032-0732-4000-8000-000000000732"
 # kimi's SetTodoList before 2025-12 wrote Pending / In Progress / Done
 KIMI_TITLE_CASE = "4b000001-1120-4000-8000-000000001120"
 KIMI_WINDOW = ("--since", "2025-11-01", "--until", "2025-11-30")
@@ -257,6 +297,7 @@ class SummarySandbox:
             destination.parent.mkdir(parents=True, exist_ok=True)
             content = TIME_TEMPLATE.sub(timestamp, source.read_text(encoding="utf-8"))
             content = content.replace("{{home}}", str(self.home))
+            content = REPEAT_TEMPLATE.sub(lambda m: m[1] * int(m[2]), content)
             if "{{" in content:
                 raise AssertionError(f"unexpanded fixture template: {source}")
             destination.write_text(content, encoding="utf-8")
@@ -483,19 +524,21 @@ class SummaryTests(unittest.TestCase):
                           for i in items], [(S12, "todo_open", "side-chat", S12_SIDE)])
         self.assertEqual(items[0]["items"], ["rebuild the echo index", "report the echo rebuild"])
 
-    def test_capped_todo_list_recovers_complete_items_or_is_no_evidence(self) -> None:
-        # both lists exceed the 800-char event cap; S13's kept items are all done, so its clean
-        # final reply decides; S14's kept items include open ones, the ones past the cap unseen
+    def test_todo_list_past_the_display_cap_is_replayed_whole(self) -> None:
+        # both lists exceed the 800-char event cap the display input keeps; the ingest keeps
+        # the list facts whole, so S13's all-done list and clean reply finish it and S14 lists
+        # every open item, the ones past the cap included, with no caveat
         _meta, items = _rows(self._ok("pending", *APRIL, "--project", "foxtrot", "--json"))
         self.assertEqual([(i["session"], i["status"]) for i in items], [(S14, "todo_open")])
-        self.assertEqual(items[0]["items"], [f"migrate the foxtrot {name} service"
-                                             for name in ("beta", "gamma", "delta", "epsilon", "zeta")])
-        self.assertEqual(items[0]["caveats"],
-                         ["todo list capped at index time; items past the cap were not seen"])
+        self.assertEqual(items[0]["items"], [f"migrate the foxtrot {name} service" for name in
+                                             ("beta", "gamma", "delta", "epsilon", "zeta", "eta",
+                                              "theta")])
+        self.assertNotIn("caveats", items[0])
 
     def test_next_steps_section_counts_only_when_it_ends_the_reply(self) -> None:
-        # S15 planned "Next steps" before its tool call and finished with "All done."; S16's
-        # section ends the reply with only a sign-off after it, its first bullet two sentences long
+        # S15 planned "Next steps", did tool work and finished with "All done.": the terminal
+        # block decides, so it is not pending; S16's section ends the reply with only a sign-off
+        # after it in the same block, its first bullet two sentences long
         _meta, items = _rows(self._ok("pending", *APRIL, "--project", "golf", "--json"))
         self.assertEqual([(i["session"], i["status"]) for i in items], [(S16, "open_next_steps")])
         self.assertEqual(items[0]["items"], ["publish the golf release notes. They are drafted in docs.",
@@ -689,6 +732,29 @@ class SummaryTests(unittest.TestCase):
                           ["Publish the oscar notes", "Announce the oscar release"]))
         self.assertNotIn("caveats", item)
 
+    def test_task_list_past_the_display_cap_and_one_ending_in_an_ellipsis_reset(self) -> None:
+        # the ingest keeps a TaskList's whole listing beside its capped display output, so a
+        # listing past 800 chars still resets the replay to the twelve tasks it printed, and a
+        # listing whose last subject ends in an ellipsis is not mistaken for a cut one
+        pending = self._tasks_pending("--project", "mx-tasks")
+        item = pending[TASKS_LISTED_LONG]
+        self.assertEqual((item["status"], item["items"][:2], len(item["items"])),
+                         ("todo_open", ["Review the papa plan",
+                                        "Port the alpha module of the papa service to the new "
+                                        "loader API and refresh its docs"], 11))
+        self.assertNotIn("caveats", item)
+        item = pending[TASKS_LISTED_ELLIPSIS]
+        self.assertEqual((item["status"], item["items"]),
+                         ("todo_open", ["Write the quebec docs: sections 1\u20133, then\u2026"]))
+        self.assertNotIn("caveats", item)
+
+    def test_task_update_carrying_a_description_still_resolves_its_status(self) -> None:
+        # the display input keeps only the update's new description; the fields kept whole say
+        # #1 completed, so #2 is the one open task rather than an unresolved change
+        item = self._tasks_pending("--project", "mx-tasks")[TASKS_UPDATE_DESCRIBED]
+        self.assertEqual((item["status"], item["items"]), ("todo_open", ["Write the romeo docs"]))
+        self.assertNotIn("caveats", item)
+
     def test_cursor_todo_merge_updates_items_by_id(self) -> None:
         # Cursor's todo_write merges by id when `merge` is true, leaving unsent fields as they were
         pending = self._tasks_pending("--agent", "cursor")
@@ -828,9 +894,10 @@ class SummaryTests(unittest.TestCase):
         root.task_kin, side.task_kin = [side], [root]
         self.assertTrue(summary._addresses(root, message, side))
 
-    def test_a_large_agent_family_classifies_in_linear_time(self) -> None:
-        # 60 sync agents of 400 calls, 200 messages to them by id or by name, and one background
-        # agent still running: each message's target resolves once, not once per side chat
+    @staticmethod
+    def _large_family(agents: int, calls: int, messages: int):
+        """`agents` sync agents of `calls` calls each handed back, `messages` messages to them by
+        id or by name, and one background agent still running: (root, sides, stub handles)."""
         import summary
 
         def chat(session: str, turn_ts: int, events: list[dict],
@@ -843,26 +910,26 @@ class SummaryTests(unittest.TestCase):
             return out
 
         clock, launches, sides = 1_800_000_000_000, [], []
-        for n in range(60):
+        for n in range(agents):
             launches.append({"kind": "subagent_start", "name": "Agent", "ts": clock, "ok": True,
                              "output": "[Subagent hand-back] …", "child": f"agent-a{n:016x}",
                              "meta": f"name=w{n} status=completed returned={clock + 6_000}"})
             sides.append(chat(f"agent-a{n:016x}", clock + 1, [
                 {"kind": "tool", "name": "Read", "ts": clock + 2 + i, "ok": True}
-                for i in range(400)]))
+                for i in range(calls)]))
             clock += 7_000
-        messages = []
-        for n in range(200):
-            to = f"a{n % 60:016x}" if n % 2 else f"w{n % 60}"
-            messages.append({"kind": "tool", "name": "SendMessage", "ts": clock, "ok": True,
-                             "output": json.dumps({"success": True, "message": "queued"}),
-                             "meta": f"to={to} returned={clock + 1}"})
+        sent = []
+        for n in range(messages):
+            to = f"a{n % agents:016x}" if n % 2 else f"w{n % agents}"
+            sent.append({"kind": "tool", "name": "SendMessage", "ts": clock, "ok": True,
+                         "output": json.dumps({"success": True, "message": "queued"}),
+                         "meta": f"to={to} returned={clock + 1}"})
             clock += 1_000
         busy = {"kind": "subagent_start", "name": "Agent", "ts": clock, "ok": True,
                 "child": "agent-a" + "f" * 16, "meta": f"status=async_launched returned={clock}"}
         sides.append(chat("agent-a" + "f" * 16, clock + 1,
                           [{"kind": "tool", "name": "Bash", "ts": clock + 60_000}], reply=""))
-        root = chat("r", clock - 10_000_000, [*launches, *messages, busy])
+        root = chat("r", clock - 10_000_000, [*launches, *sent, busy])
         for member in (root, *sides):
             member.task_kin = [other for other in (root, *sides) if other is not member]
 
@@ -873,21 +940,39 @@ class SummaryTests(unittest.TestCase):
             def turn(self, chat_: summary._Chat, turn: int) -> str:
                 return f"{chat_.session}:{turn}"
 
+        return root, sides, Handles()
+
+    def test_a_large_agent_family_classifies_in_linear_time(self) -> None:
+        # 60 sync agents of 400 calls, 200 messages to them by id or by name, and one background
+        # agent still running: each message's target resolves once, not once per side chat
+        import summary
+        root, sides, handles = self._large_family(60, 400, 200)
         started = time.perf_counter()
-        item = summary._pending_item(root, sides, Handles())
+        item = summary._pending_item(root, sides, handles)
         elapsed = time.perf_counter() - started
         self.assertEqual((item["status"], item["evidence_session"]),
                          ("agent_work_incomplete", "agent-a" + "f" * 16))
         # well under 0.1 s here; one rescan of the family per message per side took seconds
         self.assertLess(elapsed, 2.0)
 
-    def test_capped_cursor_merge_leaves_the_list_unknown(self) -> None:
-        # the merge closing items 9 and 10 was cut by the event cap: they are neither open nor done
-        item = self._tasks_pending("--agent", "cursor")[CURSOR_MERGE_CAPPED]
-        self.assertEqual(
-            (item["status"], item["confidence"], item["items"], item.get("caveats")),
-            ("unknown", "low", [],
-             ["todo list capped at index time; its later changes could not be replayed"]))
+    def test_many_agents_and_messages_classify_without_rescanning_the_root(self) -> None:
+        # 150 agents and 1,000 messages: the root's calls, messages, results and notifications
+        # are grouped once by the agent they reach, so each hand-back proof reads its own few
+        # events instead of every root event per side chat (3.9 s before, under 0.1 s here)
+        import summary
+        root, sides, handles = self._large_family(150, 40, 1_000)
+        started = time.perf_counter()
+        item = summary._pending_item(root, sides, handles)
+        elapsed = time.perf_counter() - started
+        self.assertEqual((item["status"], item["evidence_session"]),
+                         ("agent_work_incomplete", "agent-a" + "f" * 16))
+        # 3.7 s before the index at load 165; 0.02-0.25 s with it at the same load
+        self.assertLess(elapsed, 1.0)
+
+    def test_cursor_merge_past_the_display_cap_replays_whole(self) -> None:
+        # the merge closing all ten items passes the event cap in its display input; the facts
+        # kept whole close them, and the clean final reply finishes the chat
+        self.assertNotIn(CURSOR_MERGE_CAPPED, self._tasks_pending("--agent", "cursor"))
 
     def test_kimi_in_progress_with_a_space_is_open(self) -> None:
         _meta, items = _rows(self.sandbox.summary("pending", *KIMI_WINDOW, "--agent", "kimi",
@@ -936,17 +1021,19 @@ class SummaryTests(unittest.TestCase):
                 self.assertNotIn(MX[agent]["handed_back"], pending)
         meta, _items = _rows(self.sandbox.summary("pending", *MATRIX, "--project", "mx-omp",
                                                    "--json"))
-        self.assertEqual((meta["chats"], meta["side_chats"]), (10, 2))
+        self.assertEqual((meta["chats"], meta["side_chats"]), (11, 2))
 
-    def test_capped_omp_init_whose_later_ops_cannot_replay_is_unknown(self) -> None:
-        # the ingest keeps 800 chars of the sorted-key input, so the only phase object and the
-        # op are lost; the accepted start/done/start that follow address tasks never seen
+    def test_omp_init_past_the_display_cap_replays_its_later_ops(self) -> None:
+        # the display input keeps 800 chars of the 14-item init, so its only phase object and the
+        # op are cut there; the list facts kept whole let the accepted start/done/start replay
         pending = self._pending_by_session("--project", "mx-omp")
         item = pending[MX_OMP_CAPPED_INIT]
-        self.assertEqual((item["status"], item["confidence"], item["items"]),
-                         ("unknown", "low", []))
-        self.assertEqual(item["caveats"],
-                         ["todo list capped at index time; its later changes could not be replayed"])
+        self.assertEqual((item["status"], item["confidence"], len(item["items"])),
+                         ("todo_open", "medium", 13))
+        self.assertEqual(item["items"][:2], [
+            "port the echo module bravo to the new loader API and its tests",
+            "port the echo module charlie to the new loader API and its tests"])
+        self.assertNotIn("caveats", item)
 
     def test_timed_out_codex_wait_is_not_a_hand_back(self) -> None:
         # wait_agent returned {"status":{id:"running"},"timed_out":true}; the worker's reply
@@ -1145,47 +1232,614 @@ class SummaryTests(unittest.TestCase):
                 root.events = events
                 self.assertIs(summary._notified(root, side), linked)
 
-    def test_glued_last_bullet_is_listed_at_medium_with_a_caveat(self) -> None:
+    def test_a_completed_linked_tool_call_hands_a_prose_less_subagent_back(self) -> None:
+        # gemini's invoke_agent names the subagent it ran, whose last turn can end on a
+        # complete_task call with no prose: the call's own completion is the hand-back
+        import summary
+        fields = {"project": "p", "root": "root", "first_ts": 0, "last_ts": 0, "first_text": ""}
+        side = summary._Chat(session="c1c1-agent", agent="gemini", side=True, **fields)
+        side.turns = [summary._Turn(0, 1_000, "subagent", "Investigate alpaca.", None)]
+        side.events = [{"kind": "tool", "name": "complete_task", "ts": 1_000, "ok": True}]
+        root = summary._Chat(session="root", agent="gemini", side=False, **fields)
+        call = {"kind": "tool", "name": "invoke_agent", "ts": 900, "call_id": "agent-1", "ok": True,
+                "output": "Subagent 'codebase_investigator' finished.", "child": "c1c1-agent",
+                "meta": "delegation=completed"}
+        # Claude's SendMessage that resumes an agent in the background links the agent too, but
+        # returns before it finishes: a link without the recorded completion proves nothing
+        resumed = {"kind": "tool", "name": "SendMessage", "ts": 900, "call_id": "sm-1", "ok": True,
+                   "output": '{"success":true,"message":"Resuming agent c1c1"}', "child": "c1c1-agent"}
+        cases = (
+            ([call], True),
+            ([dict(call, meta="delegation=cancelled", ok=None)], False),
+            ([dict(call, meta="delegation=error", ok=False)], False),
+            ([dict(call, meta="")], False),
+            ([dict(call, child="c1c1-other")], False),
+            ([dict(call, child="")], False),
+            ([resumed], False),
+            ([], False),
+        )
+        for events, received in cases:
+            with self.subTest(events=events):
+                root.events = events
+                self.assertIs(summary._result_received(root, side), received)
+
+    def test_a_later_block_after_the_list_is_quoted_unless_work_came_between(self) -> None:
+        # list, Edit, completion: finished; list then a sign-off block with no work: high
         pending = self._pending_by_session("--project", "mx-claude")
-        item = pending[MX_CLAUDE_GLUED_BULLET]
-        self.assertEqual(
-            (item["status"], item["confidence"], item["items"], item["caveats"]),
-            ("open_next_steps", "medium",
-             ["update the callers",
-              "run the full suite Updated the callers and the full suite passes."],
-             ["the last bullet may include a later reply block the index joined to it"]))
-        # an ordinary open list keeps its high confidence and has no caveat
+        self.assertNotIn(MX_CLAUDE_GLUED_BULLET, pending)
+        item = pending[MX_CLAUDE_LIST_THEN_SIGN_OFF]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("open_next_steps", "high", ["update the callers", "run the full suite"]))
+        self.assertNotIn("caveats", item)
         plain = pending[MX["claude"]["next_steps"]]
         self.assertEqual(plain["confidence"], "high")
         self.assertNotIn("caveats", plain)
 
-    def test_glued_bullet_signs(self) -> None:
+    def test_reply_blocks_keep_their_boundary_on_every_read_path(self) -> None:
+        # the search db path reads the block structure from its reply_shape side table for the
+        # rows it classifies; the materialized path reads it with the replies: the same verdicts
+        def verdict():
+            pending = self._pending_by_session("--project", "mx-claude")
+            return (MX_CLAUDE_GLUED_BULLET in pending,
+                    pending[MX_CLAUDE_LIST_THEN_SIGN_OFF]["items"],
+                    pending["ca000050-0550-4000-8000-000000000550"]["confidence"],
+                    pending[MX_CLAUDE_TOOL_AFTER_TEXT]["status"],
+                    MX_CLAUDE_TEXT_AFTER_TOOL in pending,
+                    pending[MX_CLAUDE_CAPPED_QUESTION]["status"],
+                    MX_CLAUDE_CAPPED_DONE in pending)
+        expected = (False, ["update the callers", "run the full suite"], "medium",
+                    "agent_work_incomplete", False, "waiting_on_user", False)
+        self.assertEqual(self._on_every_read_path(verdict), [expected] * 3)
+
+    def test_time_mode_never_reads_reply_shapes(self) -> None:
+        import summary
+        from unittest import mock
+        with mock.patch.object(summary, "_load_shapes",
+                               side_effect=AssertionError("time mode read shapes")):
+            table = _time_table(self._ok("time", *MARCH, "--json"))
+        self.assertEqual(table[("2026-03-10", "atlas")]["estimated_active_ms"], 26 * MINUTE)
+        # the subprocess ran unpatched; the in-process guard is for the loader itself
+        chats = {"x": summary._Chat(session="x", agent="claude", project="p", root="x",
+                                    side=False, first_ts=0, last_ts=0, first_text="")}
+        with mock.patch.object(summary, "_load_shapes",
+                               side_effect=AssertionError("time mode read shapes")):
+            summary._load_transcripts(chats, None, shapes=False)
+
+    def test_section_items_keep_the_same_block_rules(self) -> None:
         import summary
 
-        def glued(body):
-            return summary._open_section_items(f"Done.\n\nNext steps:\n{body}")[3]
+        def items(body):
+            section = summary._open_section_items(f"Done.\n\nNext steps:\n{body}")
+            return None if section is None else section[1]
 
-        # the reported shape, and the punctuation contrast alone
-        self.assertTrue(glued("- update the callers\n"
-                              "- run the full suite Updated the callers and the full suite passes."))
-        self.assertTrue(glued("- update the callers\n- run the full suite and it passes."))
-        # unpunctuated, consistently punctuated, and a sign-off split off at a sentence end
-        self.assertFalse(glued("- update the callers\n- run the full suite"))
-        self.assertFalse(glued("- Update the callers.\n- Run the full suite."))
-        self.assertFalse(glued("- update the callers\n- run the full suite. Let me know."))
-        # a single bullet capitalized mid-way is usually naming something (a person, a product);
-        # with no list style to contradict it stays high
-        self.assertFalse(glued("- ask Priya whether the Billing Export job should move to Postgres "
-                               "before the Friday freeze."))
-        # a closed or empty last bullet carries no open item to doubt
-        self.assertFalse(glued("- update the callers\n- [x] run the full suite Updated it all."))
-        # a punctuated list ends its last bullet the same way; a capital there names something
-        self.assertFalse(glued("- Backfill the epsilon table.\n"
-                               "- Point the Reporting service at the new table."))
-        self.assertFalse(glued("- Pin the toolchain.\n- Update the docs for Python 3.12 support."))
-        self.assertFalse(glued("- Merge the fixture branch.\n"
-                               "- Run the Playwright suite against staging."))
-        self.assertFalse(glued("- add tests;\n- update the docs;\n- release it."))
+        # prose after the list in the same block supersedes it unless it is a short sign-off;
+        # the list's own punctuation never changes the answer
+        self.assertIsNone(items("- update the callers\n- run the full suite\n\n"
+                                "Updated the callers and the full suite passes."))
+        self.assertEqual(items("- update the callers\n- run the full suite\n\nLet me know."),
+                         ["update the callers", "run the full suite"])
+        self.assertEqual(items("- update the callers\n- run the full suite. Let me know."),
+                         ["update the callers", "run the full suite."])
+        self.assertEqual(items("- update the callers\n- run the full suite and it passes."),
+                         ["update the callers", "run the full suite and it passes."])
+        self.assertEqual(items("- ask Priya whether the Billing Export job should move to Postgres "
+                               "before the Friday freeze."),
+                         ["ask Priya whether the Billing Export job should move to Postgres "
+                          "before the Friday freeze."])
+        self.assertEqual(items("- Backfill the epsilon table.\n"
+                               "- Point the Reporting service at the new table."),
+                         ["Backfill the epsilon table.",
+                          "Point the Reporting service at the new table."])
+        self.assertEqual(items("- add tests;\n- update the docs;\n- release it."),
+                         ["add tests;", "update the docs;", "release it."])
+
+    def test_a_tool_call_after_the_last_reply_block_leaves_the_turn_unfinished(self) -> None:
+        # the ingest marks the calls no reply text of their turn followed; the final text after a
+        # call finishes the turn, and a todo write closing the list after the final text is
+        # bookkeeping, not work cut off
+        pending = self._pending_by_session()
+        for session, tool in ((MX_CLAUDE_TOOL_AFTER_TEXT, "Bash"),
+                              (MX_CODEX_TOOL_AFTER_TEXT, "shell_command"),
+                              (MX_CODEX_SAME_MS_TOOL_LAST, "shell_command"),
+                              (MX_CODEX_UNTIMED_TEXT, "shell_command"),
+                              (MX_CODEX_COMPACTED_NO_REPLY, "shell_command")):
+            with self.subTest(session=session):
+                item = pending[session]
+                self.assertEqual((item["status"], item["confidence"], item["source"],
+                                  item["signals"]),
+                                 ("agent_work_incomplete", "medium", "root",
+                                  [f"reply ended before the turn's last tool call ({tool})"]))
+        self.assertEqual(pending[MX_CLAUDE_TOOL_AFTER_TEXT]["evidence"],
+                         "I'll run the xray suite now.")
+        for session in (MX_CLAUDE_TEXT_AFTER_TOOL, MX_CODEX_TEXT_AFTER_TOOL,
+                        MX_CODEX_SAME_MS_TEXT_LAST, MX_CODEX_RESUMED_SPLIT,
+                        MX_CLAUDE_TODO_AFTER_TEXT):
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
+        # the matrix's finished and open shapes keep their verdicts (asserted elsewhere); every
+        # other tool-bearing chat of the matrix stays as it was
+        self.assertNotIn(MX["claude"]["finished"], pending)
+        self.assertNotIn(MX["codex"]["handed_back"], pending)
+
+    def test_trailing_call_rule_reads_the_recorded_fact_only(self) -> None:
+        import summary
+        call = {"kind": "tool", "name": "Bash", "ts": 2_000, "ok": True, "i": 1}
+        later = {"kind": "tool", "name": "Read", "ts": 3_000, "ok": True, "i": 2}
+        self.assertIsNone(summary._trailing_call([call, later]))
+        marked = dict(later, meta="after_reply=1")
+        self.assertIs(summary._trailing_call([call, marked]), marked)
+        # the latest call decides, not an earlier trailing-marked one
+        self.assertIsNone(summary._trailing_call([dict(call, meta="after_reply=1"), later]))
+        # at one timestamp the later event in the file decides
+        tied = dict(later, ts=2_000, meta="after_reply=1")
+        self.assertIs(summary._trailing_call([call, tied]), tied)
+        self.assertIsNone(summary._trailing_call([tied, dict(call, i=3)]))
+        # bookkeeping writes, launches and markers never count
+        for name in ("TodoWrite", "TaskUpdate", "update_plan", "todo", "yield"):
+            with self.subTest(name=name):
+                self.assertIsNone(summary._trailing_call([dict(tied, name=name)]))
+        self.assertIsNone(summary._trailing_call([dict(tied, kind="subagent_start")]))
+        self.assertIsNone(summary._trailing_call([dict(tied, kind="control")]))
+
+    def test_capped_reply_is_classified_by_its_kept_ending(self) -> None:
+        # the text of a reply past 64,000 chars is 0.4.2's head; the ingest keeps the latest
+        # block's tail beside it (up to 8,000 chars): a closing question waits, a completion
+        # finishes; only a final block cut past the kept tail stays unknown, and says so
+        pending = self._pending_by_session("--project", "mx-claude")
+        item = pending[MX_CLAUDE_CAPPED_QUESTION]
+        self.assertEqual((item["status"], item["confidence"], item["evidence"]),
+                         ("waiting_on_user", "high", "Should I apply it to the zulu schema now?"))
+        self.assertNotIn(MX_CLAUDE_CAPPED_DONE, pending)
+        item = pending[MX_CLAUDE_CAPPED_TAIL_CUT]
+        self.assertEqual((item["status"], item["confidence"], item["signals"]),
+                         ("unknown", "low",
+                          ["reply capped at index time; its final block ran past 8,000 chars, so "
+                           "a list above its ending was not indexed"]))
+        # the kept tail is one sentence of 8,000 chars (no period before its ending), clipped
+        self.assertTrue(item["evidence"].startswith("zzzz"))
+
+    def test_reply_blocks_split_at_the_recorded_joins_and_fold_across_recaps(self) -> None:
+        import summary
+        fields = {"session": "x", "project": "p", "root": "x", "side": False,
+                  "first_ts": 0, "last_ts": 0, "first_text": ""}
+        shape = summary._ReplyShape(breaks=[3, 7])
+        self.assertEqual(summary._blocks("one two three", shape), ["one", "two", "three"])
+        # an offset that is not a joining space is ignored; no shape means one block
+        self.assertEqual(summary._blocks("one two", summary._ReplyShape(breaks=[1])), ["one two"])
+        self.assertEqual(summary._blocks("one two", None), ["one two"])
+        self.assertEqual(summary._blocks("", shape), [])
+        # a recap's reply continues the prompt before it as further blocks, with its own ending;
+        # its lead join (the work since the prompt's last block) joins the two, unknown when
+        # the row carries none
+        chat = summary._Chat(agent="claude", **fields)
+        chat.turns = [summary._Turn(0, 1_000, "user", "go", None),
+                      summary._Turn(1, 2_000, "recap", "summary", None)]
+        chat.replies = {0: "a b", 1: "c d"}
+        chat.reply_shapes = {0: summary._ReplyShape(breaks=[1], worked=[1], lead=0,
+                                                    blocks=["a", "b"]),
+                             1: summary._ReplyShape(breaks=[1], worked=[0, 0], lead=1, end="tail",
+                                                    end_cut=True, blocks=["c", "d"])}
+        summary._fold_recaps(chat)
+        self.assertEqual(chat.replies, {0: "a b\n\nc d"})
+        folded = chat.reply_shapes[0]
+        self.assertEqual((folded.blocks, folded.worked, folded.lead, folded.end, folded.end_cut),
+                         (["a", "b", "c", "d"], [1, 1, 0, 0], 0, "tail", True))
+        text, ending, missing = summary._terminal(chat, 0)
+        self.assertEqual((text, ending.blocks, ending.worked, missing),
+                         ("tail", ["a", "b", "c", "d", "tail"], [1, 1, 0, 0],
+                          "reply capped at index time; its final block ran past 8,000 chars, so "
+                          "a list above its ending was not indexed"))
+        chat.turns = [summary._Turn(0, 1_000, "user", "go", None),
+                      summary._Turn(1, 2_000, "recap", "summary", None)]
+        chat.replies = {0: "a b", 1: "c"}
+        chat.reply_shapes = {0: summary._ReplyShape(breaks=[1], worked=[1], blocks=["a", "b"]),
+                             1: summary._ReplyShape(blocks=["c"])}
+        summary._fold_recaps(chat)
+        self.assertEqual(chat.reply_shapes[0].worked, [1, 2])
+
+    def test_tool_work_after_a_list_block_hands_the_turn_to_its_terminal_block(self) -> None:
+        # work after the list block: the terminal block decides; no work: a sign-off keeps the
+        # list, other prose lowers it to medium, quoted; unrecorded order: sign-offs keep it at
+        # medium, anything else hands the turn to the terminal block
+        import summary
+        body = "Ported the parser.\n\nNext steps:\n- update the callers\n- run the full suite"
+        open_items = ["update the callers", "run the full suite"]
+        NO, YES, UNKNOWN = 0, 1, 2
+
+        def section(blocks, worked):
+            shape = summary._ReplyShape(blocks=blocks, worked=worked)
+            result = summary._open_section(shape)
+            return None if result is None else (result[1], result[3])
+
+        def same_block(tail):
+            return section([f"{body}\n\n{tail}"], [])
+
+        for tail in ("Let me know if I missed anything.", "Happy to help further if needed.",
+                     "Let me know if you have any questions about the proposed changes.",
+                     "Let me know when you'd like me to get started.",
+                     "I can also add tests if you're interested."):
+            with self.subTest(tail=tail, block="same"):
+                self.assertEqual(same_block(tail), (open_items, None))
+        for tail in ("Hope this helped!", "Glad that worked out.", "Thanks, appreciated!",
+                     "Both are now in place: callers point at the new parser and the suite is "
+                     "clean.", "Updated the callers and the full suite passes."):
+            with self.subTest(tail=tail, block="same"):
+                self.assertIsNone(same_block(tail))
+        quoted = "a later reply block may report this done: "
+        unknown = "whether work followed this list is not recorded; a later block: "
+        for tail in ("Let me know if you want me to run them.", "Happy to continue tomorrow."):
+            with self.subTest(tail=tail, block="later sign-off"):
+                self.assertEqual(section([body, tail], [NO]), (open_items, None))
+                self.assertEqual(section([body, tail], [UNKNOWN]),
+                                 (open_items, unknown + repr(tail)))
+                self.assertEqual(section([body, tail, "Just say the word."], [UNKNOWN, UNKNOWN]),
+                                 (open_items, unknown + repr(tail)))
+        for tail in ("Hope this helps!", "Thanks!", "Good luck with the release!",
+                     "I'll stop here for now.", "Updated the callers and the full suite passes.",
+                     "Done. I updated the callers and ran the full suite: 412 passed."):
+            with self.subTest(tail=tail, block="later prose"):
+                self.assertEqual(section([body, tail], [NO]), (open_items, quoted + repr(tail)))
+                self.assertIsNone(section([body, tail], [UNKNOWN]))
+                # a sign-off before the prose does not hide it
+                self.assertEqual(section([body, "Let me know.", tail], [NO, NO]),
+                                 (open_items, quoted + repr(tail)))
+                self.assertIsNone(section([body, "Let me know.", tail], [UNKNOWN, NO]))
+        for tail in ("Updated the callers and the full suite passes.",
+                     "Done. I updated the callers and ran the full suite: 412 passed.",
+                     "Hope this helps!", "All done."):
+            with self.subTest(tail=tail, block="later, after work"):
+                self.assertIsNone(section([body, tail], [YES]))
+                self.assertIsNone(section([body, tail], [UNKNOWN, YES]))
+        # work after the list, then a terminal list of its own: that list, high
+        final = "Three tests still fail.\n\nNext steps:\n- fix the fixtures\n- rerun the suite"
+        self.assertEqual(section([body, final], [YES]),
+                         (["fix the fixtures", "rerun the suite"], None))
+        self.assertEqual(section([body, final], [UNKNOWN]),
+                         (["fix the fixtures", "rerun the suite"], None))
+        # work before the list block but none after it: the list block is the latest word
+        self.assertEqual(section(["Starting.", body], [YES]), (open_items, None))
+        self.assertEqual(section(["Starting.", body, "Thanks!"], [YES, NO]),
+                         (open_items, quoted + "'Thanks!'"))
+        self.assertEqual(section(["Starting.", body, "Thanks!"], [NO, YES]), None)
+        # missing flags read as unknown
+        self.assertIsNone(section([body, "Thanks!"], []))
+        self.assertEqual(section([body, "Let me know."], []),
+                         (open_items, unknown + "'Let me know.'"))
+        self.assertEqual(section([body], []), (open_items, None))
+        self.assertIsNone(section(["Done.", "All good."], [NO]))
+
+    def test_structural_rule_on_indexed_chats(self) -> None:
+        # executed plans (list, tool, completion) are finished; the terminal block after work
+        # decides (its own list high, a question waits); no work: closing medium + quote,
+        # sign-off high
+        pending = self._pending_by_session("--project", "mx-claude")
+        for session in (MX_CLAUDE_GLUED_BULLET, "ca000047-0547-4000-8000-000000000547"):
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
+        _meta, golf = _rows(self._ok("pending", *APRIL, "--project", "golf", "--json"))
+        self.assertEqual([(i["session"], i["confidence"]) for i in golf], [(S16, "high")])
+        item = pending["ca000048-0548-4000-8000-000000000548"]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("open_next_steps", "high", ["fix the bravo fixtures", "rerun the suite"]))
+        self.assertNotIn("caveats", item)
+        item = pending["ca000049-0549-4000-8000-000000000549"]
+        self.assertEqual((item["status"], item["evidence"]),
+                         ("waiting_on_user", "Should I also port the charlie docs?"))
+        item = pending["ca000050-0550-4000-8000-000000000550"]
+        self.assertEqual((item["status"], item["confidence"], item["items"], item["caveats"]),
+                         ("open_next_steps", "medium", ["update the callers", "run the full suite"],
+                          ["a later reply block may report this done: 'Hope this helps!'"]))
+        item = pending[MX_CLAUDE_LIST_THEN_SIGN_OFF]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("open_next_steps", "high", ["update the callers", "run the full suite"]))
+        self.assertNotIn("caveats", item)
+        plain = pending[MX["claude"]["next_steps"]]
+        self.assertEqual(plain["confidence"], "high")
+        # a delegation is work (claude Agent); the recap row's lead join carries the work
+        # across a compaction (claude, codex): the terminal block decides, so none is pending
+        for session in ("ca000051-0551-4000-8000-000000000551",
+                        "ca000052-0552-4000-8000-000000000552"):
+            with self.subTest(session=session):
+                self.assertNotIn(session, pending)
+        pending = self._pending_by_session("--project", "mx-codex")
+        self.assertNotIn("cx000030-0570-4000-8000-000000000570", pending)
+        # opencode orders its parts, so its joins carry the fact: plan, work, done is finished;
+        # plan then a sign-off with no work keeps the list at high
+        pending = self._pending_by_session("--project", "mx-opencode")
+        self.assertNotIn("ses_oc000008mx", pending)
+        item = pending["ses_oc000009mx"]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("open_next_steps", "high", ["read the loader config", "fix the parser"]))
+        self.assertNotIn("caveats", item)
+
+    def test_a_single_block_recap_reply_keeps_its_lead_on_the_search_db_path(self) -> None:
+        # plan, work, compaction, closer: the recap reply is one block, so its only fact is the
+        # lead join; the search db keeps that row too, and both read paths agree it is finished
+        def verdict():
+            return tuple(session in self._pending_by_session("--project", project)
+                         for project, session in (("mx-claude", MX_CLAUDE_PLAN_COMPACT_CLOSER),
+                                                  ("mx-codex", MX_CODEX_PLAN_COMPACT_CLOSER),
+                                                  ("mx-omp", MX_OMP_PLAN_COMPACT_CLOSER)))
+        self.assertEqual(self._on_every_read_path(verdict), [(False, False, False)] * 3)
+        import corpusdb
+        with contextlib.closing(sqlite3.connect(self.sandbox.data / "corpus.db")) as db:
+            shapes = corpusdb.reply_shapes(db, [(MX_CLAUDE_PLAN_COMPACT_CLOSER, 1),
+                                                (MX_CODEX_PLAN_COMPACT_CLOSER, 1),
+                                                (MX_OMP_PLAN_COMPACT_CLOSER, 1)])
+        self.assertEqual({key: (shape["reply_breaks"], shape["reply_lead"])
+                          for key, shape in shapes.items()},
+                         {(MX_CLAUDE_PLAN_COMPACT_CLOSER, 1): ([], 1),
+                          (MX_CODEX_PLAN_COMPACT_CLOSER, 1): ([], 1),
+                          (MX_OMP_PLAN_COMPACT_CLOSER, 1): ([], 1)})
+
+    def test_every_adapter_records_work_between_its_blocks(self) -> None:
+        # gemini orders prose before a message's calls: plan + run_shell_command, then a closer
+        # is finished; 'To do:' then a sign-off with no work is an open list at high
+        _meta, items = _rows(self._ok("pending", *TASKS, "--agent", "gemini", "--json"))
+        by_session = {item["session"]: item for item in items}
+        self.assertNotIn(GEMINI_PLAN_WORK_CLOSER, by_session)
+        item = by_session[GEMINI_TODO_SIGN_OFF]
+        self.assertEqual((item["status"], item["confidence"], item["items"]),
+                         ("open_next_steps", "high",
+                          ["reproduce the loader bug", "patch the handler"]))
+        self.assertNotIn("caveats", item)
+        import explore
+        path = self.sandbox.data / "replies.jsonl"
+        facts = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            agent = str(record["id"]).split(":")[0]
+            shape = explore.reply_shape(record)
+            if shape["reply_breaks"] or shape["reply_lead"] != 2:
+                facts.setdefault(agent, set()).add(
+                    (tuple(shape["reply_worked"]), shape["reply_lead"]))
+        # every adapter the fixture store covers describes its joins; none is left unknown
+        self.assertEqual(sorted(facts), ["claude", "codex", "cursor", "gemini", "kimi",
+                                         "opencode", "pi"])
+        for agent, seen in facts.items():
+            with self.subTest(agent=agent):
+                self.assertFalse(any(2 in worked or lead == 2 for worked, lead in seen), seen)
+
+    def test_a_cursor_bubbles_own_call_joins_it_to_the_next_bubble(self) -> None:
+        # a bubble's prose precedes its own call, so the call is work after the plan, not before
+        # it: plan + edit then a completion is finished, plan + edit then a sign-off is too (the
+        # terminal block decides after work), as kimi, crush and cline read the same turn
+        pending = self._tasks_pending("--agent", "cursor")
+        self.assertNotIn(CURSOR_PLAN_EDIT_DONE, pending)
+        self.assertNotIn(CURSOR_PLAN_EDIT_SIGN_OFF, pending)
+        import explore
+        shapes = {}
+        for line in (self.sandbox.data / "replies.jsonl").read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            if record["id"].startswith("cursor:k5000005") or record["id"].startswith("cursor:k6000006"):
+                shape = explore.reply_shape(record)
+                shapes[record["id"].split(":")[1]] = (shape["reply_lead"], shape["reply_worked"])
+        self.assertEqual(shapes, {CURSOR_PLAN_EDIT_DONE: (0, [1]), CURSOR_PLAN_EDIT_SIGN_OFF: (0, [1])})
+
+    def test_a_capped_replys_ending_refreshes_when_only_its_shape_moves(self) -> None:
+        # a reply past the cap keeps its text frozen, so a later block moves only the shape the
+        # search db keeps beside it: the session's signature covers the shape, and the refresh
+        # reapplies it instead of serving the stale ending
+        sandbox = SummarySandbox()
+        self.addCleanup(sandbox.close)
+        session = "ca000099-0599-4000-8000-000000000599"
+        path = (sandbox.home / ".claude" / "projects" / "-projects-mx-claude"
+                / f"{session}.jsonl")
+
+        def row(stamp, role, content):
+            record = {"sessionId": session, "cwd": str(sandbox.home / "projects" / "mx-claude"),
+                      "type": role, "timestamp": stamp,
+                      "message": {"role": role, "content": content}}
+            if role == "user":
+                record["userType"] = "external"
+            else:
+                record["message"]["model"] = "claude-sonnet-4"
+            return json.dumps(record) + "\n"
+
+        def block(stamp, text):
+            return row(stamp, "assistant", [{"type": "text", "text": text}])
+
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(row("2026-06-24T10:00:00.000Z", "user", "Draft the zulu migration."))
+            handle.write(block("2026-06-24T10:01:00.000Z", "Drafted the zulu migration."))
+            handle.write(block("2026-06-24T10:02:00.000Z", "z" * 70_000))
+            handle.write(block("2026-06-24T10:03:00.000Z", "Working on the remaining tables now."))
+
+        def pending():
+            _meta, items = _rows(sandbox.summary("pending", *MATRIX, "--project", "mx-claude",
+                                                 "--json"))
+            return {item["session"]: item for item in items}
+
+        sandbox.index()
+        self.assertNotIn(session, pending())
+        database = sandbox.data / "corpus.db"
+        before = database.stat().st_ino
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(block("2026-06-24T10:04:00.000Z",
+                               "All tables migrated. Should I apply it to production now?"))
+        sandbox.index()
+        item = pending()[session]
+        self.assertEqual((item["status"], item["confidence"], item["evidence"]),
+                         ("waiting_on_user", "high", "Should I apply it to production now?"))
+        self.assertEqual(database.stat().st_ino, before)
+        import corpusdb
+        with contextlib.closing(sqlite3.connect(database)) as db:
+            shape = corpusdb.reply_shapes(db, [(session, 0)])[(session, 0)]
+        self.assertEqual(shape["reply_end"],
+                         "All tables migrated. Should I apply it to production now?")
+        # the signature itself: the same rows with a different shape are a different session
+        rows = [("x", 0, 0, "claude", "p", "", "m", "explicit", "user", "text", "ab12")]
+        self.assertNotEqual(corpusdb._session_sig(rows, [(0, "[]", "[]", 0, "old", 0)]),
+                            corpusdb._session_sig(rows, [(0, "[]", "[]", 0, "new", 0)]))
+        first, second = (0, "[]", "[]", 0, "e", 0), (1, "[]", "[]", 1, "", 0)
+        self.assertEqual(corpusdb._session_sig(rows, [first, second]),
+                         corpusdb._session_sig(rows, [second, first]))
+
+    def test_a_capped_reply_without_its_ending_is_still_reported_unknown(self) -> None:
+        # a reply past the cap whose ending the index does not hold (a last-good row the upgrade
+        # could not reparse, or 0.4.2 data read before the first new index) keeps 0.4.2's
+        # 'ending not indexed' signal instead of reading its head as the ending
+        import summary
+        fields = {"session": "x", "project": "p", "root": "x", "side": False,
+                  "first_ts": 0, "last_ts": 0, "first_text": ""}
+        head = "z" * 64_000 + "…"
+        for shape in (None, summary._ReplyShape()):
+            with self.subTest(shape=shape):
+                chat = summary._Chat(agent="claude", **fields)
+                chat.turns = [summary._Turn(0, 1_000, "user", "go", None)]
+                chat.replies = {0: head}
+                if shape is not None:
+                    chat.reply_shapes = {0: shape}
+                record = summary._classify_root(chat)
+                self.assertEqual((record["status"], record["signals"]),
+                                 ("unknown", ["reply capped at index time; ending not indexed"]))
+        # with the ending kept the question in it decides
+        chat = summary._Chat(agent="claude", **fields)
+        chat.turns = [summary._Turn(0, 1_000, "user", "go", None)]
+        chat.replies = {0: head}
+        chat.reply_shapes = {0: summary._ReplyShape(end="Should I apply it now?", blocks=[head])}
+        self.assertEqual(summary._classify_root(chat)["status"], "waiting_on_user")
+        # an uncapped single block is read whole
+        chat.replies = {0: "Short and done."}
+        chat.reply_shapes = {}
+        self.assertIsNone(summary._classify_root(chat))
+
+    def test_reply_handles_minted_by_0_4_2_still_resolve(self) -> None:
+        # 0.4.2 hashed a reply as its text blocks joined with one space, cut at 64,000 chars,
+        # and embedded that same text; the index publishes that exact text, so every digest and
+        # embedding hash equals 0.4.2's and a handle quoted from an older index opens the reply
+        import compact
+        import embedding_store
+        cap = 64_000
+        expected: dict[str, tuple[str, str]] = {}
+        store = FIXTURES / "store" / "claude" / "projects" / "-projects-mx-claude"
+        for path in sorted(store.glob("*.jsonl")):
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            prompts = [r for r in rows if r.get("type") == "user" and r.get("userType")]
+            if len(prompts) != 1 or rows[0] is not prompts[0]:
+                continue
+            legacy = ""
+            for row in rows:
+                if row.get("type") != "assistant":
+                    continue
+                for block in row["message"]["content"]:
+                    text = block.get("text", "").strip() if block.get("type") == "text" else ""
+                    if not text or len(legacy) >= cap:
+                        continue
+                    text = REPEAT_TEMPLATE.sub(lambda m: m[1] * int(m[2]), text)
+                    legacy = f"{legacy} {text}" if legacy else text
+                    if len(legacy) > cap:
+                        legacy = legacy[:cap] + "…"
+            if legacy:
+                expected[rows[0]["sessionId"]] = (compact.content_digest(legacy),
+                                                  embedding_store.semantic_text_hash(legacy))
+        # the four in-band shapes: a line of one space inside a diff fence, alone and before a
+        # question block; a log with such a line then a closing block; a 70K block with one at 30K
+        for session in ("ca000043-0543-4000-8000-000000000543", "ca000044-0544-4000-8000-000000000544",
+                        "ca000045-0545-4000-8000-000000000545", "ca000046-0546-4000-8000-000000000546",
+                        MX_CLAUDE_GLUED_BULLET, MX_CLAUDE_CAPPED_QUESTION, MX_CLAUDE_CAPPED_TAIL_CUT):
+            self.assertIn(session, expected)
+        self.assertGreater(len(expected), 36)
+        with contextlib.closing(sqlite3.connect(self.sandbox.data / "corpus.db")) as db:
+            published = {s: (d, embedding_store.semantic_text_hash(t)) for s, d, t in db.execute(
+                "SELECT session, content_digest, text FROM msgs WHERE who='agent' AND turn=0")}
+        self.assertEqual({s: published.get(s) for s in expected}, expected)
+        for session in ("ca000043-0543-4000-8000-000000000543", "ca000044-0544-4000-8000-000000000544",
+                        "ca000046-0546-4000-8000-000000000546", MX_CLAUDE_GLUED_BULLET,
+                        MX_CLAUDE_CAPPED_QUESTION, MX_CLAUDE_CAPPED_TAIL_CUT):
+            handle = f"@{session[:8]}:0.{expected[session][0]}"
+            with self.subTest(handle=handle):
+                opened = self.sandbox.spawn([str(ROOT / "cli.py"), "around", handle, "--json",
+                                             "--no-auto"])
+                self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+
+    def test_a_refresh_that_moves_most_sessions_rebuilds_the_search_db_fresh(self) -> None:
+        # an in-place rewrite of most sessions leaves the db a third larger and takes twice as
+        # long as a fresh build; one session moving still refreshes in place
+        sandbox = SummarySandbox()
+        self.addCleanup(sandbox.close)
+        sandbox.index()
+        database = sandbox.data / "corpus.db"
+        # root and side transcripts alike: more than half of the indexed sessions must move
+        files = sorted((sandbox.home / ".claude").rglob("*.jsonl"))
+        self.assertGreater(len(files), 100)
+
+        def extend(path: Path) -> None:
+            session = json.loads(path.read_text(encoding="utf-8").splitlines()[0])["sessionId"]
+            row = {"sessionId": session, "cwd": str(sandbox.home / "projects" / "x"),
+                   "type": "assistant", "timestamp": "2026-09-01T00:00:00.000Z",
+                   "message": {"role": "assistant", "model": "claude-sonnet-4",
+                               "content": [{"type": "text", "text": "A later block."}]}}
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row) + "\n")
+
+        before = database.stat()
+        extend(files[0])
+        sandbox.index()
+        self.assertEqual(database.stat().st_ino, before.st_ino)
+        for path in files:
+            extend(path)
+        sandbox.index()
+        after = database.stat()
+        # a fresh build is renamed into place; the in-place rewrite kept the inode and grew the
+        # file by 29% here (31% on a 3,100-session store), one short block per session apart
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertLess(after.st_size, before.st_size * 1.2)
+
+    def test_the_search_db_keeps_each_replys_shape_beside_its_rows(self) -> None:
+        # corpus.db's reply_shape table carries the block structure keyed like the msgs row,
+        # written by the fresh build, refreshed for a session that changed, dropped with a
+        # session that went away; the briefing reads only the keys it classifies
+        import corpusdb
+        sandbox = SummarySandbox()
+        self.addCleanup(sandbox.close)
+        sandbox.index()
+        database = sandbox.data / "corpus.db"
+        glued, signed, capped = (MX_CLAUDE_GLUED_BULLET, MX_CLAUDE_LIST_THEN_SIGN_OFF,
+                                 MX_CLAUDE_CAPPED_QUESTION)
+        with contextlib.closing(sqlite3.connect(database)) as db:
+            shapes = corpusdb.reply_shapes(db, [(glued, 0), (signed, 0), (capped, 0),
+                                                (glued, 7)])
+        self.assertEqual(set(shapes), {(glued, 0), (signed, 0), (capped, 0)})
+        self.assertEqual((shapes[(glued, 0)]["reply_worked"], shapes[(signed, 0)]["reply_worked"]),
+                         ([1], [0]))
+        self.assertEqual(len(shapes[(glued, 0)]["reply_breaks"]), 1)
+        self.assertEqual(shapes[(capped, 0)]["reply_end"],
+                         "The zulu migration is drafted. Should I apply it to the zulu schema now?")
+        self.assertFalse(shapes[(capped, 0)]["reply_end_cut"])
+        # a later block after the sign-off chat's reply: its shape row follows the refresh
+        path = (sandbox.home / ".claude" / "projects" / "-projects-mx-claude"
+                / f"{MX_CLAUDE_LIST_THEN_SIGN_OFF}.jsonl")
+        row = {"sessionId": MX_CLAUDE_LIST_THEN_SIGN_OFF,
+               "cwd": str(sandbox.home / "projects" / "mx-claude"), "type": "assistant",
+               "timestamp": "2026-09-01T00:00:00.000Z",
+               "message": {"role": "assistant", "model": "claude-sonnet-4",
+                           "content": [{"type": "text", "text": "A later block."}]}}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+        glued_path = path.with_name(f"{MX_CLAUDE_GLUED_BULLET}.jsonl")
+        glued_path.unlink()
+        before = database.stat().st_ino
+        sandbox.index()
+        self.assertEqual(database.stat().st_ino, before)
+        with contextlib.closing(sqlite3.connect(database)) as db:
+            shapes = corpusdb.reply_shapes(db, [(glued, 0), (signed, 0)])
+            rows = db.execute("SELECT count(*) FROM reply_shape WHERE session=?",
+                              (glued,)).fetchone()[0]
+        self.assertEqual(set(shapes), {(signed, 0)})
+        self.assertEqual(rows, 0)
+        self.assertEqual((len(shapes[(signed, 0)]["reply_breaks"]),
+                          shapes[(signed, 0)]["reply_worked"]), (2, [0, 0]))
+
+    def test_side_chat_todo_caveats_are_reported(self) -> None:
+        # the background agent ran past the root's last moment with no result handed back; its
+        # todo list came in a shape the replay cannot read, which is unknown evidence, not none
+        item = self._pending_by_session("--project", "mx-claude")[MX_CLAUDE_SIDE_TODO_UNKNOWN]
+        self.assertEqual((item["status"], item["confidence"], item["source"],
+                          item["evidence_session"], item["signals"], item["caveats"]),
+                         ("unknown", "low", "side-chat", MX_CLAUDE_SIDE_TODO_UNKNOWN_SIDE,
+                          ["side chat's todo list captured in an unknown shape"],
+                          ["todo list captured in an unknown shape"]))
 
     def test_capped_question_input_shows_the_question_never_raw_json(self) -> None:
         import summary
@@ -1402,6 +2056,38 @@ class SummaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertIn(diagnostic, result.stderr)
+
+
+@unittest.skipUnless(os.name == "posix", "the summary sandbox relies on POSIX paths")
+class SummaryEventsUnavailableTests(unittest.TestCase):
+    """A briefing taken while the event store cannot be read used to drop every tool
+    event without a word: times lost their event tails, statuses their tool evidence."""
+
+    def test_unreadable_tool_events_are_disclosed(self) -> None:
+        sandbox = SummarySandbox()
+        self.addCleanup(sandbox.close)
+        sandbox.index()
+        window = ("time", *MARCH, "--project", "atlas", "--no-auto")
+        result = sandbox.summary(*window, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta, _rows_ = _rows(result)
+        self.assertEqual(meta["events_unavailable_chats"], 0)
+        self.assertFalse(any("tool events" in line for line in meta["caveats"]))
+        # a published database generation the marker does not match: no lookup can verify
+        marker = sandbox.data / "events" / ".generation"
+        marker.write_bytes(b"0" * len(marker.read_bytes()))
+        result = sandbox.summary(*window, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta, _rows_ = _rows(result)
+        self.assertGreater(meta["events_unavailable_chats"], 0)
+        self.assertTrue(any("tool events are unavailable right now" in line
+                            for line in meta["caveats"]))
+        human = sandbox.summary(*window)
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("tool events are unavailable right now for", human.stderr)
+        # A marker left behind waits for the next index pass, not for a retry.
+        self.assertIn("`agrep index`", human.stderr)
+        self.assertNotIn("retry in a moment", human.stderr)
 
 
 if __name__ == "__main__":

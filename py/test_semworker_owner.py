@@ -34,6 +34,8 @@ class SemanticWorkerOwnerTests(unittest.TestCase):
         self.coordination = mock.patch.object(
             semworker, "_coordination_base_path", return_value=self.root)
         self.coordination.start()
+        # fixtures write raw records; a writer would have minted the namespace
+        semworker._prepare_ephemeral_coordination_dir()
         self.handles: list[ownerfile.Handle] = []
 
     def tearDown(self) -> None:

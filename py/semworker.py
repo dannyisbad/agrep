@@ -32,12 +32,13 @@ from dataclasses import dataclass
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import common
 import indexd_runtime
 import ownerfile
 import removal_fence
+import surface_policy as surface
 
 PROTOCOL = 10
 CAPABILITIES = (
@@ -86,16 +87,27 @@ def _request_coordination_refused() -> bool:
     return _request_coordination_refusal_reason() is not None
 
 
-def _worker_coordination_refusal_reason() -> str | None:
+def _protective_refusal_reason() -> str | None:
+    """The two gates that forbid touching semantic coordination at all."""
     if _data_dir_readonly():
         return "AGREP_DATA_READONLY protects the data directory"
     if (removal_fence.background_removal_active()
             and not removal_fence.background_removal_owned_by_current_process()):
         return "agrep removal is active"
+    return None
+
+
+def _ownership_refusal_reason() -> str | None:
+    """The derived stores belong to another build: no worker may be launched
+    or its records republished from this one."""
     ownership = indexd_runtime.derived_writer_mutation_info()
     if ownership.writable or ownership.journal_blocked:
         return None
     return ownership.reason
+
+
+def _worker_coordination_refusal_reason() -> str | None:
+    return _protective_refusal_reason() or _ownership_refusal_reason()
 
 
 def _worker_lock_coordination_refusal_reason() -> str | None:
@@ -167,6 +179,10 @@ class ResidentSemanticPreflightUnavailable(ResidentSemanticUnavailable):
     """The request failed before any semantic inference could start."""
 
 
+class ResidentSemanticNamespaceBlocked(ResidentSemanticPreflightUnavailable):
+    """The coordination namespace is planted or unsafe: no wait will clear it."""
+
+
 class ResidentSemanticLoopbackUnavailable(
         ResidentSemanticPreflightUnavailable):
     """Local socket policy blocked IPC before inference; child fallback is safe."""
@@ -189,9 +205,12 @@ def _ephemeral_coordination_path(name: str) -> Path:
     agent sandbox that can read Application Support but may write only its
     private temporary directory. Exact-owner files remain mode 0600 and bind
     the path to this data directory.
+
+    Resolution is pure: only a writer prepares (creates and verifies) the
+    namespace, so an observer never mints a directory for a data dir that
+    will never run a worker.
     """
-    root = _prepare_ephemeral_coordination_dir()
-    return root / name.lstrip(".")
+    return _ephemeral_coordination_dir() / name.lstrip(".")
 
 
 def _coordination_base_path() -> Path:
@@ -216,20 +235,108 @@ def _ephemeral_coordination_dir() -> Path:
 def _prepare_ephemeral_coordination_dir() -> Path:
     """Create and verify the private cross-sandbox coordination namespace."""
     path = _ephemeral_coordination_dir()
+    for attempt in range(2):
+        try:
+            return _verify_ephemeral_coordination_dir(path)
+        except FileNotFoundError:
+            # a reaper or a finished diagnostic removed the empty namespace
+            # between our mkdir and its verification; mint it again once
+            if attempt:
+                raise
+    raise AssertionError("unreachable")
+
+
+class _NamespaceRefusal(Enum):
+    NOT_A_DIRECTORY = "not a private directory"
+    FOREIGN_OWNER = "has a foreign owner"
+    NOT_PRIVATE = "is not private"
+    UNREADABLE = "cannot be inspected"
+
+
+def _coordination_dir_refusal(
+        info: os.stat_result, *, exact_mode: bool) -> _NamespaceRefusal | None:
+    """Why a namespace entry may not be trusted, from one lstat; None if ours.
+
+    Shared by the writer that creates it and every reader that follows it, so
+    a planted symlink or foreign directory in sticky /tmp can never hand a
+    reader a crafted record. Writers demand (and repair to) exactly 0700;
+    readers accept any own-uid directory nobody else can write into."""
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or bool(getattr(info, "st_file_attributes", 0) & reparse)):
+        return _NamespaceRefusal.NOT_A_DIRECTORY
+    if os.name == "nt":
+        return None
+    owner_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+    owner = info.st_uid if owner_fn is None else owner_fn()
+    if info.st_uid != owner:
+        return _NamespaceRefusal.FOREIGN_OWNER
+    mode = stat.S_IMODE(info.st_mode)
+    hijackable = mode != 0o700 if exact_mode else bool(mode & 0o022)
+    if hijackable:
+        return _NamespaceRefusal.NOT_PRIVATE
+    return None
+
+
+class _NamespaceState(Enum):
+    ABSENT = "absent"
+    PRIVATE = "private"
+    BLOCKED = "blocked"
+
+
+class _NamespaceObservation(NamedTuple):
+    state: _NamespaceState
+    refusal: _NamespaceRefusal | None = None
+
+    @property
+    def reason(self) -> str | None:
+        """The one sentence every surface renders for a blocked namespace."""
+        if self.refusal is None:
+            return None
+        path = common.terminal_safe(_ephemeral_coordination_dir())
+        # chmod 700 would keep entries others planted while it was open
+        remedy = (
+            "remove that entry"
+            if self.refusal is _NamespaceRefusal.NOT_A_DIRECTORY else
+            "remove that directory")
+        return (f"semantic coordination path {self.refusal.value}: {path}; "
+                f"{remedy}, then retry")
+
+
+def _observe_coordination_dir() -> _NamespaceObservation:
+    """Read-side gate: never creates the namespace, never follows a bad one."""
+    try:
+        info = os.lstat(_ephemeral_coordination_dir())
+    except FileNotFoundError:
+        return _NamespaceObservation(_NamespaceState.ABSENT)
+    except OSError:
+        return _NamespaceObservation(
+            _NamespaceState.BLOCKED, _NamespaceRefusal.UNREADABLE)
+    refusal = _coordination_dir_refusal(info, exact_mode=False)
+    if refusal is not None:
+        return _NamespaceObservation(_NamespaceState.BLOCKED, refusal)
+    return _NamespaceObservation(_NamespaceState.PRIVATE)
+
+
+def _verify_ephemeral_coordination_dir(path: Path) -> Path:
     path.mkdir(mode=0o700, exist_ok=True)
     before = os.lstat(path)
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    if (stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode)
-            or bool(getattr(before, "st_file_attributes", 0) & reparse)):
-        raise OSError(
-            f"semantic coordination path is not a private directory: {path}")
+    refusal = _coordination_dir_refusal(before, exact_mode=True)
+    if refusal is _NamespaceRefusal.NOT_A_DIRECTORY:
+        raise OSError(f"semantic coordination path is {refusal.value}: {path}")
+    if refusal is _NamespaceRefusal.FOREIGN_OWNER:
+        raise PermissionError(
+            f"semantic coordination directory {refusal.value}: {path}")
+    if (refusal is _NamespaceRefusal.NOT_PRIVATE
+            and _coordination_dir_refusal(before, exact_mode=False) is not None
+            and any(True for _ in os.scandir(path))):
+        # Others could write here and did not get cleaned out: repairing the
+        # mode would re-trust whatever they planted. Only an empty one heals.
+        raise PermissionError(
+            f"semantic coordination directory {refusal.value}: {path}; "
+            "remove that directory, then retry")
     if os.name == "nt":
         return path
-    owner_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
-    owner = before.st_uid if owner_fn is None else owner_fn()
-    if before.st_uid != owner:
-        raise PermissionError(
-            f"semantic coordination directory has a foreign owner: {path}")
     flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
              | getattr(os, "O_NOFOLLOW", 0))
     fd = os.open(path, flags)
@@ -253,9 +360,11 @@ _STALE_NAMESPACE_S = 3600.0
 
 
 def reap_stale_coordination_dirs(now: float | None = None) -> int:
-    """Remove sibling namespaces that hold no record and have not been touched
-    for an hour; every sandboxed data dir mints one and nothing else deletes it.
-    A non-empty or foreign-owned directory is never touched."""
+    """Remove sibling namespaces nothing will come back for: untouched for an
+    hour and either empty or holding only a worker.lock whose owner is dead or
+    reused (pid plus start identity). The live namespace, a live or unverifiable
+    worker's record, a foreign-owned or otherwise non-empty directory is never
+    touched."""
     live = _ephemeral_coordination_dir().name
     prefix = f"agrep-semantic-v{_COORDINATION_NAMESPACE_VERSION}-"
     uid_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
@@ -274,11 +383,26 @@ def reap_stale_coordination_dirs(now: float | None = None) -> int:
             if (not stat.S_ISDIR(st.st_mode) or st.st_mtime > cutoff
                     or (uid is not None and st.st_uid != uid)):
                 continue
-            os.rmdir(entry.path)
+            _reap_dead_worker_lock(Path(entry.path) / "worker.lock")
+            if not ownerfile.remove_record_dir(Path(entry.path)):
+                continue
             removed += 1
         except OSError:
             continue
     return removed
+
+
+def _reap_dead_worker_lock(path: Path) -> bool:
+    """Unlink a worker record only when its exact owner is provably gone."""
+    inspected = _inspect_worker_lock_path(path)
+    if inspected.snapshot is None or inspected.state not in (
+            _WorkerOwnerState.RECLAIMABLE, _WorkerOwnerState.MALFORMED_STALE):
+        return False
+    try:
+        return ownerfile.remove_exact(
+            path, inspected.snapshot, tombstone=True, require_stable_mtime=True)
+    except OSError:
+        return False
 
 
 def worker_lock_path() -> Path:
@@ -490,7 +614,9 @@ def _descriptor_compatible(rec: dict) -> bool:
 
 
 def _request_worker_stop(rec: dict, timeout_s: float = 0.5) -> bool:
-    """Ask a current-enough worker to retire; old workers may simply return 404."""
+    """Ask a current-enough worker to retire; old workers may simply return 404.
+    The reply says only that something on the port accepted the token - it is
+    never process identity, so no signal is ever decided by it."""
     token = _hex_token(rec.get("token"), 64)
     try:
         port = int(rec["port"])
@@ -551,6 +677,10 @@ class _WorkerOwner:
     state: _WorkerOwnerState
     record: dict | None = None
     snapshot: ownerfile.Snapshot | None = None
+    # BLOCKED by the namespace gate: the one sentence naming path and remedy
+    namespace_reason: str | None = None
+    # a planted entry or foreign record: no worker of ours can be behind it
+    planted: bool = False
 
 
 _STOP_REASONS = {
@@ -586,22 +716,45 @@ def _owner_state_reason(state: str) -> str:
         state, "semantic ownership cannot be reconciled safely")
 
 
+def _unbound_worker_reason(rec: dict, acknowledged: bool, why: str) -> str:
+    """A live process named only by an endpoint record: asked, never signalled."""
+    pid = int(rec.get("pid") or 0)
+    asked = ("accepted the stop request but is still running"
+             if acknowledged else "did not answer the stop request")
+    return (f"the semantic worker (pid {pid}) named by its endpoint record {asked}, "
+            f"and {why}, so it was not signalled; end that process yourself "
+            f"(kill {pid}) or wait for its idle lease to end, then retry")
+
+
 def _stop_outcome(
         ok: bool, *, running: bool | None = None, blocked: bool = False,
         owner_state: str | None = None, stop_ack: bool = False,
         fallback_termination: bool = False, pid: int | None = None,
-        replacements: int = 0) -> dict:
+        replacements: int = 0, reason: str | None = None) -> dict:
     if ok and running is None:
         running = False
     state = owner_state or ("active" if running is True else "absent")
     return {
         "ok": bool(ok), "running": running, "blocked": bool(blocked),
         "owner_state": state,
-        "reason": None if ok else _owner_state_reason(state),
+        "reason": reason if reason is not None or ok else _owner_state_reason(state),
         "stop_ack": bool(stop_ack),
         "fallback_termination": bool(fallback_termination),
         "pid": pid, "replacements": int(replacements),
     }
+
+
+def _blocked_namespace_stop_outcome(inspected: _WorkerOwner) -> dict:
+    """A planted entry (symlink, foreign dir, foreign record) can hold no worker
+    of ours: nothing to stop, so removal proceeds with a note. Anything else
+    the gate refused may hide a real record: blocked, with the remedy."""
+    if inspected.planted:
+        return _stop_outcome(
+            True, owner_state="namespace-planted",
+            reason=f"no semantic worker of ours can exist there: {inspected.namespace_reason}")
+    return _stop_outcome(
+        False, running=None, blocked=True, owner_state="namespace-blocked",
+        reason=inspected.namespace_reason)
 
 
 def _malformed_worker_owner(observed: ownerfile.Snapshot) -> _WorkerOwner:
@@ -612,11 +765,43 @@ def _malformed_worker_owner(observed: ownerfile.Snapshot) -> _WorkerOwner:
     return _WorkerOwner(state, snapshot=observed)
 
 
+class ForeignRecord(OSError):
+    """A coordination record not owned by this user; never trusted."""
+
+
+def _own_record_snapshot(
+        path: Path, *, max_bytes: int = _WORKER_OWNER_BYTES) -> ownerfile.Snapshot:
+    """ownerfile.snapshot plus an owner check on the exact entry that was read.
+
+    A record planted while the namespace was writable, or hardlinked in from
+    another user's file, carries that user's uid: refuse it (ForeignRecord)
+    rather than let its contents name a process to signal."""
+    observed = ownerfile.snapshot(path, max_bytes=max_bytes)
+    if os.name == "nt":
+        return observed
+    info = os.lstat(path)
+    if (info.st_dev, info.st_ino) != observed.identity[:2]:
+        raise ownerfile.OwnershipLost(
+            f"owner record changed after reading: {path}")
+    owner_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+    if owner_fn is not None and info.st_uid != owner_fn():
+        raise ForeignRecord(f"owner record has a foreign owner: {path}")
+    return observed
+
+
 def _inspect_worker_lock_path(path: Path) -> _WorkerOwner:
     try:
-        observed = ownerfile.snapshot(path, max_bytes=_WORKER_OWNER_BYTES)
+        observed = _own_record_snapshot(path, max_bytes=_WORKER_OWNER_BYTES)
     except FileNotFoundError:
         return _WorkerOwner(_WorkerOwnerState.ABSENT)
+    except ForeignRecord:
+        # no writer of ours produced it, so no worker of ours is behind it
+        return _WorkerOwner(
+            _WorkerOwnerState.BLOCKED,
+            namespace_reason=(
+                "semantic owner record has a foreign owner: "
+                f"{common.terminal_safe(path)}; remove it, then retry"),
+            planted=True)
     except OSError:
         return _WorkerOwner(_WorkerOwnerState.BLOCKED)
     try:
@@ -693,6 +878,15 @@ def _inspect_worker_lock_path(path: Path) -> _WorkerOwner:
 
 
 def _inspect_worker_lock() -> _WorkerOwner:
+    namespace = _observe_coordination_dir()
+    if namespace.state is _NamespaceState.ABSENT:
+        return _WorkerOwner(_WorkerOwnerState.ABSENT)
+    if namespace.state is _NamespaceState.BLOCKED:
+        return _WorkerOwner(
+            _WorkerOwnerState.BLOCKED, namespace_reason=namespace.reason,
+            planted=namespace.refusal in (
+                _NamespaceRefusal.NOT_A_DIRECTORY,
+                _NamespaceRefusal.FOREIGN_OWNER))
     return _inspect_worker_lock_path(worker_lock_path())
 
 
@@ -777,24 +971,57 @@ def _descriptor_bound_to_lock(rec: dict, lock: _WorkerOwner) -> bool:
         and lock.record.get("named_job") is rec.get("named_job"))
 
 
-def _request_and_drain_worker(rec: dict, descriptor, timeout_s: float):
+def _bound_to_gated_owner(rec: dict) -> bool:
+    """The trusted binding that alone authorises a signal: `rec` names the same
+    live process (pid and start identity) as the worker.lock owner record read
+    through the gated private namespace - own uid, 0700, not a symlink, record
+    st_uid == euid - which another user cannot plant. An endpoint record must
+    also carry that owner's generation (_descriptor_bound_to_lock); the owner
+    record itself is bound by being that record. Nothing a listener on the
+    recorded port says ever substitutes for this."""
+    inspected = _inspect_worker_lock()
+    if (inspected.state is not _WorkerOwnerState.EXACT or inspected.record is None
+            or inspected.record.get("tree_bound") is not True):
+        return False
+    if "port" in rec:
+        return _descriptor_bound_to_lock(rec, inspected)
+    return _same_owner(inspected.record, rec)
+
+
+def _request_and_drain_worker(rec: dict, descriptor, timeout_s: float, *, bound: bool):
+    """Ask the worker to retire and see it out.
+
+    bound: the caller verified the trusted binding (_bound_to_gated_owner) for
+    `rec`, so after an ack its tree is ended - on Windows through the Job object
+    only the worker itself created (named for its pid and start identity, opened
+    by winjob.open_exact, which also matches the process's creation time) -
+    and, failing an ack, the caller may terminate it. Unbound, the request is
+    sent only while the recorded pid is alive with the expected start identity,
+    the worker is given until its own retire deadline (STOP_ACK_ORPHAN_S) to
+    exit, and nothing is ever signalled."""
     pid = int(rec.get("pid") or 0)
     expected_start = str(rec.get("process_start") or "")
     deadline = time.monotonic() + max(0.0, float(timeout_s))
 
     def request_stop(target: dict):
+        nonlocal deadline
         remaining = deadline - time.monotonic()
         tree = None
-        if common.WIN and target.get("named_job") is True:
+        if bound and common.WIN and target.get("named_job") is True:
             import winjob
 
             tree = winjob.open_exact(pid, expected_start)
             if tree is None:
                 return False, None
+        if (not bound and _process_owner(pid, expected_start)
+                is not ownerfile.ProcessOwner.EXACT_LIVE):
+            return False, None
         acknowledged = (
             remaining > 0
             and _request_worker_stop(
                 target, timeout_s=min(0.5, remaining)))
+        if acknowledged and not bound:
+            deadline = max(deadline, time.monotonic() + STOP_ACK_ORPHAN_S + 1.0)
         if not acknowledged and tree is not None:
             tree.close()
             tree = None
@@ -805,7 +1032,7 @@ def _request_and_drain_worker(rec: dict, descriptor, timeout_s: float):
     drained_after_ack = False
     try:
         while True:
-            if stop_ack and not drained_after_ack:
+            if stop_ack and bound and not drained_after_ack:
                 drained_after_ack = True
                 remaining = max(0.0, deadline - time.monotonic())
                 if ack_tree is not None:
@@ -820,7 +1047,7 @@ def _request_and_drain_worker(rec: dict, descriptor, timeout_s: float):
             if state in (
                     ownerfile.ProcessOwner.DEAD,
                     ownerfile.ProcessOwner.REUSED):
-                if common.WIN and rec.get("named_job") is True:
+                if common.WIN and rec.get("named_job") is True and bound:
                     return False, descriptor, stop_ack
                 if (not common.WIN and rec.get("tree_bound") is True
                         and common._process_group_active(pid) is not False):
@@ -880,6 +1107,34 @@ def _stop_worker_under_start_claim(
                 pid=first_pid, replacements=replacements)
         descriptor = _reconcile_descriptor(deadline=deadline)
         inspected = _inspect_worker_lock()
+        if inspected.namespace_reason and descriptor is None:
+            live = _live_descriptor_behind_blocked_namespace()
+            if live is None:
+                outcome = _blocked_namespace_stop_outcome(inspected)
+                return {**outcome, "pid": first_pid, "stop_ack": stop_ack,
+                        "fallback_termination": fallback_termination,
+                        "replacements": replacements}
+            # The namespace cannot vouch for its lock, so the descriptor alone
+            # never authorises a signal: the worker is asked to retire and given
+            # its own retire deadline; if it stays, that is reported, not forced.
+            rec, observed = live
+            remaining = max(0.0, deadline - time.monotonic())
+            exited, _descriptor, acknowledged = _request_and_drain_worker(
+                rec, live, min(grace_s + fallback_s, remaining), bound=False)
+            stop_ack = stop_ack or acknowledged
+            if not exited:
+                return _stop_outcome(
+                    False, running=True, blocked=True,
+                    owner_state="descriptor-unanswered",
+                    stop_ack=stop_ack,
+                    fallback_termination=fallback_termination,
+                    pid=int(rec.get("pid") or 0), replacements=replacements,
+                    reason=_unbound_worker_reason(
+                        rec, acknowledged,
+                        f"its owner record cannot be read ({inspected.namespace_reason})"))
+            first_pid = first_pid or int(rec.get("pid") or 0)
+            _discard_record(descriptor_path(), observed)
+            continue
         if descriptor is not None:
             rec = descriptor[0]
             lock = (
@@ -1013,9 +1268,21 @@ def _stop_worker_under_start_claim(
                 pid=first_pid, replacements=replacements)
         remaining = max(0.0, deadline - time.monotonic())
         request_budget = min(grace_s, remaining)
+        # bound: rec is the gated owner record itself, or an endpoint record
+        # matching it (lock); only that binding ever authorises a signal
+        bound = descriptor is None or lock is not None
         exited, descriptor, acknowledged = _request_and_drain_worker(
-            rec, descriptor, request_budget)
+            rec, descriptor, request_budget, bound=bound)
         stop_ack = stop_ack or acknowledged
+        if not exited and not bound:
+            return _stop_outcome(
+                False, running=True, blocked=True,
+                owner_state="descriptor-unanswered", stop_ack=stop_ack,
+                fallback_termination=fallback_termination,
+                pid=first_pid, replacements=replacements,
+                reason=_unbound_worker_reason(
+                    rec, acknowledged,
+                    "no owner record in the private coordination namespace names it"))
         if not exited:
             remaining = max(0.0, deadline - time.monotonic())
             used_fallback = (
@@ -1061,10 +1328,154 @@ def _stop_worker_under_start_claim(
             _discard_worker_record(worker_lock_path(), lock[1])
 
 
+def _live_worker_records() -> list[tuple[str, dict]] | None:
+    """(source, record) for every semantic worker process verified alive by pid
+    and start identity, read without touching any record; None when a record
+    cannot be classified (so nothing can be called stopped). The endpoint
+    record is preferred for a worker also named by an owner record: it is the
+    one carrying the port and token a stop request needs."""
+    live: list[tuple[str, dict]] = []
+    try:
+        rec = json.loads(_own_record_snapshot(descriptor_path(), max_bytes=4096).raw)
+        pid, start = rec.get("pid"), rec.get("process_start")
+        if (isinstance(rec, dict) and isinstance(pid, int) and not isinstance(pid, bool)
+                and pid > 0 and isinstance(start, str) and start not in _UNVERIFIABLE_STARTS
+                and _process_owner(pid, start) is ownerfile.ProcessOwner.EXACT_LIVE):
+            live.append(("endpoint record", rec))
+    except (FileNotFoundError, ForeignRecord):
+        # absent, or planted by another user: no worker of ours is behind it
+        pass
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    for source, inspected in (("owner record", _inspect_worker_lock()),
+                              ("legacy owner record", _inspect_legacy_worker_lock())):
+        if inspected.state is _WorkerOwnerState.EXACT and inspected.record is not None:
+            if not any(_same_owner(inspected.record, known) for _, known in live):
+                live.append((source, inspected.record))
+        elif inspected.state in (_WorkerOwnerState.UNVERIFIABLE,
+                                 _WorkerOwnerState.ORPHANED_GROUP,
+                                 _WorkerOwnerState.BLOCKED) and not inspected.planted:
+            return None
+    return live
+
+
+class _ForeignStop(NamedTuple):
+    acknowledged: bool
+    gone: bool
+    bound: bool
+    terminated: bool
+
+
+def _retire_foreign_worker(rec: dict, deadline: float) -> _ForeignStop:
+    """One live worker of another build. Bound (_bound_to_gated_owner): it is
+    asked to retire over its endpoint and its tree is ended either way - what
+    authorises the signal is the binding, never the reply. Unbound: the request
+    goes out only while the recorded pid is alive with its start identity, the
+    worker gets until its own retire deadline (STOP_ACK_ORPHAN_S) to exit, and
+    nothing is signalled."""
+    pid = int(rec.get("pid") or 0)
+    expected_start = str(rec.get("process_start") or "")
+    bound = _bound_to_gated_owner(rec)
+    tree = None
+    if bound and common.WIN:
+        import winjob
+
+        # the Job only the worker itself created, named for this pid and start
+        tree = winjob.open_exact(pid, expected_start) if rec.get("named_job") is True else None
+        bound = tree is not None
+    try:
+        acknowledged = False
+        remaining = deadline - time.monotonic()
+        if ("port" in rec and remaining > 0 and _process_owner(pid, expected_start)
+                is ownerfile.ProcessOwner.EXACT_LIVE):
+            acknowledged = _request_worker_stop(rec, timeout_s=min(0.5, remaining))
+        if bound:
+            # an acked worker releases and exits on its own; the tree is ended the
+            # way the owner path ends it, a brief grace first when it did not answer
+            if not acknowledged:
+                grace = min(deadline, time.monotonic() + 1.0)
+                while time.monotonic() < grace and _process_owner(
+                        pid, expected_start) is ownerfile.ProcessOwner.EXACT_LIVE:
+                    time.sleep(0.05)
+            budget = max(0.0, deadline - time.monotonic())
+            if tree is not None:
+                gone = tree.terminate_and_wait(budget)
+            else:
+                gone = _terminate_worker_tree(rec, budget) or _process_owner(
+                    pid, expected_start) in (
+                        ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED)
+            return _ForeignStop(acknowledged, gone, True, True)
+        settle = max(deadline, time.monotonic() + STOP_ACK_ORPHAN_S + 1.0)
+        gone = False
+        while not gone and time.monotonic() < settle:
+            gone = _process_owner(pid, expected_start) in (
+                ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED)
+            if not gone:
+                time.sleep(0.05)
+        return _ForeignStop(acknowledged, gone, False, False)
+    finally:
+        if tree is not None:
+            tree.close()
+
+
+def _stop_under_foreign_ownership(
+        reason: str, grace_s: float, fallback_s: float) -> dict:
+    """Removal from a build that does not own the derived stores: with no live
+    semantic worker there is nothing to stop and the ownership is irrelevant; a
+    live one bound to the private owner record is retired (no record of another
+    build is rewritten); one that is not bound is asked and, if it stays, named."""
+    live = _live_worker_records()
+    if live is None:
+        return _stop_outcome(
+            False, running=None, blocked=True, owner_state="unverifiable",
+            reason=("the semantic owner record cannot be verified, and this build "
+                    f"does not own the index ({reason})"))
+    if not live:
+        return _stop_outcome(True, running=False)
+    budget = max(0.0, min(300.0, grace_s)) + max(0.0, min(300.0, fallback_s))
+    deadline = time.monotonic() + budget
+    acknowledged = False
+    terminated = False
+    unbound: list[tuple[str, dict, bool]] = []
+    for source, rec in live:
+        outcome = _retire_foreign_worker(rec, deadline)
+        acknowledged = acknowledged or outcome.acknowledged
+        terminated = terminated or outcome.terminated
+        if not outcome.bound and not outcome.gone and "port" in rec:
+            unbound.append((source, rec, outcome.acknowledged))
+    while True:
+        remaining = _live_worker_records()
+        if remaining is not None and not remaining:
+            return _stop_outcome(
+                True, running=False, stop_ack=acknowledged,
+                fallback_termination=terminated, pid=int(live[0][1].get("pid") or 0))
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    if unbound:
+        source, rec, asked = unbound[0]
+        return _stop_outcome(
+            False, running=True, blocked=True, owner_state="descriptor-unanswered",
+            pid=int(rec.get("pid") or 0), stop_ack=acknowledged,
+            reason=_unbound_worker_reason(
+                rec, asked,
+                "no owner record in the private coordination namespace names it"))
+    source, rec = live[0]
+    pid = int(rec.get("pid") or 0)
+    return _stop_outcome(
+        False, running=True, blocked=True, owner_state="foreign-owner", pid=pid,
+        stop_ack=acknowledged, fallback_termination=terminated,
+        reason=(f"a semantic worker (pid {pid}, from its {source}) started by another "
+                f"agrep build is still running and this build does not own the index "
+                f"({reason}); stop it from the build that started it, or run "
+                f"`{common.cli_name()} index` with this build to take ownership, then "
+                "retry"))
+
+
 def stop_worker_and_wait(
         grace_s: float = 5.0, fallback_s: float = 2.0) -> dict:
     """Fence new launches, then stop and settle the exact semantic owner."""
-    if _worker_coordination_refusal_reason() is not None:
+    if _protective_refusal_reason() is not None:
         return _stop_outcome(
             False, running=False, blocked=True, owner_state="read-only")
     grace_s = float(grace_s)
@@ -1075,6 +1486,9 @@ def stop_worker_and_wait(
     fallback_s = (
         max(0.0, min(300.0, fallback_s))
         if math.isfinite(fallback_s) else 0.0)
+    ownership = _ownership_refusal_reason()
+    if ownership is not None:
+        return _stop_under_foreign_ownership(ownership, grace_s, fallback_s)
     deadline = time.monotonic() + grace_s + fallback_s
     claim = None
     while claim is None:
@@ -1169,7 +1583,9 @@ def _inspect_descriptor() -> _DescriptorObservation:
     """Observe the endpoint and its exact owner without changing either."""
     path = descriptor_path()
     try:
-        observed = ownerfile.snapshot(path)
+        # the same owner-uid check as the coordination records: a record planted
+        # by another user names no worker of ours (ForeignRecord is an OSError)
+        observed = _own_record_snapshot(path)
     except FileNotFoundError:
         return _DescriptorObservation(_DescriptorState.ABSENT)
     except OSError:
@@ -1276,6 +1692,24 @@ def _reconcile_descriptor(
     return None
 
 
+def _live_descriptor_behind_blocked_namespace(
+        ) -> tuple[dict, ownerfile.Snapshot] | None:
+    """The data-dir descriptor of a live worker of this build, or None.
+
+    With its namespace refused, the descriptor reads PROTECTED or UNBOUND
+    only because the lock cannot be consulted; the descriptor itself lives
+    in the data dir and carries a verified pid + start identity, which is
+    all a stop needs."""
+    inspected = _inspect_descriptor()
+    if (inspected.record is None or inspected.snapshot is None
+            or inspected.state not in (
+                _DescriptorState.READY, _DescriptorState.PROTECTED,
+                _DescriptorState.UNBOUND)
+            or not _descriptor_compatible(inspected.record)):
+        return None
+    return inspected.record, inspected.snapshot
+
+
 def _descriptor_entry_present() -> bool:
     try:
         descriptor_path().lstat()
@@ -1328,12 +1762,20 @@ def resident_status(*, include_resources: bool = False) -> dict:
             f"descriptor-{descriptor.state.value}"
             if descriptor_blocked
             else inspected.state.value)
+        reason = None
+        if blocked:
+            reason = (
+                inspected.namespace_reason
+                if inspected.namespace_reason and not descriptor_blocked
+                else _owner_state_reason(owner_state))
         return {
             "running": False, "starting": False, "protected": blocked,
             "blocked": blocked, "owner_state": owner_state,
-            "reason": _owner_state_reason(owner_state) if blocked else None,
+            "reason": reason,
             "descriptor_state": descriptor.state.value,
             "descriptor_blocked": descriptor_blocked,
+            **({"namespace_blocked": True}
+               if inspected.namespace_reason else {}),
         }
     rec = descriptor.record
     if rec is None:
@@ -1366,6 +1808,8 @@ def _start_claim_active() -> bool:
 
 def _semantic_owner_pending() -> bool:
     inspected = _inspect_worker_lock()
+    if inspected.namespace_reason:
+        raise ResidentSemanticNamespaceBlocked(inspected.namespace_reason)
     if inspected.state in (
             _WorkerOwnerState.EXACT,
             _WorkerOwnerState.ORPHANED_GROUP,
@@ -1435,14 +1879,14 @@ def _cancel_timed_out_worker(rec: dict) -> bool:
     return True
 
 
-def _request_slot_raw() -> bytes | None:
+def _request_slot_raw() -> tuple[bytes, str] | None:
     process_start = common.process_start_identity(os.getpid())
     if process_start is None:
         return None
+    nonce = secrets.token_hex(16)
     return json.dumps({
-        "pid": os.getpid(), "process_start": process_start,
-        "nonce": secrets.token_hex(16),
-    }, separators=(",", ":")).encode()
+        "pid": os.getpid(), "process_start": process_start, "nonce": nonce,
+    }, separators=(",", ":")).encode(), nonce
 
 
 def _request_slot_reclaimable(observed: ownerfile.Snapshot) -> bool:
@@ -1462,32 +1906,53 @@ def _request_slot_reclaimable(observed: ownerfile.Snapshot) -> bool:
     owner = ownerfile.classify_process(
         pid, process_start, pid_alive=common.pid_alive,
         process_start=common.process_start_identity)
-    return owner in (ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED)
+    return (owner in (ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED)
+            or ownerfile.stranded_own_record(
+                pid, process_start, nonce,
+                process_start=common.process_start_identity))
 
 
 def _acquire_request_slot(deadline: float) -> ownerfile.Handle | None:
     refusal = _request_coordination_refusal_reason()
     if refusal is not None:
         raise ResidentSemanticPreflightUnavailable(refusal)
-    raw = _request_slot_raw()
-    if raw is None:
+    claim = _request_slot_raw()
+    if claim is None:
         raise ResidentSemanticPreflightUnavailable(_coordination_failure(
             "create", "this process has no verifiable start identity"))
+    raw, nonce = claim
     try:
         _prepare_ephemeral_coordination_dir()
     except OSError as exc:
         raise ResidentSemanticPreflightUnavailable(
             _coordination_failure("prepare", exc)) from exc
     path = request_lock_path()
+    reminted = False
     while True:
         try:
-            return ownerfile.create_exclusive(
-                path, raw, mode=0o600, retain_fd=True)
+            return ownerfile.create_held(
+                path, raw, token=nonce, mode=0o600, retain_fd=True)
+        except FileNotFoundError as exc:
+            # the empty namespace was reaped under us; mint it again once
+            if reminted:
+                raise ResidentSemanticPreflightUnavailable(
+                    _coordination_failure("create", exc)) from exc
+            reminted = True
+            try:
+                _prepare_ephemeral_coordination_dir()
+            except OSError as prepare_exc:
+                raise ResidentSemanticPreflightUnavailable(
+                    _coordination_failure("prepare", prepare_exc)) from prepare_exc
         except FileExistsError:
             try:
-                observed = ownerfile.snapshot(path)
+                observed = _own_record_snapshot(path)
             except FileNotFoundError:
                 continue
+            except ForeignRecord:
+                # not ours and never reclaimable by us: waiting cannot clear it
+                raise ResidentSemanticNamespaceBlocked(
+                    "semantic request record has a foreign owner: "
+                    f"{common.terminal_safe(path)}; remove it, then retry")
             except ownerfile.OwnershipLost:
                 # The request slot is recreated between serialized callers, so
                 # this exact handoff is contention rather than corruption. Stay
@@ -1537,6 +2002,7 @@ def _request_worker_retire_handoff(rec: dict) -> bool:
         "target_start": str(rec.get("process_start") or ""),
     }, separators=(",", ":")).encode("utf-8")
     try:
+        _prepare_ephemeral_coordination_dir()
         ownerfile.create_exclusive(path, raw, mode=0o600)
         return True
     except FileExistsError:
@@ -1546,17 +2012,21 @@ def _request_worker_retire_handoff(rec: dict) -> bool:
 
 
 def _retire_handoff_requested(owner_nonce: str) -> bool:
+    if _observe_coordination_dir().state is not _NamespaceState.PRIVATE:
+        return False
     try:
-        ownerfile.snapshot(retire_request_path(owner_nonce), max_bytes=4096)
+        _own_record_snapshot(retire_request_path(owner_nonce), max_bytes=4096)
         return True
     except OSError:
         return False
 
 
 def _discard_retire_handoff(owner_nonce: str) -> None:
+    if _observe_coordination_dir().state is not _NamespaceState.PRIVATE:
+        return
     path = retire_request_path(owner_nonce)
     try:
-        observed = ownerfile.snapshot(path, max_bytes=4096)
+        observed = _own_record_snapshot(path, max_bytes=4096)
         ownerfile.remove_exact(
             path, observed, tombstone=True, require_stable_mtime=True)
     except OSError:
@@ -2213,8 +2683,45 @@ def search_worker(query: str, *, level: str, k: int,
 
 
 def diagnostic_query_status(
-        *, ready: bool, timeout_s: float = 1.5) -> dict:
-    """Probe each prerequisite, then complete one real semantic request."""
+        *, ready: bool, timeout_s: float = 1.5,
+        coherence_probe: Callable[[], dict] | None = None) -> dict:
+    """Probe each prerequisite, then complete one real semantic request.
+
+    ``coherence_probe`` re-observes the generation after a refused query: the
+    diagnostic request never refreshes, so a generation that moved under the
+    probe answers "stale" while the lane rebinds by itself. That observation
+    is reported as ``generation-moved`` (unverified) with ``coherence_after``
+    carrying the newer state; a lane that is searchable again gets one retry,
+    so the probe spends at most two queries and two coherence reads.
+
+    The resident worker is shared by every client of this data dir, so the
+    probe never stops one; a worker it launched ends on its idle lease and
+    the reaper reclaims its record. The probe's own request slot mints the
+    coordination namespace; one the probe minted is removed again if empty.
+    """
+    namespace = _ephemeral_coordination_dir()
+    namespace_existed = _entry_present(namespace)
+    result = _diagnostic_query_status(
+        ready=ready, timeout_s=timeout_s, coherence_probe=coherence_probe)
+    resident_after = resident_status(include_resources=True)
+    result["resident_after"] = resident_after
+    result["discovered"] = bool(
+        resident_after.get("running")
+        and resident_after.get("descriptor_state") == "ready")
+    result["alive"] = bool(
+        resident_after.get("running")
+        or resident_after.get("starting")
+        or resident_after.get("inprocess"))
+    result["cleanup"] = {
+        "namespace_removed": (
+            not namespace_existed and _remove_empty_dir(namespace)),
+    }
+    return result
+
+
+def _diagnostic_query_status(
+        *, ready: bool, timeout_s: float,
+        coherence_probe: Callable[[], dict] | None) -> dict:
     resident_before = resident_status(include_resources=True)
     bind = loopback_bind_status()
     coordination = request_coordination_status(
@@ -2243,6 +2750,11 @@ def diagnostic_query_status(
         result["reason"] = "the current semantic generation is not query-ready"
         return result
     if resident_before.get("protected") and not discovered:
+        if resident_before.get("namespace_blocked"):
+            result["state"] = "namespace-blocked"
+            result["query_serving"] = False
+            result["reason"] = str(resident_before.get("reason"))
+            return result
         owner_state = str(
             resident_before.get("owner_state") or "protected")
         result["state"] = "worker-protected"
@@ -2288,6 +2800,53 @@ def diagnostic_query_status(
             "agrep build or finish upgrading it")
         return result
     started = time.perf_counter()
+    outcome = _readiness_query_outcome(timeout_s, coordination_busy)
+    retried = False
+    while (coherence_probe is not None
+           and outcome["state"] in ("query-failed", "query-unavailable")):
+        after = coherence_probe()
+        if _lane_searchable(after):
+            if retried:
+                break
+            retried = True
+            outcome = _readiness_query_outcome(timeout_s, coordination_busy)
+            continue
+        if surface.semantic_generation_self_heals(after.get("state")):
+            outcome = {
+                "state": "generation-moved",
+                "query_serving": None,
+                "reason": (
+                    "the semantic generation moved during the probe "
+                    f"(embeddings {after.get('state') or 'unknown'}); the lane "
+                    "rebinds in the background"),
+                "coherence_after": after,
+            }
+        break
+    result.update(outcome)
+    result["roundtrip_ms"] = round(
+        (time.perf_counter() - started) * 1000.0, 3)
+    return result
+
+
+def _entry_present(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except OSError:
+        return False
+    return True
+
+
+def _remove_empty_dir(path: Path) -> bool:
+    return ownerfile.remove_record_dir(path)
+
+
+def _lane_searchable(coherence: dict) -> bool:
+    return bool(coherence.get("searchable", coherence.get("coherent", False)))
+
+
+def _readiness_query_outcome(
+        timeout_s: float, coordination_busy: bool) -> dict:
+    """One bounded diagnostic request, classified: state, query_serving, reason."""
     try:
         response = search_worker(
             "agrep semantic readiness", level="message", k=1,
@@ -2298,64 +2857,51 @@ def diagnostic_query_status(
             timing=False, timeout_s=timeout_s,
             start_timeout_s=min(0.75, max(0.05, float(timeout_s))))
     except ResidentSemanticTimeout as exc:
-        result["state"] = "query-busy" if coordination_busy else "query-timeout"
-        result["query_serving"] = None if coordination_busy else False
-        result["reason"] = str(exc)
+        return {
+            "state": "query-busy" if coordination_busy else "query-timeout",
+            "query_serving": None if coordination_busy else False,
+            "reason": str(exc),
+        }
     except ResidentSemanticUnavailable as exc:
-        result["state"] = "query-failed"
-        result["query_serving"] = False
-        result["reason"] = str(exc)
-    else:
-        if isinstance(response, dict):
-            integrity = response.get("semantic_integrity")
-            semantic_status = response.get("semantic_status")
-            status_detail = (
-                semantic_status if isinstance(semantic_status, dict) else {})
-            unavailable = bool(
-                response.get("semantic_unavailable")
-                or response.get("score_kind") == "unavailable"
-                or status_detail.get("state") == "unavailable")
-            if unavailable:
-                detail = integrity if isinstance(integrity, dict) else {}
-                state = str(
-                    detail.get("state")
-                    or status_detail.get("state") or "unavailable")
-                reason = str(
-                    detail.get("reason")
-                    or status_detail.get("reason")
-                    or response.get("reason")
-                    or "semantic retrieval returned an unavailable envelope")
-                result["state"] = "query-unavailable"
-                result["query_serving"] = False
-                result["reason"] = (
-                    f"semantic readiness query returned {state}: "
-                    f"{common.terminal_safe(reason)}")
-            elif not isinstance(response.get("results"), list):
-                result["state"] = "query-invalid"
-                result["query_serving"] = False
-                result["reason"] = (
-                    "semantic readiness query returned no result envelope")
-            else:
-                result["state"] = "query-serving"
-                result["query_serving"] = True
-        else:
-            result["state"] = "worker-unavailable"
-            result["query_serving"] = False
-            result["reason"] = (
+        return {"state": "query-failed", "query_serving": False,
+                "reason": str(exc)}
+    if not isinstance(response, dict):
+        return {
+            "state": "worker-unavailable", "query_serving": False,
+            "reason": (
                 "no semantic worker accepted the bounded readiness query; "
-                f"inspect with {_diagnostic_command()}")
-    result["roundtrip_ms"] = round(
-        (time.perf_counter() - started) * 1000.0, 3)
-    resident_after = resident_status(include_resources=True)
-    result["resident_after"] = resident_after
-    result["discovered"] = bool(
-        resident_after.get("running")
-        and resident_after.get("descriptor_state") == "ready")
-    result["alive"] = bool(
-        resident_after.get("running")
-        or resident_after.get("starting")
-        or resident_after.get("inprocess"))
-    return result
+                f"inspect with {_diagnostic_command()}"),
+        }
+    integrity = response.get("semantic_integrity")
+    semantic_status = response.get("semantic_status")
+    status_detail = (
+        semantic_status if isinstance(semantic_status, dict) else {})
+    unavailable = bool(
+        response.get("semantic_unavailable")
+        or response.get("score_kind") == "unavailable"
+        or status_detail.get("state") == "unavailable")
+    if unavailable:
+        detail = integrity if isinstance(integrity, dict) else {}
+        state = str(
+            detail.get("state")
+            or status_detail.get("state") or "unavailable")
+        reason = str(
+            detail.get("reason")
+            or status_detail.get("reason")
+            or response.get("reason")
+            or "semantic retrieval returned an unavailable envelope")
+        return {
+            "state": "query-unavailable", "query_serving": False,
+            "reason": (
+                f"semantic readiness query returned {state}: "
+                f"{common.terminal_safe(reason)}"),
+        }
+    if not isinstance(response.get("results"), list):
+        return {
+            "state": "query-invalid", "query_serving": False,
+            "reason": "semantic readiness query returned no result envelope",
+        }
+    return {"state": "query-serving", "query_serving": True, "reason": None}
 
 
 def _validate_request(obj: object) -> tuple[str, str, int, dict, bool]:
@@ -2451,6 +2997,12 @@ def _acquire_worker_lock(
                 return owner
             _release_unpublished_owner(owner)
             return None
+        except FileNotFoundError:
+            # the empty namespace was reaped under us; mint it again once
+            try:
+                _prepare_ephemeral_coordination_dir()
+            except OSError:
+                return None
         except FileExistsError:
             inspected = _inspect_worker_lock()
             if inspected.state is _WorkerOwnerState.ABSENT:
@@ -2514,9 +3066,15 @@ def _acquire_launched_owner(nonce: str) -> ownerfile.Handle | None:
 
 
 def acquire_inprocess_owner() -> ownerfile.Handle | None:
-    """Serialize the explicit in-process fallback with resident model owners."""
+    """Serialize the explicit in-process fallback with resident model owners.
+
+    Raises ResidentSemanticNamespaceBlocked for a planted or unsafe
+    namespace: no lease wait will ever clear it."""
     if removal_fence.background_removal_active():
         return None
+    inspected = _inspect_worker_lock()
+    if inspected.namespace_reason:
+        raise ResidentSemanticNamespaceBlocked(inspected.namespace_reason)
     owner = _acquire_worker_lock(tree_bound=False)
     if owner is not None and removal_fence.background_removal_active():
         _release_unpublished_owner(owner)

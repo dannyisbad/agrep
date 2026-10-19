@@ -21,6 +21,7 @@ import common  # noqa: E402
 import corpusdb  # noqa: E402
 import explore  # noqa: E402
 import session_context  # noqa: E402
+import fileops  # noqa: E402
 
 
 @contextmanager
@@ -379,13 +380,86 @@ class CorpusSessionFamilyTests(unittest.TestCase):
             self._publish_families(root, rows)
             sessions = root / "sessions.jsonl"
             with _data_dir(root):
-                first = common.read_session_family_census(root)
-                self.assertIsNotNone(first)
+                before_identity = fileops.file_identity(sessions)
+                with mock.patch.object(
+                        session_context.time, "time_ns",
+                        return_value=max(before_identity[3:5]) + 3_000_000_000):
+                    self.assertIsNotNone(common.read_session_family_census(root))
                 modified = sessions.stat().st_mtime_ns
                 damaged = sessions.read_bytes().replace(b"root-a", b"root-b", 1)
-                sessions.write_bytes(damaged)
-                os.utime(sessions, ns=(modified, modified))
-                self.assertIsNone(common.read_session_family_census(root))
+                # Coarse clocks can keep an immediate rewrite in the same identity tick.
+                deadline = time.monotonic() + 5.0
+                while True:
+                    sessions.write_bytes(damaged)
+                    os.utime(sessions, ns=(modified, modified))
+                    after_identity = fileops.file_identity(sessions)
+                    if after_identity != before_identity:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("session rewrite did not advance file identity")
+                    time.sleep(0.01)
+                # Both reads sit outside the racy window, so only the identity can refuse the cache.
+                with mock.patch.object(
+                        session_context.time, "time_ns",
+                        return_value=max(after_identity[3:5]) + 3_000_000_000):
+                    self.assertIsNone(common.read_session_family_census(root))
+
+    @unittest.skipIf(fileops.WIN, "Windows identities carry a change token; no racy window")
+    def test_same_tick_rewrite_does_not_serve_cached_family(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = [
+                {"session": "child", "parent": "root-a"},
+                {"session": "root-a"},
+            ]
+            self._publish_families(root, rows)
+            sessions = root / "sessions.jsonl"
+            with _data_dir(root):
+                identity = fileops.file_identity(sessions)
+                with mock.patch.object(
+                        session_context.time, "time_ns",
+                        return_value=identity[3] + 3_000_000_000):
+                    self.assertIsNotNone(
+                        common.read_session_family_census(root))
+                sessions.write_bytes(
+                    sessions.read_bytes().replace(b"root-a", b"root-b", 1))
+                with (
+                    mock.patch.object(
+                        fileops, "file_identity", return_value=identity),
+                    mock.patch.object(
+                        session_context.time, "time_ns",
+                        return_value=identity[3] - 1),
+                ):
+                    self.assertIsNone(common.read_session_family_census(root))
+
+    @unittest.skipIf(fileops.WIN, "Windows identities carry a change token; no racy window")
+    def test_racy_record_is_not_cached_after_the_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = [
+                {"session": "child", "parent": "root-a"},
+                {"session": "root-a"},
+            ]
+            self._publish_families(root, rows)
+            sessions = root / "sessions.jsonl"
+            identity = fileops.file_identity(sessions)
+            with _data_dir(root):
+                with mock.patch.object(
+                        session_context.time, "time_ns",
+                        return_value=identity[3] - 1):
+                    self.assertIsNotNone(
+                        common.read_session_family_census(root))
+                with (
+                    mock.patch.object(
+                        session_context.time, "time_ns",
+                        return_value=identity[3] + 3_000_000_000),
+                    mock.patch.object(
+                        session_context, "_open_session_family_rows",
+                        wraps=session_context._open_session_family_rows) as opened,
+                ):
+                    self.assertIsNotNone(
+                        common.read_session_family_census(root))
+                self.assertEqual(opened.call_count, 1)
 
     def test_streamed_family_digest_matches_a_large_reference(self) -> None:
         import hashlib
@@ -689,6 +763,144 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                         ).fetchone(),
                         ("other",),
                     )
+
+    def test_a_displaced_index_lock_never_falls_through_to_a_full_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "messages.jsonl").write_text(
+                json.dumps({
+                    "id": "codex:child:1", "session": "child", "agent": "codex",
+                    "turn": 1, "text": "needle",
+                }) + "\n", encoding="utf-8")
+            self._publish_families(root, [{"session": "child"}])
+            patches = self._paths(root)
+            displaced = mock.Mock(spec=common.IndexLock)
+            displaced.verify.side_effect = OSError(
+                "index lock was displaced while held: now held by pid=999999")
+            touched: list[str] = []
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4], patches[5], patches[6]:
+                first_stamp = corpusdb._stamp()
+                corpusdb._build(corpusdb.DB_PATH, first_stamp)
+                self._publish_families(root, [{"session": "child", "parent": "other"}],
+                                       "2:changed")
+                corpusdb.CHANGED_PATH.write_text("", encoding="utf-8")
+                second_stamp = corpusdb._stamp()
+                self.assertNotEqual(first_stamp, second_stamp)
+                # the incremental refuses with the lock's verdict; it is not a rebuild trigger
+                with self.assertRaisesRegex(OSError, "displaced while held"):
+                    corpusdb._incremental(second_stamp, lock=displaced)
+                with closing(sqlite3.connect(corpusdb.DB_PATH)) as db:
+                    stamp = db.execute(
+                        "SELECT value FROM meta WHERE key='stamp'").fetchone()[0]
+                self.assertEqual(stamp, first_stamp)
+                # a rebuild under a displaced lock refuses before the shared temp path is touched
+                with mock.patch.object(
+                        corpusdb, "_cleanup_tmp", side_effect=lambda p: touched.append("cleanup")), \
+                        mock.patch.object(
+                            corpusdb, "_build", side_effect=lambda *a: touched.append("build")), \
+                        mock.patch.object(
+                            corpusdb, "purge_legacy_build_temps",
+                            side_effect=lambda: touched.append("purge")):
+                    with self.assertRaisesRegex(OSError, "displaced while held"):
+                        corpusdb._rebuild_and_publish(second_stamp, False, lock=displaced)
+                self.assertEqual(touched, [])
+                self.assertEqual(displaced.verify.call_count, 2)
+
+    def test_a_fence_displacement_leaves_the_displacers_build_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "messages.jsonl").write_text(
+                json.dumps({
+                    "id": "codex:child:1", "session": "child", "agent": "codex",
+                    "turn": 1, "text": "needle",
+                }) + "\n", encoding="utf-8")
+            self._publish_families(root, [{"session": "child"}])
+            patches = self._paths(root)
+            verdicts = [None, OSError(
+                "index lock was displaced while held: now held by pid=999999")]
+
+            def verify() -> None:
+                # the verify at the top passes; the one in the publish fence finds us displaced
+                if verdicts and (verdict := verdicts.pop(0)) is not None:
+                    raise verdict
+
+            lock = mock.Mock(spec=common.IndexLock)
+            lock.verify.side_effect = verify
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4], patches[5], patches[6]:
+                building = corpusdb._tmp_db_path()
+                writable = corpusdb._DerivedWriteOwnership("current", "")
+
+                def lose_the_slot_before_the_fence(*_args, **_kwargs):
+                    # the displacer took the lock after this build completed and started
+                    # its own build at the shared path
+                    building.unlink()
+                    building.write_bytes(b"the displacer's build in progress")
+                    return writable
+
+                with mock.patch.object(
+                        corpusdb, "_derived_write_ownership",
+                        side_effect=lose_the_slot_before_the_fence):
+                    with self.assertRaisesRegex(OSError, "displaced while held"):
+                        corpusdb._rebuild_and_publish(corpusdb._stamp(), False, lock=lock)
+                self.assertEqual(building.read_bytes(), b"the displacer's build in progress")
+                self.assertFalse(corpusdb.DB_PATH.exists())
+                building.unlink()
+                # a build that is still this writer's own is cleaned up on every other exit
+                lock.verify.side_effect = None
+                with mock.patch.object(
+                        corpusdb, "_derived_write_ownership",
+                        side_effect=OSError("ownership probe failed")):
+                    with self.assertRaisesRegex(OSError, "ownership probe failed"):
+                        corpusdb._rebuild_and_publish(corpusdb._stamp(), False, lock=lock)
+                self.assertFalse(building.exists())
+                self.assertFalse(corpusdb.DB_PATH.exists())
+
+    def test_a_displacement_after_a_moved_source_attempt_never_rebuilds_again(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "messages.jsonl").write_text(
+                json.dumps({
+                    "id": "codex:child:1", "session": "child", "agent": "codex",
+                    "turn": 1, "text": "needle",
+                }) + "\n", encoding="utf-8")
+            self._publish_families(root, [{"session": "child"}])
+            patches = self._paths(root)
+            displaced = OSError(
+                "index lock was displaced while held: now held by pid=999999")
+            verdicts = [None, displaced]
+
+            def verify() -> None:
+                # the verify at the top passes; from the one after the moved-source
+                # attempt on, the record is the displacer's and stays so
+                verdict = verdicts.pop(0) if verdicts else displaced
+                if verdict is not None:
+                    raise verdict
+
+            lock = mock.Mock(spec=common.IndexLock)
+            lock.verify.side_effect = verify
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4], patches[5], patches[6]:
+                building = corpusdb._tmp_db_path()
+                attempts: list[str] = []
+
+                def sources_move_then_the_slot_is_lost(dst, stamp):
+                    # the first attempt loses its generation; by then the displacer has taken
+                    # the lock and started its own build at the shared path
+                    attempts.append(stamp)
+                    Path(dst).write_bytes(b"the displacer's build in progress")
+                    raise corpusdb._SourceMoved("sources moved")
+
+                with mock.patch.object(
+                        corpusdb, "_build", side_effect=sources_move_then_the_slot_is_lost):
+                    with self.assertRaisesRegex(OSError, "displaced while held"):
+                        corpusdb._rebuild_and_publish(corpusdb._stamp(), False, lock=lock)
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(building.read_bytes(), b"the displacer's build in progress")
+                self.assertFalse(corpusdb.DB_PATH.exists())
+                # top, after the failed attempt, and the final cleanup's own check
+                self.assertEqual(lock.verify.call_count, 3)
 
     def test_incremental_writer_keeps_spill_enabled_with_large_cache(self) -> None:
         observed: list[tuple[int, int]] = []

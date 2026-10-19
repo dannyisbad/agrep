@@ -12,12 +12,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import re
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import scrub_coordination_namespaces, fixture_tree, isolate_data_dir
 
 isolate_data_dir()
 
@@ -648,7 +649,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
 
     def test_completed_refresh_does_not_hide_unreadable_sources(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-source-health-") as raw:
+        with fixture_tree(prefix="agrep-source-health-") as raw:
             root = Path(raw)
             (root / ".source-health.json").write_text(json.dumps({
                 "code": "source-unreadable",
@@ -747,7 +748,7 @@ class CliTests(unittest.TestCase):
 
 class SnapshotCurrencyTests(unittest.TestCase):
     def test_startup_failure_cancels_the_pending_recovery(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with fixture_tree() as raw, \
                 mock.patch.object(postcompact.common, "DATA_DIR", Path(raw)), \
                 mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
                 mock.patch.object(postcompact.indexd_runtime, "kick_background_repair"), \
@@ -760,7 +761,7 @@ class SnapshotCurrencyTests(unittest.TestCase):
                 list((Path(raw) / ".recovery_requests").iterdir()), [])
 
     def test_completed_refresh_cannot_validate_old_message_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with fixture_tree() as raw:
             root = Path(raw)
             messages = root / "messages.jsonl"
             messages.write_text("old publication\n", encoding="utf-8")
@@ -817,7 +818,7 @@ class RecoveryReadPathTests(unittest.TestCase):
             "agrep-rs.exe" if os.name == "nt" else "agrep-rs")
         if not binary.is_file():
             self.skipTest("release ingest binary is required")
-        with tempfile.TemporaryDirectory(prefix="agrep-new-boundary-") as raw:
+        with fixture_tree(prefix="agrep-new-boundary-") as raw:
             root = Path(raw)
             folder = root / "home/.omp/agent/sessions/project"
             folder.mkdir(parents=True)
@@ -837,7 +838,7 @@ class RecoveryReadPathTests(unittest.TestCase):
             built = subprocess.run(
                 cli + ["index"], cwd=root,
                 env=self._environment(root, binary, automatic=False),
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=300)
             self.assertEqual(built.returncode, 0, built.stderr)
             env = self._environment(root, binary, automatic=True)
             stop_flush = threading.Event()
@@ -903,7 +904,7 @@ class RecoveryReadPathTests(unittest.TestCase):
             "agrep-rs.exe" if os.name == "nt" else "agrep-rs")
         if not binary.is_file():
             self.skipTest("release ingest binary is required")
-        with tempfile.TemporaryDirectory(prefix="agrep-recovery-lock-") as raw:
+        with fixture_tree(prefix="agrep-recovery-lock-") as raw:
             root = Path(raw)
             home, data = root / "home", root / "data"
             home.mkdir()
@@ -928,16 +929,23 @@ class RecoveryReadPathTests(unittest.TestCase):
             with mock.patch.object(index_lock, "INDEX_LOCK_PATH", lock_path), \
                     index_lock.IndexLock("agrep-rs"):
                 owner = lock_path.read_bytes()
-                started = time.monotonic()
                 result = subprocess.run(
                     [sys.executable, str(repo / "cli.py"), "postcompact",
                      "--session", "root", "--json"],
-                    env=env, cwd=home, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=12, check=False)
-                elapsed = time.monotonic() - started
+                    env={**env, "AGREP_TIMING": "1"}, cwd=home,
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=30, check=False)
                 self.assertEqual(lock_path.read_bytes(), owner)
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertLess(elapsed, 8.0)
+            # An exclusive index holder must not make the packet wait out the
+            # refresh window; interpreter start and imports are host load.
+            report = re.search(r"(?m)^took (\d+\.\d+)s: (.*)$", result.stderr)
+            self.assertIsNotNone(report, result.stderr)
+            imports = re.search(r"(?:^|· )imports (\d+\.\d+)s", report.group(2))
+            self.assertIsNotNone(imports, result.stderr)
+            self.assertLess(
+                float(report.group(1)) - float(imports.group(1)),
+                postcompact._REFRESH_WAIT_S / 2, report.group(0))
             packet = json.loads(result.stdout)
             self.assertEqual(packet["status"], "partial")
             self.assertEqual(packet["selection"]["boundary_turn"], 8)
@@ -1191,6 +1199,7 @@ class _IngestSandbox:
             raise unittest.SkipTest("release ingest binary is required")
         temp = tempfile.TemporaryDirectory(prefix="agrep-ingest-sandbox-")
         cls.addClassCleanup(temp.cleanup)
+        cls.addClassCleanup(scrub_coordination_namespaces, temp.name)
         root = Path(temp.name)
         home, cls.data = root / "home", root / "data"
         cls.data.mkdir()

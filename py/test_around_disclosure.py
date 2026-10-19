@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import shlex
 import unittest
@@ -79,6 +80,7 @@ class AroundDisclosureTests(unittest.TestCase):
                 os.utime(path, ns=prior_times),
             ) if existed else path.unlink(missing_ok=True))
         patches = (
+            mock.patch.object(common, "ingest_bin", return_value=Path(__file__)),
             mock.patch.object(around.indexd_runtime, "ensure_index",
                               lambda auto=True, **_kw: True),
             mock.patch.object(explore, "resolve_session",
@@ -457,6 +459,46 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertIn(f"turns 0-{LAST} of 0-{LAST}", human)
         self.assertNotIn("--full", human)
 
+    def test_large_pull_hint_names_no_tools_only_when_tools_were_rendered(self) -> None:
+        # a plain pull already hides tools: `--no-tools` would re-render the same bytes
+        rc, out, err = self._run(
+            [TWINS[0], "300", "-C", "300", "--color", "never", "--no-auto"])
+        self.assertEqual(rc, 0, err)
+        self.assertGreater(len(out.encode("utf-8")), around._PULL_WARN_BYTES)
+        self.assertNotIn("--no-tools", err)
+        self.assertNotIn("large pull", err)
+
+        def with_tools(session: str, center: int, radius: int) -> dict:
+            window = _window(session, center, radius)
+            window["events"] = [{
+                "kind": "tool", "turn": turn["turn"], "ts": 0, "name": "exec",
+                "input": "step", "output": "done", "ok": True, "output_chars": 4,
+            } for turn in window["turns"]]
+            return window
+
+        with mock.patch.object(explore, "get_window", with_tools):
+            rc, out, err = self._run(
+                [TWINS[0], "300", "-C", "300", "--full", "--color", "never", "--no-auto"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(err.count("\n"), 1)
+            self.assertIn("dropping `--full` keeps the conversation only", err)
+            self.assertNotIn("--no-tools", err)
+            # the figure counts the bytes a pipe receives, not code points
+            shown = int(re.search(r"~(\d+)KB", err).group(1))
+            self.assertEqual(shown, len(out.encode("utf-8")) // 1024)
+            self.assertNotEqual(shown, len(out) // 1024)
+            rc, _out, err = self._run(
+                [TWINS[0], "300", "-C", "300", "--tool-output", "4", "--color", "never",
+                 "--no-auto"])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("dropping `--tool-output`", err)
+            # --who tool refuses --no-tools, so the hint stays silent
+            rc, _out, err = self._run(
+                [TWINS[0], "300", "-C", "300", "--who", "tool", "--color", "never",
+                 "--no-auto"])
+            self.assertEqual(rc, 0, err)
+            self.assertNotIn("large pull", err)
+
     def test_whole_refuses_a_numeric_radius_beside_it(self) -> None:
         for argv in ([TWINS[0], "5", "--whole", "-C", "3"],
                      [TWINS[0], "5", "-C", "some"]):
@@ -795,6 +837,40 @@ class AroundDisclosureTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._divergences(out), [])
         self.assertEqual(err, "")
+
+    def test_an_unreadable_event_store_is_never_an_exact_count_of_zero(self) -> None:
+        # The window the explorer packs while the event store cannot be read:
+        # no events, and the fact that none could be read.
+        def blind(session: str, center: int, radius: int) -> dict:
+            window = _window(session, center, radius)
+            window["events_unavailable"] = True
+            return window
+        with mock.patch.object(explore, "get_window", blind), \
+                mock.patch.object(explore, "get_windows",
+                                  lambda reqs: [blind(*req) for req in reqs]):
+            rc, out, err = self._run([TWINS[0], "5", "--full", "--json"])
+            self.assertEqual(rc, 0)
+            rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+            self.assertEqual(rows[0]["scope"]["counts_state"], "events_unavailable")
+            self.assertEqual(rows[0]["scope"]["tools"]["available"], 0)
+            note, = [d for d in self._divergences(out)
+                     if d["kind"] == "events_unavailable"]
+            self.assertIn("tool events are unavailable right now", note["note"])
+            # A crashed writer's store waits for the next index pass, not for a retry.
+            self.assertIn("`agrep index`", note["note"])
+            self.assertNotIn("retry in a moment", note["note"])
+            self.assertEqual(err, "")
+
+            rc, out, err = self._run([TWINS[0], "5", "--full"])
+            self.assertEqual(rc, 0)
+            self.assertIn("tool events are unavailable right now", err)
+
+            # a root-prose read never asked for tool events and says nothing
+            rc, out, err = self._run([TWINS[0], "5", "--json"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._divergences(out), [])
+            rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+            self.assertEqual(rows[0]["scope"]["counts_state"], "events_unavailable")
 
 
 if __name__ == "__main__":

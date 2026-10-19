@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import scrub_coordination_namespaces, fixture_tree, isolate_data_dir
 
 
 isolate_data_dir()
@@ -639,13 +639,15 @@ class PosixProcessTreeTerminationTests(unittest.TestCase):
         kill.assert_not_called()
 
     def test_real_private_group_drains_an_inherited_index_child(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-indexd-tree-") as raw:
+        with fixture_tree(prefix="agrep-indexd-tree-") as raw:
             ready = Path(raw) / "child.pid"
             child = "import time\nwhile True: time.sleep(1)\n"
             parent = (
-                "import pathlib,subprocess,sys,time\n"
+                "import os,pathlib,subprocess,sys,time\n"
                 "child=subprocess.Popen([sys.executable,'-c',sys.argv[1]])\n"
-                "pathlib.Path(sys.argv[2]).write_text(str(child.pid))\n"
+                "staged=pathlib.Path(sys.argv[2]+'.tmp')\n"
+                "staged.write_text(str(child.pid))\n"
+                "os.replace(staged,sys.argv[2])\n"
                 "while True: time.sleep(1)\n"
             )
             process = subprocess.Popen(
@@ -687,7 +689,7 @@ class PosixProcessTreeTerminationTests(unittest.TestCase):
     )
     def test_nonparent_zombie_leader_drains_its_stubborn_descendant(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-zombie-tree-") as raw:
+        with fixture_tree(prefix="agrep-zombie-tree-") as raw:
             ready = Path(raw) / "ready.json"
             cleanup = Path(raw) / "cleanup"
             helper_code = (
@@ -873,15 +875,106 @@ class PosixProcessTreeTerminationTests(unittest.TestCase):
                 process.kill()
             process.wait(timeout=2.0)
 
+    @unittest.skipUnless(sys.platform == "darwin", "XNU zombie list lookup")
+    def test_darwin_exiting_process_is_live_until_it_is_a_zombie(self) -> None:
+        """XNU reports a process that has started exiting only through its
+        zombie list, with p_stat still running; that process holds its files."""
+        ctypes, library, short_info, bsd_info, _real, listpids = proc._darwin_proc_api()
+        pid = 4242
+        statuses = iter((2, 2, 5))
+        seen_args: list[int] = []
+
+        def kernel_pidinfo(queried, flavor, arg, buffer, size):
+            seen_args.append(int(arg))
+            if int(queried) != pid or int(flavor) != 13 or not int(arg):
+                ctypes.set_errno(errno.ESRCH)
+                return 0
+            info = buffer._obj
+            info.status = next(statuses)
+            info.pgid = pid
+            return int(size)
+
+        def kill(queried, sig):
+            if queried != pid or sig != 0:
+                raise AssertionError((queried, sig))
+
+        def getpgid(queried):
+            raise ProcessLookupError(errno.ESRCH, "exiting")
+
+        with mock.patch.object(
+                proc, "_darwin_proc_api",
+                return_value=(ctypes, library, short_info, bsd_info,
+                              kernel_pidinfo, listpids)), \
+                mock.patch.object(proc.os, "kill", side_effect=kill), \
+                mock.patch.object(proc.os, "getpgid", side_effect=getpgid):
+            exiting = proc._observe_posix_process(pid)
+            self.assertEqual(exiting, proc._PosixProcessObservation("active", pid))
+            self.assertTrue(proc.pid_alive(pid))
+            self.assertEqual(proc._observe_posix_process(pid).state, "zombie")
+        self.assertTrue(seen_args)
+        self.assertTrue(all(seen_args), seen_args)
+
+    @unittest.skipUnless(sys.platform == "darwin", "XNU exit window")
+    def test_darwin_zombie_verdict_means_reapable(self) -> None:
+        """A real child with an expensive teardown is never 'zombie' before
+        waitpid can reap it, however long its exit takes."""
+        child = (
+            "import mmap,os,resource,sys,time\n"
+            "soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE)\n"
+            "limit=min(hard if hard!=resource.RLIM_INFINITY else 8192,8192)\n"
+            "resource.setrlimit(resource.RLIMIT_NOFILE,(limit,hard))\n"
+            "fds=[]\n"
+            "while len(fds)<limit-64:\n"
+            " try: fds.append(os.open(os.devnull,os.O_RDONLY))\n"
+            " except OSError: break\n"
+            "region=mmap.mmap(-1,128*1024*1024)\n"
+            "for offset in range(0,len(region),4096): region[offset]=1\n"
+            "os.write(int(sys.argv[1]),b'r')\n"
+            "time.sleep(60)\n"
+        )
+        for _round in range(3):
+            read_fd, write_fd = os.pipe()
+            process = subprocess.Popen(
+                [sys.executable, "-c", child, str(write_fd)],
+                pass_fds=(write_fd,), start_new_session=True)
+            os.close(write_fd)
+            try:
+                self.assertEqual(os.read(read_fd, 1), b"r")
+                self.assertEqual(
+                    proc._observe_posix_process(process.pid).state, "active")
+                process.send_signal(signal.SIGKILL)
+                states: list[str] = []
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    observed = proc._observe_posix_process(process.pid)
+                    if not states or states[-1] != observed.state:
+                        states.append(observed.state)
+                    if observed.state in ("zombie", "gone"):
+                        reaped, _status = os.waitpid(process.pid, os.WNOHANG)
+                        self.assertEqual(
+                            reaped, process.pid,
+                            f"{observed.state!r} verdict before the child was "
+                            f"reapable; states={states}")
+                        process.returncode = -signal.SIGKILL
+                        break
+                self.assertIn(states[-1], ("zombie", "gone"), states)
+            finally:
+                os.close(read_fd)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+
     def test_unready_spawn_drains_private_group_without_birth_identity(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-unready-tree-") as raw:
+        with fixture_tree(prefix="agrep-unready-tree-") as raw:
             ready = Path(raw) / "child.pid"
             child = "import time\nwhile True: time.sleep(1)\n"
             parent = (
-                "import pathlib,subprocess,sys,time\n"
+                "import os,pathlib,subprocess,sys,time\n"
                 "child=subprocess.Popen([sys.executable,'-c',sys.argv[1]])\n"
-                "pathlib.Path(sys.argv[2]).write_text(str(child.pid))\n"
+                "staged=pathlib.Path(sys.argv[2]+'.tmp')\n"
+                "staged.write_text(str(child.pid))\n"
+                "os.replace(staged,sys.argv[2])\n"
                 "while True: time.sleep(1)\n"
             )
             process = subprocess.Popen(
@@ -1037,8 +1130,8 @@ class PosixLifetimeGuardianTests(unittest.TestCase):
             indexd_runtime.INDEXD_READY_PATH,
             indexd_runtime.INDEXD_CHILD_PATH,
         ) = self.saved_paths
+        scrub_coordination_namespaces(self.temp.name)
         self.temp.cleanup()
-
     @staticmethod
     def _wait_for(path: Path, process: subprocess.Popen) -> None:
         deadline = time.monotonic() + 5.0
@@ -1168,8 +1261,10 @@ class PosixLifetimeGuardianTests(unittest.TestCase):
             "import json,os,pathlib,subprocess,sys,time\n"
             "child=subprocess.Popen([sys.executable,'-c','import time;"
             "time.sleep(60)'])\n"
-            "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+            "staged=pathlib.Path(sys.argv[1]+'.tmp')\n"
+            "staged.write_text(json.dumps({"
             "'target':os.getpid(),'child':child.pid}),encoding='utf-8')\n"
+            "os.replace(staged,sys.argv[1])\n"
         )
         guard, control_fd = self._launch(
             "9" * 32, fence,
@@ -1339,7 +1434,9 @@ class PosixLifetimeGuardianTests(unittest.TestCase):
         ready = self.root / "no-pipe-leak.pid"
         target = (
             "import os,pathlib,sys,time\n"
-            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii')\n"
+            "staged=pathlib.Path(sys.argv[1]+'.tmp')\n"
+            "staged.write_text(str(os.getpid()),encoding='ascii')\n"
+            "os.replace(staged,sys.argv[1])\n"
             "print('target ready',flush=True)\n"
             "print('target ready',file=sys.stderr,flush=True)\n"
             "while True: time.sleep(1)\n"
@@ -1362,9 +1459,9 @@ class PosixLifetimeGuardianTests(unittest.TestCase):
             self._wait_for(fence, guard)
             target_pid = int(ready.read_text(encoding="ascii"))
             os.kill(guard.pid, signal.SIGKILL)
-            started = time.monotonic()
+            # A guard holding its pipes open past its death would hang here;
+            # the communicate timeout is the bound.
             guard.communicate(timeout=2.0)
-            self.assertLess(time.monotonic() - started, 2.0)
             self.assertTrue(common.pid_alive(target_pid))
             self.assertTrue(fence.exists())
             self.assertTrue(indexd_runtime._retire_indexd_child(
@@ -1523,8 +1620,8 @@ class TeachIndexdTeardownTests(unittest.TestCase):
             indexd_runtime.INDEXD_CHILD_PATH,
             indexd_runtime.LEGACY_INDEXD_LOCK_PATH,
         ) = self.saved_paths
+        scrub_coordination_namespaces(self.temp.name)
         self.temp.cleanup()
-
     @staticmethod
     def _raw(*, token: str = "a" * 32) -> bytes:
         group = "job" if common.WIN else "4242"

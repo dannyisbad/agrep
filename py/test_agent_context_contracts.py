@@ -978,6 +978,32 @@ class AgentContextContracts(unittest.TestCase):
                             body, encoding="utf-8")
                         self.assertIsNone(common.index_summary())
 
+    @unittest.skipIf(os.name == "nt", "Windows identities carry a change token; no racy window")
+    def test_index_summary_counts_a_family_census_read_inside_the_racy_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _publish_family_meta(root, [
+                {"session": "a", "agent": "codex", "n": 3},
+                {"session": "b", "agent": "claude", "n": 2},
+            ], "5:stable")
+            messages = root / "messages.jsonl"
+            messages.write_text("{}\n", encoding="utf-8")
+            stamp = (root / "sessions.jsonl").stat().st_mtime_ns
+            with mock.patch.object(common, "DATA_DIR", root), \
+                    mock.patch.object(session_context, "DATA_DIR", root), \
+                    mock.patch.object(common, "MESSAGES_PATH", messages), \
+                    mock.patch.object(
+                        session_context.time, "time_ns", return_value=stamp - 1), \
+                    mock.patch.object(
+                        session_context, "_open_session_family_rows",
+                        wraps=session_context._open_session_family_rows) as opened:
+                summary = common.index_summary()
+            # Both census reads parsed the file: the racy one was never cached.
+            self.assertEqual(opened.call_count, 2)
+            self.assertIsNotNone(summary)
+            self.assertEqual(summary["messages"], 5)
+            self.assertEqual(summary["sessions"], 2)
+
     def test_session_prefix_lookup_is_bounded_but_exact_still_wins(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1070,7 +1096,8 @@ class AgentContextContracts(unittest.TestCase):
 
     def test_freshness_notice_is_universal_actionable_and_persistent(self) -> None:
         with tempfile.TemporaryDirectory() as td, \
-                mock.patch.object(common, "DATA_DIR", Path(td)):
+                mock.patch.object(common, "DATA_DIR", Path(td)), \
+                mock.patch.object(common, "ingest_bin", return_value=Path(__file__)):
             indexd_runtime.record_auto_index_health(3, "worker \x1b[31mfailed")
             health = Path(td) / indexd_runtime.AUTO_INDEX_HEALTH
             old = time.time() - 24 * 3600

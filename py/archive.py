@@ -36,10 +36,13 @@ import hashlib
 import io
 import json
 import lzma
+import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
 import stat
 import sys
 import tempfile
@@ -69,24 +72,38 @@ _MAX_CHUNKS = 100_000
 _MAX_MANIFEST_BYTES = 256 * 1024**2
 _MAX_MANIFEST_LINE = 2 * 1024**2
 _MAX_MANIFEST_RECORDS = 250_000
+# growth chunks a record carries before a fresh whole-file capture: ~110 bytes per
+# descriptor keeps the record well inside _MAX_MANIFEST_LINE (2 MiB)
+_MAX_APPEND_CHAIN = 8192
+_TEMP_PREFIXES = (".copy-", ".snapshot-", ".progress-")  # pass temps; orphans are swept
+_SPAWNER_ENV = "AGREP_ARCHIVE_SPAWNER"  # "<pid>:<start>" of the daemon that spawned the pass
+# a store rewritten in place on every message is re-imaged by the tick at most this often
+_REWRITE_RECAPTURE_MS = 10 * 60_000
+_REWRITE_REASON = ("rewritten in place; re-captured at most every "
+                   f"{_REWRITE_RECAPTURE_MS // 60_000} min on the indexer tick")
 _MAX_REGISTRY_BYTES = 4 * 1024**2
 _MAX_CONFIG_BYTES = 64 * 1024
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _UNVERIFIABLE_LOCK_STARTS = frozenset(("unknown",))
 _LOCK_PUBLISH_GRACE_S = 3.0
 _LOCK_WEDGED_S = 300.0
+# a running pass that reports no progress for this long is stuck, not slow: one source
+# step (a stat, a copy, one backup, one xz) is far shorter even on a loaded box
+STALL_BOUND_S = 900.0
 
 
 class ArchiveStatusBudget(RuntimeError):
     """Routine diagnostics exhausted their manifest-inspection deadline."""
 
 # (agent, glob relative to HOME, sqlite?) - mirrors the Rust adapters' discovery.
+# `**` spans zero or more directories; a `*` before it is a required level.
 ROOTS: list[tuple[str, str, bool]] = [
     ("claude", ".claude/projects/*/**/*.jsonl", False),
-    ("codex", ".codex/sessions/*/*/*/rollout-*.jsonl", False),
+    ("codex", ".codex/sessions/**/rollout-*.jsonl", False),
     ("codex", ".codex/archived_sessions/rollout-*.jsonl", False),
     ("gemini", ".gemini/tmp/*/chats/*.json", False),
     ("gemini", ".gemini/tmp/*/chats/*.jsonl", False),
+    ("gemini", ".gemini/tmp/*/chats/*/*.jsonl", False),
     ("antigravity", ".gemini/antigravity-cli/brain/**/*.json", False),
     ("antigravity", ".gemini/antigravity-cli/brain/**/*.jsonl", False),
     ("kimi", ".kimi/sessions/**/*.jsonl", False),
@@ -98,7 +115,13 @@ ROOTS: list[tuple[str, str, bool]] = [
     ("cursor", "Library/Application Support/Cursor/User/globalStorage/state.vscdb", True),
     ("cursor", ".config/Cursor/User/globalStorage/state.vscdb", True),
     ("pi", ".pi/agent/sessions/**/*.jsonl", False),
+    ("pi", ".pi/agent/sessions/**/*.jsonl.gz", False),
+    ("pi", ".pi/agent/archive/sessions/**/*.jsonl", False),
+    ("pi", ".pi/agent/archive/sessions/**/*.jsonl.gz", False),
     ("pi", ".omp/agent/sessions/**/*.jsonl", False),
+    ("pi", ".omp/agent/sessions/**/*.jsonl.gz", False),
+    ("pi", ".omp/agent/archive/sessions/**/*.jsonl", False),
+    ("pi", ".omp/agent/archive/sessions/**/*.jsonl.gz", False),
 ]
 
 # a session id in the filename (uuid-ish or codex rollout stamp) -> restore-by-session
@@ -186,6 +209,33 @@ def _keep() -> int:
     return k if isinstance(k, int) and k >= 0 else 3
 
 
+def _human_bytes(value: int) -> str:
+    size = float(max(0, int(value)))
+    unit = "B"
+    for larger in ("KB", "MB", "GB"):
+        if size < 999.95:
+            break
+        size /= 1000
+        unit = larger
+    if unit == "B":
+        return f"{size:.0f} B"
+    return f"{size:.2f} GB" if unit == "GB" else f"{size:.1f} {unit}"
+
+
+def _captures_retained() -> bool:
+    """Captured copies (manifest or chunk store) exist, whatever the config says."""
+    return any(_plain_target_exists(path) if path is MANIFEST else path.is_dir()
+               for path in (MANIFEST, STORE))
+
+
+def _disabled_detail(stored: int | None) -> str:
+    if not stored or not _captures_retained():
+        return "automatic capture is disabled"
+    return (f"automatic capture is disabled; {_human_bytes(stored)} of earlier "
+            f"captures stay in {ARCHIVE_DIR} (`{common.cli_name()} archive --purge` "
+            "deletes them)")
+
+
 def _try_lock() -> ownerfile.Handle | None:
     """Archive-only lock (NOT the index lock: a capture must never queue behind a
     30-minute reindex, or block one). Non-blocking - the indexer tick just skips a
@@ -196,10 +246,14 @@ def _try_lock() -> ownerfile.Handle | None:
     lock = ARCHIVE_DIR / "lock"
     pid = os.getpid()
     start = common.process_start_identity(pid) or "unknown"
-    body = f"pid={pid} start={start} token={secrets.token_hex(16)}\n".encode()
+    token = secrets.token_hex(16)
+    daemon = os.environ.get(_SPAWNER_ENV, "")
+    body = (f"pid={pid} start={start} token={token}"
+            + (f" daemon={daemon}" if re.fullmatch(r"[0-9]+:[^\s=]+", daemon) else "")
+            + "\n").encode()
     for _ in range(2):
         try:
-            return ownerfile.create_exclusive(lock, body, retain_fd=True)
+            return ownerfile.create_held(lock, body, token=token, retain_fd=True)
         except FileExistsError:
             try:
                 leaf = lock.lstat()
@@ -225,8 +279,11 @@ def _try_lock() -> ownerfile.Handle | None:
                     pid, fields.get("start"), pid_alive=common.pid_alive,
                     process_start=common.process_start_identity,
                     unverifiable_starts=_UNVERIFIABLE_LOCK_STARTS)
+                stranded = ownerfile.stranded_own_record(
+                    pid, fields.get("start"), fields.get("token"),
+                    process_start=common.process_start_identity)
                 if state in (ownerfile.ProcessOwner.EXACT_LIVE,
-                             ownerfile.ProcessOwner.UNVERIFIABLE):
+                             ownerfile.ProcessOwner.UNVERIFIABLE) and not stranded:
                     return None
             else:
                 age = time.time() - observed.mtime
@@ -236,6 +293,22 @@ def _try_lock() -> ownerfile.Handle | None:
                     lock, observed, tombstone=True, require_stable_mtime=True):
                 return None
     return None
+
+
+def _spawner_live(value: str | None) -> bool:
+    """The daemon recorded as the pass's spawner is still that exact process, so it
+    holds the child's handle and will stop it once the stall bound passes."""
+    if not value or ":" not in value:
+        return False
+    pid_text, start = value.split(":", 1)
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return False
+    return pid > 0 and ownerfile.classify_process(
+        pid, start, pid_alive=common.pid_alive,
+        process_start=common.process_start_identity,
+        unverifiable_starts=_UNVERIFIABLE_LOCK_STARTS) == ownerfile.ProcessOwner.EXACT_LIVE
 
 
 def _lock_status() -> dict:
@@ -266,15 +339,31 @@ def _lock_status() -> dict:
             process_start=common.process_start_identity,
             unverifiable_starts=_UNVERIFIABLE_LOCK_STARTS)
         if owner == ownerfile.ProcessOwner.EXACT_LIVE:
-            return {**result, "state": "busy", "detail": "verified live holder"}
+            daemon_live = _spawner_live(fields.get("daemon"))
+            beat = progress_beat()
+            # a spawned child is judged by its daemon's monotonic clock; only an orphan
+            # (no live spawner, nothing will ever judge it) is judged by wall age
+            recorded = _recorded_stall(pid)
+            if daemon_live:
+                idle = recorded if recorded is not None else 0.0
+            else:
+                idle = age if beat is None else min(beat[1], age)
+            return {**result, "state": "busy", "detail": "verified live holder",
+                    "idle_s": idle, "stalled": idle > STALL_BOUND_S,
+                    "daemon_live": daemon_live}
         if owner == ownerfile.ProcessOwner.UNVERIFIABLE and age <= _LOCK_WEDGED_S:
             return {**result, "state": "lock-protected",
                     "detail": "holder identity is not yet verifiable"}
+        if owner in (ownerfile.ProcessOwner.DEAD, ownerfile.ProcessOwner.REUSED):
+            # a daemon stop or crash mid-pass: _try_lock reclaims this at once
+            return {**result, "state": "interrupted",
+                    "detail": "the last capture pass was interrupted; the next pass "
+                              "resumes it"}
     elif age <= _LOCK_PUBLISH_GRACE_S:
         return {**result, "state": "lock-protected",
                 "detail": "lock owner record is still being published"}
     return {**result, "state": "lock-wedged",
-            "detail": "holder is dead, malformed, or unverifiable past the grace bound"}
+            "detail": "holder is malformed or unverifiable past the grace bound"}
 
 
 def _unlock(owner: ownerfile.Handle) -> None:
@@ -320,8 +409,7 @@ def _regular_identity(info: os.stat_result) -> tuple[int, int, int, int]:
             getattr(info, "st_mtime_ns", int(info.st_mtime * 1e9)))
 
 
-def _open_regular_file(path: Path, maximum: int, root: Path,
-                       expected: tuple[int, int, int, int] | None = None
+def _open_regular_file(path: Path, maximum: int, root: Path
                        ) -> tuple[int, os.stat_result, tuple[int, int, int, int]]:
     if maximum < 0:
         raise ValueError("invalid file bound")
@@ -347,8 +435,7 @@ def _open_regular_file(path: Path, maximum: int, root: Path,
         opened = os.fstat(fd)
         identity = _regular_identity(opened)
         if (not stat.S_ISREG(opened.st_mode) or opened.st_size > maximum
-                or (leaf.st_dev, leaf.st_ino) != (opened.st_dev, opened.st_ino)
-                or (expected is not None and identity != expected)):
+                or (leaf.st_dev, leaf.st_ino) != (opened.st_dev, opened.st_ino)):
             raise ValueError("bounded file is not a plausible regular file")
         return fd, opened, identity
     except Exception:
@@ -356,17 +443,30 @@ def _open_regular_file(path: Path, maximum: int, root: Path,
         raise
 
 
+def _still_holds(info: os.stat_result, identity: tuple[int, int, int, int],
+                 length: int) -> bool:
+    """The same inode still carries at least the bytes a capture read. Transcripts
+    are append-only, so growth past them is fine; a shrink or a swap is not."""
+    return (info.st_dev, info.st_ino) == identity[:2] and info.st_size >= length
+
+
 def _hash_regular_file(path: Path, root: Path, *, prefix: int | None = None
                        ) -> tuple[str, int, str | None, str | None,
                                   tuple[int, int, int, int], os.stat_result]:
+    """sha256 of the bytes present at open, split at `prefix` into before/after
+    digests when asked. A write that lands during the read forces a second read of
+    the same range: an append leaves it byte-identical, an in-place rewrite does not."""
     fd, opened, identity = _open_regular_file(path, _MAX_ARCHIVE_BYTES, root)
+    wanted = opened.st_size
     whole = hashlib.sha256()
     before = hashlib.sha256() if prefix is not None else None
     after = hashlib.sha256() if prefix is not None else None
-    total = 0
     try:
-        while True:
-            chunk = os.read(fd, 1024**2)
+        if prefix is not None and not 0 <= prefix <= wanted:
+            raise ValueError("archive prefix exceeds source size")
+        total = 0
+        while total < wanted:
+            chunk = os.read(fd, min(1024**2, wanted - total))
             if not chunk:
                 break
             whole.update(chunk)
@@ -375,13 +475,25 @@ def _hash_regular_file(path: Path, root: Path, *, prefix: int | None = None
                 before.update(chunk[:split])
                 after.update(chunk[split:])
             total += len(chunk)
-        if _regular_identity(os.fstat(fd)) != identity or total != opened.st_size:
+        current = os.fstat(fd)
+        if total != wanted or not _still_holds(current, identity, wanted):
             raise ValueError("bounded file changed while being read")
+        if _regular_identity(current) != identity:
+            os.lseek(fd, 0, os.SEEK_SET)
+            again = hashlib.sha256()
+            total = 0
+            while total < wanted:
+                chunk = os.read(fd, min(1024**2, wanted - total))
+                if not chunk:
+                    break
+                again.update(chunk)
+                total += len(chunk)
+            if (total != wanted or again.hexdigest() != whole.hexdigest()
+                    or not _still_holds(os.fstat(fd), identity, wanted)):
+                raise ValueError("source rewritten during archive capture")
     finally:
         os.close(fd)
-    if prefix is not None and not 0 <= prefix <= total:
-        raise ValueError("archive prefix exceeds source size")
-    return (whole.hexdigest(), total, before.hexdigest() if before else None,
+    return (whole.hexdigest(), wanted, before.hexdigest() if before else None,
             after.hexdigest() if after else None, identity, opened)
 
 
@@ -392,12 +504,15 @@ def _store_file_chunk(path: Path, root: Path, offset: int, length: int,
     target = _chunk_path(sha)
     if _plain_target_exists(target):
         return {"sha256": sha, "len": length, "codec": _CODEC}
+    _require_copy_space(length + 64 * 1024)  # xz never exceeds its input by more than framing
     parent_identity = _ensure_plain_parent(STORE, target.parent)
     fd, name = tempfile.mkstemp(prefix=".chunk-", suffix=".xz", dir=target.parent)
     tmp = Path(name)
     source = -1
     try:
-        source, _, _ = _open_regular_file(path, _MAX_ARCHIVE_BYTES, root, identity)
+        source, opened, _ = _open_regular_file(path, _MAX_ARCHIVE_BYTES, root)
+        if not _still_holds(opened, identity, offset + length):
+            raise ValueError("source changed during archive capture")
         os.lseek(source, offset, os.SEEK_SET)
         digest = hashlib.sha256()
         remaining = length
@@ -409,6 +524,8 @@ def _store_file_chunk(path: Path, root: Path, offset: int, length: int,
                 if not chunk:
                     raise ValueError("source ended during archive capture")
                 remaining -= len(chunk)
+                if remaining % (64 * 1024**2) < len(chunk):
+                    _progress(-remaining)
                 digest.update(chunk)
                 packed = compressor.compress(chunk)
                 if packed:
@@ -416,7 +533,7 @@ def _store_file_chunk(path: Path, root: Path, offset: int, length: int,
             stream.write(compressor.flush())
             stream.flush()
             os.fsync(stream.fileno())
-        if (_regular_identity(os.fstat(source)) != identity
+        if (not _still_holds(os.fstat(source), identity, offset + length)
                 or digest.hexdigest() != sha):
             raise ValueError("source changed during archive capture")
         if _ensure_plain_parent(STORE, target.parent) != parent_identity:
@@ -588,6 +705,21 @@ def _portable_path_part(part: str) -> bool:
     return part.split(".", 1)[0].upper() not in _WINDOWS_DEVICE_NAMES
 
 
+def _match_segments(parts: tuple[str, ...], pattern: tuple[str, ...]) -> bool:
+    if not pattern:
+        return not parts
+    if pattern[0] == "**":
+        return any(_match_segments(parts[skip:], pattern[1:])
+                   for skip in range(len(parts) + 1))
+    return (bool(parts) and fnmatch.fnmatch(parts[0], pattern[0])
+            and _match_segments(parts[1:], pattern[1:]))
+
+
+def _match_root_pattern(relative: Path, pattern: str) -> bool:
+    """Whole-path match of a ROOTS glob; Path.match would read `**` as one segment."""
+    return _match_segments(relative.parts, Path(pattern).parts)
+
+
 def _portable_source_relative(
         value: object, agent: object, is_sqlite: object) -> Path | None:
     if (not isinstance(value, str) or not value or "\0" in value
@@ -602,7 +734,7 @@ def _portable_source_relative(
             continue
         for index in range(len(parts) - 1, -1, -1):
             relative = Path(*parts[index:])
-            if relative.match(pattern):
+            if _match_root_pattern(relative, pattern):
                 return relative
     for index in range(len(parts) - 1, -1, -1):
         relative = Path(*parts[index:])
@@ -891,7 +1023,7 @@ def _claude_source(relative: Path) -> bool:
 
 
 def _note_discovery_failure(failures: list[dict] | None, path: Path,
-                            exc: OSError, phase: str) -> None:
+                            exc: OSError | str, phase: str) -> None:
     if failures is None:
         return
     error = str(exc) or type(exc).__name__
@@ -951,72 +1083,53 @@ def _entry_kind(entry: os.DirEntry, failures: list[dict]) -> str | None:
     return "file" if stat.S_ISREG(info.st_mode) else None
 
 
-def _walk_matching_files(root: Path, pattern: str, failures: list[dict]) -> list[Path]:
-    paths = []
-
-    def walk(directory: Path) -> None:
-        for entry in _scan_entries(
-                directory, failures, missing_is_error=True, phase="walk"):
-            kind = _entry_kind(entry, failures)
-            if kind == "directory":
-                walk(Path(entry.path))
-            elif kind == "file" and fnmatch.fnmatch(entry.name, pattern):
-                paths.append(Path(entry.path))
-
-    if _path_kind(root, failures, missing_is_error=False) == "directory":
-        walk(root)
-    return paths
-
-
 def _glob_paths(root: Path, pattern: str, failures: list[dict]) -> list[Path]:
     parts = Path(pattern).parts
-    if "**" in parts:
-        split = parts.index("**")
-        if split != len(parts) - 2 or any(
-                any(char in part for char in "*?[") for part in parts[:split]):
-            return []
-        base = root
-        for part in parts[:split]:
-            base /= part
-            if _path_kind(base, failures, missing_is_error=False) != "directory":
-                return []
-        return sorted(_walk_matching_files(base, parts[-1], failures))
+    paths: set[Path] = set()
 
-    paths = []
+    def accept(entry: os.DirEntry, kind: str | None, index: int) -> None:
+        if not fnmatch.fnmatch(entry.name, parts[index]):
+            return
+        path = Path(entry.path)
+        if index == len(parts) - 1:
+            if kind == "file":
+                paths.add(path)
+        elif kind == "directory":
+            visit(path, index + 1, True)
 
     def visit(directory: Path, index: int, discovered: bool) -> None:
         part = parts[index]
-        wildcard = any(char in part for char in "*?[")
         last = index == len(parts) - 1
-        if not wildcard:
+        if part == "**":
+            # zero or more directories: one scan serves the descent and the
+            # continuation at this level alike
+            for entry in _scan_entries(
+                    directory, failures, missing_is_error=discovered, phase="walk"):
+                kind = _entry_kind(entry, failures)
+                if kind == "directory":
+                    visit(Path(entry.path), index, True)
+                if not last:
+                    accept(entry, kind, index + 1)
+            return
+        if not any(char in part for char in "*?["):
             # An absent literal under a wildcard match is an ordinary
             # non-match: `.gemini/tmp/*/chats` visits every sibling of tmp and
             # most have no chats/. Only a lost enumerated entry is a race.
             path = directory / part
             kind = _path_kind(path, failures, missing_is_error=False)
             if last and kind == "file":
-                paths.append(path)
+                paths.add(path)
             elif not last and kind == "directory":
                 visit(path, index + 1, discovered)
             return
         for entry in _scan_entries(
                 directory, failures, missing_is_error=discovered, phase="glob"):
-            if not fnmatch.fnmatch(entry.name, part):
-                continue
-            kind = _entry_kind(entry, failures)
-            path = Path(entry.path)
-            if last and kind == "file":
-                paths.append(path)
-            elif not last and kind == "directory":
-                visit(path, index + 1, True)
+            if fnmatch.fnmatch(entry.name, part):
+                accept(entry, _entry_kind(entry, failures), index)
 
     if parts:
         visit(root, 0, False)
     return sorted(paths)
-
-
-def _rglob_paths(root: Path, pattern: str, failures: list[dict]) -> list[Path]:
-    return sorted(_walk_matching_files(root, pattern, failures))
 
 
 def _claude_paths(failures: list[dict] | None = None) -> list[Path]:
@@ -1275,8 +1388,8 @@ def _source_location(value: object) -> tuple[Path, Path] | None:
     except ValueError:
         relative = None
     if (relative is not None and ".." not in relative.parts
-            and (any(relative.match(pattern) for agent, pattern, _ in ROOTS
-                     if agent != "cursor")
+            and (any(_match_root_pattern(relative, pattern)
+                     for agent, pattern, _ in ROOTS if agent != "cursor")
                  or _antigravity_source(relative) or _kimi_source(relative)
                  or _claude_source(relative))
             and ("opencode" not in relative.parts or candidate.suffix.lower() != ".db"
@@ -1398,6 +1511,14 @@ def _sqlite_snapshot(path: Path) -> Path:
     if (_linklike(path, before) or not stat.S_ISREG(before.st_mode)
             or before.st_size > _MAX_ARCHIVE_BYTES):
         raise ValueError("sqlite source is not a plausible regular file")
+    # the backup writes every page the db plus its WAL hold: the largest copy the
+    # archive ever makes, so the volume is checked before a page is written
+    needed = before.st_size
+    try:
+        needed += path.with_name(path.name + "-wal").lstat().st_size
+    except OSError:
+        pass
+    _require_copy_space(needed)
     _ensure_plain_parent(ARCHIVE_DIR, ARCHIVE_DIR)
     tmp_fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", suffix=".db", dir=ARCHIVE_DIR)
     os.close(tmp_fd)
@@ -1407,7 +1528,8 @@ def _sqlite_snapshot(path: Path) -> Path:
         try:
             src = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)
             dst = sqlite3.connect(tmp)
-            src.backup(dst)
+            src.backup(dst, pages=4096,
+                       progress=lambda _status, remaining, _total: _progress(-remaining))
             dst.commit()
         finally:
             try:
@@ -1585,8 +1707,15 @@ def _plain_path_at(root: Path, relative: Path, *, failures: list[dict] | None = 
 def _plain_source_path(path: Path, failures: list[dict] | None = None, *,
                        missing_is_error: bool = False) -> bool:
     location = _source_location(str(path))
-    return bool(location and _plain_path_at(
-        *location, failures=failures, missing_is_error=missing_is_error))
+    if location is None:
+        # discovery and classification disagree: the file was found under a store
+        # root, so dropping it here would be a silent capture gap
+        _note_discovery_failure(
+            failures, path, "found under a store root but not recognized as a "
+            "store file; not captured", "classify")
+        return False
+    return _plain_path_at(
+        *location, failures=failures, missing_is_error=missing_is_error)
 
 
 def _discovered_sources(failures: list[dict] | None = None):
@@ -1627,7 +1756,7 @@ def _discovered_sources(failures: list[dict] | None = None):
                 yield "cline", path, False
     for directory in opencode_data_dirs(str(HOME)):
         storage = Path(directory) / "storage"
-        paths = _rglob_paths(storage, "*.json", failures)
+        paths = _glob_paths(storage, "**/*.json", failures)
         for path in paths:
             key = os.path.normcase(os.path.abspath(path))
             if key not in seen and _plain_source_path(
@@ -1647,9 +1776,58 @@ def _discovered_sources(failures: list[dict] | None = None):
             yield "crush", path, True
 
 
+_DEFERRAL_KINDS = frozenset(("settle", "rewrite", "busy", "disk"))
+_HEALTH_MAX_BYTES = _MAX_CONFIG_BYTES * 16  # one bound for the writer's trim and the reader
+_DEFERRAL_WORDING = {
+    "settle": "in use; captured once quiet for 15 min",
+    "rewrite": "rewritten in place; next capture within 10 min",
+    "busy": "written while being copied; retried next pass",
+    "disk": "too little free disk for a point-in-time copy",
+}
+
+
+def _tick_interval_s() -> float:
+    try:
+        return max(1.0, float(os.environ.get("AGREP_ARCHIVE_CHECK_S", "60")))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _running_line(lock: dict) -> str:
+    """'capture running (pid N, since 12s)' for a verified live lock holder, or the
+    stalled form when it has made no progress for longer than the bound."""
+    pid = lock.get("pid") or "unknown"
+    since = surface.brief_duration(float(lock.get("age_s") or 0.0))
+    if lock.get("stalled"):
+        idle = surface.brief_duration(float(lock.get("idle_s") or 0.0))
+        if lock.get("daemon_live"):
+            action = "the daemon that started it stops it on its next tick"
+        elif os.name == "nt":
+            action = f"stop it with `taskkill /PID {pid} /F`"
+        else:
+            action = f"stop it with `kill {pid}`"
+        return (f"capture stalled (pid {pid}, running {since}, no progress for {idle}); "
+                f"{action}")
+    return f"capture running (pid {pid}, since {since})"
+
+
+def _valid_deferrals(value: object, now_ms: int) -> dict[str, dict]:
+    """{path: {since_ms, kind}} from a health record; anything malformed is dropped."""
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for path, item in value.items():
+        if (not isinstance(path, str) or not isinstance(item, dict)
+                or item.get("kind") not in _DEFERRAL_KINDS
+                or not _bounded_int(item.get("since_ms"), now_ms + 60_000)):
+            continue
+        out[path] = {"since_ms": item["since_ms"], "kind": item["kind"]}
+    return out
+
+
 def _write_capture_health(
         outcome: str, *, detail: str = "", failed: int = 0,
-        completed: bool = False) -> None:
+        completed: bool = False, deferrals: dict[str, dict] | None = None) -> None:
     if _data_dir_readonly():
         raise _readonly_error()
     previous = _capture_health()
@@ -1661,8 +1839,18 @@ def _write_capture_health(
         "outcome": outcome,
         "detail": str(detail)[:2048],
         "failed": max(0, int(failed)),
+        "deferrals": {},
     }
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    kept = dict(sorted(((previous.get("deferrals") or {}) if deferrals is None
+                        else deferrals).items(),
+                       key=lambda item: (item[1]["since_ms"], item[0])))
+    # the oldest waits are the ones status must keep naming: trim the newest
+    # until the record fits the reader's bound
+    body = json.dumps({**payload, "deferrals": kept}, separators=(",", ":")).encode("utf-8")
+    while kept and len(body) > _HEALTH_MAX_BYTES:
+        kept.pop(next(reversed(kept)))
+        body = json.dumps({**payload, "deferrals": kept},
+                          separators=(",", ":")).encode("utf-8")
     _publish_restore(HEALTH, ARCHIVE_DIR, body, True)
 
 
@@ -1674,14 +1862,14 @@ def record_capture_failure(error: BaseException) -> None:
 def _capture_health() -> dict:
     try:
         value = json.loads(_read_regular_file(
-            HEALTH, _MAX_CONFIG_BYTES, ARCHIVE_DIR).decode("utf-8"))
+            HEALTH, _HEALTH_MAX_BYTES, ARCHIVE_DIR).decode("utf-8"))
     except FileNotFoundError:
         return {"outcome": "never", "last_pass_ms": None, "age_s": None,
-                "last_attempt_ms": None, "attempt_age_s": None}
+                "last_attempt_ms": None, "attempt_age_s": None, "deferrals": {}}
     except (OSError, UnicodeError, ValueError) as exc:
         return {"outcome": "unknown", "last_pass_ms": None, "age_s": None,
                 "last_attempt_ms": None, "attempt_age_s": None,
-                "detail": str(exc)}
+                "detail": str(exc), "deferrals": {}}
     now_ms = int(time.time() * 1000)
     last_pass_ms = value.get("last_pass_ms") if isinstance(value, dict) else None
     last_attempt_ms = (value.get("last_attempt_ms", last_pass_ms)
@@ -1699,7 +1887,7 @@ def _capture_health() -> dict:
                 "healthy", "partial", "busy", "capture-blocked"}):
         return {"outcome": "unknown", "last_pass_ms": None, "age_s": None,
                 "last_attempt_ms": None, "attempt_age_s": None,
-                "detail": "capture health record is invalid"}
+                "detail": "capture health record is invalid", "deferrals": {}}
     return {
         "outcome": value["outcome"],
         "last_pass_ms": last_pass_ms,
@@ -1709,29 +1897,183 @@ def _capture_health() -> dict:
         "attempt_age_s": max(0.0, time.time() - last_attempt_ms / 1000),
         "detail": str(value.get("detail") or ""),
         "failed": value.get("failed", 0),
+        "deferrals": _valid_deferrals(value.get("deferrals"), now_ms),
     }
 
 
-def capture(verbose: bool = False) -> dict:
+def waiting_summary(health: dict) -> dict | None:
+    """What the persisted deferrals say is still waiting for capture, or None. Every
+    kind is a window working as designed, never a verdict."""
+    deferrals = health.get("deferrals") or {}
+    if not deferrals:
+        return None
+    now_ms = int(time.time() * 1000)
+    by_kind: dict[str, int] = {}
+    for item in deferrals.values():
+        by_kind[item["kind"]] = by_kind.get(item["kind"], 0) + 1
+    oldest = min(deferrals, key=lambda path: deferrals[path]["since_ms"])
+    return {"count": len(deferrals), "kinds": sorted(by_kind), "by_kind": by_kind,
+            "oldest_age_s": max(0.0, (now_ms - deferrals[oldest]["since_ms"]) / 1000),
+            "oldest_path": oldest}
+
+
+def disk_line(health: dict) -> str | None:
+    """One line for a low archive volume, however many sources wait on it."""
+    deferrals = health.get("deferrals") or {}
+    short = [path for path, item in deferrals.items() if item["kind"] == "disk"]
+    if not short:
+        return None
+    return (f"{len(short)} source(s) not captured: too little free space on the "
+            f"volume holding {ARCHIVE_DIR} for a point-in-time copy; free space there "
+            "(or move the data dir) and the next pass captures them")
+
+
+def waiting_line(health: dict) -> str | None:
+    waiting = waiting_summary(health)
+    if waiting is None:
+        return None
+    by_kind = {kind: count for kind, count in waiting["by_kind"].items() if kind != "disk"}
+    if not by_kind:
+        return None
+    parts = [f"{count} {_DEFERRAL_WORDING[kind]}" for kind, count in sorted(by_kind.items())]
+    line = (f"{sum(by_kind.values())} source(s) not captured yet: {'; '.join(parts)}; "
+            f"oldest {surface.brief_duration(waiting['oldest_age_s'])}")
+    if set(by_kind) - {"settle"}:
+        line += f"; `{common.cli_name()} archive` captures them now"
+    return line
+
+
+PROGRESS_NAME = "progress"
+STALL_NAME = "stalled"
+_BEAT_EVERY_S = 5.0  # well under STALL_BOUND_S; an idle pass over 10k sources beats once
+_last_beat = 0.0
+_beat_sequence = 0
+_beat_nonce = secrets.token_hex(4)  # distinguishes this pass's beats from a predecessor's
+
+
+def _progress(step: int, *, force: bool = False) -> None:
+    """The pass's heartbeat: a tiny file the daemon reads to tell a slow child
+    from a stuck one. The beat is a per-pass sequence, not a clock, so a sleep,
+    a wake or a clock jump cannot make a healthy pass look idle. Rate-limited and
+    unsynced - the atomic replace keeps a reader from a torn line. Best effort:
+    a failed beat never fails the pass."""
+    global _last_beat, _beat_sequence
+    now = time.monotonic()
+    if not force and now - _last_beat < _BEAT_EVERY_S:
+        return
+    _last_beat = now
+    _beat_sequence += 1
+    try:
+        fd, name = tempfile.mkstemp(prefix=".progress-", dir=ARCHIVE_DIR)
+    except OSError:
+        return
+    try:
+        try:
+            os.write(fd, f"{_beat_nonce}:{_beat_sequence} {step} "
+                     f"{int(time.time() * 1000)}\n".encode("ascii"))
+        finally:
+            os.close(fd)
+        os.replace(name, ARCHIVE_DIR / PROGRESS_NAME)
+    except OSError:
+        Path(name).unlink(missing_ok=True)
+
+
+def progress_beat() -> tuple[str, float] | None:
+    """(sequence token, wall age in seconds) of the running pass's last beat."""
+    try:
+        raw = _read_regular_file(ARCHIVE_DIR / PROGRESS_NAME, 128, ARCHIVE_DIR)
+        token, _step, stamp = raw.decode("ascii").split()
+        return token, max(0.0, time.time() - int(stamp) / 1000)
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+class StallWatch:
+    """The daemon's judgement of its own child. The child is stalled only once the
+    beat token has stayed the same across at least `observations_required()` ticks
+    AND for STALL_BOUND_S of monotonic time. Wall time never enters; and because a
+    suspend counts on the monotonic clock too on Windows, a sleep of any length is
+    one observation and can never satisfy the count on its own, while a stuck child
+    still trips after roughly STALL_BOUND_S of ticks."""
+
+    def __init__(self) -> None:
+        self.token: str | None = None
+        self.since = time.monotonic()
+        self.observations = 0
+
+    @staticmethod
+    def observations_required() -> int:
+        """Consecutive unchanged ticks that span the stall bound; never fewer than two."""
+        return max(2, math.ceil(STALL_BOUND_S / _tick_interval_s()))
+
+    def observe(self) -> tuple[float, bool]:
+        """(monotonic seconds the token has been unchanged, stalled?)"""
+        beat = progress_beat()
+        token = beat[0] if beat else None
+        now = time.monotonic()
+        if token != self.token:
+            self.token, self.since, self.observations = token, now, 0
+        self.observations += 1
+        idle = now - self.since
+        return idle, (idle > STALL_BOUND_S
+                      and self.observations >= self.observations_required())
+
+
+def record_stall(pid: int, idle_s: float) -> None:
+    """The daemon's verdict on the child it is about to stop, for status to show."""
+    try:
+        _publish_restore(ARCHIVE_DIR / STALL_NAME, ARCHIVE_DIR,
+                         f"{pid} {int(idle_s)}\n".encode("ascii"), True)
+    except (OSError, ValueError):
+        pass
+
+
+def _recorded_stall(pid: int) -> float | None:
+    """Idle seconds the spawning daemon recorded for holder `pid`, if it judged it."""
+    try:
+        raw = _read_regular_file(ARCHIVE_DIR / STALL_NAME, 64, ARCHIVE_DIR)
+        recorded, idle = raw.decode("ascii").split()
+        return float(idle) if int(recorded) == pid else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _empty_stats() -> dict:
+    return {"files": 0, "unchanged": 0, "appended": 0, "full": 0, "deferred": 0,
+            "bytes_stored": 0, "failed": 0, "failures": [], "deferrals": []}
+
+
+def capture(verbose: bool = False, *, scheduled: bool = False) -> dict:
     """One capture pass over every discovered store file, then a prune of versions
     beyond `keep`. Idle sources are stat-only; changed sqlite stores use coherent
-    snapshots. A pass never queues behind another archive pass."""
+    snapshots; changed plain files are copied at one instant and compressed from
+    the copy. A pass never queues behind another archive pass. A `scheduled`
+    pass (the daemon's child) re-images a rewritten store at most once per
+    window; an explicit pass captures everything now."""
     if _data_dir_readonly():
         raise _readonly_error()
     fd = _try_lock()
     if fd is None:
         lock = _lock_status()
         _write_capture_health("busy", detail=str(lock.get("detail") or ""))
-        return {"files": 0, "unchanged": 0, "appended": 0, "full": 0,
-                "bytes_stored": 0, "failed": 0, "failures": [], "busy": True,
-                "lock": lock}
+        return {**_empty_stats(), "busy": True, "lock": lock}
     try:
-        stats = _capture_locked(verbose)
+        previous = _capture_health().get("deferrals") or {}
+        stats = _capture_locked(verbose, scheduled)
         outcome = "partial" if stats["failed"] else "healthy"
         detail = (f"{stats['failed']} source path(s) failed"
                   if stats["failed"] else "capture pass completed")
+        if stats["deferred"]:
+            detail += f"; {stats['deferred']} source path(s) deferred to the next pass"
+        now_ms = int(time.time() * 1000)
+        deferrals = {
+            item["path"]: {
+                "since_ms": previous.get(item["path"], {}).get("since_ms", now_ms),
+                "kind": item["kind"]}
+            for item in stats["deferrals"]}
         _write_capture_health(
-            outcome, detail=detail, failed=stats["failed"], completed=True)
+            outcome, detail=detail, failed=stats["failed"], completed=True,
+            deferrals=deferrals)
         return stats
     except Exception as exc:
         record_capture_failure(exc)
@@ -1740,8 +2082,93 @@ def capture(verbose: bool = False) -> dict:
         _unlock(fd)
 
 
-def _capture_locked(verbose: bool) -> dict:
+def _sweep_temps() -> int:
+    """Remove point-in-time copies and sqlite snapshots no capture holds. Only the
+    lock holder calls this, so every one found is an orphan of a crashed pass."""
+    removed = 0
+    try:
+        entries = list(os.scandir(ARCHIVE_DIR))
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(_TEMP_PREFIXES):
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False) and not entry.is_symlink():
+                os.unlink(entry.path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+class _SourceBusy(ValueError):
+    """The source changed under the point-in-time copy; the next pass retries."""
+
+
+_COPY_SPACE_RESERVE = 64 * 1024**2  # a byte copy never takes the volume below this
+
+
+class _NoSpace(ValueError):
+    """A byte copy would take the archive's volume under its reserve."""
+
+    def __init__(self, needed: int, shortfall: int) -> None:
+        super().__init__(f"needs {_human_bytes(needed)} of free space beside the "
+                         f"archive ({_human_bytes(shortfall)} short)")
+        self.needed = needed
+        self.shortfall = shortfall
+
+
+def _require_copy_space(needed: int) -> None:
+    """Called right before bytes are written to the archive's volume."""
+    try:
+        free = shutil.disk_usage(ARCHIVE_DIR if ARCHIVE_DIR.exists()
+                                 else ARCHIVE_DIR.parent).free
+    except OSError:
+        return
+    shortfall = needed + _COPY_SPACE_RESERVE - free
+    if shortfall > 0:
+        raise _NoSpace(needed, shortfall)
+
+
+def _point_in_time_copy(path: Path, root: Path) -> tuple[Path, os.stat_result]:
+    """A copy of `path` taken at one instant: cloned where the filesystem can (no
+    bytes, no space check), else copied after the space check, and accepted only
+    if the source identity (inode, size, mtime) is the same before and after.
+    Compression then reads the copy at leisure."""
     _ensure_plain_parent(ARCHIVE_DIR, ARCHIVE_DIR)
+    fd, name = tempfile.mkstemp(prefix=".copy-", suffix=".src", dir=ARCHIVE_DIR)
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        source, before, _ = _open_regular_file(path, _MAX_ARCHIVE_BYTES, root)
+        os.close(source)
+        cloned = False
+        if sys.platform == "darwin":
+            cloned = subprocess.run(
+                ["/bin/cp", "-c", "--", str(path), str(tmp)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False).returncode == 0
+        if not cloned:
+            _require_copy_space(before.st_size)
+            with open(path, "rb") as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024**2)
+        after = path.lstat()
+        if (_linklike(path, after)
+                or _regular_identity(after) != _regular_identity(before)
+                or tmp.stat().st_size != before.st_size):
+            raise _SourceBusy("source was written while being copied")
+        return tmp, before
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _capture_locked(verbose: bool, scheduled: bool = False) -> dict:
+    _ensure_plain_parent(ARCHIVE_DIR, ARCHIVE_DIR)
+    _sweep_temps()
+    _progress(0, force=True)
+    (ARCHIVE_DIR / STALL_NAME).unlink(missing_ok=True)  # a fresh pass has no verdict yet
     values, torn_tail, unsafe_record = _manifest_values()
     if (unsafe_record
             or any(not _valid_manifest_record(record) for record in values)):
@@ -1753,32 +2180,40 @@ def _capture_locked(verbose: bool) -> dict:
     records = values
     latest = {record["path"]: record for record in records}
     needs_prune = _retention_exceeded(records)
-    stats = {"files": 0, "unchanged": 0, "appended": 0, "full": 0,
-             "bytes_stored": 0, "failed": 0, "failures": []}
+    stats = _empty_stats()
+    now_ms = int(time.time() * 1000)
     manifest_changed = False
     discovery_failures: list[dict] = []
+
+    def defer(path: Path, kind: str, reason: str) -> None:
+        stats["deferred"] += 1
+        stats["deferrals"].append({"path": str(path), "kind": kind, "reason": reason})
+
+    def in_rewrite_window(old: dict | None) -> bool:
+        return (scheduled and old is not None
+                and now_ms - old["ts"] < _REWRITE_RECAPTURE_MS)
+
     for agent, p, is_sqlite in _discovered_sources(discovery_failures):
         stats["files"] += 1
-        snapshot = None
+        temp: Path | None = None
+        _progress(stats["files"])
         try:
             key = str(p)
             old = latest.get(key)
             source_sig = None
+            grown = rebase = False
             if is_sqlite:
                 source_sig, activity, st = _sqlite_source_state(p)
                 if old and old.get("source_sig") == source_sig:
                     stats["unchanged"] += 1
                     continue
                 if time.time() - activity < _SQLITE_SETTLE_S:
-                    stats["unchanged"] += 1
+                    defer(p, "settle", f"written in the last {_SQLITE_SETTLE_S // 60} min")
                     continue
-                snapshot = _sqlite_snapshot(p)
+                temp = _sqlite_snapshot(p)
                 after_sig, _, st = _sqlite_source_state(p)
                 if source_sig != after_sig:
                     raise ValueError("sqlite source changed during backup")
-                source = snapshot
-                root = ARCHIVE_DIR
-                prefix_size = None
             else:
                 st = p.lstat()
                 if (_linklike(p, st) or not stat.S_ISREG(st.st_mode)
@@ -1790,12 +2225,37 @@ def _capture_locked(verbose: bool) -> dict:
                 location = _source_location(key)
                 if location is None:
                     raise ValueError("source is outside documented store roots")
-                source = p
-                root = location[0]
-                prefix_size = old["size"] if old and st.st_size > old["size"] else None
-            sha, size, prefix_sha, suffix_sha, identity, _ = _hash_regular_file(
-                source, root, prefix=prefix_size)
-            if old and old["sha256"] == sha:
+                larger = bool(old and st.st_size > old["size"])
+                # a long append chain is rebased onto a fresh whole-file capture
+                # before its manifest record nears the line bound
+                rebase = larger and len(old["chunks"]) >= _MAX_APPEND_CHAIN
+                grown = larger and not rebase
+                if old and not larger and in_rewrite_window(old):
+                    defer(p, "rewrite", _REWRITE_REASON)
+                    continue
+                source, root = p, location[0]
+                if grown:
+                    # append-only growth needs no copy: the suffix is read from the
+                    # live file under the torn-read guard, as the prefix check proves
+                    sha, size, prefix_sha, suffix_sha, identity, _ = _hash_regular_file(
+                        source, root, prefix=old["size"])
+                    if prefix_sha != old["sha256"]:
+                        # a rewrite that happens to be longer: whole-document rules
+                        if in_rewrite_window(old):
+                            defer(p, "rewrite", _REWRITE_REASON)
+                            continue
+                        grown = False
+                if not grown:
+                    try:
+                        temp, st = _point_in_time_copy(p, root)
+                    except _SourceBusy as exc:
+                        defer(p, "busy", str(exc))
+                        continue
+                    source, root = temp, ARCHIVE_DIR
+            if not grown:
+                sha, size, prefix_sha, suffix_sha, identity, _ = _hash_regular_file(
+                    temp, ARCHIVE_DIR)
+            if old and not rebase and old["sha256"] == sha:
                 rec = {**old, "mtime_ns": st.st_mtime_ns, "ts": int(time.time() * 1000)}
                 if source_sig is not None:
                     rec["source_sig"] = source_sig
@@ -1804,16 +2264,16 @@ def _capture_locked(verbose: bool) -> dict:
                 manifest_changed = True
                 stats["unchanged"] += 1
                 continue
-            appended = bool(old and prefix_size is not None and prefix_sha == old["sha256"])
-            if appended:
+            if grown:
                 suffix_len = size - old["size"]
                 chunk = _store_file_chunk(source, root, old["size"], suffix_len,
                                           str(suffix_sha), identity)
                 chunks = old["chunks"] + [chunk]
                 stored = suffix_len
             else:
-                chunks = [_store_file_chunk(source, root, 0, size, sha, identity)]
+                chunks = [_store_file_chunk(temp, ARCHIVE_DIR, 0, size, sha, identity)]
                 stored = size
+            appended = grown
             rec = {"path": key, "agent": agent, "sessions": _sessions_of(p),
                    "sha256": sha, "size": size, "mtime_ns": st.st_mtime_ns,
                    "ts": int(time.time() * 1000), "sqlite": is_sqlite,
@@ -1828,14 +2288,16 @@ def _capture_locked(verbose: bool) -> dict:
             if verbose:
                 verb = "appended" if appended else "captured"
                 common.log(f"archive: {verb} {common.terminal_safe(p.name)} ({size} bytes)")
+        except _NoSpace as exc:
+            defer(p, "disk", str(exc))
         except (OSError, sqlite3.Error, ValueError, lzma.LZMAError) as exc:
             stats["failed"] += 1
             stats["failures"].append({"path": str(p), "error": str(exc)})
             common.log(f"archive: failed {common.terminal_safe(p)}: "
                        f"{common.terminal_safe(exc)}")
         finally:
-            if snapshot is not None:
-                snapshot.unlink(missing_ok=True)
+            if temp is not None:
+                temp.unlink(missing_ok=True)
     for failure in discovery_failures:
         stats["failed"] += 1
         stats["failures"].append(failure)
@@ -1844,6 +2306,32 @@ def _capture_locked(verbose: bool) -> dict:
     if manifest_changed or needs_prune:
         stats["pruned"] = _prune().get("reclaimed", 0)
     return stats
+
+
+def capture_child_command() -> list[str]:
+    """The daemon's capture pass: this module run as a program, scheduled mode."""
+    return [sys.executable, str(Path(__file__).resolve()), "--scheduled-pass"]
+
+
+def spawn_capture_child() -> subprocess.Popen | None:
+    """Start one unbounded capture pass as a niced child in the caller's process
+    group (so stopping the daemon's tree stops it), or None while a pass already
+    holds the lock or retention is off. The caller never waits on it."""
+    if not enabled() or _data_dir_readonly():
+        return None
+    if _lock_status().get("state") in ("busy", "lock-protected"):
+        return None
+    command = capture_child_command()
+    if os.name != "nt":
+        command = ["/usr/bin/nice", "-n", "19", *command]
+    launch: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        # the daemon's children must not flash a console; BELOW_NORMAL stands in for nice
+        launch["creationflags"] = 0x08004000  # NO_WINDOW | BELOW_NORMAL
+    env = {**os.environ,
+           _SPAWNER_ENV: f"{os.getpid()}:{common.process_start_identity(os.getpid()) or 'unknown'}"}
+    return subprocess.Popen(command, env=env, **launch)
 
 
 def _retention_exceeded(records: list[dict]) -> bool:
@@ -1899,6 +2387,79 @@ def _prune(verbose: bool = False) -> dict:
         common.log(f"archive: pruned {dropped} old version record(s), "
                    f"reclaimed {reclaimed / 1e6:.1f} MB")
     return {"dropped": dropped, "reclaimed": reclaimed}
+
+
+def _purge_locked() -> None:
+    """Delete the manifest, every stored chunk and the capture-health record; the
+    config (on/off, keep) and the lock survive. Caller holds the lock."""
+    if _data_dir_readonly():
+        raise _readonly_error()
+    _sweep_temps()
+    for path in (MANIFEST, HEALTH, ARCHIVE_DIR / PROGRESS_NAME, ARCHIVE_DIR / STALL_NAME):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if _linklike(path, info) or not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"unsafe archive entry: {path}")
+        path.unlink()
+    try:
+        info = STORE.lstat()
+    except FileNotFoundError:
+        return
+    if _linklike(STORE, info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"unsafe archive store: {STORE}")
+    for current, dirs, names in os.walk(STORE, topdown=False, followlinks=False):
+        for name in names:
+            path = Path(current) / name
+            found = path.lstat()
+            if _linklike(path, found) or not stat.S_ISREG(found.st_mode):
+                raise ValueError(f"unsafe archive entry: {path}")
+            path.unlink()
+        for name in dirs:
+            path = Path(current) / name
+            if _linklike(path):
+                raise ValueError(f"unsafe archive entry: {path}")
+            path.rmdir()
+    STORE.rmdir()
+
+
+def _purge_main(assume_yes: bool) -> int:
+    s = status()
+    stored = s.get("stored_bytes")
+    if stored is None:
+        print(f"archive purge blocked: {common.terminal_safe(s.get('detail'))}")
+        return 1
+    # leftovers of a crashed pass count as archived bytes too: they are swept
+    # whether or not a manifest ever existed. Config, health and the lock are not.
+    bookkeeping = 0
+    for entry in os.scandir(ARCHIVE_DIR) if ARCHIVE_DIR.is_dir() else ():
+        if entry.is_file(follow_symlinks=False) and (
+                entry.name in (CONFIG.name, HEALTH.name, "lock")
+                or entry.name.startswith(".lock.owner-reap-")):
+            bookkeeping += entry.stat(follow_symlinks=False).st_size
+    retained = stored - bookkeeping
+    if retained <= 0 and not _captures_retained():
+        print("archive holds no captured copies; nothing to purge")
+        return 0
+    target = common.terminal_safe(ARCHIVE_DIR)
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print(f"archive purge would delete {_human_bytes(retained)} of archived copies "
+                  f"in {target}; pass --yes to confirm")
+            return 1
+        answer = input(f"delete {_human_bytes(retained)} of archived copies in {target}, "
+                       "including copies of chats their agents already deleted? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("archive purge cancelled; nothing was deleted")
+            return 1
+    _purge_locked()
+    print(f"archive purged: {_human_bytes(retained)} of archived copies deleted "
+          f"from {target}")
+    if s.get("enabled"):
+        print(f"retention is still on: the next capture pass re-archives the live "
+              f"stores (`{common.cli_name()} archive --off` stops that)")
+    return 0
 
 
 def _reconstruct(rec: dict) -> bytes:
@@ -2172,13 +2733,48 @@ def _publish_restore(dst: Path, root: Path, data: bytes, force: bool) -> None:
     _publish_restore_writer(dst, root, lambda stream: stream.write(data), force)
 
 
+def _one_session(matches: list[dict], needle: str) -> bool:
+    """Every match carries a session id the needle selects: one session's files
+    (a Claude transcript with its subagents/ side files, a pi session and its
+    sidecar directory), restorable together because their paths never collide."""
+    shared = set.intersection(*(set(rec.get("sessions") or ()) for rec in matches))
+    return any(session.startswith(needle.lower()) for session in shared)
+
+
+def _never_archived_sources(needle: str) -> list[str]:
+    """Lines for discovered sqlite stores the needle names that have no archived
+    copy: a store written in the last settle window is deferred on every pass."""
+    lines = []
+    try:
+        for _agent, path, is_sqlite in _discovered_sources():
+            if not is_sqlite or not _matches_restore_needle(
+                    {"path": str(path), "sessions": []}, needle.lower()):
+                continue
+            try:
+                _sig, activity, _st = _sqlite_source_state(path)
+            except (OSError, ValueError):
+                continue
+            if time.time() - activity < _SQLITE_SETTLE_S:
+                lines.append(
+                    f"{common.terminal_safe(path)} has no archived copy yet: capture "
+                    f"deferred it (written in the last {_SQLITE_SETTLE_S // 60} min)")
+            else:
+                lines.append(f"{common.terminal_safe(path)} has no archived copy yet: "
+                             f"run `{common.cli_name()} archive`")
+    except (OSError, ValueError):
+        return lines
+    return lines
+
+
 def restore(needle: str, to: str | None = None, force: bool = False) -> int:
     matches = _find(needle)
     safe_needle = common.terminal_safe(needle)
     if not matches:
         print(f"no archived file matches {safe_needle!r}")
+        for line in _never_archived_sources(needle):
+            print(line)
         return 1
-    if len(matches) > 1 and to is None:
+    if len(matches) > 1 and to is None and not _one_session(matches, needle):
         print(f"{len(matches)} archived files match {safe_needle!r}:")
         for rec in matches[:10]:
             print(f"  {common.terminal_safe(rec['path'])}  ({rec['size']} bytes, "
@@ -2188,24 +2784,27 @@ def restore(needle: str, to: str | None = None, force: bool = False) -> int:
     rc = 0
     plan: list[tuple[dict, Path, Path]] = []
     for rec in matches:
+        location = _restore_location(rec)
         if to:
             root = Path(to).expanduser().absolute()
-            parsed = _stored_absolute_parts(rec.get("path"))
-            if parsed is None:
-                print(f"cannot restore {common.terminal_safe(rec.get('path'))}: "
-                      "manifest path is not a portable absolute path")
-                rc = 1
-                continue
-            dst = root / parsed[1][-1]
+            if location is not None:
+                relative = location[1]
+            else:
+                parsed = _stored_absolute_parts(rec.get("path"))
+                if parsed is None:
+                    print(f"cannot restore {common.terminal_safe(rec.get('path'))}: "
+                          "manifest path is not a portable absolute path")
+                    rc = 1
+                    continue
+                relative = Path(parsed[1][-1])
+            dst = root / relative
         else:
-            location = _restore_location(rec)
             if location is None:
                 print(f"cannot restore {common.terminal_safe(rec.get('path'))}: "
                       "manifest path is outside documented store roots")
                 rc = 1
                 continue
-            source_root, relative = location
-            root = source_root
+            root, relative = location
             dst = root / relative
         plan.append((rec, root, dst))
     # Full-plan collision gate: two archived sources aiming at one restored
@@ -2353,32 +2952,14 @@ def status(
         }
     on = bool(config["value"].get("enabled", False))
     config_state = str(config["state"])
-    if not on:
-        return {
-            "enabled": False,
-            "config_state": config_state,
-            "state": "disabled",
-            "detail": "automatic capture is disabled",
-            "manifest_state": "not-inspected",
-            "invalid_records": None,
-            "migration_records": None,
-            "files": None,
-            "raw_bytes": None,
-            "stored_bytes": (
-                None if stored_bytes is None
-                else max(0, int(stored_bytes))),
-            "ratio": None,
-            "lock": {"state": "not-inspected"},
-            "last_pass": {
-                "outcome": "not-inspected", "age_s": None, "fresh": False},
-        }
 
     if stored_bytes is None:
         stored = 0
         try:
-            if STORE.exists():
+            # the figure doctor's footprint reports too: every file under data/archive
+            if ARCHIVE_DIR.exists():
                 for current, dirs, names in os.walk(
-                        STORE, topdown=True, followlinks=False):
+                        ARCHIVE_DIR, topdown=True, followlinks=False):
                     if expired():
                         return deferred(
                             "stored-byte accounting", on=on, stored=None,
@@ -2390,8 +2971,6 @@ def status(
                         if not (Path(current) / name).is_symlink()
                     ]
                     for name in names:
-                        if not name.endswith(".xz"):
-                            continue
                         if expired():
                             return deferred(
                                 "stored-byte accounting", on=on, stored=None,
@@ -2399,9 +2978,10 @@ def status(
                         found = (Path(current) / name).lstat()
                         reparse = getattr(
                             stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-                        if (not stat.S_ISREG(found.st_mode)
-                                or bool(getattr(
-                                    found, "st_file_attributes", 0) & reparse)):
+                        if (stat.S_ISLNK(found.st_mode) or bool(getattr(
+                                found, "st_file_attributes", 0) & reparse)):
+                            continue  # a planted link is the manifest reader's verdict
+                        if not stat.S_ISREG(found.st_mode):
                             raise OSError(
                                 "archive store contains a non-regular entry")
                         stored += int(found.st_size)
@@ -2417,6 +2997,23 @@ def status(
             }
     else:
         stored = max(0, int(stored_bytes))
+    if not on:
+        return {
+            "enabled": False,
+            "config_state": config_state,
+            "state": "disabled",
+            "detail": _disabled_detail(stored),
+            "manifest_state": "not-inspected",
+            "invalid_records": None,
+            "migration_records": None,
+            "files": None,
+            "raw_bytes": None,
+            "stored_bytes": stored,
+            "ratio": None,
+            "lock": {"state": "not-inspected"},
+            "last_pass": {
+                "outcome": "not-inspected", "age_s": None, "fresh": False},
+        }
     if expired():
         return deferred(
             "capture-health observation", on=on, stored=stored,
@@ -2434,12 +3031,10 @@ def status(
             last_pass={**health, "fresh": False},
             config_state=config_state)
     age = health.get("age_s")
-    try:
-        tick = max(1.0, float(os.environ.get("AGREP_ARCHIVE_CHECK_S", "60")))
-    except (TypeError, ValueError):
-        tick = 60.0
+    tick = _tick_interval_s()
     last_pass = {**health, "fresh": age is not None and age <= tick * 2.0,
                  "tick_interval_s": tick}
+    waiting = waiting_summary(health)
     manifest = _manifest_status(timeout_s=remaining())
     if manifest["state"] == "budget-exceeded":
         return {
@@ -2467,7 +3062,10 @@ def status(
                   if manifest["state"] == "future" else
                   manifest.get("detail") or "manifest contains an unrecognized record")
     elif lock["state"] == "busy":
-        state, detail = "busy", "verified live capture pass"
+        state = "stalled" if lock.get("stalled") else "busy"
+        detail = _running_line(lock)
+    elif lock["state"] == "interrupted":
+        state, detail = "interrupted", str(lock.get("detail"))
     elif lock["state"] == "lock-wedged":
         state, detail = "lock-wedged", str(lock.get("detail") or "archive lock is wedged")
     elif lock["state"] == "lock-protected":
@@ -2487,6 +3085,8 @@ def status(
     elif manifest["state"] == "migration":
         state = "migration"
         detail = f"{manifest['migration_records']} record(s) re-anchor to the current home"
+    elif waiting is not None and "disk" in waiting["by_kind"]:
+        state, detail = "disk-full", str(disk_line(health))
     else:
         state, detail = "healthy", "archive manifest and capture state are readable"
     return {"enabled": on, "config_state": config_state,
@@ -2496,7 +3096,7 @@ def status(
             "migration_records": manifest["migration_records"],
             "files": len(latest), "raw_bytes": raw, "stored_bytes": stored,
             "ratio": round(raw / stored, 2) if stored else None,
-            "lock": lock, "last_pass": last_pass}
+            "lock": lock, "last_pass": last_pass, "waiting": waiting}
 
 
 def restore_main(argv: list[str] | None = None) -> int:
@@ -2552,6 +3152,7 @@ def _main(argv: list[str] | None = None) -> int:
                "  agrep archive --status  inspect retention and the last capture\n"
                "  agrep archive --on      enable automatic source-store captures\n"
                "  agrep archive           capture changed source stores now\n"
+               "  agrep archive --purge   delete every archived copy (asks first)\n"
                "\nexit: 0 complete; 1 incomplete, busy, or unhealthy; "
                "2 archive unavailable or invalid arguments.",
         allow_abbrev=False)
@@ -2559,15 +3160,29 @@ def _main(argv: list[str] | None = None) -> int:
     # argparse rejects the combination instead of a branch order picking one
     actions = ap.add_mutually_exclusive_group()
     actions.add_argument("--on", action="store_true", help="enable auto-capture on the indexer tick")
-    actions.add_argument("--off", action="store_true", help="disable auto-capture")
+    actions.add_argument("--off", action="store_true",
+                         help="disable auto-capture (archived copies stay until --purge)")
     actions.add_argument("--status", action="store_true", help="show archive size/ratio")
     actions.add_argument("--keep", type=nonnegative, metavar="N",
                          help="versions kept per file (persists; 0 = never prune; default 3)")
     actions.add_argument("--prune", action="store_true", help="prune old versions now")
+    actions.add_argument("--purge", action="store_true",
+                         help="delete every archived copy and the manifest; the "
+                              "on/off and keep settings stay")
+    ap.add_argument("--yes", action="store_true", help="with --purge: skip the confirmation")
+    ap.add_argument("--scheduled-pass", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    if args.yes and not args.purge:
+        ap.error("--yes only confirms --purge")
     if args.on or args.off:
         set_enabled(args.on)
         print(f"archive auto-capture {'enabled' if args.on else 'disabled'}")
+        if args.off:
+            stored = status().get("stored_bytes")
+            if stored and _captures_retained():
+                print(f"the copies already taken stay: {_human_bytes(stored)} in "
+                      f"{common.terminal_safe(ARCHIVE_DIR)}; "
+                      f"`{common.cli_name()} archive --purge` deletes them")
         return 0
     if args.keep is not None:
         _set_config(keep=args.keep)
@@ -2575,26 +3190,29 @@ def _main(argv: list[str] | None = None) -> int:
               f"{args.keep if args.keep > 0 else '0 (never prune)'} "
               "version(s) per source file")
         return 0
-    if args.prune:
+    if args.prune or args.purge:
+        verb = "purge" if args.purge else "prune"
         fd = _try_lock()
         if fd is None:
             lock = _lock_status()
             if lock.get("state") == "lock-wedged":
-                print(f"archive prune blocked: lock-wedged at "
+                print(f"archive {verb} blocked: lock-wedged at "
                       f"{common.terminal_safe(lock.get('path'))}; "
                       f"pid={lock.get('pid') or 'unknown'} "
                       f"age={float(lock.get('age_s') or 0):.1f}s; "
-                      "repair required before pruning")
+                      f"repair required before {verb[:-1]}ing")
             else:
-                print("archive prune blocked by an owned or protected lock; "
+                print(f"archive {verb} blocked by an owned or protected lock; "
                       "inspect `agrep archive --status`")
             return 1
         try:
+            if args.purge:
+                return _purge_main(args.yes)
             r = _prune(verbose=True)
         finally:
             _unlock(fd)
         print(f"pruned {r['dropped']} old version record(s), "
-              f"reclaimed {r['reclaimed'] / 1e6:.1f} MB")
+              f"reclaimed {_human_bytes(r['reclaimed'])}")
         return 0
     if args.status:
         s = status()
@@ -2604,35 +3222,55 @@ def _main(argv: list[str] | None = None) -> int:
         if not s["enabled"]:
             print(f"archive retention is off (`{common.cli_name()} archive --on` "
                   "turns it on)")
+            if s["stored_bytes"] and _captures_retained():
+                print(f"earlier captures still stored: {_human_bytes(s['stored_bytes'])} "
+                      f"in {common.terminal_safe(ARCHIVE_DIR)}; "
+                      f"`{common.cli_name()} archive --purge` deletes them")
         else:
             parts = []
             if type(s["files"]) is int:
                 parts.append(f"{s['files']:,} files")
             if type(s["stored_bytes"]) is int:
-                parts.append(f"{s['stored_bytes'] / 1e9:.2f} GB stored")
+                parts.append(f"{_human_bytes(s['stored_bytes'])} stored")
             if s["ratio"]:
                 parts.append(f"{s['ratio']}x smaller than the originals")
-            parts.append("never captured yet" if age is None
-                         else f"last capture {surface.brief_duration(age)} ago")
-            print(f"archive keeps the last {_keep()} version(s) per source "
-                  "file: " + ", ".join(parts))
-        if s["state"] not in ("healthy", "disabled", "migration"):
+            if age is None and s["state"] == "interrupted":
+                parts.append("capture interrupted before a pass completed")
+            else:
+                parts.append("never captured yet" if age is None
+                             else f"last capture {surface.brief_duration(age)} ago")
+            keep = _keep()
+            retention = (f"keeps the last {keep} version(s)" if keep
+                         else "keeps every version (never prunes)")
+            print(f"archive {retention} per source file: " + ", ".join(parts))
+            if s.get("waiting"):
+                line = waiting_line(s["last_pass"])
+                if line:
+                    print(f"archive {line}")
+        if s["state"] not in ("healthy", "disabled", "migration", "interrupted"):
             print(f"archive {s['state']}: {common.terminal_safe(s['detail'])}")
             return 2 if s["manifest_state"] == "unreadable" else 1
+        if s["state"] == "interrupted":
+            print(f"archive: {common.terminal_safe(s['detail'])}")
         return 0
     t0 = time.time()
-    stats = capture(verbose=True)
+    stats = capture(verbose=True, scheduled=args.scheduled_pass)
     if stats.get("busy"):
         lock = stats.get("lock") or {}
         if lock.get("state") == "lock-wedged":
             print(f"archive lock is wedged at {common.terminal_safe(lock.get('path'))}; "
                   f"pid={lock.get('pid') or 'unknown'} age={float(lock.get('age_s') or 0):.1f}s")
         else:
-            print("another archive pass owns the lock; inspect `agrep archive --status`")
+            print(f"archive: {_running_line(lock)}; it captures the same sources, "
+                  f"inspect `{common.cli_name()} archive --status`")
         return 1
+    deferred = f", {stats['deferred']} deferred" if stats["deferred"] else ""
     print(f"archive: {stats['files']} files - {stats['unchanged']} unchanged, "
-          f"{stats['appended']} appended, {stats['full']} full captures, "
-          f"{stats['bytes_stored'] / 1e6:.1f} MB new content in {time.time() - t0:.1f}s")
+          f"{stats['appended']} appended, {stats['full']} full captures{deferred}, "
+          f"{_human_bytes(stats['bytes_stored'])} new content in {time.time() - t0:.1f}s")
+    for item in stats["deferrals"][:10]:
+        print(f"  deferred ({common.terminal_safe(item['reason'])}): "
+              f"{common.terminal_safe(item['path'])}")
     if stats["failed"]:
         print(f"archive incomplete: {stats['failed']} source path(s) failed; "
               "successful captures were kept")

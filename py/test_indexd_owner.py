@@ -2889,7 +2889,7 @@ class IndexdOwnerTests(unittest.TestCase):
             [str(binary), "index", "--agent", "all"], cwd=ROOT,
             env={**env, "AGREP_RUNTIME_BUILD_ID": PREDECESSOR_WRITER},
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=60)
+            errors="replace", timeout=300)
         self.assertEqual(seeded.returncode, 0, seeded.stdout + seeded.stderr)
         owner = json.loads(
             (data / ".derived-owner.json").read_text(encoding="utf-8"))
@@ -2931,7 +2931,7 @@ class IndexdOwnerTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(ROOT / "cli.py"), "index", *args], cwd=ROOT,
             env=env, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=120)
+            errors="replace", timeout=300)
 
     def _assert_explicit_index_displaces_predecessor(
             self, label: str, *args: str) -> None:

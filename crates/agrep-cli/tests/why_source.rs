@@ -1,7 +1,7 @@
 //! `agrep-rs why-source`: the read-only projection `agrep why` reasons over.
 mod common;
 
-use common::{copy_dir, fixture_home, ingest_into, temp_dir, BIN};
+use common::{copy_dir, crush_home, fixture_home, ingest_into, temp_dir, BIN};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -234,6 +234,347 @@ fn projection_after_ingest_joins_sources_cache_claims_and_intake_freshness() {
     assert_eq!(filtered["issues"], serde_json::json!([]));
     let kept = why_source(&home, &data, &["--path", &alpha.to_string_lossy()]);
     assert_eq!(kept["issues"].as_array().unwrap().len(), 1);
+
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(data).unwrap();
+}
+
+fn plant_crush_conversation(db: &Path, session: &str, text: &str) {
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, title TEXT, \
+             updated_at INTEGER, created_at INTEGER); \
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, parts TEXT, \
+             model TEXT, created_at INTEGER, updated_at INTEGER);",
+        )
+        .unwrap();
+    let parts = serde_json::json!([{"type": "text", "data": {"text": text}}]);
+    connection
+        .execute(
+            "INSERT INTO sessions VALUES (?1, NULL, 'sibling', 1767349000000, 1767349000000)",
+            [session],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO messages VALUES (?1, ?2, 'user', ?3, NULL, 1767349000000, 1767349000000)",
+            [
+                format!("{session}-m1"),
+                session.to_string(),
+                parts.to_string(),
+            ],
+        )
+        .unwrap();
+    connection.close().unwrap();
+}
+
+fn token_census(home: &Path, data: &Path) -> Value {
+    let output = Command::new(BIN)
+        .args(["stores", "--tokens"])
+        .env_clear()
+        .env("HOME", home)
+        .env("AGREP_HOME", home)
+        .env("AGREP_DATA_DIR", data)
+        .env("TMPDIR", std::env::temp_dir())
+        .output()
+        .expect("spawn stores --tokens");
+    assert!(
+        output.status.success(),
+        "stores --tokens failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Token ids carry their database path; the conversations listed for `db`, by session.
+fn listed_sessions(tokens: &Value, db: &Path) -> Vec<String> {
+    let mut sessions: Vec<String> = tokens
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["state"] == "token")
+        .filter_map(|row| agrep_core::intake::parse_token_id(row["id"].as_str().unwrap()))
+        .filter(|(path, _)| Path::new(path) == db)
+        .map(|(_, session)| session)
+        .collect();
+    sessions.sort();
+    sessions
+}
+
+/// One crush database the census cannot open leaves its siblings' conversations listed with
+/// their freshness, under one issue naming that database alone, in both token projections.
+#[test]
+fn projection_lists_healthy_token_databases_beside_an_unreadable_sibling() {
+    let home = crush_home();
+    let data = temp_dir("why-source-scoped-data");
+    let main = home
+        .join(".local")
+        .join("share")
+        .join("crush")
+        .join("crush.db");
+    let sibling = home.join(".crush").join("crush.db");
+    plant_crush_conversation(&sibling, "sib1", "sibling database question");
+    ingest_into("crush", &home, &data, true);
+    let seeded = ["sc1", "sc2", "sc3"].map(str::to_owned).to_vec();
+
+    let healthy = why_source(&home, &data, &[]);
+    assert_eq!(healthy["issues"], serde_json::json!([]));
+    assert_eq!(listed_sessions(&healthy["tokens"], &main), seeded);
+    let sibling_only = vec!["sib1".to_owned()];
+    assert_eq!(listed_sessions(&healthy["tokens"], &sibling), sibling_only);
+    let healthy_census = token_census(&home, &data);
+    assert_eq!(listed_sessions(&healthy_census, &sibling), sibling_only);
+
+    fs::write(&sibling, b"not a sqlite database").unwrap();
+    let scoped = why_source(&home, &data, &[]);
+    let census: Vec<&Value> = scoped["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["kind"] == "token-census-unreadable")
+        .collect();
+    assert_eq!(census.len(), 1, "{:?}", scoped["issues"]);
+    assert_eq!(census[0]["agent"], "crush");
+    assert_eq!(census[0]["path"], sibling.to_string_lossy().as_ref());
+    assert_eq!(census[0]["durable"], false);
+    assert_eq!(listed_sessions(&scoped["tokens"], &main), seeded);
+    assert!(listed_sessions(&scoped["tokens"], &sibling).is_empty());
+    for entry in scoped["intake"]["files"].as_array().unwrap() {
+        let path = Path::new(entry["path"].as_str().unwrap());
+        if path == main {
+            assert_eq!(entry["fresh"], true, "{entry}");
+            assert_eq!(entry["current_key"], entry["key"]);
+        } else {
+            assert_eq!(path, sibling, "{entry}");
+            assert_eq!(entry["fresh"], Value::Null, "{entry}");
+            assert_eq!(entry["current_key"], Value::Null, "{entry}");
+        }
+    }
+    let stores = token_census(&home, &data);
+    assert_eq!(listed_sessions(&stores, &main), seeded);
+    let unreadable: Vec<&Value> = stores
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["state"] == "source-unreadable")
+        .collect();
+    assert_eq!(unreadable.len(), 1, "{stores}");
+    assert_eq!(unreadable[0]["name"], "crush");
+    assert_eq!(unreadable[0]["path"], sibling.to_string_lossy().as_ref());
+    assert_eq!(unreadable[0]["kind"], "token-census-unreadable");
+
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(data).unwrap();
+}
+
+#[cfg(unix)]
+fn stores_paths(home: &Path, data: &Path) -> Value {
+    let output = Command::new(BIN)
+        .args(["stores", "--paths"])
+        .env_clear()
+        .env("HOME", home)
+        .env("AGREP_HOME", home)
+        .env("AGREP_DATA_DIR", data)
+        .env("TMPDIR", std::env::temp_dir())
+        .output()
+        .expect("spawn stores --paths");
+    assert!(
+        output.status.success(),
+        "stores --paths failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// A registered data dir nobody may search hides its database from a stat. The index keeps
+/// that database's published rows, the census lists it as unreadable beside its siblings'
+/// tokens, and the store paths name it as a source issue, never as absent.
+#[cfg(unix)]
+#[test]
+fn projection_keeps_a_database_under_an_uninspectable_data_dir_unreadable_not_absent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    if unsafe { geteuid() } == 0 {
+        return;
+    }
+    let home = crush_home();
+    let data = temp_dir("why-source-denied-data");
+    let main = home
+        .join(".local")
+        .join("share")
+        .join("crush")
+        .join("crush.db");
+    let project = home.join("project");
+    let denied = project.join(".crush");
+    let sibling = denied.join("crush.db");
+    plant_crush_conversation(&sibling, "sib1", "sibling database question");
+    fs::write(
+        main.with_file_name("projects.json"),
+        serde_json::json!({"projects": [{"path": project, "data_dir": denied}]}).to_string(),
+    )
+    .unwrap();
+    ingest_into("crush", &home, &data, true);
+    let before = fs::read_to_string(data.join("messages.jsonl")).unwrap();
+    assert!(before.contains("sibling database question"));
+    let seeded = ["sc1", "sc2", "sc3"].map(str::to_owned).to_vec();
+
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        ingest_into("crush", &home, &data, false);
+        ingest_into("crush", &home, &data, false);
+        (
+            fs::read_to_string(data.join("messages.jsonl")).unwrap(),
+            why_source(&home, &data, &[]),
+            token_census(&home, &data),
+            stores_paths(&home, &data),
+        )
+    });
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+    let (after, scoped, census, paths) = result.unwrap();
+    assert!(
+        after.contains("sibling database question"),
+        "the uninspectable database's rows were pruned"
+    );
+    assert_eq!(listed_sessions(&scoped["tokens"], &main), seeded);
+    assert!(listed_sessions(&scoped["tokens"], &sibling).is_empty());
+    let sibling_str = sibling.to_string_lossy().into_owned();
+    let issues: Vec<&Value> = scoped["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["path"] == sibling_str.as_str())
+        .collect();
+    let kinds: Vec<&str> = issues
+        .iter()
+        .map(|issue| issue["kind"].as_str().unwrap())
+        .collect();
+    for kind in [
+        "token-census-unreadable",
+        "source-read-failed",
+        "permission-denied",
+    ] {
+        assert!(kinds.contains(&kind), "{kind}: {:?}", scoped["issues"]);
+    }
+    assert!(by_path(&scoped["sources"], &sibling).is_empty());
+    assert!(!by_path(&scoped["sources"], &main).is_empty());
+    for entry in by_path(&scoped["intake"]["files"], &sibling) {
+        assert_eq!(entry["fresh"], Value::Null, "{entry}");
+    }
+    for entry in by_path(&scoped["intake"]["files"], &main) {
+        assert_eq!(entry["fresh"], true, "{entry}");
+    }
+    assert_eq!(listed_sessions(&census, &main), seeded);
+    assert!(census
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["state"] == "source-unreadable" && row["path"] == sibling_str.as_str()));
+    // The walk, the census and the parse each recorded it; the listing names it once.
+    let unreadable_store: Vec<&Value> = paths
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "crush" && row["path"] == sibling_str.as_str())
+        .collect();
+    assert_eq!(unreadable_store.len(), 1, "{paths}");
+    assert_eq!(unreadable_store[0]["state"], "source-unreadable");
+    assert_eq!(unreadable_store[0]["kind"], "permission-denied");
+
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(data).unwrap();
+}
+
+/// A store behind a dotfiles link that turns into a loop (or points at a file) is misconfigured,
+/// not deleted: every pass keeps its published rows, names the root unreadable, and a cold
+/// `--full` or a plain pass after cache loss is refused rather than publishing nothing.
+#[cfg(unix)]
+#[test]
+fn projection_keeps_a_store_behind_a_looping_link_unreadable_not_absent() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir("why-source-loop-home");
+    let data = temp_dir("why-source-loop-data");
+    let real = home.join("dotfiles").join("claude");
+    copy_dir(&fixture_home("claude").join(".claude"), &real);
+    let link = home.join(".claude");
+    symlink(&real, &link).unwrap();
+    ingest_into("claude", &home, &data, true);
+    let before = fs::read_to_string(data.join("messages.jsonl")).unwrap();
+    assert!(before.contains("\"agent\":\"claude\""));
+    let root = link.join("projects");
+
+    for (label, target) in [
+        ("loop", home.join("claude-loop")),
+        ("file", home.join("a-file")),
+    ] {
+        fs::remove_file(&link).unwrap();
+        if label == "loop" {
+            symlink(&link, &target).unwrap();
+        } else {
+            fs::write(&target, b"a file where the store link should point").unwrap();
+        }
+        symlink(&target, &link).unwrap();
+
+        let warm = common::ingest_output("claude", &home, &data, false);
+        assert!(
+            warm.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&warm.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("messages.jsonl")).unwrap(),
+            before,
+            "{label}"
+        );
+        let full = common::ingest_output("claude", &home, &data, true);
+        assert!(
+            !full.status.success(),
+            "{label}: --full published past a looping link"
+        );
+        assert!(
+            String::from_utf8_lossy(&full.stderr).contains("retained the old generation"),
+            "{label}: {}",
+            String::from_utf8_lossy(&full.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("messages.jsonl")).unwrap(),
+            before,
+            "{label}"
+        );
+        fs::remove_file(data.join(".ingest_cache.bin")).unwrap();
+        let _ = common::ingest_output("claude", &home, &data, false);
+        assert_eq!(
+            fs::read_to_string(data.join("messages.jsonl")).unwrap(),
+            before,
+            "{label}"
+        );
+        let payload = why_source(&home, &data, &[]);
+        let issues: Vec<&Value> = payload["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|issue| {
+                issue["agent"] == "claude" && issue["path"] == root.to_string_lossy().as_ref()
+            })
+            .collect();
+        assert!(!issues.is_empty(), "{label}: {}", payload["issues"]);
+        assert_eq!(payload["sources"], serde_json::json!([]), "{label}");
+
+        fs::remove_file(&link).unwrap();
+        let _ = fs::remove_file(&target);
+        symlink(&real, &link).unwrap();
+        ingest_into("claude", &home, &data, true);
+        assert_eq!(
+            fs::read_to_string(data.join("messages.jsonl")).unwrap(),
+            before,
+            "{label}"
+        );
+    }
 
     fs::remove_dir_all(home).unwrap();
     fs::remove_dir_all(data).unwrap();

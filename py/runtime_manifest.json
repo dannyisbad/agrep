@@ -58,6 +58,10 @@
    "member": "agrep/py/display_policy.py"
   },
   {
+   "source": "py/derived_anchor.py",
+   "member": "agrep/py/derived_anchor.py"
+  },
+  {
    "source": "py/dist.py",
    "member": "agrep/py/dist.py"
   },
@@ -286,6 +290,10 @@
    "member": "agrep/py/settings.py"
   },
   {
+   "source": "py/source_health.py",
+   "member": "agrep/py/source_health.py"
+  },
+  {
    "source": "py/summary.py",
    "member": "agrep/py/summary.py"
   },
@@ -300,6 +308,10 @@
   {
    "source": "py/teach.py",
    "member": "agrep/py/teach.py"
+  },
+  {
+   "source": "py/termui.py",
+   "member": "agrep/py/termui.py"
   },
   {
    "source": "py/why.py",

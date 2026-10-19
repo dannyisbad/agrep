@@ -111,11 +111,13 @@ for (const phrase of [
   "do not retrieve history",
   "do not inspect the environment",
   "do not inspect the environment or substitute `agrep recall`",
-  "--more",
+  "agrep around <handle> -C 2",
 ]) {{
   check(sent[0].message.content.includes(phrase),
     `missing recovery instruction: ${{phrase}}`);
 }}
+check(!sent[0].message.content.includes("--more"),
+  "recovery text names a --more continuation postcompact does not print");
 branch = [
   {{type: "compaction", summary: "summary omitted the route"}},
   {{

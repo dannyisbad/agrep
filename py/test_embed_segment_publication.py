@@ -514,7 +514,7 @@ class SegmentedEmbedPublicationTests(unittest.TestCase):
                                 side_effect=AssertionError("model was loaded")),
               mock.patch.object(common, "log")):
             self.assertEqual(embed._run(args), 0)
-        schedule.assert_called_once_with()
+        schedule.assert_called_once_with(unblocks_lane=True)
 
     def test_owned_planning_sweeps_crash_orphans_before_new_work(self) -> None:
         orphan = common.DATA_DIR / embedding_segments.SEGMENT_DIR / "crash.bin"
@@ -582,7 +582,8 @@ class SegmentedEmbedPublicationTests(unittest.TestCase):
                   side_effect=AssertionError("legacy upgrade loaded ONNX")),
               mock.patch.object(common, "log")):
             self.assertEqual(embed._run(self._args(max_new=1)), 0)
-        schedule.assert_called_once_with(refresh_metadata=True)
+        schedule.assert_called_once_with(
+            refresh_metadata=True, unblocks_lane=True)
         self.assertEqual(
             publish_state.call_args.args[0]["indexed"],
             segments["live_rows"],

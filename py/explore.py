@@ -1,8 +1,8 @@
 """Read-only transcript access for keyword fallback, recall windows, and enrichment.
 
 Primary search normally uses corpusdb.py. This module supplies the generation-aware
-JSONL fallback and conversation-window reads; optional summaries, concepts, affect,
-and vibe data are attached only when their sidecars exist.
+JSONL fallback and conversation-window reads; optional summaries and concepts are
+attached only when their sidecars exist.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import boundary_rank
@@ -26,15 +27,14 @@ import conceptpair
 import display_policy
 import surface_policy
 
-HOT_T = 0.15  # A message above this threshold reads as emotionally hot.
 EVENTS_DIR_NAME = "events"
 # --------------------------------------------------------------------------- caches
 # Long-lived CLI workers can span reindexes, so each public entry point checks a
 # generation stamp and drops caches when it moves.
 
-_GEN_FILES = ("messages.jsonl", "summaries.jsonl", "emotions.jsonl", "replies.jsonl",
+_GEN_FILES = ("messages.jsonl", "summaries.jsonl", "replies.jsonl",
               "concepts.json", "session_concepts.jsonl", conceptpair.MANIFEST_NAME,
-              "vibe/index.json", "events/.generation", "settings.json",
+              "events/.generation", "settings.json",
               "sessions.jsonl", ".derived_generation.json", ".ingest.sig", "corpus.db")
 _GEN: tuple | None = None
 # A timeline is a few integers per real turn, even when the same session has tens of
@@ -77,23 +77,14 @@ def _freshen() -> None:
     gen = tuple(gen)
     if gen == _GEN:
         return
-    for fn in (_vibe_index, _summaries, _concept_pair, _concept_names, _session_concept,
+    for fn in (_summaries, _concept_pair, _concept_names, _session_concept,
                _summary_by_session, _messages_by_session_read,
-               _primary_models, _emotions_by_id, _reply_records_by_id_read,
+               _primary_models, _reply_records_by_id_read,
                _session_index, _session_index_read):
         fn.cache_clear()
     with _SESSION_CONTEXT_LOCK:
         _SESSION_CONTEXTS.clear()
     _GEN = gen
-
-
-@functools.lru_cache(maxsize=1)
-def _vibe_index() -> dict[str, dict]:
-    """session -> its vibe index entry (peak_turn, juice, verdict, ...)."""
-    p = common.DATA_DIR / "vibe" / "index.json"
-    if not p.exists():
-        return {}
-    return {e["session"]: e for e in json.loads(p.read_text(encoding="utf-8"))}
 
 
 @functools.lru_cache(maxsize=1)
@@ -397,17 +388,6 @@ def _native_messages_for_sessions(
         return None
 
 
-def _models_for_rows(rows: list[dict]) -> list[dict]:
-    counts: dict[str, int] = {}
-    for row in rows:
-        model = row.get("model", "")
-        if model and not (model.startswith("<") and model.endswith(">")):
-            counts[model] = counts.get(model, 0) + 1
-    return [{"name": model, "n": count}
-            for model, count in sorted(
-                counts.items(), key=lambda item: (-item[1], item[0]))]
-
-
 @functools.lru_cache(maxsize=16)
 def _primary_models(sessions: tuple[str, ...]) -> dict[str, str]:
     """Read model counts only for requested sessions."""
@@ -470,26 +450,6 @@ def session_models(sessions: list[str]) -> dict[str, str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _emotions_by_id() -> dict[str, dict]:
-    """message id -> affect row, parsed once (mirrors the messages cache)."""
-    out: dict[str, dict] = {}
-    p = common.DATA_DIR / "emotions.jsonl"
-    if p.exists():
-        with p.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if o.get("id"):
-                    out[o["id"]] = o
-    return out
-
-
-@functools.lru_cache(maxsize=1)
 def _reply_records_by_id_read() -> tuple[dict[str, dict], int]:
     """Message id to reply text and ingest-cap provenance, parsed once.
     Damage-tolerant like the session aggregate: one mutant row must never
@@ -538,6 +498,7 @@ def _reply_records_by_id_read() -> tuple[dict[str, dict], int]:
                         "reply_chars": chars,
                         "reply_truncated": bool(o.get("reply_truncated"))
                                            or chars > len(reply),
+                        **reply_shape(o),
                     }
     if skipped:
         _kick_derived_repair()
@@ -549,6 +510,26 @@ def _reply_records_by_id() -> dict[str, dict]:
     _record_direct_snapshot_damage("replies.jsonl", skipped)
     return rows
 
+
+def reply_shape(record: dict) -> dict:
+    """The block structure a replies.jsonl record carries beside its text: `reply_breaks`, the
+    offsets (str indices) of the spaces joining its blocks; `reply_worked`, per join, 1 when the
+    agent made a work call between the two blocks, 0 when none, 2 when the adapter does not
+    record that order; `reply_lead`, the same for the join before the first block (absent:
+    unknown); past the cap `reply_end`, the latest block's tail, and `reply_end_cut`, whether
+    that tail is itself cut."""
+    raw = record.get("reply_breaks")
+    breaks = ([int(o) for o in raw if type(o) is int and o >= 0]
+              if isinstance(raw, list) else [])
+    raw = record.get("reply_worked")
+    worked = ([int(w) for w in raw if type(w) is int and 0 <= w <= 2]
+              if isinstance(raw, list) else [])
+    lead = record.get("reply_lead")
+    end = record.get("reply_end")
+    return {"reply_breaks": breaks, "reply_worked": worked,
+            "reply_lead": lead if type(lead) is int and 0 <= lead <= 2 else 2,
+            "reply_end": end if isinstance(end, str) else "",
+            "reply_end_cut": record.get("reply_end_cut") is True}
 
 
 def _native_family_members(
@@ -953,8 +934,44 @@ def _read_native_generation(path: Path, limit: int) -> bytes:
     return body
 
 
+# A writer renames derived files, and rewrites event_stats.json after its event commit, before it
+# publishes the proof and signature covering them (0.1-0.2 s at scale). Only a live publisher's
+# mismatch or mid-read rename is waited for; a missing or malformed file refuses at once.
+_DIRECT_PUBLICATION_WAIT_S = 1.0
+_DIRECT_PUBLICATION_POLL_S = 0.02
+_DIRECT_PUBLICATION_PROBLEMS = (
+    "does not match its committed generation",
+    "changed during generation verification",
+    "derived artifact changed",
+)
+
+
+class _DirectPublicationPending(DirectSnapshotError):
+    """The published files are ahead of the proof and signature that cover them."""
+
+
 def _capture_direct_snapshot(*, include_events: bool = False) -> dict:
     """Capture one fully verified committed materialized generation."""
+    import corpusdb
+
+    deadline = time.monotonic() + _DIRECT_PUBLICATION_WAIT_S
+    while True:
+        try:
+            return _capture_direct_snapshot_once(include_events=include_events)
+        except _DirectPublicationPending:
+            pass
+        if time.monotonic() >= deadline or not corpusdb.query_publication_active():
+            break
+        time.sleep(_DIRECT_PUBLICATION_POLL_S)
+    # The publisher may have finished between the failed attempt and the liveness check.
+    try:
+        return _capture_direct_snapshot_once(include_events=include_events)
+    except _DirectPublicationPending as exc:
+        _kick_derived_repair()
+        raise DirectSnapshotError(str(exc)) from exc
+
+
+def _capture_direct_snapshot_once(*, include_events: bool) -> dict:
     import corpusdb
 
     root = common.DATA_DIR
@@ -970,10 +987,13 @@ def _capture_direct_snapshot(*, include_events: bool = False) -> dict:
         committed = signal[1].decode("utf-8").strip()
         if (not isinstance(proof, dict)
                 or proof.get("version") != corpusdb._DERIVED_PROOF_VERSION
-                or not committed or proof.get("signature") != committed
+                or not committed
                 or not isinstance(files, list)
                 or len(files) != len(corpusdb._DERIVED_PROOF_NAMES)):
             raise DirectSnapshotError(
+                "the committed transcript generation proof is invalid")
+        if proof.get("signature") != committed:
+            raise _DirectPublicationPending(
                 "the committed transcript generation proof is invalid")
         by_name = {
             row.get("name"): row for row in files if isinstance(row, dict)
@@ -986,6 +1006,8 @@ def _capture_direct_snapshot(*, include_events: bool = False) -> dict:
             problem = corpusdb._validate_derived_file(
                 root, by_name[name], validated, routine=False)
             if problem:
+                if any(shape in problem for shape in _DIRECT_PUBLICATION_PROBLEMS):
+                    raise _DirectPublicationPending(str(problem))
                 raise DirectSnapshotError(str(problem))
         snapshot = {
             "signal": signal[1],
@@ -1006,11 +1028,17 @@ def _capture_direct_snapshot(*, include_events: bool = False) -> dict:
             raise DirectSnapshotMoved(
                 "the committed transcript generation moved before scanning")
         return snapshot
+    except _DirectPublicationPending:
+        raise
     except DirectSnapshotError:
         _kick_derived_repair()
         raise
     except (FileNotFoundError, OSError, RecursionError, UnicodeError,
             TypeError, ValueError, json.JSONDecodeError) as exc:
+        # The proof, signature or event marker replaced while it was read: a live publication.
+        if isinstance(exc, OSError) and "derived artifact changed" in str(exc):
+            raise _DirectPublicationPending(
+                "the committed transcript generation cannot be verified") from exc
         _kick_derived_repair()
         raise DirectSnapshotError(
             "the committed transcript generation cannot be verified") from exc
@@ -2238,8 +2266,10 @@ def _pack_window(session: str, context: dict, center: int, turns: list[dict], *,
                  include_events: bool = True) -> dict:
     summ = _summary_by_session().get(session)
     agent = context.get("agent", "") or (summ.get("agent", "") if summ else "")
-    events = (_events_for_turns(agent, session, turns, context["timeline"])
-              if include_events and turns and has_events(agent, session) else [])
+    events, events_unavailable = [], False
+    if include_events and turns:
+        events, events_unavailable = _events_for_turns(
+            agent, session, turns, context["timeline"])
     packed_turns = []
     records = _reply_records_by_id()
     for row in turns:
@@ -2264,6 +2294,7 @@ def _pack_window(session: str, context: dict, center: int, turns: list[dict], *,
         "center": center,
         "turns": packed_turns,
         "events": events,
+        "events_unavailable": events_unavailable,
     }
 
 
@@ -2382,10 +2413,6 @@ def events_path(agent: str, session: str):
     return next((path for path in candidates if path.exists()), candidates[0])
 
 
-def has_events(agent: str, session: str) -> bool:
-    return common.event_exists(agent, session)
-
-
 _EVENT_CHECKPOINT_STRIDE = 64
 
 
@@ -2452,43 +2479,87 @@ def _event_checkpoints(
     return tuple(checkpoints), ordered
 
 
+class EventsUnavailable(RuntimeError):
+    """The event store could not be read; the caller must disclose it, never serve none."""
+
+
 def get_events(agent: str, session: str, start_ts: int | None = None,
                end_ts: int | None = None) -> list[dict]:
     """The session event stream, optionally restricted to ``[start_ts, end_ts)``.
 
     SQLite rows are generation-pinned BLOBs; legacy JSONL files keep the sparse
-    byte-offset path until a complete ingest migrates them.
+    byte-offset path until a complete ingest migrates them. Raises EventsUnavailable
+    when the store cannot be read right now.
     """
-    current, payload = common.event_store_blob(agent, session)
-    if current:
-        if payload is None:
-            return []
-        import io
+    per_range, unavailable = _session_events(agent, session, ((start_ts, end_ts),))
+    if unavailable:
+        raise EventsUnavailable(surface_policy.events_unavailable())
+    return per_range[0]
 
-        out = []
-        for i, raw in enumerate(io.BytesIO(payload)):
-            if not raw.strip():
+
+def _session_events(
+        agent: str, session: str,
+        ranges) -> tuple[list[list[dict]], bool]:
+    """Raw events of each ``[start_ts, end_ts)`` range, and whether the event store
+    could not be read. One store read, so one digest check, serves every range; an
+    unreadable store is reported, never served as no events."""
+    status, payload = common.event_store_blob(agent, session)
+    if status == common.EVENTS_UNAVAILABLE:
+        _kick_interrupted_pass_repair()
+    if status in (common.EVENTS_UNAVAILABLE, common.EVENTS_ABSENT):
+        return [[] for _range in ranges], status == common.EVENTS_UNAVAILABLE
+    if status == common.EVENTS_PRESENT:
+        return [_payload_events(payload, start_ts, end_ts)
+                for start_ts, end_ts in ranges], False
+    return [_legacy_events(agent, session, start_ts, end_ts)
+            for start_ts, end_ts in ranges], False
+
+
+def _kick_interrupted_pass_repair() -> None:
+    """The explorer never imports the repair scheduler by itself. Once it is installed the event
+    reader asks on each blocked read, so only the read that installs it asks from here."""
+    try:
+        import events
+        if events._EVENT_REPAIR_CALLBACK is not None:
+            return
+        import indexd_runtime  # noqa: F401
+        events._request_interrupted_pass_repair(events.EVENTS_DIR / events.EVENT_STORE_NAME)
+    except Exception:  # noqa: BLE001 -- a kick never fails a read
+        pass
+
+
+def _payload_events(payload: bytes, start_ts: int | None,
+                    end_ts: int | None) -> list[dict]:
+    import io
+
+    out = []
+    for i, raw in enumerate(io.BytesIO(payload)):
+        if not raw.strip():
+            continue
+        ts = _raw_event_ts(raw)
+        parsed = None
+        if ts is None:
+            try:
+                parsed = json.loads(raw)
+                ts = int(parsed.get("ts", 0) or 0)
+            except (json.JSONDecodeError, TypeError, ValueError):
                 continue
-            ts = _raw_event_ts(raw)
-            parsed = None
-            if ts is None:
-                try:
-                    parsed = json.loads(raw)
-                    ts = int(parsed.get("ts", 0) or 0)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    continue
-            if start_ts is not None and ts < start_ts:
+        if start_ts is not None and ts < start_ts:
+            continue
+        if end_ts is not None and ts >= end_ts:
+            break
+        if parsed is None:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
                 continue
-            if end_ts is not None and ts >= end_ts:
-                break
-            if parsed is None:
-                try:
-                    parsed = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-            parsed["i"] = i
-            out.append(parsed)
-        return out
+        parsed["i"] = i
+        out.append(parsed)
+    return out
+
+
+def _legacy_events(agent: str, session: str, start_ts: int | None,
+                   end_ts: int | None) -> list[dict]:
     p = events_path(agent, session)
     if not p.exists():
         return []
@@ -2580,16 +2651,21 @@ def _event_intervals(timeline: list[dict],
 
 
 def _events_for_turns(agent: str, session: str, turns: list[dict],
-                      timeline: list[dict]) -> list[dict]:
-    """Read and attribute only events whose latest chronological prompt is selected."""
+                      timeline: list[dict]) -> tuple[list[dict], bool]:
+    """Read and attribute only events whose latest chronological prompt is selected,
+    and whether the event store could not be read (no events then, never an exact zero)."""
     selected = {int(row["turn"]) for row in turns}
     chronological = sorted((int(row.get("ts", 0) or 0), int(row["turn"]))
                            for row in timeline if row.get("ts"))
     if not chronological:
-        return []
+        return [], False
+    intervals = _event_intervals(timeline, selected)
+    if not intervals:
+        return [], False
+    per_range, unavailable = _session_events(agent, session, intervals)
     events = []
-    for start, end in _event_intervals(timeline, selected):
-        for event in get_events(agent, session, start, end):
+    for range_events in per_range:
+        for event in range_events:
             ts = int(event.get("ts", 0) or 0)
             pos = bisect_right(chronological, (ts, float("inf"))) - 1
             owner = chronological[max(pos, 0)][1]
@@ -2714,89 +2790,4 @@ def _events_for_turns(agent: str, session: str, turns: list[dict],
     events.sort(key=lambda event: (event["ts"], event["_i"]))
     for event in events:
         event.pop("_i", None)
-    return events
-
-
-def get_chat(session: str) -> dict:
-    """Full detail for one chat: header + per-turn transcript annotated with affect, plus the
-    vibe arc if one was built. Reads from the in-process caches (messages-by-session, affect,
-    replies), so each open is a dict lookup over this session's rows rather than a scan of
-    messages.jsonl (+ emotions + replies) on every request."""
-    _freshen()
-    emo = _emotions_by_id()
-    rep = _reply_records_by_id()
-    rows = _messages_by_session().get(session, [])
-
-    turns = []
-    agent = project = ""
-    for o in rows:
-        agent = agent or o.get("agent", "")
-        project = project or o.get("project", "")
-        e = emo.get(o["id"], {})
-        rage = float(e.get("rage_raw", 0.0))
-        hype = float(e.get("hype_raw", 0.0))
-        txt = o.get("text", "")
-        reply = rep.get(o["id"], {})
-        turns.append({
-            "turn": o.get("turn", 0),
-            "ts": o.get("ts", 0),
-            "text": txt,
-            "rage": round(rage, 4),
-            "hype": round(hype, 4),
-            "hot": rage > HOT_T,
-            "top": e.get("top", []),
-            "model": o.get("model", ""),
-            "reply": reply.get("reply", ""),
-            "reply_chars": reply.get("reply_chars", 0),
-            "reply_truncated": bool(reply.get("reply_truncated")),
-            "recap": o.get("who") == "recap",
-        })
-    turns.sort(key=lambda t: t["turn"])
-
-    models = _models_for_rows(turns)
-    session_model = models[0]["name"] if models else ""
-
-    summ = _summary_by_session().get(session)
-    hot_n = sum(1 for t in turns if t["hot"])
-    return {
-        "session": session,
-        "agent": agent or (summ.get("agent", "") if summ else ""),
-        "project": project or (summ.get("cwd_project", "") if summ else ""),
-        "model": session_model,
-        "models": models,
-        "first_ts": min((t["ts"] for t in turns if t["ts"]), default=0),
-        "last_ts": max((t["ts"] for t in turns if t["ts"]), default=0),
-        "concept": _session_concept().get(session, ""),
-        "title": summ.get("title", "") if summ else "",
-        "summary": summ.get("summary", "") if summ else "",
-        "tags": summ.get("tags", []) if summ else [],
-        "n_msgs": len(turns),
-        "hot_n": hot_n,
-        "hot_pct": round(hot_n / max(1, len(turns)) * 100, 1),
-        "has_events": has_events(agent or (summ.get("agent", "") if summ else ""), session),
-        "turns": turns,
-        "vibe": get_vibe(session),
-    }
-
-
-def get_vibe(session: str) -> dict | None:
-    """Return a published vibe trace only when its file proves the requested identity."""
-    _freshen()
-    if (not session or session in (".", "..") or "\0" in session
-            or "/" in session or "\\" in session or Path(session).name != session
-            or session not in _vibe_index()):
-        return None
-    root = (common.DATA_DIR / "vibe").resolve()
-    try:
-        candidate = root / f"{session}.json"
-        if candidate.is_symlink():
-            return None
-        path = candidate.resolve(strict=True)
-        if path.parent != root:
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("session") != session:
-        return None
-    return payload
+    return events, unavailable

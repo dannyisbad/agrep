@@ -19,19 +19,84 @@ for atomic publish, and `crates/agrep-core/src/ingest/mod.rs` plus
 snapshots. Those three staging/snapshot sites are not coordination.
 `py/test_coordination_contract.py` enforces this map structurally.
 
+Removal is where exact ownership could go wrong: a remover judges a record dead
+(pid liveness, age) and then removes it, and a live owner could take the slot
+between those two steps. Every reap in a directory therefore holds the
+directory's `.owner-mutex` kernel lock while it re-reads the slot and removes
+the record, so relative to every other remover the check and the removal are
+one step, and a record a remover removes is always the record it judged.
+Under the lock the record is renamed to a tomb and the tomb unlinked, so the
+slot is free the moment the rename lands: Windows keeps a record a reader
+still holds open delete-pending, and an exclusive create against that name
+fails with `ACCESS_DENIED`, which both acquirers treat as an occupied slot.
+Creators stay lock-free: `O_EXCL` only ever creates into an empty slot, so a
+creator can neither replace a record nor be replaced by one. The sidecar is
+minted by the first reap in a directory and removed only with the directory
+(a lone sidecar counts as empty), so it exists only where agrep has reaped a
+foreign record; a process removing a record of its own (a release, the
+cleanup of a failed exclusive create, which may be a teach target in a user's
+directory) honours a sidecar a reap minted and never mints one, so a directory
+that only ever sees its own records come and go stays clean. A release that
+cannot finish (the mutex busy past every attempt, a removal refused by the
+store) leaves the record naming its live owner, which no other process may
+reclaim. Every holder a long-lived process re-acquires goes through
+`ownerfile.create_held` / `ownerfile.stranded_own_record`: its token is
+registered in the process before the record is created (so a sibling thread
+never mistakes a record created but not yet returned for a stranded one) and
+forgotten by the release whatever its outcome, and the owning process reclaims
+a record naming its own pid and verifiable process-start identity under a token
+it no longer holds on its next acquire. That is `.index.lock` (`IndexLock`),
+`.<namespace>.publish.lock` (`EmbeddingPublishLock`), `archive/lock`,
+`.settings.lock`, `<model dir>/.download.lock` and the semantic
+`worker.request` slot. `.indexd.v{P}.spawn` keeps its own retained snapshot
+(`_OWN_SPAWN_GUARD`) and clears it exactly. The remaining owner records are
+either created once per process life (daemon, worker and removal-fence owners,
+the embed and compaction claims of a one-shot child) or age out by their own
+lease (start claim, cooldown), so a stranded one ends with its process or its
+grace. What the mutex cannot cover: a remover from a build before it (0.4.2
+and earlier) that moves a live record aside with the old rename-aside reap,
+during the one upgrade in which both builds run against one data dir; and, in
+a directory no reap has yet touched, the first age-based reap of a live
+owner's record racing that owner's lock-free release (the tomb proof then
+links a gap claimant back into the vacant slot). A holder notices either at
+its next `verify()` (the daemon's heartbeat, the ingest's pre-commit checks)
+and stops; the window in which it and a gap claimant both believe they hold the
+slot is bounded by that cadence. Liveness misjudgement (a pid the OS reports
+dead that is not) and a store that cannot lock at all keep the pre-mutex
+exposure.
+
 A verified foreign-family takeover atomically publishes the successor's durable
 owner before source reparsing. The daemon retains its lifetime ownership while
 an incompatible cache is reconstructed. This handoff does not certify source
 freshness; source and event publication retain their normal postflight checks.
 
-An explicit `agrep index` waits up to three minutes for a same-writer
-`derived-adoption` claim whose PID and process-start identity are still exact
-and live. A companion daemon record must match the caller's authorized
-generation; legacy, foreign, malformed, or unverifiable owners do not qualify.
-The Rust child reports one wait line and retries exclusive claim acquisition
-without holding either writer lock. Expiry returns exit 1 and names the ongoing
-adoption, which continues independently. Read-only Rust callers retain exit 0;
-no waiting caller borrows the incumbent's claim or bypasses the writer fence.
+A foreground explicit index (`agrep index`, `agrep index --full`, the index
+`agrep setup` builds, `agrep reindex`) waits up to three minutes for a
+same-writer `derived-adoption` claim whose PID and process-start identity are
+still exact and live; background freshens never wait. A companion daemon
+record must match the caller's authorized generation; legacy, foreign,
+malformed, or unverifiable owners do not qualify. Each record the fence's
+directory scan lists is read once; one that vanished in between (its holder
+released or reaped it) is dropped from the verdict rather than read as a
+legacy or absent owner. Two same-writer claimers that each won one of the
+two claim records are waited out and retried under the same budget
+with jittered pacing; only a steady refusal is final. A claim is settled only
+when both records are the claimant's, or the second is the authorized daemon
+generation's: a record another claimer held at publish time and released
+before the fence passed is published again, so no later claimer can slip into
+the vacant slot during the holder's locked section. A local failure to publish
+the claim (an unwritable data dir, no space) is the writer's own error, not an
+ownership verdict: a foreground explicit index reports it and exits 1 at once,
+a background pass discloses it and keeps its read-only exit 0. The Rust child
+reports one wait line and retries exclusive claim acquisition without holding
+either writer lock. The claim is named as the freshness daemon's only when the
+daemon's child fence (`.indexd.v2.child.<gen>`) names that exact process;
+any other same-build claim is reported as another agrep indexer, with no
+promise that it finishes on its own. Expiry returns exit 1 and names the
+incumbent. Read-only Rust callers retain exit 0; no waiting caller borrows
+the incumbent's claim or bypasses the writer fence. After an explicit ingest,
+one passing ownership probe is the verdict; `agrep index --full` decides
+before any settlement wait whether a rerun repeats the cold reparse.
 
 When that invocation discards an incompatible, foreign-owned parse cache, it
 reconstructs the cache in the same ingest. The resulting missing cache does not
@@ -50,6 +115,21 @@ restore ownership. Daemon and semantic writers still refuse that state until
 Rust publishes the anchor. A foreign, malformed, or unreadable database owner
 does not qualify for this same-writer recovery.
 
+An anchor whose integer `version` exceeds this build's was written by a newer
+agrep: every writer in Python and Rust refuses exactly as it does for a
+malformed record, but names the upgrade ("written by a newer agrep (ownership
+record version N)") instead of calling the record malformed. Records that do
+not parse, or carry this build's version with other defects, stay malformed.
+Because this is the one fence the reader can end (upgrade, or point
+`AGREP_DATA_DIR` elsewhere), every surface names it from one bounded read of
+the anchor (`indexd_runtime.newer_anchor`): `doctor` (the freshness row and
+`core.derived_owner` in `--json`), the status page and `status --json`, the
+search hedge ("the freshness owner is blocked: ..."), and `setup`, which
+changes nothing there: no agent block, hook, launcher or sentinel is written
+or rewritten (the newer build enrolled them), no daemon is started, no
+archive capture is enabled; it exits 0 when a corpus is searchable and 3
+otherwise (docs/OUTPUT_CONTRACTS.md).
+
 Classes used below:
 
 - **lifetime** - owned as long as the recorded process (or process group) is
@@ -63,8 +143,11 @@ Classes used below:
   owner record it names still verifies; readers fall back rather than mutate.
 - **endpoint descriptor** - the address and credential a client needs to reach
   a running owner; its validity is bound to that owner's lifetime.
-- **transient** - a short-lived tombstone written during an exact reap so a
-  concurrent reader cannot mistake removal for absence.
+- **kernel mutex** - an advisory lock on an empty sidecar the kernel releases
+  with its holder's descriptors; serializes the mutations named for it.
+- **transient** - the tombstone a removal renames a record to before unlinking
+  it, so the slot is free at once and the removal stays a compare-and-remove
+  even where the kernel mutex is unsupported.
 
 All paths are relative to the agrep data dir (`AGREP_DATA_DIR`, else the
 per-OS user data dir) unless noted. `v{P}` is the daemon protocol version
@@ -84,7 +167,7 @@ agrep's data dir, and a tool shell must find it from process ancestry alone
 
 | Path | Owner module | Byte protocol | Reclaim policy | Class |
 |---|---|---|---|---|
-| `.index.lock` | `py/index_lock.py` `IndexLock`; `crates/agrep-cli/src/index_lock.rs` `IndexLock` | canonical ASCII line: `pid= start= token= label= time=`; legacy safety core is `pid` plus optional `start` | live or unverifiable holder never stolen at any age; dead, zombie, or pid-reused holder tombstoned and exactly reaped; malformed claims only inside a strict non-negative 3 s publication grace; oversized/non-regular claims fail closed | lifetime (ingest critical section) |
+| `.index.lock` | `py/index_lock.py` `IndexLock`; `crates/agrep-cli/src/index_lock.rs` `IndexLock` | canonical ASCII line: `pid= start= token= label= time=`; legacy safety core is `pid` plus optional `start` | live or unverifiable holder never stolen at any age; dead, zombie, or pid-reused holder exactly reaped under the directory's removal mutex; malformed claims only inside a strict non-negative 3 s publication grace; oversized/non-regular claims fail closed; a holder re-verifies its record (`verify()`) before each derived commit, and a record found replaced or gone there refuses the commit; at release the same finding is disclosed on stderr and flagged on the lock (`displaced` / `displacement()`), never an error for work that was committed under verification and never a reason to touch whatever now holds the slot; a record a release could not remove is an error, stays with its live owner's identity, and only that process reclaims it (its own pid, process-start identity and a token no live `IndexLock` of its holds) on its next acquire; an exclusive create refused with Windows `ACCESS_DENIED` while the entry exists or is delete-pending waits like any contention | lifetime (ingest critical section) |
 | `.indexd.v{P}.lock` | `py/indexd_runtime.py`; temporary derived-adoption claim in `crates/agrep-cli/src/main.rs` | daemon owner line: `pid= start= protocol= package= build= group= [tree=] token= time=`; adoption fence: `state=derived-adoption pid= start=unknown writer= token=`, staged as `<name>.tmp.<pid>.<nanos>` and hard-linked into place so it is never seen partial | exact-snapshot daemon-owner state machine; live compatible owner kept, dead/orphaned generation retired via its child fence; malformed record protected for a strict non-negative 3 s grace, after which the derived writer too exact-removes an incomplete record naming no live exact process; the derived writer exactly removes only its own temporary claim; owner mtime is not freshness authority (`.ingest.sig` is) | lifetime (daemon generation owner / derived-writer fence) |
 | `.indexd.v{P}.ready.<gen>` | `py/indexd_runtime.py` | byte-identical copy of the owner record | valid only while byte-equal to the live owner record; removed with its generation | lifetime (readiness bound to owner) |
 | `.indexd.v{P}.live.<gen>` | `py/indexd_runtime.py` (publish/read policy); `py/indexd.py` (resident publisher) | private regular JSON, at most 60 KiB: protocol/build, exact owner-generation token and owner SHA-256, publication time, every session state, and a disclosed count when only old feed events were trimmed | atomically replaced only while the exact compatible ready owner verifies before and after; readers re-verify that owner generation, reject records older than 12 s, and never mutate on fallback; the owner exactly removes its last publication on normal exit; crash leftovers are generation-ineligible and ignored | bounded cache (lifetime-bound live snapshot) |
@@ -107,12 +190,14 @@ agrep's data dir, and a tool shell must find it from process ancestry alone
 | `.semantic-worker.launch-<nonce>` | `py/semworker.py` | JSON: child `pid, process_start, nonce`; empty birth identity records an unverifiable startup | retained until registered ownership or child exit; teardown drains exact unregistered children, waits without signalling unverifiable live children, then stops registered owners; malformed regular records use `START_CLAIM_GRACE_S` before exact removal; oversized/non-regular records fail closed | launch handoff (covers log handles before worker registration) |
 | `.semantic-worker.json` | `py/semworker.py` | JSON endpoint: `pid, port, token` (64-hex), `process_start, owner_nonce` | publication and every reclaim verified against the worker lock generation; dead/reused or own-nonce records replaced | endpoint descriptor (lifetime-bound) |
 | `<model dir>/.download.lock` (`AGREP_MODEL_DIR` or `<user data dir>/models/<profile>`) | `py/embedder.py` | JSON: `pid, process_start, at, token` | live holder wins; dead holder reclaimed; malformed/bodyless protected only inside a strict non-negative 2 s create grace | lifetime (one downloader per model dir) |
-| `archive/lock` | `py/archive.py` | one line: `pid= start= token=` | non-blocking: exact-live/unverifiable holder skips the pass; dead holder reclaimed instantly; malformed claim gets a strict non-negative 3 s publication grace | lifetime (archive pass) |
+| `archive/lock` | `py/archive.py` | one line: `pid= start= token= daemon=<pid>:<start>` | non-blocking: exact-live/unverifiable holder skips the pass; dead holder reclaimed instantly; malformed claim gets a strict non-negative 3 s publication grace | lifetime (archive pass) |
+| `.settings.lock` | `py/settings.py` `_settings_lock` | one line: `pid= start= token=` | serializes the read-modify-write of the settings file only, never an index run: exact-live/unverifiable holder waited for at most 5 s, then `SettingsError`; a holder reclaims its own stranded record through `create_held` / `stranded_own_record`; dead or pid-reused holder exact-reaped; malformed claim protected only inside a strict non-negative 3 s publication grace; released with a tombstone | lifetime (one settings writer) |
 | `.server` | `py/legacy_cleanup.py` `retire_removed_explorer` (retire-only; no in-tree writer) | JSON: `pid, port, process_start, mode` | dead owner compare-and-unlinked; exact-live legacy explorer terminated, then unlinked | endpoint descriptor (legacy) |
 | `.agrep.search.v{P}` | `py/indexd_runtime.py` (touch), `py/indexd.py` (read) | content ignored; mtime only | none - stat-only demand beat for daemon idle-exit | signal (search demand) |
 | `.ingest.sig` | Rust ingest writes under `.index.lock`; read by the Python freshness surfaces | generation signature text | rewritten (mtime refreshed) by every ingest run; readers independently disclose an unreadable, future-dated, or over-bound mtime even when the writable health ledger failed | signal (generation / freshness clock) |
 | `.semantic-use.beat` | `py/semantic.py` | content ignored; mtime only | none - demand signal for background refs prewarming | signal (semantic demand) |
-| `.<name>.owner-reap-<pid>-<hex>` | `py/ownerfile.py`; `crates/agrep-cli/src/index_lock.rs` | byte copy of the record being removed | transient inside `remove_exact`'s two-phase reap; restored on mismatch, else unlinked; a freshness-daemon owner's tomb (`..indexd[.v{P}].lock.owner-reap-*`), which nothing reads back, is swept with the ingest staging temps once its reaper pid is dead | transient (reap tombstone) |
+| `.owner-mutex` | `py/ownerfile.py` `_SlotMutex`; `crates/agrep-cli/src/index_lock.rs` `SlotMutex` | empty file, one per directory agrep has reaped a record in; locked with `flock` (POSIX) / `LockFileEx` and `msvcrt.locking` (Windows), never read | minted by the first reap in its directory and removed only with the directory (`ownerfile.remove_record_dir`: a lone sidecar counts as empty and goes under its own lock right before the rmdir), so every process locks the same inode; the kernel drops a crashed holder's lock; every reap re-checks the slot, renames the record to a tomb and unlinks the tomb while holding this lock, so a live record swapped into the slot after a remover's judgement is never removed and the slot is free the moment the rename lands; creators never take it (`O_EXCL` only ever creates into an empty slot); a process removing a record of its own (a release, the cleanup of a failed exclusive create) locks a sidecar a reap minted and never mints one, so no sidecar ever appears in a directory whose records only come and go with their owners (the semantic coordination namespace in normal use, teach targets); a lock held past 2 s makes the remover give up for this pass; a foreign-owned or non-regular sidecar, or a store that cannot lock, runs the tomb protocol below lock-less | kernel mutex (removal serialization) |
+| `.<name>.owner-reap-<pid>-<hex>` | `py/ownerfile.py`; `crates/agrep-cli/src/index_lock.rs` | byte copy of the record being removed | every removal renames the record here (under the removal mutex where supported), unlinks the tomb once it proves to be the expected record, and otherwise links it back only into a vacant slot (a record that published into the gap is never overwritten; an unprovable tomb is left as litter); a freshness-daemon owner's tomb (`..indexd[.v{P}].lock.owner-reap-*`), which nothing reads back, is swept with the ingest staging temps once its reaper pid is dead; a holder whose record ends up in a tomb learns it at `verify()`/release | transient (reap tombstone) |
 
 Not coordination, deliberately excluded: uniquely-named staging temps that are
 atomically renamed into place (`crates/agrep-core/src/ingest_cache.rs` staged
@@ -144,6 +229,18 @@ the generation only when the pending marker is absent and the nonempty regular
 snapshot's identity and metadata stay stable across the coupled
 derived-publication health check.
 
+The parse cache is a base plus a journal of frames; every commit records the
+journal position it established in `.ingest_cache.bin.head` (base instance and
+frame sequence; compaction folds frames but keeps counting). A later decode
+that replays that instance short of the recorded sequence has lost frames, and
+with them rows a generation may have published: it is refused as a stale
+journal in every lane and the cache rebuilt from sources, exactly as a missing
+cache is. A base rewrite starts a new instance, which the head of an older one
+never judges. Independently of the cache, every lane refuses to publish while
+the published generation positively shows rows under an unreadable scope that
+this pass neither serves nor saw go (`MaterialVerdict::Drops`), so a cache
+older than the rows cannot license dropping them.
+
 Family metadata stays staged while events and cache are updated. It is
 published with the derived proofs immediately before `.ingest.sig`. Family
 readers hold a read-only SQLite transaction and distinguish a moving marker
@@ -152,6 +249,86 @@ previous verified generation only when its ingest-signature hash agrees with
 the committed publication; missing proofs and mismatched signatures remain
 unavailable. Recovery can read the published root packet without waiting for
 the ingest lock.
+
+The tool-event store uses SQLite rollback journaling (`DELETE`) rather than
+WAL so read-only and sandboxed callers can open its committed main file
+directly. During a normal write, a direct reader sees the prior committed
+generation while the non-hot `-journal` exists. If a writer is interrupted
+mid-commit, the journal may be hot and read-only SQLite callers cannot use the
+store; they report unavailable events until the next writable ingest pass rolls
+the journal back. Waiting alone never clears it: a background indexer runs that
+pass from its health check (and a read that hits the journal asks for one), and
+without a background indexer it is an explicit `agrep index`. There is
+deliberately no reader-side workaround. A journal counts as interrupted only
+while no live process holds the index lock, which every writer of the event
+store and `corpus.db` holds; it is hot, as SQLite rules, when its first byte is
+non-zero. `agrep doctor` and `agrep status` name a hot one on the event store,
+and any one on `corpus.db` (searches keep serving its last complete update),
+with `agrep index` as the fix; a journal under a live pass is that pass
+writing, never another agrep version. `agrep audit` reports a `corpus.db`
+journal left that way as a coverage gap (exit 1) naming `agrep index`, not as
+live evidence.
+
+A sidecar of either store that this user cannot both read and write, and that
+no pass can clean up by itself, is not lost ownership. That is an unreadable
+`-journal`, a hot one this user cannot write, a `-wal` (for the event store a
+non-empty one, or any beside a WAL-mode header), a `-shm` beside a live WAL, or
+an unreadable `corpus.db-shm` (the Rust ownership probe reads it). A readable
+inert journal (debris the writer discards), an unused `-shm` the event-store
+writer removes and its empty `-wal` beside a DELETE-mode header never block,
+and a sidecar that cannot be opened never makes ownership uncertain: its
+metadata still brackets the family. While one stands, every writer waits: a
+daemon stays up and heartbeats its lock but launches no pass (indexd.log says
+why once), a repair request starts none, and `agrep index` and `agrep reindex`
+decline naming it. `agrep doctor`, `agrep status` and `agrep audit` name the
+file and the fix - `sudo chown $USER <path>` for another user's file, `chmod
+u+rw <path>` for one's own, or the flag and ACL commands when its mode already
+allows access - then `agrep index`, or updating agrep while a newer agrep owns
+the data dir; the freshness row and the search, `around` and `recall` footers
+name the block instead of promising a pass. A sidecar is never opened to decide
+this beyond a journal's first byte, which SQLite never locks: closing a probe
+descriptor on a locked file would drop SQLite's own locks on it.
+
+The writer keeps readers reading. Its 32 MiB page cache holds a typical pass's
+changed payloads (the largest real session payload is about 25 MB), so it takes
+EXCLUSIVE only at its commit. A write larger than that cache spills, and readers
+are locked out from the spill until the commit. The one-time 0.4.2-to-0.4.3
+upgrade pass rewrites nearly every session and holds readers out for about 12 s
+at real-history scale; a repair pass that rewrites a large payload can do the
+same for several seconds. Readers in that window report tool events
+unavailable, and every surface that shows them says so: `around` (which serves a
+tool-event handle's turn rather than calling the handle stale), `recall`, keyword
+search in the transcript scan (which serves prose only), `summary` and the
+explorer. Every busy wait of one write attempt (a spill or the commit) shares a
+1 s budget, during which the waiting writer's PENDING lock keeps new readers
+out; past it the attempt rolls back, releasing PENDING, and retries after a
+backoff of at most 1 s. All attempts stop at a 30 s deadline (plus one attempt's
+own work); the pass then fails with the store as it was, and the next pass
+repairs it. Derived files are staged before the event write and renamed only
+once its proof is complete. A pass that fails before the event commit (the
+deadline above, the common case) or on a directory in the way of a derived file
+leaves the published derived files and their proof as they were, and readers
+keep serving them. A pass that fails after the commit (in the settle, the
+marker or the proof, or on a derived rename, such as a Windows reader holding
+`messages.jsonl` past the rename's retries) can leave event_stats.json, which
+the proof covers, and any derived file renamed before the failure ahead of their
+proof; direct readers then refuse until the next pass publishes one.
+
+A passing writer leaves the same gap briefly: from the event_stats.json
+rewrite to the proof and `.ingest.sig` publication (about 0.1-0.2 s per pass at
+real-history scale). Direct transcript readers wait up to 1 s for a proof that
+covers the published files before they report the generation unverifiable.
+
+Readers wait out a commit's page writes and its marker publication (about 1 s
+and 0.2 s at most) rather than reporting events unavailable. A marker still
+behind the database after a whole wait (its writer died between the commit and
+the marker) stays behind until the next pass, so later lookups against the same
+store and marker report unavailable at once instead of waiting again. Long-lived
+Python processes close their cached reader after 2 s idle; a fork waits for any
+reader close in progress, and the child starts with no cached reader. On
+Windows a held handle blocks the corrupt-store rebuild's rename, which retries
+for about 37 s, then fails disclosed with the store unproven, so the next pass
+rebuilds it.
 
 On macOS, a full process birth query may be denied across uid boundaries.
 The owner observer then uses `PROC_PIDTBSD_SHORTINFO` to identify the other uid,
@@ -169,3 +346,36 @@ retire the exact worker generation that exceeded its deadline.
 Resumed agents and foreground post-index hooks relay interruption to their
 owned process trees and return the canonical `128 + signal` status. Daemon
 shutdown cancels worker-thread hooks and drains their owned trees before exit.
+
+## Source deletion and unavailability
+
+Deletion is proven per store shape, never inferred from one absent walk of a
+Stat root: a file NotFound beneath directories proven real is deleted, a root
+listing nothing converges only after two consecutive complete, issue-free
+preflights agree (`.source_absence_pending`), and an issue under a root blocks
+that root's proof without vetoing its siblings. Whole-store (cline, gemini,
+kimi, antigravity, pi) and token (crush, cursor) adapters hold one snapshot or
+one conversation set per adapter: when one of several roots or databases
+disappears while a sibling still reads complete, the removed root's rows go on
+the next pass in every lane and return, reparsed, with the root. Nothing wedges
+or keeps those rows forever; a temporary unmount of one such root costs its rows
+for the unmount's duration only (`crates/agrep-cli/tests/multi_root_removal.rs`).
+Absence is judged by directory shape, not mount identity: a mount gone from a
+real directory leaves it empty and real, so for a Stat root the two-preflight
+rule converges that as a deletion, and for the other shapes the next pass
+does. The rows return, reparsed, when the mount does. Device numbers are not
+recorded because they change across reboots and remounts on the same data, so a
+device check would turn a legitimately emptied, remounted root into rows kept
+until `--full`.
+
+The stat cache (POSIX; Windows uses change-journal identity) re-verifies a file
+next run when its stamp falls in `(scan start - margin, now + max(margin, 2 s)]`
+on the stamping filesystem's clock, where `margin` is the stamp granule
+(1 ns up to 1 s; 2 s for whole-second stamps) plus the local coarse-clock tick
+(Linux `CLOCK_REALTIME_COARSE`, 0 on Apple, 20 ms elsewhere). A remote server
+clock more than 2 s ahead of this machine, or behind it by more than the margin,
+can stamp a write made during the scan outside that window; if a same-size
+rewrite then lands in the same stamp granule, the cached rows stay stale until
+the file's stamp, size or inode changes, or `agrep index --full` re-reads it.
+No content digest closes this: distinguishing such a rewrite needs every remote
+file hashed on every run, which quiet stores must not pay.

@@ -65,7 +65,11 @@ from events import (
     _event_reader_connection,
     event_store_blob,
     event_blob,
-    event_exists,
+    event_store_readable,
+    EVENTS_PRESENT,
+    EVENTS_ABSENT,
+    EVENTS_UNAVAILABLE,
+    EVENTS_LEGACY,
     event_names,
     event_blobs_bulk,
     tool_literal_matches_from_payload,
@@ -149,6 +153,23 @@ from index_lock import (
 def data_dir_usage() -> dict[str, int]:
     """Current on-disk footprint, evaluated only by explicit status/doctor calls."""
     return resources.data_dir_usage(DATA_DIR)
+
+
+# The derived-writer fence lives above this layer (indexd_runtime), which
+# installs its verdict here so lower layers can ask "may this process mutate
+# the data dir?" without importing upward. Unset means no verdict: refuse.
+derived_writes_permitted = None
+
+
+def data_dir_mutable() -> bool:
+    """Whether a derived-data mutation is permitted right now; False if unknown."""
+    if data_dir_readonly(DATA_DIR) or derived_writes_permitted is None:
+        return False
+    try:
+        return bool(derived_writes_permitted())
+    except Exception:  # noqa: BLE001 -- an unanswerable fence refuses mutation
+        return False
+
 
 
 def open_bounded_log(name: str, *, max_bytes: int = 2 * 1024 * 1024,
@@ -288,10 +309,11 @@ def index_summary(*, deadline: float | None = None) -> dict | None:
         expected_messages = int(raw_total)
     except ValueError:
         return None
+    # By value: a racy sessions.jsonl is never cached, so its re-read is a new, equal object.
     if (not separator or expected_messages < 0
             or n_messages != expected_messages
             or n_sessions != len(census.sessions)
-            or family_census() is not census):
+            or family_census() != census):
         return None
     budget_check()
     d: dict = {"sessions": n_sessions, "messages": n_messages, "agents": sorted(per),

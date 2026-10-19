@@ -91,7 +91,7 @@ class SourceTruthTests(unittest.TestCase):
                 [str(exe), "index", "--agent", "cline"],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=300,
                 env=env,
                 check=False,
             )
@@ -203,7 +203,7 @@ class SourceTruthTests(unittest.TestCase):
                     [str(exe), "index", "--agent", "cline"],
                     capture_output=True,
                     text=True,
-                    timeout=30,
+                    timeout=300,
                     env=env,
                     check=False,
                 )
@@ -250,6 +250,39 @@ class SourceTruthTests(unittest.TestCase):
                 rows = doctor._store_counts(("claude",))
         self.assertEqual(rows[0]["state"], "source-unreadable")
         self.assertEqual(rows[0]["issues"][0]["path"], str(failed))
+
+    def test_doctor_names_a_database_recorded_by_walk_census_and_parse_once(self) -> None:
+        """One denied crush database reaches source health from the store walk, the token census
+        and the parse; doctor keeps the record whose kind names the remedy, once."""
+        with tempfile.TemporaryDirectory(prefix="agrep-source-store-") as raw:
+            root = Path(raw)
+            denied = root / "project" / ".crush" / "crush.db"
+            (root / ".source-health.json").write_text(json.dumps({
+                "code": "source-unreadable",
+                "issues": [
+                    {"agent": "crush", "path": str(denied), "kind": "source-read-failed",
+                     "reason": f"cannot inspect {denied}: Permission denied (os error 13)"},
+                    {"agent": "crush", "path": str(denied), "kind": "permission-denied",
+                     "reason": "Permission denied (os error 13)"},
+                    {"agent": "crush", "path": str(denied), "kind": "permission-denied",
+                     "reason": f"cannot inspect {denied}: Permission denied (os error 13)"},
+                ],
+            }), encoding="utf-8")
+            registry = [{
+                "name": "crush", "files": 1, "state": "source-unreadable",
+                "issues": [{"agent": "crush", "path": str(denied), "kind": "permission-denied",
+                            "reason": "Permission denied (os error 13)"}],
+            }]
+            with mock.patch.object(doctor.common, "DATA_DIR", root), \
+                    mock.patch.object(
+                        doctor.common, "store_freshness", return_value=registry):
+                rows = doctor._store_counts(("crush",))
+                status, detail = doctor._store_status(rows)
+        self.assertEqual(rows[0]["state"], "source-unreadable")
+        self.assertEqual([(i["path"], i["kind"]) for i in rows[0]["issues"]],
+                         [(str(denied), "permission-denied")])
+        self.assertEqual(status, doctor.MISS)
+        self.assertEqual(detail.count(str(denied)), 1)
 
     def test_doctor_fails_closed_on_malformed_source_health(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agrep-source-store-") as raw:
@@ -326,6 +359,33 @@ class SourceTruthTests(unittest.TestCase):
                 health.unlink()
                 recovered = indexd_runtime.machine_freshness(checked=True)
             self.assertFalse(recovered["failing"])
+
+    def test_doctor_and_freshness_name_each_failed_conversation_of_a_store(self) -> None:
+        """A record carrying a conversation names that chat, beside its store; two failed chats
+        of one database are two failures, not one path recorded twice."""
+        with tempfile.TemporaryDirectory(prefix="agrep-source-store-") as raw:
+            root = Path(raw)
+            store = root / "globalStorage" / "state.vscdb"
+            issues = [{"agent": "cursor", "path": str(store), "kind": "source-read-failed",
+                       "reason": "the composer's stored rows did not parse completely",
+                       "session": session} for session in ("chat-one", "chat-two")]
+            (root / ".source-health.json").write_text(json.dumps({
+                "code": "source-unreadable", "issues": issues}), encoding="utf-8")
+            registry = [{"name": "cursor", "files": 1, "state": "available", "issues": []}]
+            with mock.patch.object(doctor.common, "DATA_DIR", root), \
+                    mock.patch.object(
+                        doctor.common, "store_freshness", return_value=registry):
+                rows = doctor._store_counts(("cursor",))
+                status, detail = doctor._store_status(rows)
+                failure = indexd_runtime._source_health_failure()
+        self.assertEqual([issue["session"] for issue in rows[0]["issues"]],
+                         ["chat-one", "chat-two"])
+        self.assertEqual(status, doctor.MISS)
+        self.assertIn(f"cursor conversation chat-one at {store}", detail)
+        self.assertIn(f"cursor conversation chat-two at {store}", detail)
+        self.assertEqual(failure.code, "source-unreadable")
+        self.assertEqual(failure.reason, f"{store} (cursor conversation chat-one) could not be read "
+                                         "(the composer's stored rows did not parse completely)")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import fixture_tree, isolate_data_dir
 
 
 isolate_data_dir()
@@ -228,7 +228,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
             raise AssertionError(f"not a 0.2.0-shaped proof: {self_names!r}")
 
     def test_v020_keyword_semantic_refusal_and_unchanged_ingest_upgrade(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-legacy-legacy-") as raw:
+        with fixture_tree(prefix="agrep-legacy-legacy-") as raw:
             home, data, term = self._fixture(Path(raw))
             first = self._ingest(home, data)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -356,7 +356,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
 
     def test_explicit_full_does_not_destroy_a_spent_adoption_clobber(
             self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-legacy-post-adoption-clobber-") as raw:
             home, data, _term = self._fixture(Path(raw))
             first = self._ingest(home, data)
@@ -428,7 +428,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
             ))
 
     def test_stable_legacy_publication_does_not_pay_movement_retries(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-legacy-stable-legacy-") as raw:
+        with fixture_tree(prefix="agrep-legacy-stable-legacy-") as raw:
             home, data, _term = self._fixture(Path(raw))
             first = self._ingest(home, data)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -445,7 +445,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_family_meta_ahead_of_signature_is_a_publication_race(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-legacy-family-ahead-") as raw:
+        with fixture_tree(prefix="agrep-legacy-family-ahead-") as raw:
             data = Path(raw)
             (data / "messages.jsonl").write_text("{}\n", encoding="utf-8")
             (data / "replies.jsonl").write_text("", encoding="utf-8")
@@ -480,7 +480,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
             separators=(",", ":")))
 
     def test_current_generation_missing_family_is_not_legacy(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-legacy-current-tear-") as raw:
+        with fixture_tree(prefix="agrep-legacy-current-tear-") as raw:
             home, data, _term = self._fixture(Path(raw))
             first = self._ingest(home, data)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -501,7 +501,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
         self.assertNotEqual(coherence["state"], "legacy-publication")
 
     def test_malformed_proof_with_missing_family_fails_closed_as_unstable(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-legacy-malformed-proof-") as raw:
+        with fixture_tree(prefix="agrep-legacy-malformed-proof-") as raw:
             home, data, _term = self._fixture(Path(raw))
             first = self._ingest(home, data)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -572,7 +572,7 @@ class LegacyPublicationUpgradeTests(unittest.TestCase):
                         coherence["state"], "legacy-publication")
 
     def test_a_source_that_moves_mid_read_remains_unstable(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-legacy-moving-") as raw:
+        with fixture_tree(prefix="agrep-legacy-moving-") as raw:
             home, data, _term = self._fixture(Path(raw))
             first = self._ingest(home, data)
             self.assertEqual(first.returncode, 0, first.stderr)

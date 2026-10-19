@@ -31,6 +31,7 @@ from hookless import live, native, registry  # noqa: E402
 import livetui  # noqa: E402
 import tail  # noqa: E402
 import teach  # noqa: E402
+import termui  # noqa: E402
 
 
 def _registry_payload() -> dict:
@@ -533,24 +534,67 @@ class AgentRegistryTests(unittest.TestCase):
                 return True
 
             def write(self, value: str) -> int:
-                if value == "\x1b[?1049h\x1b[?25l":
+                if value == termui.ENTER_SCREEN:
                     raise OSError("screen unavailable")
                 return super().write(value)
 
         stdout = FailingScreen()
-        terminal_state = ["saved"]
+        terminal_state = [0, 0, 0, 0, 0, 0, [b"\x00"] * 20]
         with mock.patch.object(sys, "argv", ["agrep board"]), \
                 mock.patch.object(sys, "stdout", stdout), \
                 mock.patch.object(livetui, "_enable_ansi", return_value=True), \
                 mock.patch.object(live, "watcher", return_value=mock.Mock()), \
+                mock.patch.object(termui, "_tty_fd", return_value=99), \
+                mock.patch.object(termui, "_wait_foreground"), \
                 mock.patch.object(
-                    livetui.termios, "tcgetattr", return_value=terminal_state), \
-                mock.patch.object(livetui.tty, "setcbreak"), \
-                mock.patch.object(livetui.termios, "tcsetattr") as restore, \
+                    termui.termios, "tcgetattr", return_value=terminal_state), \
+                mock.patch.object(termui.termios, "tcsetattr") as tcsetattr, \
+                mock.patch.object(termui.termios, "tcdrain") as tcdrain, \
                 self.assertRaisesRegex(OSError, "screen unavailable"):
             livetui.main()
-        restore.assert_called_once_with(
-            sys.stdin, livetui.termios.TCSADRAIN, terminal_state)
+        # held (NOFLSH, no flow control) while the leave sequence drains, then
+        # the exact saved modes
+        termios = termui.termios
+        holding = [0, 0, 0, termios.NOFLSH, 0, 0, terminal_state[6]]
+        self.assertEqual(tcsetattr.call_args_list[-2:],
+                         [mock.call(99, termios.TCSAFLUSH, holding),
+                          mock.call(99, termios.TCSANOW, terminal_state)])
+        tcdrain.assert_called_once_with(99)
+        self.assertTrue(stdout.getvalue().endswith(termui.LEAVE_SCREEN))
+
+    def test_board_rows_answer_ascii_digits_only(self) -> None:
+        # "²", "③" and "①" pass str.isdigit(); int() of them crashed the board
+        keys = iter(["²", "③", "①", "٣", "2", "q"])
+        frames = []
+
+        class Owner:
+            resumed = False
+
+            def key(self) -> str:
+                return next(keys)
+
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        sessions = [{"session": f"s{n}", "agent": "claude"} for n in range(3)]
+        watcher = mock.Mock()
+        watcher.snapshot.return_value = {}
+        with mock.patch.object(sys, "argv", ["agrep board"]), \
+                mock.patch.object(sys, "stdout", Terminal()), \
+                mock.patch.object(livetui, "_enable_ansi", return_value=True), \
+                mock.patch.object(live, "watcher", return_value=watcher), \
+                mock.patch.object(livetui, "_visible", return_value=sessions), \
+                mock.patch.object(livetui, "_frame", return_value="board"), \
+                mock.patch.object(livetui, "_focus_frame",
+                                  side_effect=lambda row, *_a, **_k: f"feed {row['session']}"), \
+                mock.patch.object(termui, "screen",
+                                  return_value=contextlib.nullcontext(Owner())), \
+                mock.patch.object(termui, "repaint",
+                                  side_effect=lambda lines, stdout=None: frames.append(lines[0])):
+            self.assertEqual(livetui.main(), 0)
+        # the four non-ASCII digits are no key; the ASCII 2 opens the second row
+        self.assertEqual(frames, ["board"] * 4 + ["feed s1"])
 
 
 if __name__ == "__main__":

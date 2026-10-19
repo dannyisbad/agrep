@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib
 import json
@@ -257,17 +258,50 @@ def _family_ids(
         connection.close()
 
 
+def segment_bytes(rows: int, dim: int) -> int:
+    """Staging footprint of one segment: f32 + f16 + q8 (dim+4) + 4-byte group id."""
+    return int(rows) * (7 * int(dim) + 8)
+
+
+class SegmentDiskFull(OSError):
+    """The data volume ran out of room while staging a segment."""
+
+
+def require_segment_capacity(root: Path, rows: int, dim: int) -> None:
+    """Refuse before inference when the staged segment cannot fit on ``root``.
+
+    Each retry of a disk-full pass re-embedded every row (about 30 s of CPU
+    per 480 rows) before the write failed; the check costs one statvfs."""
+    needed = int(segment_bytes(rows, dim) * 1.1) + 64 * 1024 * 1024
+    free = int(shutil.disk_usage(root).free)
+    if free < needed:
+        raise SegmentDiskFull(
+            errno.ENOSPC, f"no space left on device ({needed} needed, {free} "
+            f"free) at {root}")
+
+
 def _write_matrix(path: Path, parts: Sequence[np.ndarray], dim: int) -> int:
     _require_writable_data_dir("write a semantic segment matrix")
     rows = 0
-    with path.open("wb") as stream:
-        for part in parts:
-            array = np.ascontiguousarray(part, dtype="<f4")
-            if array.ndim != 2 or array.shape[1] != dim:
-                raise ValueError(f"embedding segment part must be (N, {dim})")
-            array.tofile(stream)
-            rows += int(array.shape[0])
-        stream.flush()
+    try:
+        with path.open("wb") as stream:
+            for part in parts:
+                array = np.ascontiguousarray(part, dtype="<f4")
+                if array.ndim != 2 or array.shape[1] != dim:
+                    raise ValueError(f"embedding segment part must be (N, {dim})")
+                # ndarray.tofile raises a bare "N requested and 0 written" with
+                # no errno on ENOSPC; a buffer-protocol write keeps the errno.
+                stream.write(memoryview(array).cast("B"))
+                rows += int(array.shape[0])
+            stream.flush()
+    except OSError as exc:
+        if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        free = int(shutil.disk_usage(path.parent).free)
+        raise SegmentDiskFull(
+            exc.errno, "no space left on device "
+            f"({segment_bytes(sum(len(part) for part in parts), dim)} needed, "
+            f"{free} free) at {path}") from exc
     return rows
 
 
@@ -280,8 +314,10 @@ def prepare(parts: Sequence[np.ndarray], ids: Sequence[str], hashes: Sequence[st
         raise ValueError("semantic segment rows, ids, hashes, and refs are misaligned")
     if any(message.id != mid for message, mid in zip(messages, ids, strict=True)):
         raise ValueError("semantic segment message order does not match its ids")
+    import embedding_segments
     root = Path(tempfile.mkdtemp(prefix=".semantic-segment-", dir=common.DATA_DIR))
     try:
+        embedding_segments.stamp_preparation_owner(root)
         matrix = root / "segment.f32"
         rows = _write_matrix(matrix, parts, int(dim))
         if rows != len(ids):
@@ -327,6 +363,8 @@ def prepare(parts: Sequence[np.ndarray], ids: Sequence[str], hashes: Sequence[st
             "f16": Path(exact["exact_artifact"]),
         }
         return PreparedSegment(root, artifacts, refs)
-    except Exception:
+    except BaseException:
+        # KeyboardInterrupt and SystemExit skip an Exception handler; only a
+        # kill or OOM is left to the scavenger that reads the owner record.
         shutil.rmtree(root, ignore_errors=True)
         raise

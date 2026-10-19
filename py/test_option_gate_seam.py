@@ -541,8 +541,15 @@ class GateRemedyTests(unittest.TestCase):
         rendered = self.assertRemedy(
             search.main, [*expected, "--json"], expected,
             surface.SEARCH_OPTION_GATES, ["agrep", "search"])
+        import signal
+        pipe = getattr(signal, "SIGPIPE", None)
+        inherited = signal.getsignal(pipe) if pipe is not None else None
         with mock.patch.object(sys, "argv", shlex.split(rendered)):
             parser = _parser(lambda _argv: cli.main(), [])
+        if pipe is not None:
+            # The CLI boundary borrows grep-style SIGPIPE for its own run; an
+            # in-process caller must get the disposition back afterwards.
+            self.assertIs(signal.getsignal(pipe), inherited)
         parsed = surface.parse_args_with_presence(parser, expected)
         self.assertEqual(parsed.pattern, ["doctor"])
         self.assertTrue(parsed.count)

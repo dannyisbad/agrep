@@ -32,6 +32,17 @@ else:
     _DATA = tempfile.TemporaryDirectory(prefix="agrep-unittest-data-")
     _DATA_ROOT = Path(_DATA.name)
     atexit.register(_DATA.cleanup)
+    # Any semantic coordination path read against the sandbox mints its
+    # per-data-dir namespace in the shared /tmp; it leaves with the sandbox.
+    atexit.register(lambda: remove_coordination_namespace(_DATA_ROOT / "data"))
+if "AGREP_DATA_DIR" not in os.environ:
+    # Any test importing this helper starts in a disposable corpus by default.
+    os.environ[_TEST_ROOT_ENV] = str(_DATA_ROOT)
+    os.environ["AGREP_DATA_DIR"] = str(_DATA_ROOT / "data")
+    os.environ["AGREP_DATA_DIR_SOURCE"] = "test"
+    os.environ["AGREP_HOME"] = str(_DATA_ROOT / "home")
+    os.environ["AGREP_NO_DAEMON"] = "1"
+    os.environ["AGREP_NO_SEM_WORKER"] = "1"
 
 
 def isolate_data_dir() -> Path:
@@ -42,6 +53,7 @@ def isolate_data_dir() -> Path:
     diagnostic test from ever observing or mutating the developer's real corpus.
     """
     root = _DATA_ROOT / "data"
+    register_data_dir(root)
     os.environ[_TEST_ROOT_ENV] = str(_DATA_ROOT)
     os.environ["AGREP_DATA_DIR"] = str(root)
     os.environ["AGREP_DATA_DIR_SOURCE"] = "test"
@@ -98,6 +110,41 @@ def wait_for_next_ctime_tick(path: Path) -> None:
         probe.unlink(missing_ok=True)
 
 
+def kill_mid_write(database: Path, statement: str) -> int:
+    """SIGKILL a writer once `statement` spilled past its 20-page cache, leaving the hot (synced)
+    rollback journal an interrupted index pass leaves; returns the journal's size."""
+    import signal
+    import subprocess
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sqlite3, sys\n"
+         "db = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+         "db.execute('PRAGMA cache_size=20')\n"
+         "db.execute('BEGIN IMMEDIATE')\n"
+         "db.execute(sys.argv[2])\n"
+         "print('ready', flush=True)\n"
+         "sys.stdin.read()\n",
+         os.fspath(database), statement],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        ready = child.stdout.readline()
+        if ready != "ready\n":
+            raise AssertionError(f"the writer did not open its transaction: {ready!r}")
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdin.close()
+        child.stdout.close()
+    journal = Path(f"{database}-journal")
+    with journal.open("rb") as stream:
+        if stream.read(8) != b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7":
+            raise AssertionError("the statement did not spill, so its journal is not hot")
+    return journal.stat().st_size
+
+
 def publish_derived_generation(
         root: Path, rows: list[dict], common_api, corpusdb_api, *,
         signature: str = "test-generation",
@@ -150,6 +197,19 @@ def publish_derived_generation(
     if mode is not None:
         for name in corpusdb_api._DERIVED_PROOF_NAMES:
             (root / name).chmod(mode)
+    publish_derived_proof(root, corpusdb_api, signature=signature)
+    (root / "settings.json").write_text(
+        '{"tools":"off"}', encoding="utf-8")
+    if mode is not None:
+        for name in (".derived_generation.json", ".ingest.sig", "settings.json"):
+            (root / name).chmod(mode)
+    return messages
+
+
+def publish_derived_proof(root: Path, corpusdb_api, *, signature: str) -> None:
+    """Publish the proof covering the derived files as they are now, then its signature."""
+    import json
+
     proof_rows = []
     for name in corpusdb_api._DERIVED_PROOF_NAMES:
         path = root / name
@@ -172,12 +232,6 @@ def publish_derived_generation(
         "signature": signature, "files": proof_rows,
     }, separators=(",", ":")), encoding="utf-8")
     (root / ".ingest.sig").write_bytes((signature + "\n").encode("utf-8"))
-    (root / "settings.json").write_text(
-        '{"tools":"off"}', encoding="utf-8")
-    if mode is not None:
-        for name in (".derived_generation.json", ".ingest.sig", "settings.json"):
-            (root / name).chmod(mode)
-    return messages
 
 
 # The real _spawn_indexd, captured by lift_daemon_semantics for the few tests
@@ -235,6 +289,277 @@ def lift_daemon_semantics(indexd_runtime):
             state.clear()
 
     return set_up_module, tear_down_module
+
+
+GENEROUS_ROUTINE_BUDGET_S = 60.0
+
+# The same widening for processes a suite starts: a sitecustomize on their PYTHONPATH
+# that widens cli's and doctor's routine budgets as they import (mode "generous"), or
+# defers one named observation once (mode "shortfall", see test_cli_conformance).
+BUDGET_INJECTION = '''
+import importlib.abc, importlib.util, os, sys, time
+MODE = <MODE>
+INJECT = <INJECT>
+BUDGET_S = 60.0
+STATUS_CAPS = ("_STATUS_ROUTINE_TIMEOUT_S", "_STATUS_STORE_TIMEOUT_S",
+               "_STATUS_DETECT_TIMEOUT_S", "_BINARY_IDENTITY_TIMEOUT_S")
+DOCTOR_CAPS = ("_DIAGNOSTIC_STORE_TIMEOUT_S", "_DIAGNOSTIC_DETECT_TIMEOUT_S",
+               "_DIAGNOSTIC_SENTINEL_TIMEOUT_S", "_DIAGNOSTIC_QUALITY_TIMEOUT_S",
+               "_DIAGNOSTIC_ARCHIVE_TIMEOUT_S")
+
+
+def reached(label):
+    open(os.path.join(INJECT, "reached-%s-%d" % (label, os.getpid())), "w").close()
+
+
+def consume(name):
+    try:
+        os.unlink(os.path.join(INJECT, "defer-" + name))
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def widen_status(module, label):
+    if getattr(module, "_agrep_generous", False) or not hasattr(module, "_status_deadline"):
+        return
+    for name in STATUS_CAPS:
+        if hasattr(module, name):
+            setattr(module, name, BUDGET_S)
+    module._agrep_generous = True
+    reached(label)
+
+
+class Budget(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        main = sys.modules.get("__main__")
+        if MODE == "generous" and main is not None:
+            widen_status(main, "main")
+        if name not in ("cli", "doctor", "ownerfile"):
+            return None
+        sys.meta_path.remove(self)
+        try:
+            spec = importlib.util.find_spec(name)
+        finally:
+            sys.meta_path.insert(0, self)
+        if spec is None or spec.loader is None:
+            return None
+        loader = spec.loader
+        exec_module = loader.exec_module
+
+        def patched(module):
+            exec_module(module)
+            argv = sys.argv[1:]
+            if MODE == "generous":
+                if name == "cli":
+                    widen_status(module, "cli")
+                elif name == "doctor":
+                    for cap in DOCTOR_CAPS:
+                        setattr(module, cap, BUDGET_S)
+                    module._routine_deadline = (
+                        lambda *, deep: None if deep else time.monotonic() + BUDGET_S)
+                    reached("doctor")
+                return
+            if name == "ownerfile" and argv == [] and consume("status"):
+                snapshot = module.snapshot
+
+                def slow(*args, **kwargs):
+                    module.snapshot = snapshot
+                    time.sleep(1.0)
+                    return snapshot(*args, **kwargs)
+                module.snapshot = slow
+            if name == "doctor" and argv == ["doctor", "--json"] and consume("doctor"):
+                module._routine_deadline = (
+                    lambda *, deep: None if deep else time.monotonic())
+        loader.exec_module = patched
+        return spec
+
+
+sys.meta_path.insert(0, Budget())
+'''
+
+
+def write_budget_injection(directory: Path, mode: str) -> None:
+    (directory / "sitecustomize.py").write_text(
+        BUDGET_INJECTION.replace("<MODE>", repr(mode)).replace("<INJECT>", repr(str(directory))),
+        encoding="utf-8")
+
+
+
+
+def generous_routine_budget():
+    """Module-scope (setUpModule, tearDownModule) widening the routine budgets.
+
+    Bare status and doctor's routine tier observe under 0.8 s deadlines that a
+    saturated host spends before the observation a test asserts on; the
+    disclosed constants in payloads are left alone. Suites that assert on the
+    deferral itself pass an explicit deadline or render synthetic payloads.
+    """
+    from unittest import mock
+    state: dict = {}
+
+    def set_up_module() -> None:
+        # Widen whichever surfaces the suite already imported; this helper
+        # itself never imports product code (it is a layer-0 leaf).
+        cli = sys.modules.get("cli")
+        doctor = sys.modules.get("doctor")
+        if cli is None and doctor is None:
+            raise RuntimeError("generous_routine_budget needs cli or doctor imported first")
+        patches = []
+        if cli is not None:
+            # The binary-identity cap bounds a hashing child, not the routine
+            # deadline; tests pin it by value, so it keeps its production figure.
+            for name in ("_STATUS_ROUTINE_TIMEOUT_S", "_STATUS_STORE_TIMEOUT_S",
+                         "_STATUS_DETECT_TIMEOUT_S"):
+                if hasattr(cli, name):
+                    patches.append(mock.patch.object(cli, name, GENEROUS_ROUTINE_BUDGET_S))
+        if doctor is not None:
+            patches.append(mock.patch.object(
+                doctor, "_routine_deadline",
+                lambda *, deep: None if deep else time.monotonic() + GENEROUS_ROUTINE_BUDGET_S))
+            for name in ("_DIAGNOSTIC_STORE_TIMEOUT_S", "_DIAGNOSTIC_DETECT_TIMEOUT_S",
+                         "_DIAGNOSTIC_SENTINEL_TIMEOUT_S", "_DIAGNOSTIC_QUALITY_TIMEOUT_S",
+                         "_DIAGNOSTIC_ARCHIVE_TIMEOUT_S"):
+                if hasattr(doctor, name):
+                    patches.append(mock.patch.object(doctor, name, GENEROUS_ROUTINE_BUDGET_S))
+        for patch in patches:
+            patch.start()
+        state["patches"] = patches
+
+    def tear_down_module() -> None:
+        for patch in reversed(state.pop("patches", [])):
+            patch.stop()
+
+    return set_up_module, tear_down_module
+
+
+# Semantic worker coordination: one namespace per data dir in a fixed shared base.
+# semworker's formula is replicated so the harness can name a sandbox's namespace
+# without importing semworker or touching common.DATA_DIR; a test pins them equal.
+COORDINATION_NAMESPACE_VERSION = 1
+
+
+def coordination_base_path() -> Path:
+    root = Path(tempfile.gettempdir()) if os.name == "nt" else Path("/tmp")
+    return root.resolve(strict=False)
+
+
+def coordination_namespace_for(data_dir) -> Path:
+    import hashlib
+    identity = os.path.normcase(os.path.realpath(os.fspath(data_dir)))
+    uid_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+    uid = str(uid_fn()) if uid_fn is not None else "user"
+    digest = hashlib.sha256(
+        f"v{COORDINATION_NAMESPACE_VERSION}\0{uid}\0".encode()
+        + os.fsencode(identity)).hexdigest()[:20]
+    return coordination_base_path() / (
+        f"agrep-semantic-v{COORDINATION_NAMESPACE_VERSION}-{uid}-{digest}")
+
+
+# Every data dir this process handed to a test or a child, by the namespace
+# name it would mint, with the module running when it was registered. The sweep
+# attributes a leaked namespace only through this registry, so strangers never count.
+_CANDIDATE_DATA_DIRS: dict[str, tuple[str, str | None]] = {}
+_REGISTRAR: str | None = None
+
+
+@contextlib.contextmanager
+def registering_for(module: str | None):
+    """Attribute every data dir registered inside the block to `module`."""
+    global _REGISTRAR
+    previous = _REGISTRAR
+    _REGISTRAR = module
+    try:
+        yield
+    finally:
+        _REGISTRAR = previous
+
+
+def register_data_dir(data_dir) -> Path:
+    """Remember a data dir a test may point product code at; returns its namespace."""
+    namespace = coordination_namespace_for(data_dir)
+    _CANDIDATE_DATA_DIRS.setdefault(namespace.name, (os.fspath(data_dir), _REGISTRAR))
+    return namespace
+
+
+def describe_namespace(name: str) -> str:
+    """The namespace with the registered data dir and module that explain it, if any.
+
+    A detached process from an earlier module can mint its data dir's namespace
+    while a later module runs; the registration names the culprit either way.
+    """
+    entry = _CANDIDATE_DATA_DIRS.get(name)
+    if entry is None:
+        return name
+    data_dir, module = entry
+    origin = f"data dir {data_dir}"
+    if module:
+        origin += f", registered during {module}"
+    return f"{name} ({origin})"
+
+
+def register_fixture_tree(root) -> None:
+    """Register a temporary tree's root and first-level directories, where every
+    sandboxed data dir lives. Call while the tree exists so realpath resolves."""
+    root = Path(root)
+    register_data_dir(root)
+    try:
+        children = [child for child in root.iterdir() if child.is_dir()]
+    except OSError:
+        return
+    for child in children:
+        register_data_dir(child)
+
+
+def registered_namespaces() -> set[str]:
+    return set(_CANDIDATE_DATA_DIRS)
+
+
+def remove_coordination_namespace(data_dir) -> bool:
+    """Remove the semantic coordination namespace a sandboxed data dir minted.
+
+    Only this uid's EMPTY namespace for exactly ``data_dir`` is removed; a
+    namespace holding any record, or any other sibling, is never touched.
+    Works whether or not this process imported semworker: child processes
+    mint too. Tests call it when they tear down a data dir.
+    """
+    namespace = register_data_dir(data_dir)
+    try:
+        if namespace.is_symlink() or not namespace.is_dir():
+            return False
+        uid_fn = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+        if uid_fn is not None and namespace.lstat().st_uid != uid_fn():
+            return False
+        namespace.rmdir()
+    except OSError:
+        return False
+    return True
+
+
+def scrub_coordination_namespaces(root) -> int:
+    """Remove the empty namespaces a fixture tree's root and first-level
+    directories minted. Returns how many were removed."""
+    root = Path(root)
+    register_fixture_tree(root)
+    candidates = [root]
+    try:
+        candidates.extend(child for child in root.iterdir() if child.is_dir())
+    except OSError:
+        pass
+    return sum(remove_coordination_namespace(candidate) for candidate in candidates)
+
+
+@contextlib.contextmanager
+def fixture_tree(**kwargs):
+    """tempfile.TemporaryDirectory whose namespaces are scrubbed before removal.
+
+    For suites whose temporary trees become data dirs of product processes.
+    """
+    with tempfile.TemporaryDirectory(**kwargs) as raw:
+        try:
+            yield raw
+        finally:
+            scrub_coordination_namespaces(raw)
 
 
 @contextlib.contextmanager

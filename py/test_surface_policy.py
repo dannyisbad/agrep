@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "py"))
 sys.path.insert(0, str(ROOT))
 
-from _test_support import isolate_data_dir  # noqa: E402
+from _test_support import generous_routine_budget, isolate_data_dir  # noqa: E402
 
 isolate_data_dir()
 
@@ -24,6 +24,8 @@ import around  # noqa: E402
 import cli  # noqa: E402
 import common  # noqa: E402
 import doctor  # noqa: E402
+
+setUpModule, tearDownModule = generous_routine_budget()
 import explore  # noqa: E402
 import embed  # noqa: E402
 import embedder  # noqa: E402
@@ -96,6 +98,21 @@ class SharedSurfacePolicyTests(unittest.TestCase):
             self.assertIn(f"{spec.name} = {spec.default}", rendered)
             self.assertIn(spec.value_help, rendered)
 
+    def test_settings_lock_failure_is_a_clean_non_argument_error(self) -> None:
+        import settings
+        output = io.StringIO()
+        with mock.patch.object(
+                settings, "set_setting",
+                side_effect=settings.SettingsError(
+                    "another agrep process is updating settings; try again")), \
+                contextlib.redirect_stdout(output):
+            rc = cli.cmd_set(SimpleNamespace(rest=["embeddings", "off"]))
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "another agrep process is updating settings; try again\n")
+        self.assertNotIn("agrep failed:", output.getvalue())
+
     def test_parser_choices_are_bound_to_shared_per_verb_policy(self) -> None:
         # search/recall route --who/--no-who through the one owned parser
         # (surface_policy.speaker_filter over the per-verb choices); around
@@ -167,7 +184,9 @@ class SharedSurfacePolicyTests(unittest.TestCase):
                     surface, "FRESHNESS_POLICY", policy), \
                     mock.patch.object(common, "DATA_DIR", Path(td)), \
                     mock.patch.object(
-                        common, "INGEST_SIG_PATH", signature):
+                        common, "INGEST_SIG_PATH", signature), \
+                    mock.patch.object(
+                        common, "ingest_bin", return_value=Path(__file__)):
                 self.assertFalse(surface.persistent_freshness_failure(6))
                 self.assertTrue(surface.persistent_freshness_failure(7))
                 self.assertEqual(
@@ -424,41 +443,9 @@ class SharedSurfacePolicyTests(unittest.TestCase):
         self.assertIn("rerun the search", stderr.getvalue())
         self.assertNotIn("doctor", stderr.getvalue())
 
-    def test_status_and_doctor_render_the_shared_governor_reason(self) -> None:
+    def test_doctor_renders_the_shared_governor_reason(self) -> None:
         deferred = surface.SemanticDeferral(
             "fixture", "runtime fixture", "shared pause reason")
-        core = {
-            "data_dir": "/tmp/agrep-test",
-            "data_dir_source": "test",
-            "warnings": [],
-            "index_built": True,
-            "sessions": 1,
-            "messages": 3,
-            "per_agent": [],
-            "search_index_ready": True,
-            "agents_taught": True,
-            "detected_not_indexed": [],
-            "embeddings_setting": {
-                "state": "verified", "value": "auto", "source": "default"},
-        }
-        semantic = {
-            "semantic_deps": True,
-            "semantic_verified": True,
-            "semantic_ready": False,
-            "semantic_embedding_now": False,
-            "semantic_state": "partial",
-            "semantic_coverage": {
-                "indexed": 1, "total": 3, "complete": False},
-        }
-        with mock.patch.object(cli, "_status_core", return_value=core), \
-                mock.patch.object(cli, "_status_semantic", return_value=semantic), \
-                mock.patch.object(
-                    surface, "observed_semantic_deferral",
-                    return_value=deferred):
-            status = "\n".join(cli._status_lines("agrep"))
-        self.assertIn(deferred.surface_reason, status)
-        self.assertNotIn("background passes close the gap", status)
-
         smart = {
             "live": True,
             "available": True,

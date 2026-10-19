@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import os
 import platform
+import secrets
+import shutil
 from pathlib import Path
 import sys
 
@@ -101,50 +103,121 @@ def available() -> tuple[bool, str]:
 
 
 def weights_dir(root=None):
-    """Where the Metal checkpoint lives, under the shared model root."""
-    import common
-    base = Path(root) if root is not None else Path(common.DATA_DIR) / "models"
+    """Where the Metal checkpoint lives: the ONNX lane's shared model root."""
+    import embedder
+    base = Path(root) if root is not None else embedder.model_root()
     return base / SUBDIR
+
+
+def _legacy_weights_dir() -> Path:
+    """Where releases before 0.4.3 kept the checkpoint: inside the data dir."""
+    import common
+    return Path(common.DATA_DIR) / "models" / SUBDIR
+
+
+def _legacy_side_mutable(legacy: Path) -> bool:
+    """Whether the legacy checkpoint's data dir may be touched at all."""
+    import common
+    import embedder
+    if embedder._readonly_contains(legacy):
+        return False
+    return common.data_dir_mutable()
+
+
+def _adopt_legacy_weights(target: Path) -> None:
+    """Bring a verified pre-0.4.3 checkpoint into the shared cache, not re-fetch it.
+
+    The legacy file stays in place until its copy is verified and published,
+    so a kill at any point leaves at least one complete copy; the staging
+    name is per process and `.adopt`, outside the downloader's `.part` sweep.
+    """
+    import embedder
+    legacy = _legacy_weights_dir()
+    if (not legacy.is_dir() or embedder._readonly_contains(target)
+            or not _legacy_side_mutable(legacy)
+            or os.path.realpath(legacy) == os.path.realpath(target)):
+        return
+    for name, (size, sha) in FILES.items():
+        source = legacy / name
+        # Releases before 0.4.3 downloaded into one fixed partial name; an
+        # interrupted fetch left it behind with no owner and nothing sweeping.
+        try:
+            (legacy / f"{name}.part").unlink(missing_ok=True)
+        except OSError:
+            pass
+        if embedder._file_ok(target / name, size, sha):
+            try:
+                source.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        if not embedder._file_ok(source, size, sha):
+            continue
+        staged = target / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.adopt"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(source, staged)
+            except OSError:
+                shutil.copyfile(source, staged)
+            if embedder._file_ok(staged, size, sha):
+                os.replace(staged, target / name)
+                if embedder._file_ok(target / name, size, sha):
+                    source.unlink(missing_ok=True)
+        except OSError:
+            pass
+        finally:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+    for directory in (legacy, legacy.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            break
+
+
+def _sweep_dead_adopters(target: Path) -> None:
+    """Drop `.name.pid.hex.adopt` staging files whose adopter is gone; the
+    legacy copy they were taken from is still in place, so nothing is lost."""
+    import common
+    import embedder
+    if embedder._readonly_contains(target):
+        return
+    for staged in target.glob(".*.adopt"):
+        parts = staged.name.split(".")
+        try:
+            pid = int(parts[-3])
+        except (IndexError, ValueError):
+            continue
+        if pid == os.getpid() or common.pid_alive(pid):
+            continue
+        try:
+            staged.unlink()
+        except OSError:
+            pass
 
 
 def ensure_weights(root=None, download: bool = True):
     """The pinned checkpoint on disk, fetched once if absent.
 
     Reuses the ONNX lane's verified fetch rather than growing a second
-    downloader: same size+digest check, same refusal to accept bytes that do
-    not match, so an accelerator cannot become the soft path into the model
-    directory.
+    downloader: same size+digest check, same per-process partials and
+    download claim, same refusal to accept bytes that do not match, so an
+    accelerator cannot become the soft path into the model directory.
     """
     import embedder
     target = weights_dir(root)
-    missing = [name for name, (size, sha) in FILES.items()
-               if not embedder._file_ok(target / name, size, sha)]
-    if not missing:
-        return target
-    if not download:
-        raise MLXUnavailable(
-            f"metal weights absent ({', '.join(missing)}) and download disabled")
-    target.mkdir(parents=True, exist_ok=True)
-    for name in missing:
-        size, sha = FILES[name]
-        url = (f"https://huggingface.co/{SUPPORTED_REPO}/resolve/"
-               f"{REVISION}/{name}")
-        part = target / f"{name}.part"
-        try:
-            embedder._fetch_pinned(url, part, size)
-            if not embedder._file_ok(part, size, sha):
-                part.unlink(missing_ok=True)
-                raise MLXUnavailable(
-                    f"metal weight {name} failed its pinned digest")
-            part.replace(target / name)
-        except MLXUnavailable:
-            raise
-        except Exception as exc:
-            part.unlink(missing_ok=True)
-            raise MLXUnavailable(
-                f"metal weight {name} could not be fetched: "
-                f"{type(exc).__name__}: {exc}") from exc
-    return target
+    _adopt_legacy_weights(target)
+    _sweep_dead_adopters(target)
+    urls = {name: (f"https://huggingface.co/{SUPPORTED_REPO}/resolve/"
+                   f"{REVISION}/{name}") for name in FILES}
+    try:
+        return embedder._ensure_pinned_files(
+            target, FILES, urls, download=download, noun="metal weights")
+    except embedder.EmbedderUnavailable as exc:
+        raise MLXUnavailable(str(exc)) from exc
 
 
 class MLXEmbedder:

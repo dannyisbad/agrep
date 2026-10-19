@@ -139,11 +139,38 @@ def background_removal_owned_by_current_process() -> bool:
     return current_start is not None and current_start == process_start
 
 
-def acquire_background_removal_fence() -> ownerfile.Handle | None:
+def _settle_cooldown() -> bool:
+    """Retire an ownerless cooldown so a new foreground removal can start."""
+    path = background_removal_cooldown_path()
+    try:
+        observed = ownerfile.snapshot(path, max_bytes=1024)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        return ownerfile.remove_exact(
+            path, observed, tombstone=True, require_stable_mtime=True)
+    except OSError:
+        return False
+
+
+def acquire_background_removal_fence(
+        *, supersede_cooldown: bool = False) -> ownerfile.Handle | None:
+    """Own the removal fence; None while another removal is live.
+
+    The cooldown a finished removal leaves behind keeps background writers
+    out for a grace period. A foreground removal is not such a writer: with
+    supersede_cooldown it retires that cooldown and proceeds."""
     if data_dir_readonly(DATA_DIR):
         return None
-    if background_removal_active():
+    if _owner_record_active(
+            background_removal_path(), _background_removal_protected):
         return None
+    if _owner_record_active(
+            background_removal_cooldown_path(), _background_cooldown_protected):
+        if not supersede_cooldown or not _settle_cooldown():
+            return None
     path = background_removal_path()
     pid = os.getpid()
     process_start = process_start_identity(pid)

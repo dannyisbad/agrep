@@ -18,13 +18,15 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import generous_routine_budget, isolate_data_dir
 
 
 isolate_data_dir()
 import common  # noqa: E402
 import corpusdb  # noqa: E402
 import doctor  # noqa: E402
+
+setUpModule, tearDownModule = generous_routine_budget()
 import embed  # noqa: E402
 import explore  # noqa: E402
 import indexd  # noqa: E402
@@ -442,14 +444,30 @@ class DerivedOwnershipTests(unittest.TestCase):
                 os.utime(binary, ns=(fixed_ns, fixed_ns))
                 first = indexd_runtime.rust_writer_env(binary)[
                     "AGREP_RUNTIME_BUILD_ID"]
-                binary.write_bytes(b"B" * 4096)
-                os.utime(binary, ns=(fixed_ns, fixed_ns))
-                second = indexd_runtime.rust_writer_env(binary)[
+                import fileops
+                before = fileops.file_identity(binary)
+                deadline = time.monotonic() + 5.0
+                while True:
+                    binary.write_bytes(b"B" * 4096)
+                    os.utime(binary, ns=(fixed_ns, fixed_ns))
+                    if fileops.file_identity(binary) != before:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("in-place rewrite did not advance identity")
+                    time.sleep(0.01)
+                in_place = indexd_runtime.rust_writer_env(binary)[
+                    "AGREP_RUNTIME_BUILD_ID"]
+                replacement = binary.with_name("agrep-rs.next")
+                replacement.write_bytes(b"C" * 4096)
+                os.utime(replacement, ns=(fixed_ns, fixed_ns))
+                os.replace(replacement, binary)
+                atomic = indexd_runtime.rust_writer_env(binary)[
                     "AGREP_RUNTIME_BUILD_ID"]
                 self.assertEqual(
                     os.environ.get("AGREP_RUNTIME_BUILD_ID"), None)
             self.assertNotEqual(missing, first)
-            self.assertNotEqual(first, second)
+            self.assertNotEqual(first, in_place)
+            self.assertNotEqual(in_place, atomic)
 
     def test_common_binary_resolution_is_read_only(
             self) -> None:
@@ -551,7 +569,7 @@ class DerivedOwnershipTests(unittest.TestCase):
             result = subprocess.run(
                 [os.fspath(binary), "index", "--agent", "cline"],
                 cwd=common.REPO_ROOT, env=env,
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=300)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((data / ".derived-owner.json").exists())
             self.assertIn(
@@ -597,7 +615,7 @@ class DerivedOwnershipTests(unittest.TestCase):
             result = subprocess.run(
                 [os.fspath(binary_b), "index", "--agent", "cline"],
                 cwd=common.REPO_ROOT, env=env,
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=300)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((data / ".derived-owner.json").exists())
             self.assertIn(
@@ -660,7 +678,7 @@ class DerivedOwnershipTests(unittest.TestCase):
             result = subprocess.run(
                 [os.fspath(binary), "index", "--agent", "cline"],
                 cwd=common.REPO_ROOT, env=env,
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=300)
             after = {
                 path.name: (path.read_bytes(), path.stat().st_mtime_ns)
                 for path in data.iterdir()
@@ -858,6 +876,126 @@ raise SystemExit(rc)
                 observed = indexd_runtime.derived_owner_info()
                 self.assertEqual(observed.state, "unavailable")
                 self.assertIn("is malformed", observed.reason)
+
+    def test_a_newer_anchor_is_named_as_newer_not_malformed(self) -> None:
+        """W16: a record a later agrep wrote (integer version above this
+        build's) fences every writer exactly as before, but the cause names the
+        upgrade; anything else that fails to parse keeps the malformed wording."""
+        newer = (
+            ('{"version": 2, "format": 1, "package": "0.5.0"}',
+             "ownership record version 2, format 1"),
+            ('{"version": 7}', "ownership record version 7"),
+            ('{"version": 2, "build_id": "' + BUILD_A + '", "format": "x"}',
+             "ownership record version 2)"),
+        )
+        malformed = (
+            '{"version": "2"}', '{"version": 2.0}', '{"version": true}',
+            '{"version": 0, "build_id": "' + BUILD_A + '"}',
+            '{"version": -2}', '{"version": 1}', '[2]',
+        )
+        with tempfile.TemporaryDirectory(prefix="agrep-owner-newer-") as raw:
+            root = Path(raw)
+            binary = root / "agrep-rs"
+            binary.write_bytes(b"exact writer binary")
+            with self._paths(root) as (_messages, db_path, owner_path):
+                self._cache(root / ".ingest_cache.bin", BUILD_A)
+                self._database(db_path, owner=BUILD_A)
+                for body, detail in newer:
+                    with self.subTest(record=body):
+                        owner_path.write_text(body, encoding="utf-8")
+                        observed = indexd_runtime.derived_owner_info()
+                        self.assertEqual(observed.state, "unavailable")
+                        self.assertIn("written by a newer agrep", observed.reason)
+                        self.assertIn(detail, observed.reason)
+                        self.assertIn("AGREP_DATA_DIR", observed.reason)
+                        self.assertNotIn("malformed", observed.reason)
+                        with self.assertRaises(
+                                indexd_runtime.DerivedWriteFenced) as fenced:
+                            indexd_runtime.rust_writer_env(binary)
+                        self.assertEqual(
+                            str(fenced.exception), observed.reason)
+                        self.assertFalse(
+                            indexd_runtime.derived_writer_launchable(
+                                fenced.exception.info))
+                        self.assertFalse(corpusdb._derived_write_ownership(
+                            for_write=True).writable)
+                        # [round 2] the surfaces share one bounded read of
+                        # the same cause: the repair verdict carries it, the
+                        # blocked-owner hedge keeps its marker clause first
+                        self.assertEqual(
+                            indexd_runtime.newer_anchor_fence(), observed.reason)
+                        self.assertEqual(
+                            indexd_runtime.blocked_owner_detail(),
+                            "the freshness owner is blocked: " + observed.reason)
+                        with mock.patch.dict(
+                                os.environ, {"AGREP_NO_DAEMON": ""}), \
+                                mock.patch.object(
+                                    common, "ingest_bin", return_value=binary), \
+                                mock.patch.object(
+                                    indexd_runtime, "freshener_alive",
+                                    return_value=False):
+                            kick = indexd_runtime.kick_background_repair()
+                        self.assertEqual(
+                            kick, indexd_runtime.RepairKick(
+                                False, "newer-anchor", observed.reason))
+                for body in malformed:
+                    with self.subTest(record=body):
+                        owner_path.write_text(body, encoding="utf-8")
+                        observed = indexd_runtime.derived_owner_info()
+                        self.assertEqual(observed.state, "unavailable")
+                        self.assertIn("is malformed", observed.reason)
+                        self.assertIsNone(indexd_runtime.newer_anchor())
+                        self.assertEqual(
+                            indexd_runtime.blocked_owner_detail(),
+                            "the freshness owner is blocked")
+                owner_path.unlink()
+                self.assertIsNone(indexd_runtime.newer_anchor_fence())
+
+    def test_rust_names_a_newer_anchor_and_serves_read_only(self) -> None:
+        binary = self._release_binary()
+        with tempfile.TemporaryDirectory(prefix="agrep-owner-newer-rust-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            source = (
+                home / ".cline" / "data" / "tasks" / "1"
+                / "api_conversation_history.json")
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                '[{"role":"user","content":"must stay unpublished","ts":1}]',
+                encoding="utf-8")
+            data.mkdir()
+            anchor = data / ".derived-owner.json"
+            anchor.write_text(
+                '{"version": 2, "format": 1, "package": "0.5.0"}',
+                encoding="utf-8")
+            env = dict(os.environ)
+            env.update({
+                "AGREP_DATA_DIR": os.fspath(data),
+                "AGREP_HOME": os.fspath(home),
+                "HOME": os.fspath(home),
+                "USERPROFILE": os.fspath(home),
+                "AGREP_NO_DAEMON": "1",
+                "AGREP_NO_FETCH": "1",
+                indexd_runtime._PYTHON_RUNTIME_BUILD_ID_ENV: BUILD_A,
+            })
+            for key in (
+                    "AGREP_RUNTIME_BUILD_ID",
+                    "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+                    "AGREP_DERIVED_ADOPTION_OWNER_TOKEN"):
+                env.pop(key, None)
+            before = self._census(data)
+            result = subprocess.run(
+                [os.fspath(binary), "index", "--agent", "cline"],
+                cwd=common.REPO_ROOT, env=env,
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "the data dir was written by a newer agrep (ownership record "
+                "version 2, format 1); this agrep serves it read-only; upgrade, "
+                "or point AGREP_DATA_DIR elsewhere; serving the published "
+                "snapshot read-only", result.stderr)
+            self.assertNotIn("malformed", result.stderr)
+            self.assertEqual(self._census(data), before)
 
     def test_parse_cache_owner_probe_is_bounded_stable_and_no_follow(
             self) -> None:
@@ -1172,9 +1310,11 @@ raise SystemExit(rc)
                             semantic.request_full_rebuild("foreign integrity")):
                         self.assertEqual(outcome["state"], "read-only")
                         self.assertIn(f"owned-by {BUILD_A}", outcome["reason"])
+                    # the removal stop is not a derived-store write: with no
+                    # removal transaction it only reports the missing fence
                     self.assertEqual(
                         semantic.stop_background_writers_for_removal()["state"],
-                        "read-only")
+                        "removal-fence-missing")
                     with self.assertRaisesRegex(
                             OSError, f"owned-by {BUILD_A}"):
                         semantic.write_generation_marker({"fixture": True})
@@ -1518,9 +1658,17 @@ raise SystemExit(rc)
 
     def test_current_anchor_rebuilds_a_damaged_same_build_database(
             self) -> None:
-        @contextlib.contextmanager
-        def granted_lock(_blocking: bool):
-            yield True
+        class granted_lock:
+            """`_ConnectIndexLock` stand-in: the slot is granted; the lock it exposes verifies."""
+
+            def __init__(self, _blocking: bool) -> None:
+                self.lock = mock.Mock(spec=common.IndexLock)
+
+            def __enter__(self) -> bool:
+                return True
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
 
         with tempfile.TemporaryDirectory(prefix="agrep-owner-db-repair-") as raw:
             root = Path(raw)
@@ -2388,7 +2536,7 @@ raise SystemExit(rc)
             first = subprocess.run(
                 [os.fspath(binary_a), "index", "--agent", "cline"],
                 cwd=common.REPO_ROOT, env=env,
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=300)
             self.assertEqual(first.returncode, 0, first.stderr)
             owner = json.loads(
                 (data / ".derived-owner.json").read_text(encoding="utf-8"))
@@ -2439,6 +2587,258 @@ raise SystemExit(rc)
             self.assertIn(
                 "daemon wedge snapshot",
                 (data / "messages.jsonl").read_text(encoding="utf-8"))
+
+
+# The CLI with the routine diagnostic budgets widened (the in-process
+# equivalent of generous_routine_budget): a saturated host must not defer the
+# very observation these tests assert on.
+_WIDE_BUDGET_CLI = '''
+import sys, time
+import cli, doctor
+for name in ("_STATUS_ROUTINE_TIMEOUT_S", "_STATUS_STORE_TIMEOUT_S",
+             "_STATUS_DETECT_TIMEOUT_S"):
+    setattr(cli, name, 60.0)
+for name in ("_DIAGNOSTIC_STORE_TIMEOUT_S", "_DIAGNOSTIC_DETECT_TIMEOUT_S",
+             "_DIAGNOSTIC_SENTINEL_TIMEOUT_S", "_DIAGNOSTIC_QUALITY_TIMEOUT_S",
+             "_DIAGNOSTIC_ARCHIVE_TIMEOUT_S"):
+    setattr(doctor, name, 60.0)
+doctor._routine_deadline = (
+    lambda *, deep: None if deep else time.monotonic() + 60.0)
+sys.argv[0] = "cli.py"
+raise SystemExit(cli.main())
+'''
+
+NEWER_ANCHOR = '{"version": 2, "format": 1, "package": "0.5.0"}'
+NEWER_REASON = (
+    "the data dir was written by a newer agrep (ownership record version 2, "
+    "format 1); this agrep serves it read-only; upgrade, or point "
+    "AGREP_DATA_DIR elsewhere")
+# the status page's words for the same fence; `python cli.py` is the dev
+# checkout's command name
+NEWER_STATUS_REMEDY = (
+    "(ownership record version 2, format 1): upgrade agrep, or point "
+    "AGREP_DATA_DIR elsewhere - details: `python cli.py doctor`")
+
+
+def _tree_census(root: Path, *, skip: tuple[str, ...] = ()) -> dict:
+    """Every entry under `root` with its bytes (files) or type: "nothing
+    changed" is an equality on this, not on a list of expected paths."""
+    census = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts[0] in skip:
+            continue
+        info = path.lstat()
+        census[str(relative)] = (
+            stat.S_IFMT(info.st_mode),
+            path.read_bytes() if stat.S_ISREG(info.st_mode) else None)
+    return census
+
+
+class NewerAnchorSurfaces(unittest.TestCase):
+    """W16: a data dir a newer agrep owns is named, with its remedy, on every
+    surface a reader reaches first - doctor (human and --json), the status page,
+    the search hedge and setup - not only on an explicit `index --full`."""
+
+    def setUp(self) -> None:
+        self.assertTrue(
+            RELEASE_BIN.is_file(),
+            f"release ingest binary missing: {RELEASE_BIN}")
+        self.temp = tempfile.TemporaryDirectory(prefix="agrep-newer-anchor-")
+        root = Path(self.temp.name)
+        self.home, self.data = root / "home", root / "data"
+        source = (self.home / ".cline" / "data" / "tasks" / "1"
+                  / "api_conversation_history.json")
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            '[{"role":"user","content":"must stay unpublished","ts":1}]',
+            encoding="utf-8")
+        # an enrolable agent, so setup's enrolment choice is observable
+        (self.home / ".claude").mkdir()
+        self.data.mkdir()
+        # setup arms the uninstall sentinel through the service manager; the
+        # sandbox must never reach the real one
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        for manager in ("launchctl", "systemctl", "schtasks"):
+            fake = fake_bin / manager
+            fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake.chmod(0o755)
+        self.env = dict(os.environ)
+        self.env.update({
+            "AGREP_DATA_DIR": os.fspath(self.data),
+            "AGREP_DATA_DIR_SOURCE": "env",
+            "AGREP_HOME": os.fspath(self.home),
+            "HOME": os.fspath(self.home),
+            "USERPROFILE": os.fspath(self.home),
+            "APPDATA": os.fspath(self.home / "AppData" / "Roaming"),
+            "LOCALAPPDATA": os.fspath(self.home / "AppData" / "Local"),
+            "XDG_CONFIG_HOME": os.fspath(self.home / ".config"),
+            "XDG_DATA_HOME": os.fspath(self.home / ".local" / "share"),
+            "CLINE_DIR": os.fspath(self.home / ".cline"),
+            "AGREP_RS_BIN": os.fspath(RELEASE_BIN),
+            "AGREP_NO_DAEMON": "1",
+            "AGREP_NO_SEM_WORKER": "1",
+            "AGREP_NO_RESIDENT": "1",
+            "AGREP_NO_FETCH": "1",
+            "PATH": os.pathsep.join([os.fspath(fake_bin), os.environ.get("PATH", "")]),
+            "PYTHONPATH": os.pathsep.join([os.fspath(ROOT), os.fspath(ROOT / "py")]),
+        })
+        for key in ("AGREP_RUNTIME_BUILD_ID",
+                    "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
+                    "AGREP_DERIVED_ADOPTION_OWNER_TOKEN",
+                    "AGREP_INSTALL_ANCHOR", "CODEX_HOME",
+                    indexd_runtime._PYTHON_RUNTIME_BUILD_ID_ENV):
+            self.env.pop(key, None)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _cli(self, *args: str, daemon: bool = True) -> subprocess.CompletedProcess:
+        env = dict(self.env)
+        if daemon:
+            # the freshness spawn is what observes the fence and names it; it
+            # launches nothing under a newer anchor (AGREP_NO_DAEMON would
+            # name itself instead, a user-chosen cause outranking the fence)
+            env.pop("AGREP_NO_DAEMON", None)
+        return subprocess.run(
+            [sys.executable, "-c", _WIDE_BUDGET_CLI, *args],
+            cwd=os.fspath(ROOT), env=env, capture_output=True, text=True,
+            timeout=120)
+
+    def _plant_newer_anchor(self) -> None:
+        (self.data / ".derived-owner.json").write_text(
+            NEWER_ANCHOR, encoding="utf-8")
+
+    def test_without_an_index_every_surface_names_the_newer_agrep(self) -> None:
+        self._plant_newer_anchor()
+
+        human = self._cli("doctor")
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn(NEWER_REASON, human.stdout)
+        self.assertNotIn("runs a publication now", human.stdout)
+        self.assertNotIn("cannot be verified", human.stdout)
+
+        machine = self._cli("doctor", "--json")
+        self.assertEqual(machine.returncode, 0, machine.stderr)
+        owner = json.loads(machine.stdout)["core"]["derived_owner"]
+        self.assertEqual(owner["state"], "newer-agrep")
+        self.assertEqual((owner["version"], owner["format"]), (2, 1))
+        self.assertEqual(owner["detail"], NEWER_REASON)
+
+        page = self._cli()
+        self.assertEqual(page.returncode, 0, page.stderr)
+        self.assertIn(
+            f"no index yet - a newer agrep owns this location {NEWER_STATUS_REMEDY}",
+            page.stdout)
+        self.assertNotIn("setup` makes this machine's", page.stdout)
+        status = json.loads(self._cli("status", "--json").stdout)
+        self.assertEqual(status["derived_owner"]["state"], "newer-agrep")
+        self.assertEqual(status["derived_owner"]["detail"], NEWER_REASON)
+
+        self.assertNotIn("do not know about agrep yet", page.stdout)
+        self.assertNotIn("setup` makes this machine's", page.stdout)
+        status = json.loads(self._cli("status", "--json").stdout)
+        self.assertEqual(status["derived_owner"]["state"], "newer-agrep")
+        self.assertEqual(status["derived_owner"]["detail"], NEWER_REASON)
+
+        # nothing is searchable and this agrep cannot build it: setup changes
+        # nothing and says so with the exit code an installer keys on
+        before_data = _tree_census(self.data)
+        setup = self._cli("setup", "--yes", "--no-semantic", "--archive")
+        self.assertEqual(setup.returncode, 3, setup.stdout + setup.stderr)
+        self.assertIn("nothing to change: a newer agrep owns this data dir and "
+                      "nothing is searchable here yet; this agrep cannot "
+                      "build it.", setup.stdout)
+        self.assertIn(NEWER_REASON, setup.stdout)
+        self.assertNotIn("setup complete", setup.stdout)
+        self.assertNotIn("indexing declined", setup.stdout)
+        self.assertFalse((self.home / ".claude" / "CLAUDE.md").exists())
+        self.assertFalse((self.home / ".claude" / "settings.json").exists())
+        self.assertEqual(_tree_census(self.data), before_data)
+
+    def test_with_an_index_every_surface_names_the_newer_agrep(self) -> None:
+        enrolled = self._cli("setup", "--yes", "--no-semantic", "--no-archive",
+                             daemon=False)
+        self.assertEqual(enrolled.returncode, 0, enrolled.stdout + enrolled.stderr)
+        self.assertIn("setup complete", enrolled.stdout)
+        self.assertTrue((self.data / "corpus.db").is_file())
+        self.assertTrue((self.home / ".claude" / "CLAUDE.md").is_file())
+        self.assertIn("PreCompact", (self.home / ".claude" / "settings.json")
+                      .read_text(encoding="utf-8"))
+        self._plant_newer_anchor()
+
+        human = self._cli("doctor")
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn(NEWER_REASON, human.stdout)
+        self.assertNotIn("cannot be verified", human.stdout)
+        owner = json.loads(self._cli("doctor", "--json").stdout)["core"]
+        self.assertEqual(owner["derived_owner"]["state"], "newer-agrep")
+        self.assertEqual(owner["search_db"]["state"], "owned-elsewhere")
+
+        page = self._cli()
+        self.assertEqual(page.returncode, 0, page.stderr)
+        self.assertIn(f"a newer agrep owns this index {NEWER_STATUS_REMEDY}",
+                      page.stdout)
+        self.assertNotIn("another agrep version is using the search index",
+                         page.stdout)
+
+        # the search hedge: the mild blocked-owner clause stays (the corpus
+        # loss escalation keys on it), the cause and remedy follow it
+        found = self._cli("unpublished")
+        self.assertEqual(found.returncode, 0, found.stdout + found.stderr)
+        self.assertIn("must stay unpublished", found.stdout)
+        self.assertIn(
+            f"history may be stale: the freshness owner is blocked: "
+            f"{NEWER_REASON}", found.stderr)
+
+        # the reviewer's repro: enrolled by a normal setup, then the owner
+        # changes; a rerun changes nothing - no block, hook, launcher or
+        # sentinel bytes, no daemon record, no archive capture, no anchor
+        before_home = _tree_census(self.home, skip=(".cline",))
+        before_data = _tree_census(self.data)
+        setup = self._cli("setup", "--yes", "--no-semantic", "--archive")
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        self.assertIn("nothing to change: a newer agrep owns this data dir; "
+                      "searches work read-only (1 messages across 1 sessions).",
+                      setup.stdout)
+        self.assertIn(NEWER_REASON, setup.stdout)
+        self.assertNotIn("setup complete", setup.stdout)
+        self.assertNotIn("archive retention enabled", setup.stdout)
+        self.assertEqual(_tree_census(self.home, skip=(".cline",)), before_home)
+        self.assertEqual(_tree_census(self.data), before_data)
+        self.assertEqual(
+            json.loads((self.data / "archive" / "config.json").read_text(
+                encoding="utf-8")).get("enabled"), False)
+        self.assertFalse([name for name in os.listdir(self.data)
+                          if name.startswith((".indexd", ".spawn"))])
+
+    def test_a_fence_that_is_not_a_newer_owner_never_claims_freshness(
+            self) -> None:
+        # [W16 round 4] a malformed anchor over a built corpus: every writer
+        # refuses, so setup's "already built" line says read-only and why,
+        # never "searches keep it fresh"; the rest of setup still runs
+        built = self._cli("setup", "--yes", "--no-semantic", "--no-archive",
+                          daemon=False)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertTrue((self.data / "corpus.db").is_file())
+        healthy = self._cli("setup", "--yes", "--no-semantic", "--no-archive",
+                            daemon=False)
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        self.assertIn("already built - 1 messages across 1 sessions (searches "
+                      "keep it fresh)", healthy.stdout)
+        (self.data / ".derived-owner.json").write_text(
+            '{"version": 2.0}', encoding="utf-8")
+
+        setup = self._cli("setup", "--yes", "--no-semantic", "--no-archive")
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        self.assertIn("already built - 1 messages across 1 sessions; read-only "
+                      "for this agrep: derived-store ownership record",
+                      setup.stdout)
+        self.assertIn("is malformed", setup.stdout)
+        self.assertNotIn("searches keep it fresh", setup.stdout)
+        self.assertNotIn("newer agrep", setup.stdout)
+        self.assertIn("setup complete", setup.stdout)
 
 
 def _db_meta(path: Path, key: str) -> str | None:

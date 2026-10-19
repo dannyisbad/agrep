@@ -1,4 +1,7 @@
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import hashlib
 import json
@@ -7,10 +10,14 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
+import common
 import doctor
 import embedder
 import embedding_store
@@ -284,6 +291,75 @@ class EmbeddingSegmentTests(unittest.TestCase):
                 segments.load_manifest(
                     meta, verify_hashes=True, validate_liveness=True)
 
+    def test_q8_payload_damage_is_caught_without_a_whole_file_python_pass(
+            self) -> None:
+        # Publication SHA-256s every artifact, so the per-byte Python FNV pass
+        # over the payloads cost ~3 s per 100k rows twice per publish and added
+        # no integrity. Damage must still be rejected, with no whole-file read.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            meta = root / "embeddings.meta"
+            artifacts, hashes, refs = _inputs(root, "base", ["a", "b"])
+            real_read_bytes = Path.read_bytes
+
+            def no_whole_q8(path: Path):
+                if path.suffix in (".q8", ".q8g"):
+                    raise AssertionError(f"whole-file read of {path.name}")
+                return real_read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", autospec=True,
+                                   side_effect=no_whole_q8):
+                manifest = segments.publish_base(
+                    meta, source={"ingest_signature": "one"}, model_id="model",
+                    dim=2, artifacts=artifacts, ids=["a", "b"], hashes=hashes,
+                    refs=refs, coverage={"total": 2})
+                segments.load_manifest(
+                    meta, verify_hashes=True, validate_liveness=True)
+            q8 = segments.artifact_path(
+                manifest, manifest["segments"][0]["artifacts"]["q8"])
+            intact = q8.read_bytes()
+            payload = bytearray(intact)
+            payload[64 + 3] ^= 0x01
+            q8.write_bytes(payload)
+            with self.assertRaisesRegex(segments.SegmentError, "digest mismatch"):
+                segments.load_manifest(
+                    meta, verify_hashes=True, validate_liveness=True)
+            q8.write_bytes(intact)
+
+            # The same damage on a staged input is refused before publication.
+            staged, hashes, refs = _inputs(root, "delta", ["c"])
+            damaged = bytearray(staged["q8"].read_bytes())
+            damaged[64 + 1] ^= 0x01
+            original_bundle = segments._bundle
+
+            def corrupt_after_bundle(*args, **kwargs):
+                record, group_count = original_bundle(*args, **kwargs)
+                (meta.parent / record["artifacts"]["q8"]["path"]).write_bytes(
+                    damaged)
+                return record, group_count
+
+            with mock.patch.object(
+                    segments, "_bundle", side_effect=corrupt_after_bundle), \
+                    self.assertRaisesRegex(segments.SegmentError, "digest mismatch"):
+                segments.publish_delta(
+                    meta, source={"ingest_signature": "one"}, artifacts=staged,
+                    ids=["c"], hashes=hashes, refs=refs, shadows=[],
+                    coverage={"total": 3},
+                    expected_generation=manifest["generation"])
+
+            # A group id past the declared count is still a structural refusal.
+            bad, hashes, refs = _inputs(root, "bad", ["d"])
+            groups = bytearray(bad["groups"].read_bytes())
+            struct.pack_into("<I", groups, 64, 7)
+            bad["groups"].write_bytes(groups)
+            with self.assertRaisesRegex(
+                    segments.SegmentError, "group id exceeds"):
+                segments.publish_delta(
+                    meta, source={"ingest_signature": "one"}, artifacts=bad,
+                    ids=["d"], hashes=hashes, refs=refs, shadows=[],
+                    coverage={"total": 3},
+                    expected_generation=manifest["generation"])
+
     def test_doctor_detects_size_preserving_refs_digest_damage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -517,6 +593,208 @@ class EmbeddingSegmentTests(unittest.TestCase):
                 [(row["mid"], row["row_ref"]) for row in segments.active_rows(current)],
                 [("b", 1), ("a", 4)])
             self.assertEqual((current["live_rows"], current["physical_rows"]), (2, 5))
+
+    def _preparation(self, root: Path, name: str, *, owner: dict | None,
+                     age_s: float = 0.0, payload: int = 1024) -> Path:
+        path = root / name
+        path.mkdir()
+        (path / "segment.f32").write_bytes(b"\0" * payload)
+        if owner is not None:
+            (path / ".owner").write_text(json.dumps(owner), encoding="utf-8")
+        stamp = time.time() - age_s
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_abandoned_preparations_follow_the_owner_record(self) -> None:
+        # A killed or OOM'd builder skips every handler and nothing scanned
+        # the prefix: 2.7 KB per row leaked on every interrupted full build.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            me = {"pid": os.getpid(),
+                  "process_start": str(common.process_start_identity(
+                      os.getpid()))}
+            with mock.patch.object(
+                    common, "pid_alive",
+                    side_effect=lambda pid: pid == os.getpid()):
+                live = self._preparation(
+                    root, ".semantic-segment-live", owner=me, age_s=90_000)
+                dead = self._preparation(
+                    root, ".semantic-segment-dead",
+                    owner={"pid": 999_999_999, "process_start": "gone"},
+                    payload=4096)
+                recycled = self._preparation(
+                    root, ".semantic-compaction-recycled",
+                    owner={**me, "process_start": "another birth"})
+                young = self._preparation(
+                    root, ".semantic-segment-young", owner=None, age_s=60)
+                stale = self._preparation(
+                    root, ".semantic-compaction-stale", owner=None, age_s=7200)
+                (root / ".semantic-segment-file").write_bytes(b"not a dir")
+                if os.name != "nt":
+                    os.symlink(dead, root / ".semantic-segment-link")
+                found = segments.abandoned_preparations(root)
+                self.assertEqual(
+                    found["paths"], (recycled, stale, dead))
+                self.assertEqual(found["count"], 3)
+                self.assertGreaterEqual(found["bytes"], 4096 + 1024 + 1024)
+
+                # An unrecorded, stale directory stays while its kind of
+                # builder still holds the claim: it may be that builder's.
+                (root / ".semantic-compaction.lock").write_text(
+                    json.dumps({**me, "token": "t"}), encoding="utf-8")
+                self.assertEqual(
+                    segments.abandoned_preparations(root)["paths"],
+                    (recycled, dead))
+
+                done = segments.prune_abandoned_preparations(root)
+            self.assertEqual(done["removed"], [recycled, dead])
+            self.assertEqual(done["deferred"], [])
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir() if p.is_dir()),
+                [".semantic-compaction-stale", ".semantic-segment-live",
+                 ".semantic-segment-young"])
+            self.assertTrue(live.exists() and young.exists() and stale.exists())
+
+    def test_prepare_stamps_its_owner_and_cleans_on_interrupt(self) -> None:
+        import semantic_segment_build
+        import types
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seen: dict[str, object] = {}
+
+            def interrupted(path: Path, *_args, **_kwargs):
+                owner = json.loads((path.parent / ".owner").read_text())
+                seen["dir"] = path.parent
+                seen["owner"] = owner
+                raise KeyboardInterrupt
+
+            with mock.patch.object(semantic_segment_build.common, "DATA_DIR", root), \
+                    mock.patch.object(
+                        semantic_segment_build, "_require_writable_data_dir"), \
+                    mock.patch.object(
+                        semantic_segment_build, "_write_matrix",
+                        side_effect=interrupted), \
+                    self.assertRaises(KeyboardInterrupt):
+                semantic_segment_build.prepare(
+                    [], ["a"], ["h"], [types.SimpleNamespace(id="a")],
+                    dim=2, model_id="model")
+            self.assertEqual(seen["owner"]["pid"], os.getpid())
+            self.assertTrue(seen["dir"].name.startswith(".semantic-segment-"))
+            self.assertFalse(seen["dir"].exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_live_builder_with_unreadable_birth_is_not_reclaimed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            me = {"pid": os.getpid(), "process_start": "darwin_birth"}
+            fresh = self._preparation(root, ".semantic-segment-fresh", owner=me)
+            old = self._preparation(root, ".semantic-segment-old", owner=me,
+                                    age_s=7200)
+            with mock.patch.object(common, "pid_alive", return_value=True), \
+                    mock.patch.object(common, "process_start_identity",
+                                      return_value=None):
+                found = segments.abandoned_preparations(root)
+            # Unknown liveness falls through to age + claim: only the stale
+            # one with no live claim of its kind is reclaimable.
+            self.assertEqual(found["paths"], (old,))
+            self.assertTrue(fresh.exists())
+
+    def test_embed_pass_and_doctor_reclaim_abandoned_preparations(self) -> None:
+        import corpusdb
+        import embed
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dead = {"pid": 999_999_999, "process_start": "gone"}
+            with mock.patch.object(embed.common, "DATA_DIR", root), \
+                    mock.patch.object(doctor.common, "DATA_DIR", root), \
+                    mock.patch.object(doctor.common, "EMBEDDINGS_PATH",
+                                      root / "embeddings.meta"), \
+                    mock.patch.object(corpusdb, "DB_PATH", root / "corpus.db"), \
+                    mock.patch.object(
+                        common, "pid_alive", return_value=False), \
+                    mock.patch.object(embed, "_data_dir_readonly",
+                                      return_value=False), \
+                    mock.patch.object(embed.common, "log") as log:
+                self._preparation(root, ".semantic-segment-a", owner=dead)
+                inventory = doctor._orphan_inventory(deep=False)
+                self.assertEqual(
+                    inventory["semantic_preparations"]["count"], 1)
+                self.assertEqual(inventory["count"], 1)
+                rows: list[tuple] = []
+                with mock.patch.object(
+                        doctor, "_row",
+                        side_effect=lambda *a: rows.append(a)):
+                    doctor._abandoned_preparation_row(
+                        inventory["semantic_preparations"], fix_actions=False)
+                self.assertEqual(rows[0][:2], ("semantic staging", doctor.WARN))
+                self.assertIn("1 abandoned semantic build dir", rows[0][2])
+                self.assertIn("doctor --fix", rows[0][2])
+                self.assertTrue((root / ".semantic-segment-a").exists())
+
+                embed._prune_loaded_segment_orphans(None)
+                self.assertFalse((root / ".semantic-segment-a").exists())
+                self.assertIn("reclaimed 1 abandoned preparation dir",
+                              log.call_args.args[0])
+
+                self._preparation(root, ".semantic-compaction-b", owner=dead)
+                rows.clear()
+                with mock.patch.object(
+                        doctor, "_row",
+                        side_effect=lambda *a: rows.append(a)):
+                    doctor._abandoned_preparation_row(
+                        doctor._orphan_inventory(deep=False)[
+                            "semantic_preparations"], fix_actions=True)
+                self.assertEqual(rows[0][:2], ("semantic staging", doctor.OK))
+                self.assertFalse((root / ".semantic-compaction-b").exists())
+
+    def test_disk_full_is_named_held_and_not_re_embedded(self) -> None:
+        import errno
+        import embed
+        import semantic_segment_build as build
+        import surface_policy as surface
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # numpy's tofile raised "N requested and 0 written" with no errno;
+            # the buffer write keeps ENOSPC so the failure can be classified.
+            full = OSError(errno.ENOSPC, "No space left on device")
+            stream = mock.MagicMock()
+            stream.__enter__.return_value.write.side_effect = full
+            with mock.patch.object(build, "_require_writable_data_dir"), \
+                    mock.patch.object(Path, "open", return_value=stream), \
+                    self.assertRaisesRegex(
+                        build.SegmentDiskFull,
+                        r"no space left on device \(\d+ needed, \d+ free\) at ") \
+                    as caught:
+                build._write_matrix(
+                    root / "segment.f32",
+                    [np.zeros((3, 2), dtype=np.float32)], 2)
+            self.assertIsNotNone(surface.host_block(str(caught.exception)))
+            self.assertEqual(caught.exception.errno, errno.ENOSPC)
+
+            usage = mock.Mock(free=1024)
+            with mock.patch.object(build.shutil, "disk_usage", return_value=usage), \
+                    self.assertRaisesRegex(build.SegmentDiskFull, "needed, 1024 free"):
+                build.require_segment_capacity(root, 1000, 384)
+
+            with mock.patch.object(embed, "_PRIOR_FAILURES", 0):
+                record = embed._failure_record(
+                    caught.exception, str(caught.exception))
+            needed = build.segment_bytes(3, 2)
+            self.assertEqual(record["disk_full"]["needed"], needed)
+            with mock.patch.object(semantic.common, "DATA_DIR", root), \
+                    mock.patch.object(semantic.shutil, "disk_usage",
+                                      return_value=mock.Mock(free=needed - 1)):
+                self.assertIn("no space left", semantic.disk_full_hold(record))
+            with mock.patch.object(semantic.common, "DATA_DIR", root), \
+                    mock.patch.object(semantic.shutil, "disk_usage",
+                                      return_value=mock.Mock(free=needed)):
+                self.assertIsNone(semantic.disk_full_hold(record))
+            detail = doctor._semantic_failure_detail(
+                {"embed_job": "failed", "live": False,
+                 "embed_fail_reason": record["error"]},
+                embeddings_off=False, lane=surface.SEMANTIC_LANE_POLICY)
+            self.assertIn("free space on this volume", detail)
+            self.assertNotIn("retries automatically", detail)
 
     def test_orphan_cleanup_defers_and_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

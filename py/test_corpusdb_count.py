@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
+from pathlib import Path
 import sqlite3
+import tempfile
 import unittest
 from unittest import mock
 
@@ -232,6 +235,333 @@ class CorpusCountTests(unittest.TestCase):
                 "SELECT agrep_contains_ci('Alpha', 'ph')").fetchone(), (1,))
         finally:
             db.close()
+
+
+class CorpusCoverageCountTests(unittest.TestCase):
+    QUERY = "alpha alpha beta hi absent"
+    TERMS = ["beta", "alpha", "alpha", "hi", "absent"]
+
+    @staticmethod
+    def _row(session, turn, who, text, project="p"):
+        return (session, turn, turn, "codex", project, "", "", "", who, text)
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="agrep-coverage-count-")
+        self.addCleanup(scratch.cleanup)
+        self.path = Path(scratch.name) / "corpus.db"
+        self.rows = [
+            self._row("a", 0, "user", "alpha beta hi"),
+            self._row("a", 1, "agent", "alpha detail"),
+            self._row("a", 2, "agent", "alpha detail again"),
+            self._row("b", 0, "agent", "alpha payload beta this"),
+            self._row("c", 0, "tool", "alpha beta tool payload"),
+            self._row("d", 0, "agent", "beta proof"),
+            self._row("e", 0, "user", "ordinary evidence"),
+            self._row("recap-text", 0, "recap", "recap payload"),
+            self._row("a", 3, "recap", ""),
+            self._row("recap-only", 0, "recap", ""),
+        ] + [
+            self._row(f"filler-{index}", 0, "agent", "filler", "other")
+            for index in range(992)
+        ]
+        self._publish(self.path, self.rows)
+
+    @staticmethod
+    def _load(db, rows) -> None:
+        db.executescript(corpusdb._SCHEMA_SQL)
+        db.executemany(corpusdb._INS, rows)
+        for table in ("msgs_fts", "msgs_prose_fts"):
+            db.execute(f"INSERT INTO {table}({table}) VALUES('rebuild')")
+        corpusdb._install_triggers(db)
+        db.executemany("INSERT INTO meta VALUES(?, ?)", [
+            ("schema", corpusdb._SCHEMA), ("stamp", "same-stamp"),
+        ])
+        db.commit()
+
+    def _publish(self, path, rows) -> None:
+        db = sqlite3.connect(path)
+        try:
+            self._load(db, rows)
+        finally:
+            db.close()
+
+    def _reader(self, path=None, *, alias=False):
+        db = (corpusdb._connect_read_alias(path or self.path, 0)
+              if alias else corpusdb._open(path or self.path))
+        self.addCleanup(db.close)
+        return db
+
+    @staticmethod
+    def _term_counts(trace):
+        return [sql for sql in trace
+                if sql.startswith("SELECT count(") and " MATCH " in sql]
+
+    @staticmethod
+    def _population_counts(trace):
+        return [sql for sql in trace
+                if sql.startswith("SELECT count(") and " MATCH " not in sql
+                and " FROM msgs" in sql]
+
+    def _expected_hits(self, db, documents=1000, alpha=5, beta=4, *, prose=False):
+        weights = {
+            term: math.log(1.0 + (documents or 1) / (df + 1))
+            for term, df in (("alpha", alpha), ("beta", beta),
+                             ("hi", documents or 1), ("absent", 0))
+        }
+        total = sum(weights.values())
+        table = "msgs_prose_fts" if prose else "msgs_fts"
+        expected = []
+        for session, turn, text in db.execute(
+                f"SELECT m.session, m.turn, m.text FROM {table} "
+                f"JOIN msgs m ON m.id = {table}.rowid WHERE {table} MATCH ? "
+                f"ORDER BY bm25({table}) LIMIT 50",
+                ('"alpha" OR "beta" OR "absent"',)):
+            matched = [term for term in weights if term in text.lower()]
+            mass = (round(sum(weights[term] for term in matched) / total, 4)
+                    if documents >= 1000 else None)
+            expected.append((session, turn, matched, mass))
+        return expected
+
+    def _assert_hits(self, hits, expected) -> None:
+        self.assertEqual([
+            (hit["session"], hit["turn"], hit["_terms_matched"], hit["_coverage_mass"])
+            for hit in hits
+        ], expected)
+        self.assertTrue(all(not hit["_query_echo"] for hit in hits))
+        for hit in hits:
+            self.assertEqual(
+                hit["_terms_missing"],
+                [term for term in ("alpha", "beta", "hi", "absent")
+                 if term not in hit["_terms_matched"]],
+            )
+
+    def test_session_df_shares_aggregate_with_coverage_across_connections(self) -> None:
+        db = self._reader()
+        expected = self._expected_hits(db)
+        trace = []
+        db.set_trace_callback(trace.append)
+        db.execute("BEGIN")
+        frequencies = corpusdb.term_session_df(db, self.TERMS)
+        self.assertEqual(list(frequencies), ["beta", "alpha", "absent"])
+        self.assertEqual(frequencies, {"beta": 4 / 999, "alpha": 3 / 999, "absent": 0.0})
+        for _ in range(2):
+            self._assert_hits(corpusdb.coverage_rank(db, self.QUERY, 50), expected)
+        self.assertTrue(db.in_transaction)
+        db.rollback()
+        counts = self._term_counts(trace)
+        self.assertEqual(len(counts), 3)
+        self.assertTrue(all(
+            sql.startswith("SELECT count(*), count(DISTINCT m.session)") for sql in counts))
+        self.assertEqual(len(self._population_counts(trace)), 3)
+
+        reopened = self._reader()
+        trace.clear()
+        reopened.set_trace_callback(trace.append)
+        self.assertEqual(corpusdb.term_session_df(reopened, self.TERMS), frequencies)
+        self._assert_hits(corpusdb.coverage_rank(reopened, self.QUERY, 50), expected)
+        self.assertEqual(self._term_counts(trace), [])
+        self.assertEqual(self._population_counts(trace), [])
+        self.assertFalse(reopened.in_transaction)
+
+    def test_coverage_first_does_not_precount_or_recount_sessions(self) -> None:
+        db = self._reader()
+        expected = self._expected_hits(db)
+        trace = []
+        db.set_trace_callback(trace.append)
+        for _ in range(2):
+            self._assert_hits(corpusdb.coverage_rank(db, self.QUERY, 50), expected)
+        self.assertEqual(len(self._term_counts(trace)), 3)
+        self.assertFalse(any(
+            "count(DISTINCT" in sql for sql in trace if sql.startswith("SELECT")))
+        for _ in range(2):
+            self.assertEqual(corpusdb.term_session_df(db, self.TERMS), {
+                "beta": 4 / 999, "alpha": 3 / 999, "absent": 0.0,
+            })
+        counts = self._term_counts(trace)
+        self.assertEqual(len(counts), 6)
+        self.assertEqual(sum(sql.startswith("SELECT count(*) FROM") for sql in counts), 3)
+        self.assertEqual(sum(
+            sql.startswith("SELECT count(DISTINCT m.session)") for sql in counts), 3)
+        self.assertEqual(len(self._population_counts(trace)), 3)
+
+    def test_content_and_coverage_share_row_counts_but_keep_exact_populations(self) -> None:
+        for prose in (False, True):
+            with self.subTest(prose=prose):
+                path = self.path
+                if prose:
+                    path = self.path.with_name("prose.db")
+                    self._publish(path, self.rows)
+                db = self._reader(path)
+                flt = {"include_tools": False} if prose else None
+                alpha, beta = (4, 3) if prose else (5, 4)
+                expected = self._expected_hits(db, alpha=alpha, beta=beta, prose=prose)
+                documents = 999 if prose else 1000
+                weights = {
+                    term: math.log(1.0 + documents / (df + 1))
+                    for term, df in (("alpha", alpha), ("beta", beta),
+                                     ("hi", documents), ("absent", 0))
+                }
+                total = sum(weights.values())
+                expected_content = sorted([
+                    (session, turn, round(sum(weights[term] for term in matched) / total, 4))
+                    for session, turn, matched, _mass in expected
+                ], key=lambda row: (-row[2], row[0], row[1]))
+                trace = []
+                db.set_trace_callback(trace.append)
+                for _ in range(2):
+                    content = corpusdb.content(db, self.QUERY, 50, flt)
+                    self.assertEqual([
+                        (hit["session"], hit["turn"], hit["coverage"])
+                        for hit in content["hits"]
+                    ], expected_content)
+                    self.assertEqual(content["total"], len(expected_content))
+                    self.assertEqual(
+                        content["chats"], len({row[0] for row in expected_content}))
+                    self._assert_hits(
+                        corpusdb.coverage_rank(db, self.QUERY, 50, flt), expected)
+                counts = self._term_counts(trace)
+                self.assertEqual(len(counts), 3)
+                self.assertTrue(all(sql.startswith("SELECT count(*) FROM") for sql in counts))
+                self.assertFalse(any(
+                    "count(DISTINCT" in sql for sql in trace if sql.startswith("SELECT")))
+                self.assertEqual(len(self._population_counts(trace)), 4 if prose else 2)
+
+    def test_prose_row_df_and_all_message_session_df_stay_distinct(self) -> None:
+        db = self._reader()
+        expected = self._expected_hits(db, alpha=4, beta=3, prose=True)
+        trace = []
+        db.set_trace_callback(trace.append)
+        for _ in range(2):
+            self.assertEqual(corpusdb.term_session_df(db, self.TERMS), {
+                "beta": 4 / 999, "alpha": 3 / 999, "absent": 0.0,
+            })
+            self._assert_hits(corpusdb.coverage_rank(
+                db, self.QUERY, 50, {"include_tools": False, "project": "p"}), expected)
+        counts = self._term_counts(trace)
+        self.assertEqual(len(counts), 6)
+        self.assertEqual(sum(" FROM msgs_fts " in sql for sql in counts), 3)
+        self.assertEqual(sum(" FROM msgs_prose_fts " in sql for sql in counts), 3)
+        self.assertFalse(any(
+            "DISTINCT" in sql and " FROM msgs_prose_fts " in sql for sql in counts))
+        self.assertEqual(len(self._population_counts(trace)), 3)
+
+    def test_in_place_publication_change_invalidates_counts_and_population(self) -> None:
+        db = self._reader()
+        corpusdb.term_session_df(db, self.TERMS)
+        corpusdb.coverage_rank(db, self.QUERY, 50)
+        original_identity = db._source_identity
+        writer = sqlite3.connect(self.path)
+        try:
+            writer.execute(corpusdb._INS, self._row("fresh", 0, "agent", "beta added"))
+            writer.commit()
+        finally:
+            writer.close()
+        frequencies = {"beta": 5 / 1000, "alpha": 3 / 1000, "absent": 0.0}
+        expected = self._expected_hits(db, documents=1001, beta=5)
+        self.assertEqual(corpusdb.term_session_df(db, self.TERMS), frequencies)
+        self._assert_hits(corpusdb.coverage_rank(db, self.QUERY, 50), expected)
+
+        fresh = self._reader()
+        self.assertNotEqual(fresh._source_identity, original_identity)
+        trace = []
+        fresh.set_trace_callback(trace.append)
+        self.assertEqual(corpusdb.term_session_df(fresh, self.TERMS), frequencies)
+        for _ in range(2):
+            self._assert_hits(corpusdb.coverage_rank(fresh, self.QUERY, 50), expected)
+        self.assertEqual(len(self._term_counts(trace)), 3)
+        self.assertEqual(len(self._population_counts(trace)), 3)
+
+    def test_different_databases_and_replaced_path_do_not_share_wrong_counts(self) -> None:
+        original = self._reader()
+        expected = self._expected_hits(original)
+        frequencies = corpusdb.term_session_df(original, self.TERMS)
+        corpusdb.coverage_rank(original, self.QUERY, 50)
+        other_path = self.path.with_name("other.db")
+        self._publish(other_path, [self._row("only-beta", 0, "agent", "beta proof")])
+        other = self._reader(other_path)
+        other_expected = self._expected_hits(other, documents=1, alpha=0, beta=1)
+        trace = []
+        other.set_trace_callback(trace.append)
+        self.assertEqual(corpusdb.term_session_df(other, self.TERMS), {
+            "beta": 1.0, "alpha": 0.0, "absent": 0.0,
+        })
+        self._assert_hits(corpusdb.coverage_rank(other, self.QUERY, 50), other_expected)
+        self.assertEqual(len(self._term_counts(trace)), 3)
+        trace.clear()
+        original.set_trace_callback(trace.append)
+        self.assertEqual(corpusdb.term_session_df(original, self.TERMS), frequencies)
+        self._assert_hits(corpusdb.coverage_rank(original, self.QUERY, 50), expected)
+        self.assertEqual(self._term_counts(trace), [])
+
+        other.close()
+        other_path.replace(self.path)
+        replacement = self._reader()
+        self.assertEqual(corpusdb.term_session_df(replacement, self.TERMS), {
+            "beta": 1.0, "alpha": 0.0, "absent": 0.0,
+        })
+        self._assert_hits(
+            corpusdb.coverage_rank(replacement, self.QUERY, 50), other_expected)
+        self.assertEqual(corpusdb.term_session_df(original, self.TERMS), frequencies)
+        self._assert_hits(corpusdb.coverage_rank(original, self.QUERY, 50), expected)
+
+    def test_alias_cache_identity_includes_wal_not_only_main_file(self) -> None:
+        writer = sqlite3.connect(self.path)
+        self.addCleanup(writer.close)
+        self.assertEqual(writer.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(corpusdb._INS, self._row("wal-first", 0, "agent", "beta first"))
+        writer.commit()
+        first = self._reader(alias=True)
+        identity = first._source_identity
+        trace = []
+        first.set_trace_callback(trace.append)
+        self.assertEqual(corpusdb.term_session_df(first, self.TERMS), {
+            "beta": 5 / 1000, "alpha": 3 / 1000, "absent": 0.0,
+        })
+        self._assert_hits(
+            corpusdb.coverage_rank(first, self.QUERY, 50),
+            self._expected_hits(first, documents=1001, beta=5),
+        )
+        self.assertEqual(len(self._term_counts(trace)), 3)
+        writer.execute(corpusdb._INS, self._row("wal-second", 0, "agent", "beta second"))
+        writer.commit()
+        second = self._reader(alias=True)
+        self.assertEqual(second._source_identity, identity)
+        trace.clear()
+        second.set_trace_callback(trace.append)
+        self.assertEqual(corpusdb.term_session_df(second, self.TERMS), {
+            "beta": 6 / 1001, "alpha": 3 / 1001, "absent": 0.0,
+        })
+        self._assert_hits(
+            corpusdb.coverage_rank(second, self.QUERY, 50),
+            self._expected_hits(second, documents=1002, beta=6),
+        )
+        self.assertEqual(len(self._term_counts(trace)), 3)
+        self.assertEqual(corpusdb.term_session_df(first, self.TERMS), {
+            "beta": 5 / 1000, "alpha": 3 / 1000, "absent": 0.0,
+        })
+
+    def test_unpublished_memory_connections_observe_mutations(self) -> None:
+        for factory in (sqlite3.Connection, corpusdb._PublishedConnection):
+            with self.subTest(factory=factory):
+                db = sqlite3.connect(":memory:", factory=factory)
+                try:
+                    self._load(db, self.rows)
+                    self.assertEqual(corpusdb.term_session_df(db, self.TERMS), {
+                        "beta": 4 / 999, "alpha": 3 / 999, "absent": 0.0,
+                    })
+                    self._assert_hits(
+                        corpusdb.coverage_rank(db, self.QUERY, 50), self._expected_hits(db))
+                    db.execute(corpusdb._INS, self._row("fresh", 0, "agent", "beta added"))
+                    self.assertEqual(corpusdb.term_session_df(db, self.TERMS), {
+                        "beta": 5 / 1000, "alpha": 3 / 1000, "absent": 0.0,
+                    })
+                    self._assert_hits(
+                        corpusdb.coverage_rank(db, self.QUERY, 50),
+                        self._expected_hits(db, documents=1001, beta=5),
+                    )
+                finally:
+                    db.close()
 
 
 if __name__ == "__main__":

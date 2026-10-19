@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::cache::{write_bytes_atomic, SessionAlias};
+use crate::cache::{stage_bytes_atomic, SessionAlias, StagedFile};
 use crate::model::Message;
 
 pub const FILE_NAME: &str = "boundary_stats.json";
@@ -773,7 +773,8 @@ fn build(msgs: &[Message], generation: &str) -> BoundaryStats {
     stats_from_cache(&rebuild_cache(msgs, &[], generation))
 }
 
-pub fn write(
+/// Stage the stats file and its cache; the caller promotes both with the rest of a publication.
+pub fn stage(
     msgs: &[Message],
     aliases: &[SessionAlias],
     path: &Path,
@@ -781,7 +782,7 @@ pub fn write(
     generation: &str,
     prior_generation: Option<&str>,
     touched: &HashSet<String>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, [StagedFile; 2])> {
     let cached = std::fs::read(cache_path)
         .ok()
         .and_then(|bytes| bincode::deserialize::<BoundaryCache>(&bytes).ok())
@@ -847,13 +848,13 @@ pub fn write(
     compact_dead_tokens(&mut cache);
     let stats = stats_from_cache(&cache);
     let families = stats.families;
-    let (cache_result, stats_result) = rayon::join(
-        || -> anyhow::Result<()> { write_bytes_atomic(cache_path, &bincode::serialize(&cache)?) },
-        || -> anyhow::Result<()> { write_bytes_atomic(path, &serde_json::to_vec(&stats)?) },
+    let (cache_staged, stats_staged) = rayon::join(
+        || -> anyhow::Result<StagedFile> {
+            stage_bytes_atomic(cache_path, &bincode::serialize(&cache)?)
+        },
+        || -> anyhow::Result<StagedFile> { stage_bytes_atomic(path, &serde_json::to_vec(&stats)?) },
     );
-    cache_result?;
-    stats_result?;
-    Ok(families)
+    Ok((families, [cache_staged?, stats_staged?]))
 }
 
 #[cfg(test)]
@@ -861,8 +862,32 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use super::{build, collect_text, counts_live, layout, write, BoundaryCache, SessionAlias};
+    use super::{build, collect_text, counts_live, layout, stage, BoundaryCache, SessionAlias};
     use crate::model::Message;
+
+    fn write(
+        msgs: &[Message],
+        aliases: &[SessionAlias],
+        path: &std::path::Path,
+        cache_path: &std::path::Path,
+        generation: &str,
+        prior_generation: Option<&str>,
+        touched: &HashSet<String>,
+    ) -> anyhow::Result<usize> {
+        let (families, staged) = stage(
+            msgs,
+            aliases,
+            path,
+            cache_path,
+            generation,
+            prior_generation,
+            touched,
+        )?;
+        for file in staged {
+            file.promote()?;
+        }
+        Ok(families)
+    }
 
     fn message(session: &str, parent: &str, text: &str) -> Message {
         Message {
@@ -879,6 +904,7 @@ mod tests {
             reply_chars: 0,
             side: !parent.is_empty(),
             parent: Arc::from(parent),
+            reply_shape: Default::default(),
         }
     }
 

@@ -91,7 +91,13 @@ allowlist fell from four rows to one.
   server forks one child per command and refuses the request before forking
   unless the kernel's peer pid (`SO_PEERCRED`, macOS `LOCAL_PEERPID`) equals
   the pid the client claims, because the child resolves caller self-exclusion
-  from that pid's ancestry. Any failure before the server acknowledges the
+  from that pid's ancestry. A command opens with a hello byte and sends its
+  request only once the server has greeted; the client gives connect, hello and
+  greeting a quarter second together, so a wedged server neither delays the
+  fallback nor holds the client's descriptors, and only a server that greeted
+  gets the two seconds a fork on a loaded host can take to acknowledge. A stop
+  request carries no hello and gets its plain reply, so a remove stops residents
+  of either version. Any failure before the server acknowledges the
   command, including a refusal, runs the ordinary in-process path, and a child
   cannot write before the client's go byte, so a fallback never follows
   partial output. Children run with the client's environment plus the changes

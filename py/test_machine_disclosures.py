@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import generous_routine_budget, isolate_data_dir
 
 
 isolate_data_dir()
@@ -18,6 +18,8 @@ import around  # noqa: E402
 import common  # noqa: E402
 import corpusdb  # noqa: E402
 import doctor  # noqa: E402
+
+setUpModule, tearDownModule = generous_routine_budget()
 import explore  # noqa: E402
 import indexd_runtime  # noqa: E402
 import recall  # noqa: E402
@@ -780,6 +782,9 @@ class MachineDisclosureContracts(unittest.TestCase):
                 mock.patch.object(doctor.shutil, "which", return_value="/cargo"), \
                 mock.patch.object(doctor, "_semantic_probe", return_value=smart), \
                 mock.patch.object(doctor, "_store_counts", return_value=[]), \
+                mock.patch.object(
+                    indexd_runtime, "observe_store_drift",
+                    return_value=([], indexd_runtime.DriftReport("current"))), \
                 mock.patch.object(
                     doctor, "_corpus_db_readiness",
                     return_value={"state": "missing", "detail": "missing"}), \

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import fnmatch
 import os
 import re
@@ -53,6 +54,10 @@ _TERMINAL_MULTILINE_TRANSLATIONS = {
     ord("\n"): "\n",
 }
 _TERMINAL_UNSAFE_CATEGORIES = frozenset({"Cf", "Cs", "Zl", "Zp"})
+# Cf characters ordinary text needs: ZWJ binds emoji sequences and Indic conjuncts, ZWNJ
+# splits Persian words. Neither reorders or hides text; bidi controls and the invisible
+# spacers (ZWSP, WJ, BOM, tags) stay escaped. Variation selectors are Mn, never escaped.
+_TERMINAL_SAFE_FORMAT = frozenset("\u200c\u200d")
 _TERMINAL_UNICODE_PROBE = re.compile(r"[^\x00-\xff]")
 # Printable ASCII is a fixed point of both translation tables and never
 # reaches the unicode-category walk; one C-level probe skips all of it.
@@ -111,8 +116,9 @@ def terminal_safe(value: object, *, multiline: bool = False) -> str:
     if _TERMINAL_UNICODE_PROBE.search(translated) is None:
         return translated
     return "".join(
-        f"\\u{ord(char):04x}"
-        if unicodedata.category(char) in _TERMINAL_UNSAFE_CATEGORIES else char
+        (f"\\U{ord(char):08x}" if ord(char) > 0xFFFF else f"\\u{ord(char):04x}")
+        if (unicodedata.category(char) in _TERMINAL_UNSAFE_CATEGORIES
+            and char not in _TERMINAL_SAFE_FORMAT) else char
         for char in translated)
 
 
@@ -934,11 +940,31 @@ def filter_coverage_disclosure(
     return out
 
 
-def inverted_window_error(since: str, until: str) -> str:
+def _next_day(value: str) -> str | None:
+    """The calendar day after a plain YYYY-MM-DD bound; None for any other spelling."""
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) is None:
+        return None
+    try:
+        day = datetime.date.fromisoformat(text)
+    except ValueError:
+        return None
+    return (day + datetime.timedelta(days=1)).isoformat()
+
+
+def inverted_window_error(since: str, until: str, *, equal: bool = False) -> str:
     """--since/--until name the half-open interval [since, until). With until
     at or before since that interval holds no instant at all, so every corpus
     answers zero - a fact the tool holds before it touches the index, and the
-    one shape a plain miss can never be told from."""
+    one shape a plain miss can never be told from. Equal bounds are the
+    one-day mistake: the fix is the next day, never a swap."""
+    if equal:
+        following = _next_day(until)
+        fix = (f"use --until {following} for the whole of {since}" if following
+               else "give --until a later moment")
+        return (f"empty time window: --since {since} and --until {until} name "
+                f"the same instant, and [since, until) excludes its end, so it "
+                f"selects no time at all - {fix}")
     return (f"empty time window: --since {since} is at or after "
             f"--until {until}, so [since, until) selects no time at all "
             f"- swap them for the range between them")
@@ -951,7 +977,7 @@ def window_bounds_error(since: str | None, since_ms: int | None,
         return None
     if since_ms is None or until_ms is None or until_ms > since_ms:
         return None
-    return inverted_window_error(since, until)
+    return inverted_window_error(since, until, equal=until_ms == since_ms)
 
 
 class OptionRef(NamedTuple):
@@ -1354,6 +1380,15 @@ class FreshnessFailure(NamedTuple):
     consecutive_failures: int = 0
 
 
+# ingest's kind for an attribution source (cursor workspace metadata) it could not read while it
+# still read every chat: nothing is missing, some project labels are provisional.
+ATTRIBUTION_ISSUE_KIND = "attribution-unreadable"
+
+
+def attribution_only_issue(issue: object) -> bool:
+    return isinstance(issue, dict) and issue.get("kind") == ATTRIBUTION_ISSUE_KIND
+
+
 FRESHNESS_POLICY = FreshnessPolicy(
     failure_threshold=3,
     last_good_index_tail="searches serve the last good index",
@@ -1557,6 +1592,11 @@ class StatusAdvice(NamedTuple):
     command: str = ""  # bare verb; the renderer prefixes the invocation name
 
 
+# The consent rebuild (`reindex --full`) also rebuilds every semantic vector in the foreground,
+# where embeddings are on and their runtime installed; its remedies disclose it there only.
+REBUILD_COST = "the rebuild also redoes meaning search, which can take a while"
+
+
 # Keyed by FreshnessFailure.code. None means the condition clears itself and
 # earns no line (law 1); an unlisted code falls back to _INDEXING_ADVICE_ANY.
 INDEXING_ADVICE = MappingProxyType({
@@ -1585,6 +1625,17 @@ INDEXING_ADVICE = MappingProxyType({
     "source-unreadable": StatusAdvice(
         "some chats could not be read, so they are missing from results",
         "doctor"),
+    "unreadable-holds-index": StatusAdvice(
+        "new chats are not being indexed - history agrep cannot read holds the "
+        "index back; fix or remove {them} in {agents}, or rebuild without {them} ({they} "
+        "indexed again once readable{cost})", "reindex --full"),
+    "unreadable-holds-newer-owner": StatusAdvice(
+        "new chats are not being indexed - history agrep cannot read holds the "
+        "index back; fix or remove {them} in {agents}, or update agrep to rebuild "
+        "without {them} (a newer agrep owns this data dir)", "doctor"),
+    "unreadable-holds-everything": StatusAdvice(
+        "new chats are not being indexed - all the index holds is history agrep cannot "
+        "read now; fix or remove {them} in {agents}", "doctor"),
     "store-unreadable": StatusAdvice(
         "one agent's chats cannot be read - the other agents index normally",
         "doctor"),
@@ -1603,6 +1654,11 @@ INDEXING_ADVICE = MappingProxyType({
     "freshness-unchecked": None,
     "diagnostic-budget-exceeded": None,
 })
+# The census could not vouch either way (budget ran out, no verdict returned):
+# nothing is known to be wrong, so doctor renders these neutrally.
+FRESHNESS_UNVERIFIED_CODES = frozenset({
+    "census-unavailable", "diagnostic-budget-exceeded", "freshness-unchecked",
+})
 
 _INDEXING_ADVICE_ANY = StatusAdvice(
     "new chats are not being indexed yet", "index")
@@ -1615,16 +1671,26 @@ def indexing_advice(code: object) -> StatusAdvice | None:
     return _INDEXING_ADVICE_ANY
 
 
-def indexing_advice_line(failure: object | None, cli: str) -> str:
-    """The single rendered sentence for a freshness failure, or "" for silence."""
+# What a hold's advice names when no record is at hand: its agent, one item, no rebuild cost.
+HOLD_DEFAULTS = MappingProxyType({"agents": "its agent", "them": "it", "they": "it is",
+                                  "cost": ""})
+
+
+def indexing_advice_line(failure: object | None, cli: str, *,
+                         hold: Callable[[], Mapping[str, str]] = dict) -> str:
+    """The single rendered sentence for a freshness failure, or "" for silence. `hold` supplies
+    a hold's names (`agents`, `them`, `they`) and its rebuild's cost clause (see REBUILD_COST);
+    it is consulted only by advice for a record holding publication back."""
     if failure is None:
         return ""
     advice = indexing_advice(getattr(failure, "code", ""))
     if advice is None:
         return ""
+    text = (advice.cost.format_map({**HOLD_DEFAULTS, **hold()})
+            if any(f"{{{name}}}" in advice.cost for name in HOLD_DEFAULTS) else advice.cost)
     failures = max(0, int(getattr(failure, "consecutive_failures", 0) or 0))
-    cost = (f"{advice.cost} ({failures} attempts in a row)"
-            if failures >= FRESHNESS_POLICY.failure_threshold else advice.cost)
+    cost = (f"{text} ({failures} attempts in a row)"
+            if failures >= FRESHNESS_POLICY.failure_threshold else text)
     return f"{cost}: `{cli} {advice.command}`" if advice.command else cost
 
 
@@ -1694,6 +1760,13 @@ REMEDIES = MappingProxyType({
     "audit-gap": Remedy(
         "auto", "the next full index pass seeds the book",
         owner="index --full tally pass"),
+    "audit-gap-interrupted": Remedy(
+        "human-prereq", "a plain `{command}` clears it, as does a background indexer's next pass",
+        owner="an interrupted pass's rollback journal waits for the next pass"),
+    "audit-live": Remedy(
+        "auto", "agents were writing; the next index pass tallies the new "
+        "records and the next audit re-observes them",
+        owner="indexd incremental pass"),
     "store-unreadable": Remedy(
         "privilege", "restore read permission / grant disk access",
         owner="OS permissions are the human's"),
@@ -1711,6 +1784,30 @@ REMEDIES = MappingProxyType({
         "human-prereq",
         "retry `{command}`; inspect the named source if it persists",
         owner="the source failure kind is not recognized"),
+    "unreadable-holds-publication": Remedy(
+        "consent",
+        "fix or remove {them} in {agent}, or run `{command}` to rebuild without {them} "
+        "({they} indexed again once readable{cost})",
+        owner="publishing without unreadable history drops its indexed rows"),
+    "unreadable-holds-newer-owner": Remedy(
+        "human-prereq",
+        "fix or remove {them} in {agent}, or update agrep to rebuild without {them} (a "
+        "newer agrep owns this data dir, and this one cannot rebuild it)",
+        owner="only the newer agrep that owns the data dir may rebuild it"),
+    "newer-owner-index": Remedy(
+        "human-prereq",
+        "update agrep to index it again (a newer agrep owns this data dir, and this one "
+        "cannot index it)",
+        owner="only the newer agrep that owns the data dir may index it"),
+    "unreadable-holds-everything": Remedy(
+        "human-prereq",
+        "fix or remove {them} in {agent} (all the index holds is history agrep cannot read "
+        "now)",
+        owner="a rebuild without unreadable history would leave nothing indexed"),
+    "attribution-provisional": Remedy(
+        "human-prereq",
+        "make the named file readable; the next `{command}` relabels the provisional projects",
+        owner="agent metadata the index attributes projects through"),
     "legacy-publication": Remedy(
         "human-prereq", "run `agrep index` once to upgrade this legacy publication",
         owner="a full ingest can be expensive and rewrites derived stores"),
@@ -1730,6 +1827,10 @@ REMEDIES = MappingProxyType({
     "index-publish": Remedy(
         "human-prereq", "`{command}` runs a publication now",
         owner="a full ingest can be expensive and rewrites derived stores"),
+    "index-rollback": Remedy(
+        "human-prereq",
+        "`{command}` rolls it back, though new chats wait on what holds the index back",
+        owner="the pass that rolls the journal back is the reader's to run"),
     "index-binary": Remedy(
         "human-prereq", "`{command}` fetches or compiles the ingest binary",
         owner="a build or network fetch can require user-controlled resources"),
@@ -1861,8 +1962,10 @@ REPAIR_DECLINE_LINES = {
     "no-binary": "the ingest binary is missing",
     "held-foreign-owner": "another agrep holds the index",
     "owner-unverifiable": "another agrep's claim on the index cannot be verified",
+    "newer-anchor": "the data dir was written by a newer agrep",
     "probe-failed": "the repair state could not be verified",
     "spawn-failed": "the daemon failed to start",
+    "sidecar-blocked": "index updates wait on the file named above, which agrep cannot use",
 }
 
 
@@ -1926,21 +2029,25 @@ BLOCKED_OWNER_STALE_MARKER = "the freshness owner is blocked"
 _PARSE_CACHE_MAGIC = b"AGRPCB01"
 # storage version -> (header length, raw-len offset, codec offset)
 _PARSE_CACHE_LAYOUTS = {2: (64, 40, None), 3: (80, 40, 64), 4: (100, 60, 84)}
+# the key prefix of the one released-row record a base may hold, serialized first
+_RELEASED_KEY_PREFIX = b"\x00released"
 
 
 def parse_cache_source_count(path: os.PathLike | str) -> int | None:
     """How many sources the parse cache itself knows, or None.
 
-    A bounded, read-only probe of the cache base: the fixed header plus the
-    12-byte payload prelude. Any unexpected shape - missing file, foreign
-    magic, compressed payload, torn length - declines with None rather than
-    guessing. Committed journal frames may shift the exact count, which is
-    why every caller renders it as an approximation.
+    A bounded, read-only probe of the cache base: the fixed header, the
+    12-byte payload prelude, and the first entry's key. Any unexpected shape -
+    missing file, foreign magic, compressed payload, torn length - declines
+    with None rather than guessing. The writer serializes its one released-row
+    record, when it holds one, as the first entry, so that key is read and the
+    record left out of the count. Committed journal frames may shift the exact
+    count, which is why every caller renders it as an approximation.
     """
     try:
         with open(path, "rb") as fh:
             size = os.fstat(fh.fileno()).st_size
-            prefix = fh.read(112)
+            prefix = fh.read(160)
     except OSError:
         return None
     if len(prefix) < 24 or prefix[12:20] != _PARSE_CACHE_MAGIC:
@@ -1962,7 +2069,12 @@ def parse_cache_source_count(path: os.PathLike | str) -> int | None:
     count = int.from_bytes(prefix[header_len + 4:header_len + 12], "little")
     # every cached entry occupies at least one payload byte; a larger claim
     # is a torn or foreign payload, not a cardinality
-    return count if count <= raw_len else None
+    if count > raw_len:
+        return None
+    first_key = prefix[header_len + 20:header_len + 20 + len(_RELEASED_KEY_PREFIX)]
+    if count and first_key == _RELEASED_KEY_PREFIX:
+        count -= 1
+    return count
 
 
 def census_contradiction(published_sessions: int | None,
@@ -2028,14 +2140,24 @@ def publication_freshness_disclosure() -> dict:
 
 
 def freshness_disclosure(failure: object | None) -> dict:
+    """Machine freshness shape every surface shares (doctor, status, search,
+    recall, summary, around): a census that could not vouch is unchecked and
+    may be stale, never a failure."""
     if failure is None:
         return {"state": "no-known-failure", "failing": False}
+    code = str(getattr(failure, "code", "") or "unknown")
+    reason = str(getattr(failure, "reason", "") or "")
+    if code in FRESHNESS_UNVERIFIED_CODES:
+        return {
+            "state": "unchecked", "failing": False, "may_be_stale": True,
+            "checked": False, "code": code, "reason": reason,
+        }
     out = {
         "state": "degraded",
         "failing": True,
         "may_be_stale": True,
-        "code": str(getattr(failure, "code", "") or "unknown"),
-        "reason": str(getattr(failure, "reason", "") or ""),
+        "code": code,
+        "reason": reason,
     }
     failures = max(0, int(getattr(failure, "consecutive_failures", 0) or 0))
     if failures:
@@ -2132,10 +2254,10 @@ def uncounted_total_line(shown: int, *, exhaustible: bool = True) -> str:
             f"(the search lane stopped early{lever})")
 
 
-def completeness_line(disclosure: Mapping) -> str:
+def completeness_line(disclosure: Mapping, *, count_exact: bool = True) -> str:
     """The prose of the same disclosure, for surfaces whose stdout is rows.
     One artifact behind both so a porcelain line can never disagree with the
-    JSON field beside it."""
+    JSON field beside it. ``count_exact`` is false when -c would be a floor too."""
     total = int(disclosure["total"])
     exact = disclosure["total_basis"] == "exact"
     unit = str(disclosure["unit"])
@@ -2150,7 +2272,8 @@ def completeness_line(disclosure: Mapping) -> str:
     # F3: a "+" total is a floor from a lane that stopped early; name the
     # surface that counts exactly - unless this disclosure has no exhaustive
     # form at all, which is exactly where -c refuses the pair
-    basis = "" if exact else f" ({count_floor_note(exhaustible=not reason)})"
+    basis = ("" if exact else
+             f" ({count_floor_note(exhaustible=not reason and count_exact)})")
     tail = (f" · larger page: {more}" if more
             else f" · {reason}" if reason else "")
     return (f"showing {disclosure['shown']} of {total}{'' if exact else '+'} "
@@ -2316,6 +2439,90 @@ def turn_not_served(requested: int, first: int, last: int) -> str:
     return f"turn {requested} is out of range"
 
 
+_EVENTS_UNAVAILABLE = "tool events are unavailable right now"
+# A write lockout ends with its pass; a crashed pass's journal or marker waits for the next pass,
+# which a read asks a background indexer for, and which nothing runs in a setup without one.
+_EVENTS_UNAVAILABLE_CAUSE = (
+    "the event store is locked by an index pass, or a crashed pass left it unreadable "
+    "until the next one (a background indexer runs that shortly; `agrep index` runs it "
+    "where none does)")
+EVENTS_UNAVAILABLE_ERROR_CODE = "events-unavailable"
+
+
+def events_unavailable() -> str:
+    return f"{_EVENTS_UNAVAILABLE} - {_EVENTS_UNAVAILABLE_CAUSE}; the tool counts exclude them"
+
+
+def journal_size(journal_bytes: int) -> str:
+    size = max(0, int(journal_bytes))
+    return _mib(size) if size >= 1024 * 1024 else f"{max(1, round(size / 1024))} KiB"
+
+
+def interrupted_pass_cause(store: str, journal_bytes: int | None = None) -> str:
+    """The read surfaces' "a crashed pass left it unreadable until the next one", once a hot
+    rollback journal no live index pass holds proves it."""
+    cause = f"an interrupted index pass left {store} unreadable until the next one"
+    if journal_bytes is None:
+        return cause
+    return f"{cause} ({journal_size(journal_bytes)} rollback journal)"
+
+
+# Searches read a private copy that rolls the journal back; only updates wait for the next pass.
+SEARCH_INDEX_INTERRUPTED = (
+    "an interrupted index pass left the search index mid-update - searches serve its last "
+    "complete update until the next one")
+
+
+def events_interrupted_pass(journal_bytes: int | None = None) -> str:
+    return f"{_EVENTS_UNAVAILABLE} - {interrupted_pass_cause('the event store', journal_bytes)}"
+
+
+def chats_events_unavailable(chats: int) -> str:
+    return (f"{_EVENTS_UNAVAILABLE} for {count_noun(chats, 'chat')} - "
+            f"{_EVENTS_UNAVAILABLE_CAUSE}; their time and status rest on their turns alone")
+
+
+def tools_gap_line(reason: str) -> str:
+    """The one line beside a scan's hits when it served prose only, naming why."""
+    if reason == EVENTS_UNAVAILABLE_ERROR_CODE:
+        return f"{_EVENTS_UNAVAILABLE} - prose only; {_EVENTS_UNAVAILABLE_CAUSE}"
+    return SCAN_TOOLS_PENDING_LINE
+
+
+def tool_query_gap_line(reason: str) -> str:
+    """Why a tool-only query on a prose-only scan ran nothing."""
+    if reason == EVENTS_UNAVAILABLE_ERROR_CODE:
+        return f"{_EVENTS_UNAVAILABLE} - {_EVENTS_UNAVAILABLE_CAUSE}"
+    return TOOL_QUERY_PENDING_LINE
+
+
+def tools_gap_zero_line(mode: str, reason: str) -> str:
+    if reason == EVENTS_UNAVAILABLE_ERROR_CODE:
+        label = mode if mode in ("keyword", "word", "regex") else "keyword"
+        return f"{label}: 0 matching rows in prose - {_EVENTS_UNAVAILABLE}"
+    return tools_pending_zero_line(mode)
+
+
+def count_floor_tools_gap(total: int, reason: str) -> str:
+    if reason == EVENTS_UNAVAILABLE_ERROR_CODE:
+        return f">={max(0, int(total)):,} counts prose only - {_EVENTS_UNAVAILABLE}"
+    return count_floor_tools_pending(total)
+
+
+def tier_counts_gap_line(reason: str) -> str:
+    if reason == EVENTS_UNAVAILABLE_ERROR_CODE:
+        return f"tier counts are unavailable - {_EVENTS_UNAVAILABLE}"
+    return "tier counts are unavailable while tool output is still indexing"
+
+
+def tools_excluded_record(reason: str) -> dict:
+    """The machine field a prose-only scan carries; an unreadable store also says why."""
+    record = {"reason": reason}
+    if reason == EVENTS_UNAVAILABLE_ERROR_CODE:
+        record["note"] = tools_gap_line(reason)
+    return record
+
+
 AROUND_SERVICE_LINES: Mapping[str, Callable[[Mapping], str]] = MappingProxyType({
     "turn_clamped": lambda n: (
         f"{turn_not_served(n['requested'], n['first_turn'], n['last_turn'])} - "
@@ -2326,6 +2533,7 @@ AROUND_SERVICE_LINES: Mapping[str, Callable[[Mapping], str]] = MappingProxyType(
         f"handle prefix matched {count_noun(n['candidates'], 'session')}; "
         f"its digest holds in {n['session']} alone"),
     "content_moved": lambda n: handle_content_moved(n["requested"], n["served"]),
+    "events_unavailable": lambda n: events_unavailable(),
 })
 
 
@@ -2401,6 +2609,18 @@ SEMANTIC_LANE_POLICY = SemanticLanePolicy(
 SEMANTIC_INDEX_UPDATE_REASON = "index update in progress; retry shortly"
 SEMANTIC_WORKER_TRANSIENT_REASON = (
     "semantic worker was busy or starting; retry shortly")
+# Generations the background refresh reaches searchable without a human; corrupt
+# (integrity), legacy-publication (`agrep index`), unknown and empty (a crashed
+# probe) stay doctor alarms.
+SEMANTIC_SELF_HEALING_GENERATION_STATES = frozenset({
+    "current", "partial", "stale", "missing-embeddings", "missing-source",
+    "unstable-source", "unstable-embeddings",
+    "profile-mismatch", "profile-unavailable", "legacy-embeddings",
+})
+
+
+def semantic_generation_self_heals(state: object) -> bool:
+    return str(state or "") in SEMANTIC_SELF_HEALING_GENERATION_STATES
 
 
 def _semantic_index_update_retryable(reason: str) -> bool:
@@ -2762,3 +2982,27 @@ def observed_semantic_deferral(
     if deferral:
         return deferral
     return semantic_deferral(memory, on_battery, battery_percent, load_probe())
+
+
+# Every coherence state that serves queries: complete, newest-but-partial, and
+# a queryable older publication. Catch-up for these keeps the full governor.
+SEMANTIC_SEARCHABLE_STATES = frozenset({"current", "partial", "published"})
+
+
+def lane_semantic_deferral(
+    state: object,
+    memory_probe: Callable[[], float | None],
+    battery_probe: Callable[[], tuple[bool | None, int | None]],
+    load_probe: Callable[[], float | None],
+) -> SemanticDeferral | None:
+    """What actually pauses the next background pass for a lane in ``state``.
+
+    A lane nobody can query gets its bounded pass through battery and CPU
+    load (only memory pressure defers it); a searchable lane's catch-up keeps
+    the full governor. Doctor renders from this so it cannot promise a pause
+    the scheduler will not take.
+    """
+    if str(state or "") in SEMANTIC_SEARCHABLE_STATES:
+        return observed_semantic_deferral(memory_probe, battery_probe, load_probe)
+    return observed_semantic_deferral(
+        memory_probe, lambda: (False, None), lambda: None)

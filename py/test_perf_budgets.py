@@ -18,6 +18,8 @@ import re
 import subprocess
 import sys
 import tempfile
+
+from _test_support import scrub_coordination_namespaces, fixture_tree  # noqa: E402
 import time
 import unittest
 from unittest import mock
@@ -441,6 +443,7 @@ class PerfBudgets(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(
             prefix="agrep-budget-", dir=_perf_fixture_parent())
         cls.addClassCleanup(cls.tmp.cleanup)
+        cls.addClassCleanup(scrub_coordination_namespaces, cls.tmp.name)
         root = Path(cls.tmp.name)
         cls.home, cls.data, cls.protected_data, cls.protected_canary = (
             _prepare_paths(root))
@@ -512,7 +515,7 @@ class PerfBudgets(unittest.TestCase):
 
     def test_source_cli_current_window_is_identical_across_machine_surfaces(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-window-contract-") as td:
+        with fixture_tree(prefix="agrep-window-contract-") as td:
             root = Path(td)
             home, data, protected, canary = _prepare_paths(root)
             _write_small_fixture(
@@ -741,6 +744,7 @@ class FreshnessBudgets(unittest.TestCase):
         _require_measured_runtime()
         self.tmp = tempfile.TemporaryDirectory(prefix="agrep-freshness-budget-")
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(scrub_coordination_namespaces, self.tmp.name)
         root = Path(self.tmp.name)
         (self.home, self.data, self.protected_data,
          self.protected_canary) = _prepare_paths(root)
@@ -872,6 +876,7 @@ class FlatScaleBudget(unittest.TestCase):
         _require_measured_runtime()
         cls.tmp = tempfile.TemporaryDirectory(prefix="agrep-flat50k-budget-")
         cls.addClassCleanup(cls.tmp.cleanup)
+        cls.addClassCleanup(scrub_coordination_namespaces, cls.tmp.name)
         root = Path(cls.tmp.name)
         (cls.home, cls.data, cls.protected_data,
          cls.protected_canary) = _prepare_paths(root)
@@ -1059,7 +1064,7 @@ class BudgetHarnessNegativeControls(unittest.TestCase):
         with mock.patch.dict(os.environ, {_PERF_CLI_ENV: "relative/agrep"}):
             with self.assertRaisesRegex(AssertionError, "absolute executable"):
                 _validate_installed_runtime(os.environ[_PERF_CLI_ENV])
-        with tempfile.TemporaryDirectory(prefix="agrep-missing-seam-") as tmp:
+        with fixture_tree(prefix="agrep-missing-seam-") as tmp:
             missing = Path(tmp) / "agrep"
             with mock.patch.dict(os.environ, {_PERF_CLI_ENV: str(missing)}):
                 with self.assertRaisesRegex(AssertionError, "is unavailable"):
@@ -1068,7 +1073,7 @@ class BudgetHarnessNegativeControls(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "outside the source"):
                 _validate_installed_runtime(os.environ[_PERF_CLI_ENV])
         if os.name != "nt":
-            with tempfile.TemporaryDirectory(
+            with fixture_tree(
                     prefix="agrep-nonexec-seam-") as tmp:
                 nonexec = Path(tmp) / "agrep"
                 nonexec.write_text("candidate\n", encoding="utf-8")
@@ -1076,7 +1081,7 @@ class BudgetHarnessNegativeControls(unittest.TestCase):
                     _validate_installed_runtime(str(nonexec))
 
     def test_installed_candidate_owns_python_and_native_resolution(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-installed-seam-") as tmp:
+        with fixture_tree(prefix="agrep-installed-seam-") as tmp:
             root = Path(tmp)
             executable = root / (
                 "agrep.exe" if os.name == "nt" else "agrep")
@@ -1113,7 +1118,7 @@ class BudgetHarnessNegativeControls(unittest.TestCase):
                 self.assertNotIn("CLAUDECODE", isolated)
 
     def test_source_mode_preserves_checkout_argv_native_and_bytecode(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-source-seam-") as tmp:
+        with fixture_tree(prefix="agrep-source-seam-") as tmp:
             root = Path(tmp)
             release = root / "agrep-rs"
             release.write_text("source native\n", encoding="utf-8")
@@ -1202,7 +1207,7 @@ class BudgetHarnessNegativeControls(unittest.TestCase):
             _validate_optional_slow_profile("", 0.42, forced=True)
 
     def test_bulk_file_runner_bypasses_stdout_pipe_and_forces_timing(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-bulk-sink-") as tmp:
+        with fixture_tree(prefix="agrep-bulk-sink-") as tmp:
             output = Path(tmp) / "rows.tsv"
             seen = {}
 
@@ -1239,7 +1244,7 @@ class BudgetHarnessNegativeControls(unittest.TestCase):
         agent = (
             f"{SCALE_SESSION}\tclaude\tflat50k-fixture\t0\tagent\t"
             "flat budget reply 0 fiftyk lantern")
-        with tempfile.TemporaryDirectory(prefix="agrep-bulk-validate-") as tmp, \
+        with fixture_tree(prefix="agrep-bulk-validate-") as tmp, \
                 mock.patch(f"{__name__}.SCALE_ROWS", 2):
             output = Path(tmp) / "rows.tsv"
             output.write_bytes(f"{user}\r\n{agent}\r\n".encode())
@@ -1315,6 +1320,7 @@ class FreshnessDisclosureBlackBox(_IsolatedBlackBox, unittest.TestCase):
             raise unittest.SkipTest(f"release binary missing: {RELEASE_BIN}")
         cls.tmp = tempfile.TemporaryDirectory(prefix="agrep-fresh-")
         cls.addClassCleanup(cls.tmp.cleanup)
+        cls.addClassCleanup(scrub_coordination_namespaces, cls.tmp.name)
         root = Path(cls.tmp.name)
         cls.home, cls.data = root / "home", root / "data"
         cls.addClassCleanup(_stop_fixture_processes, cls.home, cls.data)
@@ -1455,6 +1461,7 @@ class DisclosureCompositionBlackBox(_IsolatedBlackBox, unittest.TestCase):
             raise unittest.SkipTest(f"release binary missing: {RELEASE_BIN}")
         cls.tmp = tempfile.TemporaryDirectory(prefix="agrep-compose-")
         cls.addClassCleanup(cls.tmp.cleanup)
+        cls.addClassCleanup(scrub_coordination_namespaces, cls.tmp.name)
         root = Path(cls.tmp.name)
         cls.home, cls.data = root / "home", root / "data"
         cls.addClassCleanup(_stop_fixture_processes, cls.home, cls.data)

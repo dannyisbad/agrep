@@ -169,6 +169,23 @@ class ExplorerSecurityTests(unittest.TestCase):
         self.assertEqual(payload["tools_excluded"], {"reason": "tools-pending"})
         self.assertFalse(payload["totals_exact"])
 
+    def test_search_discloses_an_unreadable_event_store(self) -> None:
+        cookie = self.enroll()
+        result = {
+            "engine": "jsonl", "total": 0, "totals_exact": False,
+            "tools_excluded": True, "tools_excluded_reason": "events-unavailable",
+            "hits": [],
+        }
+        with mock.patch.object(search, "run_query", return_value=result):
+            status, _headers, body = self.request(
+                "GET", "/api/search?q=needle", headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        excluded = json.loads(body)["tools_excluded"]
+        self.assertEqual(excluded["reason"], "events-unavailable")
+        self.assertIn("tool events are unavailable right now", excluded["note"])
+        app = (ROOT / "web" / "app.html").read_text(encoding="utf-8")
+        self.assertIn("No prose hits; tool events are unavailable right now.", app)
+
     def test_context_drops_tool_output_and_caps_visible_payloads(self) -> None:
         cookie = self.enroll()
         raw = {
@@ -194,6 +211,25 @@ class ExplorerSecurityTests(unittest.TestCase):
         self.assertNotIn("output", window["events"][0])
         self.assertTrue(window["events"][0]["input_truncated"])
         self.assertTrue(window["turns"][0]["text_truncated"])
+
+    def test_context_discloses_tool_events_it_could_not_read(self) -> None:
+        # /api/around used to drop the window's flag, showing no tool events and no reason.
+        cookie = self.enroll()
+        raw = {
+            "session": "session", "agent": "codex", "project": "fixture",
+            "first_turn": 1, "last_turn": 1, "center": 1,
+            "turns": [{"turn": 1, "ts": 0, "who": "user", "text": "hi", "reply": "ok"}],
+            "events": [], "events_unavailable": True,
+        }
+        for flag in (True, False):
+            with mock.patch.object(
+                    explore, "get_window",
+                    return_value=raw | {"events_unavailable": flag}):
+                status, _headers, body = self.request(
+                    "GET", "/api/around?session=session&turn=1",
+                    headers={"Cookie": cookie})
+            self.assertEqual(status, 200)
+            self.assertIs(json.loads(body)["events_unavailable"], flag)
 
     def test_context_has_aggregate_turn_event_and_character_caps(self) -> None:
         raw = {
@@ -559,6 +595,16 @@ class ExplorerPackagingTests(unittest.TestCase):
         self.assertIn('async function loadHistoryWindow(', app)
         self.assertIn('radius: String(radius)', app)
         self.assertIn('reader.scrollTop = 0;', app)
+
+    def test_history_context_shows_unavailable_tool_events(self) -> None:
+        app = (ROOT / "web" / "app.html").read_text(encoding="utf-8")
+        self.assertIn("if (windowData.events_unavailable) {", app)
+        line = next(
+            line for line in app.splitlines()
+            if 'head.append(node("div", "cut", "tool events are unavailable right now' in line)
+        # A crashed writer's store heals only on the next index pass, never by waiting.
+        self.assertIn("`agrep index`", line)
+        self.assertNotIn("retry in a moment", line)
 
     def test_runtime_manifest_carries_server_and_app(self) -> None:
         manifest = json.loads(

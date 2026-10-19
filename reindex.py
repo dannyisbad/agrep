@@ -32,6 +32,7 @@ WIN = sys.platform == "win32"
 sys.path.insert(0, str(ROOT / "py"))
 import common  # noqa: E402  -- single source for binary and data paths
 import dist  # noqa: E402
+import index_lock  # noqa: E402
 import indexd_runtime  # noqa: E402
 import surface_policy as surface  # noqa: E402
 
@@ -180,7 +181,8 @@ def main() -> int:
         ),
     )
     ap.add_argument("--full", action="store_true",
-                    help="reparse every source and rebuild semantic embeddings")
+                    help="reparse every source and rebuild semantic embeddings, leaving out "
+                         "(and naming) history that cannot be read")
     # Developer/test seam; installed wheels have no Cargo workspace to skip.
     ap.add_argument("--no-build", action="store_true", help=argparse.SUPPRESS)
     # tolerated: an old caller (UI button on a stale server) must not crash the rebuild
@@ -211,14 +213,33 @@ def main() -> int:
     ownership = indexd_runtime.derived_writer_mutation_info(
         allow_legacy_adoption=True)
     if not ownership.writable:
-        print(f"  ! reindex skipped: {ownership.reason}.", flush=True)
+        reason = ownership.reason
+        if ownership.journal_blocked:
+            corpus = common.DATA_DIR / "corpus.db"
+            state = index_lock.rollback_journal_state(corpus, common.INDEX_LOCK_PATH)
+            # No writer holds it: a pass that died mid-write left it, and the next index
+            # pass rolls it back before it does anything else.
+            if state.get("state") == "interrupted-pass":
+                reason = (f"an interrupted index pass left {corpus} mid-write; "
+                          f"`{common.cli_name()} index` rolls it back, then rerun this")
+        print(f"  ! reindex skipped: {reason}.", flush=True)
         return 1
-    # --full also bypasses the Rust per-file parse cache (clean re-parse of every store file)
+    # --full also bypasses the Rust per-file parse cache (clean re-parse of every store file).
+    # An explicit full rebuild is the consent to publish without what cannot be read, which
+    # otherwise holds every pass back; no other caller passes --drop-unreadable.
     ingest = common.ingest_bin()
+    consent = ["--drop-unreadable"] if args.full else []
+    try:
+        env = indexd_runtime.explicit_rust_writer_env(ingest)
+    except OSError as fenced:
+        # a fenced writer (an event-store sidecar this user cannot use, among others) is a
+        # decline with its cause, as `index --full` gives it, never a crash
+        print(f"  ! reindex skipped: {indexd_runtime.fenced_reason(fenced)}.", flush=True)
+        return 1
     run(
         "ingest transcripts (rust)",
-        [str(ingest), "index", "--agent", "all", *full],
-        env=indexd_runtime.rust_writer_env(ingest))
+        [str(ingest), "index", "--agent", "all", "--retry-failed-sources", *full, *consent],
+        env=env)
 
     refreshed = indexd_runtime.refresh_search_index(quiet=False)
     if refreshed is False:

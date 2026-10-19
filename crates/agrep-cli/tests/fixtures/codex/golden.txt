@@ -8,14 +8,14 @@
 {"id":"codex:33333333-3333-4333-8333-333333333333:0","agent":"codex","project":"beta","session":"33333333-3333-4333-8333-333333333333","ts":1767351600000,"turn":0,"text":"[subagent task] /root/model_check (from /root)","content_digest":"b68f","who":"subagent","model":"gpt-5.5-codex","model_source":"explicit"}
 {"id":"codex:33333333-3333-4333-8333-333333333333:1","agent":"codex","project":"beta","session":"33333333-3333-4333-8333-333333333333","ts":1767351660000,"turn":1,"text":"[subagent message] /root/model_check (from /root)","content_digest":"6b27","who":"subagent","model":"gpt-5.5-codex","model_source":"explicit"}
 === replies.jsonl (8 lines) ===
-{"id":"codex:01990001-0002-7000-8000-000000000002:0","reply":"Legacy direct child retained.","content_digest":"619f","reply_chars":29,"reply_truncated":false}
-{"id":"codex:01990002-0002-7000-8000-000000000002:0","reply":"Legacy delegation child retained.","content_digest":"ca74","reply_chars":33,"reply_truncated":false}
-{"id":"codex:01990003-0003-7000-8000-000000000003:0","reply":"The native job path belongs to the child only.","content_digest":"e751","reply_chars":46,"reply_truncated":false}
-{"id":"codex:01990003-0003-7000-8000-000000000003:1","reply":"Worker chronology checked.","content_digest":"b260","reply_chars":26,"reply_truncated":false}
-{"id":"codex:22222222-2222-4222-8222-222222222222:0","reply":"Wrapped fetch in a 3-try loop with backoff.","content_digest":"c759","reply_chars":43,"reply_truncated":false}
-{"id":"codex:22222222-2222-4222-8222-222222222222:1","reply":"Capped the backoff at 2000ms.","content_digest":"fc20","reply_chars":29,"reply_truncated":false}
-{"id":"codex:33333333-3333-4333-8333-333333333333:0","reply":"The Granite audit found no current IBM models.","content_digest":"31df","reply_chars":46,"reply_truncated":false}
-{"id":"codex:33333333-3333-4333-8333-333333333333:1","reply":"Compared Granite against the current embedding and reranking roles.","content_digest":"fadf","reply_chars":67,"reply_truncated":false}
+{"id":"codex:01990001-0002-7000-8000-000000000002:0","reply":"Legacy direct child retained.","content_digest":"619f","reply_chars":29,"reply_truncated":false,"reply_lead":1}
+{"id":"codex:01990002-0002-7000-8000-000000000002:0","reply":"Legacy delegation child retained.","content_digest":"ca74","reply_chars":33,"reply_truncated":false,"reply_lead":0}
+{"id":"codex:01990003-0003-7000-8000-000000000003:0","reply":"The native job path belongs to the child only.","content_digest":"e751","reply_chars":46,"reply_truncated":false,"reply_lead":1}
+{"id":"codex:01990003-0003-7000-8000-000000000003:1","reply":"Worker chronology checked.","content_digest":"b260","reply_chars":26,"reply_truncated":false,"reply_lead":0}
+{"id":"codex:22222222-2222-4222-8222-222222222222:0","reply":"Wrapped fetch in a 3-try loop with backoff.","content_digest":"c759","reply_chars":43,"reply_truncated":false,"reply_lead":1}
+{"id":"codex:22222222-2222-4222-8222-222222222222:1","reply":"Capped the backoff at 2000ms.","content_digest":"fc20","reply_chars":29,"reply_truncated":false,"reply_lead":0}
+{"id":"codex:33333333-3333-4333-8333-333333333333:0","reply":"The Granite audit found no current IBM models.","content_digest":"31df","reply_chars":46,"reply_truncated":false,"reply_lead":1}
+{"id":"codex:33333333-3333-4333-8333-333333333333:1","reply":"Compared Granite against the current embedding and reranking roles.","content_digest":"fadf","reply_chars":67,"reply_truncated":false,"reply_lead":0}
 === sessions.jsonl (5 lines) ===
 {"session":"01990001-0002-7000-8000-000000000002","agent":"codex","project":"legacy","n":1,"first_ts":1767358800000,"last_ts":1767358800000,"first_text":"[subagent task] verify the legacy direct child path","parent":"01990001-0001-7000-8000-000000000001"}
 {"session":"01990002-0002-7000-8000-000000000002","agent":"codex","project":"legacy","n":1,"first_ts":1767362400000,"last_ts":1767362400000,"first_text":"[subagent task] review legacy adapter parsing and report exact evidence","parent":"01990002-0001-7000-8000-000000000001"}

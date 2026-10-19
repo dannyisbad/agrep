@@ -380,8 +380,11 @@ pub fn keyed_token(
         .unwrap()
         .push((id, Some(legacy), agent, fingerprint, Arc::clone(&tally)));
     opened(&tally);
+    // A reserved session (a store census, "\0…\0") is bookkeeping outside any guarded parse.
     #[cfg(feature = "parse-panic-injection")]
-    inject_parse_panic(&path.to_string_lossy());
+    if !session.starts_with('\0') {
+        inject_parse_panic(&path.to_string_lossy());
+    }
     tally
 }
 

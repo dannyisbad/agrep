@@ -15,6 +15,7 @@ import sys
 import time
 
 import boundary_rank
+from hookless import _log
 from proc import WIN
 import surface_policy as surface
 
@@ -32,11 +33,35 @@ def dbg(msg: str, sign: str = "*") -> None:
     ms = (time.time() - _DBG_T0) * 1000.0
     line = f"{sign} [agrep +{ms:8.1f}ms] {msg}"
     try:
-        if sys.stderr.isatty() and enable_vt():
+        if color_enabled(sys.stderr):
             line = f"\033[2m{line}\033[0m"  # dim, like curl's verbose chatter
     except Exception:  # noqa: BLE001 -- isatty on an odd stream; just print plain
         pass
     print(line, file=sys.stderr, flush=True)
+
+
+def settle_interrupts() -> None:
+    """For a process entry point whose command has finished: a Ctrl-C from here
+    on (the rest of a storm that ended a full-screen view) ends the process at
+    once, dying of SIGINT, rather than surfacing as a KeyboardInterrupt
+    traceback from interpreter shutdown (atexit hooks, thread joins). A Ctrl-C
+    already caught raises KeyboardInterrupt here, so callers call it in a loop
+    until it returns. In-process callers of a command's main() never call it
+    and keep their own handler."""
+    import signal
+    try:
+        # switching straight to SIG_DFL would report a Ctrl-C caught just
+        # before as "Signal 2 ignored due to race condition" (CPython
+        # bpo-43406); this handler switches and dies in one step
+        signal.signal(signal.SIGINT, _die_of_signal)
+    except (OSError, ValueError):  # not the main thread
+        pass
+
+
+def _die_of_signal(signum, _frame) -> None:
+    import signal
+    signal.signal(signum, signal.SIG_DFL)
+    signal.raise_signal(signum)
 
 
 _PROFILE_T0 = float(os.environ.get("AGREP_T0") or time.perf_counter())
@@ -86,6 +111,24 @@ def timing_trace(label: str, payload: dict) -> None:
         print(line, file=sys.stderr, flush=True)
 
 
+# Console output modes as they were before enable_vt turned VT processing on,
+# so a full-screen view can hand the console back as it found it.
+_VT_ORIGINAL: dict[int, int] = {}
+
+
+def _console_kernel32():
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetStdHandle.argtypes = (wintypes.DWORD,)
+    k32.GetStdHandle.restype = wintypes.HANDLE
+    k32.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    k32.GetConsoleMode.restype = wintypes.BOOL
+    k32.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    k32.SetConsoleMode.restype = wintypes.BOOL
+    return k32
+
+
 def enable_vt() -> bool:
     """Turn on ANSI escape processing for this process's console streams. Windows
     conhost ships with VT processing off, so \\r\\x1b[K-style repaints render as
@@ -98,33 +141,54 @@ def enable_vt() -> bool:
         import ctypes
         from ctypes import wintypes
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.GetStdHandle.argtypes = (wintypes.DWORD,)
-        k32.GetStdHandle.restype = wintypes.HANDLE
-        k32.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        k32.GetConsoleMode.restype = wintypes.BOOL
-        k32.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-        k32.SetConsoleMode.restype = wintypes.BOOL
+        k32 = _console_kernel32()
         ok = True
         for std_handle in (-11, -12):  # stdout, stderr
             h = k32.GetStdHandle(std_handle)
             mode = wintypes.DWORD()
             if not k32.GetConsoleMode(h, ctypes.byref(mode)):
                 continue  # redirected stream, not a console - nothing paints there
-            if not mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING and not \
-                    k32.SetConsoleMode(h, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+            if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+                continue
+            if k32.SetConsoleMode(h, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+                _VT_ORIGINAL.setdefault(int(h or 0), mode.value)
+            else:
                 ok = False
         return ok
     except (AttributeError, OSError):
         return False
 
 
+def restore_vt() -> None:
+    """Put back the console output modes enable_vt changed; never raises."""
+    if not WIN or not _VT_ORIGINAL:
+        return
+    try:
+        k32 = _console_kernel32()
+        for handle, mode in _VT_ORIGINAL.items():
+            k32.SetConsoleMode(handle, mode)
+    except (AttributeError, OSError):
+        pass
+    _VT_ORIGINAL.clear()
+
+
 def color_enabled(stream, when: str = "auto") -> bool:
-    if when == "always":
-        return True
+    """The one colour rule: an explicit --color wins, then NO_COLOR disables, then
+    FORCE_COLOR forces (both set and non-empty), then a tty that renders VT."""
     if when == "never":
         return False
-    return bool(stream.isatty() and enable_vt())
+    forced = True if when == "always" else _log.color_override()
+    if forced is None:
+        return bool(stream.isatty() and enable_vt())
+    if forced:
+        # Forced colour on a console still needs conhost's VT processing switched on,
+        # or the escapes print literally; the user's decision stands either way.
+        try:
+            if stream.isatty():
+                enable_vt()
+        except Exception:  # noqa: BLE001 -- an odd stream without isatty
+            pass
+    return forced
 
 
 def utf8_stdio() -> None:

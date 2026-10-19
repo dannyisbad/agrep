@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
@@ -13,7 +15,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import scrub_coordination_namespaces, fixture_tree, isolate_data_dir
 
 
 isolate_data_dir()
@@ -25,8 +27,27 @@ import indexd_runtime  # noqa: E402
 
 setUpModule, tearDownModule = lift_daemon_semantics(indexd_runtime)
 import common  # noqa: E402
+import corpusdb  # noqa: E402
+import doctor  # noqa: E402
 import ownerfile  # noqa: E402
+import removal_fence  # noqa: E402
 import semworker  # noqa: E402
+import surface_policy as surface  # noqa: E402
+
+
+def _restat(info: os.stat_result, **fields: int) -> os.stat_result:
+    """A stat_result with ``fields`` replaced and every extended field kept
+    (a plain tuple rebuild drops st_mtime_ns and friends)."""
+    values = list(info)
+    for name, value in fields.items():
+        values[getattr(stat, name)] = value
+    extra = {
+        name: getattr(info, name)
+        for name in ("st_atime", "st_mtime", "st_ctime", "st_atime_ns",
+                     "st_mtime_ns", "st_ctime_ns", "st_blocks", "st_blksize",
+                     "st_rdev", "st_flags", "st_gen", "st_birthtime")
+        if hasattr(info, name)}
+    return os.stat_result(tuple(values[:10]) + tuple(values[10:]), extra)
 
 
 class _Clock:
@@ -49,17 +70,29 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.saved_data_dir = common.DATA_DIR
         common.DATA_DIR = self.root
+        # The worker gate also reads store paths these modules bound at import to the
+        # process-wide data dir, which every module in a shared interpreter writes to.
+        for module, name, target in (
+                (removal_fence, "DATA_DIR", self.root),
+                (indexd_runtime, "DERIVED_OWNER_PATH", self.root / ".derived-owner.json"),
+                (indexd_runtime, "INGEST_CACHE_PATH", self.root / ".ingest_cache.bin"),
+                (corpusdb, "DB_PATH", self.root / "corpus.db")):
+            patcher = mock.patch.object(module, name, target)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.production_coordination_base_path = (
             semworker._coordination_base_path)
         self.coordination = mock.patch.object(
             semworker, "_coordination_base_path", return_value=self.root)
         self.coordination.start()
+        # fixtures write raw records; a writer would have minted the namespace
+        semworker._prepare_ephemeral_coordination_dir()
 
     def tearDown(self) -> None:
         self.coordination.stop()
         common.DATA_DIR = self.saved_data_dir
+        scrub_coordination_namespaces(self.temp.name)
         self.temp.cleanup()
-
     @staticmethod
     def _record(
             *, pid: int = 4242, process_start: str = "birth",
@@ -150,6 +183,23 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 "queued fallback", level="hybrid", k=3,
                 timeout_s=1.0, start_timeout_s=0.5)
         request.assert_not_called()
+
+    def test_worker_gate_reads_only_this_tests_store(self) -> None:
+        """Ownership and removal state another module left in the shared data dir
+        must not decide whether this module's follower may wait."""
+        for path in (removal_fence.background_removal_path(),
+                     removal_fence.background_removal_cooldown_path(),
+                     indexd_runtime.DERIVED_OWNER_PATH,
+                     indexd_runtime.INGEST_CACHE_PATH,
+                     corpusdb.DB_PATH):
+            self.assertTrue(path.is_relative_to(self.root), path)
+        with self._clear_worker_env():
+            self.assertFalse(semworker._worker_disabled())
+            removal_fence.background_removal_path().write_text(json.dumps({
+                "pid": os.getpid(),
+                "process_start": common.process_start_identity(os.getpid()),
+                "started_at": time.time(), "nonce": "b" * 32}), encoding="utf-8")
+            self.assertTrue(semworker._worker_disabled())
 
     def test_follower_stops_waiting_when_peer_claim_disappears(self) -> None:
         clock = _Clock()
@@ -288,6 +338,33 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         if slot is not None:
             semworker._release_request_slot(slot)
 
+    def test_a_caller_reclaims_its_own_stranded_request_slot(self) -> None:
+        # a release honours a mutex an earlier reap minted; one held past every attempt
+        # leaves the record naming this live process, which only this process may reclaim
+        path = semworker.request_lock_path()
+        with mock.patch.object(
+                common, "process_start_identity", return_value="self-birth"):
+            slot = semworker._acquire_request_slot(time.monotonic() + 1.0)
+            self.assertIsNotNone(slot)
+            stranded = slot.snapshot
+            (path.parent / semworker.ownerfile.SLOT_MUTEX_NAME).touch()
+            with mock.patch.object(
+                    semworker.ownerfile, "_lock_descriptor", return_value="busy"), \
+                    mock.patch.object(semworker.ownerfile, "_SLOT_MUTEX_WAIT_S", 0.01):
+                self.assertFalse(semworker._release_request_slot(slot))
+            self.assertEqual(semworker.ownerfile.snapshot(path), stranded)
+            self.assertTrue(semworker._request_slot_reclaimable(stranded))
+            with mock.patch.object(
+                    semworker.ownerfile, "_HELD_TOKENS", {slot.token}):
+                self.assertFalse(semworker._request_slot_reclaimable(stranded))
+                with self.assertRaises(semworker.ResidentSemanticPreflightTimeout):
+                    semworker._acquire_request_slot(time.monotonic() + 0.2)
+            again = semworker._acquire_request_slot(time.monotonic() + 1.0)
+            self.assertIsNotNone(again)
+            self.assertNotEqual(again.snapshot.raw, stranded.raw)
+            self.assertTrue(semworker._release_request_slot(again))
+        self.assertFalse(path.exists())
+
     def test_request_coordination_respects_removal_fence(self) -> None:
         with mock.patch.object(
                 semworker.removal_fence, "background_removal_active",
@@ -414,7 +491,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             semworker._validate_request(request)
 
     def test_production_coordination_is_external_to_readonly_data_dir(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-runtime-") as runtime_raw:
             runtime = Path(runtime_raw)
             protected = runtime / "protected-data"
@@ -439,15 +516,8 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 worker_path = semworker.worker_lock_path()
                 self.assertEqual(request_path.parent.parent, runtime.resolve())
                 self.assertEqual(worker_path.parent, request_path.parent)
-                coordination_info = os.lstat(request_path.parent)
-                if os.name == "nt":
-                    self.assertFalse(
-                        getattr(coordination_info, "st_file_attributes", 0)
-                        & getattr(
-                            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-                else:
-                    self.assertEqual(
-                        stat.S_IMODE(coordination_info.st_mode), 0o700)
+                # resolving a path mints nothing; the writers below do
+                self.assertFalse(request_path.parent.exists())
                 self.assertNotEqual(request_path, worker_path)
                 self.assertEqual(
                     semworker.descriptor_path().parent, protected)
@@ -459,6 +529,15 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 owner = semworker.acquire_inprocess_owner()
                 self.assertIsInstance(slot, ownerfile.Handle)
                 self.assertIsInstance(owner, ownerfile.Handle)
+                coordination_info = os.lstat(request_path.parent)
+                if os.name == "nt":
+                    self.assertFalse(
+                        getattr(coordination_info, "st_file_attributes", 0)
+                        & getattr(
+                            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+                else:
+                    self.assertEqual(
+                        stat.S_IMODE(coordination_info.st_mode), 0o700)
                 semworker.verify_inprocess_owner(owner)
 
                 with mock.patch.object(common, "DATA_DIR", other):
@@ -487,7 +566,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             "print(json.dumps([str(semworker.worker_lock_path()),"
             "str(semworker.request_lock_path())]))")
         python_path = str(Path(__file__).resolve().parent)
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-path-proof-") as raw:
             root = Path(raw).resolve()
             data = root / "data"
@@ -519,8 +598,8 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             self.assertEqual(outputs[0], outputs[2])
             coordination = Path(outputs[0][0]).parent
             self.assertEqual(coordination, Path(outputs[0][1]).parent)
-            self.assertEqual(stat.S_IMODE(coordination.stat().st_mode), 0o700)
-            coordination.rmdir()
+            # three processes resolved the same path and none minted it
+            self.assertFalse(coordination.exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX cross-process owner proof")
     def test_cross_process_readonly_contender_cannot_split_model_owner(self) -> None:
@@ -540,7 +619,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             "semworker.finish_inprocess_owner(owner,resources_released=True) "
             "if owner is not None else None")
         python_path = str(Path(__file__).resolve().parent)
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-semworker-owner-proof-") as raw:
             root = Path(raw).resolve()
             data = root / "data"
@@ -578,7 +657,8 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             Path(held["path"]).parent.rmdir()
 
     def test_coordination_directory_symlink_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory(
+        # resolving the path is pure; every writer verifies before creating
+        with fixture_tree(
                 prefix="agrep-semworker-coord-symlink-") as runtime_raw:
             runtime = Path(runtime_raw).resolve()
             protected = runtime / "data"
@@ -588,12 +668,22 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             with mock.patch.object(common, "DATA_DIR", protected), \
                     mock.patch.object(
                         semworker, "_coordination_base_path",
-                        return_value=runtime):
+                        return_value=runtime), \
+                    mock.patch.object(
+                        common, "process_start_identity",
+                        return_value="self-birth"):
                 coordination = semworker._ephemeral_coordination_dir()
                 coordination.symlink_to(target, target_is_directory=True)
+                self.assertEqual(
+                    semworker.request_lock_path().parent, coordination)
                 with self.assertRaisesRegex(
-                        OSError, "not a private directory"):
-                    semworker.request_lock_path()
+                        semworker.ResidentSemanticPreflightUnavailable,
+                        "not a private directory"):
+                    semworker._acquire_request_slot(time.monotonic() + 0.5)
+                self.assertIsNone(semworker._acquire_worker_lock())
+                self.assertFalse(semworker._request_worker_retire_handoff(
+                    {"owner_nonce": "a" * 32, "pid": 1, "process_start": "x"}))
+                self.assertEqual(list(target.iterdir()), [])
 
     def test_request_slot_retries_normal_owner_handoff_race(self) -> None:
         slot = mock.Mock()
@@ -696,7 +786,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 semworker, "resident_status",
-                side_effect=(resident, resident)),
+                return_value=resident),
             mock.patch.object(
                 semworker, "loopback_bind_status",
                 return_value={
@@ -742,7 +832,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 semworker, "resident_status",
-                side_effect=(resident, resident)),
+                return_value=resident),
             mock.patch.object(
                 semworker, "loopback_bind_status",
                 return_value={"bindable": True, "reason": None}),
@@ -766,7 +856,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 semworker, "resident_status",
-                side_effect=(resident, resident)),
+                return_value=resident),
             mock.patch.object(
                 semworker, "loopback_bind_status",
                 return_value={"bindable": True, "reason": None}),
@@ -794,7 +884,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 semworker, "resident_status",
-                side_effect=(resident, resident)),
+                return_value=resident),
             mock.patch.object(
                 semworker, "loopback_bind_status",
                 return_value={"bindable": True, "reason": None}),
@@ -862,6 +952,791 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         self.assertIn("derived stores owned by another build", status["reason"])
         self.assertIn("active installed agrep build", status["reason"])
         search_query.assert_not_called()
+
+    def _diagnostic_probe_mocks(self, search_outcomes: list) -> list:
+        resident = {
+            "running": True, "descriptor_state": "ready", "pid": 42,
+        }
+        return [
+            mock.patch.object(
+                semworker, "resident_status",
+                return_value=resident),
+            mock.patch.object(
+                semworker, "loopback_bind_status",
+                return_value={"bindable": True, "reason": None}),
+            mock.patch.object(
+                semworker, "request_coordination_status",
+                return_value={"writable": True, "reason": None}),
+            mock.patch.object(
+                semworker, "search_worker", side_effect=search_outcomes),
+        ]
+
+    def test_diagnostic_status_reports_a_generation_that_moved_under_it(
+            self) -> None:
+        # Right after a large publication the probe (which never refreshes)
+        # answers "stale" while the lane rebinds: that is convergence, not a
+        # broken worker, and the newer observation is what doctor reports.
+        refusal = semworker.ResidentSemanticUnavailable(
+            "embeddings stale for the current generation; inspect with "
+            "`agrep doctor --deep`")
+        moved = {"coherent": False, "searchable": False, "state": "stale"}
+        with contextlib.ExitStack() as stack:
+            for patcher in self._diagnostic_probe_mocks([refusal]):
+                stack.enter_context(patcher)
+            probe = mock.Mock(return_value=moved)
+            status = semworker.diagnostic_query_status(
+                ready=True, timeout_s=0.5, coherence_probe=probe)
+        probe.assert_called_once_with()
+        self.assertEqual(status["state"], "generation-moved")
+        self.assertIsNone(status["query_serving"])
+        self.assertIn("moved during the probe", status["reason"])
+        self.assertIn("stale", status["reason"])
+        self.assertEqual(status["coherence_after"], moved)
+
+    def test_diagnostic_status_retries_once_when_the_lane_is_searchable_again(
+            self) -> None:
+        refusal = semworker.ResidentSemanticUnavailable(
+            "embeddings stale for the current generation")
+        rebound = {"coherent": True, "searchable": True, "state": "current"}
+        with contextlib.ExitStack() as stack:
+            for patcher in self._diagnostic_probe_mocks(
+                    [refusal, {"results": []}]):
+                search_query = stack.enter_context(patcher)
+            status = semworker.diagnostic_query_status(
+                ready=True, timeout_s=0.5,
+                coherence_probe=mock.Mock(return_value=rebound))
+        self.assertEqual(status["state"], "query-serving")
+        self.assertTrue(status["query_serving"])
+        self.assertEqual(search_query.call_count, 2)
+
+    def test_diagnostic_status_bounds_its_retry_under_a_republishing_corpus(
+            self) -> None:
+        # Two refusals in a row with the lane moving between them is still
+        # convergence: at most two queries and two reads, then the honest
+        # "moved" verdict rather than a loop or a false failure.
+        refusal = semworker.ResidentSemanticUnavailable(
+            "embeddings stale for the current generation")
+        rebound = {"coherent": True, "searchable": True, "state": "current"}
+        moved = {"coherent": False, "searchable": False, "state": "stale"}
+        with contextlib.ExitStack() as stack:
+            for patcher in self._diagnostic_probe_mocks([refusal, refusal]):
+                search_query = stack.enter_context(patcher)
+            probe = mock.Mock(side_effect=[rebound, moved])
+            status = semworker.diagnostic_query_status(
+                ready=True, timeout_s=0.5, coherence_probe=probe)
+        self.assertEqual(search_query.call_count, 2)
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(status["state"], "generation-moved")
+        self.assertIsNone(status["query_serving"])
+
+    def test_diagnostic_status_keeps_a_refusal_the_lane_cannot_explain(
+            self) -> None:
+        # The lane reads searchable twice yet the worker refuses twice: that
+        # disagreement is real and stays a failure.
+        refusal = semworker.ResidentSemanticUnavailable(
+            "embeddings stale for the current generation")
+        rebound = {"coherent": True, "searchable": True, "state": "current"}
+        with contextlib.ExitStack() as stack:
+            for patcher in self._diagnostic_probe_mocks([refusal, refusal]):
+                search_query = stack.enter_context(patcher)
+            probe = mock.Mock(return_value=rebound)
+            status = semworker.diagnostic_query_status(
+                ready=True, timeout_s=0.5, coherence_probe=probe)
+        self.assertEqual(search_query.call_count, 2)
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(status["state"], "query-failed")
+        self.assertFalse(status["query_serving"])
+
+    def test_diagnostic_status_keeps_a_refusal_on_a_broken_generation(
+            self) -> None:
+        # A re-read landing on a generation the refresh cannot repair is not
+        # "moved": the refusal stands, so doctor keeps alarming.
+        refusal = semworker.ResidentSemanticUnavailable(
+            "semantic embedding integrity failed")
+        for state in ("corrupt-embeddings", "legacy-publication", "unknown", ""):
+            with self.subTest(state=state), contextlib.ExitStack() as stack:
+                for patcher in self._diagnostic_probe_mocks([refusal]):
+                    stack.enter_context(patcher)
+                status = semworker.diagnostic_query_status(
+                    ready=True, timeout_s=0.5,
+                    coherence_probe=mock.Mock(return_value={
+                        "coherent": False, "searchable": False,
+                        "state": state}))
+                self.assertEqual(status["state"], "query-failed")
+                self.assertFalse(status["query_serving"])
+                self.assertIn("integrity failed", status["reason"])
+
+    def test_diagnostic_status_without_a_probe_keeps_the_refusal(self) -> None:
+        refusal = semworker.ResidentSemanticUnavailable(
+            "embeddings stale for the current generation")
+        with contextlib.ExitStack() as stack:
+            for patcher in self._diagnostic_probe_mocks([refusal]):
+                stack.enter_context(patcher)
+            status = semworker.diagnostic_query_status(
+                ready=True, timeout_s=0.5)
+        self.assertEqual(status["state"], "query-failed")
+        self.assertFalse(status["query_serving"])
+
+    def _probe_in_sandbox(self, *, resident: dict, preexisting: bool,
+                          ready: bool = True) -> tuple[dict, mock.Mock]:
+        """Run the probe against a fresh data dir whose coordination namespace
+        lives under a private base. The pre-query resident read is stubbed;
+        the final observation stays real."""
+        with tempfile.TemporaryDirectory(prefix="agrep-probe-") as raw:
+            root = Path(raw)
+            data = root / "data"
+            data.mkdir()
+            base = root / "tmp"
+            base.mkdir()
+            with (mock.patch.object(common, "DATA_DIR", data),
+                  mock.patch.object(
+                      semworker, "_coordination_base_path", return_value=base),
+                  mock.patch.dict(os.environ, {"AGREP_NO_SEM_WORKER": ""})):
+                namespace = semworker._ephemeral_coordination_dir()
+                if preexisting:
+                    namespace.mkdir(mode=0o700)
+                real_status = semworker.resident_status
+                stubbed = [resident]
+                with (mock.patch.object(
+                          semworker, "resident_status",
+                          side_effect=lambda **kw: (
+                              stubbed.pop(0) if stubbed else real_status(**kw))),
+                      mock.patch.object(
+                          semworker, "loopback_bind_status",
+                          return_value={"bindable": True, "reason": None}),
+                      mock.patch.object(
+                          semworker, "search_worker",
+                          return_value={"results": []}),
+                      mock.patch.object(
+                          semworker, "stop_worker_and_wait") as stop,
+                      mock.patch.object(
+                          semworker, "_request_worker_stop") as request_stop):
+                    status_out = semworker.diagnostic_query_status(
+                        ready=ready, timeout_s=0.5)
+                status_out["_namespace_leftover"] = namespace.exists()
+                stop.request_stop = request_stop
+        return status_out, stop
+
+    def _fresh_sandbox(self):
+        """(data dir, coordination base) patches for a data dir nothing has
+        touched: the namespace must not exist unless a writer creates it."""
+        raw = tempfile.TemporaryDirectory(prefix="agrep-observer-")
+        root = Path(raw.name)
+        data = root / "data"
+        data.mkdir()
+        base = root / "tmp"
+        base.mkdir()
+        stack = contextlib.ExitStack()
+        stack.enter_context(raw)
+        stack.enter_context(mock.patch.object(common, "DATA_DIR", data))
+        stack.enter_context(mock.patch.object(
+            semworker, "_coordination_base_path", return_value=base))
+        return stack, data, base
+
+    def test_observers_never_mint_the_coordination_namespace(self) -> None:
+        # Every data dir a user ever touched used to leave an empty 0700 dir
+        # in /tmp: resolving a lock path created it, and readers resolve.
+        stack, _data, base = self._fresh_sandbox()
+        with stack:
+            semworker.worker_lock_path()
+            semworker.request_lock_path()
+            semworker.retire_request_path("a" * 32)
+            semworker.resident_status(include_resources=True)
+            self.assertEqual(
+                semworker._inspect_worker_lock().state,
+                semworker._WorkerOwnerState.ABSENT)
+            self.assertFalse(semworker._retire_handoff_requested("a" * 32))
+            semworker._discard_retire_handoff("a" * 32)
+            self.assertTrue(semworker.stop_worker_and_wait(0.0, 0.0)["ok"])
+            self.assertEqual(list(base.iterdir()), [])
+
+    def test_every_writer_prepares_and_verifies_the_namespace(self) -> None:
+        stack, _data, base = self._fresh_sandbox()
+        with stack, mock.patch.object(
+                common, "process_start_identity", return_value="self-birth"):
+            namespace = semworker._ephemeral_coordination_dir()
+            slot = semworker._acquire_request_slot(time.monotonic() + 1.0)
+            self.assertIsNotNone(slot)
+            if os.name != "nt":
+                self.assertEqual(
+                    stat.S_IMODE(os.lstat(namespace).st_mode), 0o700)
+            semworker._release_request_slot(slot)
+            namespace.rmdir()
+            owner = semworker._acquire_worker_lock()
+            self.assertIsNotNone(owner)
+            self.assertTrue(namespace.is_dir())
+            semworker._release_unpublished_owner(owner)
+            namespace.rmdir()
+            self.assertTrue(semworker._request_worker_retire_handoff(
+                {"owner_nonce": "b" * 32, "pid": 1, "process_start": "x"}))
+            self.assertTrue(
+                (namespace / ("retire-" + "b" * 32)).is_file())
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership check")
+    def test_a_foreign_owned_namespace_is_refused_by_every_writer(self) -> None:
+        stack, _data, base = self._fresh_sandbox()
+        with stack, mock.patch.object(
+                common, "process_start_identity", return_value="self-birth"):
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.mkdir(mode=0o700)
+            real_lstat = os.lstat
+
+            def foreign(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if Path(path) == namespace:
+                    return _restat(info, ST_UID=info.st_uid + 1)
+                return info
+
+            with mock.patch.object(semworker.os, "lstat", side_effect=foreign):
+                with self.assertRaisesRegex(
+                        semworker.ResidentSemanticPreflightUnavailable,
+                        "foreign owner"):
+                    semworker._acquire_request_slot(time.monotonic() + 0.5)
+                self.assertIsNone(semworker._acquire_worker_lock())
+                self.assertFalse(semworker._request_worker_retire_handoff(
+                    {"owner_nonce": "c" * 32, "pid": 1, "process_start": "x"}))
+            self.assertEqual(list(namespace.iterdir()), [])
+
+    @contextlib.contextmanager
+    def _bystander(self):
+        """A session-leader process a crafted record could name as a worker."""
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+    def _crafted_lock(self, process: subprocess.Popen) -> bytes:
+        start = common.process_start_identity(process.pid)
+        if not start:
+            self.skipTest("no process start identity on this host")
+        return json.dumps({
+            "pid": process.pid, "started_at": time.time(),
+            "process_start": start, "nonce": "d" * 32,
+            "tree_bound": True, "named_job": False,
+        }).encode("utf-8")
+
+    def _assert_readers_refuse(self, process: subprocess.Popen) -> None:
+        """Every record reader sees no usable owner and nothing gets killed."""
+        inspected = semworker._inspect_worker_lock()
+        self.assertIn(inspected.state, (
+            semworker._WorkerOwnerState.ABSENT,
+            semworker._WorkerOwnerState.BLOCKED))
+        self.assertIsNone(inspected.record)
+        resident = semworker.resident_status(include_resources=True)
+        self.assertFalse(resident.get("running"))
+        self.assertFalse(resident.get("starting"))
+        self.assertNotEqual(resident.get("owner_state"), "exact")
+        self.assertFalse(semworker._retire_handoff_requested("d" * 32))
+        semworker._discard_retire_handoff("d" * 32)
+        with mock.patch.object(
+                semworker, "_terminate_worker_tree",
+                side_effect=AssertionError("a bystander was terminated")):
+            outcome = semworker.stop_worker_and_wait(0.3, 1.0)
+        self.assertFalse(outcome.get("fallback_termination"))
+        self.assertIsNone(process.poll(), "the bystander did not survive")
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink and process-group fixture")
+    def test_a_planted_symlink_namespace_cannot_hand_readers_a_record(
+            self) -> None:
+        # Sticky /tmp: another user plants our predictable namespace path as
+        # a symlink to a dir holding a record naming a session leader; the
+        # removal stop used to SIGTERM that process group.
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._bystander() as process:
+            planted = base / "planted"
+            planted.mkdir(mode=0o700)
+            (planted / "worker.lock").write_bytes(self._crafted_lock(process))
+            (planted / ("retire-" + "d" * 32)).write_bytes(b"{}")
+            semworker._ephemeral_coordination_dir().symlink_to(
+                planted, target_is_directory=True)
+            self._assert_readers_refuse(process)
+            self.assertTrue((planted / "worker.lock").exists())
+            self.assertTrue((planted / ("retire-" + "d" * 32)).exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership and mode fixture")
+    def test_a_foreign_or_open_namespace_cannot_hand_readers_a_record(
+            self) -> None:
+        for label, mutate in (
+                ("foreign-uid", lambda v: v.__setitem__(
+                    stat.ST_UID, v[stat.ST_UID] + 1)),
+                ("group-writable", lambda v: v.__setitem__(
+                    stat.ST_MODE, (v[stat.ST_MODE] & ~0o777) | 0o775)),
+                ("world-writable", lambda v: v.__setitem__(
+                    stat.ST_MODE, (v[stat.ST_MODE] & ~0o777) | 0o707))):
+            with self.subTest(label=label):
+                stack, _data, base = self._fresh_sandbox()
+                with stack, self._bystander() as process:
+                    namespace = semworker._ephemeral_coordination_dir()
+                    namespace.mkdir(mode=0o700)
+                    (namespace / "worker.lock").write_bytes(
+                        self._crafted_lock(process))
+                    real_lstat = os.lstat
+
+                    def hostile(path, *args, **kwargs):
+                        info = real_lstat(path, *args, **kwargs)
+                        if Path(path) == namespace:
+                            values = list(info)
+                            mutate(values)
+                            return _restat(
+                                info, ST_UID=values[stat.ST_UID],
+                                ST_MODE=values[stat.ST_MODE])
+                        return info
+
+                    with mock.patch.object(
+                            semworker.os, "lstat", side_effect=hostile):
+                        self._assert_readers_refuse(process)
+                    self.assertTrue((namespace / "worker.lock").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group fixture")
+    def test_a_private_namespace_still_serves_readers_a_record(self) -> None:
+        # The gate refuses only hostile entries. Readers and writers agree: an
+        # own-uid directory nobody else can write into (0700, 0750, 0755)
+        # reads through, as the writer would simply repair its mode.
+        for mode in (0o700, 0o750, 0o755):
+            with self.subTest(mode=oct(mode)):
+                stack, _data, base = self._fresh_sandbox()
+                with stack, self._bystander() as process:
+                    namespace = semworker._ephemeral_coordination_dir()
+                    namespace.mkdir(mode=0o700)
+                    (namespace / "worker.lock").write_bytes(
+                        self._crafted_lock(process))
+                    os.chmod(namespace, mode)
+                    inspected = semworker._inspect_worker_lock()
+                    self.assertEqual(
+                        inspected.state, semworker._WorkerOwnerState.EXACT)
+                    self.assertEqual(inspected.record["pid"], process.pid)
+                    status = semworker.resident_status()
+                    self.assertEqual(status.get("owner_state"), "exact")
+                    self.assertNotIn("namespace_blocked", status)
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink and ownership fixture")
+    def test_uninstall_stop_names_a_planted_namespace_and_proceeds(
+            self) -> None:
+        # No worker of ours can live behind a symlink or a foreign directory
+        # (writers refuse them), so a planted entry must not hold removal
+        # hostage; the outcome names the path instead of a vague 'blocked'.
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._bystander() as process:
+            planted = base / "planted"
+            planted.mkdir(mode=0o700)
+            (planted / "worker.lock").write_bytes(self._crafted_lock(process))
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.symlink_to(planted, target_is_directory=True)
+            with mock.patch.object(
+                    semworker, "_terminate_worker_tree",
+                    side_effect=AssertionError("a bystander was terminated")):
+                outcome = semworker.stop_worker_and_wait(0.3, 1.0)
+            self.assertTrue(outcome["ok"], outcome)
+            self.assertEqual(outcome["owner_state"], "namespace-planted")
+            self.assertIn(str(namespace), outcome["reason"])
+            self.assertIn("remove that entry", outcome["reason"])
+            self.assertIsNone(outcome["pid"])
+            self.assertIsNone(process.poll())
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode fixture")
+    def test_uninstall_stop_reports_a_writable_namespace_with_its_remedy(
+            self) -> None:
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._bystander() as process:
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.mkdir(mode=0o700)
+            (namespace / "worker.lock").write_bytes(self._crafted_lock(process))
+            os.chmod(namespace, 0o775)
+            with mock.patch.object(
+                    semworker, "_terminate_worker_tree",
+                    side_effect=AssertionError("a bystander was terminated")):
+                outcome = semworker.stop_worker_and_wait(0.3, 1.0)
+            self.assertFalse(outcome["ok"])
+            self.assertTrue(outcome["blocked"])
+            self.assertEqual(outcome["owner_state"], "namespace-blocked")
+            self.assertIn(str(namespace), outcome["reason"])
+            self.assertIn("remove that directory", outcome["reason"])
+            self.assertNotIn("0700", outcome["reason"])
+            self.assertIsNone(process.poll())
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode and process-group fixture")
+    def test_a_writer_never_retrusts_a_namespace_others_could_write(
+            self) -> None:
+        # The first writer used to fchmod a 0775 namespace to 0700, after which
+        # readers trusted every record planted while it was open; the uninstall
+        # stop then killed the bystander the crafted record named.
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._bystander() as process:
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.mkdir(mode=0o700)
+            (namespace / "worker.lock").write_bytes(self._crafted_lock(process))
+            os.chmod(namespace, 0o775)
+            status = semworker.request_coordination_status()
+            self.assertEqual(status["state"], "blocked")
+            self.assertFalse(status["writable"])
+            self.assertIn("is not private", status["reason"])
+            self.assertEqual(
+                stat.S_IMODE(os.lstat(namespace).st_mode), 0o775,
+                "the writer repaired a namespace holding foreign-era records")
+            with self.assertRaises(
+                    semworker.ResidentSemanticPreflightUnavailable):
+                semworker._acquire_request_slot(time.monotonic() + 0.5)
+            self.assertIsNone(semworker._acquire_worker_lock())
+            self._assert_readers_refuse(process)
+            probe = semworker.diagnostic_query_status(ready=True, timeout_s=0.5)
+            self.assertEqual(probe["state"], "namespace-blocked")
+            self.assertFalse(probe["coordination"]["writable"])
+            # an EMPTY open namespace is ours to repair
+            (namespace / "worker.lock").unlink()
+            repaired = semworker.request_coordination_status()
+            self.assertEqual(repaired["state"], "ready")
+            self.assertEqual(stat.S_IMODE(os.lstat(namespace).st_mode), 0o700)
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership fixture")
+    def test_a_foreign_owned_record_in_our_namespace_is_never_trusted(
+            self) -> None:
+        # Defense in depth for hardlinks and records left from a writable
+        # window: the record file's own uid must be ours, not just the dir's.
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._bystander() as process:
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.mkdir(mode=0o700)
+            lock = namespace / "worker.lock"
+            lock.write_bytes(self._crafted_lock(process))
+            (namespace / ("retire-" + "d" * 32)).write_bytes(b"{}")
+            real_lstat = os.lstat
+
+            def foreign_file(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if Path(path).parent == namespace:
+                    return _restat(info, ST_UID=info.st_uid + 1)
+                return info
+
+            with mock.patch.object(semworker.os, "lstat", side_effect=foreign_file):
+                inspected = semworker._inspect_worker_lock()
+                self.assertEqual(
+                    inspected.state, semworker._WorkerOwnerState.BLOCKED)
+                self.assertIsNone(inspected.record)
+                # named, non-retryable, planted: like a symlinked namespace
+                self.assertIn(str(lock), inspected.namespace_reason)
+                self.assertIn("foreign owner", inspected.namespace_reason)
+                self.assertIn("remove it", inspected.namespace_reason)
+                self.assertTrue(inspected.planted)
+                status = semworker.resident_status()
+                self.assertTrue(status["namespace_blocked"])
+                self.assertEqual(status["reason"], inspected.namespace_reason)
+                for entry in (
+                        lambda: semworker.search_worker(
+                            "foreign", level="hybrid", k=1, timeout_s=5.0),
+                        semworker.acquire_inprocess_owner):
+                    with (self._clear_worker_env(),
+                          mock.patch.object(semworker.time, "sleep",
+                                            side_effect=AssertionError("waited")),
+                          mock.patch.object(
+                              semworker, "_spawn_worker",
+                              side_effect=AssertionError("launched")),
+                          self.assertRaises(
+                              semworker.ResidentSemanticNamespaceBlocked) as raised):
+                        entry()
+                    self.assertFalse(surface.semantic_status_retryable(
+                        {"reason": str(raised.exception)}))
+                self.assertFalse(semworker._retire_handoff_requested("d" * 32))
+                semworker._discard_retire_handoff("d" * 32)
+                with mock.patch.object(
+                        semworker, "_terminate_worker_tree",
+                        side_effect=AssertionError("a bystander was terminated")):
+                    outcome = semworker.stop_worker_and_wait(0.3, 1.0)
+                self.assertTrue(outcome["ok"], outcome)
+                self.assertEqual(outcome["owner_state"], "namespace-planted")
+                self.assertIn(str(lock), outcome["reason"])
+            self.assertTrue(lock.exists())
+            self.assertTrue((namespace / ("retire-" + "d" * 32)).exists())
+            self.assertIsNone(process.poll())
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink and real-worker fixture")
+    def test_a_live_worker_is_stopped_through_its_descriptor_despite_a_planted_namespace(
+            self) -> None:
+        # Its namespace replaced by a symlink mid-life, a running worker is
+        # still named by the trusted data-dir descriptor: the stop must end it
+        # rather than report 'nothing of ours to stop' while it lives on.
+        with tempfile.TemporaryDirectory(prefix="agrep-planted-live-") as raw:
+            root = Path(raw)
+            data = root / "data"
+            data.mkdir()
+            with (mock.patch.object(common, "DATA_DIR", data),
+                  mock.patch.object(
+                      semworker, "_coordination_base_path",
+                      self.production_coordination_base_path),
+                  mock.patch.object(
+                      common, "bind_descendants_to_process_lifetime",
+                      return_value=False),
+                  mock.patch.dict(os.environ, {
+                      "AGREP_NO_SEM_WORKER": "",
+                      "AGREP_DATA_DIR": str(data)})):
+                rec = semworker._ensure_worker(4.0)
+                if rec is None:
+                    self.skipTest("could not start a resident worker here")
+                namespace = semworker._ephemeral_coordination_dir()
+                planted = root / "planted"
+                try:
+                    os.rename(namespace, planted)
+                    namespace.symlink_to(planted, target_is_directory=True)
+                    self.assertEqual(
+                        semworker._observe_coordination_dir().state,
+                        semworker._NamespaceState.BLOCKED)
+                    outcome = semworker.stop_worker_and_wait(3.0, 2.0)
+                    self.assertTrue(outcome["ok"], outcome)
+                    self.assertEqual(outcome["pid"], int(rec["pid"]))
+                    self.assertFalse(common.pid_alive(int(rec["pid"])))
+                    self.assertFalse(semworker.descriptor_path().exists())
+                finally:
+                    if common.pid_alive(int(rec["pid"])):
+                        os.kill(int(rec["pid"]), signal.SIGKILL)
+                    if namespace.is_symlink():
+                        namespace.unlink()
+                    semworker._remove_empty_dir(namespace)
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership fixture")
+    def test_a_foreign_request_record_fails_a_query_at_once(self) -> None:
+        # A foreign worker.request used to read as a generic inspect failure:
+        # search then ran the read-only fallback child and waited ~27 s on a
+        # lease the resident still held, every query, until removed by hand.
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._clear_worker_env():
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.mkdir(mode=0o700)
+            request = namespace / "worker.request"
+            request.write_bytes(b'{"pid": 1, "process_start": "x"}')
+            real_lstat = os.lstat
+
+            def foreign_request(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if Path(path) == request:
+                    return _restat(info, ST_UID=info.st_uid + 1)
+                return info
+
+            rec = self._record()
+            with (mock.patch.object(semworker.os, "lstat", side_effect=foreign_request),
+                  mock.patch.object(semworker, "_ensure_worker", return_value=rec),
+                  mock.patch.object(semworker.time, "sleep",
+                                    side_effect=AssertionError("waited")),
+                  mock.patch.object(
+                      semworker.http.client, "HTTPConnection",
+                      side_effect=AssertionError("connected without the slot"))):
+                with self.assertRaises(
+                        semworker.ResidentSemanticNamespaceBlocked) as raised:
+                    semworker.search_worker(
+                        "foreign request", level="hybrid", k=1, timeout_s=5.0)
+                status = semworker.request_coordination_status()
+            detail = str(raised.exception)
+            self.assertIn(str(request), detail)
+            self.assertIn("foreign owner", detail)
+            self.assertIn("remove it", detail)
+            self.assertFalse(surface.semantic_status_retryable({"reason": detail}))
+            self.assertEqual(status["state"], "blocked")
+            self.assertFalse(status["writable"])
+            self.assertIn(str(request), status["reason"])
+            self.assertTrue(request.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink and process-group fixture")
+    def test_a_forged_descriptor_cannot_steer_the_stop_into_signalling(
+            self) -> None:
+        # Behind a blocked namespace the descriptor is one record. A forged one
+        # naming a bystander whose port never answers must not get that
+        # process signalled: the stop reports not completed, with the reason.
+        stack, data, base = self._fresh_sandbox()
+        with stack, self._bystander() as process:
+            planted = base / "planted"
+            planted.mkdir(mode=0o700)
+            semworker._ephemeral_coordination_dir().symlink_to(
+                planted, target_is_directory=True)
+            start = common.process_start_identity(process.pid)
+            if not start:
+                self.skipTest("no process start identity on this host")
+            forged = {**self._record(pid=process.pid, process_start=start),
+                      "port": 1, "tree_bound": True, "named_job": common.WIN}
+            self.assertTrue(semworker._descriptor_compatible(forged))
+            semworker.descriptor_path().write_text(
+                json.dumps(forged), encoding="utf-8")
+            with (mock.patch.object(
+                      semworker, "_request_worker_stop", return_value=False) as stop,
+                  mock.patch.object(
+                      semworker, "_terminate_worker_tree",
+                      side_effect=AssertionError("a bystander was signalled")),
+                  mock.patch.object(
+                      common, "terminate_exact_process_tree",
+                      side_effect=AssertionError("a bystander was signalled"))):
+                outcome = semworker.stop_worker_and_wait(0.3, 0.3)
+            stop.assert_called()
+            self.assertFalse(outcome["ok"])
+            self.assertEqual(outcome["owner_state"], "descriptor-unanswered")
+            self.assertFalse(outcome["fallback_termination"])
+            self.assertFalse(outcome["stop_ack"])
+            self.assertIn("did not answer the stop", outcome["reason"])
+            self.assertIn("not signalled", outcome["reason"])
+            self.assertIsNone(process.poll())
+            self.assertTrue(semworker.descriptor_path().exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
+    def test_a_blocked_namespace_fails_a_query_at_once_with_the_cause(
+            self) -> None:
+        # A planted namespace used to read as 'ownership is still settling':
+        # the query waited ~28 s on a lease that could never clear, then gave
+        # a vague failure. It now fails immediately, naming path and remedy.
+        stack, _data, base = self._fresh_sandbox()
+        with stack, self._clear_worker_env():
+            planted = base / "planted"
+            planted.mkdir(mode=0o700)
+            namespace = semworker._ephemeral_coordination_dir()
+            namespace.symlink_to(planted, target_is_directory=True)
+            clock = _Clock()
+            with (mock.patch.object(
+                      semworker.time, "monotonic", side_effect=clock.monotonic),
+                  mock.patch.object(
+                      semworker.time, "sleep", side_effect=clock.sleep),
+                  mock.patch.object(
+                      semworker, "_spawn_worker",
+                      side_effect=AssertionError("launched into a planted dir"))):
+                with self.assertRaises(
+                        semworker.ResidentSemanticNamespaceBlocked) as raised:
+                    semworker.search_worker(
+                        "planted", level="hybrid", k=3, timeout_s=30.0)
+                with self.assertRaises(
+                        semworker.ResidentSemanticNamespaceBlocked) as inprocess:
+                    semworker.acquire_inprocess_owner()
+            for exc in (raised.exception, inprocess.exception):
+                detail = str(exc)
+                self.assertIn("not a private directory", detail)
+                self.assertIn(str(namespace), detail)
+                self.assertIn("remove that entry", detail)
+                self.assertFalse(surface.semantic_status_retryable(
+                    {"reason": detail}))
+            self.assertEqual(clock.sleeps, [])
+            self.assertEqual(clock.now, 0.0)
+            status = semworker.resident_status()
+            self.assertTrue(status["namespace_blocked"])
+            self.assertEqual(status["reason"], str(raised.exception))
+            probe = semworker.diagnostic_query_status(ready=True, timeout_s=0.5)
+            self.assertEqual(probe["state"], "namespace-blocked")
+            self.assertFalse(probe["query_serving"])
+            self.assertEqual(probe["reason"], str(raised.exception))
+            for row in (
+                    doctor._resident_worker_detail(status, readiness=probe),
+                    doctor._semantic_readiness_detail({
+                        **probe, "current_generation": True})):
+                self.assertIn(str(namespace), row)
+                self.assertIn("remove that entry", row)
+                self.assertNotIn("wait for its current owner", row)
+                self.assertNotIn("duplicate model memory", row)
+
+    def test_probe_leaves_no_namespace_after_its_last_observation(self) -> None:
+        # The probe's own request slot mints the namespace; the probe must
+        # drop it again so doctor --deep leaves nothing behind.
+        absent = {"running": False}
+        for ready, state in ((True, "query-serving"),
+                             (False, "generation-not-ready")):
+            with self.subTest(ready=ready):
+                status, stop = self._probe_in_sandbox(
+                    resident=absent, preexisting=False, ready=ready)
+                self.assertEqual(status["state"], state)
+                self.assertTrue(status["cleanup"]["namespace_removed"])
+                self.assertFalse(status["_namespace_leftover"])
+                self.assertNotIn("worker_stopped", status["cleanup"])
+                stop.assert_not_called()
+                stop.request_stop.assert_not_called()
+
+    def test_probe_never_stops_any_worker_nor_touches_a_shared_namespace(
+            self) -> None:
+        # The resident worker is shared: one started by a concurrent agent
+        # query inside the probe window must survive the probe untouched.
+        running = {"running": True, "descriptor_state": "ready", "pid": 42}
+        status, stop = self._probe_in_sandbox(
+            resident=running, preexisting=True)
+        self.assertEqual(status["state"], "query-serving")
+        stop.assert_not_called()
+        stop.request_stop.assert_not_called()
+        self.assertFalse(status["cleanup"]["namespace_removed"])
+        self.assertTrue(status["_namespace_leftover"])
+
+    def test_a_concurrent_clients_worker_survives_a_probe(self) -> None:
+        # Real worker, real client: an agent query that starts the worker
+        # mid-probe keeps it (and its hot model) for its next query.
+        absent = {"running": False}
+        witnessed: dict = {}
+
+        def agent_query(*_args, **_kwargs):
+            rec = semworker._ensure_worker(3.0)
+            if rec is None:
+                raise semworker.ResidentSemanticPreflightUnavailable(
+                    "fixture could not start a resident worker")
+            witnessed["pid"] = int(rec["pid"])
+            return {"results": []}
+
+        with tempfile.TemporaryDirectory(prefix="agrep-probe-live-") as raw:
+            root = Path(raw)
+            data = root / "data"
+            data.mkdir()
+            with (mock.patch.object(common, "DATA_DIR", data),
+                  mock.patch.object(
+                      semworker, "_coordination_base_path",
+                      self.production_coordination_base_path),
+                  mock.patch.object(
+                      common, "bind_descendants_to_process_lifetime",
+                      return_value=False),
+                  mock.patch.dict(os.environ, {
+                      "AGREP_NO_SEM_WORKER": "",
+                      "AGREP_DATA_DIR": str(data)})):
+                real_status = semworker.resident_status
+                stubbed = [absent]
+                try:
+                    with (mock.patch.object(
+                              semworker, "resident_status",
+                              side_effect=lambda **kw: (
+                                  stubbed.pop(0) if stubbed
+                                  else real_status(**kw))),
+                          mock.patch.object(
+                              semworker, "loopback_bind_status",
+                              return_value={"bindable": True, "reason": None}),
+                          mock.patch.object(
+                              semworker, "search_worker",
+                              side_effect=agent_query)):
+                        status = semworker.diagnostic_query_status(
+                            ready=True, timeout_s=3.0)
+                    if status["state"] != "query-serving":
+                        self.skipTest(f"no resident worker here: {status['reason']}")
+                    after = status["resident_after"]
+                    self.assertTrue(after.get("running"), after)
+                    self.assertEqual(after.get("pid"), witnessed["pid"])
+                    self.assertTrue(status["alive"])
+                    self.assertFalse(status["cleanup"]["namespace_removed"])
+                finally:
+                    semworker.stop_worker_and_wait(grace_s=3.0, fallback_s=2.0)
+                    semworker._remove_empty_dir(
+                        semworker._ephemeral_coordination_dir())
+
+    def test_a_namespace_reaped_mid_prepare_is_minted_again(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agrep-remint-") as raw:
+            base = Path(raw)
+            namespace = base / "ns"
+            real_lstat = os.lstat
+            vanished = [False]
+
+            def lstat_once(path, *args, **kwargs):
+                if Path(path) == namespace and not vanished[0]:
+                    vanished[0] = True
+                    os.rmdir(namespace)
+                return real_lstat(path, *args, **kwargs)
+
+            with (mock.patch.object(
+                      semworker, "_ephemeral_coordination_dir",
+                      return_value=namespace),
+                  mock.patch.object(semworker.os, "lstat", side_effect=lstat_once)):
+                prepared = semworker._prepare_ephemeral_coordination_dir()
+            self.assertEqual(prepared, namespace)
+            self.assertTrue(namespace.is_dir())
+            self.assertTrue(vanished[0])
 
     def test_one_refusal_retries_same_live_generation_once(self) -> None:
         rec = self._record()

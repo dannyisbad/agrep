@@ -1176,6 +1176,7 @@ class SemanticFamilyRefreshTests(unittest.TestCase):
                     expected_current_source=current_source)
         self.assertEqual(result, {"indexed": 2, "total": 2, "pending": 0})
         self.assertEqual(publish.call_args.kwargs["shadows"], [2])
+        # a published delta schedules routine compaction: no override carried
         schedule.assert_called_once_with()
 
     def test_exact_v4_rebase_expands_reparented_descendants(self) -> None:
@@ -1363,7 +1364,8 @@ class SemanticFamilyRefreshTests(unittest.TestCase):
                 {"child"}, expected_previous_source=previous,
                 expected_current_source=current_source)
         self.assertIsNone(result)
-        schedule.assert_called_once_with()
+        # the rebase cannot publish until compaction runs: it unblocks the lane
+        schedule.assert_called_once_with(unblocks_lane=True)
         publish.assert_not_called()
 
     def test_exact_rebase_refuses_to_shadow_every_live_row(self) -> None:

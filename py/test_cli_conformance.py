@@ -20,6 +20,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+
+from _test_support import (  # noqa: E402
+    scrub_coordination_namespaces, fixture_tree, write_budget_injection)
 import time
 import unittest
 
@@ -129,7 +132,6 @@ class ConformanceSandbox:
     """Fresh fixture home; only the ingest binary override is inherited."""
 
     def __init__(self) -> None:
-        utf8_locale = _utf8_locale()
         self._temp = tempfile.TemporaryDirectory(
             prefix="cli-conformance-", dir=os.environ.get("TMPDIR"))
         self.root = Path(self._temp.name).resolve()
@@ -139,6 +141,16 @@ class ConformanceSandbox:
             (self.root / name).mkdir()
         # Socket paths stop at 104 bytes, which a deep TMPDIR (macOS /var/folders) exceeds.
         self.runtime = Path(tempfile.mkdtemp(prefix="agc-", dir="/tmp"))
+        try:
+            self._populate()
+        except BaseException:
+            shutil.rmtree(self.runtime, ignore_errors=True)
+            scrub_coordination_namespaces(self._temp.name)
+            self._temp.cleanup()
+            raise
+
+    def _populate(self) -> None:
+        utf8_locale = _utf8_locale()
         # The host agent's /tmp publication would otherwise become this caller.
         self.callers = {"human": self.root / "no-callers", "agent": self.root / "callers"}
         self.callers["agent"].mkdir(mode=0o700)
@@ -164,6 +176,11 @@ class ConformanceSandbox:
         }
         if "AGREP_RS_BIN" in os.environ:
             self.env["AGREP_RS_BIN"] = os.environ["AGREP_RS_BIN"]
+        # Every process this sandbox starts observes under a generous routine budget.
+        self.inject = self.root / "inject"
+        self.inject.mkdir()
+        write_budget_injection(self.inject, "generous")
+        self.env["PYTHONPATH"] = str(self.inject)
         self._time_replacements: dict[str, str] = {}
         self._materialize()
         (self.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
@@ -263,8 +280,8 @@ class ConformanceSandbox:
         if remaining:
             raise AssertionError(f"sandbox processes survived cleanup: {sorted(remaining)}")
         shutil.rmtree(self.runtime, ignore_errors=True)
+        scrub_coordination_namespaces(self._temp.name)
         self._temp.cleanup()
-
     def __exit__(self, *_exc) -> None:
         self.close()
 
@@ -321,8 +338,63 @@ def _golden_text(sandbox: ConformanceSandbox, result: subprocess.CompletedProces
             f"--- stderr ---\n{stream(result.stderr)}")
 
 
-def run_matrix(sandbox: ConformanceSandbox, *, run_cli=None) -> dict[str, str]:
-    """Run all cases through one swappable runner, returning normalized results."""
+CASE_BY_NAME = {case.name: case for case in CASES}
+
+
+# The routine tier never inspects these two, budget or not; the goldens pin them.
+ROUTINE_NOT_INSPECTED = frozenset({"semantic runtime", "model attribution"})
+
+
+def _verdicts_reached(case: Case, result: subprocess.CompletedProcess[str]) -> bool | None:
+    """True/False when the output discloses whether its budget held; None when it cannot."""
+    if case.name != "correct_doctor_actions" or result.returncode != 0:
+        return None
+    try:
+        diagnostics = json.loads(result.stdout)["diagnostics"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return not (set(diagnostics.get("deferred") or ()) - ROUTINE_NOT_INSPECTED)
+
+
+class Matrix(dict):
+    """Normalized case results, each produced through one runner."""
+
+    def __init__(self, sandbox: ConformanceSandbox, runner, targets: dict[str, str]) -> None:
+        super().__init__()
+        self.sandbox = sandbox
+        self.runner = runner
+        self.targets = targets
+        self.raw: dict[str, subprocess.CompletedProcess[str]] = {}
+
+    def run(self, case: Case) -> str:
+        if case.correction_of:
+            refusal = self.raw[case.correction_of]
+            corrections = re.findall(r"; run: (.+)$", refusal.stderr, flags=re.MULTILINE)
+            if len(corrections) != 1:
+                raise AssertionError(f"{case.correction_of} lacks one correction:\n{refusal.stderr}")
+            command = shlex.split(corrections[0])
+            if not command or command[0] != "agrep":
+                raise AssertionError(f"unsafe correction: {command!r}")
+            argv = command[1:]
+        else:
+            argv = [arg.format_map(self.targets) for arg in case.argv]
+        cwd = self.sandbox.home / "projects" / case.project_cwd if case.project_cwd else None
+        result = self.runner(argv, cwd=cwd, stdin="", env_overrides=None)
+        if result.returncode != case.exit_code:
+            raise AssertionError(
+                f"{case.name}: expected exit {case.exit_code}, got {result.returncode}\n"
+                f"{result.stdout}{result.stderr}")
+        if _verdicts_reached(case, result) is False:
+            raise AssertionError(
+                f"{case.name} deferred an observation under the sandbox's generous "
+                f"budget:\n{result.stdout}")
+        self.raw[case.name] = result
+        self[case.name] = _golden_text(self.sandbox, result)
+        return self[case.name]
+
+
+def discover(sandbox: ConformanceSandbox, *, run_cli=None) -> Matrix:
+    """Resolve the fixture handles one runner addresses, without running the cases."""
     runner = sandbox.run_cli if run_cli is None else run_cli
     found = runner(["violet checkpoint", "--who", "user", "--json", "-n", "1"])
     if found.returncode:
@@ -338,29 +410,16 @@ def run_matrix(sandbox: ConformanceSandbox, *, run_cli=None) -> dict[str, str]:
     if len(tools) != 1 or "~" not in tools[0].get("handle", ""):
         raise AssertionError(f"tool discovery must expose one event-bound handle:\n{tool_hit.stdout}")
     targets["tool_handle"] = tools[0]["handle"]
-    raw: dict[str, subprocess.CompletedProcess[str]] = {}
-    results = {}
+    return Matrix(sandbox, runner, targets)
+
+
+def run_matrix(sandbox: ConformanceSandbox, *, run_cli=None) -> Matrix:
+    """Run all cases through one swappable runner, returning normalized results."""
+    matrix = discover(sandbox, run_cli=run_cli)
     for case in CASES:
-        if case.correction_of:
-            refusal = raw[case.correction_of]
-            corrections = re.findall(r"; run: (.+)$", refusal.stderr, flags=re.MULTILINE)
-            if len(corrections) != 1:
-                raise AssertionError(f"{case.correction_of} lacks one correction:\n{refusal.stderr}")
-            command = shlex.split(corrections[0])
-            if not command or command[0] != "agrep":
-                raise AssertionError(f"unsafe correction: {command!r}")
-            argv = command[1:]
-        else:
-            argv = [arg.format_map(targets) for arg in case.argv]
-        cwd = sandbox.home / "projects" / case.project_cwd if case.project_cwd else None
-        result = runner(argv, cwd=cwd, stdin="", env_overrides=None)
-        if result.returncode != case.exit_code:
-            raise AssertionError(
-                f"{case.name}: expected exit {case.exit_code}, got {result.returncode}\n"
-                f"{result.stdout}{result.stderr}")
-        raw[case.name] = result
-        results[case.name] = _golden_text(sandbox, result)
-    return results
+        matrix.run(case)
+    return matrix
+
 
 
 @unittest.skipUnless(os.name == "posix", "CLI conformance goldens require POSIX shell and path semantics")
@@ -390,7 +449,57 @@ class CLIConformance(unittest.TestCase):
                     if update:
                         path.write_text(first[case.name], encoding="utf-8")
                     self.assertTrue(path.is_file(), f"missing {path}; set AGREP_UPDATE_CONFORMANCE=1")
-                    self.assertEqual(path.read_text(encoding="utf-8"), first[case.name])
+                    golden = path.read_text(encoding="utf-8")
+                    self.assertEqual(golden, first[case.name])
+
+    def test_around_reads_committed_events_during_a_held_event_write(self) -> None:
+        """A rollback journal protects the prior event generation from a writer."""
+        store = self.sandbox.data / "events" / ".store.sqlite3"
+        journal = Path(f"{store}-journal")
+        holder = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import sqlite3,sys,time\n"
+                "db=sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+                "db.execute('BEGIN IMMEDIATE')\n"
+                "db.execute('UPDATE event_agent_state SET calls=calls+1')\n"
+                "time.sleep(3)\n"
+                "db.execute('ROLLBACK')\n"
+                "db.close()\n",
+                str(store),
+            ],
+            env=self.sandbox.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not journal.exists() or journal.stat().st_size == 0:
+                if holder.poll() is not None:
+                    stdout, stderr = holder.communicate()
+                    self.fail(f"event writer exited before its journal appeared: "
+                              f"{stdout}{stderr}")
+                if time.monotonic() >= deadline:
+                    self.fail("event writer did not publish a rollback journal")
+                time.sleep(0.01)
+            result = self.sandbox.run_cli(
+                ["around", "55555555-5555-4555-8555-555555555555",
+                 "--full", "--json", "--no-auto"],
+                env_overrides={"AGREP_NO_RESIDENT": "1"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines() if line]
+            scope = next(row["scope"] for row in rows if "scope" in row)
+            tool_rows = [row for row in rows if row.get("kind") == "tool"]
+            self.assertEqual(scope["counts_state"], "exact")
+            self.assertGreater(scope["tools"]["available"], 0)
+            self.assertGreater(len(tool_rows), 0)
+        finally:
+            try:
+                stdout, stderr = holder.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                stdout, stderr = holder.communicate()
+                self.fail(f"event writer did not settle: {stdout}{stderr}")
 
 
 def caller_runner(sandbox: ConformanceSandbox, caller: str, *, resident: bool = False,
@@ -479,6 +588,211 @@ class ResidentConformance(unittest.TestCase):
         self.assertIn(AGENT_SESSION[:8], matrices["human"]["search_word"])
         self.assertNotIn(AGENT_SESSION[:8], matrices["agent"]["search_word"])
 
+    def test_resident_interpreter_receives_the_sandbox_budget(self) -> None:
+        """PYTHONPATH is resident-keyed, so the server this sandbox addresses
+        imported the sitecustomize that widens the budgets."""
+        warm_resident(self.sandbox, "human")
+        served: list = []
+        caller_runner(self.sandbox, "human", resident=True, served=served)([])
+        self.assertEqual(served, [[]])
+        self.assertTrue(
+            [path for path in self.sandbox.inject.iterdir() if path.name.startswith("reached-cli-")],
+            sorted(path.name for path in self.sandbox.inject.iterdir()))
 
+    def test_budget_shortfall_is_a_disclosed_deferral(self) -> None:
+        """With the budget spent on one side (no machine load), that side's answer
+        is a deferral the matrix detects, never a silently different verdict."""
+        self.maxDiff = None
+        with fixture_tree(prefix="agrep-defer-") as raw:
+            inject = Path(raw)
+            for name in ("status", "doctor"):
+                (inject / f"defer-{name}").touch()
+            write_budget_injection(inject, "shortfall")
+            generous_runner = caller_runner(self.sandbox, "human")
+
+            def shortfall(argv, *, cwd=None, stdin=None, env_overrides=None):
+                overrides = {**(env_overrides or {}), "PYTHONPATH": str(inject)}
+                return generous_runner(argv, cwd=cwd, stdin=stdin, env_overrides=overrides)
+
+            generous = discover(self.sandbox, run_cli=generous_runner)
+            deferring = discover(self.sandbox, run_cli=shortfall)
+            for matrix in (generous, deferring):
+                matrix.run(CASE_BY_NAME["refuse_doctor_actions"])
+                matrix.run(CASE_BY_NAME["status"])
+            generous.run(CASE_BY_NAME["correct_doctor_actions"])
+            with self.assertRaisesRegex(AssertionError, "deferred an observation"):
+                deferring.run(CASE_BY_NAME["correct_doctor_actions"])
+            self.assertEqual([path.name for path in inject.glob("defer-*")], [])
+            self.assertIn("do not know about agrep yet", generous["status"])
+            self.assertNotIn("do not know about agrep yet", deferring["status"])
+            self.assertNotEqual(deferring["status"], generous["status"])
+
+
+EVENT_SPILL = "UPDATE event_sessions SET payload = payload || zeroblob(400000)"
+CORPUS_SPILL = (
+    "INSERT INTO meta SELECT 'w33-pad-' || i, hex(randomblob(400)) FROM "
+    "(WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) "
+    "SELECT i FROM n)")
+# An index pass in miniature: agrep's own lock held across a spilled write transaction.
+LIVE_PASS = (
+    "import sqlite3, sys\n"
+    f"sys.path[:0] = [{str(ROOT / 'py')!r}, {str(ROOT)!r}]\n"
+    "import index_lock\n"
+    "with index_lock.IndexLock('fixture-pass', timeout=5):\n"
+    "    db = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+    "    db.execute('PRAGMA cache_size=20')\n"
+    "    db.execute('BEGIN IMMEDIATE')\n"
+    "    db.execute(sys.argv[2])\n"
+    "    print('ready', flush=True)\n"
+    "    sys.stdin.read()\n"
+    "    db.execute('ROLLBACK')\n"
+    "    db.close()\n"
+)
+
+
+@unittest.skipUnless(os.name == "posix", "the interrupted pass is planted with SIGKILL")
+class InterruptedPassConformance(unittest.TestCase):
+    """A pass killed mid-commit leaves a hot journal that, without a daemon, waits for the next
+    `agrep index`. doctor and status used to say nothing about the event store's, status called
+    corpus.db's 'another agrep version', and audit --full reported it as 'being written' forever."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sandbox = ConformanceSandbox()
+        cls.sandbox.__enter__()
+        cls.addClassCleanup(cls.sandbox.close)
+        cls.store = cls.sandbox.data / "events" / ".store.sqlite3"
+        cls.corpus = cls.sandbox.data / "corpus.db"
+
+    def observe(self) -> dict:
+        doctor = self.sandbox.run_cli(["doctor"])
+        doctor_json = self.sandbox.run_cli(["doctor", "--json"])
+        status = self.sandbox.run_cli([])
+        status_json = self.sandbox.run_cli(["status", "--json"])
+        audit = self.sandbox.run_cli(["audit", "--full", "--json"])
+        for result in (doctor_json, status_json):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        return {
+            "doctor": [line for line in doctor.stdout.splitlines() if "event store" in line],
+            "doctor_search": [line for line in doctor.stdout.splitlines()
+                              if "search db" in line and "[ok ]" not in line],
+            "journal": json.loads(doctor_json.stdout)["core"]["event_store_journal"],
+            "search_db": json.loads(doctor_json.stdout)["core"]["search_db"]["state"],
+            "status": [line for line in status.stdout.splitlines() if "tool events" in line],
+            "status_search": [line for line in status.stdout.splitlines()
+                              if "the search index" in line],
+            "status_json": [line for line in json.loads(status_json.stdout)["warnings"]
+                            if "tool events" in line],
+            "audit_rc": audit.returncode,
+            "audit": json.loads(audit.stdout),
+            "audit_stderr": audit.stderr,
+        }
+
+    def live_pass(self, database: Path, statement: str) -> subprocess.Popen:
+        child = subprocess.Popen(
+            [sys.executable, "-c", LIVE_PASS, str(database), statement],
+            env=self.sandbox.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        ready = child.stdout.readline()
+        if ready != "ready\n":
+            child.kill()
+            _out, err = child.communicate()
+            self.fail(f"the live pass did not open its transaction: {ready!r} {err}")
+        return child
+
+    def finish(self, child: subprocess.Popen) -> None:
+        _out, err = child.communicate(input="", timeout=10)
+        self.assertEqual(child.returncode, 0, err)
+
+    def test_an_interrupted_pass_is_named_until_agrep_index_clears_it(self) -> None:
+        from _test_support import kill_mid_write
+        clean = self.observe()
+        self.assertEqual(clean["audit_rc"], 0, clean["audit"])
+
+        kill_mid_write(self.store, EVENT_SPILL)
+        kill_mid_write(self.corpus, CORPUS_SPILL)
+        hot = self.observe()
+        self.assertEqual(len(hot["doctor"]), 1, hot["doctor"])
+        self.assertIn("[!! ]", hot["doctor"][0])
+        self.assertIn("an interrupted index pass left the event store unreadable until the "
+                      "next one (", hot["doctor"][0])
+        self.assertRegex(hot["doctor"][0], r"\d (?:KiB|MiB) rollback journal\); `.+ index` "
+                                           r"runs a publication now$")
+        self.assertEqual(hot["journal"]["state"], "interrupted-pass")
+        self.assertTrue(hot["journal"]["hot"])
+        self.assertEqual(len(hot["status"]), 1, hot["status"])
+        self.assertRegex(
+            hot["status"][0],
+            r"^  tool events are unavailable right now - an interrupted index pass left the "
+            r"event store unreadable until the next one: `.+ index`$")
+        self.assertEqual(hot["status_json"], [hot["status"][0].strip()])
+        audit = hot["audit"]
+        self.assertEqual((hot["audit_rc"], audit["status"]), (1, "warning"), audit)
+        self.assertEqual(audit["problems"], [])
+        self.assertFalse([item for item in audit["live_details"] if "corpus.db" in item], audit)
+        self.assertNotIn("evidence moved during round", hot["audit_stderr"])
+        interrupted = [item for item in audit["gap_details"] if "corpus.db" in item]
+        self.assertEqual(len(interrupted), 1, audit)
+        self.assertEqual(hot["search_db"], "interrupted-pass")
+        self.assertEqual(len(hot["doctor_search"]), 1, hot["doctor_search"])
+        self.assertRegex(
+            hot["doctor_search"][0],
+            r"\[!! \] search db +an interrupted index pass left the search index mid-update - "
+            r"searches serve its last complete update until the next one; `.+ index` runs a "
+            r"publication now$")
+        self.assertEqual(hot["status_search"], [
+            "  an interrupted index pass left the search index mid-update - searches serve its "
+            f"last complete update until the next one: `{hot['status'][0].split('`')[1]}`"])
+        # audit tells the same story as doctor and status, with doctor's rendered command
+        doctor_command = re.search(r"`([^`]+)`", hot["doctor_search"][0]).group(1)
+        self.assertIn("awaits the next index pass: an interrupted index pass left the search "
+                      "index mid-update - searches serve its last complete update until the "
+                      "next one (", interrupted[0])
+        self.assertIn(f"run `{doctor_command}`", interrupted[0])
+
+        indexed = self.sandbox.run_cli(["index"])
+        self.assertEqual(indexed.returncode, 0, indexed.stderr)
+        for journal in (self.store, self.corpus):
+            self.assertFalse(Path(f"{journal}-journal").exists(), journal)
+        cleared = self.observe()
+        self.assertEqual((cleared["doctor"], cleared["status"], cleared["status_json"],
+                          cleared["doctor_search"], cleared["status_search"]),
+                         ([], [], [], [], []))
+        self.assertEqual(cleared["journal"], {"state": "none", "bytes": 0, "hot": False})
+        self.assertEqual(cleared["search_db"], "ready")
+        self.assertEqual(cleared["audit_rc"], 0, cleared["audit"])
+
+    def test_a_live_pass_is_still_reported_as_being_written(self) -> None:
+        events_pass = self.live_pass(self.store, EVENT_SPILL)
+        try:
+            doctor = self.sandbox.run_cli(["doctor", "--json"])
+            status = self.sandbox.run_cli([])
+        finally:
+            self.finish(events_pass)
+        self.assertEqual(
+            json.loads(doctor.stdout)["core"]["event_store_journal"]["state"], "live-pass")
+        self.assertNotIn("interrupted index pass", status.stdout)
+        corpus_pass = self.live_pass(self.corpus, CORPUS_SPILL)
+        try:
+            audit = self.sandbox.run_cli(["audit", "--full", "--json"])
+            doctor = self.sandbox.run_cli(["doctor", "--json"])
+            status = self.sandbox.run_cli([])
+        finally:
+            self.finish(corpus_pass)
+        self.assertEqual(json.loads(doctor.stdout)["core"]["search_db"]["state"], "busy")
+        self.assertNotIn("another agrep version", status.stdout)
+        self.assertNotIn("the search index", status.stdout)
+        payload = json.loads(audit.stdout)
+        self.assertEqual((audit.returncode, payload["status"]), (1, "warning"), payload)
+        self.assertTrue([item for item in payload["live_details"]
+                         if "corpus.db is being written" in item], payload)
+        self.assertFalse([item for item in payload["gap_details"]
+                          if "awaits the next index pass" in item], payload)
+
+
+# Bare `agrep` and `doctor --json` observe under a routine budget. "generous" widens
+# every deadline and cap in each sandbox process (direct or resident) without touching
+# the disclosed constants; "shortfall" spends them once per marker file.
 if __name__ == "__main__":
     unittest.main()

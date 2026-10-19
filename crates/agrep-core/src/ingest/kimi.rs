@@ -181,6 +181,8 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
     let mut turn = 0u32;
     let mut n_user = 0usize;
     let mut last_ts = 0i64;
+    // an assistant record's content precedes its tool_calls: the calls join it to the next block
+    let mut worked = false;
 
     // Parse fully first: user timestamps align against the TAIL of the wire turn
     // stream — /clear rotates context.jsonl but wire.jsonl keeps the whole session,
@@ -223,6 +225,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                     continue;
                 }
                 tally.row();
+                worked = false;
                 out.push(RawMessage {
                     agent: "kimi",
                     project: project.to_string(),
@@ -235,6 +238,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                     reply_chars: 0,
                     side: !parent.is_empty(),
                     parent: parent.to_string(),
+                    reply_shape: Default::default(),
                 });
                 turn += 1;
             }
@@ -243,12 +247,9 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                     let txt = text_of(content);
                     if !txt.trim().is_empty() {
                         if let Some(last) = out.last_mut() {
-                            let chars = crate::ingest::append_capped(
-                                &mut last.reply,
-                                &txt,
-                                crate::ingest::REPLY_CAP,
-                            );
-                            last.reply_chars += chars;
+                            crate::ingest::append_reply(last, &txt);
+                            crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, worked);
+                            worked = false;
                         }
                     }
                 }
@@ -260,6 +261,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
+                        worked |= !crate::ingest::is_bookkeeping_tool(&name);
                         let native_call_id = c
                             .get("id")
                             .and_then(|i| i.as_str())
@@ -268,12 +270,16 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                             format!("kimi:{session}:{record_ordinal}:{call_ordinal}")
                         });
                         // arguments is a JSON-encoded string
+                        let mut state = String::new();
                         let (input, input_chars) = f
                             .get("arguments")
                             .and_then(|a| a.as_str())
                             .map(|args| {
                                 serde_json::from_str::<serde_json::Value>(args)
-                                    .map(|v| summarize_tool_input_with_chars(&v))
+                                    .map(|v| {
+                                        state = crate::ingest::task_state(&name, Some(&v));
+                                        summarize_tool_input_with_chars(&v)
+                                    })
                                     .unwrap_or_else(|_| cap_str_with_chars(args, EVENT_CAP))
                             })
                             .unwrap_or_default();
@@ -304,6 +310,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                             call_id,
                             child_session: String::new(),
                             meta: String::new(),
+                            state,
                         });
                     }
                 }

@@ -319,6 +319,116 @@ class RepairTriggerTests(unittest.TestCase):
             loop._check_derived_health(1000.0)
         self.assertEqual(loop._repair, corpusdb.NO_REPAIR)
 
+    def test_a_second_interrupted_pass_soon_after_a_repair_is_rolled_back_promptly(
+            self) -> None:
+        # Nothing asks for corpus.db's repair (searches read a private copy), so the health tick
+        # is the only trigger, and it waited the 300 s reparse gap after any earlier repair.
+        loop = _loop()
+        loop._repair = corpusdb.RepairPlan("interrupted-pass", "publish", "x")
+        loop._last_repair_run = time.time() - 45
+        self.assertTrue(loop._should_run())
+        # still never back to back
+        loop._last_repair_run = time.time() - 5
+        self.assertFalse(loop._should_run())
+
+    def test_a_rollback_that_left_the_journal_standing_waits_the_reparse_gap(self) -> None:
+        loop = _loop()
+        loop._repair = corpusdb.RepairPlan("interrupted-pass", "publish", "x")
+        loop._last_repair_run = time.time() - 45
+        loop._repair_streak = 1
+        self.assertFalse(loop._should_run())
+        loop._repair = corpusdb.RepairPlan("torn-generation", "full", "x")
+        loop._repair_streak = 0
+        self.assertFalse(loop._should_run())
+
+
+class InaccessibleSidecarTests(unittest.TestCase):
+    """A store sidecar this user cannot read and write pauses every writer; it is not lost
+    ownership, so the daemon keeps heartbeating its own lock."""
+
+    BLOCKED = indexd_runtime.DerivedMutationInfo(
+        "unavailable", None, "the search index cannot be updated - its rollback journal",
+        sidecar_blocked=True)
+    FOREIGN = indexd_runtime.DerivedMutationInfo("foreign", "other", "held")
+
+    def test_the_heartbeat_survives_a_blocked_sidecar_but_not_a_lost_owner(self) -> None:
+        owner = mock.Mock()
+        with mock.patch.object(indexd_runtime, "_data_dir_readonly", return_value=False), \
+                mock.patch.object(indexd_runtime, "live_indexer_claim", return_value=False), \
+                mock.patch.object(indexd_runtime, "derived_writer_mutation_info",
+                                  return_value=self.BLOCKED):
+            indexd_runtime.heartbeat_indexd_owner(owner)
+        owner.touch.assert_called_once_with()
+        with mock.patch.object(indexd_runtime, "_data_dir_readonly", return_value=False), \
+                mock.patch.object(indexd_runtime, "live_indexer_claim", return_value=True), \
+                mock.patch.object(indexd_runtime, "derived_writer_mutation_info",
+                                  return_value=self.FOREIGN):
+            with self.assertRaises(indexd_runtime.ownerfile.OwnershipLost):
+                indexd_runtime.heartbeat_indexd_owner(owner)
+
+    def test_passes_pause_with_one_line_and_launch_nothing(self) -> None:
+        loop = _loop()
+        loop._ownership_survives = lambda: True
+        for permitted, event_refusal, info in (
+                (False, None, self.BLOCKED),
+                (True, self.BLOCKED._replace(reason="the event store cannot be updated"),
+                 _WRITABLE)):
+            with self.subTest(permitted=permitted), \
+                    mock.patch.object(indexd_runtime, "derived_writes_permitted",
+                                      return_value=permitted), \
+                    mock.patch.object(indexd_runtime, "derived_writer_mutation_info",
+                                      return_value=info), \
+                    mock.patch.object(indexd_runtime, "event_store_sidecar_refusal",
+                                      return_value=event_refusal), \
+                    mock.patch.object(indexd_runtime, "rust_writer_env") as launch, \
+                    mock.patch.object(indexer.common, "log") as log:
+                self.assertFalse(loop._index())
+                self.assertFalse(loop._index())
+                launch.assert_not_called()
+                reason = (event_refusal or info).reason
+                self.assertEqual(log.call_args_list, [mock.call(f"auto-index paused: {reason}")])
+                self.assertEqual(loop.state["phase"], "idle")
+
+    def test_a_repair_kick_names_the_blocked_file_not_another_agrep(self) -> None:
+        sidecar = {"store": "search index", "kind": "rollback journal",
+                   "path": "/d/corpus.db-journal", "owner": "root"}
+        with mock.patch.object(indexd_runtime, "_data_dir_readonly", return_value=False), \
+                mock.patch.dict(os.environ, {"AGREP_NO_DAEMON": ""}), \
+                mock.patch.object(indexd_runtime.common, "ingest_bin",
+                                  return_value=Path(__file__)), \
+                mock.patch("source_health.store_sidecars_blocked", return_value=[sidecar]), \
+                mock.patch.object(indexd_runtime, "_spawn_indexd") as spawn:
+            kick = indexd_runtime.kick_background_repair()
+        spawn.assert_not_called()
+        self.assertEqual(kick, indexd_runtime.RepairKick(False, "sidecar-blocked"))
+        self.assertNotIn("another agrep", surface.repair_decline_line(kick.cause))
+
+
+class JournalRefusalWordingTests(unittest.TestCase):
+    """indexd.log called a killed pass's journal 'a live rollback journal'."""
+
+    def test_the_writer_refusal_names_an_interrupted_pass_or_a_live_one(self) -> None:
+        import index_lock
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "corpus.db"
+            db.write_bytes(b"SQLite format 3\0" + bytes(84))
+            Path(f"{db}-journal").write_bytes(b"\x01" + bytes(511))
+            lock = root / ".index.lock"
+            with mock.patch.object(common, "INDEX_LOCK_PATH", lock):
+                dead = corpusdb._database_build_id(path=db)
+                lock.write_bytes(index_lock.render_record(
+                    pid=os.getpid(), start=common.process_start_identity(os.getpid()),
+                    token="a" * 32, label="agrep-rs", time_ms=time.time_ns() // 1_000_000))
+                live = corpusdb._database_build_id(path=db)
+        self.assertEqual(dead[:2], ("journal", None))
+        self.assertEqual(
+            dead[2], f"an interrupted index pass left a rollback journal at {db}-journal; "
+                     "the next index pass rolls it back")
+        self.assertEqual(live, ("journal", None,
+                                f"corpus.db has a live rollback journal at {db}-journal"))
+
+
 
 # Shapes that put agrep's own work back on the reader. Each is the literal
 # text the product owner was looking at, or its close kin.
@@ -479,6 +589,21 @@ class JournaledOwnerLaunchabilityTests(unittest.TestCase):
         self.assertEqual(
             surface.repair_decline_line(kick.cause),
             "another agrep's claim on the index cannot be verified")
+
+    def test_the_kick_names_a_newer_anchor_with_its_remedy(self) -> None:
+        # [W16 round 2] the one fence the reader can end: the verdict carries
+        # the sentence, and the fallback line stays short
+        reason = indexd_runtime.newer_anchor_reason(2, 1)
+        with mock.patch.object(
+                indexd_runtime, "newer_anchor_fence", return_value=reason):
+            kick = self._kick(indexd_runtime.DerivedMutationInfo(
+                "unavailable", None, reason))
+        self.assertFalse(self.spawned)
+        self.assertEqual(
+            kick, indexd_runtime.RepairKick(False, "newer-anchor", reason))
+        self.assertEqual(
+            surface.repair_decline_line(kick.cause),
+            "the data dir was written by a newer agrep")
 
 
 def _dead_pid() -> int | None:
@@ -722,9 +847,10 @@ class ColdRollbackJournalTests(unittest.TestCase):
         return json.loads(
             (data / ".derived-owner.json").read_text(encoding="utf-8"))["build_id"]
 
-    def _wedge(self, data: Path, live: bool) -> subprocess.Popen | None:
+    def _wedge(self, data: Path, live: bool,
+               db: Path | None = None) -> subprocess.Popen | None:
         """Leave the shape the upgrade left: a rollback journal over the stores."""
-        db = data / "corpus.db"
+        db = data / "corpus.db" if db is None else db
         held = (
             'db.execute("BEGIN IMMEDIATE")\n'
             'db.execute("CREATE TABLE IF NOT EXISTS wedge(x)")\n')
@@ -850,6 +976,91 @@ class ColdRollbackJournalTests(unittest.TestCase):
                     "scanning sources this query", healed.stderr)
             finally:
                 self._stop_daemons(dict(first))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+        "chmod 000 must deny this user")
+    def test_a_journal_this_user_cannot_use_never_stops_the_daemon(self) -> None:
+        """An interrupted `sudo agrep` leaves a journal owned by root. The heartbeat read it as
+        lost ownership, so the daemon exited within seconds and every read respawned one."""
+        # A -shm beside the DELETE-mode corpus.db is no journal, yet the ownership probe opened
+        # it: the daemon died on it again once it stopped counting as a block.
+        for store, suffix, kind in (
+                ("corpus.db", "-journal", "rollback journal"),
+                ("events/.store.sqlite3", "-journal", "rollback journal"),
+                ("corpus.db", "-shm", "shared-memory file")):
+            with self.subTest(store=store, suffix=suffix), \
+                    tempfile.TemporaryDirectory(prefix="agrep-sidecar-") as raw:
+                root = Path(raw)
+                first, _second, data = self._sandbox(root)
+                live = dict(first)
+                live.pop("AGREP_NO_DAEMON", None)
+                journal = Path(f"{data / store}{suffix}")
+                try:
+                    self.assertEqual(self._agrep(first, "index").returncode, 0)
+                    self._agrep(live, "search", "cold journal wedge phrase")
+                    pid = self._running_daemon(live)
+                    if suffix == "-journal":
+                        self._wedge(data, live=False, db=data / store)
+                    else:
+                        journal.write_bytes(bytes(32768))
+                    journal.chmod(0)
+                    lock = data / f".indexd.v{indexd_runtime.INDEXD_PROTOCOL}.lock"
+                    beat = lock.stat().st_mtime
+                    time.sleep(3 * 5.0 + 2)  # three of the daemon's 5 s heartbeats
+                    self.assertEqual(self._running_daemon(live), pid)
+                    self.assertGreater(lock.stat().st_mtime, beat, "no heartbeat landed")
+                    named = (f"its {kind} at {journal} is not readable and "
+                             "writable by you, so no index pass can use it: `chmod u+rw ")
+                    doctor = self._agrep(first, "doctor")
+                    status = self._agrep(first)
+                    for surface_output in (doctor.stdout, status.stdout):
+                        self.assertIn(named, surface_output)
+                        self.assertRegex(surface_output, r"`, then `[^`]* index`")
+                        self.assertNotIn("another agrep", surface_output)
+                    declined = self._agrep(first, "index")
+                    self.assertEqual(declined.returncode, 1, declined.stderr)
+                    self.assertIn("indexing declined; the ", declined.stderr)
+                    self.assertIn(named, declined.stderr)
+                    self.assertNotIn("Errno", declined.stderr)
+                    if store == "corpus.db":
+                        # an uncertified gap naming the file (exit 1), never an evidence error
+                        audit = self._agrep(first, "audit", "--json")
+                        self.assertEqual(audit.returncode, 1, audit.stdout)
+                        self.assertTrue([gap for gap in json.loads(audit.stdout)["gap_details"]
+                                         if named in gap], audit.stdout)
+
+                    journal.chmod(0o600)
+                    self.assertEqual(self._agrep(first, "index").returncode, 0)
+                    # rolled back, or (unsynced when its writer died) inert, as SQLite rules
+                    self.assertFalse(suffix == "-journal" and journal.exists()
+                                     and journal.read_bytes()[:1] not in (b"", b"\0"))
+                    for argv in (("doctor",), ()):
+                        self.assertNotIn("not readable and writable",
+                                         self._agrep(first, *argv).stdout)
+                    self.assertEqual(self._running_daemon(live), pid)
+
+                    # lost ownership still ends it: another process takes the daemon's lock
+                    lock.unlink()
+                    lock.write_text(f"pid={os.getpid()} token={'b' * 32}\n", encoding="ascii")
+                    deadline = time.monotonic() + 20.0
+                    while time.monotonic() < deadline and common.pid_alive(pid):
+                        time.sleep(0.25)
+                    self.assertFalse(common.pid_alive(pid), "a daemon outlived its lost lock")
+                finally:
+                    if journal.exists():
+                        journal.chmod(0o600)
+                    self._stop_daemons(dict(first))
+
+    def _running_daemon(self, env: dict) -> int:
+        deadline = time.monotonic() + 30.0
+        while True:
+            status = json.loads(self._agrep(env, "status", "--json").stdout)
+            daemon = status.get("daemon") or {}
+            if daemon.get("running"):
+                return int(daemon["pid"])
+            self.assertLess(time.monotonic(), deadline, f"no daemon came up: {daemon}")
+            time.sleep(0.5)
 
     def _assert_declined(self, declined: subprocess.CompletedProcess,
                          data: Path, seeded: str) -> None:

@@ -221,7 +221,8 @@ fn intake_ids(data: &Path) -> Vec<String> {
 /// tests/fixtures/gemini_flows. `expected.json` holds the conversation a person had: what upstream
 /// resumes, plus turns a context rewrite (compression, masking, truncation, `/chat resume`) took
 /// out of the model's view. Rewound and rolled-back turns are gone, with their tool events where a
-/// flow pins them, and every recording of one flow reads the same.
+/// flow pins them, and every recording of one flow reads the same. A subagent's chat (`parent` in
+/// its entry) publishes as a side session of that parent, whose invoke_agent event names it.
 #[test]
 fn gemini_flows_read_as_the_conversation_a_person_had() {
     let fixture = fixtures_dir().join("gemini_flows");
@@ -241,7 +242,14 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
                 )
             })
             .collect();
+    let families: std::collections::HashMap<String, serde_json::Value> =
+        sorted_lines(&data.join("sessions.jsonl"))
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|row| (row["session"].as_str().unwrap().to_string(), row))
+            .collect();
     let calls = gemini_event_ids(&data);
+    let links = gemini_event_links(&data);
     let mut failures = Vec::new();
     for (session, case) in expected.as_object().unwrap() {
         let rows = session_rows(&data, session);
@@ -264,6 +272,20 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
         {
             failures.push(format!("{}: got {got:?} turns {turns:?}", case["flow"]));
         }
+        let parent = case.get("parent").and_then(|p| p.as_str());
+        let published = families.get(session).and_then(|row| row["parent"].as_str());
+        if !rows.is_empty() && published != parent {
+            failures.push(format!("{}: parent {published:?}", case["flow"]));
+        }
+        if let Some(parent) = parent {
+            if !links.contains(&(parent.to_string(), session.clone()))
+                && case["flow"]
+                    .as_str()
+                    .is_some_and(|flow| flow.contains("/subagent/"))
+            {
+                failures.push(format!("{}: no invoke_agent event links it", case["flow"]));
+            }
+        }
         let mut events = calls.get(session).cloned().unwrap_or_default();
         events.sort_unstable();
         if case
@@ -275,6 +297,26 @@ fn gemini_flows_read_as_the_conversation_a_person_had() {
     }
     let _ = fs::remove_dir_all(&data);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every (session, child) an event store links, as published.
+fn gemini_event_links(data: &Path) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    for (name, body) in event_rows(data) {
+        let session = name
+            .trim_start_matches("gemini-")
+            .split("--")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        for line in String::from_utf8_lossy(&body).lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(child) = event["child"].as_str().filter(|child| !child.is_empty()) {
+                links.push((session.clone(), child.to_string()));
+            }
+        }
+    }
+    links
 }
 
 /// Each session's tool event call ids, as the event store holds them.
@@ -312,6 +354,9 @@ fn gemini_sessions_undone_after_a_warm_index_publish_nothing() {
     let mut cases = Vec::new();
     for entry in fs::read_dir(fixture.join("home").join(chats)).unwrap() {
         let path = entry.unwrap().path();
+        if path.is_dir() {
+            continue;
+        }
         let body = fs::read(&path).unwrap();
         let meta: serde_json::Value =
             serde_json::from_slice(body.split(|b| *b == b'\n').next().unwrap()).unwrap();

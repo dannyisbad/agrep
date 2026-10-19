@@ -1,6 +1,9 @@
 """Mechanical tests for the semantic scale gate's fixtures and math."""
 
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import importlib.util
 import tempfile

@@ -1,4 +1,7 @@
 from __future__ import annotations
+from _test_support import isolate_data_dir
+
+isolate_data_dir()
 
 import contextlib
 import hashlib
@@ -178,14 +181,45 @@ class ReindexSignatureTests(unittest.TestCase):
             run.assert_called_once()
             refresh.assert_called_once_with(quiet=False)
 
+    def test_a_fenced_writer_is_a_decline_never_a_traceback(self) -> None:
+        # An event-store sidecar this user cannot use fences the writer after corpus.db's
+        # preflight passed; reindex called the fenced env unguarded and crashed.
+        fenced = reindex.indexd_runtime.DerivedWriteFenced(
+            reindex.indexd_runtime.DerivedMutationInfo(
+                "unavailable", None, "the event store cannot be updated - its rollback "
+                "journal at /d/events/.store.sqlite3-journal is not readable and writable "
+                "by you, so no index pass can use it: `chmod u+rw /d/x`, then `agrep index`",
+                sidecar_blocked=True))
+        for argv in (["reindex.py", "--no-build"], ["reindex.py", "--no-build", "--full"]):
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as temporary:
+                binary = Path(temporary) / "agrep-rs"
+                binary.touch()
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.object(reindex.common, "ingest_bin", return_value=binary), \
+                        mock.patch.object(
+                            reindex.indexd_runtime, "derived_writer_mutation_info",
+                            return_value=mock.Mock(writable=True)), \
+                        mock.patch.object(reindex.indexd_runtime, "explicit_rust_writer_env",
+                                          side_effect=fenced), \
+                        mock.patch.object(reindex, "run") as run, \
+                        contextlib.redirect_stdout(stdout):
+                    self.assertEqual(reindex.main(), 1)
+                run.assert_not_called()
+                self.assertEqual(stdout.getvalue(),
+                                 f"  ! reindex skipped: {fenced.info.reason}.\n")
+
     def test_reindex_refreshes_keyword_index_after_ingest(self) -> None:
         order: list[str] = []
 
         def run_stage(desc, _cmd, optional=False, *, env=None):
             order.append(desc)
             if desc == "ingest transcripts (rust)":
-                self.assertEqual(
-                    env, {"AGREP_RUNTIME_BUILD_ID": "a" * 20})
+                # a foreground reindex is an explicit index: its ingest waits out a
+                # live same-build writer instead of declining
+                self.assertEqual(env, {
+                    "AGREP_RUNTIME_BUILD_ID": "a" * 20,
+                    "AGREP_DERIVED_ADOPTION_WAIT_MS": "180000"})
             return True
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -261,6 +295,8 @@ class ReindexSignatureTests(unittest.TestCase):
                     ), "indexer": mock.Mock(run_post_index_hooks=lambda: None)}):
                 self.assertEqual(reindex.main(), 0)
         self.assertIn("--full", commands["ingest transcripts (rust)"])
+        # The explicit rebuild consents to publish without what it cannot read.
+        self.assertIn("--drop-unreadable", commands["ingest transcripts (rust)"])
         self.assertEqual(
             commands["embed messages"][1:], ["py/embed.py", "--full"])
 
@@ -302,6 +338,9 @@ class ReindexSignatureTests(unittest.TestCase):
                     ), "indexer": mock.Mock(run_post_index_hooks=lambda: None)}):
                 self.assertEqual(reindex.main(), 0)
         self.assertNotIn("--full", commands["ingest transcripts (rust)"])
+        self.assertNotIn("--drop-unreadable", commands["ingest transcripts (rust)"])
+        # An explicit reindex re-reads a source whose recorded read failed, changed or not.
+        self.assertIn("--retry-failed-sources", commands["ingest transcripts (rust)"])
         self.assertEqual(commands["embed messages"][1:], ["py/embed.py"])
 
     def test_corrupt_completion_signature_is_a_cache_miss_not_a_crash(self) -> None:

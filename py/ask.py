@@ -1537,9 +1537,10 @@ def _require_current_message_index() -> dict:
         try:
             manifest, _, _, coverage = segment_query.open_current(meta_path)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            # The reader may be `agrep -s` itself: name the cause, not the command.
             raise RuntimeError(
-                "semantic message index is not a validated current generation; "
-                "run meaning search through managed `agrep -s`") from exc
+                "semantic message index is not a validated current generation: "
+                f"{common.terminal_safe(exc)}") from exc
         _CURRENT_MESSAGE_STATE.update(
             bundle=(f"segment:{manifest['generation']}:"
                     f"{manifest['set_manifest']['sha256']}"),
@@ -1556,7 +1557,7 @@ def _require_current_message_index() -> dict:
     except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             "semantic message index is not a validated current generation; "
-            "run meaning search through managed `agrep -s`") from exc
+            "the next semantic refresh republishes it") from exc
     if not isinstance(marker, dict):
         marker = {}
     marker_output = marker.get("output")
@@ -1591,7 +1592,7 @@ def _require_current_message_index() -> dict:
     if coverage is None:
         raise RuntimeError(
             "semantic message index is stale or has invalid coverage; "
-            "run meaning search through managed `agrep -s`")
+            "the next semantic refresh republishes it")
     _CURRENT_MESSAGE_STATE.update(
         bundle=state["identity"], artifacts=state["artifacts"], source=source,
         generation=state["commit"]["generation"])

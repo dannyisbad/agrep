@@ -1,0 +1,28 @@
+{
+  "sessionId": "9e000004-0716-4000-8000-000000000716",
+  "projectHash": "3c9e1f0a7b2d4e6f8a1c3e5f7b9d0a2c4e6f8b1d3f5a7c9e0b2d4f6a8c1e3f5a",
+  "startTime": "2026-07-16T09:00:00.000Z",
+  "lastUpdated": "2026-07-16T09:01:00.000Z",
+  "messages": [
+    {
+      "id": "m1",
+      "timestamp": "2026-07-16T09:00:00.000Z",
+      "type": "user",
+      "content": "Plan the loader parser fix."
+    },
+    {
+      "id": "m2",
+      "timestamp": "2026-07-16T09:00:20.000Z",
+      "type": "gemini",
+      "model": "gemini-2.5-pro",
+      "content": "To do:\n- reproduce the loader bug\n- patch the handler"
+    },
+    {
+      "id": "m3",
+      "timestamp": "2026-07-16T09:01:00.000Z",
+      "type": "gemini",
+      "model": "gemini-2.5-pro",
+      "content": "Let me know if you want me to proceed."
+    }
+  ]
+}

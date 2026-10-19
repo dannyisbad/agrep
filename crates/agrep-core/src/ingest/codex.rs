@@ -250,6 +250,7 @@ fn compact_boundary_message(
         parent: subagent
             .map(|ctx| ctx.parent_session.clone())
             .unwrap_or_default(),
+        reply_shape: Default::default(),
     }
 }
 
@@ -277,6 +278,7 @@ fn compaction_marker(
         call_id: format!("codex:{source_stem}:{record_ordinal}:compacted"),
         child_session: String::new(),
         meta: String::new(),
+        state: String::new(),
     }
 }
 
@@ -853,11 +855,7 @@ fn parse_file_with_tally(
             );
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
-            return (
-                Vec::new(),
-                Vec::new(),
-                crate::ingest_cache::ReadOutcome::Skipped,
-            );
+            return (Vec::new(), Vec::new(), crate::ingest::read_failure_outcome(&e));
         }
     };
 
@@ -865,6 +863,7 @@ fn parse_file_with_tally(
     let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut recap_turns = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    let mut order = crate::ingest::ReplyOrder::new();
     // call_id -> index into `events`, so the *_output line can pair up.
     let mut pending: HashMap<String, usize> = HashMap::new();
     let mut turn = 0u32;
@@ -1146,10 +1145,12 @@ fn parse_file_with_tally(
                             tally.discard_rows_as_replay(out.len() as u64);
                             tally.discard_events(events.len() as u64);
                             events.clear();
+                            order.reset(&events);
                             out.clear();
                             turn = 0;
                         }
                         tally.row();
+                        order.prompt(&mut events);
                         out.push(crate::model::RawMessage {
                             agent: "codex",
                             project: project.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -1164,6 +1165,7 @@ fn parse_file_with_tally(
                             reply_chars: 0,
                             side: true,
                             parent: ctx.parent_session.clone(),
+                            reply_shape: Default::default(),
                         });
                         turn += 1;
                         continue;
@@ -1221,10 +1223,12 @@ fn parse_file_with_tally(
                         tally.discard_rows_as_replay(out.len() as u64);
                         tally.discard_events(events.len() as u64);
                         events.clear();
+                        order.reset(&events);
                         out.clear();
                         turn = 0;
                     }
                     tally.row();
+                    order.prompt(&mut events);
                     out.push(crate::model::RawMessage {
                         agent: "codex",
                         project: project.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -1239,6 +1243,7 @@ fn parse_file_with_tally(
                         reply_chars: 0,
                         side: true,
                         parent: ctx.parent_session.clone(),
+                        reply_shape: Default::default(),
                     });
                     turn += 1;
                     continue;
@@ -1280,6 +1285,7 @@ fn parse_file_with_tally(
                 // function_call carries `arguments` as a JSON string; custom_tool_call
                 // carries `input` as a raw string (e.g. an apply_patch body).
                 let mut control = false;
+                let mut state = String::new();
                 let (input, input_chars) = if let Some(raw) = payload.arguments {
                     let args_val: serde_json::Value =
                         serde_json::from_str(raw.get()).unwrap_or_default();
@@ -1287,10 +1293,16 @@ fn parse_file_with_tally(
                     match args_val {
                         serde_json::Value::String(inner) => {
                             serde_json::from_str::<serde_json::Value>(&inner)
-                                .map(|v| summarize_tool_input_with_chars(&v))
+                                .map(|v| {
+                                    state = crate::ingest::task_state(&name, Some(&v));
+                                    summarize_tool_input_with_chars(&v)
+                                })
                                 .unwrap_or_else(|_| cap_str_with_chars(&inner, EVENT_CAP))
                         }
-                        v => summarize_tool_input_with_chars(&v),
+                        v => {
+                            state = crate::ingest::task_state(&name, Some(&v));
+                            summarize_tool_input_with_chars(&v)
+                        }
                     }
                 } else {
                     payload.input.as_deref().map_or_else(
@@ -1332,6 +1344,7 @@ fn parse_file_with_tally(
                     call_id,
                     child_session: String::new(),
                     meta: String::new(),
+                    state,
                 });
                 continue;
             }
@@ -1398,6 +1411,7 @@ fn parse_file_with_tally(
                     call_id: event_id(),
                     child_session: String::new(),
                     meta: String::new(),
+                    state: String::new(),
                 });
                 continue;
             }
@@ -1419,12 +1433,11 @@ fn parse_file_with_tally(
         if payload.role.as_deref() == Some("assistant") {
             if let Some(txt) = extract_assistant(blocks) {
                 if let Some(last) = out.last_mut() {
-                    let chars = crate::ingest::append_capped(
-                        &mut last.reply,
-                        &txt,
-                        crate::ingest::REPLY_CAP,
-                    );
-                    last.reply_chars += chars;
+                    let chars = crate::ingest::append_reply(last, &txt);
+                    if chars > 0 {
+                        order.joined(&mut last.reply_shape, &events, events.len());
+                        order.reply(events.len());
+                    }
                     if last.model.is_empty() && !current_model.is_empty() {
                         last.model = current_model.clone();
                     }
@@ -1458,6 +1471,7 @@ fn parse_file_with_tally(
         }
 
         tally.row();
+        order.prompt(&mut events);
         out.push(crate::model::RawMessage {
             agent: "codex",
             project: project.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -1475,9 +1489,11 @@ fn parse_file_with_tally(
                 .as_ref()
                 .map(|ctx| ctx.parent_session.clone())
                 .unwrap_or_default(),
+            reply_shape: Default::default(),
         });
         turn += 1;
     }
+    order.finish(&mut events);
 
     // Canonical prefilter skips dominate the line count. Fold them into the per-file tally
     // once, keeping the same seen identity while avoiding millions of atomic increments.
@@ -2203,5 +2219,252 @@ mod tests {
             assert!(raw_call_output(line).is_some());
             assert!(serde_json::from_str::<Line<'_>>(line).is_ok());
         }
+    }
+
+    fn stamped(ts: &str, mut record: serde_json::Value) -> serde_json::Value {
+        record["timestamp"] = serde_json::json!(ts);
+        record
+    }
+
+    fn assistant_item(ts: &str, text: &str) -> serde_json::Value {
+        stamped(
+            ts,
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]}}),
+        )
+    }
+
+    fn call_item(ts: &str, id: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+        stamped(
+            ts,
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "function_call", "name": name, "call_id": id,
+                "arguments": args.to_string()}}),
+        )
+    }
+
+    fn output_item(ts: &str, id: &str, out: &str) -> serde_json::Value {
+        stamped(
+            ts,
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": id, "output": out}}),
+        )
+    }
+
+    fn compacted_item(ts: &str) -> serde_json::Value {
+        stamped(
+            ts,
+            serde_json::json!({"type": "compacted", "payload": {"message": "",
+                "replacement_history": [{"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "Summary."}]}]}}),
+        )
+    }
+
+    fn trailing(events: &[crate::model::Event]) -> Vec<(&str, bool)> {
+        events
+            .iter()
+            .map(|e| {
+                (
+                    e.call_id.as_str(),
+                    e.meta
+                        .split(' ')
+                        .any(|t| t == crate::ingest::AFTER_REPLY_META),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn calls_no_reply_followed_carry_the_fact_in_every_order() {
+        let root = scratch("reply-order");
+        let path = rollout(
+            &root,
+            "rollout-order.jsonl",
+            &[
+                meta("s-order", serde_json::json!({})),
+                // turn 1: text, call, text: the call was answered
+                stamped("2026-01-01T09:00:00Z", user_item("first")),
+                stamped("2026-01-01T09:00:00Z", submitted("first")),
+                assistant_item("2026-01-01T09:00:10Z", "Checking."),
+                call_item(
+                    "2026-01-01T09:00:10Z",
+                    "c1",
+                    "shell",
+                    serde_json::json!({"command": "ls"}),
+                ),
+                output_item("2026-01-01T09:00:11Z", "c1", "ok"),
+                assistant_item("2026-01-01T09:00:12Z", "All clear."),
+                // turn 2: call before any text, then text, then a call and a compaction with
+                // more calls after it and no further text: the trailing run spans the recap
+                stamped("2026-01-01T09:10:00Z", user_item("second")),
+                stamped("2026-01-01T09:10:00Z", submitted("second")),
+                call_item(
+                    "2026-01-01T09:10:01Z",
+                    "c2",
+                    "shell",
+                    serde_json::json!({"command": "pwd"}),
+                ),
+                output_item("2026-01-01T09:10:02Z", "c2", "/w"),
+                assistant_item("2026-01-01T09:10:03Z", "Rebuilding."),
+                call_item(
+                    "2026-01-01T09:10:03Z",
+                    "c3",
+                    "shell",
+                    serde_json::json!({"command": "make"}),
+                ),
+                output_item("2026-01-01T09:10:09Z", "c3", "built"),
+                compacted_item("2026-01-01T09:15:00Z"),
+                call_item(
+                    "2026-01-01T09:20:00Z",
+                    "c4",
+                    "shell",
+                    serde_json::json!({"command": "make 2"}),
+                ),
+                output_item("2026-01-01T09:20:09Z", "c4", "built"),
+                // turn 3: no text at all
+                stamped("2026-01-01T09:30:00Z", user_item("third")),
+                stamped("2026-01-01T09:30:00Z", submitted("third")),
+                call_item(
+                    "2026-01-01T09:30:01Z",
+                    "c5",
+                    "shell",
+                    serde_json::json!({"command": "cat"}),
+                ),
+            ],
+        );
+        let (msgs, events, healthy) = parse_file(&path);
+        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        let replies: Vec<&str> = msgs.iter().map(|m| &*m.reply).collect();
+        assert_eq!(replies, ["Checking. All clear.", "Rebuilding.", "", ""]);
+        let mut facts = trailing(&events);
+        facts.sort();
+        assert_eq!(
+            facts,
+            [
+                ("c1", false),
+                ("c2", false),
+                ("c3", true),
+                ("c4", true),
+                ("c5", true),
+                ("codex:rollout-order:14:compacted", true),
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn replayed_rollout_file_agrees_with_the_original_on_trailing_calls() {
+        // a resume replays the earlier records into a new file: the replayed turn's facts are
+        // identical, so dedupe by call id keeps the same answer whichever copy it keeps
+        let root = scratch("reply-order-replay");
+        let first = [
+            meta("s-replay", serde_json::json!({})),
+            stamped("2026-01-01T09:00:00Z", user_item("first")),
+            stamped("2026-01-01T09:00:00Z", submitted("first")),
+            assistant_item("2026-01-01T09:00:10Z", "Checking."),
+            call_item(
+                "2026-01-01T09:00:10Z",
+                "c1",
+                "shell",
+                serde_json::json!({"command": "ls"}),
+            ),
+            output_item("2026-01-01T09:00:11Z", "c1", "ok"),
+        ];
+        let mut resumed = first.to_vec();
+        resumed.extend([
+            stamped("2026-01-01T10:00:00Z", user_item("second")),
+            stamped("2026-01-01T10:00:00Z", submitted("second")),
+            assistant_item("2026-01-01T10:00:10Z", "Done."),
+        ]);
+        let original = rollout(&root, "rollout-2026-01-01T09-00-00-s-replay.jsonl", &first);
+        let replay = rollout(
+            &root,
+            "rollout-2026-01-01T10-00-00-s-replay.jsonl",
+            &resumed,
+        );
+        let (_, events_a, _) = parse_file(&original);
+        let (msgs_b, events_b, _) = parse_file(&replay);
+        assert_eq!(trailing(&events_a), [("c1", true)]);
+        assert_eq!(trailing(&events_b), [("c1", true)]);
+        assert_eq!(
+            msgs_b.iter().map(|m| &*m.reply).collect::<Vec<_>>(),
+            ["Checking.", "Done."]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn update_plan_keeps_its_steps_whole_past_the_display_cap() {
+        let root = scratch("plan-state");
+        let steps: Vec<serde_json::Value> = (0..12)
+            .map(|n| {
+                serde_json::json!({"step": format!("port module {n} {}", "x".repeat(80)),
+                                        "status": if n == 0 { "completed" } else { "pending" }})
+            })
+            .collect();
+        let path = rollout(
+            &root,
+            "rollout-plan.jsonl",
+            &[
+                meta("s-plan", serde_json::json!({})),
+                stamped("2026-01-01T09:00:00Z", user_item("port them")),
+                stamped("2026-01-01T09:00:00Z", submitted("port them")),
+                call_item(
+                    "2026-01-01T09:00:10Z",
+                    "p1",
+                    "update_plan",
+                    serde_json::json!({"explanation": "the plan", "plan": steps}),
+                ),
+                call_item(
+                    "2026-01-01T09:00:11Z",
+                    "c1",
+                    "shell",
+                    serde_json::json!({"command": "ls"}),
+                ),
+            ],
+        );
+        let (_, events, _) = parse_file(&path);
+        let plan = events.iter().find(|e| e.call_id == "p1").unwrap();
+        assert!(plan.input.ends_with('…') && plan.input_chars > crate::ingest::EVENT_CAP);
+        let state: serde_json::Value = serde_json::from_str(&plan.state).unwrap();
+        assert_eq!(state["plan"].as_array().unwrap().len(), 12);
+        assert_eq!(state["plan"][11]["status"], "pending");
+        assert!(state.get("explanation").is_none());
+        assert_eq!(events.iter().find(|e| e.call_id == "c1").unwrap().state, "");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_routed_subagent_anchor_discards_the_replayed_parent_rows() {
+        let root = scratch("anchor-discard");
+        let anchor = serde_json::json!({"timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
+            "payload": {"type": "agent_message", "recipient": "/root/child", "author": "/root",
+                "content": [{"type": "input_text", "text":
+                    "Message Type: NEW_TASK\nTask name: uniform\nPayload: Child uniform task."}]}});
+        let path = rollout(
+            &root,
+            "rollout-anchor.jsonl",
+            &[
+                user_item("Parent preamble tango question."),
+                submitted("Parent preamble tango question."),
+                assistant_item("2026-01-01T00:00:02Z", "Parent tango answer."),
+                meta(
+                    "child",
+                    serde_json::json!({"thread_source": "subagent",
+                    "agent_path": "/root/child", "parent_thread_id": "parent"}),
+                ),
+                anchor,
+                assistant_item("2026-01-01T00:00:06Z", "Child uniform done."),
+            ],
+        );
+        let (msgs, _events, _) = parse_file(&path);
+        assert_eq!(
+            msgs.iter()
+                .map(|m| (&*m.text, &*m.reply))
+                .collect::<Vec<_>>(),
+            [("[subagent task] Child uniform task.", "Child uniform done.")]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

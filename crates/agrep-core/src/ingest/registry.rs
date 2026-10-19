@@ -36,10 +36,24 @@ pub enum Fingerprint {
     Always,
 }
 
+/// Issue kind of an attribution source (cursor's workspace metadata) the census could not read
+/// while it still listed every conversation: nothing is hidden or lost, some projects are
+/// provisional. The publication guard admits it without a material verdict for its path.
+pub const ATTRIBUTION_ISSUE_KIND: &str = "attribution-unreadable";
+
+pub fn attribution_only_issue(kind: &str) -> bool {
+    kind == ATTRIBUTION_ISSUE_KIND
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenAvailability {
     Data(Vec<(String, String)>),
     Empty,
+    /// Every database the census opened lists its conversations; `issues` name each it could not.
+    Partial {
+        tokens: Vec<(String, String)>,
+        issues: Vec<TokenReadIssue>,
+    },
     Unreadable(Vec<TokenReadIssue>),
 }
 
@@ -48,6 +62,12 @@ pub struct TokenReadIssue {
     pub path: PathBuf,
     pub kind: &'static str,
     pub reason: String,
+    /// Conversations listed under a fallback project because `path`, an attribution source,
+    /// could not be read. Empty when the issue hides conversations instead.
+    pub provisional: Vec<String>,
+    /// Conversations of a listed store this issue leaves unlisted; empty when `path` itself is
+    /// the store (or a registry) that stayed unlisted whole.
+    pub hidden: Vec<String>,
 }
 
 impl TokenReadIssue {
@@ -66,7 +86,19 @@ impl TokenReadIssue {
             path: path.into(),
             kind,
             reason: reason.into(),
+            provisional: Vec::new(),
+            hidden: Vec::new(),
         }
+    }
+
+    pub fn provisional(mut self, sessions: Vec<String>) -> Self {
+        self.provisional = sessions;
+        self
+    }
+
+    pub fn hiding(mut self, sessions: Vec<String>) -> Self {
+        self.hidden = sessions;
+        self
     }
 }
 
@@ -76,6 +108,28 @@ impl TokenAvailability {
             Self::Empty
         } else {
             Self::Data(tokens)
+        }
+    }
+
+    /// A census over several databases: the conversations of each it opened beside the issue
+    /// naming each it could not. Nothing listed is plain `Unreadable`.
+    pub fn from_observation(tokens: Vec<(String, String)>, issues: Vec<TokenReadIssue>) -> Self {
+        if issues.is_empty() {
+            Self::from_tokens(tokens)
+        } else if tokens.is_empty() {
+            Self::Unreadable(issues)
+        } else {
+            Self::Partial { tokens, issues }
+        }
+    }
+
+    /// The listed conversations and the issues scoping what stayed unlisted.
+    pub fn into_parts(self) -> (Vec<(String, String)>, Vec<TokenReadIssue>) {
+        match self {
+            Self::Data(tokens) => (tokens, Vec::new()),
+            Self::Empty => (Vec::new(), Vec::new()),
+            Self::Partial { tokens, issues } => (tokens, issues),
+            Self::Unreadable(issues) => (Vec::new(), issues),
         }
     }
 }
@@ -178,6 +232,15 @@ pub trait Adapter: Sync {
     /// Exact live tokens keyed the same way as `intake_stats.json` entries.
     fn intake_tokens(&self) -> TokenAvailability {
         self.freshness_tokens()
+    }
+    /// [`Self::intake_tokens`] beside the parse cache the diagnostic decoded (None when it could
+    /// not): an adapter whose tokens depend on what the last generation published (cursor's
+    /// retained attribution) reads it rather than the live sources alone.
+    fn intake_tokens_with(
+        &self,
+        _cache: Option<&crate::ingest_cache::CacheView>,
+    ) -> TokenAvailability {
+        self.intake_tokens()
     }
     /// For `Fingerprint::Token` stores: the prefix every freshness token id and parse-cache id of
     /// `database`'s conversations starts with. None keeps a listed database counted as material.
@@ -795,18 +858,34 @@ pub fn metadata_is_link(metadata: &fs::Metadata) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
-fn secure_read_options(options: &mut fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    options.custom_flags(0x20_000 | 0x800);
+/// Whether a failed `symlink_metadata(path)` proves nothing exists at `path`: ENOENT, or a
+/// parent that is not a directory (or a name too long) where the deepest ancestor that stats is
+/// not a link. A link there is mispointed and, like a loop (ELOOP), hides data that may be
+/// intact; EACCES and EIO likewise stay unavailable and retain their rows.
+pub fn stat_proves_absent(path: &Path, error: &std::io::Error) -> bool {
+    match error.kind() {
+        ErrorKind::NotFound => true,
+        ErrorKind::NotADirectory | ErrorKind::InvalidFilename => path
+            .ancestors()
+            .skip(1)
+            .find_map(|ancestor| fs::symlink_metadata(ancestor).ok())
+            .is_some_and(|metadata| !metadata_is_link(&metadata)),
+        _ => false,
+    }
 }
 
-#[cfg(target_os = "macos")]
-fn secure_read_options(options: &mut fs::OpenOptions) {
+/// Read-open flags that refuse a final-component symlink (ELOOP) and never block on a FIFO.
+/// The O_* values differ by architecture: x86_64's O_NOFOLLOW is O_LARGEFILE on aarch64 Linux.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn nofollow_read_options(options: &mut fs::OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
 
-    options.custom_flags(0x100 | 0x4);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn secure_read_options(options: &mut fs::OpenOptions) {
+    nofollow_read_options(options);
 }
 
 #[cfg(windows)]
@@ -864,7 +943,10 @@ fn same_plain_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.modified().ok() == right.modified().ok()
 }
 
-fn open_regular_snapshot(path: &Path, before: &fs::Metadata) -> std::io::Result<fs::File> {
+pub(crate) fn open_regular_snapshot(
+    path: &Path,
+    before: &fs::Metadata,
+) -> std::io::Result<fs::File> {
     if metadata_is_link(before) || !before.is_file() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
@@ -1387,6 +1469,7 @@ pub fn regular_file_edge_snapshot(
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    crate::fault_injection::postflight_wal_gate(path);
     regular_file_edge_snapshot_from_meta(path, edge_bytes, before).map(Some)
 }
 
@@ -1836,9 +1919,11 @@ impl SourceSnapshotView {
             .collect()
     }
 
-    /// Store roots of Stat adapters under which the walk found no source: the per-root form of
-    /// [`Self::cleanly_absent_agents`]. An issue blocks every root it may scope - its own, any
-    /// root beneath it, or all of them when it lies outside each - so a sibling's denial cannot.
+    /// Store roots under which the walk found no source: the per-root form of
+    /// [`Self::cleanly_absent_agents`], for Stat adapters and for the databases a Token adapter
+    /// registers (which must also list no conversation). An issue blocks every root it may
+    /// scope - its own, any root beneath it, or all of them when it lies outside each - so a
+    /// sibling's denial cannot.
     pub fn cleanly_absent_roots(&self) -> HashSet<(String, PathBuf)> {
         if self.snapshot.snapshot_version != SOURCE_SNAPSHOT_VERSION {
             return HashSet::new();
@@ -1846,7 +1931,11 @@ impl SourceSnapshotView {
         let mut absent = HashSet::new();
         for adapter in &self.snapshot.adapters {
             let Some(owner) = ADAPTERS.iter().find(|candidate| {
-                candidate.name() == adapter.agent && candidate.fingerprint() == Fingerprint::Stat
+                candidate.name() == adapter.agent
+                    && matches!(
+                        candidate.fingerprint(),
+                        Fingerprint::Stat | Fingerprint::Token
+                    )
             }) else {
                 continue;
             };
@@ -1866,7 +1955,11 @@ impl SourceSnapshotView {
                         || within(root, issue)
                         || !roots.iter().any(|other| within(issue, other))
                 });
+                let listed = owner.token_prefix(root).is_some_and(|prefix| {
+                    adapter.tokens.iter().any(|(id, _)| id.starts_with(&prefix))
+                });
                 if !blocked
+                    && !listed
                     && !adapter
                         .files
                         .iter()
@@ -2179,6 +2272,88 @@ fn sqlite_snapshot_directory(_path: &Path) -> bool {
     false
 }
 
+/// How a symlinked source relates to its store root. `agrep resume` links a transcript
+/// into the launch cwd's Claude slug, so a transcript-shaped link inside a store is
+/// normally agrep's own: its target is indexed directly (an alias) or was since removed.
+pub enum StoreLink {
+    /// a regular transcript inside the store, reached by this walked path
+    Alias(PathBuf),
+    /// a transcript path inside the store with nothing there any more
+    Dangling,
+    /// anything else: outside the store, not a transcript, a loop, a directory
+    Foreign,
+}
+
+fn lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+pub fn classify_store_link(link: &Path, root: &Path, accepts: &dyn Fn(&Path) -> bool) -> StoreLink {
+    if !accepts(link) {
+        return StoreLink::Foreign;
+    }
+    let Ok(raw) = fs::read_link(link) else {
+        return StoreLink::Foreign;
+    };
+    let lexical = if raw.is_absolute() {
+        raw
+    } else {
+        link.parent()
+            .map_or_else(|| raw.clone(), |parent| parent.join(&raw))
+    };
+    if !accepts(&lexical) {
+        return StoreLink::Foreign;
+    }
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    match fs::canonicalize(&lexical) {
+        Ok(target) => {
+            if !fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file()) {
+                return StoreLink::Foreign;
+            }
+            match target.strip_prefix(&canonical_root) {
+                Ok(relative) => StoreLink::Alias(root.join(relative)),
+                Err(_) => StoreLink::Foreign,
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let target = lexical_path(&lexical);
+            let inside = target.strip_prefix(lexical_path(root)).is_ok()
+                || target.strip_prefix(&canonical_root).is_ok();
+            if inside {
+                StoreLink::Dangling
+            } else {
+                StoreLink::Foreign
+            }
+        }
+        Err(_) => StoreLink::Foreign,
+    }
+}
+
+/// Whether a link found by a walk is agrep's own (alias of a walked candidate, or dangling
+/// inside the store) and so skipped silently; any other link keeps the unsupported-link issue.
+fn own_store_link(
+    link: &Path,
+    root: &Path,
+    candidates: &[SourceCandidate],
+    accepts: &impl Fn(&Path) -> bool,
+) -> bool {
+    match classify_store_link(link, root, accepts) {
+        StoreLink::Alias(walked) => candidates.iter().any(|candidate| candidate.path == walked),
+        StoreLink::Dangling => true,
+        StoreLink::Foreign => false,
+    }
+}
+
 fn walk_regular_sources<const CENSUS: bool>(
     adapter: &dyn Adapter,
     path: &Path,
@@ -2189,6 +2364,7 @@ fn walk_regular_sources<const CENSUS: bool>(
     let mut pending = vec![(root.clone(), None)];
     let mut candidates = Vec::new();
     let mut issues = Vec::new();
+    let mut links = Vec::new();
     let mut complete = true;
     while let Some((path, observed)) = pending.pop() {
         let metadata = match observed
@@ -2196,7 +2372,8 @@ fn walk_regular_sources<const CENSUS: bool>(
             .unwrap_or_else(|| fs::symlink_metadata(&path))
         {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound && path == root => continue,
+            // A root behind a file or a too-long name is as absent as one that is ENOENT.
+            Err(error) if path == root && stat_proves_absent(&path, &error) => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip(adapter.name(), &path, &error);
                 issues.push(SourceIssue::from_io(adapter.name(), &path, &error));
@@ -2205,15 +2382,7 @@ fn walk_regular_sources<const CENSUS: bool>(
             }
         };
         if metadata_is_link(&metadata) {
-            let reason = "symlink sources are not followed";
-            crate::ingest::warn_source_skip(adapter.name(), &path, reason);
-            issues.push(SourceIssue::new(
-                adapter.name(),
-                &path,
-                "unsupported-link",
-                reason,
-            ));
-            complete = false;
+            links.push(path);
             continue;
         }
         if metadata.is_file() {
@@ -2281,6 +2450,20 @@ fn walk_regular_sources<const CENSUS: bool>(
             }
         }
     }
+    for link in links {
+        if own_store_link(&link, &root, &candidates, &accepts) {
+            continue;
+        }
+        let reason = "symlink sources are not followed";
+        crate::ingest::warn_source_skip(adapter.name(), &link, reason);
+        issues.push(SourceIssue::new(
+            adapter.name(),
+            &link,
+            "unsupported-link",
+            reason,
+        ));
+        complete = false;
+    }
     if !CENSUS {
         candidates.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     }
@@ -2300,7 +2483,8 @@ fn walk_sources(
 ) -> (bool, Vec<SourceIssue>, SourceSnapshotTiming) {
     // Discovery (notably Codex's YYYY/MM/DD tree) has no depth ceiling. Store roots
     // never follow symlinks, so transcript-shaped files outside them stay out of scope.
-    let walked = walk_regular_sources::<false>(adapter, path, |path| adapter.freshness_content(path));
+    let walked =
+        walk_regular_sources::<false>(adapter, path, |path| adapter.freshness_content(path));
     let candidate_count = walked.candidates.len();
     let mut complete = walked.complete;
     let mut issues = walked.issues;
@@ -2345,7 +2529,7 @@ fn walk_sources(
     )
 }
 
-fn sqlite_database(path: &Path) -> bool {
+pub(crate) fn sqlite_database(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
@@ -2427,26 +2611,31 @@ fn adapter_source_with_timing(
     files.sort();
     files.dedup();
     let mut tokens = if kind == Fingerprint::Token {
-        match match token_projection {
+        let (tokens, token_issues) = match token_projection {
             SnapshotTokenProjection::Freshness => adapter.freshness_tokens(),
             SnapshotTokenProjection::Intake => adapter.intake_tokens(),
-        } {
-            TokenAvailability::Data(tokens) => tokens,
-            TokenAvailability::Empty => Vec::new(),
-            TokenAvailability::Unreadable(token_issues) => {
-                for issue in token_issues {
-                    crate::ingest::warn_source_skip(adapter.name(), &issue.path, &issue.reason);
-                    issues.push(SourceIssue::new(
-                        adapter.name(),
-                        &issue.path,
-                        issue.kind,
-                        issue.reason,
-                    ));
-                }
-                complete = false;
-                Vec::new()
-            }
         }
+        .into_parts();
+        if !token_issues.is_empty() {
+            complete = false;
+        }
+        for issue in token_issues {
+            // The walk already named this path (a database it could not stat) with its kind.
+            if issues
+                .iter()
+                .any(|flagged| Path::new(flagged.path()) == issue.path)
+            {
+                continue;
+            }
+            crate::ingest::warn_source_skip(adapter.name(), &issue.path, &issue.reason);
+            issues.push(SourceIssue::new(
+                adapter.name(),
+                &issue.path,
+                issue.kind,
+                issue.reason,
+            ));
+        }
+        tokens
     } else {
         Vec::new()
     };
@@ -2685,7 +2874,8 @@ fn store_census(adapter: &dyn Adapter) -> StoreCensus {
     let mut files = Vec::new();
     let mut issues = Vec::new();
     for root in adapter.store_roots() {
-        let walked = walk_regular_sources::<true>(adapter, &root, |path| adapter.store_content(path));
+        let walked =
+            walk_regular_sources::<true>(adapter, &root, |path| adapter.store_content(path));
         issues.extend(walked.issues);
         files.reserve(walked.candidates.len());
         for candidate in walked.candidates {
@@ -2829,12 +3019,16 @@ pub fn runtime_issue_roots(agent: &str) -> Vec<(String, PathBuf)> {
         .unwrap_or_else(|_| vec![(agent.to_string(), crate::ingest::home())])
 }
 
+/// A project named after its own agent is that adapter's fallback bucket (gemini, pi), so of two
+/// otherwise equal copies the attributed one is canonical.
 pub(crate) fn canonical_message_cmp(left: &Message, right: &Message) -> std::cmp::Ordering {
+    let attributed = |message: &Message| message.project.as_ref() != message.agent;
     left.reply_chars
         .cmp(&right.reply_chars)
         .then_with(|| left.reply.len().cmp(&right.reply.len()))
         .then_with(|| (!left.model.is_empty()).cmp(&(!right.model.is_empty())))
         .then_with(|| (!left.project.is_empty()).cmp(&(!right.project.is_empty())))
+        .then_with(|| attributed(left).cmp(&attributed(right)))
         .then_with(|| (!left.parent.is_empty()).cmp(&(!right.parent.is_empty())))
         .then_with(|| left.side.cmp(&right.side))
         .then_with(|| match (left.ts > 0, right.ts > 0) {
@@ -3529,8 +3723,29 @@ mod tests {
             reply_chars: 0,
             side: false,
             parent: String::new(),
+            reply_shape: Default::default(),
         }
         .freeze()
+    }
+
+    /// Two copies of one row that differ only in project: the one bucketed under its agent's
+    /// own name is the adapter's fallback, so the attributed copy is canonical even when the
+    /// fallback name sorts after it.
+    #[test]
+    fn dedupe_prefers_an_attributed_project_over_the_agent_named_fallback() {
+        let gemini = |project: &str| {
+            let mut row = message("session", 0, "alpaca");
+            row.agent = "gemini";
+            row.project = project.into();
+            row
+        };
+        for (first, second) in [("gemini", "alpha"), ("alpha", "gemini"), ("zoo", "gemini")] {
+            let kept = dedupe_messages(vec![gemini(first), gemini(second)]);
+            assert_eq!(kept.len(), 1, "{first} vs {second}");
+            assert_ne!(kept[0].project.as_ref(), "gemini", "{first} vs {second}");
+        }
+        let kept = dedupe_messages(vec![gemini("alpha"), gemini("zoo")]);
+        assert_eq!(kept[0].project.as_ref(), "zoo");
     }
 
     #[test]
@@ -3574,6 +3789,7 @@ mod tests {
             call_id: call_id.into(),
             child_session: String::new(),
             meta: String::new(),
+            state: String::new(),
         }
     }
 
@@ -4262,6 +4478,52 @@ mod tests {
         ))
     }
 
+    /// ENOENT, a real file where a directory was, and a name too long prove absence; a loop, a
+    /// link pointing at a file, and EACCES may hide intact data and prove nothing.
+    #[cfg(unix)]
+    #[test]
+    fn stat_errors_prove_absence_only_without_a_mispointed_link() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = snapshot_root("stat-proves-absent");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"was a directory").unwrap();
+        symlink(root.join("file"), root.join("to-file")).unwrap();
+        symlink(root.join("loop-b"), root.join("loop-a")).unwrap();
+        symlink(root.join("loop-a"), root.join("loop-b")).unwrap();
+        fs::create_dir_all(root.join("denied")).unwrap();
+        fs::set_permissions(root.join("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+        let cases = [
+            (root.join("missing").join("store"), true),
+            (root.join("file").join("store"), true),
+            (root.join("x".repeat(300)).join("store"), true),
+            (root.join("to-file").join("store"), false),
+            (root.join("loop-a").join("store"), false),
+            (root.join("denied").join("store"), false),
+        ];
+        let verdicts: Vec<(PathBuf, bool, bool)> = cases
+            .iter()
+            .map(|(path, expected)| {
+                let error = fs::symlink_metadata(path).unwrap_err();
+                (path.clone(), *expected, stat_proves_absent(path, &error))
+            })
+            .collect();
+        fs::set_permissions(root.join("denied"), fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        for (path, expected, verdict) in verdicts {
+            if path.starts_with(root.join("denied")) && unsafe { geteuid() } == 0 {
+                continue;
+            }
+            assert_eq!(verdict, expected, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+
     #[cfg(unix)]
     fn fifo(path: &Path) {
         let status = std::process::Command::new("mkfifo")
@@ -4291,7 +4553,8 @@ mod tests {
                 self.0.clone()
             }
             fn store_content(&self, path: &Path) -> bool {
-                path.extension().is_some_and(|extension| extension == "jsonl")
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
             }
         }
 
@@ -4344,6 +4607,105 @@ mod tests {
             .as_millis() as u64;
         assert_eq!(diagnostic.newest_mtime_ms(), expected_mtime);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_links_to_walked_transcripts_are_aliases_not_issues() {
+        use std::os::unix::fs::symlink;
+
+        struct LinkAdapter(PathBuf);
+        impl Adapter for LinkAdapter {
+            fn name(&self) -> &'static str {
+                "link-test"
+            }
+            fn fingerprint(&self) -> Fingerprint {
+                Fingerprint::Stat
+            }
+            fn collect(&self, _cache: &mut IngestCache) -> (Vec<Message>, Vec<Event>) {
+                panic!("a store census must not parse transcripts")
+            }
+            fn store_roots(&self) -> Vec<PathBuf> {
+                vec![self.0.clone()]
+            }
+            fn store_content(&self, path: &Path) -> bool {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            }
+        }
+
+        let root = snapshot_root("resume-alias-links");
+        let recorded = root.join("-work-app");
+        let launch = root.join("-home-user");
+        fs::create_dir_all(&recorded).unwrap();
+        fs::create_dir_all(&launch).unwrap();
+        let transcript = recorded.join("s1.jsonl");
+        fs::write(&transcript, b"not parsed").unwrap();
+        // agrep's own resume link: same transcript, another slug - an alias
+        symlink(&transcript, launch.join("s1.jsonl")).unwrap();
+        // a transcript-shaped link to data outside the store stays unsupported
+        let outside_root = snapshot_root("resume-alias-outside");
+        fs::create_dir_all(&outside_root).unwrap();
+        let outside = outside_root.join("x.jsonl");
+        fs::write(&outside, b"not parsed").unwrap();
+        let foreign = launch.join("x.jsonl");
+        symlink(&outside, &foreign).unwrap();
+
+        let adapter = LinkAdapter(root.clone());
+        let diagnostic = store_diagnostic(&adapter).unwrap();
+        assert_eq!(
+            diagnostic.paths().collect::<Vec<_>>(),
+            [transcript.to_str().unwrap()]
+        );
+        assert_eq!(
+            diagnostic
+                .issues()
+                .iter()
+                .map(|issue| (issue.path(), issue.kind()))
+                .collect::<Vec<_>>(),
+            [(foreign.to_str().unwrap(), "unsupported-link")]
+        );
+        let (complete, issues, _timing) = {
+            let mut out = Vec::new();
+            walk_sources(&adapter, &root, false, &mut out)
+        };
+        assert!(!complete);
+        assert_eq!(issues.len(), 1);
+
+        fs::remove_file(&foreign).unwrap();
+        // the alias's target gone (moved or deleted): a clean absence, no issue
+        symlink(recorded.join("gone.jsonl"), launch.join("gone.jsonl")).unwrap();
+        // a dangling link whose target lies outside the store stays unsupported
+        let dangling_out = launch.join("elsewhere.jsonl");
+        symlink(outside_root.join("missing.jsonl"), &dangling_out).unwrap();
+        let diagnostic = store_diagnostic(&adapter).unwrap();
+        assert_eq!(
+            diagnostic
+                .issues()
+                .iter()
+                .map(|issue| issue.path().to_string())
+                .collect::<Vec<_>>(),
+            [dangling_out.to_str().unwrap()]
+        );
+        fs::remove_file(&dangling_out).unwrap();
+        // a self-loop inside the store is corrupt, never agrep's own link
+        let looped = launch.join("loop.jsonl");
+        symlink(&looped, &looped).unwrap();
+        let diagnostic = store_diagnostic(&adapter).unwrap();
+        assert_eq!(diagnostic.issues().len(), 1);
+        assert_eq!(diagnostic.issues()[0].kind(), "unsupported-link");
+        fs::remove_file(&looped).unwrap();
+
+        let diagnostic = store_diagnostic(&adapter).unwrap();
+        assert!(diagnostic.issues().is_empty());
+        assert_eq!(diagnostic.state(), "available");
+        let mut out = Vec::new();
+        let (complete, issues, _timing) = walk_sources(&adapter, &root, false, &mut out);
+        assert!(complete);
+        assert!(issues.is_empty());
+        assert_eq!(out.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside.parent().unwrap()).unwrap();
     }
 
     #[cfg(unix)]

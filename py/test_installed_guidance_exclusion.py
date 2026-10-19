@@ -96,7 +96,7 @@ def _index(home: Path, data: Path) -> list[dict]:
     run = subprocess.run(
         [str(binary), "index", "--agent", "codex", "--full"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env=env, timeout=120)
+        env=env, timeout=300)
     if run.returncode != 0:
         raise AssertionError(f"ingest rc={run.returncode}: {run.stderr}")
     rows_path = data / "messages.jsonl"

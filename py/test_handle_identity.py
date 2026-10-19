@@ -678,9 +678,9 @@ class PrintedHandleReopens(unittest.TestCase):
             marks = [(row["ts"], row["turn"]) for row in self.TIMELINE]
             indexed = [(row["ts"], row["turn"])
                        for row in events.tool_rows_from_payload(payload, marks)]
-            first = explore._events_for_turns(
+            first, _ = explore._events_for_turns(
                 "codex", self.SESSION, self.TURNS[:1], self.TIMELINE)
-            second = explore._events_for_turns(
+            second, _ = explore._events_for_turns(
                 "codex", self.SESSION, self.TURNS[1:], self.TIMELINE)
         self.assertEqual(indexed, [(500, 0), (1_500, 0), (2_500, 1)])
         self.assertEqual([(row["ts"], row["turn"]) for row in first],
@@ -717,7 +717,7 @@ class PrintedHandleReopens(unittest.TestCase):
                         "project": "agrep", "concept": "", "title": "",
                         "turns": turns,
                         "events": explore._events_for_turns(
-                            "codex", self.SESSION, turns, self.TIMELINE)}
+                            "codex", self.SESSION, turns, self.TIMELINE)[0]}
 
             rc, rows, stderr = self._around(
                 handle, window, {self.SESSION: self.SESSION})

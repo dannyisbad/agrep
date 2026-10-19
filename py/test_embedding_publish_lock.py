@@ -357,6 +357,30 @@ class EmbeddingPublishLockTests(unittest.TestCase):
         handle.close()
         self.path.unlink()
 
+    def test_a_process_reclaims_its_own_stranded_publish_lock(self) -> None:
+        # a release honours a mutex an earlier reap minted; one held past every attempt
+        # leaves the record naming this live process, which only this process may reclaim
+        (self.root / ownerfile.SLOT_MUTEX_NAME).touch()
+        lock = common.EmbeddingPublishLock(self.target, timeout=0)
+        lock.__enter__()
+        stranded = lock.handle.snapshot
+        with mock.patch.object(ownerfile, "_lock_descriptor", return_value="busy"), \
+                mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.01), \
+                mock.patch.object(embedding_store.time, "sleep"):
+            lock.__exit__(None, None, None)
+        self.assertEqual(ownerfile.snapshot(self.path), stranded)
+        self.assertTrue(lock._reclaimable(stranded))
+        with mock.patch.object(ownerfile, "_HELD_TOKENS", {lock.token}):
+            self.assertFalse(lock._reclaimable(stranded))
+        started = time.monotonic()
+        with common.EmbeddingPublishLock(self.target, timeout=2.0) as again:
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertNotEqual(again.handle.snapshot.raw, stranded.raw)
+            again.verify()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(
+            [entry.name for entry in self.root.iterdir() if ".owner-reap-" in entry.name], [])
+
     def test_flat_writer_refuses_v2_and_guards_both_namespaces(self) -> None:
         import numpy as np
 

@@ -68,6 +68,9 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 
 ARCHIVE_CHECK_S = _interval("AGREP_ARCHIVE_CHECK_S", 60.0)
 TEACH_CHECK_S = _interval("AGREP_TEACH_CHECK_S", 300.0)
+# /tmp semantic coordination namespaces go stale an hour after their last use;
+# a scandir of /tmp every hour is the whole cost of never leaving them behind.
+COORDINATION_REAP_S = _interval("AGREP_COORDINATION_REAP_S", 3600.0)
 # Hard-polite drain idle gap: per-pass footprint (128 rows, 2 threads, nice
 # 15) is unchanged; 30 s just shrinks the 91%-idle wait between passes.
 EMBED_CHECK_S = _interval("AGREP_EMBED_CHECK_S", 30.0)
@@ -99,6 +102,12 @@ EMBED_PRESSURE_CHECK_S = _interval("AGREP_EMBED_PRESSURE_CHECK_S", 30.0)
 # activity (a filled disk, a killed writer), so activity cannot be its trigger.
 HEALTH_CHECK_S = _interval("AGREP_HEALTH_CHECK_S", 60.0)
 REPAIR_MIN_GAP_S = _interval("AGREP_REPAIR_MIN_GAP_S", 300.0)
+# Rolling back a killed pass's journal is a plain publication pass, not a reparse; once one of
+# these has run and left the journal standing, REPAIR_MIN_GAP_S applies again.
+INTERRUPTED_REPAIR_GAP_S = _interval("AGREP_INTERRUPTED_REPAIR_GAP_S", 30.0)
+# Baseline of a cadence that has not run. time.monotonic() counts from boot, so a 0.0
+# baseline reads as "ran at boot" and holds the first run until uptime passes the interval.
+_NEVER = float("-inf")
 _EMBED_RESOURCE_CACHE: dict[str, object] = {"at": 0.0, "value": None}
 HOOK_TIMEOUT_S = 600
 INDEX_CHILD_TIMEOUT_S = 1800
@@ -396,18 +405,21 @@ class AutoIndexer(threading.Thread):
         self._lock = threading.Lock()
         self._child: tuple[subprocess.Popen, str | None, int | None] | None = None
         self._last_index_wall = 0.0
-        self._last_archive_check = 0.0
-        self._last_teach_check = 0.0
-        self._last_embed_check = 0.0
+        self._last_archive_check = _NEVER
+        self._archive_child: subprocess.Popen | None = None
+        self._archive_watch: object | None = None
+        self._last_teach_check = _NEVER
+        self._last_embed_check = _NEVER
+        self._last_coordination_reap = _NEVER
         self._embed_defer_started_mono = 0.0
-        self._last_health_check = 0.0
+        self._last_health_check = _NEVER
         self._repair = corpusdb_module().NO_REPAIR
         self._repair_seen = ""
         self._repair_attempted = False
         self._repair_streak = 0
         self._last_repair_run = 0.0
         self._last_verify_stamp = time.monotonic()
-        self._last_census_check = 0.0
+        self._last_census_check = _NEVER
         self._fail_streak, last_error, last_attempt = (
             indexd_runtime.indexd_failure_state())
         self._pending_streak = 0
@@ -441,6 +453,7 @@ class AutoIndexer(threading.Thread):
         with self._lock:
             self._stop_requested.set()
         self._terminate_child()
+        self._stop_archive_child()
         if threading.current_thread() is not self:
             self._post_index_idle.wait()
 
@@ -597,7 +610,7 @@ class AutoIndexer(threading.Thread):
             return
         if not self._ownership_survives():
             return
-        if not indexd_runtime.derived_writes_permitted():
+        if not indexd_runtime.derived_ownership_held():
             return
         self._operational.set()
         # A watcher cannot report source changes that predate this daemon generation.
@@ -668,6 +681,9 @@ class AutoIndexer(threading.Thread):
         if now - self._last_archive_check >= ARCHIVE_CHECK_S:
             self._last_archive_check = now
             self._capture_archive()
+        if now - self._last_coordination_reap >= COORDINATION_REAP_S:
+            self._last_coordination_reap = now
+            self._reap_coordination_namespaces()
         embed_interval = EMBED_CHECK_S
         embed_policy: dict[str, object] | None = None
         try:
@@ -696,6 +712,18 @@ class AutoIndexer(threading.Thread):
         self._embed_defer_started_mono = 0.0
         with self._lock:
             self.state.pop("semantic_refresh", None)
+
+    def _reap_coordination_namespaces(self) -> None:
+        """Drop idle semantic coordination namespaces other data dirs left in
+        /tmp. The worker reaps them too, but a box that never runs one
+        (embeddings off, keyword-only use) would otherwise keep every one."""
+        try:
+            import semworker
+            removed = semworker.reap_stale_coordination_dirs()
+            if removed:
+                common.dbg(f"reaped {removed} stale semantic coordination dir(s)")
+        except Exception:  # noqa: BLE001 -- /tmp hygiene never wounds indexing
+            pass
 
     def _refresh_embeddings(self, policy: dict[str, object] | None = None) -> None:
         """Keep semantic vectors current with zero user action: one bounded,
@@ -739,7 +767,8 @@ class AutoIndexer(threading.Thread):
                            if recently_active else EMBED_MAX_NEW)
             else:
                 # Missing/stale = keyword fallback: publish a small generation
-                # fast, but an indexd resource decision remains authoritative.
+                # fast under the indexd thread/nice budget; ensure_fresh_async
+                # lets that bounded pass through battery and CPU load itself.
                 if governed:
                     cap = min(int(policy["cap"]),
                               semantic.SEMANTIC_BOOTSTRAP_MAX_NEW)
@@ -782,12 +811,11 @@ class AutoIndexer(threading.Thread):
                 return
             self._clear_embedding_refresh_deferral()
             state = semantic.ensure_fresh_async(
-                max_new=cap, spawn_env=spawn_env,
-                ignore_battery=bool(governed and not coherence.get("searchable")))
+                max_new=cap, spawn_env=spawn_env)
             if state.get("state") == "running":
                 common.dbg(f"embed pass: cap={cap} policy={policy}")
                 common.log("building the embeddings index in the background "
-                           "(low priority) - bare `agrep` shows progress")
+                           "(low priority) - run `agrep doctor` to see progress")
         except Exception:  # noqa: BLE001
             pass
 
@@ -834,29 +862,54 @@ class AutoIndexer(threading.Thread):
                     f"{health['refusals'][0]['reason']}")
 
     def _capture_archive(self) -> None:
-        """Incremental snapshot of the agents' own store files (the byte-identical
-        backup `agrep restore` rehydrates from). Stat-cheap once seeded - unchanged
-        files are skipped without a read - and must never wound the indexer. The
-        first pass over a big store is the slow one; `agrep archive` runs it
-        explicitly."""
+        """Start the archive capture pass as a niced child in this daemon's process
+        group (removal stops it with the tree) and return at once: indexing never
+        waits on compression. One child at a time; a pass still running at the
+        next tick is left alone while its beat sequence advances, and the archive
+        lock refuses a second pass. A child whose beat has stayed unchanged across
+        enough consecutive ticks to span the stall bound, and for that bound of
+        monotonic time, is stopped through this daemon's own handle - never a pid
+        read from a file. A sleep of any length is one tick, so a wake alone never
+        qualifies."""
+        import archive
+        child = self._archive_child
+        if child is not None:
+            if child.poll() is None:
+                idle, stalled = self._archive_watch.observe()
+                if stalled:
+                    common.log(f"archive: capture pass pid {child.pid} made no progress "
+                               f"for {idle:.0f}s; stopping it")
+                    archive.record_stall(child.pid, idle)
+                    self._stop_archive_child()
+                return
+            self._archive_child = None
+            if child.returncode:
+                common.log(f"archive: capture pass exited with {child.returncode}")
         try:
-            import archive
-            if archive.enabled():
-                s = archive.capture()
-                if s["appended"] or s["full"]:
-                    common.log(f"archive: {s['appended']} appended, {s['full']} full, "
-                               f"+{s['bytes_stored'] / 1e6:.1f} MB")
-                if s.get("failed"):
-                    common.log(f"archive: {s['failed']} source path(s) failed; "
-                               "successful captures were kept")
+            self._archive_child = archive.spawn_capture_child()
+            self._archive_watch = archive.StallWatch()
         except Exception as exc:  # noqa: BLE001 -- indexing survives archive failure
-            common.log(f"archive: capture blocked: {type(exc).__name__}: {exc}")
+            common.log(f"archive: capture could not start: {type(exc).__name__}: {exc}")
+
+    def _stop_archive_child(self) -> None:
+        """Stop the capture child through this daemon's own handle: TERM, a short
+        grace, then KILL. A SIGSTOPped child is continued first so the signal lands."""
+        child = self._archive_child
+        self._archive_child = None
+        if child is None or child.poll() is not None:
+            return
+        try:
+            if not WIN:
+                child.send_signal(signal.SIGCONT)
+            child.terminate()
+            child.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
             try:
-                archive.record_capture_failure(exc)
-            except Exception as health_exc:  # noqa: BLE001 -- retain both failures in the log
-                common.log(
-                    "archive: could not persist capture health: "
-                    f"{type(health_exc).__name__}: {health_exc}")
+                child.kill()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
     def _maybe_verify_current(self, now: float) -> None:
         """Idle lapse: prove (cheap census compare) that the sources did not
@@ -929,11 +982,21 @@ class AutoIndexer(threading.Thread):
         if self._repair.code:
             # a reparse is the most expensive thing this loop can do; a flapping
             # verdict must never be able to schedule them back to back
-            return now - self._last_repair_run >= REPAIR_MIN_GAP_S
+            first_rollback = (
+                self._repair.code == "interrupted-pass" and self._repair_streak == 0)
+            min_gap = INTERRUPTED_REPAIR_GAP_S if first_rollback else REPAIR_MIN_GAP_S
+            return now - self._last_repair_run >= min_gap
         activity = self._w._last_event_wall  # wall seconds of the last live event
         if activity <= self._last_index_wall:  # nothing new since we last indexed
             return False
         return (now - activity) >= QUIET_S or gap >= MAX_STALE_S
+
+    def _note_writer_pause(self, info: "indexd_runtime.DerivedMutationInfo") -> None:
+        """Say once why passes wait on a store file agrep cannot use; other fences stay quiet."""
+        if not info.sidecar_blocked or info.reason == getattr(self, "_paused_reason", ""):
+            return
+        self._paused_reason = info.reason
+        common.log(f"auto-index paused: {info.reason}")
 
     def _index(self, *, startup: bool = False) -> bool:
         if not self._ownership_survives():
@@ -941,7 +1004,13 @@ class AutoIndexer(threading.Thread):
         # the permitted fence, not raw writable: a dead foreign anchor is
         # reaped here by the ingest's successor takeover
         if not indexd_runtime.derived_writes_permitted():
+            self._note_writer_pause(indexd_runtime.derived_writer_mutation_info())
             return False
+        refusal = indexd_runtime.event_store_sidecar_refusal()
+        if refusal is not None:
+            self._note_writer_pause(refusal)
+            return False
+        self._paused_reason = ""
         with self._lock:
             if self.state["phase"] == "indexing":
                 return False
@@ -956,7 +1025,7 @@ class AutoIndexer(threading.Thread):
         if repair.code:
             # a queued repair owns this run; the health tick re-verifies after it
             self._repair_attempted = True
-            self._last_health_check = 0.0
+            self._last_health_check = _NEVER
             self._last_repair_run = time.time()
             if repair.scope == "full":
                 cmd.append("--full")
@@ -1102,7 +1171,7 @@ class AutoIndexer(threading.Thread):
         if not err:
             # the loop re-verifies on its next tick, refreshing the
             # verified-current record against the just-published generation
-            self._last_verify_stamp = 0.0
+            self._last_verify_stamp = _NEVER
         if pending:
             common.dbg("auto-index: publication pending after a clean pass; "
                        "confirming run scheduled")

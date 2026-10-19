@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 import time
@@ -33,6 +32,7 @@ from hookless import live, registry
 import indexd_runtime
 import settings
 import surface_policy as surface
+import termui
 
 BOLD, DIM, RESET = (
     surface.PALETTE["bold"], surface.PALETTE["d"], surface.PALETTE["r"])
@@ -43,52 +43,6 @@ _ONESHOT_RETRY_WAIT_S = 5.0
 _MAX_ONESHOT_WAIT_S = 10.0
 _MACHINE_DEFAULT_ROWS = 20
 _MACHINE_MAX_ROWS = 100
-
-if os.name == "nt":
-    import msvcrt
-
-    _NT_ARROWS = {"H": "up", "P": "down", "M": "right", "K": "left"}
-
-    def _getkey() -> str:
-        if not msvcrt.kbhit():
-            return ""
-        k = msvcrt.getwch()
-        if k in ("\x00", "\xe0"):  # two-char arrow/function key
-            return _NT_ARROWS.get(msvcrt.getwch() if msvcrt.kbhit() else "", "")
-        if k == "\x1b":
-            return "esc"
-        if k == "\r":
-            return "enter"
-        return k
-else:
-    import select
-    import termios
-    import tty
-
-    _VT_ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left"}
-
-    def _getkey() -> str:
-        # os.read on the raw fd: buffered sys.stdin slurps an arrow's "[A" tail
-        # into python's buffer, after which select() on the fd truthfully reports
-        # no data - and every arrow key mis-parses as a bare esc
-        fd = sys.stdin.fileno()
-        if not select.select([fd], [], [], 0)[0]:
-            return ""
-        k = os.read(fd, 1).decode("utf-8", "replace")
-        if k in ("\r", "\n"):
-            return "enter"
-        if k != "\x1b":
-            return k
-        # arrows arrive as a burst: esc [ A - give the tail 10ms to land
-        seq = ""
-        while select.select([fd], [], [], 0.01)[0]:
-            c = os.read(fd, 1).decode("utf-8", "replace")
-            seq += c
-            if c.isalpha() or c == "~":
-                break
-        if not seq:
-            return "esc"
-        return _VT_ARROWS.get(seq[-1], "")
 
 
 def _enable_ansi() -> bool:
@@ -108,6 +62,34 @@ def _age(ms: int, now: int) -> str:
 _cell_clusters = surface.cell_clusters
 _cells = surface.cell_width
 _pad_cells = surface.pad_cells
+
+
+def _tail_cells(text: str, width: int) -> str:
+    """The last ``width`` cells of ``text`` (grapheme clusters, not characters)."""
+    kept: list[str] = []
+    used = 0
+    for cluster, step in reversed(list(surface.cell_clusters(text))):
+        if used + step > width:
+            break
+        kept.append(cluster)
+        used += step
+    return "".join(reversed(kept))
+
+
+def _unreadable_store_notice(agent: str, path: str, error: str, width: int) -> str:
+    """The cause of a degraded source must survive the width: a long store
+    path (deep homes, long data dirs) is elided in the middle, never the error."""
+    head = f"! unreadable {agent} store: "
+    tail = f": {error}"
+    room = width - _cells(head) - _cells(tail)
+    if _cells(path) > room:
+        if room < 8:
+            # Even the path's ends do not fit beside the cause: drop the path.
+            return surface.truncate_cells(f"{head}…{tail}", width)
+        keep = (room - 1) // 2
+        path = (surface.truncate_cells(path, keep, "")
+                + "…" + _tail_cells(path, room - keep - 1))
+    return f"{head}{path}{tail}"
 
 
 def _trunc(s: str, w: int) -> str:
@@ -449,11 +431,11 @@ def _frame(sessions: list[dict], now: int, compact: bool, agent_filter: str,
             "snapshot still scanning; more live sessions may appear")
     if degraded_sources:
         first = degraded_sources[0]
-        notices.append(
-            f"! unreadable {first.get('agent') or 'agent'} store: "
-            f"{first.get('path') or '?'}: {first.get('error') or 'access failed'}")
-        if len(degraded_sources) > 1:
-            notices[-1] += f" (+{len(degraded_sources) - 1} more)"
+        more = (f" (+{len(degraded_sources) - 1} more)"
+                if len(degraded_sources) > 1 else "")
+        notices.append(_unreadable_store_notice(
+            str(first.get("agent") or "agent"), str(first.get("path") or "?"),
+            str(first.get("error") or "access failed"), width - _cells(more)) + more)
     source_error = any(
         last_err.startswith(
             f"{item.get('agent')} source unreadable: {item.get('path')}:")
@@ -832,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
     tty_out = sys.stdout.isatty()
     ansi = _enable_ansi()
     once = a.once or a.json or not tty_out or not ansi
-    color = (tty_out and ansi) or "FORCE_COLOR" in os.environ
+    color = common.color_enabled(sys.stdout)
 
     resident_snapshot = (
         indexd_runtime.resident_indexd_live_snapshot() if once else None)
@@ -873,8 +855,16 @@ def main(argv: list[str] | None = None) -> int:
     agent_filter = requested_agent or remembered_agent or "all"
 
     def remember_view() -> None:
-        settings.set_setting("board_view",
-                             {"agent": agent_filter, "expanded": not compact})
+        timeout = settings.SETTINGS_LOCK_TIMEOUT_S
+        settings.SETTINGS_LOCK_TIMEOUT_S = min(timeout, 0.15)
+        try:
+            settings.set_setting(
+                "board_view", {"agent": agent_filter, "expanded": not compact})
+        except settings.SettingsError:
+            pass
+        finally:
+            settings.SETTINGS_LOCK_TIMEOUT_S = timeout
+
     focus = ""    # session id of the focused feed, "" = board
     sel_id = ""   # board row the cursor is on (by id: rows reorder between ticks)
     sel_prev = 0  # last row index, held when the selected session vanishes
@@ -1016,90 +1006,73 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     assert w is not None
-    unix_state = None
-    screen_entered = False
     try:
-        if os.name != "nt":
-            unix_state = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-        screen_entered = True
-        sys.stdout.write("\x1b[?1049h\x1b[?25l")  # alt screen, hide cursor
-        last_draw = 0.0
-        while True:
-            k = _getkey()
-            now = time.monotonic()
-            # keys repaint immediately; the data tick repaints at 2Hz (faster while
-            # the watcher seeds, so the board fills the moment sessions appear).
-            # The idle path is a 30ms input poll, so navigation never waits.
-            tick = 0.15 if now - started < 2.0 else 0.5
-            if not k and now - last_draw < tick:
-                time.sleep(0.03)
-                continue
-            if k in ("q", "Q", "\x03"):
-                return 0
-            if k in ("esc", "b", "B"):
-                focus, scroll = "", 0
-            if k in ("c", "C"):
-                compact = not compact
-                remember_view()
-            if k in ("a", "A"):
-                focus, scroll = "", 0
-                agents = sorted({x.get("agent") or "?"
-                                 for x in (w.snapshot().get("sessions") or [])})
-                cycle = ["all", *agents]
-                try:
-                    agent_filter = cycle[(cycle.index(agent_filter) + 1) % len(cycle)]
-                except ValueError:
-                    agent_filter = "all"
-                remember_view()
+        with termui.screen() as owner:
+            last_draw = 0.0
+            while True:
+                # a paste arrives as the one key "paste", which no binding reads:
+                # pasted letters and newlines never act as board keys
+                k = owner.key()
+                now = time.monotonic()
+                if owner.resumed:  # back from Ctrl-Z on a blank screen
+                    owner.resumed, last_draw = False, 0.0
+                # keys repaint immediately; the data tick repaints at 2Hz (faster while
+                # the watcher seeds, so the board fills the moment sessions appear).
+                # The idle path is a 30ms input poll, so navigation never waits.
+                tick = 0.15 if now - started < 2.0 else 0.5
+                if not k and now - last_draw < tick:
+                    time.sleep(0.03)
+                    continue
+                if k in ("q", "Q", "\x03", "eof"):
+                    return 0
+                if k in ("esc", "b", "B"):
+                    focus, scroll = "", 0
+                if k in ("c", "C"):
+                    compact = not compact
+                    remember_view()
+                if k in ("a", "A"):
+                    focus, scroll = "", 0
+                    agents = sorted({x.get("agent") or "?"
+                                     for x in (w.snapshot().get("sessions") or [])})
+                    cycle = ["all", *agents]
+                    try:
+                        agent_filter = cycle[(cycle.index(agent_filter) + 1) % len(cycle)]
+                    except ValueError:
+                        agent_filter = "all"
+                    remember_view()
 
-            snap = w.snapshot()
-            sessions = visible(snap)
-            ids = [x["session"] for x in sessions]
-            # a vanished selection holds its position instead of snapping to the top
-            sel = (ids.index(sel_id) if sel_id in ids
-                   else min(sel_prev, len(ids) - 1) if ids else -1)
-            if focus:
-                feed = next((len(x.get("recent") or []) for x in sessions
-                             if x["session"] == focus), 0)
-                if k in ("up", "k"):
-                    scroll = min(scroll + 1, feed)  # display clamps the rest
-                if k in ("down", "j"):
-                    scroll = max(0, scroll - 1)
-            else:
-                if k in ("up", "k") and ids:
-                    sel = max(0, sel - 1)
-                if k in ("down", "j") and ids:
-                    sel = min(len(ids) - 1, sel + 1)
-                if k.isdigit() and k != "0" and int(k) <= len(ids):
-                    sel = int(k) - 1
-                    focus, scroll = ids[sel], 0
-                if k == "enter" and 0 <= sel < len(ids):
-                    focus, scroll = ids[sel], 0
-            sel_id = ids[sel] if 0 <= sel < len(ids) else ""
-            sel_prev = max(0, sel)
+                snap = w.snapshot()
+                sessions = visible(snap)
+                ids = [x["session"] for x in sessions]
+                # a vanished selection holds its position instead of snapping to the top
+                sel = (ids.index(sel_id) if sel_id in ids
+                       else min(sel_prev, len(ids) - 1) if ids else -1)
+                if focus:
+                    feed = next((len(x.get("recent") or []) for x in sessions
+                                 if x["session"] == focus), 0)
+                    if k in ("up", "k"):
+                        scroll = min(scroll + 1, feed)  # display clamps the rest
+                    if k in ("down", "j"):
+                        scroll = max(0, scroll - 1)
+                else:
+                    if k in ("up", "k") and ids:
+                        sel = max(0, sel - 1)
+                    if k in ("down", "j") and ids:
+                        sel = min(len(ids) - 1, sel + 1)
+                    # ASCII only: "²" or "①" pass isdigit() but are no row number
+                    if len(k) == 1 and "1" <= k <= "9" and int(k) <= len(ids):
+                        sel = int(k) - 1
+                        focus, scroll = ids[sel], 0
+                    if k == "enter" and 0 <= sel < len(ids):
+                        focus, scroll = ids[sel], 0
+                sel_id = ids[sel] if 0 <= sel < len(ids) else ""
+                sel_prev = max(0, sel)
 
-            width, height = shutil.get_terminal_size((110, 34))
-            frame = render(snap, width, height, sel=sel)
-            # repaint in place, clearing each line's tail - no full-clear flicker
-            out = "".join(ln + "\x1b[K\n" for ln in frame.split("\n"))
-            sys.stdout.write("\x1b[H" + out + "\x1b[0J")
-            sys.stdout.flush()
-            last_draw = now
+                width, height = shutil.get_terminal_size((110, 34))
+                termui.repaint(render(snap, width, height, sel=sel).split("\n"))
+                last_draw = now
     except KeyboardInterrupt:
         return 130
-    finally:
-        if screen_entered:
-            try:
-                sys.stdout.write("\x1b[?25h\x1b[?1049l")
-                sys.stdout.flush()
-            except OSError:
-                pass
-        if unix_state is not None:
-            try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, unix_state)
-            except OSError:
-                pass
 
 
 if __name__ == "__main__":

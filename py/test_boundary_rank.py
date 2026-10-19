@@ -533,6 +533,35 @@ class BoundaryRankTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "outside text"):
                         prepared.evaluate(text, spans=(span,), validate_spans=False)
 
+    def test_long_compact_snippet_prepares_only_matching_boundaries(self):
+        query = "alpha beta gamma delta"
+        prepared = boundary_rank.prepare_query(query)
+        texts = (
+            ("東京 " * 3000) + "alphaBeta beta gamma delta " + ("noise " * 3000),
+            "…" + ("a\u0301👩\u200d💻 " * 1500)
+            + "alphabeta alpha BETA gamma delta…",
+            ("각 ’don't’ " * 1200) + "alpha beta gamma delta",
+        )
+        full_prepare = boundary_rank.prepare_text
+        for text in texts:
+            with self.subTest(length=len(text)):
+                with mock.patch.object(
+                        boundary_rank, "prepare_text",
+                        side_effect=lambda value, **_kwargs: full_prepare(value)):
+                    expected = prepared.evaluate(text)
+                    expected_snippet = search._compact_snippet(
+                        {"matched": "all-terms", "snippet": text}, None, prepared)
+                boundary_rank.prepare_text.cache_clear()
+                with mock.patch.object(
+                        boundary_rank, "_boundary_between",
+                        wraps=boundary_rank._boundary_between) as boundary:
+                    actual = prepared.evaluate(text)
+                    actual_snippet = search._compact_snippet(
+                        {"matched": "all-terms", "snippet": text}, None, prepared)
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual_snippet, expected_snippet)
+                self.assertLessEqual(boundary.call_count, 32)
+
     def test_prepared_text_is_reused_across_occurrence_evaluations(self):
         self.assertIs(boundary_rank.prepare_text("東京都心部"),
                       boundary_rank.prepare_text("東京都心部"))

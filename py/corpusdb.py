@@ -19,7 +19,7 @@ support returns None from connect() and callers use the JSONL fallback.
 
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import heapq
 import json
@@ -31,6 +31,7 @@ import stat as statmod
 import sys
 import tempfile
 import time
+import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import chain
@@ -50,11 +51,14 @@ import surface_policy as surface
 DB_PATH = common.DATA_DIR / "corpus.db"
 BOUNDARY_STATS_PATH = common.DATA_DIR / "boundary_stats.json"
 INGEST_SIG_PATH = common.DATA_DIR / ".ingest.sig"
-_SCHEMA = "15"  # 15: structural side-session provenance in family relations
+_SCHEMA = "17"  # 17: reply_shape side table beside the agent rows
 _TRIGGER_SCHEMA = "4"  # 4: FTS triggers consume the normalized text sidecar
 # 1: codex's empty-text recap rows are indexed. A database lacking this meta value predates
 # the shape and converges through one full parse and signature diff on its next refresh.
 _ROW_SHAPE = "1"
+# an incremental refresh that would rewrite more sessions than this (and more than half of the
+# indexed ones) is abandoned for a fresh build, which is faster and leaves no freelist behind
+_REBUILD_MIN_SESSIONS = 64
 # The compact event generation moves only after its DB transaction commits.
 _SOURCES = ("messages.jsonl", "replies.jsonl", "session_concepts.jsonl", "concepts.json",
             "concept_pair.manifest.json", "events/.generation", "settings.json",
@@ -131,6 +135,14 @@ _SCHEMA_SQL = """
         token TEXT PRIMARY KEY, n INTEGER NOT NULL, s INTEGER NOT NULL,
         q INTEGER NOT NULL
     ) WITHOUT ROWID;
+    -- the block structure beside a capped or multi-block reply (explore.reply_shape); rows
+    -- with a single whole block carry none. Keyed like the agent msgs row it describes
+    CREATE TABLE reply_shape(
+        session TEXT NOT NULL, turn INTEGER NOT NULL, breaks TEXT NOT NULL,
+        worked TEXT NOT NULL, lead INTEGER NOT NULL CHECK(lead IN (0, 1, 2)),
+        end TEXT NOT NULL, end_cut INTEGER NOT NULL CHECK(end_cut IN (0, 1)),
+        PRIMARY KEY(session, turn)
+    ) WITHOUT ROWID;
     CREATE VIEW msgs_fts_content AS
         SELECT id, coalesce(fts_text, text) AS text FROM msgs;
     CREATE VIEW msgs_prose_fts_content AS
@@ -204,6 +216,62 @@ def _indexed_row(row: tuple) -> tuple:
 
 def _insert_index_rows(db: sqlite3.Connection, rows: Iterable[tuple]) -> None:
     db.executemany(_INS_INDEXED, (_indexed_row(row) for row in rows))
+
+
+# session -> [(turn, breaks json, worked json, lead, end, end_cut)] gathered by the latest
+# _scan, drained as each session's rows are written
+_REPLY_SHAPES: dict[str, list[tuple[int, str, str, int, str, int]]] = {}
+
+
+def _note_reply_shape(record: dict) -> None:
+    """Remember a replies.jsonl record's block structure when it has one worth a row: a join,
+    a kept ending, or a known lead join (a recap row's single block carries the work before it)."""
+    import explore
+    shape = explore.reply_shape(record)
+    if not shape["reply_breaks"] and not shape["reply_end"] and shape["reply_lead"] == 2:
+        return
+    parts = str(record.get("id") or "").split(":")
+    if len(parts) < 3:
+        return
+    try:
+        turn = int(parts[-1])
+    except ValueError:
+        return
+    _REPLY_SHAPES.setdefault(":".join(parts[1:-1]), []).append(
+        (turn, json.dumps(shape["reply_breaks"], separators=(",", ":")),
+         json.dumps(shape["reply_worked"], separators=(",", ":")), shape["reply_lead"],
+         shape["reply_end"], int(shape["reply_end_cut"])))
+
+
+def _replace_reply_shapes(db: sqlite3.Connection, session: str,
+                          shapes: list[tuple[int, str, str, int, str, int]]) -> None:
+    db.execute("DELETE FROM reply_shape WHERE session = ?", (session,))
+    if shapes:
+        db.executemany(
+            "INSERT OR REPLACE INTO reply_shape"
+            "(session, turn, breaks, worked, lead, end, end_cut) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            ((session, *shape) for shape in shapes))
+
+
+def reply_shapes(db: sqlite3.Connection, keys: list[tuple[str, int]]) -> dict[tuple[str, int], dict]:
+    """`explore.reply_shape` for the given (session, turn) agent rows, by primary key."""
+    out: dict[tuple[str, int], dict] = {}
+    for start in range(0, len(keys), 200):
+        page = keys[start:start + 200]
+        marks = " OR ".join("(session = ? AND turn = ?)" for _ in page)
+        for session, turn, breaks, worked, lead, end, end_cut in db.execute(
+                "SELECT session, turn, breaks, worked, lead, end, end_cut FROM reply_shape "
+                f"WHERE {marks}", [value for key in page for value in key]):
+            try:
+                offsets, flags = json.loads(breaks), json.loads(worked)
+            except ValueError:
+                offsets, flags = [], []
+            out[(str(session), int(turn))] = {
+                "reply_breaks": [o for o in offsets if type(o) is int and o >= 0],
+                "reply_worked": [w for w in flags if type(w) is int and 0 <= w <= 2],
+                "reply_lead": lead if type(lead) is int and 0 <= lead <= 2 else 2,
+                "reply_end": str(end or ""), "reply_end_cut": bool(end_cut)}
+    return out
 
 
 # Canonical renderers live in common: hydration must render the bytes explore's scan shows.
@@ -338,6 +406,9 @@ class _DerivedWriteOwnership:
     adopt_legacy_db: bool = False
     sqlite_failure: sqlite3.Error | None = None
     journal_blocked: bool = False
+    # a sidecar this user cannot read and write, not an owner, stopped the probe: every writer
+    # waits until its owner or mode is fixed; ownership itself still holds
+    sidecar_blocked: bool = False
     replace_retained_db: bool = False
     retained_reader_identity: tuple[int, int, int, int, int] | None = None
     retained_build_id: str | None = None
@@ -377,6 +448,11 @@ def _database_build_id(
                 return "unavailable", None, str(exc)
             if main_before is None:
                 return "absent", None, ""
+            blocked = index_lock.inaccessible_sidecars(database, "search index")
+            if blocked:
+                import source_health
+                return "sidecar-inaccessible", None, source_health.inaccessible_sidecar_line(
+                    blocked[0])
             before = (main_before,) + tuple(
                 _optional_sqlite_identity(source) for source in sources[1:])
             if before[1] is not None and before[1][0] != 0:
@@ -385,7 +461,10 @@ def _database_build_id(
                 return (
                     "journal",
                     None,
-                    f"corpus.db has a live rollback journal at {sources[1]}",
+                    f"corpus.db has a live rollback journal at {sources[1]}"
+                    if _live_refresh_lock() else
+                    f"an interrupted index pass left a rollback journal at {sources[1]}; "
+                    "the next index pass rolls it back",
                 )
             # Query checkpointed DELETE publication with normal read-only locking;
             # avoid corpus-scale clones. WAL may hold the only committed owner and
@@ -632,6 +711,8 @@ def _derived_write_ownership(
             "repair is disabled because replacing corpus.db could destroy "
             "the last-good searchable snapshot; run `agrep doctor` for the "
             "safe backup-and-reindex remedy")
+    if db_state == "sidecar-inaccessible":
+        return _DerivedWriteOwnership("refused", str(db_error), sidecar_blocked=True)
     if db_state in {"uncertain", "journal"}:
         sqlite_failure = (
             db_error if isinstance(db_error, sqlite3.Error) else None)
@@ -733,6 +814,14 @@ def _optional_sqlite_identity(path: Path):
         return _sqlite_file_identity(path)
     except FileNotFoundError:
         return None
+    except PermissionError:
+        if not path.name.endswith(("-journal", "-wal", "-shm")):
+            raise
+        # A sidecar this user cannot open is not an ownership verdict: one that blocks a pass is
+        # named before this runs, and any other one still brackets the family by its metadata.
+        info = path.lstat()
+        return (int(info.st_size), int(info.st_mtime_ns), int(info.st_ctime_ns),
+                int(info.st_dev), int(info.st_ino))
 
 
 def _sqlite_file_identity(path: Path) -> tuple[int, int, int, int, int]:
@@ -977,6 +1066,7 @@ def _sqlite_alias_snapshot(path: Path, max_clone_bytes: int | None = None):
 
 class _PublishedConnection(sqlite3.Connection):
     _source_identity = None
+    _source_path = None
     _source_build_id = None
     _retained_snapshot = False
     _source_stamp_current = None
@@ -1493,6 +1583,8 @@ _REPAIR_SCOPE = MappingProxyType({
     "proof-damaged": "full",
     "search-index-stale": "publish",
     "generation-relocated": "publish",
+    # a killed pass's rollback journal; any pass's first write-capable open rolls it back
+    "interrupted-pass": "publish",
 })
 
 
@@ -1584,8 +1676,24 @@ def derived_repair_plan(now: float | None = None) -> RepairPlan:
 
     Both derived verifiers - the generation proof and the census - read the
     same artifacts, so deriving one plan is what keeps a repair and a report
-    from disagreeing about a single damaged file.
+    from disagreeing about a single damaged file. Any repair pass also rolls
+    back a killed pass's journal, which on an idle box nothing else would.
     """
+    plan = _derived_generation_plan(now)
+    if plan.code:
+        return plan
+    for path, only_hot in (
+            (common.DATA_DIR / "events" / common.EVENT_STORE_NAME, True), (DB_PATH, False)):
+        journal = index_lock.rollback_journal_state(path, common.INDEX_LOCK_PATH)
+        # The writer preflight refuses any corpus.db journal; event readers only fail on a hot one.
+        if journal["state"] == "interrupted-pass" and (journal["hot"] or not only_hot):
+            return RepairPlan(
+                "interrupted-pass", _REPAIR_SCOPE["interrupted-pass"],
+                f"an interrupted index pass left a rollback journal beside {path.name}")
+    return NO_REPAIR
+
+
+def _derived_generation_plan(now: float | None) -> RepairPlan:
     try:
         health = search_generation_health(now)
     except Exception as exc:  # noqa: BLE001 -- an unreadable proof is damage
@@ -1987,6 +2095,7 @@ def _open(path, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
             raise _SQLitePublicationMoved(
                 "SQLite publication changed while acquiring its read lock")
         db._source_identity = before
+        db._source_path = Path(os.path.abspath(os.fspath(path)))
         return db
     except Exception:
         db.close()
@@ -2052,6 +2161,7 @@ def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
         names, concept = {}, {}
 
     reps: dict[str, tuple[str, str]] = {}
+    _REPLY_SHAPES.clear()
     p = common.DATA_DIR / "replies.jsonl"
     if p.exists():
         with p.open(encoding="utf-8") as replies:
@@ -2072,6 +2182,7 @@ def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
                     reply = o.get("reply", "") or ""
                     reps[o["id"]] = (
                         reply, _digest(o, reply, "replies.jsonl"))
+                    _note_reply_shape(o)
 
     by: dict[str, list[tuple]] = {}
     with common.MESSAGES_PATH.open(encoding="utf-8") as f:
@@ -2122,14 +2233,17 @@ def _scan(only: set[str] | None = None) -> dict[str, list[tuple]]:
     return by
 
 
-def _session_sig(rows: list[tuple]) -> str:
-    """Order-independent fingerprint of one session's indexed rows. Sorted before hashing so a
-    reordering in messages.jsonl never reads as a change; covers every column the msgs table
-    stores, so any content/metadata move (edit, model backfill, concept relabel) flips the sig."""
+def _session_sig(rows: list[tuple], shapes: list[tuple] = ()) -> str:
+    """Order-independent fingerprint of one session's indexed rows and reply shapes. Sorted
+    before hashing so a reordering in messages.jsonl never reads as a change; covers every
+    column the msgs and reply_shape tables store, so any content/metadata move (edit, model
+    backfill, concept relabel, a capped reply's ending or work order) flips the sig."""
     import hashlib
     h = hashlib.md5()
     for row in sorted(rows, key=lambda r: (r[1], r[8], r[9])):  # (turn, who, text)
         h.update(repr(row).encode("utf-8", "replace"))
+    for shape in sorted(shapes):
+        h.update(repr(shape).encode("utf-8", "replace"))
     return h.hexdigest()
 
 
@@ -2214,7 +2328,10 @@ def _build(dst, expected_stamp: str | None = None) -> None:
         session_rows = None
         for session, session_rows in by.items():
             _insert_index_rows(db, session_rows)
-            session_sigs.append((session, _session_sig(session_rows)))
+            shapes = _REPLY_SHAPES.pop(session, [])
+            _replace_reply_shapes(db, session, shapes)
+            session_sigs.append((session, _session_sig(session_rows, shapes)))
+        _REPLY_SHAPES.clear()
         known_sessions = tuple(by)
         del by
         session_rows = None
@@ -2491,7 +2608,8 @@ def _apply_session_row_diff(db: sqlite3.Connection, session: str,
     return len(add_rows), len(remove_ids)
 
 
-def _incremental(stamp: str) -> sqlite3.Connection | None:
+def _incremental(stamp: str, *,
+                 lock: index_lock.IndexLock | None = None) -> sqlite3.Connection | None:
     """Refresh an existing current-schema db from the Rust changed-session delta.
 
     Changed sessions are reparsed, but their stored rows are reconciled as multisets:
@@ -2572,14 +2690,26 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
             _replace_boundary_stats(db)
         if meta.get("family_stamp", "") != (family_snapshot.source_stamp or ""):
             _reconcile_session_families(db, family_snapshot, changed)
+        # a parse that changed most sessions (a cache-version reparse rewrote their replies) is
+        # cheaper as a fresh build, and leaves no freelist behind: the in-place rewrite of 3,100
+        # sessions took 72 s against 31 s fresh and grew the db by 31%
+        sigs = {s: (_session_sig(by[s], _REPLY_SHAPES.get(s, [])) if by.get(s) else None)
+                for s in targets}
+        moved = sum(1 for s, sig in sigs.items() if sig != old.get(s))
+        if old and moved > max(_REBUILD_MIN_SESSIONS, len(old) // 2):
+            db.rollback()
+            db.close()
+            common.dbg(f"corpusdb incremental abandoned: {moved} of {len(old)} sessions moved")
+            return None
         n_add = n_remove = n_changed = n_unchanged = n_removed_sessions = 0
         for s in sorted(targets):
             rows = by.get(s, [])
-            sig = _session_sig(rows) if rows else None
+            sig = sigs[s]
             if sig == old.get(s):
                 n_unchanged += 1
                 continue  # candidate didn't really change
             added, removed = _apply_session_row_diff(db, s, rows)
+            _replace_reply_shapes(db, s, _REPLY_SHAPES.pop(s, []))
             n_add += added
             n_remove += removed
             n_changed += 1
@@ -2592,6 +2722,7 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         for s in old:
             if s not in targets and s not in current:
                 added, removed = _apply_session_row_diff(db, s, [])
+                _replace_reply_shapes(db, s, [])
                 n_add += added
                 n_remove += removed
                 n_removed_sessions += 1
@@ -2601,6 +2732,7 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         # change immediately after this check is observed by the next connect.
         if _stamp() != stamp:
             raise _SourceMoved("corpus sources moved during incremental scan")
+        _verify_index_lock(lock)
         db.execute("UPDATE meta SET value = ? WHERE key = 'stamp'", (stamp,))
         db.executemany(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
@@ -2616,6 +2748,15 @@ def _incremental(stamp: str) -> sqlite3.Connection | None:
         db.close()
         db = None
         return _open(DB_PATH)
+    except _IndexLockDisplaced:
+        # Not a reason to rebuild: the writer no longer excludes anyone, so no derived
+        # publication may follow. connect() lets it reach the caller as a failed refresh.
+        if db is not None:
+            try:
+                db.rollback()
+            except sqlite3.DatabaseError:
+                pass
+        raise
     except Exception as exc:  # noqa: BLE001 -- ANY failure (db corruption, a half-written source's
         # OSError/JSONDecodeError) drops to a clean full rebuild, never escapes to crash the
         # search. finally closes db so no write-locked handle blocks the rebuild swap.
@@ -3115,31 +3256,69 @@ def _clear_query_rebuild_request() -> None:
     _FOREIGN_QUERY_FAILURE_LOCAL.pop(key, None)
 
 
-def _rebuild_and_publish(stamp: str, repair_required: bool):
+class _IndexLockDisplaced(OSError):
+    """The held index lock no longer names this process: no derived write may follow."""
+
+
+def _verify_index_lock(lock: index_lock.IndexLock | None) -> None:
+    if lock is None:
+        return
+    try:
+        lock.verify()
+    except OSError as exc:
+        raise _IndexLockDisplaced(str(exc)) from exc
+
+
+def _release_build_path(tmp: Path, built: fileops.FileIdentity | None,
+                        lock: index_lock.IndexLock | None) -> None:
+    """Unlink the shared build path only while it is provably this writer's: the exact file
+    this pass built, or, when its build never finished, whatever is there while the index
+    lock still names this process. A displaced writer leaves the displacer's build alone."""
+    if built is not None:
+        try:
+            if fileops.file_identity(tmp) != built:
+                return
+        except OSError:
+            return
+    else:
+        try:
+            _verify_index_lock(lock)
+        except _IndexLockDisplaced:
+            return
+    _cleanup_tmp(tmp)
+
+
+def _rebuild_and_publish(stamp: str, repair_required: bool, *,
+                         lock: index_lock.IndexLock | None = None):
     """Build the whole corpus into the single claimed temp path, then publish it by rename.
 
-    Callers hold the index lock. Every exit leaves zero build bytes behind, so a rebuild
-    that dies of ENOSPC does not consume the free space its own next attempt needs."""
+    Callers hold the index lock; it is re-verified before the shared temp path is touched
+    and again inside the publish fence. Every exit leaves zero build bytes of this pass
+    behind, so a rebuild that dies of ENOSPC does not consume the free space its own next
+    attempt needs."""
+    _verify_index_lock(lock)
     purged = purge_legacy_build_temps()
     if purged["removed"]:
         common.dbg(
             f"corpusdb: reclaimed {purged['removed']} legacy build artifact(s), "
             f"{purged['removed_bytes']} byte(s)")
     tmp = _tmp_db_path()
+    built: fileops.FileIdentity | None = None
     try:
         _cleanup_tmp(tmp)
-        built = False
         for attempt in range(3):
             stamp = _stamp()
             try:
                 _build(tmp, stamp)
-                built = True
+                built = fileops.file_identity(tmp)
                 break
             except _SourceMoved as exc:
                 common.dbg(f"corpusdb: full scan generation moved (attempt {attempt + 1}/3): "
                            f"{exc}", "!")
+                # knowing the slot is the displacer's ends the pass; its build is left alone
+                _verify_index_lock(lock)
                 _cleanup_tmp(tmp)
-        if not built:
+        if built is None:
             common.dbg("corpusdb: sources kept moving; defer full rebuild to freshener", "!")
             return _stale_db()
         ownership = _derived_write_ownership(
@@ -3148,7 +3327,8 @@ def _rebuild_and_publish(stamp: str, repair_required: bool):
             return _interactive_snapshot(
                 stamp, repair_required=repair_required, ownership=ownership)
 
-        def retained_replace_fence() -> None:
+        def publish_fence() -> None:
+            _verify_index_lock(lock)
             if not ownership.replace_retained_db:
                 return
             observed = _derived_write_ownership(for_write=True)
@@ -3160,13 +3340,15 @@ def _rebuild_and_publish(stamp: str, repair_required: bool):
                     "retained search db changed before atomic replacement")
         try:
             common.replace_with_retry(
-                tmp, DB_PATH, before_attempt=retained_replace_fence)
+                tmp, DB_PATH, before_attempt=publish_fence)
+        except _IndexLockDisplaced:
+            raise
         except OSError:
             # Windows: a live reader can still hold corpus.db - keep the old db and let the next
             # connect retry; _stale_db enforces the schema match, else the JSONL engine serves.
             return _stale_db()
     finally:
-        _cleanup_tmp(tmp)
+        _release_build_path(tmp, built, lock)
     _consume_changed()  # a full rebuild indexed everything -> the delta is superseded
     _clear_query_rebuild_request()
     indexd_runtime._set_fts_delegated(False)
@@ -3175,15 +3357,9 @@ def _rebuild_and_publish(stamp: str, repair_required: bool):
 
 def _live_refresh_lock() -> bool:
     """Whether the corpus/ingest lock names its exact live process."""
-    try:
-        observed = index_lock._snapshot(common.INDEX_LOCK_PATH)
-        owner = index_lock.parse_owner(observed.raw) if observed is not None else None
-        if owner is None or owner.start in (None, "unknown"):
-            return False
-        return (common.pid_alive(owner.pid)
-                and common.process_start_identity(owner.pid) == owner.start)
-    except OSError:
-        return False
+    return index_lock.holder_live(
+        common.INDEX_LOCK_PATH, alive=common.pid_alive,
+        start_identity=common.process_start_identity)
 
 
 def query_publication_active() -> bool:
@@ -3358,7 +3534,8 @@ def connect(quiet: bool = False, allow_stale: bool = False,
     common.dbg("corpusdb: source moved -> refresh needed")
     if not quiet:
         common.log("refreshing search index…")
-    with _ConnectIndexLock(False) as lock_acquired:
+    guard = _ConnectIndexLock(False)
+    with guard as lock_acquired:
         if not lock_acquired:
             return None
         stamp = _stamp()
@@ -3399,7 +3576,7 @@ def connect(quiet: bool = False, allow_stale: bool = False,
         db = (
             None
             if repair_required or ownership.replace_retained_db
-            else _incremental(stamp)
+            else _incremental(stamp, lock=guard.lock)
         )
         if db is not None:
             common.dbg("corpusdb: incremental refresh applied (only changed sessions re-indexed)")
@@ -3409,7 +3586,7 @@ def connect(quiet: bool = False, allow_stale: bool = False,
             return _interactive_snapshot(
                 stamp, repair_required=repair_required, ownership=ownership)
         common.dbg("corpusdb: full rebuild (schema bump / cold / bulk row-shape move / invalid db)")
-        return _rebuild_and_publish(stamp, repair_required)
+        return _rebuild_and_publish(stamp, repair_required, lock=guard.lock)
 
 
 def generation(db: sqlite3.Connection) -> tuple[str, str]:
@@ -4648,7 +4825,10 @@ def keyword(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None, *,
             cand += 1
             m = pat.search(row[_TEXT]) if len(row[_TEXT]) >= min_phrase_chars else None
             if m:
-                hits.append(_hit(row, m.start(), m.end()))
+                h = _hit(row, m.start(), m.end())
+                h["_query_echo_checked"] = q
+                h["_query_echo_match"] = True
+                hits.append(h)
     # cand >> hits means FTS surfaced rows the adjacency matcher then rejected - the exact
     # signature of a separator/punctuation mismatch (the bug AGREP_DEBUG is here to expose).
     common.dbg(f"keyword: {cand} FTS candidate(s) -> {len(hits)} confirmed hit(s)"
@@ -4682,13 +4862,12 @@ def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> 
         return {"hits": [], "total": 0, "chats": 0}
     fts_table = _fts_table(flt)
     prose_only = fts_table == "msgs_prose_fts"
-    n_docs = _document_count(db, prose_only=prose_only) or 1
+    n_docs, counts = _coverage_counts(db, toks, fts_table, prose_only=prose_only)
+    n_docs = n_docs or 1
     idf: dict[str, float] = {}
     for t in toks:
         if len(t) >= 3:
-            df = db.execute(
-                f"SELECT count(*) FROM {fts_table} WHERE {fts_table} MATCH ?",
-                (_fts_quote(t),)).fetchone()[0]
+            df = counts[t][0]
         else:  # too short for the trigram index; treat as common
             df = n_docs
         idf[t] = math.log(1.0 + n_docs / (df + 1))
@@ -4721,23 +4900,105 @@ def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> 
     return {"hits": hits[:k], "total": len(hits), "chats": len({h["session"] for h in hits})}
 
 
+_COVERAGE_COUNT_CACHE: dict[tuple, tuple[int | None, ...]] = {}
+_COVERAGE_COUNT_LOCK = threading.Lock()
+_COVERAGE_COUNT_CACHE_MAX = 4096
+
+
+@contextmanager
+def _coverage_count_snapshot(db: sqlite3.Connection):
+    if (not isinstance(db, _PublishedConnection)
+            or db._source_identity is None
+            or (db._source_path is None
+                and not isinstance(db, _AliasedConnection))):
+        yield None
+        return
+    owns_transaction = not db.in_transaction
+    if owns_transaction:
+        db.execute("BEGIN")
+    try:
+        # The read lock binds the file identity to the rows, including during an incremental commit.
+        db.execute("PRAGMA schema_version").fetchone()
+        snapshot = None
+        if isinstance(db, _AliasedConnection):
+            version = db.execute("PRAGMA data_version").fetchone()[0]
+            if (db._alias_cleanup is not None and not db.total_changes
+                    and version == db._alias_data_version):
+                snapshot = (
+                    db._source_identity, db._alias_stable, db._alias_evidence)
+        else:
+            try:
+                if _sqlite_file_identity(db._source_path) == db._source_identity:
+                    snapshot = (db._source_identity,)
+            except OSError:
+                pass
+        yield snapshot
+    finally:
+        if owns_transaction:
+            db.rollback()
+
+
+def _coverage_counts(
+        db: sqlite3.Connection, terms: list[str], fts_table: str = "msgs_fts", *,
+        session_df: bool = False, prose_only: bool = False,
+) -> tuple[int, dict[str, tuple[int, int | None]]]:
+    with _coverage_count_snapshot(db) as snapshot:
+        with _COVERAGE_COUNT_LOCK if snapshot is not None else nullcontext():
+            cache = _COVERAGE_COUNT_CACHE if snapshot is not None else {}
+            population_key = (snapshot, None, session_df, prose_only)
+            population = cache.get(population_key)
+            if population is None:
+                total = (int(db.execute(
+                    "SELECT count(DISTINCT session) FROM msgs").fetchone()[0])
+                    if session_df else _document_count(db, prose_only=prose_only))
+                population = (total,)
+                cache[population_key] = population
+            counts = {}
+            indexable = terms if not session_df or population[0] else []
+            for term in dict.fromkeys(t for t in indexable if len(t) >= 3):
+                key = (snapshot, fts_table, term)
+                count = cache.get(key)
+                if count is None or (session_df and count[1] is None):
+                    query = _fts_quote(term)
+                    if session_df:
+                        if count is None:
+                            count = tuple(int(n) for n in db.execute(
+                                f"SELECT count(*), count(DISTINCT m.session) FROM {fts_table} "
+                                f"JOIN msgs m ON m.id = {fts_table}.rowid "
+                                f"WHERE {fts_table} MATCH ?", (query,)).fetchone())
+                        else:
+                            sessions = int(db.execute(
+                                f"SELECT count(DISTINCT m.session) FROM {fts_table} "
+                                f"JOIN msgs m ON m.id = {fts_table}.rowid "
+                                f"WHERE {fts_table} MATCH ?", (query,)).fetchone()[0])
+                            count = (count[0], sessions)
+                    else:
+                        # Coverage-only callers need no joined session scan.
+                        rows = int(db.execute(
+                            f"SELECT count(*) FROM {fts_table} "
+                            f"WHERE {fts_table} MATCH ?", (query,)).fetchone()[0])
+                        count = (rows, None)
+                    cache[key] = count
+                counts[term] = count
+            while len(cache) > _COVERAGE_COUNT_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+            return population[0], counts
+
+
 def term_session_df(db: sqlite3.Connection,
                     terms: list[str]) -> dict[str, float]:
     """Per-term session document frequency (0..1): the corpus's own measure of
     which query terms discriminate. A ubiquitous term is narration to the
     coverage retry; this only measures - callers pick the threshold."""
-    total = db.execute(
-        "SELECT count(DISTINCT session) FROM msgs").fetchone()[0]
+    # Session discrimination includes tool rows even when coverage ranks prose.
+    total, counts = _coverage_counts(db, terms, session_df=True)
     if not total:
         return {}
     out = {}
     for t in terms:
         if len(t) < 3:
             continue
-        n = db.execute(
-            "SELECT count(DISTINCT m.session) FROM msgs_fts "
-            "JOIN msgs m ON m.id = msgs_fts.rowid WHERE msgs_fts MATCH ?",
-            (_fts_quote(t),)).fetchone()[0]
+        n = counts[t][1]
         out[t] = n / total
     return out
 
@@ -4763,13 +5024,13 @@ def coverage_rank(db: sqlite3.Connection, q: str, k: int,
         return []
     echo_pat = re.compile(r"[\W_]*".join(re.escape(t) for t in raw), re.I)
     fts_table = _fts_table(flt)
-    n_docs = _document_count(db) or 1
+    # Prose changes the posting list, not the all-document coverage population.
+    n_docs, counts = _coverage_counts(db, toks, fts_table)
+    n_docs = n_docs or 1
     idf: dict[str, float] = {}
     for t in toks:
         if len(t) >= 3:
-            df = db.execute(
-                f"SELECT count(*) FROM {fts_table} WHERE {fts_table} MATCH ?",
-                (_fts_quote(t),)).fetchone()[0]
+            df = counts[t][0]
         else:
             df = n_docs
         idf[t] = math.log(1.0 + n_docs / (df + 1))
@@ -4794,6 +5055,7 @@ def coverage_rank(db: sqlite3.Connection, q: str, k: int,
         h = _lower_hit(row, low, first, first + len(lead))
         h["_terms_matched"] = matched
         h["_terms_missing"] = [t for t in toks if pos[t] < 0]
+        h["_query_echo_checked"] = q
         h["_query_echo"] = echo_pat.search(row[_TEXT]) is not None
         # idf-mass share of the query this row covers; None below statistical
         # scale, where every unusual word is df=0 and the share means nothing
@@ -4855,12 +5117,16 @@ def keyword_terms(db: sqlite3.Connection, q: str, k: int, flt: dict | None = Non
             if m:
                 phrase_hit = _hit(row, m.start(), m.end())
                 phrase_hit["_agrep_row_key"] = row_key
+                phrase_hit["_query_echo_checked"] = q
+                phrase_hit["_query_echo_match"] = True
                 phrase_hits.append(phrase_hit)
             continue
         term_hit = _spans_hit(row, spans)
         term_hit["_agrep_row_key"] = row_key
-        term_hits.append(term_hit)
         m = search(text) if len(text) >= min_phrase_chars else None
+        term_hit["_query_echo_checked"] = q
+        term_hit["_query_echo_match"] = m is not None
+        term_hits.append(term_hit)
         if m:
             phrase_hit = dict(term_hit)
             phrase_hit["snippet"] = _snip_at(text, m.start(), m.end())

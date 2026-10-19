@@ -295,6 +295,8 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
     let mut events: Vec<Event> = Vec::new();
     let mut pending: HashMap<String, usize> = HashMap::new();
     let mut turn = 0u32;
+    // blocks are in order: a tool_use sets the flag the next text consumes
+    let mut worked = false;
 
     for (message_ordinal, m) in msgs.iter().enumerate() {
         tally.seen();
@@ -369,6 +371,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                 continue;
             }
             tally.row();
+            worked = false;
             out.push(RawMessage {
                 agent: "cline",
                 project: project.clone(),
@@ -381,14 +384,23 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                 reply_chars: 0,
                 side: false,
                 parent: String::new(),
+                reply_shape: Default::default(),
             });
             turn += 1;
         } else if role == "assistant" {
             let mut reply = plain.map(str::to_string).unwrap_or_default();
+            // the message's text blocks make one reply block: its join is what came before the
+            // first of them, calls after that join it to the next message
+            let mut worked_before = plain
+                .filter(|text| !text.trim().is_empty())
+                .map(|_| std::mem::take(&mut worked));
             for (block_ordinal, b) in blocks.iter().enumerate() {
                 match b.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            if worked_before.is_none() {
+                                worked_before = Some(std::mem::take(&mut worked));
+                            }
                             if !reply.is_empty() {
                                 reply.push('\n');
                             }
@@ -401,6 +413,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
+                        worked |= !crate::ingest::is_bookkeeping_tool(&name);
                         let native_call_id = b
                             .get("id")
                             .and_then(|i| i.as_str())
@@ -431,6 +444,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                             call_id,
                             child_session: String::new(),
                             meta: String::new(),
+                            state: String::new(),
                         });
                     }
                     _ => {}
@@ -438,12 +452,12 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             }
             if !reply.trim().is_empty() {
                 if let Some(last) = out.last_mut() {
-                    let chars = crate::ingest::append_capped(
-                        &mut last.reply,
-                        &reply,
-                        crate::ingest::REPLY_CAP,
+                    crate::ingest::append_reply(last, &reply);
+                    crate::ingest::ReplyOrder::joined_known(
+                        &mut last.reply_shape,
+                        worked_before.unwrap_or(false),
                     );
-                    last.reply_chars += chars;
+
                     if last.model.is_empty() && !model.is_empty() {
                         last.model = model;
                     }

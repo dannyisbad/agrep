@@ -31,6 +31,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -154,6 +155,41 @@ def probe_default_lane(*, download: bool = False) -> tuple[str, str | None]:
     return probe.lane, probe.metal_refusal
 
 
+def _metal_lane_declined(profile: Mapping) -> str | None:
+    """Why the Metal lane will not open here, from facts that cost no model load."""
+    if profile.get("provider", "CPUExecutionProvider") != "CPUExecutionProvider":
+        # An explicitly pinned provider is the owner's decision; never
+        # silently answer with a different engine than the one named.
+        return "an ONNX execution provider is explicitly pinned"
+    ok, reason = mlx_embed.available()
+    if not ok:
+        return reason
+    cached = _cached_parity()
+    if cached is not None and cached < _METAL_MIN_COSINE:
+        # Re-proving this verdict cost ~150ms per construction. The key
+        # covers the mlx build and model, so it cannot outlive either.
+        return (f"its parity cosine {cached:.5f} is below "
+                f"{_METAL_MIN_COSINE} against the onnx lane (cached)")
+    return None
+
+
+def ensure_lane_weights(model_id: str | None, *, download: bool) -> None:
+    """Verify (or fetch) the extra checkpoint the lane for ``model_id`` needs.
+
+    The ONNX files are the floor for both lanes; a Metal lane also needs its
+    own weights. An offline pass that cannot have them must say so, rather
+    than quietly open CPU and record that lane into a fresh store for life.
+    """
+    if resolve_lane(model_id) != LANE_METAL:
+        return
+    if _metal_lane_declined(PROFILE) is not None:
+        return
+    try:
+        mlx_embed.ensure_weights(download=download)
+    except mlx_embed.MLXUnavailable as exc:
+        raise EmbedderUnavailable(str(exc)) from exc
+
+
 def store_profile_string(model_id: str | None) -> str:
     """The identity this process reads and writes for a store recording ``model_id``."""
     return profile_string(resolve_lane(model_id))
@@ -206,12 +242,16 @@ def _thread_budget() -> int:
         return default
 
 
+def model_root() -> Path:
+    """The per-user model cache every lane stores under (AGREP_MODEL_DIR overrides)."""
+    override = os.environ.get("AGREP_MODEL_DIR")
+    return Path(override).expanduser() if override else common.DEFAULT_DATA_DIR / "models"
+
+
 def model_dir() -> Path:
     # Model ownership is per user, independent of synthetic benchmark data dirs.
     # Moving AGREP_DATA_DIR must not duplicate the separately cached weights.
-    override = os.environ.get("AGREP_MODEL_DIR")
-    base = Path(override).expanduser() if override else common.DEFAULT_DATA_DIR / "models"
-    return base / PROFILE["id"]
+    return model_root() / PROFILE["id"]
 
 
 def model_cached() -> bool:
@@ -316,7 +356,10 @@ def _download_claim_state(observed: ownerfile.Snapshot) -> tuple[bool, float]:
             raise ValueError("download claim age is not finite")
         alive = (pid > 0 and common.pid_alive(pid)
                  and expected not in ("", "None", "unknown")
-                 and str(common.process_start_identity(pid)) == expected)
+                 and str(common.process_start_identity(pid)) == expected
+                 and not ownerfile.stranded_own_record(
+                     pid, expected, rec.get("token"),
+                     process_start=common.process_start_identity))
         return alive, age
     except (OSError, OverflowError, ValueError, TypeError, json.JSONDecodeError):
         age = time.time() - observed.mtime
@@ -346,8 +389,11 @@ def _download_claim_leaf_problem(path: Path) -> OSError | None:
     return None
 
 
-def _acquire_download_claim(root: Path) -> ownerfile.Handle | None:
+def _acquire_download_claim(
+        root: Path, files: Mapping[str, tuple] | None = None,
+) -> ownerfile.Handle | None:
     """One downloader per model directory; ``None`` means a peer finished it."""
+    pinned = PROFILE["files"] if files is None else files
     if _readonly_contains(root):
         raise EmbedderUnavailable(
             "AGREP_DATA_READONLY protects the model cache; "
@@ -359,7 +405,7 @@ def _acquire_download_claim(root: Path) -> ownerfile.Handle | None:
     verified: dict[str, tuple[int, ...]] = {}
 
     def model_complete() -> bool:
-        for name, (size, sha) in PROFILE["files"].items():
+        for name, (size, sha) in pinned.items():
             artifact = root / name
             current = _artifact_stamp(artifact, size)
             if current is None:
@@ -385,8 +431,7 @@ def _acquire_download_claim(root: Path) -> ownerfile.Handle | None:
                 "pid": pid, "process_start": process_start,
                 "at": time.time(), "token": token,
             }, separators=(",", ":")).encode("utf-8")
-            return ownerfile.create_exclusive(
-                path, raw)
+            return ownerfile.create_held(path, raw, token=token)
         except FileExistsError:
             if reclaimed_last:
                 if time.monotonic() >= deadline:
@@ -516,46 +561,62 @@ def _fetch_pinned(url: str, part: Path, expected_size: int) -> None:
             stream.write(chunk)
 
 
-def ensure_model(download: bool = True) -> Path:
-    """Verify-or-fetch the pinned weights. Returns the model dir, or raises
-    EmbedderUnavailable. Downloads are atomic (.part + rename) so a killed
-    fetch never leaves a half file that passes existence checks."""
-    root = model_dir()
-    missing = [(name, spec) for name, spec in PROFILE["files"].items()
-               if not _file_ok(root / name, *spec)]
+def _offline_unavailable_reason(
+        root: Path, missing: Sequence[str], noun: str) -> str:
+    """Why an offline open fails: absent files and present-but-corrupt ones apart."""
+    absent = [name for name in missing if not (root / name).exists()]
+    corrupt = [name for name in missing if name not in absent]
+    parts = []
+    if absent:
+        parts.append(f"{noun} missing under {root}: {', '.join(absent)}")
+    if corrupt:
+        parts.append(
+            f"{noun} failed size/SHA-256 verification under {root}: "
+            f"{', '.join(corrupt)} (`agrep -s <query>` or `agrep setup` "
+            "re-fetches them)")
+    return "; ".join(parts)
+
+
+def _ensure_pinned_files(
+        root: Path, files: Mapping[str, tuple[int, str]],
+        urls: Mapping[str, str], *, download: bool,
+        noun: str = "model files") -> Path:
+    """Verify-or-fetch one pinned artifact set under ``root``.
+
+    Every lane downloads through here: per-process partials, one claim per
+    directory and stale-partial takeover are what make a killed or racing
+    fetch harmless, so no lane may grow a second copy of the dance.
+    """
+    missing = [name for name, (size, sha) in files.items()
+               if not _file_ok(root / name, size, sha)]
     if not missing:
         return root
     if not download:
-        raise EmbedderUnavailable(f"model files missing under {root}")
+        raise EmbedderUnavailable(_offline_unavailable_reason(root, missing, noun))
     if _readonly_contains(root):
         raise EmbedderUnavailable(
             "AGREP_DATA_READONLY protects the model cache; "
             "cannot download model files")
     _require_model_download_enabled()
     root.mkdir(parents=True, exist_ok=True)
-    claim = _acquire_download_claim(root)
+    claim = _acquire_download_claim(root, files)
     if claim is None:
         return root
     try:
         _require_download_claim(claim)
         # Partials left under a superseded exact claim are takeover debris.
-        for part in root.glob(".*.part"):
+        for part in (*root.glob(".*.part"), *root.glob(".*.adopt")):
             if not _discard_download_part(part, claim):
                 raise EmbedderUnavailable(
                     f"could not remove stale model partial: {part}")
-        missing = [(name, spec) for name, spec in PROFILE["files"].items()
-                   if not _file_ok(root / name, *spec)]
-        base = (f"https://huggingface.co/{PROFILE['repo']}/resolve/"
-                f"{PROFILE['revision']}/")
-        for name, (size, sha) in missing:
-            remote_paths = PROFILE.get("remote_paths")
-            remote_path = (remote_paths[name] if remote_paths is not None else
-                           PROFILE["remote_dir"].get(name, "") + name)
-            url = base + remote_path
+        missing = [name for name, (size, sha) in files.items()
+                   if not _file_ok(root / name, size, sha)]
+        for name in missing:
+            size, sha = files[name]
             part = root / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.part"
             common.log(f"embedder: fetching {name} ({size / 1e6:.0f} MB) ...")
             try:
-                _fetch_pinned(url, part, size)
+                _fetch_pinned(urls[name], part, size)
                 if not _file_ok(part, size, sha):
                     raise EmbedderUnavailable(
                         f"{name} failed size/sha verification")
@@ -566,8 +627,24 @@ def ensure_model(download: bool = True) -> Path:
                 _discard_download_part(part)
     finally:
         _release_download_claim(claim)
-    common.log(f"embedder: model ready at {root}")
+    common.log(f"embedder: {noun} ready at {root}")
     return root
+
+
+def ensure_model(download: bool = True) -> Path:
+    """Verify-or-fetch the pinned weights. Returns the model dir, or raises
+    EmbedderUnavailable. Downloads are atomic (.part + rename) so a killed
+    fetch never leaves a half file that passes existence checks."""
+    base = (f"https://huggingface.co/{PROFILE['repo']}/resolve/"
+            f"{PROFILE['revision']}/")
+    remote_paths = PROFILE.get("remote_paths")
+    remote_dir = PROFILE.get("remote_dir") or {}
+    urls = {
+        name: base + (remote_paths[name] if remote_paths is not None
+                      else remote_dir.get(name, "") + name)
+        for name in PROFILE["files"]}
+    return _ensure_pinned_files(
+        model_dir(), PROFILE["files"], urls, download=download)
 
 
 # int8 CPU vs BF16 metal: ~0.99 is quantization cost; 0.995 admitted none of
@@ -715,18 +792,20 @@ class Embedder:
         # The reason used to exist only as a debug line, so a box that wanted
         # metal and silently got cpu looked identical to one that never asked.
         self.metal_refusal: str | None = None
+        self.metal_weights_refusal: str | None = None
         # An unnamed lane is this machine's default and may quietly land on CPU;
         # a named one came from a store's recorded identity, so failing to open
         # it must be an error rather than a different vector space.
         if (lane if lane is not None else default_lane()) == LANE_METAL:
-            self._start_metal_lane(required=lane is not None)
+            self._start_metal_lane(required=lane is not None, download=download)
 
     @property
     def profile_string(self) -> str:
         """The identity of the rows this instance produces."""
         return profile_string(getattr(self, "lane", LANE_CPU))
 
-    def _start_metal_lane(self, required: bool = False) -> None:
+    def _start_metal_lane(self, required: bool = False,
+                          download: bool = True) -> None:
         """Open the Metal lane only if it proves it shares ONNX's vector space.
 
         The capability check says "this machine could"; the parity gate says
@@ -745,24 +824,23 @@ class Embedder:
             self.metal_refusal = reason
             common.dbg(f"metal lane unavailable: {reason}", "~")
 
-        if self.profile.get("provider", "CPUExecutionProvider") != "CPUExecutionProvider":
-            # An explicitly pinned provider is the owner's decision; never
-            # silently answer with a different engine than the one named.
-            refuse("an ONNX execution provider is explicitly pinned")
-            return
-        ok, reason = mlx_embed.available()
-        if not ok:
+        reason = _metal_lane_declined(self.profile)
+        if reason is not None:
             refuse(reason)
             return
         cached = _cached_parity()
-        if cached is not None and cached < _METAL_MIN_COSINE:
-            # Re-proving this verdict cost ~150ms per construction. The key
-            # covers the mlx build and model, so it cannot outlive either.
-            refuse(f"its parity cosine {cached:.5f} is below "
-                   f"{_METAL_MIN_COSINE} against the onnx lane (cached)")
+        try:
+            # The caller's download permission covers both checkpoints: an
+            # offline probe or background pass must not fetch 91 MB either.
+            mlx_embed.ensure_weights(download=download)
+        except mlx_embed.MLXUnavailable as exc:
+            # Absent or unfetchable weights are not a machine that cannot run
+            # Metal: a fresh store must wait for them rather than record CPU.
+            self.metal_weights_refusal = str(exc)
+            refuse(f"its weights are not available: {exc}")
             return
         try:
-            lane = mlx_embed.MLXEmbedder()
+            lane = mlx_embed.MLXEmbedder(download=download)
             agreement = cached if cached is not None else self._metal_parity(lane)
         except Exception as exc:
             refuse(f"it did not load: {type(exc).__name__}: {exc}")

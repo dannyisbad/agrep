@@ -1254,6 +1254,79 @@ class OverspecRecoveryTests(unittest.TestCase):
         self.assertNotIn("_query_echo", hits[0])
         self.assertTrue(hits[1]["_query_echo"])
 
+    def test_query_echo_verdict_reuses_full_candidate_text_without_sql(self):
+        db = self._corpus()
+        text = " ".join(reversed(self.QUERY.split()))
+        db.execute(
+            corpusdb._INS_DIGEST,
+            ("independent", 1, 92, "codex", "p", "", "", "", "user",
+             text, compact.content_digest(text)))
+        db.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+        rows = corpusdb.keyword_terms(db, self.QUERY, 200)["terms"]["hits"]
+        self.assertTrue(any(hit["session"] == "independent" for hit in rows))
+        self.assertTrue(all("_query_echo" not in hit for hit in rows))
+        with mock.patch.object(search, "corpusdb", corpusdb), \
+                mock.patch.object(corpusdb, "connect", return_value=db) as connect:
+            search._mark_query_echoes(self.QUERY, rows)
+        connect.assert_not_called()
+        self.assertEqual(
+            [bool(hit.get("_query_echo")) for hit in rows],
+            [hit["session"] != "independent" for hit in rows])
+        db.close()
+
+    def test_short_keyword_verdict_does_not_activate_tool_echo_demotion(self):
+        db = self._corpus()
+        try:
+            rows = corpusdb.keyword(db, "publication", 200)["hits"]
+            self.assertTrue(any(hit.get("who") == "tool" for hit in rows))
+            search._demote_query_echoes("publication", rows)
+            self.assertTrue(all("_query_echo" not in hit for hit in rows))
+        finally:
+            db.close()
+
+    def test_query_echo_lookup_uses_one_statement_at_every_page_size(self):
+        for size in (1, 2, 80, 260):
+            with self.subTest(size=size):
+                db = self._corpus()
+                statements = []
+                db.set_trace_callback(statements.append)
+                hits = [
+                    {"session": "echo-src" if index % 2 == 0 else "evidence",
+                     "turn": 0, "who": "user" if index % 2 == 0 else "tool"}
+                    for index in range(size)]
+                with mock.patch.object(search, "corpusdb", corpusdb), \
+                        mock.patch.object(corpusdb, "connect", return_value=db):
+                    search._mark_query_echoes(self.QUERY, hits)
+                lookups = [sql for sql in statements if sql.startswith("SELECT")]
+                self.assertEqual(len(lookups), 1)
+                self.assertEqual(
+                    [bool(hit.get("_query_echo")) for hit in hits],
+                    [index % 2 == 0 for index in range(size)])
+
+    def test_query_echo_batch_reuses_missing_digest_and_exact_row_identity(self):
+        db = self._corpus()
+        text = f"tool result: {self.QUERY}"
+        db.execute(
+            corpusdb._INS_DIGEST,
+            ("evidence", 0, 51, "codex", "p", "", "", "", "tool", text, None))
+        digest = compact.content_digest(text)
+        identity = common.tool_event_identity("evidence", 0, 51, text)
+        hits = [
+            {"session": "evidence", "turn": 0, "who": "tool", "ts": 51,
+             "content_digest": digest, "_event_identity": identity}
+            for _ in range(80)]
+        hits.append(
+            {"session": "evidence", "turn": 0, "who": "tool", "ts": 50,
+             "content_digest": compact.content_digest(self.TARGET_TEXT)})
+        with mock.patch.object(search, "corpusdb", corpusdb), \
+                mock.patch.object(corpusdb, "connect", return_value=db), \
+                mock.patch.object(
+                    compact, "content_digest", wraps=compact.content_digest) as compute:
+            search._mark_query_echoes(self.QUERY, hits)
+        self.assertEqual(compute.call_count, 1)
+        self.assertTrue(all(hit.get("_query_echo") for hit in hits[:-1]))
+        self.assertNotIn("_query_echo", hits[-1])
+
     def test_retry_block_skips_echoes_and_shown_sessions(self):
         db = self._corpus()
         page = [{"session": "echo-src", "turn": 0, "who": "user"}]

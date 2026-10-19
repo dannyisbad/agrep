@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import secrets
 import time
 
 from dist import REPO_ROOT
 from events import DATA_DIR, DATA_DIR_SOURCE, data_dir_readonly
 from fileops import replace_with_retry
-from index_lock import IndexLock
 import ownerfile
-from proc import WIN
+from proc import WIN, pid_alive, process_start_identity
 import surface_policy as surface
 
 # The pre-package layout kept the index repo-local at <repo>/data.
@@ -186,17 +187,87 @@ def setting(key: str, default=_SETTING_DEFAULT):
     return _read_settings(for_update=False).get(key, fallback)
 
 
+SETTINGS_LOCK_NAME = ".settings.lock"
+SETTINGS_LOCK_TIMEOUT_S = 5.0
+_LOCK_PUBLISH_GRACE_S = 3.0
+
+
+def _reclaim_settings_lock(lock: Path) -> bool:
+    """Remove a dead or malformed holder's record; False while a live one holds it."""
+    try:
+        observed = ownerfile.snapshot(lock)
+    except OSError:
+        return False
+    fields: dict[str, str] = {}
+    try:
+        fields = dict(part.split("=", 1) for part in observed.raw.decode().split())
+        pid = int(fields.get("pid", "0"))
+    except (UnicodeError, ValueError):
+        pid = 0
+    if pid > 0:
+        state = ownerfile.classify_process(
+            pid, fields.get("start"), pid_alive=pid_alive,
+            process_start=process_start_identity,
+            unverifiable_starts=frozenset(("unknown",)))
+        if state in (ownerfile.ProcessOwner.EXACT_LIVE,
+                     ownerfile.ProcessOwner.UNVERIFIABLE):
+            if ownerfile.stranded_own_record(
+                    pid, fields.get("start"), fields.get("token"),
+                    process_start=process_start_identity):
+                return ownerfile.remove_exact(
+                    lock, observed, tombstone=True, require_stable_mtime=True)
+            return False
+    elif 0.0 <= time.time() - observed.mtime <= _LOCK_PUBLISH_GRACE_S:
+        return False
+    return ownerfile.remove_exact(lock, observed, tombstone=True, require_stable_mtime=True)
+
+
+@contextmanager
+def _settings_lock():
+    """Serializes the read-modify-write of settings.json between agrep processes.
+    Deliberately NOT the index lock: `agrep set` must never queue behind an index
+    run, and nothing needs settings frozen for one - the search-db build stamps
+    the `tools` value into its source generation and retries when it moves."""
+    lock = SETTINGS_PATH.with_name(SETTINGS_LOCK_NAME)
+    deadline = time.monotonic() + SETTINGS_LOCK_TIMEOUT_S
+    delay = 0.02
+    pid = os.getpid()
+    start = process_start_identity(pid) or "unknown"
+    token = secrets.token_hex(16)
+    while True:
+        body = f"pid={pid} start={start} token={token}\n".encode()
+        try:
+            handle = ownerfile.create_held(
+                lock, body, token=token, retain_fd=True)
+            break
+        except FileExistsError:
+            if _reclaim_settings_lock(lock):
+                continue
+            if time.monotonic() >= deadline:
+                raise SettingsError(
+                    "another agrep process is updating settings; try again") from None
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.25)
+    try:
+        yield
+    finally:
+        try:
+            handle.release(tombstone=True, require_stable_mtime=True)
+        except OSError:
+            pass
+
+
 def update_setting(key: str, mutate):
     """Atomically replace one setting from its current value."""
     if data_dir_readonly(SETTINGS_PATH.parent):
         raise SettingsError(
             "AGREP_DATA_READONLY protects this data directory")
-    with IndexLock("settings"):
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _settings_lock():
         path = SETTINGS_PATH
         cur = _read_settings(for_update=True)
         value = mutate(cur.get(key))
         cur[key] = value
-        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(
             f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:

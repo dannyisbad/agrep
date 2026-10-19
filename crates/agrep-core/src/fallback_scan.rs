@@ -3220,6 +3220,7 @@ not-json
             call_id: "call-1".into(),
             child_session: String::new(),
             meta: String::new(),
+            state: String::new(),
         }];
         let keep = HashSet::from([crate::cache::event_fname("codex", "one")]);
         crate::cache::write_events(

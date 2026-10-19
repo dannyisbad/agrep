@@ -135,8 +135,12 @@ def _release_claim() -> None:
 
 
 def _governor_reason() -> str | None:
+    """embed.py's governor, with the battery/load overrides the spawner gave
+    the pass this compaction unblocks; memory and disk gates always apply."""
     import embed
-    return embed._governor_deferral()
+    ignore_battery, ignore_load = embed._governor_env_overrides()
+    return embed._governor_deferral(
+        ignore_battery=ignore_battery, ignore_load=ignore_load)
 
 
 def _require_capacity(governor) -> None:
@@ -619,6 +623,7 @@ def compact(
         root = Path(tempfile.mkdtemp(
             prefix=".semantic-compaction-", dir=meta_path.parent))
         try:
+            embedding_segments.stamp_preparation_owner(root)
             metadata_path = None
             if metadata_db is not None:
                 metadata_path = _current_metadata_map(metadata_db, root)

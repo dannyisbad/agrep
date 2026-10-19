@@ -18,7 +18,8 @@ unicode-segmentation = { workspace = true }
 flate2 = { workspace = true }
 # bundled => compiles SQLite from C source (needs cl.exe under the MSVC toolchain on Windows).
 # Used by the opencode sqlite adapter (per-build chat stores live in *.db files).
-rusqlite = { version = "0.32", features = ["bundled"] }
+# hooks => the progress handler that ends an event write whose busy wait gave up.
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 # kimi-cli keys its per-workdir session dirs by md5(workdir path); ~/.kimi/kimi.json holds
 # the real paths, so we hash each registered path to find its sessions dir.
 md5 = "0.7"
@@ -27,6 +28,14 @@ md5 = "0.7"
 # Enabled only by agrep-ingest's dev-dependency, so shipped `cargo build` binaries never carry it;
 # AGREP_TEST_PARSE_PANIC then names the one source whose parse panics (see intake::keyed).
 parse-panic-injection = []
+# Same contract: AGREP_TEST_OWNER_VANISH then makes the derived writer's owner fence observe
+# records vanishing between its scan and its read (see fault_injection).
+owner-vanish-injection = []
+
+[target.'cfg(unix)'.dependencies]
+# Hardened opens need the per-architecture O_* values, and SQLite snapshots probe a writer's
+# lock on the live database; the linear-time proofs time their own thread's CPU.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir, wait_for_next_ctime_tick
+from _test_support import fixture_tree, isolate_data_dir, wait_for_next_ctime_tick
 
 
 isolate_data_dir()
@@ -26,6 +26,18 @@ import indexd_runtime  # noqa: E402
 import semantic  # noqa: E402
 import settings  # noqa: E402
 import teach  # noqa: E402
+
+
+def _rows(rendered: str, label: str) -> list[str]:
+    """Doctor rows carrying `label`, matched by their `[..] label` shape: path-bearing
+    lines (runtime build, data location) may contain any word a label does."""
+    return [line for line in rendered.splitlines() if f"] {label}" in line]
+
+
+def _without_paths(rendered: str) -> str:
+    """The status lines minus the one naming the data dir, which can hold any word."""
+    return "\n".join(line for line in rendered.splitlines()
+                     if not line.lstrip().startswith("data dir:"))
 
 
 def _missing_semantic() -> dict:
@@ -113,7 +125,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         native_import.assert_not_called()
 
     def test_routine_semantic_probe_preserves_bounded_failed_job(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-semantic-state-") as td:
             root = Path(td)
             state = root / ".semantic-embed-state.json"
@@ -168,7 +180,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         When the bounded open refuses, the check did not run: that must read as
         absence, never as a damaged database the reader is asked to repair.
         """
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-routine-db-") as td:
             root = Path(td)
             (root / "corpus.db").write_bytes(b"nonempty")
@@ -187,7 +199,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
     def test_diagnostic_snapshot_bounds_only_the_routine_alias_clone(
             self) -> None:
         marker = object()
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-clone-tier-") as td:
             path = Path(td) / "fixture.db"
             with mock.patch.object(
@@ -211,7 +223,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
     def test_damaged_census_owner_probe_never_uses_snapshot_alias(
             self) -> None:
         build_id = "a" * 20
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-routine-owner-") as td:
             root = Path(td)
             database = root / "corpus.db"
@@ -249,7 +261,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         doctor._MODEL_CHECK_MEMORY.clear()
 
     def test_routine_readiness_never_runs_quick_check_and_discloses_it(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-routine-") as td:
+        with fixture_tree(prefix="agrep-doctor-routine-") as td:
             root = Path(td)
             (root / "corpus.db").write_bytes(b"fixture")
             source_stamp = json.dumps([None] * len(corpusdb._SOURCES))
@@ -280,7 +292,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
             root / "corpus.db", routine=True)
 
     def test_deep_checks_metadata_before_quick_check(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-verdict-first-") as td:
+        with fixture_tree(prefix="agrep-doctor-verdict-first-") as td:
             root = Path(td)
             (root / "corpus.db").write_bytes(b"fixture")
             db = _RecordingDb({"schema": "obsolete"})
@@ -311,7 +323,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
                 "elapsed_s": 0.1, "checked_at": 1.0, "bytes": 3,
             },
         }
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-mode-poison-") as td:
+        with fixture_tree(prefix="agrep-doctor-mode-poison-") as td:
             root = Path(td)
             evidence = root / doctor._DOCTOR_EVIDENCE_NAME
             evidence.write_text(json.dumps(poison), encoding="utf-8")
@@ -334,7 +346,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
             "version": doctor._DOCTOR_EVIDENCE_VERSION,
             "fixture": {"verified": True},
         }
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-windows-mode-") as td:
+        with fixture_tree(prefix="agrep-doctor-windows-mode-") as td:
             root = Path(td)
             evidence = root / doctor._DOCTOR_EVIDENCE_NAME
             evidence.write_text(json.dumps(payload), encoding="utf-8")
@@ -355,7 +367,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
                 "identity": identity, "verified": True, "checked_at": 1.0,
             },
         }
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-uid-poison-") as td:
+        with fixture_tree(prefix="agrep-doctor-uid-poison-") as td:
             root = Path(td)
             evidence = root / doctor._DOCTOR_EVIDENCE_NAME
             evidence.write_text(json.dumps(poison), encoding="utf-8")
@@ -378,7 +390,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
             self.assertEqual(evidence.read_bytes(), before)
 
     def test_evidence_writer_caps_payload_and_publishes_private_mode(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-evidence-cap-") as td:
+        with fixture_tree(prefix="agrep-doctor-evidence-cap-") as td:
             root = Path(td)
             evidence = root / doctor._DOCTOR_EVIDENCE_NAME
             with mock.patch.object(doctor.common, "DATA_DIR", root):
@@ -398,7 +410,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
             self.assertEqual(evidence.read_bytes(), before)
 
     def test_quick_check_cache_includes_wal_change_identity(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-cache-") as td:
+        with fixture_tree(prefix="agrep-doctor-cache-") as td:
             root = Path(td)
             database = root / "corpus.db"
             wal = root / "corpus.db-wal"
@@ -430,7 +442,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         self.assertIn("cached", [event["phase"] for event in progress])
 
     def test_identity_changes_after_same_size_rewrite_with_restored_mtime(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-change-time-") as td:
+        with fixture_tree(prefix="agrep-doctor-change-time-") as td:
             path = Path(td) / "corpus.db"
             path.write_bytes(b"before")
             before_stat = path.stat()
@@ -473,7 +485,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows no-USN fallback")
     def test_windows_identity_hashes_when_usn_is_unavailable(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-content-token-") as td:
             path = Path(td) / "corpus.db"
             path.write_bytes(b"before")
@@ -494,7 +506,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         self.assertNotEqual(before[4], after[4])
 
     def test_quick_check_rejects_publication_moved_since_open(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-open-race-") as td:
+        with fixture_tree(prefix="agrep-doctor-open-race-") as td:
             root = Path(td)
             database = root / "corpus.db"
             database.write_bytes(b"old publication")
@@ -511,7 +523,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         self.assertIn("changed before the scan", result["detail"])
 
     def test_model_sha_verdict_is_cached_by_change_sensitive_identity(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-model-cache-") as td:
+        with fixture_tree(prefix="agrep-doctor-model-cache-") as td:
             root = Path(td)
             model = root / "model.bin"
             model.write_bytes(b"model1")
@@ -545,7 +557,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
         self.assertEqual(calls, [False, False])
 
     def test_post_adoption_clobber_names_the_full_rebuild_command(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-clobber-") as td:
+        with fixture_tree(prefix="agrep-doctor-clobber-") as td:
             root = Path(td)
             (root / "corpus.db").write_bytes(b"fixture")
             with (
@@ -570,7 +582,7 @@ class DoctorEvidenceTierTests(unittest.TestCase):
 
     def test_real_locked_canonical_database_is_busy_not_corrupt(self) -> None:
         build_id = "a" * 20
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-real-busy-") as td:
+        with fixture_tree(prefix="agrep-doctor-real-busy-") as td:
             root = Path(td)
             database = root / "corpus.db"
             created = sqlite3.connect(database)
@@ -616,7 +628,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
     def test_index_summary_carries_no_private_drift_observation(self) -> None:
         # the mtime-vs-timestamp drift clock was deleted (law 4: a check that
         # cannot run truthfully is not a row); its private feed goes with it
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-summary-") as td:
+        with fixture_tree(prefix="agrep-doctor-summary-") as td:
             root = Path(td)
             sessions = root / "sessions.jsonl"
             sessions.write_text("\n".join((
@@ -654,7 +666,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
         )
 
     def test_footprint_prunes_symlink_or_reparse_directories(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-footprint-") as td:
+        with fixture_tree(prefix="agrep-doctor-footprint-") as td:
             base = Path(td)
             root = base / "data"
             outside = base / "outside"
@@ -785,7 +797,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
             "last_pass": {"age_s": None, "fresh": False},
         }
         output = io.StringIO()
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-report-") as td:
+        with fixture_tree(prefix="agrep-doctor-report-") as td:
             root = Path(td)
             (root / "sessions.jsonl").write_text("", encoding="utf-8")
             with (
@@ -867,7 +879,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
         ensure.assert_not_called()
         rendered = output.getvalue()
         # the page scan did not run, so no row speaks for it
-        self.assertNotIn("integrity", rendered)
+        self.assertEqual(_rows(rendered, "integrity"), [])
         self.assertIn("installed build", rendered)
         self.assertIn("lags local master by 8.0 days", rendered)
         self.assertIn("uv tool install --force --from", rendered)
@@ -882,7 +894,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
             "state": "missing", "detail": "database does not exist",
             "integrity": doctor._integrity_not_verified(),
         }
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-fix-") as td:
+        with fixture_tree(prefix="agrep-doctor-fix-") as td:
             root = Path(td)
             (root / "sessions.jsonl").write_text("", encoding="utf-8")
             with (
@@ -943,7 +955,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
     def test_deep_report_generation_probe_is_shared_with_actual_readiness(self) -> None:
         generation = {"state": "ready", "detail": "fixture generation"}
         current_drift = indexd_runtime.DriftReport("current")
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-generation-") as td:
+        with fixture_tree(prefix="agrep-doctor-generation-") as td:
             root = Path(td)
             with (
                 mock.patch.object(doctor.common, "DATA_DIR", root),
@@ -1129,7 +1141,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
             clock[0] = deadline
             raise TimeoutError("fixture census exhausted the deadline")
 
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-status-deadline-") as td:
             root = Path(td)
             with (
@@ -1200,7 +1212,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
         # line saying so is noise (law 6): the corpus block is simply absent
         self.assertNotIn("no index yet", rendered)
         self.assertNotIn("messages ·", rendered)
-        self.assertNotIn("unreadable", rendered)
+        self.assertNotIn("unreadable", _without_paths(rendered))
         for leak in ("not verified", "deferred", "census", "routine"):
             self.assertNotIn(leak, rendered)
 
@@ -1211,7 +1223,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
             observation.update(state="complete")
             return []
 
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-status-publishing-") as td:
             root = Path(td)
             (root / "corpus.db").write_bytes(b"published")
@@ -1269,8 +1281,8 @@ class DoctorObservationSharingTests(unittest.TestCase):
             mock.patch.object(cli, "_status_semantic", return_value=semantic),
         ):
             rendered = "\n".join(cli._status_lines("agrep"))
-        self.assertNotIn("unreadable", rendered)
-        self.assertNotIn("missing", rendered)
+        self.assertNotIn("unreadable", _without_paths(rendered))
+        self.assertNotIn("missing", _without_paths(rendered))
         self.assertNotIn("`agrep index", rendered)
 
     def test_status_defers_every_active_publication_window(self) -> None:
@@ -1365,8 +1377,8 @@ class DoctorObservationSharingTests(unittest.TestCase):
                         cli, "_status_semantic", return_value={}),
                 ):
                     rendered = "\n".join(cli._status_lines("agrep"))
-                self.assertNotIn("unreadable", rendered)
-                self.assertNotIn("missing", rendered)
+                self.assertNotIn("unreadable", _without_paths(rendered))
+                self.assertNotIn("missing", _without_paths(rendered))
                 self.assertNotIn("`agrep index", rendered)
 
     def test_first_run_status_has_one_setup_remedy(self) -> None:
@@ -1406,7 +1418,7 @@ class DoctorObservationSharingTests(unittest.TestCase):
         self.assertNotIn("doctor --deep", rendered)
 
     def test_status_empty_database_is_unavailable_not_missing(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-status-empty-db-") as td:
             root = Path(td)
             (root / "corpus.db").write_bytes(b"")
@@ -1582,6 +1594,97 @@ class DoctorObservationSharingTests(unittest.TestCase):
                 self.assertIn("cannot be combined", message)
 
 
+class RoutineDefaultDeadlineTests(unittest.TestCase):
+    """The deadline the CLI itself runs under: no caller-supplied budget.
+
+    Every other deadline test passes one explicitly, so a routine tier that
+    stopped binding its own default would still pass them. These stall one
+    observation past the production budget on an injected clock and require
+    the call to return on budget with the deferral disclosed."""
+
+    def test_default_doctor_probe_defers_a_stalled_observation(self) -> None:
+        clock = [1000.0]
+        stall = doctor._DIAGNOSTIC_ROUTINE_TIMEOUT_S + 0.5
+
+        def stalled_footprint(*, deadline=None):
+            # One observation outlives the routine budget; everything after it
+            # must see an expired deadline rather than the wall clock.
+            clock[0] += stall
+            return {"state": "complete", "complete": True, "files": 1,
+                    "bytes": 1, "breakdown": "", "archive_bytes": 0}
+
+        with (
+            mock.patch.object(doctor.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(doctor, "_semantic_probe", return_value=_missing_semantic()),
+            mock.patch.object(doctor, "_orphan_inventory",
+                              return_value={"state": "complete", "complete": True,
+                                            "count": 0, "bytes": 0}),
+            mock.patch.object(doctor, "_data_footprint", side_effect=stalled_footprint),
+            mock.patch.object(doctor.common, "index_summary",
+                              side_effect=AssertionError("summary read after the budget")),
+            mock.patch.object(doctor.common, "detected_stores",
+                              side_effect=AssertionError("detection ran after the budget")),
+            mock.patch.object(doctor.indexd_runtime, "indexd_resource_status",
+                              side_effect=AssertionError("daemon observed after the budget")),
+        ):
+            payload = doctor.probe()
+        diagnostics = payload["diagnostics"]
+        self.assertEqual(diagnostics["tier"], "routine")
+        self.assertEqual(diagnostics["budget_s"], doctor._DIAGNOSTIC_ROUTINE_TIMEOUT_S)
+        self.assertEqual(diagnostics["state"], "partial")
+        for label in ("index summary", "unsupported-store detection",
+                      "daemon resource observation"):
+            self.assertIn(label, diagnostics["deferred"], diagnostics)
+        self.assertEqual(payload["core"]["indexed"]["state"], "status-deferred")
+        # The call consumed exactly the stall; nothing waited on a wall clock.
+        self.assertEqual(clock[0], 1000.0 + stall)
+
+    def test_default_status_data_defers_a_stalled_observation(self) -> None:
+        clock = [2000.0]
+        stall = cli._STATUS_ROUTINE_TIMEOUT_S + 0.5
+
+        def stalled_drift(*, timeout_s):
+            clock[0] += stall
+            return [], indexd_runtime.DriftReport("current")
+
+        def summary(*, deadline):
+            # The summary read receives the shared deadline, already expired by
+            # the stall, and declines exactly as the product does past it.
+            self.assertLessEqual(deadline, clock[0])
+            raise TimeoutError("routine budget expired before the index census")
+
+        with fixture_tree(prefix="agrep-status-default-") as td:
+            root = Path(td)
+            with (
+                mock.patch.object(cli.time, "monotonic", side_effect=lambda: clock[0]),
+                mock.patch.object(cli.common, "DATA_DIR", root),
+                mock.patch.object(cli.common, "MESSAGES_PATH", root / "messages.jsonl"),
+                mock.patch.object(cli, "_build_identity",
+                                  return_value={"runtime_build_id": "e" * 20,
+                                                "writer_build_id": "a" * 20,
+                                                "writer_build_state": "verified"}),
+                mock.patch.object(indexd_runtime, "indexd_resource_status",
+                                  return_value={"running": False}),
+                mock.patch.object(indexd_runtime, "observe_store_drift",
+                                  side_effect=stalled_drift),
+                mock.patch.object(indexd_runtime, "indexing_failure", return_value=None),
+                mock.patch.object(cli.common, "index_summary", side_effect=summary),
+                mock.patch.object(cli.common, "detected_stores",
+                                  side_effect=AssertionError("detection ran after the budget")),
+                mock.patch.object(cli, "_kick_repair_if_damaged"),
+            ):
+                payload = cli._status_data()
+        diagnostics = payload["diagnostics"]
+        self.assertEqual(diagnostics["budget_s"], cli._STATUS_ROUTINE_TIMEOUT_S)
+        self.assertEqual(diagnostics["state"], "partial")
+        for label in ("index summary", "unsupported-store detection",
+                      "instruction enrollment"):
+            self.assertIn(label, diagnostics["deferred"], diagnostics)
+        self.assertIsNone(payload["index_built"])
+        self.assertIsNone(payload["agents_taught"])
+        self.assertEqual(payload["semantic_status"], "status-deferred")
+
+
 class DiagnosticDeadlineTests(unittest.TestCase):
     def test_expired_footprint_discards_partial_counts_without_walking(self) -> None:
         with (
@@ -1677,6 +1780,13 @@ class DiagnosticDeadlineTests(unittest.TestCase):
                     "version": 1, "state": "unenrolled", "repaired": [],
                     "refusals": [], "preserved_newer": [],
                     "_enrollment": {"state": "unenrolled", "targets": 0},
+                }),
+            # The identity probe otherwise hashes whatever binary the host has.
+            mock.patch.object(
+                doctor, "_native_binary_identity",
+                return_value={
+                    "native_binary_build_id": "a" * 20,
+                    "native_binary_build_state": "verified",
                 }),
         )
 
@@ -1845,7 +1955,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
             ["store census"])
 
     def test_teach_enrollment_uses_the_bounded_loader_once(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-teach-bounded-") as td:
             data = Path(td)
             (data / "teach.json").write_text(
@@ -1875,7 +1985,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
 
     def test_routine_teach_probe_defers_reconciliation_after_bounded_load(
             self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-teach-routine-") as td:
             data = Path(td)
             (data / "teach.json").write_text(
@@ -1899,7 +2009,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
 
     def test_teach_load_consuming_deadline_never_continues_to_reconcile(
             self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-teach-deadline-") as td:
             data = Path(td)
             (data / "teach.json").write_text(
@@ -1934,7 +2044,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
         reconcile.assert_not_called()
 
     def test_settings_damage_never_becomes_the_embeddings_default(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-settings-") as td:
             root = Path(td)
             cases = {
@@ -2029,7 +2139,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
     def test_routine_archive_manifest_has_a_shared_deadline(self) -> None:
         import archive
 
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-archive-deadline-") as td:
             manifest = Path(td) / "manifest.jsonl"
             manifest.write_text("{}\n", encoding="utf-8")
@@ -2043,7 +2153,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
         self.assertEqual(status["state"], "budget-exceeded")
 
     def test_timed_out_store_census_reaps_outside_the_budget(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-census-") as td:
+        with fixture_tree(prefix="agrep-doctor-census-") as td:
             binary = Path(td) / "agrep-rs"
             binary.write_bytes(b"fixture")
             process = mock.Mock()
@@ -2104,7 +2214,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
         derive.assert_called_once_with(store_rows=None)
 
     def test_store_detection_forwards_the_diagnostic_deadline(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-detect-") as td:
+        with fixture_tree(prefix="agrep-doctor-detect-") as td:
             binary = Path(td) / "agrep-rs"
             binary.write_bytes(b"fixture")
             completed = SimpleNamespace(returncode=0, stdout="[]")
@@ -2119,7 +2229,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
 
     def test_store_detection_timeout_is_not_a_verified_empty_list(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-detect-") as td:
+        with fixture_tree(prefix="agrep-doctor-detect-") as td:
             binary = Path(td) / "agrep-rs"
             binary.write_bytes(b"fixture")
             outcome = {}
@@ -2138,7 +2248,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
 
     def test_store_detection_malformed_output_is_explicitly_unavailable(
             self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-detect-") as td:
+        with fixture_tree(prefix="agrep-doctor-detect-") as td:
             binary = Path(td) / "agrep-rs"
             binary.write_bytes(b"fixture")
             outcome = {}
@@ -2155,7 +2265,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
         self.assertIn("malformed", outcome["detail"])
 
     def test_sentinel_timeout_is_a_bounded_negative_verdict(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-sentinel-") as td:
+        with fixture_tree(prefix="agrep-doctor-sentinel-") as td:
             data = Path(td)
             for name in ("sentinel.json", "sentinel_watch.py"):
                 (data / name).write_text("{}", encoding="utf-8")
@@ -2175,7 +2285,7 @@ class DiagnosticDeadlineTests(unittest.TestCase):
         self.assertLessEqual(run.call_args.kwargs["timeout"], 0.125)
 
     def test_linux_sentinel_shares_one_deadline_across_units(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with fixture_tree(
                 prefix="agrep-doctor-sentinel-linux-") as td:
             data = Path(td)
             for name in ("sentinel.sh", "sentinel_strip.pl"):
@@ -2226,7 +2336,7 @@ class RoutineSemanticProbeSpeaksTheUnknownVocabulary(unittest.TestCase):
     for a lane that answered queries at that instant (hunt 3 D3)."""
 
     def test_unprobed_flags_are_none_never_false(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-unknown-") as td:
+        with fixture_tree(prefix="agrep-doctor-unknown-") as td:
             with mock.patch.object(doctor.common, "DATA_DIR", Path(td)):
                 observed = doctor._semantic_probe(deep=False, fix=False)
         self.assertIsNone(observed["live"])
@@ -2236,7 +2346,7 @@ class RoutineSemanticProbeSpeaksTheUnknownVocabulary(unittest.TestCase):
         self.assertIs(observed["embed_running"], False)
 
     def test_a_live_worker_claim_is_reported_from_the_artifact(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-claim-") as td:
+        with fixture_tree(prefix="agrep-doctor-claim-") as td:
             root = Path(td)
             start = common.process_start_identity(os.getpid())
             (root / ".semantic-embed.lock").write_text(json.dumps({
@@ -2353,7 +2463,7 @@ class ASupersededEmbedFailureStopsSpeaking(unittest.TestCase):
 
     def test_routine_doctor_drops_an_aged_failure_record(self) -> None:
         old = time.time() - 2 * semantic.BOOTSTRAP_RETRY_S - 60
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-aged-") as td:
+        with fixture_tree(prefix="agrep-doctor-aged-") as td:
             root = Path(td)
             (root / ".semantic-embed-state.json").write_text(json.dumps({
                 "state": "failed", "finished_at": old,
@@ -2368,7 +2478,7 @@ class ASupersededEmbedFailureStopsSpeaking(unittest.TestCase):
         self.assertIsNone(observed["embed_fail_reason"])
 
     def test_routine_doctor_still_reports_a_fresh_failure(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-fresh-") as td:
+        with fixture_tree(prefix="agrep-doctor-fresh-") as td:
             root = Path(td)
             (root / ".semantic-embed-state.json").write_text(json.dumps({
                 "state": "failed", "finished_at": time.time(),
@@ -2384,7 +2494,7 @@ class ASupersededEmbedFailureStopsSpeaking(unittest.TestCase):
             observed["embed_fail_reason"], "onnx session init failed")
 
     def test_a_coherent_refresh_check_clears_the_record_on_disk(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-clear-") as td:
+        with fixture_tree(prefix="agrep-doctor-clear-") as td:
             root = Path(td)
             state = root / ".semantic-embed-state.json"
             state.write_text(json.dumps({
@@ -2399,7 +2509,7 @@ class ASupersededEmbedFailureStopsSpeaking(unittest.TestCase):
                 self.assertFalse(state.exists())
 
     def test_clearing_never_touches_a_non_failed_record(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agrep-doctor-keep-") as td:
+        with fixture_tree(prefix="agrep-doctor-keep-") as td:
             root = Path(td)
             state = root / ".semantic-embed-state.json"
             state.write_text(json.dumps({

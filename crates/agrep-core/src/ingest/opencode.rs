@@ -200,6 +200,8 @@ struct PendingText {
     model: String,
     text: String,
     source_parts: u64,
+    /// A work part came between the previous prose and this message's first text part.
+    worked: bool,
 }
 
 fn flush_text(
@@ -237,6 +239,7 @@ fn flush_text(
             reply_chars: 0,
             side: !pending.parent.is_empty(),
             parent: pending.parent,
+            reply_shape: Default::default(),
         });
         *turn += 1;
     } else if pending.role == "assistant" {
@@ -244,12 +247,9 @@ fn flush_text(
             .last_mut()
             .filter(|message| message.session == pending.session)
         {
-            let chars = crate::ingest::append_capped(
-                &mut last.reply,
-                &pending.text,
-                crate::ingest::REPLY_CAP,
-            );
-            last.reply_chars += chars;
+            crate::ingest::append_reply(last, &pending.text);
+            crate::ingest::ReplyOrder::joined_known(&mut last.reply_shape, pending.worked);
+
             if last.model.is_empty() && !pending.model.is_empty() {
                 last.model = pending.model;
             }
@@ -365,7 +365,17 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
                 crate::ingest::terminal_safe(&e)
             );
             tally.error(&format!("cannot open: {e}"));
-            return (Vec::new(), Vec::new(), ReadOutcome::Invalid);
+            crate::ingest::note_read_failure(path, e.to_string());
+            // A database that moved under its snapshot is read again by the next pass; a lock or
+            // a journal may clear or persist, and a defect no retry heals is unreadable.
+            let outcome = if crate::ingest::sqlite_open_moved(&e) {
+                ReadOutcome::Moved
+            } else if crate::ingest::sqlite_open_defect(path, &e).is_some() {
+                ReadOutcome::Invalid
+            } else {
+                ReadOutcome::Unavailable
+            };
+            return (Vec::new(), Vec::new(), outcome);
         }
     };
     // opencode 2.x migrates in place and drops the v1 tables, so table presence is
@@ -461,6 +471,10 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
     let mut out: Vec<crate::model::RawMessage> = Vec::new();
     let mut turn = 0u32;
     let mut pending: Option<PendingText> = None;
+    // part rows arrive in store order (message time, then part key): a work part sets the
+    // flag the next prose consumes; a prompt opens a turn with none
+    let mut worked = false;
+    let mut worked_session = String::new();
 
     // Tool rows are buffered, then sorted by (session, part time, part id) before becoming Events.
     let mut tool_rows: Vec<Row> = Vec::new();
@@ -488,8 +502,16 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             main_scope_covered = false;
             continue;
         }
+        if r.session_id != worked_session {
+            worked_session.clone_from(&r.session_id);
+            worked = false;
+        }
         if r.p_ty == "tool" {
             tally.agent_row();
+            worked |= !r
+                .tool
+                .as_deref()
+                .is_some_and(crate::ingest::is_bookkeeping_tool);
             tool_rows.push(r);
             continue;
         }
@@ -554,12 +576,14 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             if let Some(current) = pending.take() {
                 flush_text(current, &mut out, &mut turn, &tally);
             }
+            let worked_before = std::mem::take(&mut worked);
             pending = Some(PendingText {
                 session: session_id,
                 message_id: m_id,
                 directory,
                 parent: parent_id,
                 ts: m_ts,
+                worked: role == "assistant" && worked_before,
                 role,
                 model,
                 ..PendingText::default()
@@ -587,12 +611,16 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
     });
     let mut events: Vec<Event> = Vec::with_capacity(tool_rows.len());
     for r in tool_rows {
-        let (input, input_chars) = r
+        let name = r.tool.unwrap_or_else(|| "?".to_string());
+        let args = r
             .input
             .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .map(|v| summarize_tool_input_with_chars(&v))
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let (input, input_chars) = args
+            .as_ref()
+            .map(summarize_tool_input_with_chars)
             .unwrap_or_default();
+        let state = crate::ingest::task_state(&name, args.as_ref());
         let recovered_nul_output = r.output.contains('\0');
         let (output, output_chars, output_bytes) = if recovered_nul_output {
             cap_event_output(&r.output)
@@ -614,7 +642,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             session: r.session_id,
             ts: r.p_ts,
             kind: "tool",
-            name: r.tool.unwrap_or_else(|| "?".to_string()),
+            name,
             input,
             output,
             input_chars,
@@ -624,6 +652,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
             call_id: r.call_id.unwrap_or(r.p_id),
             child_session: String::new(),
             meta: String::new(),
+            state,
         });
     }
 
@@ -674,6 +703,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
                         call_id: child.clone(),
                         child_session: child,
                         meta: String::new(),
+                        state: String::new(),
                     });
                 }
             }
@@ -1213,6 +1243,42 @@ mod tests {
         assert_eq!(outcome, ReadOutcome::Partial);
         assert_eq!(messages.len(), 1);
         assert_eq!(&*messages[0].text, "survivor");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A hot rollback journal no writer holds needs recovery by its agent: a durable defect, as a
+    /// file SQLite rejects as no database is. An empty journal no writer holds is no failure.
+    #[test]
+    fn an_idle_hot_journal_and_a_non_database_are_durable() {
+        let dir = temp_dir("open-hot-journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY);")
+            .unwrap();
+        let journal = dir.join("opencode.db-journal");
+        std::fs::write(&journal, b"").unwrap();
+        assert!(crate::ingest::open_sqlite_ro(&path).is_ok());
+        std::fs::write(&journal, b"hot").unwrap();
+        let files = [path.clone()];
+        let refused = crate::ingest::open_sqlite_ro(&path).err().unwrap();
+        assert_eq!(crate::ingest::sqlite_open_defect(&path, &refused), Some("needs-recovery"));
+        assert_eq!(collect_db(&path).2, ReadOutcome::Invalid);
+        let mut hot = IngestCache::cold();
+        collect_cached_for(&mut hot, "opencode", &dir, &files, collect_db);
+        assert!(!hot.output_complete());
+        let issue = &hot.source_read_issues()[0];
+        assert!(!issue.retryable && !issue.moving && issue.unreadable_material(), "{issue:?}");
+
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::write(&path, b"not a database, and never one").unwrap();
+        assert_eq!(collect_db(&path).2, ReadOutcome::Invalid);
+        let mut foreign = IngestCache::cold();
+        collect_cached_for(&mut foreign, "opencode", &dir, &files, collect_db);
+        assert!(foreign.output_complete_past_unreadable());
+        assert!(!foreign.output_complete());
+        assert!(foreign.source_read_issues()[0].unreadable_material());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

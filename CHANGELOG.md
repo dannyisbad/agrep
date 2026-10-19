@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.5 — 2026-10-12
+
+### Index integrity and recovery
+
+- Publication and retry paths preserve already-published rows across unreadable
+  sources, interrupted passes, and racy source or census observations instead
+  of treating an incomplete scan as proof that rows were deleted.
+- Held stores and newer ownership anchors now identify the affected agent or
+  source and provide one actionable remedy, including blocked event-store
+  sidecars and foreign derived stores.
+
+### Status, doctor and audit
+
+- Status, doctor, audit, `why`, `around`, and recall consistently report live
+  freshness and ownership evidence, including when a cache can still serve
+  results while repair is blocked.
+- Repair and reindex decisions now wait for active publication or owner
+  transitions instead of racing them, and destructive cleanup remains scoped
+  to the current installation.
+
+### Runtime reliability
+
+- Hardened terminal hand-back, signal teardown, filesystem opens, resident
+  lifecycle handling, and Linux/Windows test portability.
+
 ## 0.4.2 — 2026-10-07
 
 ### Status, doctor and setup

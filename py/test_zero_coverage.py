@@ -332,6 +332,35 @@ class WindowTests(unittest.TestCase):
     def test_equal_bounds_are_the_same_empty_interval(self) -> None:
         self.assertIsNotNone(surface.window_bounds_error("x", 100, "y", 100))
 
+    def test_equal_day_bounds_point_at_the_next_day_not_a_swap(self) -> None:
+        # swapping equal bounds reproduces the same error; the window is half-open
+        message = surface.window_bounds_error("2026-09-01", 100, "2026-09-01", 100)
+        self.assertNotIn("swap", message)
+        self.assertIn("--until 2026-09-02", message)
+        self.assertIn("2026-09-01", message)
+        self.assertIn("[since, until)", message)
+        for value in ("7d", "2026-09-01 10:00"):
+            with self.subTest(value=value):
+                message = surface.window_bounds_error(value, 5, value, 5)
+                self.assertNotIn("swap", message)
+                self.assertIn("later", message)
+        # the inverted case still asks for the swap
+        self.assertIn("swap", surface.window_bounds_error("2026-09-02", 200, "2026-09-01", 100))
+        self.assertEqual(surface._next_day("2026-12-31"), "2027-01-01")
+        self.assertIsNone(surface._next_day("2026-13-01"))
+
+    def test_iso_t_form_parses_like_the_space_form_and_errors_echo_the_input(self) -> None:
+        self.assertEqual(search._parse_when("2026-09-01T10:00"),
+                         search._parse_when("2026-09-01 10:00"))
+        self.assertEqual(search._parse_when("2026-09-01T10:00:30"),
+                         search._parse_when("2026-09-01 10:00:30"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+            search._parse_when("2026-09-01Tmorning")
+        self.assertEqual(stop.exception.code, 2)
+        self.assertIn("'2026-09-01Tmorning'", err.getvalue())
+        self.assertNotIn("tmorning", err.getvalue())
+
     def test_the_right_way_round_is_not_an_error(self) -> None:
         self.assertIsNone(surface.window_bounds_error("7d", 100, "1d", 500))
 

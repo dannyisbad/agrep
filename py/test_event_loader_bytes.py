@@ -25,9 +25,10 @@ class EventByteLoadingTests(unittest.TestCase):
     @staticmethod
     def _load(event: dict) -> dict:
         turns = [{"turn": 0, "ts": 1}]
-        with mock.patch.object(explore, "get_events", return_value=[event]):
+        with mock.patch.object(
+                explore, "_session_events", return_value=([[event]], False)):
             return explore._events_for_turns(
-                "codex", "session", turns, turns)[0]
+                "codex", "session", turns, turns)[0][0]
 
     def test_event_store_stamp_uses_native_change_time(self) -> None:
         identity = (11, 22, 33, 44, 55)
@@ -163,7 +164,7 @@ class EventByteLoadingTests(unittest.TestCase):
             opened_stamp = (1, 6, 3, 4, 5)
             with mock.patch.object(
                     explore.common, "event_store_blob",
-                    return_value=(False, None)), \
+                    return_value=(explore.common.EVENTS_LEGACY, None)), \
                     mock.patch.object(
                         explore, "events_path", return_value=path), \
                     mock.patch.object(

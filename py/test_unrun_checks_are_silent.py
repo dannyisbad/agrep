@@ -22,12 +22,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import (
+    generous_routine_budget, isolate_data_dir, remove_coordination_namespace)
 
 isolate_data_dir()
 import cli  # noqa: E402
 import corpusdb  # noqa: E402
 import doctor  # noqa: E402
+
+setUpModule, tearDownModule = generous_routine_budget()
 from test_perf_budgets import (  # noqa: E402
     _prepare_paths, _public_cli, _require_release_binary, _write_small_fixture,
 )
@@ -142,17 +145,17 @@ class RoutineAndDeepAgree(unittest.TestCase):
         _require_release_binary()
         cls.tmp = tempfile.TemporaryDirectory(
             prefix="agrep-verdict-", dir=SANDBOX_ROOT)
+        cls.addClassCleanup(cls.tmp.cleanup)
         root = Path(cls.tmp.name)
         (cls.home, cls.data, cls.protected,
          cls.canary) = _prepare_paths(root)
+        # The public CLI's children mint this data dir's /tmp coordination
+        # namespace; cleanups run last-in first, so it goes before the tree.
+        cls.addClassCleanup(remove_coordination_namespace, cls.data)
         _write_small_fixture(cls.home, root)
         built = cls._cli("index")
         if built.returncode != 0:
             raise AssertionError(f"fixture ingest failed: {built.stderr[-400:]}")
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.tmp.cleanup()
 
     @classmethod
     def _cli(cls, *args: str, timeout: float = 180):

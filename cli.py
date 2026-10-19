@@ -38,6 +38,7 @@ import argparse
 import errno
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -311,11 +312,22 @@ def _index() -> bool:
     return ok
 
 
+def _explicit_index_refusal() -> str | None:
+    """Why an explicit index would decline right now, or None. Only an ingest
+    binary that exists can be judged; `cmd_index` fetches or builds a missing one."""
+    import indexd_runtime
+
+    ingest = common.ingest_bin()
+    if not ingest.exists():
+        return None
+    refusal = indexd_runtime.writer_launch_refusal(ingest)
+    return None if refusal is None else refusal.reason
+
+
 # --- status (bare `agrep`) ------------------------------------------------
 
 # same palette as search/around/doctor (common owns it)
 _paint = common.paint
-_meter = common.meter
 _STATUS_ROUTINE_TIMEOUT_S = 0.80
 _STATUS_STORE_TIMEOUT_S = 0.20
 _STATUS_DETECT_TIMEOUT_S = 0.15
@@ -471,6 +483,11 @@ def _status_core(*, deadline: float | None = None,
             "running": False, "state": "status-deferred", "detail": detail}
         _status_defer(d, "daemon resource observation", detail)
     d["daemon"] = daemon
+    newer = indexd_runtime.newer_anchor()
+    if newer is not None:
+        d["derived_owner"] = {
+            "state": "newer-agrep", "version": newer[0], "format": newer[1],
+            "detail": indexd_runtime.newer_anchor_reason(*newer)}
     writer_active = bool(daemon.get("running") or daemon.get("starting"))
     store_timeout = _status_remaining(deadline, _STATUS_STORE_TIMEOUT_S)
     if store_timeout > 0.0:
@@ -491,15 +508,25 @@ def _status_core(*, deadline: float | None = None,
     d["freshness"] = indexd_runtime.machine_freshness(
         checked=_stores is not None, failure=failure,
         drift_report=drift_report)
+    import source_health
+    # a store sidecar no pass can use comes first: until it is fixed, no other remedy can run
+    for sidecar in source_health.store_sidecars_blocked():
+        d["warnings"].append(source_health.inaccessible_sidecar_line(
+            sidecar, f"{common.cli_name()} index"))
     if failure is not None:
         if failure.code == "diagnostic-budget-exceeded":
             _status_defer(d, "freshness verdict", failure.reason)
         else:
             # surface owns the translation; the raw code and reason stay in
             # d["freshness"] for machines that want the mechanism
-            line = surface.indexing_advice_line(failure, common.cli_name())
+            line = surface.indexing_advice_line(
+                failure, common.cli_name(), hold=source_health.hold_fields)
             if line:
                 d["warnings"].append(line)
+    import doctor
+    if doctor.event_store_interrupted(doctor._event_store_journal()):
+        d["warnings"].append(surface.events_interrupted_pass()
+                             + _interrupted_remedy(newer is not None, common.cli_name()))
     try:
         summary = common.index_summary(deadline=deadline)
     except TimeoutError:
@@ -606,7 +633,6 @@ def _status_core(*, deadline: float | None = None,
                 # ~14ms of metadata reads behind a clone-bounded open. Skipping
                 # them is what let this surface answer "ready" while the deep
                 # tier called the same database unreadable.
-                import doctor
                 readiness = doctor._corpus_db_readiness()
                 state = str(readiness.get("state") or "unavailable")
                 code = str(readiness.get("code") or "")
@@ -785,6 +811,29 @@ def _status_data() -> dict:
     return d
 
 
+def _newer_agrep_status_line(cli: str, newer: dict, *, built: bool) -> str:
+    """The newer-anchor fence in the status page's words: the cause, the two
+    remedies the reader has, and the surface that carries the full sentence."""
+    detail = f"ownership record version {newer['version']}"
+    if newer.get("format") is not None:
+        detail += f", format {newer['format']}"
+    what = "this index" if built else "this location"
+    return (f"a newer agrep owns {what} ({detail}): upgrade agrep, or point "
+            f"AGREP_DATA_DIR elsewhere - details: `{cli} doctor`")
+
+
+def _interrupted_remedy(newer_owner: bool, cli: str, *, corpus: bool = False) -> str:
+    """What clears an interrupted pass's journal, as a status line's tail: for the event store,
+    the next publication, which a hold refuses until its remedy is taken; for corpus.db
+    (`corpus`), any index pass. A newer agrep's data dir leaves either to that agrep."""
+    import source_health
+    remedy = (source_health.rollback_remedy if corpus
+              else source_health.publication_remedy)(f"{cli} index", newer_owner=newer_owner)
+    if not newer_owner and remedy == source_health.command_remedy("index-publish", "index"):
+        return f": `{cli} index`"
+    return f"; {remedy}"
+
+
 def _status_lines(cli: str, color: bool = False):
     """Human render for bare `agrep`; all observations share one deadline."""
     import indexd_runtime
@@ -804,6 +853,14 @@ def _status_lines(cli: str, color: bool = False):
          "budget_s": _STATUS_ROUTINE_TIMEOUT_S, "deferred": []},
     )
     repairing = bool(repair is not None and repair.in_flight)
+    # the one owner the reader can end; `agrep index` is never the remedy here
+    owner = d.get("derived_owner") or {}
+    newer = owner if owner.get("state") == "newer-agrep" else {}
+    import source_health
+    # while a store sidecar blocks every pass, `index` cannot help; the warning above names the
+    # file and its fix, so these lines point at it instead of repeating it
+    block = bool(source_health.store_sidecars_blocked())
+    index_remedy = "; index updates wait on the file named above" if block else f": `{cli} index`"
     # the default path explains nothing; a redirected one explains why the
     # corpus below looks unfamiliar
     if str(d.get("data_dir_source") or "default") != "default":
@@ -827,12 +884,16 @@ def _status_lines(cli: str, color: bool = False):
             yield (f"  indexed, but no chats were found: `{cli} doctor` lists "
                    "the folders agrep looked in")
     elif d["index_built"] is False:
-        yield (f"  no index yet - `{cli} setup` makes this machine's agent "
-               "history searchable")
+        if newer:
+            yield ("  no index yet - "
+                   + _newer_agrep_status_line(cli, newer, built=False))
+        else:
+            yield (f"  no index yet - `{cli} setup` makes this machine's agent "
+                   "history searchable")
     elif (d.get("index_state") != "status-deferred"
           and str(d.get("search_index_state") or "") not in {
               "missing", "stale", "rebuild-pending", "corrupt", "unavailable",
-              "owned-elsewhere",
+              "owned-elsewhere", "interrupted-pass",
           }):
         # a summary read that merely ran out of time learned nothing, so it
         # says nothing; damaged evidence is what the reader can act on
@@ -845,9 +906,10 @@ def _status_lines(cli: str, color: bool = False):
     # drift a background writer is converging needs no line - it ends without
     # the reader; drift nothing will absorb is one line with the command
     if (freshness.get("state") == "index-behind"
+            and not newer
+            and not block
             and not (d.get("daemon") or {}).get("running")):
-        yield (f"  new chats since the last index are not searchable yet: "
-               f"`{cli} index`")
+        yield f"  new chats since the last index are not searchable yet{index_remedy}"
     # a present index is the unremarkable case and gets no line; the four
     # unusable shapes each get one, with the command that ends them
     defect = str(d.get("search_index_defect") or "")
@@ -864,14 +926,19 @@ def _status_lines(cli: str, color: bool = False):
         pass
     elif foreign_owner:
         yield "  " + _paint(
-            "y", "another agrep version is using the search index: "
+            "y",
+            _newer_agrep_status_line(cli, newer, built=True) if newer else
+            "another agrep version is using the search index: "
             f"`{cli} doctor`", color)
+    elif search_state == "interrupted-pass":
+        remedy = _interrupted_remedy(bool(newer), cli, corpus=True)
+        yield "  " + _paint("y", f"{surface.SEARCH_INDEX_INTERRUPTED}{remedy}", color)
     elif search_state == "missing":
         yield "  " + _paint(
-            "y", f"the search index is missing: `{cli} index`", color)
+            "y", f"the search index is missing{index_remedy}", color)
     elif defect == "empty":
         yield "  " + _paint(
-            "y", f"the search index is empty: `{cli} index`", color)
+            "y", f"the search index is empty{index_remedy}", color)
     elif defect == "not-a-file":
         yield "  " + _paint(
             "y",
@@ -882,108 +949,21 @@ def _status_lines(cli: str, color: bool = False):
             "y", f"the search index cannot be read: `{cli} doctor`", color)
     elif search_state in {"stale", "rebuild-pending"}:
         yield "  " + _paint(
-            "y", f"the search index is out of date: `{cli} index`", color)
+            "y", f"the search index is out of date{index_remedy}", color)
     elif search_state == "corrupt":
         yield "  " + _paint(
             "y", f"the search index is damaged: `{cli} index --full`", color)
     elif search_state == "unavailable":
         yield "  " + _paint(
             "y", f"the search index cannot be read: `{cli} doctor`", color)
-
-    semantic = _status_semantic(deadline=deadline)
-    d.update(semantic)
-    if semantic.get("semantic_status") == "status-deferred":
-        _status_defer(
-            d, "semantic capability",
-            "routine budget expired before optional-dependency discovery")
-    elif not semantic.get("semantic_verified"):
-        _status_defer(
-            d, "semantic runtime and index",
-            "routine status does not discover optional packages, load native "
-            "code, or scan semantic artifacts")
-    setting_observation = d.get("embeddings_setting") or {
-        "state": "unavailable", "value": None}
-    setting = (
-        setting_observation.get("value")
-        if setting_observation.get("state") == "verified" else None)
-    governor_deferral = (
-        surface.observed_semantic_deferral(
-            common.available_memory_fraction,
-            common.battery_state,
-            common.host_cpu_fraction,
-        )
-        if (d.get("semantic_deps") and d.get("semantic_verified")
-            and not d.get("semantic_ready") and setting != "off")
-        else None
-    )
-    sem = ""
-    if d.get("semantic_deps") is False:
-        sem = ("meaning search is off - optional dependencies are not "
-               f"installed. enable: {dist.semantic_install_hint()}")
-    elif (d.get("semantic_status") == "status-deferred"
-            or d.get("semantic_deps") is None or setting is None
-            or setting == "off" or not d.get("semantic_verified")):
-        # nothing about meaning search was observed here, and a working
-        # keyword search is not news - the routine tier stays quiet about both
-        sem = ""
-    elif d.get("semantic_embedding_now"):
-        cov = d.get("semantic_coverage") or {}
-        done, total = cov.get("indexed"), cov.get("total")
-        # the worker's own counters beat published coverage: vectors land on disk
-        # only at the end of a pass, so during a first build "published" reads 0
-        # for the whole run while the worker is chewing through thousands of rows
-        if d.get("embed_total"):
-            total = total or d["embed_total"]
-            done = min(total, (done or 0) + d.get("embed_done", 0))
-        # the meaning index embeds every non-tool row (subagent/control/recap too),
-        # a larger set than the banner's prose "messages" - so say rows, not messages
-        if done is not None and total:
-            pct = f"{100 * done // total}%"
-            # Without live counters, "building" can be a kick the governor will
-            # decline; render the pause instead of work that is not happening.
-            if governor_deferral and not d.get("embed_total"):
-                at = f" at {pct} ({done:,}/{total:,} rows)" if done else ""
-                sem = (f"meaning search {_paint('y', 'is paused', color)}{at} - "
-                       f"{governor_deferral.surface_reason}; resumes automatically")
-            elif not done:
-                sem = f"meaning search is building - {total:,} rows to embed"
-            elif done / total >= 0.99:
-                # an active box is nearly always a few fresh turns behind; that
-                # is current with a top-up in flight, not a build
-                sem = ""
-            else:
-                sem = (f"meaning search is building "
-                       f"{_paint('g', _meter(done, total), color)} {pct} · "
-                       f"{done:,}/{total:,} rows"
-                       if color else
-                       f"meaning search is building "
-                       f"({done:,}/{total:,} rows, {pct})")
-        else:
-            sem = (f"meaning search {_paint('y', 'is paused', color)} - "
-                   f"{governor_deferral.surface_reason}; resumes automatically"
-                   if governor_deferral and not d.get("embed_total")
-                   else "meaning search is building")
-    elif d.get("semantic_kick_state") == "failed":
-        retry = d.get("semantic_retry_in_s")
-        when = (f"in ~{max(1, retry // 60)}m" if retry and retry > 60
-                else "shortly" if retry is not None else "automatically")
-        sem = (f"meaning search {_paint('y', 'failed to build', color)} - "
-               f"retries {when}; keyword search is unaffected")
-    elif governor_deferral:
-        sem = (f"meaning search {_paint('y', 'is paused', color)} - "
-               f"{governor_deferral.surface_reason}; resumes automatically")
-    else:
-        # ready, never built, or repairing: all end without the reader
-        sem = ""
-    if sem:
-        yield f"  {sem}"
     det = d.get("detected_not_indexed") or []
     if det:
         names = ", ".join(f"{x['name']} ({x['count']})" for x in det)
         yield f"  found but not supported yet: {names}"
-    if d.get("agents_taught") is False:
+    if d.get("agents_taught") is False and not newer:
         # the entire value channel: no model has an agrep prior, so an agent
-        # never reaches for it until its instructions say it exists
+        # never reaches for it until its instructions say it exists; under a
+        # newer owner `setup` declines, so the hint would only loop
         yield ("  your agents " + _paint("y", "do not know about agrep yet", color)
                + f": `{cli} setup`")
 
@@ -1037,6 +1017,14 @@ def cmd_status(a) -> int:
 # --- subcommands ----------------------------------------------------------
 
 
+def _ingest_sig_identity() -> tuple[int, int, int] | None:
+    try:
+        info = (common.DATA_DIR / ".ingest.sig").stat()
+    except OSError:
+        return None
+    return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+
 def cmd_index(a) -> int:
     if getattr(a, "rest", None):
         raw_rest = getattr(a, "raw_rest", None) or a.rest
@@ -1056,14 +1044,27 @@ def cmd_index(a) -> int:
         # an upgrade's predecessor daemon is retired first, as build_index does
         ingest = common.ingest_bin()
         indexd_runtime.retire_displaceable_indexd_owner()
-        r = subprocess.run(
-            [str(ingest), "index", "--agent", "all", "--full"],
-            cwd=str(ROOT),
-            env=indexd_runtime.rust_writer_env(ingest))
+        # --full stays last: the settlement rerun below drops only it
+        cmd = [str(ingest), "index", "--agent", "all", "--retry-failed-sources", "--full"]
+        try:
+            env = indexd_runtime.explicit_rust_writer_env(ingest)
+        except OSError as fenced:
+            # the same verdict the incremental path gives: a fenced writer
+            # is a decline with its cause, not a crash
+            common.log(f"indexing declined; {indexd_runtime.fenced_reason(fenced)}")
+            common.lap("index")
+            return 1
+        sig_before = _ingest_sig_identity()
+        r = subprocess.run(cmd, cwd=str(ROOT), env=env)
         if r.returncode != 0:
             common.lap("index")
             return r.returncode
-        if indexd_runtime.explicit_index_declined():
+        # the ingest rewrites .ingest.sig on every pass it did not decline, so a settled
+        # rerun repeats the cold reparse only when this one declined; decided now, before
+        # a settlement wait during which the daemon's own pass rewrites the sig too
+        rerun_cmd = cmd if sig_before == _ingest_sig_identity() else cmd[:-1]
+        if not indexd_runtime.explicit_ingest_published(
+                lambda: subprocess.run(rerun_cmd, cwd=str(ROOT), env=env).returncode):
             common.lap("index")
             return 1
         indexd_runtime.record_binary_identity(ingest)
@@ -1085,6 +1086,7 @@ def cmd_audit(a) -> int:
 
 def cmd_doctor(a) -> int:
     import doctor
+    common.lap("imports")
     if "-h" in a.rest or "--help" in a.rest:
         print(doctor.__doc__.strip())
         return 0
@@ -1223,7 +1225,7 @@ def _setup_start_semantic(
     state = str(result.get("state") or "") if isinstance(result, dict) else ""
     if state == "running":
         print("\nbuilding the embeddings index in the background "
-              f"- bare `{cli}` shows progress", flush=True)
+              f"- run `{cli} doctor` to see progress", flush=True)
         return
     if state == "ready":
         return
@@ -1246,22 +1248,32 @@ def _setup_start_semantic(
     _setup_semantic_deferred(reason)
 
 
+def _delete_dir_command(path: Path) -> str:
+    """The one command that removes agrep's data directory on this platform."""
+    if os.name == "nt":
+        return f'rmdir /s /q "{path}"'
+    return f"rm -rf {shlex.quote(str(path))}"
+
+
 def _setup_consent_screen(*, no_semantic: bool) -> str:
     """Disclose the core and instruction writes before instruction consent."""
     import platform
 
     import teach
     lines = ["setup writes these, in this order:", "",
-             "core (agrep's own directories; removed by uninstall):"]
+             "core (agrep's own data directory; `agrep remove` and a package "
+             "uninstall both leave it in place):"]
     lines.append(f"  search index at {common.DATA_DIR}")
     lines.append("    reason: the searchable copy of your agent history; "
                  "built read-only over the agent stores")
+    lines.append(f"    delete it yourself when you are done: "
+                 f"{_delete_dir_command(common.DATA_DIR)}")
     if not no_semantic:
         lines.append("  semantic model cache (~52 MiB download, one time)")
         lines.append("    reason: meaning search over that index; "
                      "--no-semantic skips it this run")
         if sys.platform == "darwin" and platform.machine() == "arm64":
-            lines.append("  Metal GPU weights (~91 MiB, on first GPU embed)")
+            lines.append("  Metal GPU weights (~91 MiB, prefetched by setup where Metal opens)")
             lines.append("    reason: GPU embedding; AGREP_MLX=off opts out")
     lines += ["", "agent instructions (first consent choice; "
               "undone by `agrep remove`):"]
@@ -1299,6 +1311,8 @@ def _setup_hook_consent_screen() -> str:
     for path in hookinstall.codex_hooks_paths():
         if path.parent.is_dir():
             lines.append(f"  codex SessionStart/compact hook in {path}")
+            lines.append(f"    plus its /bin/sh launcher and stdlib-only payload "
+                         f"copy in {hookinstall.codex_payload_dir(path)}")
             lines.append("    does: injects recovery context only when Codex "
                          "reports a compacted-session start")
     pi_targets = [
@@ -1349,6 +1363,34 @@ def _setup_banner(cli: str) -> None:
     print(common.paint("bold", f"{cli} setup", on)
           + f" - {_SETUP_STEP_TOTAL} steps: dependencies · agent instructions"
           " · recovery integrations · search index · archive\n", flush=True)
+
+
+# `agrep setup` declined without changing anything and a retry declines the
+# same way until the cause is resolved; installers key their summary on it.
+SETUP_DECLINED_RC = 3
+
+
+def _setup_newer_owner(fence: str) -> int:
+    """A newer agrep owns the data dir: setup changes nothing. That build
+    enrolled the agents and keeps the index; blocks and hooks written here
+    would describe a freshness this agrep cannot deliver, its daemon would
+    die on its first publication, and archive capture could never run."""
+    summary, _ = _setup_index_state()
+    on = _setup_color()
+    if summary is not None:
+        head = ("nothing to change: a newer agrep owns this data dir; searches "
+                f"work read-only ({summary.get('messages', 0):,} messages "
+                f"across {summary.get('sessions', 0):,} sessions).")
+        rc = 0
+    else:
+        head = ("nothing to change: a newer agrep owns this data dir and "
+                "nothing is searchable here yet; this agrep cannot build it.")
+        rc = SETUP_DECLINED_RC
+    print(common.paint("y", head, on), flush=True)
+    print(f"  {fence}", flush=True)
+    print("  agent instructions, recovery integrations, the uninstall sentinel "
+          "and the archive choice stay as they are.", flush=True)
+    return rc
 
 
 def _setup_headless_brief(cli: str, *, no_semantic: bool) -> str:
@@ -1403,6 +1445,12 @@ def cmd_setup(a) -> int:
     # A valid receipt with a live target already answered the instruction choice.
     enrolled = teach.enrollment_active()
     _setup_banner(cli)
+    # a data dir a newer agrep owns is that build's to change; this one
+    # neither writes, starts nor enables anything here
+    import indexd_runtime
+    fence = indexd_runtime.newer_anchor_fence()
+    if fence is not None:
+        return _setup_newer_owner(fence)
     # An agent driving a PTY still must not answer its human's consent
     # prompt; env-detected agent context reads the headless brief instead.
     interactive = sys.stdin.isatty() and not common.in_agent_context()
@@ -1434,12 +1482,13 @@ def cmd_setup(a) -> int:
     common.lap("dependencies")
     if rc != 0:
         return rc
+    teach_rc = 0
     if no_teach:
         _setup_step(2, "agent instructions skipped")
     else:
         _setup_step(2, "agent instructions")
         import teach
-        rc = teach.teach(yes=yes or consented)
+        teach_rc = teach.teach(yes=yes or consented)
     if not no_hook:
         import hookinstall
         if not yes and hookinstall.hooks_need_consent():
@@ -1477,30 +1526,57 @@ def cmd_setup(a) -> int:
         if hook_rc != 0:
             print("  ! post-compact hook install failed (setup continues)", flush=True)
     index_upgrade_pending = False
-    if rc == 0:
-        # setup ends with search working - never "your first search will fetch/build"
-        _setup_step(4, "search index")
-        # A plain leaf is not enough: its committed generation must also prove
-        # that the bytes belong to the corpus setup is about to vouch for.
-        s, index_upgrade_pending = _setup_index_state()
-        if s is not None:
-            if index_upgrade_pending:
-                print(f"  {s.get('messages', 0):,} messages across "
-                      f"{s.get('sessions', 0):,} sessions remain keyword-searchable; "
-                      "the background index upgrade is finishing", flush=True)
-            else:
-                print(f"  already built - {s.get('messages', 0):,} messages across "
-                      f"{s.get('sessions', 0):,} sessions (searches keep it fresh)",
-                      flush=True)
-        elif (not _preserve_invalid_corpus_leaf(common.MESSAGES_PATH)
-              or cmd_index(argparse.Namespace(full=True)) != 0):
-            # instructions may already be installed - a silent exit here reads
-            # as success while agents are enrolled against no index
-            print(f"\nsetup incomplete: the index build failed. "
-                  f"anything already installed (agent instructions) stays; "
-                  f"`{cli} doctor` shows what is missing, and any search "
-                  f"retries the build.", flush=True)
-            rc = 1
+    # one agent file that cannot be written must not cost the user the index,
+    # the archive choice or the semantic start: those steps run regardless and
+    # the summary below says what did not complete.
+    _setup_step(4, "search index")
+    # A plain leaf is not enough: its committed generation must also prove
+    # that the bytes belong to the corpus setup is about to vouch for.
+    s, index_upgrade_pending = _setup_index_state()
+    # one verdict for both branches: an index this agrep cannot refresh is
+    # reported as read-only, never as "kept fresh"
+    declined = _explicit_index_refusal()
+    # A record holding publication back fails every pass, searches' and the daemon's alike.
+    import source_health
+    newer_owner = indexd_runtime.newer_anchor() is not None
+    held = source_health.held_publication_remedy(newer_owner=newer_owner)
+    if s is not None:
+        if index_upgrade_pending:
+            print(f"  {s.get('messages', 0):,} messages across "
+                  f"{s.get('sessions', 0):,} sessions remain keyword-searchable; "
+                  "the background index upgrade is finishing", flush=True)
+        elif declined is not None:
+            print(f"  already built - {s.get('messages', 0):,} messages across "
+                  f"{s.get('sessions', 0):,} sessions; read-only for this agrep: "
+                  f"{declined}", flush=True)
+        elif held is not None:
+            print(f"  already built - {s.get('messages', 0):,} messages across "
+                  f"{s.get('sessions', 0):,} sessions, but new chats are not being "
+                  "indexed: "
+                  # The receipt below says what the rebuild costs; this line need not.
+                  f"{source_health.held_publication_remedy(newer_owner=newer_owner, cost=False)}",
+                  flush=True)
+        else:
+            print(f"  already built - {s.get('messages', 0):,} messages across "
+                  f"{s.get('sessions', 0):,} sessions (searches keep it fresh)",
+                  flush=True)
+    elif declined is not None:
+        # the writer is fenced (another build's stores, a malformed anchor,
+        # an unverifiable binary): say why here and launch nothing
+        print(f"  ! indexing declined; {declined}", flush=True)
+        print(f"\nsetup incomplete: the index build was declined. "
+              f"anything already installed (agent instructions) stays; "
+              f"`{cli} doctor` shows the details.", flush=True)
+        rc = 1
+    elif (not _preserve_invalid_corpus_leaf(common.MESSAGES_PATH)
+          or cmd_index(argparse.Namespace(full=True)) != 0):
+        # instructions may already be installed - a silent exit here reads
+        # as success while agents are enrolled against no index
+        print(f"\nsetup incomplete: the index build failed. "
+              f"anything already installed (agent instructions) stays; "
+              f"`{cli} doctor` shows what is missing, and any search "
+              f"retries the build.", flush=True)
+        rc = 1
     if rc == 0:
         _setup_step(5, "optional archive retention")
         choice = True if archive_on else False if archive_off else None
@@ -1509,24 +1585,38 @@ def cmd_setup(a) -> int:
             common.setting("embeddings") != "off":
         _setup_start_semantic(
             cli, index_upgrade_disclosed=index_upgrade_pending)
-    if rc == 0:
-        knows = (common.DATA_DIR / "teach.json").exists()
-        if knows:
-            tail = " - your agents now know agrep exists"
-        else:
-            # "re-run setup" is only advice when there is something to enroll -
-            # on an agentless box that advice can never converge
-            import teach
-            tail = ((" (agents not enrolled - search works now, but they are "
-                     f"not told agrep exists until `{cli} setup` writes their "
-                     "instructions)")
-                    if teach.detected_agents() else
-                    " (no agents detected on this box - `agrep setup` enrolls "
-                    "them once one is installed)")
+    if rc != 0:
+        return rc
+    if teach_rc != 0:
+        print("\n" + common.paint(
+            "y", "setup finished, but step 2 (agent instructions) did not "
+            "complete: see the lines marked `!` above for each file, why, "
+            f"and the fix. search works now; re-run `{cli} setup` once those "
+            "files are fixed.", _setup_color()))
+        print(f"\n{_core_evidence_path(cli)}")
+        return 1
+    knows = (common.DATA_DIR / "teach.json").exists()
+    if knows:
+        tail = " - your agents now know agrep exists"
+    else:
+        # "re-run setup" is only advice when there is something to enroll -
+        # on an agentless box that advice can never converge
+        import teach
+        tail = ((" (agents not enrolled - search works now, but they are "
+                 f"not told agrep exists until `{cli} setup` writes their "
+                 "instructions)")
+                if teach.detected_agents() else
+                " (no agents detected on this box - `agrep setup` enrolls "
+                "them once one is installed)")
+    if held is not None:
+        print("\n" + common.paint(
+            "y", f"setup finished{tail}, but new chats are not being indexed: {held}.",
+            _setup_color()))
+    else:
         print("\n" + common.paint(
             "g", f"setup complete{tail}.", _setup_color()))
-        print(f"\n{_core_evidence_path(cli)}")
-    return rc
+    print(f"\n{_core_evidence_path(cli)}")
+    return 0
 
 
 def cmd_remove(a) -> int:
@@ -1548,11 +1638,13 @@ def _print_set_help() -> None:
     print("\nexamples:")
     print("  agrep set                  list current settings")
     print("  agrep set embeddings off   disable semantic downloads and builds")
-    print("\nexit: 0 listed or changed, 2 invalid arguments.")
+    print("\nexit: 0 listed or changed, 1 settings could not be changed, "
+          "2 invalid arguments.")
 
 
 def cmd_set(a) -> int:
     import common
+    import settings
 
     if a.rest in (["-h"], ["--help"]):
         _print_set_help()
@@ -1578,7 +1670,11 @@ def cmd_set(a) -> int:
             detail = f"{key} must be {spec.value_help}"
         return surface.argument_error(
             "agrep set", detail, argv=a.rest, search_word="set")
-    settings.set_setting(key, val)
+    try:
+        settings.set_setting(key, val)
+    except settings.SettingsError as exc:
+        print(common.terminal_safe(exc))
+        return 1
     tail = f"  ({spec.update_note})" if spec.update_note else ""
     print(f"{key} = {val}{tail}")
     return 0
@@ -1641,6 +1737,7 @@ def cmd_around(a) -> int:
 
 def cmd_postcompact(a) -> int:
     import postcompact
+    common.lap("imports")
     return postcompact.main(a.rest)
 
 
@@ -1714,8 +1811,10 @@ def cmd_run(a) -> int:
         agent, cwd = parsed.agent, parsed.cwd
         if extra[:1] == ["--"]:
             extra = extra[1:]
-    agent = registry.normalize_agent_name(agent)
-    unsupported = registry.capability_error("native_resume", agent)
+    # capability checks use the registry label; the launch keeps the spelling
+    # the user typed, which for pi/omp names the fork to start
+    unsupported = registry.capability_error(
+        "native_resume", registry.normalize_agent_name(agent))
     if unsupported:
         common.log(common.terminal_safe(unsupported))
         return 2
@@ -1910,7 +2009,11 @@ def _main() -> int:
                         formatter_class=argparse.RawDescriptionHelpFormatter,
                         epilog="examples:\n"
                                "  agrep index          ingest new sessions + refresh the search db\n"
-                               "  agrep index --full   cold reparse of every store file")
+                               "  agrep index --full   cold reparse of every store file\n"
+                               "\n"
+                               "a store on a network filesystem whose clock runs more than 2 s\n"
+                               "ahead of this machine (or behind it by more than its timestamp\n"
+                               "granule) can keep a same-size rewrite cached; --full re-reads it")
     ix.add_argument("--full", action="store_true",
                     help="ignore the parse cache; re-read every store file")
     ix.set_defaults(fn=cmd_index)
@@ -2011,12 +2114,31 @@ def _crash_line(exc: BaseException) -> str:
 def main() -> int:
     """CLI boundary: grep-style broken-pipe behavior without Python tracebacks."""
     common.utf8_stdio()
+    inherited = None
     if sys.platform != "win32":
         try:
             import signal
-            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+            inherited = signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         except (AttributeError, OSError, ValueError):
             pass
+    try:
+        try:
+            return _bounded_main()
+        finally:
+            # Process-wide state is this boundary's to borrow, not to keep: an
+            # in-process caller (tests, embedding) gets its disposition back.
+            if inherited is not None:
+                try:
+                    signal.signal(signal.SIGPIPE, inherited)
+                except (OSError, ValueError):
+                    pass
+    except KeyboardInterrupt:
+        # a Ctrl-C storm can outlast the command (a full-screen view ended on
+        # its first Ctrl-C) and land here, after the status was decided
+        return 130
+
+
+def _bounded_main() -> int:
     try:
         try:
             result = _main()
@@ -2054,4 +2176,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    status = main()
+    try:
+        while True:
+            try:
+                import console
+                console.settle_interrupts()
+                break
+            except KeyboardInterrupt:  # a Ctrl-C caught before the switch
+                status = 130
+    except KeyboardInterrupt:
+        # one handled at the loop's own back-edge, outside the inner try: end
+        # now, as the switched handler would (a builtin call is not checked
+        # for signals before it runs)
+        os._exit(130)
+    raise SystemExit(status)

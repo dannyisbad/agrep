@@ -14,12 +14,14 @@ import time
 import unittest
 from unittest import mock
 
-from _test_support import isolate_data_dir
+from _test_support import generous_routine_budget, isolate_data_dir
 
 isolate_data_dir()
 
 import common  # noqa: E402
 import doctor  # noqa: E402
+
+setUpModule, tearDownModule = generous_routine_budget()
 import indexer  # noqa: E402
 import ownerfile  # noqa: E402
 import teach  # noqa: E402

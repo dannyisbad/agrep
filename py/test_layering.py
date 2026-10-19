@@ -29,6 +29,7 @@ LAYERS = {
     "mlx_modernbert": 0,
     "regex_guard": 0,
     "surface_policy": 0,
+    "termui": 0,
     "winjob": 0,
     "hookless.__init__": 0,
     "hookless._log": 0,
@@ -59,11 +60,13 @@ LAYERS = {
     "archive": 3,
     "audit": 3,
     "compact": 3,
+    "derived_anchor": 3,
     "embedder": 3,
     "lifetime": 3,
     "mlx_embed": 3,
     "semantic_q8": 3,
     "semantic_segment_build": 3,
+    "source_health": 3,
     # 4 — engine: the store/index/semantic core; its internal cycles are
     # sideways here and stay legal until the extraction train splits them
     "ask": 4,

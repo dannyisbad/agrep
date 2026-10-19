@@ -164,6 +164,10 @@ _SNAPSHOT_SWEEP_DONE = False
 _SNAPSHOT_LEGACY_REAP_AGE_S = 3600.0
 _EVENT_REPAIR_REQUESTED = False
 _EVENT_REPAIR_CALLBACK: Callable[[], bool] | None = None
+# (store, monotonic time, journal identity kicked for): one probe per interval, one kick per journal.
+_INTERRUPTED_REPAIR_ATTEMPT: tuple[str, float, tuple | None] | None = None
+# The daemon's own health check re-verifies on this cadence; a read need not ask sooner.
+_INTERRUPTED_REPAIR_INTERVAL_S = 60.0
 
 
 def _sweep_dead_snapshot_dirs() -> None:
@@ -258,12 +262,15 @@ class _EventSnapshotConnection(sqlite3.Connection):
     _snapshot_cleanup = None
     _snapshot_source = None
     _snapshot_stamp = None
+    _snapshot_direct = False
 
     def source_stable(self) -> bool:
         try:
             return (
                 self._snapshot_source is not None
-                and _event_store_stamp(self._snapshot_source)
+                and _event_store_identity(
+                    _event_store_stamp(self._snapshot_source),
+                    self._snapshot_direct)
                 == self._snapshot_stamp
             )
         except OSError:
@@ -283,12 +290,10 @@ class _EventSnapshotConnection(sqlite3.Connection):
 def _close_event_reader() -> None:
     """Release this thread's cached event DB handle."""
     state = getattr(_EVENT_READER_LOCAL, "state", None)
-    if state is not None:
-        try:
-            state["connection"].close()
-        except Exception:  # noqa: BLE001 -- cleanup must tolerate a broken SQLite handle
-            pass
     _EVENT_READER_LOCAL.state = None
+    if state is not None:
+        with state["lock"]:
+            _retire_event_reader(state)
 
 
 def _event_is_regular(metadata) -> bool:
@@ -332,7 +337,27 @@ def _event_store_stamp(store: Path) -> tuple:
         except FileNotFoundError:
             if not suffix:
                 raise
+        except PermissionError:
+            if not suffix:
+                raise
+            # a sidecar this user cannot open still brackets the family by its metadata; one a
+            # read needs (a non-empty -wal, a hot journal) fails that read on its own
+            info = path.lstat()
+            stamps.append((suffix, (int(info.st_mtime_ns), int(info.st_ctime_ns),
+                                    int(info.st_size), int(info.st_dev), int(info.st_ino))))
     return tuple(stamps)
+
+
+def _event_store_identity(stamp: tuple, direct: bool) -> tuple:
+    """The family a reader must see unchanged. A direct open ignores the rollback
+    journal: SQLite's locks serve the committed pages while a writer holds one,
+    and refuse a hot one at open. A snapshot copy omits it, so there it counts."""
+    if not direct:
+        return stamp
+    try:
+        return tuple(entry for entry in stamp if entry[0] != "-journal")
+    except (TypeError, IndexError):
+        return stamp
 
 
 def _event_payload_hash(payload: bytes) -> int:
@@ -349,6 +374,10 @@ def _event_payload_digest(payload: bytes) -> bytes:
     return hashlib.md5(payload).digest()
 
 
+class _EventPathMoved(OSError):
+    """A file's identity changed under a read or an open, as a writer's commit does."""
+
+
 def _read_regular_bytes(path: Path) -> bytes:
     before = fileops.file_identity(path)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -356,7 +385,7 @@ def _read_regular_bytes(path: Path) -> bytes:
     try:
         opened = fileops.file_identity_fd(descriptor)
         if opened != before:
-            raise OSError(f"event path changed before opening: {path}")
+            raise _EventPathMoved(f"event path changed before opening: {path}")
         with os.fdopen(descriptor, "rb", closefd=False) as source:
             body = source.read()
         after_open = fileops.file_identity_fd(descriptor)
@@ -364,7 +393,7 @@ def _read_regular_bytes(path: Path) -> bytes:
         os.close(descriptor)
     after = fileops.file_identity(path)
     if opened != after_open or after_open != after:
-        raise OSError(f"event path changed while reading: {path}")
+        raise _EventPathMoved(f"event path changed while reading: {path}")
     return body
 
 
@@ -380,14 +409,14 @@ def open_regular_binary(path: Path):
         try:
             opened_identity = fileops.file_identity_fd(source.fileno())
             if opened_identity != before:
-                raise OSError(f"event path changed before opening: {path}")
+                raise _EventPathMoved(f"event path changed before opening: {path}")
             yield source
             after_open = fileops.file_identity_fd(source.fileno())
         finally:
             source.close()
         after = fileops.file_identity(path)
         if opened_identity != after_open or after_open != after:
-            raise OSError(f"event path changed while reading: {path}")
+            raise _EventPathMoved(f"event path changed while reading: {path}")
 
     return opened()
 
@@ -397,16 +426,19 @@ def _event_generation_token(manifest: bytes) -> bytes:
 
 
 def _event_generation_snapshot(state: dict, marker: Path) -> tuple[tuple, bytes]:
-    for _attempt in range(2):
+    for _attempt in range(3):
         before = _event_file_stamp(marker)
         if state.get("generation_stamp") == before:
             return before, state["generation"]
-        body = _read_regular_bytes(marker)
+        try:
+            body = _read_regular_bytes(marker)
+        except _EventPathMoved:
+            continue  # an atomic publication landed mid-read; the next read sees it whole
         if _event_file_stamp(marker) == before:
             state["generation_stamp"] = before
             state["generation"] = body
             return before, body
-    raise OSError("event generation changed while reading")
+    raise _EventPathMoved("event generation changed while reading")
 
 
 def _event_seal_identity(stamp: tuple[int, int, int, int, int]) -> dict[str, int]:
@@ -500,6 +532,8 @@ def _event_filter_authority(
                 "SELECT DISTINCT agent FROM event_sessions")
         }
         agents = represented | set(inventory) | expected_agents
+        sealed = [store_identity] + ([] if wal_identity is None else [wal_identity])
+        now_ns = time.time_ns()
         proofs = {}
         for agent in sorted(agents):
             proof = _read_event_proof(agent)
@@ -513,9 +547,14 @@ def _event_filter_authority(
                     or proof["inventory_hash"] != root_a
                     or proof["inventory_hash_b"] != root_b):
                 return None
+            # A same-size rewrite in the seal's timestamp tick keeps the sealed identity (Linux ctime is
+            # coarse), so a proof written within that racy window cannot vouch for rows it never reads.
+            if any(fileops.racy_identity(
+                    (0, 0, 0, seal["modified_ns"], seal["changed_ns"]),
+                    proof["file_identity"][3], now_ns) for seal in sealed):
+                return None
             proofs[agent] = proof
         return {
-            "store_stamp": store_stamp,
             "generation_stamp": generation_stamp,
             "generation_value": generation_value,
             "proofs": proofs,
@@ -526,9 +565,10 @@ def _event_filter_authority(
 
 def _event_filter_authority_stable(
         authority: dict, connection, store: Path, marker: Path) -> bool:
+    # source_stable compares the store family the open recorded (minus a direct
+    # open's rollback journal), which is the family the authority was read under.
     try:
         if (not connection.source_stable()
-                or _event_store_stamp(store) != authority["store_stamp"]
                 or _event_file_stamp(marker) != authority["generation_stamp"]
                 or _read_regular_bytes(marker) != authority["generation_value"]):
             return False
@@ -559,8 +599,41 @@ def _request_event_repair() -> None:
         pass
 
 
+def _request_interrupted_pass_repair(store: Path) -> None:
+    """A blocked read caused by a killed pass's hot journal asks, once per journal, for the pass
+    that rolls it back, whether or not the scheduler accepts."""
+    global _INTERRUPTED_REPAIR_ATTEMPT
+    callback = _EVENT_REPAIR_CALLBACK
+    if callback is None:
+        return
+    key, now = str(store), time.monotonic()
+    last = _INTERRUPTED_REPAIR_ATTEMPT
+    if last is not None and last[0] == key and now - last[1] < _INTERRUPTED_REPAIR_INTERVAL_S:
+        return
+    if store != DATA_DIR / "events" / EVENT_STORE_NAME or data_dir_readonly(DATA_DIR):
+        return
+    try:
+        info = Path(f"{store}-journal").lstat()
+    except OSError:
+        return
+    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    if last is not None and last[0] == key and last[2] == identity:
+        _INTERRUPTED_REPAIR_ATTEMPT = (key, now, identity)
+        return
+    import index_lock
+    journal = index_lock.rollback_journal_state(store)
+    kick = journal["state"] == "interrupted-pass" and journal["hot"]
+    _INTERRUPTED_REPAIR_ATTEMPT = (key, now, identity if kick else None)
+    if kick:
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 -- repair scheduling cannot fail a reader
+            pass
+
+
 def _open_verified_event_store(
-        store: Path, expected_stamp: tuple, timeout_s: float = 1.0,
+        store: Path, expected_stamp: tuple, timeout_s: float = 1.0, *,
+        shared: bool = False, writer_free: bool = False,
 ):
     try:
         expected = dict(expected_stamp)
@@ -576,10 +649,6 @@ def _open_verified_event_store(
     except (TypeError, ValueError):
         expected = {}
         structured_stamp = False
-    journal = expected.get("-journal")
-    if structured_stamp and journal is not None and journal[2] != 0:
-        raise OSError("event store has a live rollback journal")
-
     # A checkpointed DELETE publication needs no WAL shared-memory sidecar and
     # stays direct. Copy every other publication to a system-temp main+WAL
     # snapshot; never hardlink or create aliases beside the canonical store.
@@ -596,6 +665,12 @@ def _open_verified_event_store(
             and (wal is None or wal[2] == 0)
         )
     )
+    journal = expected.get("-journal")
+    # writer_free callers (audit) report a store being written as live, never read past it.
+    if (not direct or writer_free) and journal is not None and journal[2] != 0:
+        raise OSError(f"{store.name} has a live rollback journal")
+    ignores_journal = direct and not writer_free
+    identity = _event_store_identity(expected_stamp, ignores_journal)
     cleanup = None
     alias = store
     if not direct:
@@ -606,16 +681,17 @@ def _open_verified_event_store(
         alias = Path(cleanup.name) / store.name
         try:
             for suffix in ("", "-wal"):
-                identity = expected.get(suffix)
-                if identity is None or (suffix and identity[2] == 0):
+                member = expected.get(suffix)
+                if member is None or (suffix and member[2] == 0):
                     continue
                 source_path = Path(f"{store}{suffix}")
                 target_path = Path(f"{alias}{suffix}")
                 with open_regular_binary(source_path) as source, \
                         target_path.open("xb") as target:
                     shutil.copyfileobj(source, target, length=1024 * 1024)
-            if _event_store_stamp(store) != expected_stamp:
-                raise OSError("event store changed while snapshotting")
+            if _event_store_identity(
+                    _event_store_stamp(store), ignores_journal) != identity:
+                raise _EventPathMoved("event store changed while snapshotting")
         except BaseException:
             cleanup.cleanup()
             raise
@@ -624,11 +700,13 @@ def _open_verified_event_store(
     try:
         connection = sqlite3.connect(
             f"{alias.absolute().as_uri()}?mode=ro", uri=True,
-            timeout=max(0.0, timeout_s), factory=_EventSnapshotConnection)
-        if _event_store_stamp(store) != expected_stamp:
-            raise OSError("event store changed while opening")
+            timeout=max(0.0, timeout_s), factory=_EventSnapshotConnection,
+            check_same_thread=not shared)
+        if _event_store_identity(_event_store_stamp(store), ignores_journal) != identity:
+            raise _EventPathMoved("event store changed while opening")
         connection._snapshot_source = store
-        connection._snapshot_stamp = expected_stamp
+        connection._snapshot_stamp = identity
+        connection._snapshot_direct = ignores_journal
         if cleanup is not None:
             connection._snapshot_cleanup = cleanup
         return connection
@@ -643,31 +721,148 @@ def _open_verified_event_store(
 def open_sqlite_snapshot(
         path: Path, timeout_s: float = 0,
 ) -> sqlite3.Connection:
-    """Open any SQLite family without creating a sidecar beside its source."""
+    """Open any SQLite family without creating a sidecar beside its source; a non-empty
+    rollback journal (a writer mid-transaction) refuses the open."""
     path = Path(path)
     stamp = _event_store_stamp(path)
-    return _open_verified_event_store(path, stamp, timeout_s)
+    return _open_verified_event_store(path, stamp, timeout_s, writer_free=True)
+
+
+# A long-lived process (the explorer server, the daemon) must not hold the live store
+# open once idle: on Windows an open handle blocks the corrupt-store rebuild's rename.
+_EVENT_READER_IDLE_S = 2.0
+# Every thread's cached reader, so a reaper can close idle ones (even of exited threads).
+_EVENT_READERS: dict[int, dict] = {}
+_EVENT_READERS_LOCK = threading.Lock()
+_EVENT_READER_REAPER: threading.Thread | None = None
+# Held across each reader close; a fork waits on it so no child inherits SQLite mid-close.
+_EVENT_READER_CLOSE_LOCK = threading.Lock()
+# A forked child's copies of the parent's readers: kept referenced and never used or closed.
+_EVENT_READERS_INHERITED: list[dict] = []
+
+
+def _retire_event_reader(state: dict) -> None:
+    """Close one cached reader; the caller holds its lock."""
+    if state.get("closed"):
+        return
+    with _EVENT_READER_CLOSE_LOCK:
+        try:
+            state["connection"].close()
+        except Exception:  # noqa: BLE001 -- cleanup must tolerate a broken SQLite handle
+            pass
+        state["closed"] = True
+    with _EVENT_READERS_LOCK:
+        _EVENT_READERS.pop(id(state), None)
+
+
+def _event_readers_after_fork_child() -> None:
+    """Start the child with no reader, reaper or lock a parent thread may have held."""
+    global _EVENT_READERS, _EVENT_READERS_LOCK, _EVENT_READER_REAPER, _EVENT_READER_CLOSE_LOCK
+    inherited = list(_EVENT_READERS.values())
+    local_state = getattr(_EVENT_READER_LOCAL, "state", None)
+    if local_state is not None:
+        inherited.append(local_state)
+    for state in inherited:
+        state["lock"] = threading.RLock()
+        state["closed"] = True
+    _EVENT_READERS_INHERITED.extend(inherited)
+    _EVENT_READERS = {}
+    _EVENT_READERS_LOCK = threading.Lock()
+    _EVENT_READER_REAPER = None
+    # Only the forking thread survives into the child, and its cached reader is the parent's.
+    _EVENT_READER_LOCAL.state = None
+    _EVENT_READER_CLOSE_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only
+    os.register_at_fork(
+        before=lambda: _EVENT_READER_CLOSE_LOCK.acquire(),
+        after_in_parent=lambda: _EVENT_READER_CLOSE_LOCK.release(),
+        after_in_child=_event_readers_after_fork_child)
+
+
+def _reap_idle_event_readers() -> None:
+    global _EVENT_READER_REAPER
+    while True:
+        with _EVENT_READERS_LOCK:
+            if not _EVENT_READERS:
+                _EVENT_READER_REAPER = None
+                return
+            states = list(_EVENT_READERS.values())
+        wait = _EVENT_READER_IDLE_S
+        for state in states:
+            remaining = _EVENT_READER_IDLE_S - (time.monotonic() - state["used_at"])
+            if remaining > 0:
+                wait = min(wait, remaining)
+            elif state["lock"].acquire(blocking=False):
+                try:
+                    if time.monotonic() - state["used_at"] >= _EVENT_READER_IDLE_S:
+                        _retire_event_reader(state)
+                finally:
+                    state["lock"].release()
+            else:
+                wait = min(wait, 0.1)
+        time.sleep(max(wait, 0.05))
+
+
+def _register_event_reader(state: dict) -> None:
+    global _EVENT_READER_REAPER
+    with _EVENT_READERS_LOCK:
+        _EVENT_READERS[id(state)] = state
+        if _EVENT_READER_REAPER is not None and _EVENT_READER_REAPER.is_alive():
+            return
+        reaper = threading.Thread(
+            target=_reap_idle_event_readers, name="agrep-event-reader-idle", daemon=True)
+        try:
+            reaper.start()
+        except RuntimeError:  # interpreter shutdown; the next lookup still expires it
+            return
+        _EVENT_READER_REAPER = reaper
 
 
 def _event_reader_connection(store: Path):
-    import sqlite3
-
+    """This thread's cached reader of ``store``, returned with its lock held so the
+    idle reaper cannot close it mid-lookup; pass it to ``_release_event_reader``."""
     store_stamp = _event_store_stamp(store)
     state = getattr(_EVENT_READER_LOCAL, "state", None)
     key = str(store.absolute())
-    if (state is not None and state.get("store") == key
-            and state.get("store_stamp") == store_stamp):
-        return state
+    now = time.monotonic()
     if state is not None:
+        state["lock"].acquire()
+        cached = state["connection"]
+        if (not state.get("closed") and state.get("store") == key
+                and now - state["used_at"] <= _EVENT_READER_IDLE_S
+                and _event_store_identity(store_stamp, cached._snapshot_direct)
+                == cached._snapshot_stamp):
+            state["used_at"] = now
+            return state
         try:
-            state["connection"].close()
-        except sqlite3.Error:
-            pass
+            _retire_event_reader(state)
+        finally:
+            state["lock"].release()
         _EVENT_READER_LOCAL.state = None
-    connection = _open_verified_event_store(store, store_stamp)
-    state = {"store": key, "store_stamp": store_stamp, "connection": connection}
+    # A commit rewrites the main file for tens of milliseconds (about 70 ms for a 25 MB
+    # payload); an open it moves under waits it out like a busy lock, about 1 s at most.
+    for delay in (0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.37, None):
+        try:
+            connection = _open_verified_event_store(store, store_stamp, shared=True)
+            break
+        except _EventPathMoved:
+            if delay is None:
+                raise
+            time.sleep(delay)
+            store_stamp = _event_store_stamp(store)
+    state = {"store": key, "connection": connection, "used_at": now,
+             "lock": threading.RLock()}
+    state["lock"].acquire()
     _EVENT_READER_LOCAL.state = state
+    _register_event_reader(state)
     return state
+
+
+def _release_event_reader(state: dict) -> None:
+    state["used_at"] = time.monotonic()
+    state["lock"].release()
 
 
 _EVENT_LEGACY = 0
@@ -685,8 +880,28 @@ def _event_legacy_allowed(directory: Path) -> bool:
     return False
 
 
-def _event_store_lookup(agent: str, session: str) -> tuple[int, bytes | None]:
+# The writer publishes the marker after its commit and settle (about 10 ms); a reader that
+# sees the new database generation first waits for it rather than reporting unavailable.
+_EVENT_MARKER_WAITS = (0.001, 0.004, 0.01, 0.025, 0.05, 0.1)
+# A marker still behind after a whole wait stays behind until the next pass (its writer
+# died between commit and marker): lookups against that same store and marker fail fast.
+_EVENT_MARKER_STALLED: tuple | None = None
+
+
+def _event_marker_stall(state: dict, marker_stamp: tuple) -> tuple:
+    return state["store"], state["connection"]._snapshot_stamp, marker_stamp
+
+
+def _event_store_lookup(name: str) -> tuple[int, bytes | None]:
     """Return migration/current/blocked status and one generation-stable DB row."""
+    status, payload = _event_store_row(name)
+    if status == _EVENT_BLOCKED:
+        _request_interrupted_pass_repair(EVENTS_DIR / EVENT_STORE_NAME)
+    return status, payload
+
+
+def _event_store_row(name: str) -> tuple[int, bytes | None]:
+    global _EVENT_MARKER_STALLED
     import sqlite3
 
     store = EVENTS_DIR / EVENT_STORE_NAME
@@ -699,24 +914,22 @@ def _event_store_lookup(agent: str, session: str) -> tuple[int, bytes | None]:
     except (OSError, sqlite3.Error, ValueError):
         return _EVENT_BLOCKED, None
     try:
-        for attempt in range(3):
+        for delay in (*_EVENT_MARKER_WAITS, None):
             stamp, expected = _event_generation_snapshot(state, marker)
             row = state["connection"].execute(
                 "SELECT m.value, s.digest, s.payload FROM event_meta AS m "
                 "LEFT JOIN event_sessions AS s "
                 "ON s.name=? "
                 "WHERE m.key='generation'",
-                (event_filename(agent, session),),
+                (name,),
             ).fetchone()
-            if _event_file_stamp(marker) != stamp:
-                state.pop("generation_stamp", None)
-                continue
-            if row is None:
+            moved = _event_file_stamp(marker) != stamp
+            if not moved and row is None:
                 seeded = state["connection"].execute(
                     "SELECT 1 FROM event_meta WHERE key='manifest'").fetchone()
                 legacy = seeded is None and _event_legacy_allowed(EVENTS_DIR)
                 return (_EVENT_LEGACY if legacy else _EVENT_BLOCKED), None
-            if bytes(row[0]) == expected:
+            if not moved and bytes(row[0]) == expected:
                 payload = None if row[2] is None else bytes(row[2])
                 if payload is not None:
                     try:
@@ -727,8 +940,12 @@ def _event_store_lookup(agent: str, session: str) -> tuple[int, bytes | None]:
                         return _EVENT_BLOCKED, None
                 return _EVENT_CURRENT, payload
             state.pop("generation_stamp", None)
-            if attempt < 2:
-                time.sleep(0.001)
+            stall = _event_marker_stall(state, stamp)
+            if not moved and stall == _EVENT_MARKER_STALLED:
+                return _EVENT_BLOCKED, None
+            if delay is not None:
+                time.sleep(delay)
+        _EVENT_MARKER_STALLED = stall
         _close_event_reader()
         return _EVENT_BLOCKED, None
     except sqlite3.OperationalError as error:
@@ -753,21 +970,35 @@ def _event_store_lookup(agent: str, session: str) -> tuple[int, bytes | None]:
         _close_event_reader()
         return _EVENT_BLOCKED, None
     except (sqlite3.Error, TypeError, ValueError):
-        state = getattr(_EVENT_READER_LOCAL, "state", None)
-        if state is not None and state.get("store") == str(store.absolute()):
+        cached = getattr(_EVENT_READER_LOCAL, "state", None)
+        if cached is not None and cached.get("store") == str(store.absolute()):
             _close_event_reader()
         return _EVENT_BLOCKED, None
+    finally:
+        _release_event_reader(state)
 
 
-def event_store_blob(agent: str, session: str) -> tuple[bool, bytes | None]:
-    """Read one DB row, distinguishing a current empty store from migration fallback."""
-    status, payload = _event_store_lookup(agent, session)
-    return status != _EVENT_LEGACY, payload if status == _EVENT_CURRENT else None
+EVENTS_PRESENT = "present"
+EVENTS_ABSENT = "absent"
+EVENTS_UNAVAILABLE = "unavailable"
+# Not yet migrated to the store: read the legacy per-session JSONL instead.
+EVENTS_LEGACY = "legacy"
+
+
+def event_store_blob(agent: str, session: str) -> tuple[str, bytes | None]:
+    """Read one generation-pinned, digest-verified DB row: present with its payload,
+    absent, unavailable (blocked, torn or unverifiable; never an empty set), or legacy."""
+    status, payload = _event_store_lookup(event_filename(agent, session))
+    if status == _EVENT_LEGACY:
+        return EVENTS_LEGACY, None
+    if status == _EVENT_BLOCKED:
+        return EVENTS_UNAVAILABLE, None
+    return (EVENTS_ABSENT, None) if payload is None else (EVENTS_PRESENT, payload)
 
 
 def event_blob(agent: str, session: str) -> bytes | None:
     """Read a session event blob from SQLite, then pre-migration JSONL if needed."""
-    status, payload = _event_store_lookup(agent, session)
+    status, payload = _event_store_lookup(event_filename(agent, session))
     if status == _EVENT_CURRENT:
         return payload
     if status == _EVENT_BLOCKED:
@@ -780,61 +1011,11 @@ def event_blob(agent: str, session: str) -> bytes | None:
     return None
 
 
-def event_exists(agent: str, session: str) -> bool:
-    """Check one event identity without loading its session BLOB or the global name set."""
-    import sqlite3
-
-    store = EVENTS_DIR / EVENT_STORE_NAME
-    marker = EVENTS_DIR / EVENT_GENERATION_NAME
-    try:
-        state = _event_reader_connection(store)
-    except FileNotFoundError:
-        if not _event_legacy_allowed(EVENTS_DIR):
-            return False
-        state = None
-    except (OSError, sqlite3.Error, ValueError):
-        return False
-    if state is not None:
-        try:
-            for attempt in range(3):
-                stamp, expected = _event_generation_snapshot(state, marker)
-                row = state["connection"].execute(
-                    "SELECT m.value, EXISTS(SELECT 1 FROM event_sessions WHERE name=?1) "
-                    "FROM event_meta AS m WHERE m.key='generation'",
-                    (event_filename(agent, session),),
-                ).fetchone()
-                if _event_file_stamp(marker) != stamp:
-                    state.pop("generation_stamp", None)
-                    continue
-                if row is not None and bytes(row[0]) == expected:
-                    return bool(row[1])
-                if row is None:
-                    seeded = state["connection"].execute(
-                        "SELECT 1 FROM event_meta WHERE key='manifest'").fetchone()
-                    if seeded is None:
-                        state = None
-                        break
-                    return False
-                state.pop("generation_stamp", None)
-                if attempt < 2:
-                    time.sleep(0.001)
-            return False
-        except (OSError, sqlite3.Error, TypeError, ValueError):
-            try:
-                seeded = state["connection"].execute(
-                    "SELECT 1 FROM event_meta WHERE key='manifest'").fetchone()
-            except sqlite3.Error:
-                seeded = (1,)
-            if seeded is not None:
-                return False
-    if not _event_legacy_allowed(EVENTS_DIR):
-        return False
-    for path in event_path_candidates(agent, session):
-        try:
-            return _event_is_regular(path.lstat())
-        except OSError:
-            continue
-    return False
+def event_store_readable() -> bool:
+    """Whether published tool events can be read right now: a busy, torn or unverifiable
+    store cannot; a missing or pre-migration one reads through its legacy files."""
+    # No row is named "": the lookup reads only the generation and its marker.
+    return _event_store_lookup("")[0] != _EVENT_BLOCKED
 
 
 def event_names(events_dir: Path | None = None) -> set[str]:
@@ -1155,7 +1336,6 @@ def event_blobs_bulk(
                     authority, connection, store, marker):
                 raise RuntimeError("event proof changed during bulk read")
         elif (not connection.source_stable()
-              or _event_store_stamp(store) != store_stamp
               or _event_file_stamp(marker) != stamp):
             raise RuntimeError("event generation changed during bulk read")
         if pending is not None:

@@ -31,10 +31,14 @@ pub struct Message {
     /// "unknown", "control", "synthetic", "recap", "harness", "explicit_harness",
     /// or "ambiguous_session".
     pub model_source: Arc<str>,
-    /// The agent's reply to this turn, trimmed for display. Empty if none was captured.
+    /// The agent's reply to this turn, trimmed for display: its text blocks joined with one
+    /// space and cut at `ingest::REPLY_CAP` characters (`…` appended when a block was cut), the
+    /// exact text every release has hashed for reply handles. Empty if none was captured.
     pub reply: Arc<str>,
     /// Original normalized reply length before the ingest safety cap.
     pub reply_chars: usize,
+    /// Where `reply`'s blocks join and, past the cap, how it ended; see [`ReplyShape`].
+    pub reply_shape: Arc<ReplyShape>,
     /// True when this turn lives in a SIDE session (subagent/Task/fork child). The
     /// normalizer turns it into `who="subagent"`; adapters set it when the store
     /// proves provenance.
@@ -57,6 +61,7 @@ pub struct RawMessage {
     pub model: String,
     pub reply: String,
     pub reply_chars: usize,
+    pub reply_shape: ReplyShape,
     pub side: bool,
     pub parent: String,
 }
@@ -84,11 +89,58 @@ impl RawMessage {
             model: self.model.into(),
             reply: self.reply.into(),
             reply_chars,
+            reply_shape: Arc::new(self.reply_shape),
             side: self.side,
             parent: self.parent.into(),
         }
     }
 }
+
+/// The block structure of a reply, kept beside its text so the text stays the one 0.4.2
+/// published. Offsets count Unicode scalar values (Rust `char`s, Python `str` indices).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplyShape {
+    /// Characters held in `reply` (its cap marker included once cut).
+    pub head_chars: u32,
+    /// Offset in `reply` of each space that joins a block to the one before it; the later block
+    /// starts one past it. Empty for a single block.
+    pub breaks: Vec<u32>,
+    /// Per join (each break, then a tail block past the cap that made no break): 1 when the
+    /// agent made a work tool call between the two blocks, 0 when none, 2 when the adapter
+    /// does not record block/tool order (`WORKED_*`).
+    pub worked: Vec<u8>,
+    /// How many joins the reply made; `worked` fills up to it.
+    pub joins: u32,
+    /// The join before the first block: work between the row's start (its prompt, or for a
+    /// compaction recap the previous row's last block) and that block (`WORKED_*`).
+    pub lead: u8,
+    /// Past the cap, the latest block's last `ingest::REPLY_TAIL_CAP` characters; empty while
+    /// the reply is whole.
+    pub end: String,
+    /// `end` holds only the tail of that block (it ran past `REPLY_TAIL_CAP`).
+    pub end_cut: bool,
+}
+
+/// A shape no adapter has described yet (a row restored from an older cache): its lead join is
+/// unknown, not "no work".
+impl Default for ReplyShape {
+    fn default() -> Self {
+        Self {
+            head_chars: 0,
+            breaks: Vec::new(),
+            worked: Vec::new(),
+            joins: 0,
+            lead: WORKED_UNKNOWN,
+            end: String::new(),
+            end_cut: false,
+        }
+    }
+}
+
+/// `ReplyShape::worked` values.
+pub const WORKED_NO: u8 = 0;
+pub const WORKED_YES: u8 = 1;
+pub const WORKED_UNKNOWN: u8 = 2;
 
 /// One tool call or subagent step inside a session. Written to per-session files under
 /// `data/events/`, separate from the canonical message stream. Inputs/outputs are capped
@@ -124,6 +176,10 @@ pub struct Event {
     pub child_session: String,
     /// Facts the store recorded for this call beside its display text, as space-separated
     /// `key=value` tokens (Claude: an agent call's `name`/`status`, a message's `to`/`handback`,
-    /// and when either `returned`). Never capped; empty when the store recorded none.
+    /// and when either `returned`; any adapter: `after_reply=1` for a call no reply text of
+    /// its turn followed). Never capped; empty when the store recorded none.
     pub meta: String,
+    /// The task-list facts a todo/plan/task call carried, as compact JSON kept whole past the
+    /// display cap (`ingest::task_state`, `ingest::task_listing`); empty for every other call.
+    pub state: String,
 }

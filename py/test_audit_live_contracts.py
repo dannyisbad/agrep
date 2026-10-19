@@ -111,19 +111,32 @@ class AuditFailClosedTests(unittest.TestCase):
                 book_path.write_text("{", encoding="utf-8")
                 return set()
 
-            stdout = io.StringIO()
-            with mock.patch.object(audit, "BOOK_PATH", book_path), \
-                    mock.patch.object(
-                        audit, "_discovered",
-                        return_value=[("codex", str(source))]), \
-                    mock.patch.object(audit, "_live_tokens", return_value={}), \
-                    mock.patch.object(
-                        audit, "_indexed_agents", side_effect=replace_book), \
-                    redirect_stdout(stdout):
-                rc = audit.main(["--strict", "--json"])
-        payload = json.loads(stdout.getvalue())
-        self.assertEqual(rc, 2)
-        self.assertTrue(any("evidence book" in row for row in payload["problems"]))
+            results = {}
+            for argv in (["--strict", "--json"], ["--json"]):
+                stdout = io.StringIO()
+                book_path.write_text(json.dumps({
+                    "version": audit.BOOK_VERSION, "files": book,
+                }), encoding="utf-8")
+                with mock.patch.object(audit, "BOOK_PATH", book_path), \
+                        mock.patch.object(
+                            audit, "_discovered",
+                            return_value=[("codex", str(source))]), \
+                        mock.patch.object(audit, "_live_tokens", return_value={}), \
+                        mock.patch.object(
+                            audit, "_indexed_agents", side_effect=replace_book), \
+                        redirect_stdout(stdout):
+                    rc = audit.main(argv)
+                results[tuple(argv)] = (rc, json.loads(stdout.getvalue()))
+        strict_rc, strict_payload = results[("--strict", "--json")]
+        plain_rc, plain_payload = results[("--json",)]
+        for payload in (strict_payload, plain_payload):
+            self.assertEqual(payload["problems"], [])
+            self.assertTrue(any(
+                "evidence book was republished" in row
+                for row in payload["live_details"]))
+            self.assertNotEqual(payload["status"], "clean")
+        self.assertEqual(strict_rc, 2)
+        self.assertEqual(plain_rc, 1)
 
     def test_book_replacement_during_raw_census_cannot_certify_clean(self):
         with tempfile.TemporaryDirectory() as td:
@@ -143,6 +156,7 @@ class AuditFailClosedTests(unittest.TestCase):
 
             stdout = io.StringIO()
             with mock.patch.object(audit, "BOOK_PATH", book_path), \
+                    mock.patch.object(audit, "_LIVE_SETTLE_S", 0.0), \
                     mock.patch.object(
                         audit, "_discovered",
                         return_value=[("codex", str(source))]), \
@@ -154,8 +168,9 @@ class AuditFailClosedTests(unittest.TestCase):
                     redirect_stdout(stdout):
                 rc = audit.main(["--strict", "--json", "--full"])
         payload = json.loads(stdout.getvalue())
+        # Round one sees the book move; the settle round re-reads it and finds it corrupt.
         self.assertEqual(rc, 2)
-        self.assertTrue(any("evidence book" in row for row in payload["problems"]))
+        self.assertTrue(any("is corrupt" in row for row in payload["problems"]))
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO contract is POSIX-only")
     def test_special_or_oversized_evidence_book_is_bounded(self):
@@ -552,6 +567,61 @@ class LiveIntegrityTests(unittest.TestCase):
             [], snapshot["now"], True, "all", 120, 30, False,
             last_err="claude tick failed")
         self.assertIn("live watcher: claude tick failed", plain)
+
+    def test_long_store_path_never_hides_the_degradation_cause(self):
+        # macOS homes under Library/Application Support and deep data dirs
+        # pushed the error off the right edge; the path is what gets elided,
+        # by cells, and the recorded cause no longer repeats the path.
+        short = livetui._unreadable_store_notice("claude", "/tmp/c", "denied", 120)
+        self.assertEqual(short, "! unreadable claude store: /tmp/c: denied")
+        if os.name == "nt" or os.geteuid() == 0:
+            self.skipTest("chmod 000 does not deny the owner here")
+        with tempfile.TemporaryDirectory() as td:
+            shapes = {
+                "ascii": "Library/Application Support/" + "x" * 150 + "/claude",
+                "cjk": "Library/Application Support/"
+                       + "/".join("日本語の長い経路" * 4 for _ in range(6))
+                       + "/claude",
+                "emoji": "Library/Application Support/"
+                        + "/".join("📁🚀" * 3 for _ in range(20))
+                        + "/claude",
+            }
+            stores = []
+            for label, shape in shapes.items():
+                store = Path(td) / label / shape
+                store.mkdir(parents=True)
+                store.chmod(0)
+                stores.append((label, store))
+            try:
+                for label, store in stores:
+                    self._assert_cause_survives_width(label, store)
+            finally:
+                for _label, store in stores:
+                    store.chmod(0o700)
+
+    def _assert_cause_survives_width(self, label: str, store: Path) -> None:
+        watcher = LiveWatcher()
+        self.assertEqual(
+            watcher._refresh_source_health("claude", [str(store)]), {})
+        snapshot = watcher.snapshot()
+        degraded = snapshot["degraded_sources"]
+        self.assertEqual(degraded[0]["path"], str(store))
+        self.assertEqual(degraded[0]["error"], "Permission denied")
+        self.assertIn("Permission denied", snapshot["last_err"])
+        for width in (60, 80, 120):
+            frame = livetui._frame(
+                [], snapshot["now"], True, "all", width, 30, False,
+                last_err=snapshot["last_err"],
+                degraded_sources=degraded + [
+                    {"agent": "codex", "path": "/x", "error": "gone"}])
+            notice = next(
+                line for line in frame.splitlines()
+                if line.startswith("! unreadable claude store: "))
+            self.assertLessEqual(livetui._cells(notice), width, (label, width))
+            self.assertTrue(
+                notice.endswith(": Permission denied (+1 more)"),
+                (label, width, notice))
+            self.assertIn("…", notice)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO contract is POSIX-only")
     def test_source_health_rejects_links_and_special_files_without_blocking(self):

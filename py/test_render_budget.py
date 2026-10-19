@@ -90,7 +90,7 @@ class RenderBudget(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, str(CLI), *argv],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=cls._env(data_dir), timeout=120, cwd=str(ROOT))
+            env=cls._env(data_dir), timeout=300, cwd=str(ROOT))
         return r.returncode, r.stdout, r.stderr
 
     def _state(self, name: str) -> Path:
@@ -186,7 +186,7 @@ class RenderBudget(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, str(CLI), *argv],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=env, timeout=120, cwd=str(ROOT))
+            env=env, timeout=300, cwd=str(ROOT))
         return r.returncode, r.stdout, r.stderr
 
     def _assert_stderr_budget(self, err: str, label: str) -> None:

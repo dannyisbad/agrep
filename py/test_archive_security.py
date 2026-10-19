@@ -18,7 +18,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
-
+import types
 from _test_support import isolate_data_dir, without_store_override
 
 isolate_data_dir()
@@ -68,6 +68,10 @@ class ArchiveSecurityTest(unittest.TestCase):
     def _lock_path(self) -> Path:
         archive.ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
         return archive.ARCHIVE_DIR / "lock"
+
+    def _out(self, output: Path, source: Path) -> Path:
+        """Where `--to output` puts `source`: its store-relative layout is kept."""
+        return output / source.relative_to(self.home)
 
     def _lock_tombs(self) -> list[Path]:
         return list(archive.ARCHIVE_DIR.glob(".lock.owner-reap-*"))
@@ -148,7 +152,7 @@ class ArchiveSecurityTest(unittest.TestCase):
         source.unlink()
         output = self.base / "out"
         self.assertEqual(self._restore("archive-safe", to=str(output)), 1)
-        self.assertFalse((output / source.name).exists())
+        self.assertFalse(self._out(output, source).exists())
         outside = self.base / "packed.xz"
         outside.write_bytes(chunk.read_bytes())
         chunk.unlink()
@@ -157,7 +161,7 @@ class ArchiveSecurityTest(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"symlinks unavailable: {exc}")
         self.assertEqual(self._restore("archive-safe", to=str(output)), 1)
-        self.assertFalse((output / source.name).exists())
+        self.assertFalse(self._out(output, source).exists())
 
     def test_append_capture_and_atomic_restore_round_trip(self) -> None:
         source, first = self._capture_codex()
@@ -166,7 +170,7 @@ class ArchiveSecurityTest(unittest.TestCase):
         self.assertEqual(archive.capture()["appended"], 1)
         output = self.base / "out"
         self.assertEqual(self._restore("archive-safe", to=str(output)), 0)
-        self.assertEqual((output / source.name).read_bytes(), second)
+        self.assertEqual(self._out(output, source).read_bytes(), second)
 
     def _capture_same_basename_pair(self) -> tuple[Path, Path]:
         archive.ROOTS = [("codex", ".codex/sessions/*.jsonl", False),
@@ -180,27 +184,35 @@ class ArchiveSecurityTest(unittest.TestCase):
         self.assertEqual(archive.capture()["full"], 2)
         return first, second
 
-    def test_restore_to_refuses_colliding_basenames_before_writing(self) -> None:
-        first, second = self._capture_same_basename_pair()
+    def test_restore_to_refuses_colliding_destinations_before_writing(self) -> None:
+        # a manifest migrated across machines can hold two records that land on
+        # one restored path: the posix original and its Windows twin
+        source, _ = self._capture_codex()
+        record = archive._records()[0]
+        twin = copy.deepcopy(record)
+        twin["path"] = r"C:\Users\Example\.codex\sessions\rollout-archive-safe.jsonl"
+        archive.MANIFEST.write_text(
+            json.dumps(record) + "\n" + json.dumps(twin) + "\n", encoding="utf-8")
+        source.unlink()
         output = self.base / "out"
-        for force in (True, False):
+        for to, force in ((str(output), True), (str(output), False)):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
-                rc = archive.restore(
-                    "context.jsonl", to=str(output), force=force)
+                rc = archive.restore("archive-safe", to=to, force=force)
             self.assertEqual(rc, 1)
             self.assertFalse(output.exists(), "collision must precede writes")
-            for path in (first, second):
-                self.assertIn(str(path), stdout.getvalue())
+            for path in (record["path"], twin["path"]):
+                self.assertIn(path, stdout.getvalue())
             self.assertIn("would both restore", stdout.getvalue())
+        self.assertEqual(self._restore("archive-safe"), 1)
+        self.assertFalse(source.exists(), "an ambiguous in-place match writes nothing")
 
-    def test_narrowed_needle_still_restores_one_of_the_twins(self) -> None:
+    def test_to_keeps_same_basename_twins_apart(self) -> None:
         first, second = self._capture_same_basename_pair()
         output = self.base / "out"
-        self.assertEqual(
-            self._restore("spare/context.jsonl", to=str(output)), 0)
-        self.assertEqual((output / "context.jsonl").read_bytes(),
-                         second.read_bytes())
+        self.assertEqual(self._restore("context.jsonl", to=str(output)), 0)
+        self.assertEqual(self._out(output, first).read_bytes(), first.read_bytes())
+        self.assertEqual(self._out(output, second).read_bytes(), second.read_bytes())
         self.assertNotEqual(second.read_bytes(), first.read_bytes())
 
     def test_restore_path_needles_are_separator_portable(self) -> None:
@@ -238,7 +250,7 @@ class ArchiveSecurityTest(unittest.TestCase):
         source.unlink()
         output = self.base / "out"
         self.assertEqual(self._restore("archive-safe", to=str(output)), 0)
-        self.assertEqual((output / source.name).read_bytes(), second)
+        self.assertEqual(self._out(output, source).read_bytes(), second)
 
     def test_manifest_append_fsyncs_successful_record(self) -> None:
         self._capture_codex()
@@ -260,7 +272,7 @@ class ArchiveSecurityTest(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         self.assertIn("cannot prove the requested archive version", stdout.getvalue())
-        self.assertFalse((output / source.name).exists())
+        self.assertFalse(self._out(output, source).exists())
 
     def test_restore_refuses_newer_unrecognized_version(self) -> None:
         source, first = self._capture_codex()
@@ -280,7 +292,7 @@ class ArchiveSecurityTest(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         self.assertIn("cannot prove the requested archive version", stdout.getvalue())
-        self.assertFalse((output / source.name).exists())
+        self.assertFalse(self._out(output, source).exists())
 
     def test_restore_refuses_when_only_matching_record_has_future_schema(self) -> None:
         source, _ = self._capture_codex()
@@ -517,6 +529,31 @@ class ArchiveSecurityTest(unittest.TestCase):
             archive._unlock(owner)
             self.assertFalse(lock.exists())
             self.assertEqual(self._lock_tombs(), [])
+
+    def test_a_pass_reclaims_its_own_stranded_lock(self) -> None:
+        lock = self._lock_path()
+        # a release honours a mutex an earlier reap minted; one held past every attempt
+        # leaves the record naming this live process, which only this process may reclaim
+        (lock.parent / archive.ownerfile.SLOT_MUTEX_NAME).touch()
+        with mock.patch.object(
+                archive.common, "process_start_identity", return_value="birth"):
+            owner = archive._try_lock()
+            self.assertIsNotNone(owner)
+            stranded = owner.snapshot
+            with mock.patch.object(
+                    archive.ownerfile, "_lock_descriptor", return_value="busy"), \
+                    mock.patch.object(archive.ownerfile, "_SLOT_MUTEX_WAIT_S", 0.01):
+                archive._unlock(owner)
+            self.assertEqual(lock.read_bytes(), stranded.raw)
+            with mock.patch.object(
+                    archive.ownerfile, "_HELD_TOKENS", {owner.token}):
+                self.assertIsNone(archive._try_lock())
+            again = archive._try_lock()
+            self.assertIsNotNone(again)
+            self.assertNotEqual(again.snapshot.raw, stranded.raw)
+            archive._unlock(again)
+        self.assertFalse(lock.exists())
+        self.assertEqual(self._lock_tombs(), [])
 
     def test_pidless_and_malformed_lock_use_exact_three_second_grace(self) -> None:
         lock = self._lock_path()
@@ -881,7 +918,7 @@ time.sleep(30)
                 self.fail_backup = fail_backup
                 self.closed = False
 
-            def backup(self, _destination) -> None:
+            def backup(self, _destination, **_kwargs) -> None:
                 if self.fail_backup:
                     raise RuntimeError("backup failed")
 
@@ -1144,15 +1181,18 @@ time.sleep(30)
         self.assertEqual(result["files"], 0)
         self.assertEqual(result["failed"], 0)
 
-    def test_indexer_reports_archive_failures_without_content_changes(self) -> None:
+    def test_indexer_spawns_the_capture_child_and_logs_its_exit_code(self) -> None:
         import indexer
-        stats = {"appended": 0, "full": 0, "bytes_stored": 0, "failed": 2}
-        with mock.patch.object(archive, "enabled", return_value=True), \
-                mock.patch.object(archive, "capture", return_value=stats), \
+        owner = types.SimpleNamespace(_archive_child=None)
+        done = mock.Mock(**{"poll.return_value": 3, "returncode": 3})
+        with mock.patch.object(archive, "spawn_capture_child",
+                               return_value=done) as spawn, \
                 mock.patch.object(indexer.common, "log") as log:
-            indexer.AutoIndexer._capture_archive(object())
-        log.assert_called_once_with(
-            "archive: 2 source path(s) failed; successful captures were kept")
+            indexer.AutoIndexer._capture_archive(owner)
+            self.assertIs(owner._archive_child, done)
+            indexer.AutoIndexer._capture_archive(owner)
+        self.assertEqual(spawn.call_count, 2)
+        log.assert_called_once_with("archive: capture pass exited with 3")
 
     def test_every_capture_pass_persists_outcome_and_age(self) -> None:
         archive.set_enabled(True)
@@ -1172,6 +1212,22 @@ time.sleep(30)
         status = archive.status()
         self.assertFalse(status["last_pass"]["fresh"])
         self.assertEqual(archive.HEALTH.read_bytes(), before)
+
+    def test_status_names_interrupted_capture_when_stored_files_exist(self) -> None:
+        archive.set_enabled(True)
+        self._capture_codex()
+        archive.HEALTH.unlink()
+        lock = self._lock_path()
+        lock.write_bytes(
+            b"pid=4000000000 start=unknown token=" + b"0" * 32 + b"\n")
+        old = time.time() - 60
+        os.utime(lock, (old, old))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(archive.main(["--status"]), 0)
+        rendered = output.getvalue()
+        self.assertIn("capture interrupted before a pass completed", rendered)
+        self.assertNotIn("never captured yet", rendered)
 
     def test_partial_capture_has_a_distinct_durable_state(self) -> None:
         archive.ROOTS = []
@@ -1234,8 +1290,13 @@ time.sleep(30)
         self.assertEqual(state["manifest_state"], "not-inspected")
         self.assertIsNone(state["files"])
         self.assertEqual(rc, 0)
-        # a count it declined to measure is omitted, never rendered as a value
-        self.assertNotIn("files", output.getvalue())
+        # a count it declined to measure is omitted, never rendered as a value or a
+        # placeholder: no `<token> files` phrase of any kind on the status lines
+        count_phrase = re.compile(r"\S+ files\b")
+        self.assertIsNone(count_phrase.search(output.getvalue()), output.getvalue())
+        for placeholder in ("None files", "0 files", "? files"):
+            self.assertIsNotNone(count_phrase.search(f"archive: {placeholder} stored"),
+                                 "the check must catch a rendered placeholder")
         self.assertEqual(archive.MANIFEST.read_bytes(), body)
 
     def test_damaged_config_is_never_laundered_to_disabled(self) -> None:
@@ -1401,16 +1462,15 @@ time.sleep(30)
         self.assertNotIn("try again", output.getvalue())
         self.assertTrue(lock.exists())
 
-    def test_indexer_persists_and_logs_capture_exception(self) -> None:
+    def test_indexer_logs_a_capture_child_that_could_not_start(self) -> None:
         import indexer
-        failure = ValueError("future manifest schema")
-        with mock.patch.object(archive, "enabled", return_value=True), \
-                mock.patch.object(archive, "capture", side_effect=failure), \
-                mock.patch.object(archive, "record_capture_failure") as durable, \
+        owner = types.SimpleNamespace(_archive_child=None)
+        with mock.patch.object(archive, "spawn_capture_child",
+                               side_effect=OSError("no fork")), \
                 mock.patch.object(indexer.common, "log") as log:
-            indexer.AutoIndexer._capture_archive(object())
-        durable.assert_called_once_with(failure)
-        self.assertIn("future manifest schema", log.call_args_list[0].args[0])
+            indexer.AutoIndexer._capture_archive(owner)
+        self.assertIsNone(owner._archive_child)
+        self.assertIn("no fork", log.call_args_list[0].args[0])
 
     def test_keep_zero_preserves_duplicate_and_distinct_versions(self) -> None:
         source, first = self._capture_codex()
@@ -1461,7 +1521,7 @@ time.sleep(30)
         self.assertEqual(source.read_bytes(), original)
         self.assertTrue(archive._record_migrated(record))
 
-    def test_windows_manifest_path_uses_portable_name_with_to(self) -> None:
+    def test_windows_manifest_path_uses_portable_layout_with_to(self) -> None:
         source, original = self._capture_codex()
         record = archive._records()[0]
         record["path"] = (
@@ -1471,8 +1531,10 @@ time.sleep(30)
 
         self.assertEqual(archive.restore("archive-safe", to=str(output)), 0)
         self.assertEqual(
-            (output / "rollout-archive-safe.jsonl").read_bytes(), original)
+            (output / ".codex" / "sessions" / "rollout-archive-safe.jsonl").read_bytes(),
+            original)
         self.assertFalse((output / record["path"]).exists())
+        self.assertFalse((output / "rollout-archive-safe.jsonl").exists())
 
     def test_portable_paths_reject_devices_unc_ads_and_traversal(self) -> None:
         values = (

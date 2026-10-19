@@ -247,7 +247,7 @@ impl IndexLock {
         loop {
             match create(path, label) {
                 Ok(lock) => return Ok(lock),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(error) if exclusive_create_contended(path, &error) => {
                     if let Ok(observed) = snapshot(path) {
                         holder = holder_description(&observed.raw);
                     }
@@ -292,14 +292,44 @@ impl IndexLock {
         }
     }
 
-    pub fn release(&mut self) -> anyhow::Result<()> {
+    /// The record at the path is still exactly this process's. Called before each derived
+    /// commit: a holder whose record was reaped or replaced no longer excludes other writers.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.released,
+            "index lock {} was already released",
+            self.path.display()
+        );
+        match snapshot(&self.path) {
+            Ok(observed) if observed.matches(&self.snapshot) => Ok(()),
+            Ok(observed) => anyhow::bail!(
+                "index lock {} was displaced while held; now held by {}",
+                self.path.display(),
+                holder_description(&observed.raw)
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                anyhow::bail!("index lock {} disappeared while held", self.path.display())
+            }
+            Err(error) => anyhow::bail!(
+                "could not verify index lock {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+
+    /// Remove this process's record. A record that is neither at the path nor in a tomb was
+    /// removed or replaced while this writer ran; every derived commit re-verified the record
+    /// first, so that is disclosed on stderr and returned as the finding, never an error, and
+    /// whatever now holds the slot is never touched. A record of ours that could not be removed
+    /// is an error.
+    pub fn release(&mut self) -> anyhow::Result<Option<String>> {
         if self.released {
-            return Ok(());
+            return Ok(None);
         }
         self.file.take();
-        if remove_exact(&self.path, &self.snapshot) {
+        if release_exact(&self.path, &self.snapshot) {
             self.released = true;
-            return Ok(());
+            return Ok(None);
         }
         match find_owned_record(&self.path, &self.snapshot) {
             Ok(Some(stranded)) => {
@@ -313,8 +343,16 @@ impl IndexLock {
                 ));
             }
         }
+        let finding = self.verify().err();
         self.released = true;
-        Ok(())
+        let Some(finding) = finding else {
+            anyhow::bail!(
+                "could not release owned index lock: {}",
+                self.path.display()
+            );
+        };
+        eprintln!("{finding}; another writer may have run alongside this one: `agrep doctor`");
+        Ok(Some(finding.to_string()))
     }
 }
 
@@ -325,7 +363,7 @@ impl Drop for IndexLock {
         }
         self.file.take();
         self.released = true;
-        let _ = remove_exact(&self.path, &self.snapshot);
+        let _ = release_exact(&self.path, &self.snapshot);
     }
 }
 
@@ -644,6 +682,15 @@ fn secure_token() -> io::Result<String> {
     Ok(token)
 }
 
+/// A uniform-ish delay in `0..=max` milliseconds; zero when no entropy source is available.
+pub(crate) fn jitter_millis(max: u64) -> u64 {
+    let mut random = [0u8; 8];
+    match fill_random(&mut random) {
+        Ok(()) if max > 0 => u64::from_le_bytes(random) % (max + 1),
+        _ => 0,
+    }
+}
+
 #[cfg(unix)]
 fn fill_random(output: &mut [u8]) -> io::Result<()> {
     File::open("/dev/urandom")?.read_exact(output)
@@ -817,18 +864,9 @@ fn is_reparse_point(_metadata: &Metadata) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn secure_read_options(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    options.custom_flags(0x20_000 | 0x800);
-}
-
-#[cfg(target_os = "macos")]
-fn secure_read_options(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    options.custom_flags(0x100 | 0x4);
+    agrep_core::ingest::registry::nofollow_read_options(options);
 }
 
 #[cfg(windows)]
@@ -881,19 +919,157 @@ fn remove_created_partial(
     if !observed.identity.same_entry(created_identity) || observed.raw != expected_raw {
         return false;
     }
-    remove_exact(path, &observed)
+    // A record this process just created: lock the directory's mutex only where a reap minted
+    // it, never mint one (the directory may not be agrep's), and leave no tomb behind.
+    let mutex = SlotMutex::acquire(path, false);
+    removal_cleared(&mutex, path, &observed) && unlink_with_retries(path)
 }
 
+/// An exclusive create refused by a slot that is not empty: `AlreadyExists`, or on Windows the
+/// `ACCESS_DENIED` a delete-pending record (one a reader still holds open) answers with, which a
+/// stat of the entry shares. The slot clears when the reader closes, so the caller waits as for
+/// any holder.
+pub fn exclusive_create_contended(path: &Path, error: &io::Error) -> bool {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => true,
+        io::ErrorKind::PermissionDenied if cfg!(windows) => !matches!(
+            fs::symlink_metadata(path),
+            Err(probe) if probe.kind() == io::ErrorKind::NotFound
+        ),
+        _ => false,
+    }
+}
+
+/// How long a removal waits for the directory's record mutex before giving up for this pass.
+const SLOT_MUTEX_WAIT: Duration = Duration::from_secs(2);
+const SLOT_MUTEX_POLL: Duration = Duration::from_millis(2);
+/// Sidecar every reap in a directory locks (a kernel lock, so a crashed holder frees it). Minted
+/// by the first reap, so it only ever appears where agrep reaps, and removed only with its
+/// directory, so every process locks the same inode.
+pub const SLOT_MUTEX_NAME: &str = ".owner-mutex";
+
+enum SlotMutex {
+    Held(File),
+    Busy,
+    Unsupported,
+    /// Not minted here, and this caller must not mint it.
+    Absent,
+}
+
+impl SlotMutex {
+    fn acquire(record: &Path, mint: bool) -> Self {
+        let Some(parent) = record.parent() else {
+            return Self::Unsupported;
+        };
+        let path = parent.join(SLOT_MUTEX_NAME);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(mint).truncate(false);
+        secure_create_options(&mut options);
+        secure_read_options(&mut options);
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !mint => return Self::Absent,
+            Err(_) => return Self::Unsupported,
+        };
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            return Self::Unsupported;
+        }
+        let deadline = Instant::now() + SLOT_MUTEX_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Self::Held(file),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Self::Busy;
+                    }
+                    std::thread::sleep(SLOT_MUTEX_POLL);
+                }
+                Err(fs::TryLockError::Error(_)) => return Self::Unsupported,
+            }
+        }
+    }
+}
+
+impl Drop for SlotMutex {
+    fn drop(&mut self) {
+        if let Self::Held(file) = self {
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// Reap the record at `path` only while it is still exactly `expected`: the caller judged another
+/// process's record dead. Every reap in the directory takes the slot mutex, minting it on first
+/// use, so the check and the removal are one step relative to every other remover, and a live
+/// record swapped in since the caller's judgement is never touched. Creators need no lock: they
+/// only ever create into an empty slot. The record is renamed aside and the tomb unlinked, so the
+/// slot is free at once even where a reader still holds the record open (Windows). Where the
+/// mutex cannot be taken at all, the same tomb protocol runs lock-less.
 fn remove_exact(path: &Path, expected: &Snapshot) -> bool {
+    remove_record(path, expected, true)
+}
+
+/// Release this process's own record: honours a mutex a reap minted and never mints one, so a
+/// directory only ever holds one once something was reaped there.
+fn release_exact(path: &Path, expected: &Snapshot) -> bool {
+    remove_record(path, expected, false)
+}
+
+fn remove_record(path: &Path, expected: &Snapshot, mint_mutex: bool) -> bool {
+    if !snapshot(path).is_ok_and(|current| current.matches(expected)) {
+        return false;
+    }
+    agrep_core::fault_injection::park_gate("mutex");
+    let mutex = SlotMutex::acquire(path, mint_mutex);
+    removal_cleared(&mutex, path, expected) && remove_exact_via_tomb(path, expected)
+}
+
+/// Whether a removal may go ahead: under the mutex the slot must still hold `expected`; a busy
+/// mutex is no verdict, so nothing is touched this pass.
+fn removal_cleared(mutex: &SlotMutex, path: &Path, expected: &Snapshot) -> bool {
+    match mutex {
+        SlotMutex::Held(_) => snapshot(path).is_ok_and(|current| current.matches(expected)),
+        SlotMutex::Busy => false,
+        SlotMutex::Unsupported | SlotMutex::Absent => true,
+    }
+}
+
+/// Windows refuses to unlink or rename a record a reader opened without delete sharing; such
+/// readers hold it for microseconds.
+fn unlink_with_retries(path: &Path) -> bool {
+    transient_retries(|| match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    })
+}
+
+fn transient_retries(mut attempt: impl FnMut() -> bool) -> bool {
+    for delay in [0, 5, 10] {
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        if attempt() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Move the record aside, prove the tomb is the expected record, then unlink it. A tomb that
+/// holds anything else, or that cannot be unlinked, is linked back only into a vacant slot; a
+/// record that published into the gap is never overwritten, and an unprovable tomb is left as
+/// litter.
+fn remove_exact_via_tomb(path: &Path, expected: &Snapshot) -> bool {
     let Some(tomb) = fresh_tomb_path(path) else {
         return false;
     };
-    if fs::rename(path, &tomb).is_err() {
+    agrep_core::fault_injection::park_gate("rename");
+    if !transient_retries(|| fs::rename(path, &tomb).is_ok()) {
         return false;
     }
+    agrep_core::fault_injection::park_gate("restore");
     let moved = snapshot(&tomb).ok();
-    if moved.as_ref().is_some_and(|moved| moved.matches(expected)) && fs::remove_file(&tomb).is_ok()
-    {
+    if moved.as_ref().is_some_and(|moved| moved.matches(expected)) && unlink_with_retries(&tomb) {
         return true;
     }
     restore_tomb(path, &tomb);
@@ -1491,15 +1667,149 @@ mod tests {
     }
 
     #[test]
-    fn explicit_release_preserves_an_exact_byte_replacement() {
+    fn fallback_restore_never_overwrites_a_gap_occupant() {
+        let dir = temp_dir("gap-occupant");
+        let path = dir.join(".indexd.v2.lock");
+        let tomb = dir.join(format!(
+            "..indexd.v2.lock.owner-reap-{}-fixture",
+            std::process::id()
+        ));
+        fs::write(&tomb, b"pid=12345 start=proc_live protocol=2\n").unwrap();
+        fs::write(&path, b"state=derived-adoption pid=54321\n").unwrap();
+        restore_tomb(&path, &tomb);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"state=derived-adoption pid=54321\n"
+        );
+        assert!(tomb.exists());
+        fs::remove_file(&path).unwrap();
+        restore_tomb(&path, &tomb);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"pid=12345 start=proc_live protocol=2\n"
+        );
+        assert!(!tomb.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removal_is_serialized_by_the_directory_mutex() {
+        let dir = temp_dir("slot-mutex");
+        let path = dir.join(".index.lock");
+        fs::write(&path, b"pid=12345 start=proc_old\n").unwrap();
+        let observed = snapshot(&path).unwrap();
+        let held = SlotMutex::acquire(&path, true);
+        assert!(matches!(held, SlotMutex::Held(_)));
+        assert!(dir.join(SLOT_MUTEX_NAME).is_file());
+        let started = Instant::now();
+        assert!(matches!(SlotMutex::acquire(&path, true), SlotMutex::Busy));
+        assert!(started.elapsed() >= SLOT_MUTEX_WAIT);
+        // A busy mutex is not a verdict: nothing is removed and nothing is moved aside.
+        assert!(!remove_exact(&path, &observed));
+        assert_eq!(fs::read(&path).unwrap(), b"pid=12345 start=proc_old\n");
+        assert!(!fs::read_dir(&dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".owner-reap-")));
+        drop(held);
+        assert!(remove_exact(&path, &observed));
+        assert!(!path.exists());
+        assert!(dir.join(SLOT_MUTEX_NAME).is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_record_its_creator_discards_never_mints_the_mutex() {
+        let dir = temp_dir("own-partial");
+        let path = dir.join(".index.lock");
+        fs::write(&path, b"pid=1 start=unfinished").unwrap();
+        let created = snapshot(&path).unwrap();
+        assert!(remove_created_partial(
+            &path,
+            &created.identity,
+            b"pid=1 start=unfinished"
+        ));
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        // Where a reap minted the mutex, the creator's cleanup honours it like any remover.
+        fs::write(&path, b"pid=1 start=unfinished").unwrap();
+        let created = snapshot(&path).unwrap();
+        let held = SlotMutex::acquire(&path, true);
+        assert!(matches!(held, SlotMutex::Held(_)));
+        assert!(!remove_created_partial(
+            &path,
+            &created.identity,
+            b"pid=1 start=unfinished"
+        ));
+        assert!(path.exists());
+        drop(held);
+        assert!(remove_created_partial(
+            &path,
+            &created.identity,
+            b"pid=1 start=unfinished"
+        ));
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from(SLOT_MUTEX_NAME)]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_an_occupied_or_delete_pending_slot_counts_as_create_contention() {
+        let dir = temp_dir("create-contention");
+        let path = dir.join(".index.lock");
+        let exists = io::Error::from(io::ErrorKind::AlreadyExists);
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(exclusive_create_contended(&path, &exists));
+        assert!(!exclusive_create_contended(&path, &denied));
+        fs::write(&path, b"pid=12345 start=proc_old\n").unwrap();
+        assert_eq!(exclusive_create_contended(&path, &denied), cfg!(windows));
+        assert!(!exclusive_create_contended(
+            &path,
+            &io::Error::from(io::ErrorKind::NotFound)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_release_reports_an_exact_byte_replacement_as_displacement() {
         let dir = temp_dir("same-bytes");
         let path = dir.join(".index.lock");
         let mut lock = IndexLock::acquire(&path, "fixture", Duration::ZERO).unwrap();
+        lock.verify().unwrap();
         let raw = fs::read(&path).unwrap();
         write_new_entry(&path, &raw);
-        lock.release().unwrap();
+        let error = lock.verify().unwrap_err().to_string();
+        assert!(error.contains("was displaced while held"), "{error}");
+        let finding = lock.release().unwrap().unwrap();
+        assert!(finding.contains("was displaced while held"), "{finding}");
         assert_eq!(fs::read(&path).unwrap(), raw);
         fs::remove_file(path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_release_reports_a_vanished_record() {
+        let dir = temp_dir("vanished-record");
+        let path = dir.join(".index.lock");
+        let mut lock = IndexLock::acquire(&path, "fixture", Duration::ZERO).unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = lock.verify().unwrap_err().to_string();
+        assert!(error.contains("disappeared while held"), "{error}");
+        let finding = lock.release().unwrap().unwrap();
+        assert!(finding.contains("disappeared while held"), "{finding}");
+        assert_eq!(
+            lock.release().unwrap(),
+            None,
+            "a release reports its verdict once"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

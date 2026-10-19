@@ -1055,6 +1055,28 @@ class CompactTests(unittest.TestCase):
                 r"broader rerun \(may repeat\): agrep --deeper "
                 r"m\.[A-Za-z0-9_-]{8}\n$")
 
+    def test_a_continuation_keeps_the_floor_count_basis_of_an_excluded_tool_lane(
+            self) -> None:
+        # --more pages offered `-c exact` although the first page's lane excluded tool rows.
+        hits = [_hit(index) for index in range(24)]
+        deeper = ("agrep", "--classic", "-n", "80", "--", "result")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            page = compact.start_compact(
+                hits, lambda hit: hit["text"], {"sig": "a"}, "rank-v1",
+                data_dir=root, now=10, byte_budget=24, corpus_more=True,
+                query="result", deeper_argv=deeper, count_floor=True)
+            self.assertTrue(page.more)
+            page = compact.continue_compact(
+                page.handle, {"sig": "a"}, "rank-v1", data_dir=root, now=11,
+                byte_budget=24)
+            self.assertTrue(page.count_floor)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                search._compact_summary(page)
+        self.assertIn("(floor)", stderr.getvalue())
+        self.assertNotIn("-c exact", stderr.getvalue())
+
     def test_exhausted_exact_page_has_no_footer(self) -> None:
         page = compact.CompactPage(
             ({"hit": {}, "line": "one"},), False, None, "exhausted", 1,
@@ -1978,13 +2000,13 @@ class EventPathTests(unittest.TestCase):
             for path, name in zip(paths, ("first", "second")):
                 path.write_text(json.dumps({"ts": 150, "kind": "tool",
                                             "name": name}) + "\n", encoding="utf-8")
-            first = explore._events_for_turns("codex", "a/b", selected, timeline)
-            second = explore._events_for_turns("codex", "a?b", selected, timeline)
+            first, _ = explore._events_for_turns("codex", "a/b", selected, timeline)
+            second, _ = explore._events_for_turns("codex", "a?b", selected, timeline)
 
             legacy = explore.common.event_path_candidates("codex", "legacy/id")[1]
             legacy.write_text(json.dumps({"ts": 150, "kind": "tool",
                                           "name": "legacy"}) + "\n", encoding="utf-8")
-            old = explore._events_for_turns("codex", "legacy/id", selected, timeline)
+            old, _ = explore._events_for_turns("codex", "legacy/id", selected, timeline)
         self.assertEqual([event["name"] for event in first], ["first"])
         self.assertEqual([event["name"] for event in second], ["second"])
         self.assertEqual([event["name"] for event in old], ["legacy"])
@@ -2005,10 +2027,94 @@ class EventPathTests(unittest.TestCase):
             payload = explore.common.event_blob("codex", "session")
             self.assertIsNotNone(payload)
             tools = events.tool_rows_from_payload(payload, [(100, 1)])
-            self.assertTrue(explore.has_events("codex", "session"))
+            self.assertEqual(explore.common.event_store_blob("codex", "session"),
+                             (explore.common.EVENTS_PRESENT, db_payload))
             explore.common._close_event_reader()
         self.assertEqual([row["name"] for row in rows], ["database"])
         self.assertTrue(tools[0]["text"].startswith("database"))
+
+    def _window_fixture(self, td: str) -> tuple[dict, list[dict]]:
+        events_dir = Path(td) / "events"
+        name = explore.common.event_filename("codex", "session")
+        payload = "".join(
+            json.dumps({"ts": ts, "kind": "tool", "name": f"tool-{ts}"}) + "\n"
+            for ts in (150, 250, 350)).encode()
+        self._store(events_dir, [(name, "codex", "session", payload)])
+        timeline = [{"turn": turn, "ts": turn * 100} for turn in (1, 2, 3)]
+        context = {"agent": "codex", "project": "p", "timeline": timeline,
+                   "n_turns": 3, "first_turn": 1, "last_turn": 3}
+        # Turns 1 and 3 own two separate event ranges of the one stored row.
+        turns = [{"turn": turn, "ts": turn * 100, "text": "t", "who": "user",
+                  "reply": ""} for turn in (1, 3)]
+        return context, turns
+
+    def test_a_window_whose_own_read_is_blocked_is_never_an_exact_zero(self) -> None:
+        # The read that fills the window reports the block itself: a block that cleared
+        # before a separate availability probe used to pack as zero events, exact.
+        real = explore.common.event_store_blob
+        reads = []
+
+        def blocked_once(agent: str, session: str):
+            reads.append(session)
+            if len(reads) == 1:
+                return explore.common.EVENTS_UNAVAILABLE, None
+            return real(agent, session)
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(explore.common, "DATA_DIR", Path(td)), \
+                mock.patch.object(events, "EVENTS_DIR", Path(td) / "events"), \
+                mock.patch.object(explore, "_summary_by_session", return_value={}), \
+                mock.patch.object(explore, "_reply_records_by_id", return_value={}), \
+                mock.patch.object(explore, "_session_concept", return_value={}), \
+                mock.patch.object(explore.common, "event_store_blob",
+                                  side_effect=blocked_once):
+            context, turns = self._window_fixture(td)
+            blocked = explore._pack_window("session", context, 1, turns)
+            served = explore._pack_window("session", context, 1, turns)
+            explore.common._close_event_reader()
+        self.assertEqual((blocked["events"], blocked["events_unavailable"]), ([], True))
+        self.assertFalse(served["events_unavailable"])
+        self.assertEqual([event["name"] for event in served["events"]],
+                         ["tool-150", "tool-350"])
+        self.assertEqual(len(reads), 2, "one store read per window")
+
+    def test_get_events_never_serves_an_unreadable_store_as_no_events(self) -> None:
+        # It returned [] for a store it could not read, so `summary` dropped tool events
+        # with nothing said; a caller now has to catch the refusal to serve without them.
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(explore.common, "DATA_DIR", Path(td)), \
+                mock.patch.object(events, "EVENTS_DIR", Path(td) / "events"):
+            self._window_fixture(td)
+            self.assertEqual(len(explore.get_events("codex", "session")), 3)
+            with mock.patch.object(
+                    explore.common, "event_store_blob",
+                    return_value=(explore.common.EVENTS_UNAVAILABLE, None)), \
+                    self.assertRaisesRegex(
+                        explore.EventsUnavailable, "tool events are unavailable"):
+                explore.get_events("codex", "session")
+            self.assertEqual(explore.get_events("codex", "absent"), [])
+            explore.common._close_event_reader()
+
+    def test_a_window_verifies_its_payload_once_and_the_store_probe_hashes_nothing(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(explore.common, "DATA_DIR", Path(td)), \
+                mock.patch.object(events, "EVENTS_DIR", Path(td) / "events"), \
+                mock.patch.object(explore, "_summary_by_session", return_value={}), \
+                mock.patch.object(explore, "_reply_records_by_id", return_value={}), \
+                mock.patch.object(explore, "_session_concept", return_value={}):
+            context, turns = self._window_fixture(td)
+            with mock.patch.object(events, "_event_payload_digest",
+                                   wraps=events._event_payload_digest) as digest:
+                window = explore._pack_window("session", context, 1, turns)
+                window_digests = digest.call_count
+                digest.reset_mock()
+                self.assertTrue(explore.common.event_store_readable())
+                probe_digests = digest.call_count
+            explore.common._close_event_reader()
+        self.assertEqual(len(window["events"]), 2)
+        self.assertEqual(window_digests, 1)
+        self.assertEqual(probe_digests, 0)
 
     def test_seeded_sqlite_generation_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td, \
@@ -2022,12 +2128,13 @@ class EventPathTests(unittest.TestCase):
             explore.common.event_path_candidates("codex", "session")[0].write_text(
                 json.dumps({"ts": 150, "kind": "tool", "name": "legacy"}) + "\n",
                 encoding="utf-8")
-            rows = explore.get_events("codex", "session")
+            # neither the stale legacy file nor an empty stream: the read is refused
+            with self.assertRaises(explore.EventsUnavailable):
+                explore.get_events("codex", "session")
             names = explore.common.event_names(events_dir)
             with self.assertRaisesRegex(RuntimeError, "incoherent"):
                 list(explore.common.event_blobs_bulk([("codex", "session")], full=True))
             explore.common._close_event_reader()
-        self.assertEqual(rows, [])
         self.assertEqual(names, set())
 
     @unittest.skipUnless(os.name == "posix", "POSIX symlink test")
@@ -2073,11 +2180,13 @@ class EventPathTests(unittest.TestCase):
                 encoding="utf-8")
             rows = explore.get_events("codex", "session")
             names = explore.common.event_names(events_dir)
-            has_events = explore.has_events("codex", "session")
+            status = explore.common.event_store_blob("codex", "session")
+            readable = explore.common.event_store_readable()
             explore.common._close_event_reader()
         self.assertEqual([row["name"] for row in rows], ["legacy"])
         self.assertEqual(names, {name})
-        self.assertTrue(has_events)
+        self.assertEqual(status, (explore.common.EVENTS_LEGACY, None))
+        self.assertTrue(readable)
 
     def test_current_sqlite_missing_row_does_not_resurrect_stale_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as td, \
@@ -2110,7 +2219,9 @@ class EventPathTests(unittest.TestCase):
                     sqlite3.connect(events_dir / explore.common.EVENT_STORE_NAME).close()
 
                 self.assertIsNone(explore.common.event_blob("codex", "session"))
-                self.assertFalse(explore.common.event_exists("codex", "session"))
+                self.assertEqual(explore.common.event_store_blob("codex", "session"),
+                                 (explore.common.EVENTS_UNAVAILABLE, None))
+                self.assertFalse(explore.common.event_store_readable())
                 self.assertEqual(explore.common.event_names(events_dir), set())
                 error = "read failed" if empty_store else "missing"
                 with self.assertRaisesRegex(RuntimeError, error):
@@ -2483,7 +2594,7 @@ class RecallTests(unittest.TestCase):
                       json_hit["window"][0]["text"])
         self.assertNotIn("--full", json_hit["window"][0]["text"])
 
-        def capture_text(text, _budget, _ends, trailer=""):
+        def capture_text(text, _budget, _ends, trailer="", _keep=None):
             captured["text"] = text
             captured["trailer"] = trailer
             return "ok"
@@ -2501,7 +2612,7 @@ class RecallTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = recall.main(["needle", "--lexical", "--hits", "2",
-                              "--budget", "64"])
+                              "--budget", "160"])
         self.assertEqual(rc, 0)
         # The collision-safe handle matters; taught usage already supplies the verb.
         self.assertIn("@0199aaaa-db7e-b:8", captured["trailer"])
@@ -2731,13 +2842,14 @@ class RecallTests(unittest.TestCase):
         ends = [(len(block1), "agrep around abcd1234 9"),
                 (len(text), "agrep around ffff0000 4")]
 
-        # cut would land inside block1's existing marker: back off, don't corrupt it
+        # cut would land inside block1's existing marker: back off, don't corrupt it;
+        # block2, evicted whole, is named in the over-budget trailer
         fitted = recall._fit_text_payload(text, len(block1) + 30, ends)
         self.assertLessEqual(len(fitted), len(block1) + 30)
-        self.assertIn("agrep around abcd1234 9", fitted.rsplit("[", 1)[1])
+        self.assertIn("rest at agrep around abcd1234 9", fitted)
+        self.assertIn("[+1 hit(s) over budget - agrep around ffff0000 4]", fitted)
         for m in re.finditer(r"\[\+", fitted):
             self.assertIn("]", fitted[m.start():], "marker sliced mid-command")
-
         # cut lands in block2's body: the cap marker names block2's window
         fitted = recall._fit_text_payload(text, len(block1) + 120, ends)
         self.assertLessEqual(len(fitted), len(block1) + 120)
@@ -2871,8 +2983,8 @@ class RecallTests(unittest.TestCase):
         self.assertRegex(out, r"\[\+\d+ hit\(s\) over budget")
 
     def test_budget_cap_keeps_the_over_budget_hit_marker(self) -> None:
-        # the measured --budget 3000 case: the final cap used to cut from the
-        # end and eat the [+N hit(s) over budget] disclosure appended last
+        # the final cap used to cut from the end and eat the [+N hit(s) over budget]
+        # disclosure appended last; 1500 bytes holds three hit floors, not four
         sessions = [f"0199000{i}-0000-7000-8000-00000000000{i}" for i in range(4)]
         hits = [{"session": session, "turn": 1, "ts": 1, "who": "user",
                  "agent": "codex", "project": "agrep", "score": 1.0,
@@ -2903,17 +3015,18 @@ class RecallTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = recall.main(["needle", "--lexical", "--who", "user",
-                              "--hits", "4", "--budget", "3000"])
+                              "--hits", "4", "--budget", "1500"])
         self.assertEqual(rc, 0)
         out = stdout.getvalue()
-        self.assertLessEqual(len(out), 3000)
+        self.assertLessEqual(len(out), 1500)
         evicted = re.search(r"\[\+\d+ hit\(s\) over budget - [^\]]+\]", out)
         self.assertIsNotNone(evicted, "eviction disclosure lost to the budget cap")
         # Handles remain actionable while leaving more of the exhausted budget for evidence.
         self.assertRegex(evicted.group(0), r"@[\w.-]+:\d+")
-        # content is evicted before the marker: the cap cut, the trailer survived
-        self.assertIn("[output truncated to --budget", out)
+        # the blocks were sized to leave the trailer its room: it survives, last and
+        # whole, and the first block kept its hit evidence
         self.assertTrue(out.rstrip().endswith(evicted.group(0)))
+        self.assertIn("1 user: needle needle", out)
         for m in re.finditer(r"\[\+", out):
             self.assertIn("]", out[m.start():], "marker sliced mid-command")
 

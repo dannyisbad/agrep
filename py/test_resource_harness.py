@@ -67,6 +67,58 @@ class TestSupportIsolationTests(unittest.TestCase):
             self.assertTrue(inherited)
 
 
+class CoordinationNamespaceTests(unittest.TestCase):
+    """The harness names a data dir's namespace with semworker's own formula."""
+
+    def test_namespace_formula_matches_semworker(self):
+        import _test_support
+        script = (
+            "import pathlib, sys\n"
+            "import common, semworker\n"
+            "common.DATA_DIR = pathlib.Path(sys.argv[1])\n"
+            "print(semworker._ephemeral_coordination_dir())\n")
+        with tempfile.TemporaryDirectory(prefix="agrep-namespace-") as raw:
+            root = Path(raw)
+            (root / "nested" / "data").mkdir(parents=True)
+            for data_dir in (root, root / "nested" / "data", root / "absent"):
+                with self.subTest(data_dir=data_dir.name):
+                    # The product resolves it in its own process; no shared
+                    # global is swapped under other threads here.
+                    resolved = subprocess.run(
+                        [sys.executable, "-c", script, str(data_dir)],
+                        cwd=str(Path(__file__).resolve().parent),
+                        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent)},
+                        capture_output=True, text=True, timeout=60, check=False)
+                    self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                    self.assertEqual(
+                        resolved.stdout.strip(),
+                        str(_test_support.coordination_namespace_for(data_dir)))
+
+    def test_registry_names_only_what_this_process_handed_out(self):
+        import _test_support
+        with tempfile.TemporaryDirectory(prefix="agrep-registry-") as raw:
+            root = Path(raw)
+            (root / "data").mkdir()
+            mine = _test_support.register_data_dir(root / "data").name
+            self.assertIn(mine, _test_support.registered_namespaces())
+            foreign = _test_support.coordination_namespace_for(root / "never-registered").name
+            self.assertNotIn(foreign, _test_support.registered_namespaces())
+            # An empty namespace for a registered dir is removed; a stranger's is not.
+            base = _test_support.coordination_base_path()
+            (base / mine).mkdir(mode=0o700)
+            (base / foreign).mkdir(mode=0o700)
+            try:
+                self.assertTrue(_test_support.remove_coordination_namespace(root / "data"))
+                self.assertFalse((base / mine).exists())
+                self.assertTrue((base / foreign).exists())
+            finally:
+                for name in (mine, foreign):
+                    try:
+                        (base / name).rmdir()
+                    except OSError:
+                        pass
+
+
 class ResourceHarnessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -304,7 +356,9 @@ class ResourceHarnessTests(unittest.TestCase):
                 "def stop(_signum,_frame):\n"
                 " child=subprocess.Popen([sys.executable,'-c',"
                 "'import time; time.sleep(60)'])\n"
-                " child_pid.write_text(str(child.pid),encoding='ascii')\n"
+                " staged=child_pid.with_name(child_pid.name+'.tmp')\n"
+                " staged.write_text(str(child.pid),encoding='ascii')\n"
+                " staged.replace(child_pid)\n"
                 " while True: time.sleep(1)\n"
                 "signal.signal(signal.SIGTERM,stop)\n"
                 "ready.touch()\n"

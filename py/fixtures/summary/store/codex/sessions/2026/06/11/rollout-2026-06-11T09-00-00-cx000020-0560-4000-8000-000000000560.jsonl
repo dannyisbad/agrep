@@ -1,0 +1,7 @@
+{"timestamp": "2026-06-11T09:00:00.000Z", "type": "session_meta", "payload": {"id": "cx000020-0560-4000-8000-000000000560", "cwd": "{{home}}/projects/mx-codex"}}
+{"timestamp": "2026-06-11T09:00:30.000Z", "type": "turn_context", "payload": {"model": "gpt-5", "turn_id": "cx20-turn-a"}}
+{"timestamp": "2026-06-11T09:00:00.000Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Check the whiskey config."}]}}
+{"timestamp": "2026-06-11T09:00:01.000Z", "type": "event_msg", "payload": {"type": "user_message", "message": "Check the whiskey config."}}
+{"timestamp": "2026-06-11T09:00:30.000Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking the whiskey config."}]}}
+{"timestamp": "2026-06-11T09:01:00.000Z", "type": "response_item", "payload": {"type": "function_call", "name": "shell_command", "call_id": "shell-cx20", "arguments": "{\"command\": \"cat whiskey.toml\"}"}}
+{"timestamp": "2026-06-11T09:01:05.000Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "shell-cx20", "output": "[whiskey]\nretries = 3"}}

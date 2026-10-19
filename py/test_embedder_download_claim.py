@@ -102,8 +102,28 @@ class DownloadClaimTests(unittest.TestCase):
         create.assert_not_called()
         self.assertFalse(self.claim_path.exists())
 
+    def test_offline_open_names_corrupt_files_apart_from_missing_ones(self) -> None:
+        # Every file present but one byte wrong read as "model files missing",
+        # which sent the reader hunting for a file that was right there.
+        with self.assertRaisesRegex(
+                embedder.EmbedderUnavailable,
+                rf"^model files missing under {self.root}: model\.bin$"):
+            embedder.ensure_model(download=False)
+        (self.root / "model.bin").write_bytes(b"pinned-mode1")
+        with self.assertRaisesRegex(
+                embedder.EmbedderUnavailable,
+                rf"^model files failed size/SHA-256 verification under {self.root}: "
+                r"model\.bin \(`agrep -s <query>` or `agrep setup` re-fetches them\)$"):
+            embedder.ensure_model(download=False)
+        # A later permitted fetch replaces it in place; nothing to delete first.
+        with mock.patch.object(
+                embedder, "_fetch_pinned",
+                side_effect=lambda _url, part, _size: part.write_bytes(self.payload)):
+            self.assertEqual(embedder.ensure_model(), self.root)
+        self.assertEqual((self.root / "model.bin").read_bytes(), self.payload)
+
     def test_owner_and_malformed_age_policies(self) -> None:
-        raw = self._claim_raw(at=100.0)
+        raw = self._claim_raw(pid=4242, at=100.0)
         observed = ownerfile.Snapshot((1, 2, len(raw), 3), 699.0, raw)
         with mock.patch.object(embedder.time, "time", return_value=700.0), \
                 mock.patch.object(common, "pid_alive", return_value=True), \
@@ -185,8 +205,8 @@ class DownloadClaimTests(unittest.TestCase):
     def test_acquisition_reclaims_expired_live_and_recycled_owners(self) -> None:
         now = time.time()
         cases = (
-            (self._claim_raw(process_start="birth", at=now - 600.1), "birth"),
-            (self._claim_raw(process_start="old-birth", at=now), "new-birth"),
+            (self._claim_raw(pid=4242, process_start="birth", at=now - 600.1), "birth"),
+            (self._claim_raw(pid=4242, process_start="old-birth", at=now), "new-birth"),
         )
         for raw, actual_birth in cases:
             self.claim_path.write_bytes(raw)
@@ -198,7 +218,7 @@ class DownloadClaimTests(unittest.TestCase):
             self.assertNotEqual(claim.snapshot.raw, raw)
             self.assertTrue(claim.release(tombstone=True))
 
-        raw = self._claim_raw(process_start="birth", at=now - 600.0)
+        raw = self._claim_raw(pid=4242, process_start="birth", at=now - 600.0)
         self.claim_path.write_bytes(raw)
         real_snapshot = ownerfile.snapshot
 
@@ -220,6 +240,30 @@ class DownloadClaimTests(unittest.TestCase):
         self.assertEqual(self.claim_path.read_bytes(), raw)
         self.claim_path.unlink()
         (self.root / "model.bin").unlink()
+
+    def test_acquisition_reclaims_only_its_own_stranded_claim(self) -> None:
+        # a release that could not finish leaves the record naming this live process; only
+        # this process reclaims it, and only while no live claim of its own holds the token
+        raw = self._claim_raw(process_start="birth", at=time.time())
+        self.claim_path.write_bytes(raw)
+        with mock.patch.object(common, "pid_alive", return_value=True), \
+                mock.patch.object(
+                    common, "process_start_identity", return_value="birth"), \
+                mock.patch.object(embedder.time, "sleep") as sleep:
+            claim = embedder._acquire_download_claim(self.root)
+        self.assertNotEqual(claim.snapshot.raw, raw)
+        sleep.assert_not_called()
+        self.assertEqual(claim.token, json.loads(claim.snapshot.raw)["token"])
+        embedder.MODEL_DOWNLOAD_WAIT_S = 0.2
+        with mock.patch.object(common, "pid_alive", return_value=True), \
+                mock.patch.object(
+                    common, "process_start_identity", return_value="birth"), \
+                self.assertRaisesRegex(
+                    embedder.EmbedderUnavailable,
+                    "^timed out waiting for another model download$"):
+            embedder._acquire_download_claim(self.root)
+        self.assertEqual(self.claim_path.read_bytes(), claim.snapshot.raw)
+        self.assertTrue(claim.release(tombstone=True))
 
     def test_repeated_reclaims_poll_before_retrying(self) -> None:
         raw = self._claim_raw(pid=999999, at=1.0)
@@ -477,7 +521,7 @@ class DownloadClaimTests(unittest.TestCase):
                 len(payload_b), hashlib.sha256(payload_b).hexdigest()),
         }
         (self.root / "model.bin").write_bytes(self.payload)
-        raw = self._claim_raw(process_start="birth")
+        raw = self._claim_raw(pid=4242, process_start="birth")
         owner = ownerfile.create_exclusive(self.claim_path, raw)
         hashes = 0
         real_hash = embedder._sha256_fd
@@ -534,7 +578,7 @@ class DownloadClaimTests(unittest.TestCase):
             "tokenizer.json": (
                 len(payload_b), hashlib.sha256(payload_b).hexdigest()),
         }
-        raw = self._claim_raw(process_start="birth")
+        raw = self._claim_raw(pid=4242, process_start="birth")
         owner = ownerfile.create_exclusive(self.claim_path, raw)
         old_stamp = (1, 2, len(self.payload), 3, 4)
         new_stamp = (1, 2, len(self.payload), 5, 6)

@@ -644,7 +644,6 @@ fn plant_empty_crush(db: &Path) {
     connection.close().unwrap();
 }
 
-#[cfg(unix)]
 fn add_crush_conversation(db: &Path, session: &str, text: &str) {
     let parts = serde_json::json!([{"type": "text", "data": {"text": text}}]);
     let connection = rusqlite::Connection::open(db).unwrap();
@@ -780,8 +779,19 @@ fn sibling_census_failure_cannot_unpublish_another_databases_rows() {
 #[cfg(unix)]
 const HELD_TEXT: &str = "crush conversation published past a held snapshot";
 
+/// A writer holding Cursor's database mid-transaction, which holds a pass's snapshot back until
+/// the returned connection closes and rolls it back.
+#[cfg(unix)]
+fn hold_cursor(home: &Path) -> rusqlite::Connection {
+    let writer = rusqlite::Connection::open(cursor_db(home)).unwrap();
+    writer
+        .execute_batch("BEGIN IMMEDIATE; INSERT OR REPLACE INTO cursorDiskKV VALUES ('held', 'x');")
+        .unwrap();
+    writer
+}
+
 /// An empty crush store published beside cursor, then a crush conversation that a pass holding
-/// its snapshot back (a cursor rollback journal) publishes. Returns the home, data and database.
+/// its snapshot back (a live cursor writer) publishes. Returns the home, data and database.
 #[cfg(unix)]
 fn publish_past_held_snapshot(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     let home = cursor_home();
@@ -791,10 +801,9 @@ fn publish_past_held_snapshot(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     index_empty_store_until_published(&home, &data, "crush", &crush);
 
     add_crush_conversation(&crush, "held-session", HELD_TEXT);
-    let journal = cursor_db(&home).with_file_name("state.vscdb-journal");
-    fs::write(&journal, b"hot").unwrap();
+    let writer = hold_cursor(&home);
     let held = ingest_output("all", &home, &data, false);
-    fs::remove_file(&journal).unwrap();
+    drop(writer);
     assert_published(&held, "cursor journal holds the snapshot back");
     assert!(normalize(&data).contains(HELD_TEXT));
     assert!(data.join(".ingest_pending.bin").exists());
@@ -878,10 +887,9 @@ fn new_database_published_past_a_held_snapshot_survives_a_lost_cache() {
 
     fs::create_dir_all(crush.parent().unwrap()).unwrap();
     plant_crush_seed(&crush);
-    let journal = cursor_db(&home).with_file_name("state.vscdb-journal");
-    fs::write(&journal, b"hot").unwrap();
+    let writer = hold_cursor(&home);
     let held = ingest_output("all", &home, &data, false);
-    fs::remove_file(&journal).unwrap();
+    drop(writer);
     assert_published(&held, "cursor journal holds the snapshot back");
     assert_eq!(crush_rows(&data), 3);
     assert!(data.join(".ingest_pending.bin").exists());
@@ -971,8 +979,7 @@ fn database_added_under_a_held_snapshot_survives_a_lost_cache_and_record() {
         let data = temp_dir("crush-added-held-data");
         ingest_into("all", &home, &data, false);
 
-        let journal = cursor_db(&home).with_file_name("state.vscdb-journal");
-        fs::write(&journal, b"hot").unwrap();
+        let mut writer = Some(hold_cursor(&home));
         let marked = ingest_output("all", &home, &data, false);
         assert_published(&marked, "cursor journal writes the pending marker");
         assert!(data.join(".ingest_pending.bin").exists());
@@ -981,7 +988,7 @@ fn database_added_under_a_held_snapshot_survives_a_lost_cache_and_record() {
         add_crush_conversation(&added, "added-session", ADDED_TEXT);
         let held = ingest_output("all", &home, &data, false);
         if !held_while_served {
-            fs::remove_file(&journal).unwrap();
+            drop(writer.take());
         }
         assert_published(&held, "database added under a held snapshot");
         assert!(normalize(&data).contains(ADDED_TEXT));
@@ -992,7 +999,7 @@ fn database_added_under_a_held_snapshot_survives_a_lost_cache_and_record() {
             return;
         }
         let served = ingest_output("all", &home, &data, false);
-        let _ = fs::remove_file(&journal);
+        drop(writer.take());
         assert_published(&served, &context);
         assert!(normalize(&data).contains(ADDED_TEXT));
         let record_path = data.join(".token_material.json");
@@ -1017,4 +1024,160 @@ fn database_added_under_a_held_snapshot_survives_a_lost_cache_and_record() {
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&data);
     }
+}
+
+fn cursor_rows(data: &Path) -> Vec<String> {
+    sorted_lines(&data.join("messages.jsonl"))
+        .into_iter()
+        .filter(|line| line.contains("\"agent\":\"cursor\""))
+        .collect()
+}
+
+/// A cursor workspace source the pass cannot read is an attribution gap, not a lost row: with no
+/// parse cache to say which project each chat kept, the pass reads the published generation's,
+/// so every other agent keeps publishing (plain and --full) and cursor's rows stay as published.
+#[test]
+fn cursor_attribution_gap_without_a_cache_publishes_other_agents_and_keeps_projects() {
+    let home = cursor_home();
+    copy_dir(&fixture_home("claude"), &home);
+    let data = temp_dir("cursor-attribution-gap-data");
+    ingest_into("all", &home, &data, false);
+    let before = cursor_rows(&data);
+    assert!(!before.is_empty());
+    let workspace = cursor_db(&home)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("workspaceStorage")
+        .join("aaaa0001bbbb0002cccc0003dddd0004")
+        .join("state.vscdb");
+    remove_database(&workspace);
+    plant_not_sqlite(&workspace);
+    // A stray legacy per-session event file is no reason to lose the published projects: only
+    // messages.jsonl carries them.
+    let stray = data.join("events").join("cursor-0123456789ab.jsonl");
+    fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    fs::write(&stray, b"").unwrap();
+    for (minute, full) in [(1, false), (2, false), (3, true)] {
+        remove_parse_cache(&data);
+        append_churn(&claude_transcript(&home), minute);
+        let output = ingest_output("all", &home, &data, full);
+        assert_published(
+            &output,
+            &format!("attribution gap without a cache (full={full})"),
+        );
+        assert!(normalize(&data).contains(&format!("crush probe churn {minute}")));
+        assert_eq!(
+            cursor_rows(&data),
+            before,
+            "cursor rows relabelled or lost (full={full})"
+        );
+        // The preflight and the pass each record the gap; consumers read one issue per path.
+        let mut kinds = source_issue_kinds(&data, "cursor", &workspace);
+        kinds.dedup();
+        assert_eq!(kinds, ["attribution-unreadable"], "full={full}");
+    }
+    fs::remove_file(&stray).unwrap();
+
+    remove_database(&workspace);
+    let seed = fs::read_to_string(fixtures_dir().join("cursor").join("workspace.sql")).unwrap();
+    let connection = rusqlite::Connection::open(&workspace).unwrap();
+    connection.execute_batch(&seed).unwrap();
+    connection.close().unwrap();
+    append_churn(&claude_transcript(&home), 4);
+    let repaired = ingest_output("all", &home, &data, false);
+    assert_published(&repaired, "workspace source readable again");
+    assert_eq!(cursor_rows(&data), before);
+    assert!(source_issue_kinds(&data, "cursor", &workspace).is_empty());
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
+}
+
+/// A registered crush database a stat proves gone, beside a healthy sibling database so the agent
+/// never enumerates to nothing, may be an unmounted volume: one observation keeps its rows
+/// (disclosed, or refused when no cache can serve them), a volume that returns leaves them
+/// untouched, two agreeing observations confirm the removal, and --full converges a genuine
+/// deletion at once.
+#[test]
+fn registered_crush_database_that_disappears_waits_for_a_second_observation() {
+    const VOLUME_TEXT: &str = "crush conversation on the external volume";
+    let home = claude_home("crush-registered-gone-home");
+    let global = crush_db(&home);
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    plant_crush_seed(&global);
+    let volume = home.join("Volumes").join("ext");
+    let project = volume.join("elm");
+    let db = project.join(".crush").join("crush.db");
+    plant_empty_crush(&db);
+    add_crush_conversation(&db, "volume-chat", VOLUME_TEXT);
+    fs::write(
+        global.with_file_name("projects.json"),
+        serde_json::json!({"projects": [{"path": project, "data_dir": db.parent().unwrap()}]})
+            .to_string(),
+    )
+    .unwrap();
+    let data = temp_dir("crush-registered-gone-data");
+    ingest_into("all", &home, &data, false);
+    let volume_rows = |data: &Path| normalize(data).contains(VOLUME_TEXT);
+    assert!(volume_rows(&data));
+    let parked = home.join("parked");
+
+    fs::rename(&volume, &parked).unwrap();
+    append_churn(&claude_transcript(&home), 1);
+    let once = ingest_output("all", &home, &data, false);
+    assert_published(&once, "registered database absent once");
+    assert!(volume_rows(&data), "one observation dropped the rows");
+    let published = normalize(&data);
+    assert!(published.contains("crush probe churn 1"));
+    assert!(
+        published.contains(CRUSH_TEXT),
+        "the sibling database lost its rows"
+    );
+    assert_eq!(crush_issue_kinds(&data, &db), ["source-root-unavailable"]);
+    assert!(crush_issue_kinds(&data, &global).is_empty());
+
+    fs::rename(&parked, &volume).unwrap();
+    append_churn(&claude_transcript(&home), 2);
+    let back = ingest_output("all", &home, &data, false);
+    assert_published(&back, "volume mounted again");
+    assert!(volume_rows(&data));
+    assert!(crush_issue_kinds(&data, &db).is_empty());
+
+    fs::rename(&volume, &parked).unwrap();
+    remove_parse_cache(&data);
+    append_churn(&claude_transcript(&home), 59);
+    let lost = ingest_output("all", &home, &data, false);
+    assert_refused(
+        &lost,
+        "registered database absent once with no cache to serve it",
+    );
+    assert!(volume_rows(&data), "a refused pass dropped the rows");
+    append_churn(&claude_transcript(&home), 3);
+    let twice = ingest_output("all", &home, &data, false);
+    assert_published(&twice, "registered database absent twice");
+    assert!(
+        !volume_rows(&data),
+        "two observations kept a removed database's rows"
+    );
+    let published = normalize(&data);
+    assert!(published.contains("crush probe churn 3"));
+    assert!(
+        published.contains(CRUSH_TEXT),
+        "the sibling database lost its rows"
+    );
+    assert!(!data.join(".source-health.json").exists());
+
+    fs::rename(&parked, &volume).unwrap();
+    ingest_into("all", &home, &data, false);
+    assert!(volume_rows(&data));
+    fs::remove_dir_all(&volume).unwrap();
+    let full = ingest_output("all", &home, &data, true);
+    assert_published(&full, "--full after a genuine deletion");
+    assert!(!volume_rows(&data), "--full kept a deleted database's rows");
+    assert!(normalize(&data).contains(CRUSH_TEXT));
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&data);
 }

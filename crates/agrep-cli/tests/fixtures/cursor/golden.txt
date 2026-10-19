@@ -3,8 +3,8 @@
 {"id":"cursor:c1a11111-1111-4111-8111-111111111111:1","agent":"cursor","project":"flaky-app","session":"c1a11111-1111-4111-8111-111111111111","ts":1772366470000,"turn":1,"text":"fix it and rerun the suite","content_digest":"466d","who":"user","model":"claude-4.6-sonnet","model_source":"explicit"}
 {"id":"cursor:c2a22222-2222-4222-8222-222222222222:0","agent":"cursor","project":"cursor","session":"c2a22222-2222-4222-8222-222222222222","ts":1772443800000,"turn":0,"text":"does cursor keep chat history locally","content_digest":"c7cf","who":"user","model_source":"unknown"}
 === replies.jsonl (2 lines) ===
-{"id":"cursor:c1a11111-1111-4111-8111-111111111111:0","reply":"the test binds a random port and retries collide - the seed is shared across workers","content_digest":"14c6","reply_chars":84,"reply_truncated":false}
-{"id":"cursor:c1a11111-1111-4111-8111-111111111111:1","reply":"patched the port allocation to derive from the worker id","content_digest":"d7d4","reply_chars":56,"reply_truncated":false}
+{"id":"cursor:c1a11111-1111-4111-8111-111111111111:0","reply":"the test binds a random port and retries collide - the seed is shared across workers","content_digest":"14c6","reply_chars":84,"reply_truncated":false,"reply_lead":1}
+{"id":"cursor:c1a11111-1111-4111-8111-111111111111:1","reply":"patched the port allocation to derive from the worker id","content_digest":"d7d4","reply_chars":56,"reply_truncated":false,"reply_lead":0}
 === sessions.jsonl (2 lines) ===
 {"session":"c1a11111-1111-4111-8111-111111111111","agent":"cursor","project":"flaky-app","n":2,"first_ts":1772366400000,"last_ts":1772366470000,"first_text":"the login test fails every third run, figure out why"}
 {"session":"c2a22222-2222-4222-8222-222222222222","agent":"cursor","project":"cursor","n":1,"first_ts":1772443800000,"last_ts":1772443800000,"first_text":"does cursor keep chat history locally"}

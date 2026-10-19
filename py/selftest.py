@@ -1932,7 +1932,8 @@ def t_canonical_windows():
             timeline = [{"turn": 1, "ts": 100}, {"turn": 2, "ts": 200},
                         {"turn": 3, "ts": 300}]
             selected = [{"turn": 1}, {"turn": 2}]
-            got = explore._events_for_turns("codex", "fixture", selected, timeline)
+            got, _unavailable = explore._events_for_turns(
+                "codex", "fixture", selected, timeline)
             attribution = ([row["turn"] for row in got] == [1, 1, 2, 2]
                            and len({row["name"] for row in got}) == 4)
     finally:
@@ -3538,6 +3539,7 @@ def t_semworker_claim_recovery():
                 semworker._release_start_claim(claim)
             checks["starting_released"] = not start.exists()
 
+            semworker._prepare_ephemeral_coordination_dir()
             lock = semworker.worker_lock_path()
             lock.write_text("{", encoding="utf-8")
             os.utime(lock, (old, old))
@@ -4302,6 +4304,40 @@ def t_cli():
     return ("PASS" if ok else "FAIL", f"run-help={'agrep run' in r1.stdout}, search-rc={r2.returncode}")
 
 
+# A launch still booting has no owner record yet: keep stopping until the status
+# reports neither an owner nor a pending launch.
+_QUIESCE_FIXTURE_DAEMON = """
+import sys, time
+sys.path.insert(0, "py")
+import indexd_runtime
+deadline = time.monotonic() + float(sys.argv[1])
+while True:
+    stopped = indexd_runtime.stop_indexers_for_removal(wait_s=5.0)
+    status = indexd_runtime.indexd_resource_status(include_rss=False)
+    pending = {key: status.get(key) for key in ("running", "starting", "blocked", "state")
+               if status.get(key)}
+    report = f"owner={stopped['owner_state']} pending={pending}"
+    if stopped["ok"] and not pending:
+        print("quiet", report)
+        sys.exit(0)
+    if time.monotonic() >= deadline:
+        print("busy", report)
+        sys.exit(3)
+    time.sleep(0.1)
+"""
+
+
+def _quiesce_fixture_daemon(env: dict, *, timeout_s: float = 60.0) -> tuple[bool, str]:
+    """Stop the freshness daemon a command launched over a scratch data dir and prove the
+    tree quiet, through the product's own pre-removal stop."""
+    r = subprocess.run(
+        [sys.executable, "-c", _QUIESCE_FIXTURE_DAEMON, str(timeout_s)], cwd=REPO,
+        env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout_s + 30)
+    detail = r.stdout.strip() or (r.stderr.strip().splitlines() or ["no report"])[-1]
+    return r.returncode == 0, detail
+
+
 # Status and doctor JSON each emit exactly one object on stdout.
 # Doctor failure states need direct fixtures because ordinary runs rarely reach them.
 def t_doctor_states():
@@ -4310,9 +4346,9 @@ def t_doctor_states():
     import tempfile
     import time as _time
     from pathlib import Path
-    # doctor legitimately kicks a background repair over this fixture; on
-    # Windows that child can briefly hold a file open while the context
-    # manager deletes, and deleting an open file is PermissionError there.
+    # doctor legitimately launches the freshness daemon over this fixture; it
+    # is stopped and proven gone before the directory is removed. On Windows
+    # deleting a file a dying child still holds is PermissionError.
     with tempfile.TemporaryDirectory(
             ignore_cleanup_errors=(os.name == "nt")) as td:
         fix = Path(td)
@@ -4353,9 +4389,10 @@ def t_doctor_states():
         for w in ("not built", cargo_tail):
             if w not in r2.stdout:
                 missing.append(w)
-    ok = not missing and r.returncode == 0 and r2.returncode == 0
+        quiet, quiet_detail = _quiesce_fixture_daemon(env)
+    ok = not missing and r.returncode == 0 and r2.returncode == 0 and quiet
     return ("PASS" if ok else "FAIL",
-            f"missing={missing!r} rc={r.returncode}/{r2.returncode}")
+            f"missing={missing!r} rc={r.returncode}/{r2.returncode} daemon={quiet_detail}")
 
 
 def t_json_surface():
@@ -5578,8 +5615,8 @@ def t_archive():
     import tempfile
     from pathlib import Path as P
     import archive
-    if len(archive.ROOTS) != 17:  # a new adapter should land with its archive glob
-        return ("FAIL", f"ROOTS has {len(archive.ROOTS)} entries, pinned 17 - "
+    if len(archive.ROOTS) != 24:  # a new adapter should land with its archive glob
+        return ("FAIL", f"ROOTS has {len(archive.ROOTS)} entries, pinned 24 - "
                         "add the new store glob AND re-pin here")
     sid = "0199aaaa-bbbb-cccc-dddd-eeeeffff0000"
     saved = {k: getattr(archive, k) for k in
@@ -5604,7 +5641,7 @@ def t_archive():
                 want = src.read_bytes()
                 out = P(td) / "out"
                 rc_to = archive.restore(sid[:8], to=str(out))
-                got = (out / src.name).read_bytes()
+                got = (out / src.relative_to(home)).read_bytes()
                 rc_live = archive.restore(sid[:8])  # source still exists -> must refuse
                 data = bytearray(src.read_bytes())
                 data[10:13] = b"XYZ"  # non-append edit -> prefix check fails -> full store
@@ -5620,7 +5657,7 @@ def t_archive():
                 n_chunks = sum(1 for _ in archive.STORE.rglob("*.xz"))
                 out2 = P(td) / "out2"
                 rc_pruned = archive.restore(sid[:8], to=str(out2))
-                got_pruned = (out2 / src.name).read_bytes()
+                got_pruned = (out2 / src.relative_to(home)).read_bytes()
         finally:
             for k, v in saved.items():
                 setattr(archive, k, v)
