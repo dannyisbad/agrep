@@ -348,16 +348,18 @@ class CodexHookTests(unittest.TestCase):
                 mock.patch.object(hookinstall.console, "WIN", False):
             value = json.loads(hookinstall._codex_hook_payload(self.paths[0]))
             self.assertTrue(hookinstall.install_codex_hooks(warn=False))
-        command = value["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            command = value["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            # the registration is read back on the platform that wrote it
+            operands = hookinstall._codex_command_operands(command)
         launcher = hookinstall.codex_launcher_path(self.paths[0])
         # the command itself is shell-agnostic: a plain `/bin/sh <file>`
         self.assertEqual(shlex.split(command), ["/bin/sh", str(launcher)])
-        self.assertEqual(hookinstall._codex_command_operands(command),
-                         ("launcher", "/bin/sh", str(launcher)))
+        self.assertEqual(operands, ("launcher", "/bin/sh", str(launcher)))
         text = launcher.read_text(encoding="utf-8")
         self.assertIn(f"p={shlex.quote(python)}\n", text)
         self.assertIn('[ -x "$p" ] || p=python3\n', text)
-        self.assertTrue(os.access(launcher, os.X_OK))
+        if os.name != "nt":
+            self.assertTrue(os.access(launcher, os.X_OK))
 
     def test_user_hooks_json_is_never_overwritten(self) -> None:
         user = json.dumps({"hooks": {"SessionStart": [

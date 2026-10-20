@@ -30,6 +30,7 @@ SECRET_PATTERNS = (
     re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
     re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{40,}\b"),
+    re.compile(rb"\bnpm_[A-Za-z0-9_-]{20,}\b"),
     re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(rb"\bAIza[0-9A-Za-z_-]{30,}\b"),
 )

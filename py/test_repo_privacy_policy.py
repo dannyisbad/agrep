@@ -85,13 +85,14 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
             root = Path(raw).resolve()
             suspect = root / "suspect.txt"
             token = "sk-" + "x" * 24
+            npm_token = "npm_" + "n" * 36
             private_ip = ".".join(("100", "100", "10", "20"))
             mac_home = "/".join(("", "Users", "real-person", "project"))
             mac_temp = "/".join((
                 "", "var", "folders", "xy", "fixture" * 6, "T", "artifact"))
             win_home = "C:" + "\\".join(("", "Users", "actual-user", "repo"))
             suspect.write_text(
-                f"{token}\n{private_ip}\n{mac_home}\n{mac_temp}\n{win_home}\n",
+                f"{token}\n{npm_token}\n{private_ip}\n{mac_home}\n{mac_temp}\n{win_home}\n",
                 encoding="utf-8")
             oversized = root / "oversized.txt"
             oversized.write_bytes(
@@ -232,6 +233,33 @@ class RepoPrivacyPolicyTests(unittest.TestCase):
         self.assertIn(
             ("bench/render/capture.txt", "private capture or agent scratch tree"),
             history_findings)
+
+    def test_all_refs_catches_npm_token_without_echoing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            _init_repo(root)
+            safe = root / "safe.txt"
+            safe.write_text("safe", encoding="utf-8")
+            _git(root, "add", "safe.txt")
+            _git(root, "commit", "-qm", "safe root")
+            safe_commit = _git(root, "rev-parse", "HEAD").decode().strip()
+            _git(root, "checkout", "--detach", "-q")
+            token = "npm_" + "z" * 36
+            leak = root / "old-token.txt"
+            leak.write_text(f"revoked={token}\n", encoding="utf-8")
+            _git(root, "add", ".")
+            _git(root, "commit", "-qm", "old token")
+            backup = _git(root, "rev-parse", "HEAD").decode().strip()
+            _git(root, "update-ref", "refs/remotes/origin/backup", backup)
+            _git(root, "checkout", "--detach", "-q", safe_commit)
+
+            output = io.StringIO()
+            with redirect_stderr(output):
+                code = self.validator.main([os.fspath(root), "--all-refs"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("old-token.txt: credential-shaped content", output.getvalue())
+        self.assertNotIn(token, output.getvalue())
 
     def test_all_refs_catches_remote_backup_outside_head(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

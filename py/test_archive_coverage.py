@@ -39,6 +39,10 @@ import archive  # noqa: E402
 LINE = b'{"type":"message","role":"user","content":"%d"}\n'
 
 
+def _stop_command(pid: int) -> str:
+    return f"taskkill /PID {pid} /F" if os.name == "nt" else f"kill {pid}"
+
+
 class _ArchiveSandbox(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -215,6 +219,10 @@ class LiveAppendCaptureTests(_ArchiveSandbox):
         def copy(src, dst, *args, **kwargs):
             real_copy(src, dst, *args, **kwargs)
             if getattr(src, "name", "") == str(self.source):
+                if os.name == "nt":
+                    # Windows refuses to replace a file held open, so a writer's
+                    # window there opens when the copy's read handle closes
+                    src.close()
                 fire()
 
         return mock.patch.multiple(archive, subprocess=mock.Mock(
@@ -430,10 +438,22 @@ class LiveAppendCaptureTests(_ArchiveSandbox):
     def test_a_compressed_chunk_never_writes_below_the_reserve(self) -> None:
         # the clone costs nothing, but the xz output does: on a volume at the reserve
         # the capture defers before a byte of chunk lands, on either copy path
+        host_platform = sys.platform
+        real_run = subprocess.run
+
+        def clone(command, *args, **kwargs):
+            # off macOS there is no `/bin/cp -c`: stand in a clone that skips the
+            # space check, as APFS would
+            if host_platform != "darwin" and command[:2] == ["/bin/cp", "-c"]:
+                shutil.copyfile(command[-2], command[-1])
+                return subprocess.CompletedProcess(command, 0)
+            return real_run(command, *args, **kwargs)
+
         for platform in ("darwin", "linux"):
             with self.subTest(platform=platform), \
                     self._short_volume(archive._COPY_SPACE_RESERVE + 1024), \
-                    mock.patch.object(archive.sys, "platform", platform):
+                    mock.patch.object(archive.sys, "platform", platform), \
+                    mock.patch.object(archive.subprocess, "run", clone):
                 stats = archive.capture()
             self.assertEqual((stats["full"], stats["deferred"]), (0, 1), stats)
             self.assertEqual(stats["deferrals"][0]["kind"], "disk")
@@ -534,7 +554,8 @@ class DaemonCaptureChildTests(unittest.TestCase):
         os.utime(db, (quiet, quiet))
         child = archive.spawn_capture_child()
         self.assertIsNotNone(child)
-        self.assertEqual(os.getpgid(child.pid), os.getpgid(os.getpid()))
+        if hasattr(os, "getpgid"):  # Windows: test_windows_child_uses_the_daemon_no_window_policy
+            self.assertEqual(os.getpgid(child.pid), os.getpgid(os.getpid()))
         self.assertEqual(child.wait(timeout=60), 0)
         records = archive._records()
         self.assertEqual([rec["path"] for rec in records], [str(db)])
@@ -739,7 +760,7 @@ class DaemonCaptureChildTests(unittest.TestCase):
                 verdict = archive.status()
                 self.assertEqual(verdict["state"], "stalled")
                 self.assertIn(f"capture stalled (pid {os.getpid()}", verdict["detail"])
-                self.assertIn(f"stop it with `kill {os.getpid()}`", verdict["detail"])
+                self.assertIn(f"stop it with `{_stop_command(os.getpid())}`", verdict["detail"])
                 self.assertNotIn("daemon", verdict["detail"])
                 out = io.StringIO()
                 with redirect_stdout(out):
@@ -779,7 +800,7 @@ class DaemonCaptureChildTests(unittest.TestCase):
                 liveness[daemon_pid] = False
                 lock = archive._lock_status()
                 self.assertEqual((lock["state"], lock["daemon_live"]), ("busy", False))
-                self.assertIn(f"`kill {os.getpid()}`", archive._running_line(lock))
+                self.assertIn(f"`{_stop_command(os.getpid())}`", archive._running_line(lock))
         finally:
             archive._unlock(holder)
         # a fresh pass starts without a verdict hanging over it

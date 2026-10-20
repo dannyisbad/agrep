@@ -1928,6 +1928,14 @@ def _acquire_request_slot(deadline: float) -> ownerfile.Handle | None:
             _coordination_failure("prepare", exc)) from exc
     path = request_lock_path()
     reminted = False
+
+    def queued() -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ResidentSemanticPreflightTimeout(
+                "semantic request expired while queued")
+        time.sleep(min(REQUEST_SLOT_POLL_S, remaining))
+
     while True:
         try:
             return ownerfile.create_held(
@@ -1957,11 +1965,15 @@ def _acquire_request_slot(deadline: float) -> ownerfile.Handle | None:
                 # The request slot is recreated between serialized callers, so
                 # this exact handoff is contention rather than corruption. Stay
                 # inside the caller's deadline, as for create/snapshot races.
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ResidentSemanticPreflightTimeout(
-                        "semantic request expired while queued")
-                time.sleep(min(REQUEST_SLOT_POLL_S, remaining))
+                queued()
+                continue
+            except PermissionError as exc:
+                # a sibling thread of this process holding or releasing the slot
+                # is the same handoff; any other denial is a fault
+                if not ownerfile.denied_by_own_holder(path, exc):
+                    raise ResidentSemanticPreflightUnavailable(
+                        _coordination_failure("inspect", exc)) from exc
+                queued()
                 continue
             except OSError as exc:
                 raise ResidentSemanticPreflightUnavailable(
@@ -1969,11 +1981,7 @@ def _acquire_request_slot(deadline: float) -> ownerfile.Handle | None:
             if (_request_slot_reclaimable(observed)
                     and _discard_request_record(path, observed)):
                 continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ResidentSemanticPreflightTimeout(
-                    "semantic request expired while queued")
-            time.sleep(min(REQUEST_SLOT_POLL_S, remaining))
+            queued()
         except OSError as exc:
             raise ResidentSemanticPreflightUnavailable(
                 _coordination_failure("create", exc)) from exc

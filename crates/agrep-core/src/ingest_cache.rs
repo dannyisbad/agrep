@@ -10076,13 +10076,25 @@ mod tests {
         assert_eq!(read["claude"].rows.len(), 1);
         assert_eq!(read["claude"].sessions, HashSet::from(["s3".to_owned()]));
 
+        // Synthetic sources keyed as this platform keys them: Windows refuses a bare path key.
+        let synthetic_key = |index: u8| {
+            let path = std::path::PathBuf::from(format!("/fixture/{index}.jsonl"));
+            #[cfg(windows)]
+            {
+                let identity = crate::ingest::registry::WindowsFileIdentity {
+                    kind: 1,
+                    volume: 1,
+                    id: [index; 16],
+                };
+                super::windows_source_key(&path, identity)
+            }
+            #[cfg(not(windows))]
+            {
+                super::source_key(&path)
+            }
+        };
         let mut entries: HashMap<String, super::Entry> = (0..64)
-            .map(|index| {
-                (
-                    format!("/fixture/{index}.jsonl"),
-                    cached_entry(&[test_message("row")]),
-                )
-            })
+            .map(|index| (synthetic_key(index), cached_entry(&[test_message("row")])))
             .collect();
         entries.insert(key.clone(), entry);
         let payload = bincode::serialize(&super::CacheFileRef {

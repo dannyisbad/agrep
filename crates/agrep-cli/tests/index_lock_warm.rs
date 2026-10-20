@@ -18,7 +18,10 @@ const WARM_EXIT_BUDGET: Duration = Duration::from_secs(2);
 const CHILD_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 fn scrub(command: &mut Command, home: &std::path::Path, data: &std::path::Path) {
-    command.env("AGREP_HOME", home).env("AGREP_DATA_DIR", data);
+    command
+        .env("AGREP_HOME", home)
+        .env("AGREP_DATA_DIR", data)
+        .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID);
     for name in [
         "USERPROFILE",
         "HOME",
@@ -26,6 +29,7 @@ fn scrub(command: &mut Command, home: &std::path::Path, data: &std::path::Path) 
         "CLINE_DIR",
         "XDG_CONFIG_HOME",
         "AGREP_RS_BIN",
+        "AGREP_PYTHON_RUNTIME_BUILD_ID",
         "AGREP_DEBUG",
     ] {
         command.env_remove(name);

@@ -1247,7 +1247,8 @@ mod tests {
     }
 
     /// A hot rollback journal no writer holds needs recovery by its agent: a durable defect, as a
-    /// file SQLite rejects as no database is. An empty journal no writer holds is no failure.
+    /// file SQLite rejects as no database is. Windows cannot probe a journal's writer, so there a
+    /// nonempty journal is named and retried instead. An empty journal is no failure.
     #[test]
     fn an_idle_hot_journal_and_a_non_database_are_durable() {
         let dir = temp_dir("open-hot-journal");
@@ -1263,13 +1264,22 @@ mod tests {
         std::fs::write(&journal, b"hot").unwrap();
         let files = [path.clone()];
         let refused = crate::ingest::open_sqlite_ro(&path).err().unwrap();
-        assert_eq!(crate::ingest::sqlite_open_defect(&path, &refused), Some("needs-recovery"));
-        assert_eq!(collect_db(&path).2, ReadOutcome::Invalid);
-        let mut hot = IngestCache::cold();
-        collect_cached_for(&mut hot, "opencode", &dir, &files, collect_db);
-        assert!(!hot.output_complete());
-        let issue = &hot.source_read_issues()[0];
-        assert!(!issue.retryable && !issue.moving && issue.unreadable_material(), "{issue:?}");
+        #[cfg(not(windows))]
+        {
+            assert_eq!(crate::ingest::sqlite_open_defect(&path, &refused), Some("needs-recovery"));
+            assert_eq!(collect_db(&path).2, ReadOutcome::Invalid);
+            let mut hot = IngestCache::cold();
+            collect_cached_for(&mut hot, "opencode", &dir, &files, collect_db);
+            assert!(!hot.output_complete());
+            let issue = &hot.source_read_issues()[0];
+            assert!(!issue.retryable && !issue.moving && issue.unreadable_material(), "{issue:?}");
+        }
+        #[cfg(windows)]
+        {
+            assert!(refused.to_string().contains(crate::ingest::JOURNAL_PRESENT), "{refused}");
+            assert_eq!(crate::ingest::sqlite_open_defect(&path, &refused), None);
+            assert_eq!(collect_db(&path).2, ReadOutcome::Unavailable);
+        }
 
         std::fs::remove_file(&journal).unwrap();
         std::fs::write(&path, b"not a database, and never one").unwrap();

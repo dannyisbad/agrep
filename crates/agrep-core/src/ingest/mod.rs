@@ -877,7 +877,13 @@ impl WindowsSqliteGuard {
             }
             files.push(file);
         }
+        // SQLite never rolls back an empty journal, so one is read past. This platform cannot
+        // probe for a journal's writer, so any other journal is named instead of read.
         match std::fs::symlink_metadata(sqlite_sidecar(path, "-journal")) {
+            Ok(journal)
+                if journal.len() == 0
+                    && journal.is_file()
+                    && !crate::ingest::registry::metadata_is_link(&journal) => {}
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,

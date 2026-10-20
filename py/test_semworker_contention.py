@@ -365,6 +365,33 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             self.assertTrue(semworker._release_request_slot(again))
         self.assertFalse(path.exists())
 
+    def test_a_denied_inspection_waits_only_on_this_process_holder(self) -> None:
+        # Windows can refuse to open the slot a sibling thread holds: contention while this
+        # process holds it, a refusal for every other denial
+        denied = PermissionError(13, "Access is denied")
+        with mock.patch.object(
+                common, "process_start_identity", return_value="self-birth"):
+            slot = semworker._acquire_request_slot(time.monotonic() + 1.0)
+            self.assertIsNotNone(slot)
+            try:
+                with mock.patch.object(
+                        semworker, "_own_record_snapshot", side_effect=denied):
+                    with mock.patch.object(semworker.ownerfile, "_WINDOWS", True):
+                        with self.assertRaises(semworker.ResidentSemanticPreflightTimeout):
+                            semworker._acquire_request_slot(time.monotonic() + 0.2)
+                    for windows in (True, False):
+                        with self.subTest(windows=windows), \
+                                mock.patch.object(semworker.ownerfile, "_WINDOWS", windows), \
+                                mock.patch.object(
+                                    semworker.ownerfile, "holds_record",
+                                    return_value=not windows):
+                            with self.assertRaisesRegex(
+                                    semworker.ResidentSemanticPreflightUnavailable,
+                                    "cannot inspect"):
+                                semworker._acquire_request_slot(time.monotonic() + 1.0)
+            finally:
+                self.assertTrue(semworker._release_request_slot(slot))
+
     def test_request_coordination_respects_removal_fence(self) -> None:
         with mock.patch.object(
                 semworker.removal_fence, "background_removal_active",

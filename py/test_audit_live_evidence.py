@@ -67,11 +67,17 @@ def _corpus(path: Path, agents: tuple[str, ...]) -> None:
 
 
 def _bincode_str(value: str) -> bytes:
-    if os.name == "nt":
-        units = value.encode("utf-16-le")
-        return struct.pack("<Q", len(units) // 2) + units
     body = value.encode("utf-8")
     return struct.pack("<Q", len(body)) + body
+
+
+def _bincode_path(path: str, os_name: str | None = None) -> bytes:
+    """registry.rs `SourceFile.path`: UTF-8 bytes, or UTF-16 units under Windows'
+    `windows_path_serde`. Every other snapshot string is UTF-8 on every platform."""
+    if (os_name or os.name) == "nt":
+        units = path.encode("utf-16-le")
+        return struct.pack("<Q", len(units) // 2) + units
+    return _bincode_str(path)
 
 
 def _write_inventory(data: Path, paths: list[str], *, selection: str = "all",
@@ -81,9 +87,32 @@ def _write_inventory(data: Path, paths: list[str], *, selection: str = "all",
     body = struct.pack("<II", version, 37) + _bincode_str(selection)
     body += struct.pack("<Q", len(paths))
     for path in paths:
-        body += _bincode_str("agent") + _bincode_str(path) + struct.pack("<QQI", 1, 1, 0)
+        body += _bincode_str("agent") + _bincode_path(path) + struct.pack("<QQI", 1, 1, 0)
     body += struct.pack("<?", complete)
     (data / ".source_snapshot.bin").write_bytes(body)
+
+
+def _wait_past_inventory(data: Path) -> None:
+    """Let a later write stamp strictly after the published inventory's mtime, which
+    canaries are judged against: Linux ctime ticks coarsely, and an NTFS write time
+    can share the inventory's clock tick."""
+    snapshot = data / ".source_snapshot.bin"
+    if os.name != "nt":
+        wait_for_next_ctime_tick(snapshot)
+        return
+    before = snapshot.stat().st_mtime_ns
+    probe = data / ".mtime-probe"
+    deadline = time.monotonic() + 5.0
+    try:
+        while True:
+            probe.write_bytes(b"tick")
+            if probe.stat().st_mtime_ns > before:
+                return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"mtime never advanced past {snapshot} within 5 s")
+            time.sleep(0.001)
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 class LiveEvidenceTests(unittest.TestCase):
@@ -865,27 +894,16 @@ class LiveEvidenceTests(unittest.TestCase):
             "/h/lossy\ufffd.jsonl",
             "/h/.claude/projects/-a/" + "y" * 16 + ".jsonl",  # same length bucket, other body
         ]
-        body = struct.pack("<II", audit._SOURCE_SNAPSHOT_VERSION, 37) + _bincode_str("all")
-        body += struct.pack("<Q", len(listed_paths))
-        for path in listed_paths:
-            # Zero-heavy neighbours: a small u64 file length and a None option tag.
-            body += (_bincode_str("claude") + _bincode_str(path)
-                     + struct.pack("<QQIIQ?", 1, 0, 0, 0, 0, False))
-        body += struct.pack("<?", True)
         for os_name in ("posix", "nt"):
             with self.subTest(os_name=os_name), mock.patch.object(audit.os, "name", os_name):
                 encoded = {path: audit._encoded_path(path) for path in listed_paths}
-                buffer = body
-                if os_name == "nt":
-                    buffer = struct.pack("<II", audit._SOURCE_SNAPSHOT_VERSION, 37)
-                    buffer += struct.pack("<Q", 3) + "all".encode("utf-16-le")
-                    buffer += struct.pack("<Q", len(listed_paths))
-                    for path in listed_paths:
-                        length, units = encoded[path]
-                        buffer += (struct.pack("<Q", 6) + "claude".encode("utf-16-le")
-                                   + struct.pack("<Q", length) + units
-                                   + struct.pack("<QQIIQ?", 1, 0, 0, 0, 0, False))
-                    buffer += struct.pack("<?", True)
+                buffer = (struct.pack("<II", audit._SOURCE_SNAPSHOT_VERSION, 37)
+                          + _bincode_str("all") + struct.pack("<Q", len(listed_paths)))
+                for path in listed_paths:
+                    # Zero-heavy neighbours: a small u64 file length and a None option tag.
+                    buffer += (_bincode_str("claude") + _bincode_path(path, os_name)
+                               + struct.pack("<QQIIQ?", 1, 0, 0, 0, 0, False))
+                buffer += struct.pack("<?", True)
                 listed = audit._inventory_lists(buffer, set(listed_paths) | set(absent_paths))
                 for path in listed_paths:
                     self.assertIs(listed[path], True, path)
@@ -903,7 +921,7 @@ class LiveEvidenceTests(unittest.TestCase):
         body = struct.pack("<II", audit._SOURCE_SNAPSHOT_VERSION, 37) + _bincode_str("all")
         body += struct.pack("<Q", len(paths))
         for path in paths:
-            body += (_bincode_str("codex") + _bincode_str(path)
+            body += (_bincode_str("codex") + _bincode_path(path)
                      + struct.pack("<QQIIQ?", 1, 0, 0, 0, 0, False))
         body += struct.pack("<?", True)
         orphans = {p.replace("rollout", "rotated") for p in paths[:4_000]} | set(paths[4_000:])
@@ -1005,12 +1023,13 @@ class LiveEvidenceTests(unittest.TestCase):
 
     def test_pruning_refuses_when_present_sources_are_not_found_in_the_inventory(self):
         # The scan proves its own encoding on sources the last pass must have walked. A
-        # reader whose encoding differs from the writer's (UTF-16 units against a UTF-8
-        # inventory here) finds none of them, and must prune nothing.
+        # reader whose encoding differs from the writer's (the other platform's path
+        # encoding here) finds none of them, and must prune nothing.
         real_scan = audit._inventory_lists
+        foreign = "posix" if os.name == "nt" else "nt"
 
-        def utf16_scan(inventory, paths):
-            with mock.patch.object(audit.os, "name", "nt"):
+        def foreign_scan(inventory, paths):
+            with mock.patch.object(audit.os, "name", foreign):
                 return real_scan(inventory, paths)
 
         with tempfile.TemporaryDirectory() as raw:
@@ -1018,7 +1037,7 @@ class LiveEvidenceTests(unittest.TestCase):
             data, _store, source, book_path, book = self._orphan_fixture(root)
             discovered = [("codex", str(source))]
             with mock.patch.object(index_lock, "INDEX_LOCK_PATH", data / ".index.lock"):
-                with mock.patch.object(audit, "_inventory_lists", side_effect=utf16_scan):
+                with mock.patch.object(audit, "_inventory_lists", side_effect=foreign_scan):
                     rc, payload, _ = self._run(data, discovered, ["--full"], indexed=())
                 self.assertEqual(rc, 0, payload)
                 self.assertEqual(payload["orphaned_tallies"], 1)
@@ -1037,7 +1056,7 @@ class LiveEvidenceTests(unittest.TestCase):
                         mock.patch.object(audit, "_discovered", return_value=discovered), \
                         mock.patch.object(audit, "_live_tokens", return_value={}), \
                         mock.patch.object(audit, "_indexed_agents", return_value=set()), \
-                        mock.patch.object(audit, "_inventory_lists", side_effect=utf16_scan), \
+                        mock.patch.object(audit, "_inventory_lists", side_effect=foreign_scan), \
                         redirect_stdout(stdout), redirect_stderr(io.StringIO()):
                     audit.main(["--full"])
                 self.assertIn("not pruned: 1 present tallied source", stdout.getvalue())
@@ -1052,7 +1071,7 @@ class LiveEvidenceTests(unittest.TestCase):
             root = Path(raw)
             data, store, source, book_path, book = self._orphan_fixture(root)
             # Written after the inventory: the last pass could not have walked it.
-            wait_for_next_ctime_tick(data / ".source_snapshot.bin")
+            _wait_past_inventory(data)
             fresh = store / "fresh.jsonl"
             fresh.write_text("{}\n", encoding="utf-8")
             # Restored after the inventory: an old mtime, a new change time.
@@ -1118,7 +1137,7 @@ class LiveEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             data, _store, source, book_path, book = self._orphan_fixture(root)
-            wait_for_next_ctime_tick(data / ".source_snapshot.bin")
+            _wait_past_inventory(data)
             with source.open("a", encoding="utf-8") as stream:
                 stream.write("{}\n")
             book[str(source)] = _entry("codex", source)
