@@ -378,6 +378,14 @@ result.write_text(str(handle.release()), encoding="ascii")
         self.assertEqual(seen, {"during": False})
         self.assertFalse(ownerfile.stranded_own_record(
             os.getpid(), start, "a" * 32, process_start=lambda _pid: start))
+        self.assertTrue(ownerfile.holds_record(path))
+        denied = PermissionError(13, "Access is denied")
+        with mock.patch.object(ownerfile, "_WINDOWS", True):
+            self.assertTrue(ownerfile.denied_by_own_holder(path, denied))
+            self.assertFalse(ownerfile.denied_by_own_holder(path, OSError(5, "I/O error")))
+            self.assertFalse(ownerfile.denied_by_own_holder(self.root / "other.lock", denied))
+        with mock.patch.object(ownerfile, "_WINDOWS", False):
+            self.assertFalse(ownerfile.denied_by_own_holder(path, denied))
         with mock.patch.object(ownerfile, "_lock_descriptor", return_value="busy"), \
                 mock.patch.object(ownerfile, "_SLOT_MUTEX_WAIT_S", 0.01):
             (self.root / ownerfile.SLOT_MUTEX_NAME).touch()
@@ -386,6 +394,7 @@ result.write_text(str(handle.release()), encoding="ascii")
         self.assertEqual(path.read_bytes(), b"owner")
         self.assertTrue(ownerfile.stranded_own_record(
             os.getpid(), start, "a" * 32, process_start=lambda _pid: start))
+        self.assertFalse(ownerfile.holds_record(path))
         self.assertFalse(ownerfile.stranded_own_record(
             os.getpid() + 1, start, "a" * 32, process_start=lambda _pid: start))
         self.assertFalse(ownerfile.stranded_own_record(

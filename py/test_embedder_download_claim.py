@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import subprocess
@@ -107,12 +108,13 @@ class DownloadClaimTests(unittest.TestCase):
         # which sent the reader hunting for a file that was right there.
         with self.assertRaisesRegex(
                 embedder.EmbedderUnavailable,
-                rf"^model files missing under {self.root}: model\.bin$"):
+                rf"^model files missing under {re.escape(str(self.root))}: model\.bin$"):
             embedder.ensure_model(download=False)
         (self.root / "model.bin").write_bytes(b"pinned-mode1")
         with self.assertRaisesRegex(
                 embedder.EmbedderUnavailable,
-                rf"^model files failed size/SHA-256 verification under {self.root}: "
+                rf"^model files failed size/SHA-256 verification under "
+                rf"{re.escape(str(self.root))}: "
                 r"model\.bin \(`agrep -s <query>` or `agrep setup` re-fetches them\)$"):
             embedder.ensure_model(download=False)
         # A later permitted fetch replaces it in place; nothing to delete first.

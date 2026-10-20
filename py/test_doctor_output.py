@@ -1417,6 +1417,11 @@ class DoctorInterruptedPassTests(unittest.TestCase):
         self.assertNotIn("search db", _render_report(snapshot))
 
 
+def _sidecar_fix(command: str, path: str) -> str:
+    """source_health's remedy: a quoted shell command on POSIX, prose elsewhere."""
+    return f"`{command} {path}`" if os.name == "posix" else "fix its owner or permissions"
+
+
 class DoctorInaccessibleSidecarTests(unittest.TestCase):
     """A store sidecar this user cannot read and write: doctor named it 'another agrep' or not
     at all, and gave no remedy."""
@@ -1429,12 +1434,12 @@ class DoctorInaccessibleSidecarTests(unittest.TestCase):
         self.assertEqual(line, (
             "the search index cannot be updated - its rollback journal at "
             "/fixture/data/corpus.db-journal is owned by root, so no index pass can use it: "
-            "`sudo chown $USER /fixture/data/corpus.db-journal`, then `agrep index`"))
+            f"{_sidecar_fix('sudo chown $USER', '/fixture/data/corpus.db-journal')}, "
+            "then `agrep index`"))
         own = dict(self.ROOT_OWNED, store="event store", owner=None,
                    path="/fixture/data/events/.store.sqlite3-journal")
         self.assertIn("is not readable and writable by you, so no index pass can use it: "
-                      "`chmod u+rw /fixture/data/events/.store.sqlite3-journal`, then "
-                      "`agrep index`",
+                      f"{_sidecar_fix('chmod u+rw', own['path'])}, then `agrep index`",
                       doctor.source_health.inaccessible_sidecar_line(own, "agrep index"))
 
     def test_the_report_gives_each_one_a_row(self) -> None:
@@ -1453,7 +1458,9 @@ class DoctorInaccessibleSidecarTests(unittest.TestCase):
         rows = [row for row in rendered.splitlines() if "[!! ]" in row and "owned by" in row]
         self.assertEqual([row.split()[2:4] for row in rows],
                          [["search", "db"], ["event", "store"]])
-        self.assertTrue(all("`sudo chown $USER " in row for row in rows), rows)
+        paths = [item["path"] for item in snapshot["core"]["inaccessible_sidecars"]]
+        self.assertTrue(all(_sidecar_fix("sudo chown $USER", path) in row
+                            for row, path in zip(rows, paths)), rows)
         self.assertNotIn("unreadable -", rendered)
         self.assertNotIn("another agrep", rendered)
 
@@ -1523,7 +1530,8 @@ class DoctorInaccessibleSidecarTests(unittest.TestCase):
                                return_value=(2, 7)):
             line = doctor.source_health.inaccessible_sidecar_line(self.ROOT_OWNED, "agrep index")
         self.assertTrue(line.endswith(
-            "`sudo chown $USER /fixture/data/corpus.db-journal`, then update agrep to index it "
+            f"{_sidecar_fix('sudo chown $USER', '/fixture/data/corpus.db-journal')}, "
+            "then update agrep to index it "
             "again (a newer agrep owns this data dir, and this one cannot index it)"), line)
         self.assertNotIn("`agrep index`", line)
 

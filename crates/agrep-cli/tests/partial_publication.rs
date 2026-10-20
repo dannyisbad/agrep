@@ -66,7 +66,8 @@ fn try_index(home: &Path, data: &Path, extra: &[&str], panic: Option<&Path>) -> 
         .args(extra)
         .env_clear()
         .env("AGREP_HOME", home)
-        .env("AGREP_DATA_DIR", data);
+        .env("AGREP_DATA_DIR", data)
+        .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID);
     if let Some(panic) = panic {
         cmd.env("AGREP_TEST_PARSE_PANIC", panic);
     }
@@ -871,10 +872,15 @@ fn an_idle_empty_journal_reads_as_usual() {
 
 /// A live writer holding its transaction open across many passes, with or without a write yet,
 /// is never a persistent failure: its store is read when it can be, retried when it cannot, and
-/// never marked or left out by the consent.
+/// never marked or left out by the consent. A write leaves a rollback journal, whose writer only
+/// POSIX can probe; Windows names that journal instead of promising a retry.
 #[test]
 fn a_long_held_write_transaction_is_never_left_out() {
-    for write in ["", "UPDATE session SET time_created = time_created + 1;"] {
+    #[cfg(windows)]
+    let writes = [""];
+    #[cfg(not(windows))]
+    let writes = ["", "UPDATE session SET time_created = time_created + 1;"];
+    for write in writes {
         let home = opencode_home();
         with_claude(&home);
         let data = temp_dir("partial-held-writer-data");
@@ -979,6 +985,7 @@ fn a_wal_commit_caught_by_the_postflight_snapshot_is_retried() {
         .env_clear()
         .env("AGREP_HOME", &home)
         .env("AGREP_DATA_DIR", &data)
+        .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID)
         .env("AGREP_TEST_PARK", &park)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1034,6 +1041,7 @@ fn consent_with_cursor_write_at(home: &Path, data: &Path, step: &str, write: &st
         .env_clear()
         .env("AGREP_HOME", home)
         .env("AGREP_DATA_DIR", data)
+        .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID)
         .env("AGREP_TEST_PARK", &park)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1057,7 +1065,8 @@ fn consent_with_cursor_write_at(home: &Path, data: &Path, step: &str, write: &st
 
 /// A writer that takes Cursor's database after the census listed it fails the collector's own
 /// open; one that commits between that open and the read moves the generation under it. Neither
-/// is dropped by the consent's rebuild, however often it repeats.
+/// is dropped by the consent's rebuild, however often it repeats. The held writer's rollback
+/// journal is retried only where its writer can be probed (POSIX); Windows names it instead.
 #[test]
 fn a_cursor_store_written_during_the_pass_is_never_dropped() {
     let home = cursor_home();
@@ -1065,14 +1074,19 @@ fn a_cursor_store_written_during_the_pass_is_never_dropped() {
     let data = temp_dir("partial-cursor-write-data");
     run_index(&home, &data, &[], None);
     let published = fs::read(data.join("messages.jsonl")).unwrap();
-    let locked = consent_with_cursor_write_at(
-        &home,
-        &data,
-        "cursor-open",
-        "BEGIN IMMEDIATE; INSERT INTO cursorDiskKV VALUES ('churn', 'x');",
-    );
-    retried_not_dropped(&locked, &data, &published, "locked");
-    assert!(String::from_utf8_lossy(&locked.stderr).contains("cursor database could not be opened"));
+    #[cfg(not(windows))]
+    {
+        let locked = consent_with_cursor_write_at(
+            &home,
+            &data,
+            "cursor-open",
+            "BEGIN IMMEDIATE; INSERT INTO cursorDiskKV VALUES ('churn', 'x');",
+        );
+        retried_not_dropped(&locked, &data, &published, "locked");
+        assert!(
+            String::from_utf8_lossy(&locked.stderr).contains("cursor database could not be opened")
+        );
+    }
     for round in 0..2 {
         let moved = consent_with_cursor_write_at(
             &home,
@@ -1139,7 +1153,8 @@ fn consent_at(home: &Path, data: &Path, now_ns: Option<i64>) -> Output {
         .args(CONSENT)
         .env_clear()
         .env("AGREP_HOME", home)
-        .env("AGREP_DATA_DIR", data);
+        .env("AGREP_DATA_DIR", data)
+        .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID);
     if let Some(now_ns) = now_ns {
         cmd.env("AGREP_TEST_NOW_NS", now_ns.to_string());
     }
@@ -1453,7 +1468,9 @@ fn a_stuck_chat_in_a_busy_crush_database_persists() {
 }
 
 /// A writer that holds Cursor's database when the census reads it is a lock, not a defect: the
-/// refusal promises the retry that will read it.
+/// refusal promises the retry that will read it. Its rollback journal's writer can be probed only
+/// on POSIX; Windows names the journal instead of promising a retry.
+#[cfg(not(windows))]
 #[test]
 fn a_cursor_store_locked_at_its_census_will_retry() {
     let home = cursor_home();
@@ -1529,6 +1546,7 @@ fn index_within(home: &Path, data: &Path, limit: std::time::Duration) -> Option<
         .env_clear()
         .env("AGREP_HOME", home)
         .env("AGREP_DATA_DIR", data)
+        .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1820,6 +1838,7 @@ impl HeldTranscript {
             .env_clear()
             .env("AGREP_HOME", &self.home)
             .env("AGREP_DATA_DIR", &self.data)
+            .env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         if let Some(park) = park {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -480,9 +481,16 @@ class WriterInProgressReadsTests(unittest.TestCase):
         events._close_event_reader()
         self.addCleanup(events._close_event_reader)
         return events_dir
+    @contextmanager
+    def _temporary_events(self):
+        with tempfile.TemporaryDirectory() as raw:
+            try:
+                yield raw
+            finally:
+                events._close_event_reader()
 
     def test_a_held_write_transaction_does_not_blind_direct_readers(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             events_dir = self._publish(raw)
             store = events_dir / events.EVENT_STORE_NAME
@@ -521,7 +529,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
             self.assertEqual(events.event_blob("codex", "s1"), self.PAYLOAD)
 
     def test_a_writer_arriving_mid_bulk_read_does_not_fail_it(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             events_dir = self._publish(raw)
             store = events_dir / events.EVENT_STORE_NAME
@@ -541,7 +549,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
 
     def test_a_crashed_writers_hot_journal_reads_as_unavailable_not_absent(
             self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             events_dir = self._publish(raw)
             store = events_dir / events.EVENT_STORE_NAME
@@ -745,7 +753,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
                 events.open_sqlite_snapshot(store)
 
     def test_an_idle_cached_reader_is_released_and_reopened(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             self._publish(raw)
             self.assertEqual(events.event_blob("codex", "s1"), self.PAYLOAD)
@@ -772,7 +780,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
     def test_an_idle_cached_reader_closes_without_another_lookup(self) -> None:
         # A long-lived process (explorer server, daemon) used to keep the store open
         # until its next lookup, which on Windows blocks the corrupt-store rebuild.
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"), \
                 mock.patch.object(events, "_EVENT_READER_IDLE_S", 0.2):
             self._publish(raw)
@@ -784,7 +792,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
             self.assertIsNot(events._EVENT_READER_LOCAL.state["connection"], cached)
 
     def test_the_idle_reaper_never_closes_a_reader_mid_lookup(self) -> None:
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"), \
                 mock.patch.object(events, "_EVENT_READER_IDLE_S", 0.2):
             events_dir = self._publish(raw)
@@ -801,7 +809,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
     def test_an_open_racing_a_commit_waits_instead_of_reporting_unavailable(self) -> None:
         # A commit rewrites the main file's pages (about 70 ms for a 25 MB payload); an
         # open whose identity recheck lands inside it used to read as unavailable at once.
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             self._publish(raw)
             real = events._event_store_stamp
@@ -824,7 +832,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
         # the new generation first used to report unavailable after three 1 ms retries.
         import threading
 
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             events_dir = self._publish(raw)
             marker = events_dir / events.EVENT_GENERATION_NAME
@@ -845,7 +853,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
         # the whole marker loop (about 0.2 s): `summary` at real scale took 558 s, not 14 s.
         import threading
 
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"):
             events_dir = self._publish(raw)
             marker = events_dir / events.EVENT_GENERATION_NAME
@@ -878,7 +886,7 @@ class WriterInProgressReadsTests(unittest.TestCase):
         import threading
         import warnings
 
-        with tempfile.TemporaryDirectory() as raw, \
+        with self._temporary_events() as raw, \
                 mock.patch.object(events, "EVENTS_DIR", Path(raw) / "events"), \
                 mock.patch.object(events, "_EVENT_READER_IDLE_S", 0.2):
             self._publish(raw)
@@ -1267,7 +1275,10 @@ class InaccessibleSidecarProbeTests(unittest.TestCase):
         line = source_health.inaccessible_sidecar_line(sidecars[0], "agrep index")
         self.assertIn("is closed to you by a file flag or an access-control list", line)
         self.assertNotIn("chmod u+rw", line)
-        self.assertIn("chflags nouchg" if sys.platform == "darwin" else "chattr -i", line)
+        expected = ("chflags nouchg" if sys.platform == "darwin"
+                    else ("fix its owner or permissions" if os.name == "nt"
+                          else "chattr -i"))
+        self.assertIn(expected, line)
 
     def test_the_writer_preflight_calls_it_a_blocked_sidecar_not_an_owner(self) -> None:
         import corpusdb

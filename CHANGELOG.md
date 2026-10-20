@@ -2,6 +2,10 @@
 
 ## 0.4.5 — 2026-10-12
 
+### Release safety
+
+- Privacy preflight now detects npm access tokens in the worktree, index, and reachable Git history without echoing token contents.
+
 ### Index integrity and recovery
 
 - Publication and retry paths preserve already-published rows across unreadable

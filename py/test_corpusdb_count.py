@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -494,15 +495,22 @@ class CorpusCoverageCountTests(unittest.TestCase):
         self.assertEqual(self._term_counts(trace), [])
 
         other.close()
+        original_identity = original._source_identity
+        # Windows refuses to replace a database file another connection holds open
+        held_open = os.name != "nt"
+        if not held_open:
+            original.close()
         other_path.replace(self.path)
         replacement = self._reader()
+        self.assertNotEqual(replacement._source_identity, original_identity)
         self.assertEqual(corpusdb.term_session_df(replacement, self.TERMS), {
             "beta": 1.0, "alpha": 0.0, "absent": 0.0,
         })
         self._assert_hits(
             corpusdb.coverage_rank(replacement, self.QUERY, 50), other_expected)
-        self.assertEqual(corpusdb.term_session_df(original, self.TERMS), frequencies)
-        self._assert_hits(corpusdb.coverage_rank(original, self.QUERY, 50), expected)
+        if held_open:
+            self.assertEqual(corpusdb.term_session_df(original, self.TERMS), frequencies)
+            self._assert_hits(corpusdb.coverage_rank(original, self.QUERY, 50), expected)
 
     def test_alias_cache_identity_includes_wal_not_only_main_file(self) -> None:
         writer = sqlite3.connect(self.path)

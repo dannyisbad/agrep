@@ -2696,11 +2696,15 @@ class NewerAnchorSurfaces(unittest.TestCase):
 
     def _cli(self, *args: str, daemon: bool = True) -> subprocess.CompletedProcess:
         env = dict(self.env)
-        if daemon:
+        if daemon and os.name != "nt":
             # the freshness spawn is what observes the fence and names it; it
             # launches nothing under a newer anchor (AGREP_NO_DAEMON would
             # name itself instead, a user-chosen cause outranking the fence)
             env.pop("AGREP_NO_DAEMON", None)
+        elif daemon:
+            # Windows keeps detached daemon handles open until idle exit, which
+            # would outlive this temporary data directory.
+            env["AGREP_NO_DAEMON"] = "1"
         return subprocess.run(
             [sys.executable, "-c", _WIDE_BUDGET_CLI, *args],
             cwd=os.fspath(ROOT), env=env, capture_output=True, text=True,

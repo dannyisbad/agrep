@@ -748,18 +748,28 @@ class RunLaunchesTheForkTheUserNamed(unittest.TestCase):
         self.bin.mkdir()
 
     def _stub(self, name: str) -> Path:
+        # PATH lookup on Windows only resolves PATHEXT names, as npm's `pi.cmd` shims are
+        if os.name == "nt":
+            path = self.bin / f"{name}.cmd"
+            path.write_text(f"@echo I am {name}\r\n", encoding="utf-8")
+            return path
         path = self.bin / name
         path.write_text(f"#!/bin/sh\necho I am {name}\n", encoding="utf-8")
         path.chmod(0o755)
         return path
 
+    @staticmethod
+    def _resolved(found: tuple[str, str | None]) -> tuple[str, Path | None]:
+        # Windows paths compare case-insensitively, as PATHEXT's spelling may differ
+        return found[0], (Path(found[1]) if found[1] else None)
+
     def test_new_session_exe_prefers_the_typed_spelling(self) -> None:
         pi, omp = self._stub("pi"), self._stub("omp")
         with mock.patch.dict(os.environ, {"PATH": str(self.bin)}):
-            self.assertEqual(native.new_session_exe("pi", "pi"), ("pi", str(pi)))
-            self.assertEqual(native.new_session_exe("pi", "omp"), ("omp", str(omp)))
+            self.assertEqual(self._resolved(native.new_session_exe("pi", "pi")), ("pi", pi))
+            self.assertEqual(self._resolved(native.new_session_exe("pi", "omp")), ("omp", omp))
             pi.unlink()
-            self.assertEqual(native.new_session_exe("pi", "pi"), ("omp", str(omp)))
+            self.assertEqual(self._resolved(native.new_session_exe("pi", "pi")), ("omp", omp))
             omp.unlink()
             self.assertEqual(native.new_session_exe("pi", "pi"), ("pi", None))
 
@@ -785,7 +795,7 @@ class RunLaunchesTheForkTheUserNamed(unittest.TestCase):
                 mock.patch("hookless.live.watcher", return_value=None):
             self.assertEqual(cli.cmd_run(SimpleNamespace(rest=["pi"])), 0)
             self.assertEqual(cli.cmd_run(SimpleNamespace(rest=["omp"])), 0)
-        self.assertEqual([Path(argv[0]).name for argv in launched], ["pi", "omp"])
+        self.assertEqual([Path(argv[0]).stem for argv in launched], ["pi", "omp"])
 
 
 @unittest.skipUnless(POSIX and shutil.which("perl"), "sh sentinel needs perl")

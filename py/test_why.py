@@ -3172,7 +3172,13 @@ class PartialPublicationTests(_VerdictAssertions):
             self.assertTrue(opencode.with_name("opencode.db-journal").exists())
             refused = self.sandbox.cli("reindex", "--full", "--no-build")
             self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-            self.assertIn("will retry", refused.stderr)
+            if os.name == "nt":
+                # no writer's lock can be probed here: the journal is named with how its agent
+                # recovers it and promised no retry (docs/OUTPUT_CONTRACTS.md), never dropped
+                self.assertIn("a rollback journal is present beside", refused.stderr)
+                self.assertNotIn("will retry", refused.stderr)
+            else:
+                self.assertIn("will retry", refused.stderr)
             self.assertNotIn("to rebuild without", refused.stderr)
             self.assertNotIn("rebuilt without", refused.stdout)
             self.assertEqual(self.hit_sessions("quince"), {"ses_quince"})
@@ -3526,6 +3532,9 @@ class PartialPublicationTests(_VerdictAssertions):
         held = [{"agent": "crush", "kind": "source-read-failed", "blocks_publication": True}]
         newer = ("update agrep to index it again (a newer agrep owns this data dir, and this one "
                  "cannot index it)")
+        # source_health quotes a shell command only on POSIX
+        fix = ("`chmod u+rw /d/corpus.db-journal`" if os.name == "posix"
+               else "fix its owner or permissions")
         for anchor in (None, (2, None)):
             with self.subTest(newer=anchor is not None), \
                     mock.patch.object(source_health, "store_sidecars_blocked",
@@ -3545,7 +3554,7 @@ class PartialPublicationTests(_VerdictAssertions):
                 }
                 for name, line in lines.items():
                     with self.subTest(line=name):
-                        self.assertIn("index updates wait on /d/corpus.db-journal: `chmod u+rw",
+                        self.assertIn(f"index updates wait on /d/corpus.db-journal: {fix}, then",
                                       line)
                         self.assertNotIn("rolls it back", line)
                         if anchor is not None:

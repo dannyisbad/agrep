@@ -154,7 +154,12 @@ class Handle:
 # token that is not here was stranded by a release that could not finish, and only this
 # process may reclaim it (every other process sees a live holder)
 _HELD_TOKENS: set[str] = set()
+_HELD_PATHS: dict[str, str] = {}  # token -> the record path its holder registered
 _HELD_TOKENS_LOCK = threading.Lock()
+
+
+def _held_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
 
 
 def create_held(path: Path, raw: bytes, *, token: str, **kwargs: object) -> Handle:
@@ -163,6 +168,7 @@ def create_held(path: Path, raw: bytes, *, token: str, **kwargs: object) -> Hand
     fresh record a stranded one of its own; it stays registered until the handle's release."""
     with _HELD_TOKENS_LOCK:
         _HELD_TOKENS.add(token)
+        _HELD_PATHS[token] = _held_key(path)
     try:
         handle = create_exclusive(path, raw, **kwargs)
     except BaseException:
@@ -176,6 +182,22 @@ def forget_held(token: str | None) -> None:
     if token is not None:
         with _HELD_TOKENS_LOCK:
             _HELD_TOKENS.discard(token)
+            _HELD_PATHS.pop(token, None)
+
+
+def holds_record(path: Path) -> bool:
+    """Whether a holder in this process registered the record at `path`: creating, holding or
+    still releasing it."""
+    key = _held_key(path)
+    with _HELD_TOKENS_LOCK:
+        return any(token in _HELD_TOKENS and held == key
+                   for token, held in _HELD_PATHS.items())
+
+
+def denied_by_own_holder(path: Path, error: OSError) -> bool:
+    """Windows refuses to open a record while another handle or a release in progress has it;
+    with a holder in this process registered on `path`, that refusal is a handoff, not a fault."""
+    return _WINDOWS and isinstance(error, PermissionError) and holds_record(path)
 
 
 def stranded_own_record(
@@ -463,6 +485,9 @@ class _SlotMutex:
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+    def release(self) -> None:
         fd, self._fd = self._fd, None
         if fd is not None:
             try:
@@ -635,6 +660,10 @@ def remove_record_dir(path: Path) -> bool:
                 if (mutex.state == "held"
                         and os.listdir(path) != [SLOT_MUTEX_NAME]):
                     return False
+                if _WINDOWS:
+                    # Windows cannot delete a file anyone holds open, this handle included:
+                    # let go first, and a remover that opened it since fails the unlink
+                    mutex.release()
                 sidecar.unlink()
             except OSError:
                 return False

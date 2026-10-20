@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{Connection, OptionalExtension};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_agrep-rs");
+pub const TEST_WRITER_BUILD_ID: &str = "00000000000000000000";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn fixtures_dir() -> PathBuf {
@@ -150,6 +151,7 @@ pub fn ingest_output(agent: &str, home: &Path, data: &Path, full: bool) -> std::
     }
     cmd.env("AGREP_HOME", home);
     cmd.env("AGREP_DATA_DIR", data);
+    cmd.env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID);
     // strip anything that would point discovery or the binary at a real install
     for k in [
         "USERPROFILE",
@@ -158,6 +160,7 @@ pub fn ingest_output(agent: &str, home: &Path, data: &Path, full: bool) -> std::
         "CLINE_DIR",
         "XDG_CONFIG_HOME",
         "AGREP_RS_BIN",
+        "AGREP_PYTHON_RUNTIME_BUILD_ID",
     ] {
         cmd.env_remove(k);
     }
@@ -171,6 +174,7 @@ pub fn ingest_emit_output(agent: &str, home: &Path, data: &Path) -> std::process
     cmd.args(["index", "--agent", agent, "--emit-rows"]);
     cmd.env("AGREP_HOME", home);
     cmd.env("AGREP_DATA_DIR", data);
+    cmd.env("AGREP_RUNTIME_BUILD_ID", TEST_WRITER_BUILD_ID);
     for k in [
         "USERPROFILE",
         "HOME",
@@ -178,6 +182,7 @@ pub fn ingest_emit_output(agent: &str, home: &Path, data: &Path) -> std::process
         "CLINE_DIR",
         "XDG_CONFIG_HOME",
         "AGREP_RS_BIN",
+        "AGREP_PYTHON_RUNTIME_BUILD_ID",
     ] {
         cmd.env_remove(k);
     }

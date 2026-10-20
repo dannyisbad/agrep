@@ -881,6 +881,11 @@ class IndexingAdviceTests(unittest.TestCase):
         self.assertNotIn("streak", line)
 
 
+def _sidecar_fix(command: str, path: str) -> str:
+    """source_health's remedy: a quoted shell command on POSIX, prose elsewhere."""
+    return f"`{command} {path}`" if os.name == "posix" else "fix its owner or permissions"
+
+
 class StatusInterruptedPassTests(unittest.TestCase):
     """Without a daemon a killed pass's hot event-store journal waits for `agrep index`; only
     the read surfaces said so, and the status page stayed silent."""
@@ -971,7 +976,8 @@ class StatusInterruptedPassTests(unittest.TestCase):
         self.assertIn("the search index is out of date; index updates wait on the file named "
                       "above", stale)
         for rendered in (behind, stale):
-            self.assertEqual(rendered.count("sudo chown $USER"), 1, rendered)
+            self.assertEqual(rendered.count(
+                _sidecar_fix("sudo chown $USER", self.SIDECAR["path"])), 1, rendered)
             self.assertNotIn("`agrep index`;", rendered)
         # with nothing blocked both lines keep their command
         with mock.patch.object(source_health, "store_sidecars_blocked", return_value=[]):
@@ -1020,7 +1026,8 @@ class StatusInterruptedPassTests(unittest.TestCase):
             "/d/events/.store.sqlite3-journal is not readable and writable by you"), line)
         self.assertTrue(line.endswith(" index`; fix sc1 in crush"), line)
         self.assertTrue(promise.startswith(
-            "; index updates wait on /d/events/.store.sqlite3-journal: `chmod u+rw "), promise)
+            "; index updates wait on /d/events/.store.sqlite3-journal: "
+            + _sidecar_fix("chmod u+rw", sidecar["path"])), promise)
         self.assertNotIn("rebuild on the next", promise)
 
 
