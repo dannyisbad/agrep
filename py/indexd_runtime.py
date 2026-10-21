@@ -3430,6 +3430,12 @@ def disclose_foreground_snapshot(
     `code` and `reason` are seams for stronger policies such as build
     ownership.
     """
+    if code == DERIVED_STORE_OWNER_CODE:
+        fence = newer_anchor_fence()
+        if fence is not None:
+            disclose_blocked_owner_failure(
+                f"{surface.BLOCKED_OWNER_STALE_MARKER}: {fence}")
+            return
     # The recorded reason is the cause alone (law 5): the served lane is the
     # engine fact in the footer and --json, and gluing mechanism onto every
     # deferral built the exact wall the render budget outlaws.

@@ -2923,14 +2923,11 @@ def _interactive_snapshot(
             sqlite_contention and expected_build and observed_build
             and observed_build != expected_build)
         if ownership_refused and (not sqlite_contention or foreign_contention):
-            if indexd_runtime.newer_anchor_fence() is not None:
-                indexd_runtime.disclose_blocked_owner_failure()
-            else:
-                indexd_runtime.disclose_foreground_snapshot(
-                    direct_scan=db is None,
-                    code=indexd_runtime.DERIVED_STORE_OWNER_CODE,
-                    reason=ownership.reason,
-                )
+            indexd_runtime.disclose_foreground_snapshot(
+                direct_scan=db is None,
+                code=indexd_runtime.DERIVED_STORE_OWNER_CODE,
+                reason=ownership.reason,
+            )
         if db is None:
             if sqlite_contention:
                 indexd_runtime.disclose_foreground_snapshot(
