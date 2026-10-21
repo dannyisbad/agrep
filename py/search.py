@@ -4259,7 +4259,8 @@ def _scan_lever_tail(spec: QuerySpec) -> str:
 
 def _announce_database_repair(kick, spec: QuerySpec) -> None:
     if kick.cause == "newer-anchor":
-        indexd_runtime.disclose_blocked_owner_failure()
+        indexd_runtime.disclose_blocked_owner_failure(
+            f"{surface.BLOCKED_OWNER_STALE_MARKER}: {kick.detail}")
         _announce_slow_lane(
             "db-unusable",
             f"{kick.detail} - scanning sources this query"
