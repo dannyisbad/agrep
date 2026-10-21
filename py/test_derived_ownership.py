@@ -36,6 +36,7 @@ import ownerfile  # noqa: E402
 import semantic  # noqa: E402
 import session_context  # noqa: E402
 from hookless.registry import AGENT_CONTEXT_ENV_KEYS  # noqa: E402
+from hookless import native  # noqa: E402
 
 sys.path.insert(0, os.fspath(Path(__file__).resolve().parent.parent))
 import reindex  # noqa: E402
@@ -2706,10 +2707,10 @@ class NewerAnchorSurfaces(unittest.TestCase):
             # Windows keeps detached daemon handles open until idle exit, which
             # would outlive this temporary data directory.
             env["AGREP_NO_DAEMON"] = "1"
-        return subprocess.run(
+        return native.run_owned_process(
             [sys.executable, "-c", _WIDE_BUDGET_CLI, *args],
-            cwd=os.fspath(ROOT), env=env, capture_output=True, text=True,
-            timeout=120)
+            cwd=os.fspath(ROOT), env=env, capture_output=True,
+            timeout=120, hide_window=(os.name == "nt"))
 
     def _plant_newer_anchor(self) -> None:
         (self.data / ".derived-owner.json").write_text(
