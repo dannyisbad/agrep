@@ -695,11 +695,12 @@ def _signal_owned(process: subprocess.Popen, signum: int) -> None:
     if sys.platform != "win32":
         try:
             os.killpg(process.pid, signum)
-            if signum != signal.SIGINT:
-                # a stopped group acts on a termination only once continued
-                os.killpg(process.pid, signal.SIGCONT)
-        except ProcessLookupError:
+        except OSError:
             pass
+        if signum != signal.SIGINT:
+            # A stopped group acts on a termination only once continued. The
+            # group can disappear between these calls on macOS.
+            _continue_group(process.pid)
         return
     if signum == signal.SIGINT and hasattr(signal, "CTRL_BREAK_EVENT"):
         try:

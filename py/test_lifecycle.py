@@ -2887,6 +2887,20 @@ class LifecycleTests(unittest.TestCase):
             self.assertTrue(native._drain_owned(process))
         killpg.assert_called_once_with(4242, signal.SIGTERM)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group proof")
+    def test_signal_owned_tolerates_group_race_during_continue(self) -> None:
+        process = mock.Mock(pid=4242)
+        process.poll.return_value = None
+        with mock.patch.object(
+                native.os, "killpg",
+                side_effect=(
+                    None, PermissionError("Operation not permitted"))) as killpg:
+            native._signal_owned(process, signal.SIGTERM)
+        killpg.assert_has_calls([
+            mock.call(4242, signal.SIGTERM),
+            mock.call(4242, signal.SIGCONT),
+        ])
+
     def test_owned_tick_failure_drains_exactly_once(self) -> None:
         process = mock.Mock(pid=4242)
         with mock.patch.object(
