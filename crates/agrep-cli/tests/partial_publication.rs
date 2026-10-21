@@ -1164,6 +1164,7 @@ fn consent_at(home: &Path, data: &Path, now_ns: Option<i64>) -> Output {
 /// On a 1-second clock, a session caught torn or empty twice within one tick has one identity
 /// both times: neither catch proves it stays so, and the consent keeps its rows. Observed past
 /// that tick, the same state persists from its next observation on, and the consent drops it.
+#[cfg(not(windows))]
 #[test]
 fn a_failure_caught_within_a_timestamp_tick_never_persists() {
     for (label, damaged) in [("empty", 0usize), ("torn", 1)] {

@@ -3712,6 +3712,11 @@ def kick_background_repair() -> RepairKick:
     try:
         if _data_dir_readonly():
             return RepairKick(False, "readonly")
+        fence = newer_anchor_fence()
+        if fence is not None:
+            # The newer build's fence is the actionable cause, even when
+            # this reader deliberately disabled background work.
+            return RepairKick(False, "newer-anchor", fence)
         if os.environ.get("AGREP_NO_DAEMON"):
             return RepairKick(False, "no-daemon")
         if not common.ingest_bin().exists():
@@ -3723,10 +3728,6 @@ def kick_background_repair() -> RepairKick:
         if freshener_alive():
             return RepairKick(True, "")  # already hot; it will reach the damage
         if not derived_writes_permitted():
-            fence = newer_anchor_fence()
-            if fence is not None:
-                # the one fence the reader can end: upgrade, or point elsewhere
-                return RepairKick(False, "newer-anchor", fence)
             # An exact incompatible daemon is an upgrade predecessor, not an
             # indefinite fence. _spawn_indexd performs the process-identity
             # checked handoff; every hostile/unverifiable claim stays closed.
