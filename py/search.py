@@ -4257,6 +4257,18 @@ def _scan_lever_tail(spec: QuerySpec) -> str:
         ("--since", spec.since_ms)) if value is None]
     return f"; {'/'.join(levers)} narrows it" if levers else ""
 
+def _announce_database_repair(kick, spec: QuerySpec) -> None:
+    if kick.cause == "newer-anchor":
+        _announce_slow_lane(
+            "db-unusable",
+            f"{kick.detail} - scanning sources this query"
+            f"{_scan_lever_tail(spec)}")
+    elif kick.cause in ("held-foreign-owner", "owner-unverifiable"):
+        _announce_slow_lane(
+            "db-unusable",
+            "the search index is held by another agrep - scanning "
+            f"sources this query{_scan_lever_tail(spec)}")
+
 
 def _count_early_stop(db, spec: QuerySpec, flt: dict, bounded: dict) -> None:
     """Replace a stopped lane's self-measurement with a count of the result set.
@@ -4849,7 +4861,8 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
         pass
     elif db is None and native_checked:
         if corpusdb.DB_PATH.exists():
-            indexd_runtime.kick_background_repair()
+            _announce_database_repair(
+                indexd_runtime.kick_background_repair(), spec)
     elif (db is None and corpusdb._trigram_ok()
             and not corpusdb.DB_PATH.exists()):
         # One durable fact governs this window: a queued FTS build means the
@@ -4871,17 +4884,8 @@ def _keyword_candidates_once(spec: QuerySpec) -> LaneResult:
         # An unusable search db is agrep's own damage: repair starts here, not
         # in a sentence (law 1), and the scan serves silently while it runs
         # (law 3). A held foreign claim is the one cause worth a line (law 5).
-        kick = indexd_runtime.kick_background_repair()
-        if kick.cause == "newer-anchor":
-            _announce_slow_lane(
-                "db-unusable",
-                f"{kick.detail} - scanning sources this query"
-                f"{_scan_lever_tail(spec)}")
-        elif kick.cause in ("held-foreign-owner", "owner-unverifiable"):
-            _announce_slow_lane(
-                "db-unusable",
-                "the search index is held by another agrep - scanning "
-                f"sources this query{_scan_lever_tail(spec)}")
+        _announce_database_repair(
+            indexd_runtime.kick_background_repair(), spec)
     elif db is None and not corpusdb._trigram_ok() and common.MESSAGES_PATH.exists():
         # legacy sqlite: the scan is this build's only engine - announce it
         # (no rebuild promise: a rebuild cannot grow this python's sqlite)
