@@ -2593,19 +2593,20 @@ raise SystemExit(rc)
 # equivalent of generous_routine_budget): a saturated host must not defer the
 # very observation these tests assert on.
 _WIDE_BUDGET_CLI = '''
-import sys, time
-import cli, doctor
-for name in ("_STATUS_ROUTINE_TIMEOUT_S", "_STATUS_STORE_TIMEOUT_S",
-             "_STATUS_DETECT_TIMEOUT_S"):
-    setattr(cli, name, 60.0)
-for name in ("_DIAGNOSTIC_STORE_TIMEOUT_S", "_DIAGNOSTIC_DETECT_TIMEOUT_S",
-             "_DIAGNOSTIC_SENTINEL_TIMEOUT_S", "_DIAGNOSTIC_QUALITY_TIMEOUT_S",
-             "_DIAGNOSTIC_ARCHIVE_TIMEOUT_S"):
-    setattr(doctor, name, 60.0)
-doctor._routine_deadline = (
-    lambda *, deep: None if deep else time.monotonic() + 60.0)
-sys.argv[0] = "cli.py"
-raise SystemExit(cli.main())
+if __name__ == "__main__":
+    import sys, time
+    import cli, doctor
+    for name in ("_STATUS_ROUTINE_TIMEOUT_S", "_STATUS_STORE_TIMEOUT_S",
+                 "_STATUS_DETECT_TIMEOUT_S"):
+        setattr(cli, name, 60.0)
+    for name in ("_DIAGNOSTIC_STORE_TIMEOUT_S", "_DIAGNOSTIC_DETECT_TIMEOUT_S",
+                 "_DIAGNOSTIC_SENTINEL_TIMEOUT_S", "_DIAGNOSTIC_QUALITY_TIMEOUT_S",
+                 "_DIAGNOSTIC_ARCHIVE_TIMEOUT_S"):
+        setattr(doctor, name, 60.0)
+    doctor._routine_deadline = (
+        lambda *, deep: None if deep else time.monotonic() + 60.0)
+    sys.argv[0] = "cli.py"
+    raise SystemExit(cli.main())
 '''
 
 NEWER_ANCHOR = '{"version": 2, "format": 1, "package": "0.5.0"}'
