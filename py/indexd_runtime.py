@@ -3393,6 +3393,11 @@ def blocked_owner_detail() -> str:
     return detail if fence is None else f"{detail}: {fence}"
 
 
+def disclose_blocked_owner_failure(reason: str | None = None) -> None:
+    """Expose the owner fence when a read-only fallback serves this query."""
+    _set_freshen_failure("blocked-owner", reason or blocked_owner_detail())
+
+
 # The ownership-refusal code every emitter and checker shares: corpusdb
 # discloses it, _daemon_will_converge refuses to promise convergence on it.
 DERIVED_STORE_OWNER_CODE = surface.DERIVED_STORE_OWNER_CODE
