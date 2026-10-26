@@ -140,7 +140,7 @@ class PiOmpCoverageTests(_ArchiveSandbox):
                 "/h/.pi/agent/sessions/slug/2001_x/2001_y.jsonl",
                 "/h/.omp/agent/sessions/slug/a/b/c.jsonl.gz",
                 "/h/.omp/agent/archive/sessions/slug/2001_x.jsonl",
-                r"/Users/runner\.pi\agent\archive\sessions\slug\deep\2001_x.jsonl.gz"):
+                r"C:\Users\u\.pi\agent\archive\sessions\slug\deep\2001_x.jsonl.gz"):
             self.assertIsNotNone(
                 archive._portable_source_relative(value, "pi", False), value)
         self.assertIsNotNone(

@@ -77,7 +77,7 @@ def _archive(path: Path, *, mode_override: str | None = None,
                 member.uname = member.gname = "private-builder"
             if name == pax_override:
                 member.pax_headers = {
-                    "agrep.builder-path": "/Users/runner/project"}
+                    "agrep.builder-path": "/Users/private-builder/project"}
             tar.addfile(member, io.BytesIO(data))
     path.write_bytes(_gzip_tar(stream.getvalue()))
 
@@ -234,9 +234,9 @@ class SdistManifestTests(unittest.TestCase):
                 _archive(path)
                 raw = path.read_bytes()
                 if case == "tail":
-                    path.write_bytes(raw + b"/Users/runner")
+                    path.write_bytes(raw + b"/Users/private-builder")
                 elif case == "second":
-                    path.write_bytes(raw + _gzip_tar(b"/Users/runner"))
+                    path.write_bytes(raw + _gzip_tar(b"/Users/private-builder"))
                 else:
                     path.write_bytes(raw[:3] + b"\x08" + raw[4:10]
                                      + b"private-builder\x00" + raw[10:])

@@ -1252,7 +1252,7 @@ class CodexHookSurvivesCachePrunes(unittest.TestCase):
             "inline fallback with agrep's own interpreter": (
                 f"p={shlex.quote(sys.executable)}; [ -x \"$p\" ] || p=python3; exec \"$p\" "
                 f"{self.payload}"),
-            "launcher of another home": "/bin/sh '/Users/runner/altcodex/hooks/agrep/run'",
+            "launcher of another home": "/bin/sh '/Users/alice/altcodex/hooks/agrep/run'",
         }
         for label, command in ours.items():
             with self.subTest(label):
@@ -1273,12 +1273,12 @@ class CodexHookSurvivesCachePrunes(unittest.TestCase):
         theirs = {
             "user's own copy": "/user/python '/user/hooks/codex_compact_payload.py'",
             "wrapper script": (
-                "/Users/runner/bin/audit-wrapper.sh "
-                "/Users/runner/src/agrep/py/hooks/codex_compact_payload.py"),
+                "/Users/alice/bin/audit-wrapper.sh "
+                "/Users/alice/src/agrep/py/hooks/codex_compact_payload.py"),
             "env prefix": f"PYTHONWARNINGS=ignore /usr/bin/python3 {self.payload}",
             "nice prefix": f"nice -n 5 python3 {self.payload}",
             "interpreter option": f"/usr/bin/python3 -I {self.payload}",
-            "destructive prefix": f"rm -rf /Users/runner/important {self.payload}",
+            "destructive prefix": f"rm -rf /Users/alice/important {self.payload}",
             "fallback with a user-chosen interpreter": (
                 "p=/opt/homebrew/bin/python3.13; [ -x \"$p\" ] || p=python3; exec \"$p\" "
                 f"{self.payload}"),
@@ -1287,7 +1287,7 @@ class CodexHookSurvivesCachePrunes(unittest.TestCase):
                 f"{self.payload} --mine"),
             "prefixed command": f"true; /bin/sh {self.launcher}",
             "launcher via another shell": f"/bin/bash {self.launcher}",
-            "launcher elsewhere": "/bin/sh /Users/runner/bin/run",
+            "launcher elsewhere": "/bin/sh /Users/alice/bin/run",
         }
         for label, command in theirs.items():
             with self.subTest(label):

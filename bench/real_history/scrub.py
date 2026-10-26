@@ -484,7 +484,7 @@ class Scrubber:
         self.stats["paths"] += 1
         normalized = value.replace("\\", "/")
         if normalized.startswith("~"):
-            normalized = "/Users/runner" + normalized[1:]
+            normalized = "/home/u" + normalized[1:]
         segments = [segment for segment in normalized.split("/") if segment]
         if normalized.startswith("//"):
             segments = segments[2:]
@@ -506,9 +506,9 @@ class Scrubber:
                     break
                 if lowered in CONTAINER_SEGMENTS:
                     kept.append(segment)
-            return "/Users/runner" + ("/" + "/".join(kept) if kept else "")
+            return "/home/u" + ("/" + "/".join(kept) if kept else "")
         tail = self._tail_after(segments, root)
-        return "/Users/runner/projects/" + "/".join([self.word(root), *tail])
+        return "/home/u/projects/" + "/".join([self.word(root), *tail])
 
     def _tail_after(self, segments: list[str], root: str) -> list[str]:
         try:

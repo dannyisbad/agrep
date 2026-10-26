@@ -42,7 +42,7 @@ import search  # noqa: E402
 import surface_policy as surface  # noqa: E402
 
 INDEXED_AGENTS = ("claude", "codex")
-INDEXED_PROJECTS = ("/Users/runner/webapp", "/Users/runner/apartment")
+INDEXED_PROJECTS = ("/home/u/webapp", "/home/u/apartment")
 INDEXED_MODELS = ("claude-opus-5", "claude-opus-4-8", "gpt-5.6-sol")
 INDEXED_WHO = ("user", "agent", "tool")
 # one value per dimension that the fixture index provably does not hold
@@ -92,14 +92,14 @@ class DimensionEvidenceTests(unittest.TestCase):
             self.assertIsNone(search._indexed_dimension_values("agent"))
 
     def test_project_domain_rides_the_session_aggregate(self) -> None:
-        rows = {"s1": {"project": "/Users/runner/webapp"},
-                "s2": {"project": ""}, "s3": {"project": "/Users/runner/webapp"}}
+        rows = {"s1": {"project": "/home/u/webapp"},
+                "s2": {"project": ""}, "s3": {"project": "/home/u/webapp"}}
         with mock.patch.object(explore, "_session_index", return_value=rows), \
                 mock.patch.object(search.indexd_runtime, "freshness_story",
                                   return_value=surface.FreshnessStory("current")), \
                 mock.patch.object(common, "index_summary", return_value={"agents": []}):
             self.assertEqual(search._indexed_dimension_values("project"),
-                             ("/Users/runner/webapp",))
+                             ("/home/u/webapp",))
 
     def test_project_domain_withdraws_when_the_served_generation_is_unproven(self) -> None:
         with mock.patch.object(search.indexd_runtime, "freshness_story",
@@ -406,7 +406,7 @@ def _run(entry, argv: list[str]) -> tuple[int, str]:
 
 
 MESSAGES = (
-    {"id": "claude:s1:1", "agent": "claude", "project": "/Users/runner/webapp",
+    {"id": "claude:s1:1", "agent": "claude", "project": "/home/u/webapp",
      "session": "0199aaaa-1111-7000-8000-000000000001", "turn": 1, "ts": 1000,
      "who": "user", "model": "claude-opus-5", "text": "deadlock in the writer"},
 )

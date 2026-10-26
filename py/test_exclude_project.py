@@ -95,9 +95,9 @@ class ExcludeProjectTests(unittest.TestCase):
             db = sqlite3.connect(path)
             db.executescript(corpusdb._SCHEMA_SQL)
             db.executemany(corpusdb._INS, [
-                ("shop", 0, NOW_MS, "pi", "/Users/runner/projects/shop", "",
+                ("shop", 0, NOW_MS, "pi", "/Users/u/projects/shop", "",
                  "", "", "user", "needle one"),
-                ("admin", 0, NOW_MS, "pi", "/Users/runner/projects/shop-admin",
+                ("admin", 0, NOW_MS, "pi", "/Users/u/projects/shop-admin",
                  "", "", "", "user", "needle two"),
                 ("claude", 0, NOW_MS, "claude", "shop", "", "", "", "user",
                  "needle three"),
@@ -112,21 +112,21 @@ class ExcludeProjectTests(unittest.TestCase):
                     value: {hit["session"] for hit in search.run_query(
                         "needle", limit=0, project=value,
                         allow_fallback=False)["hits"]}
-                    for value in ("shop", "SHOP", "/Users/runner/projects/shop",
+                    for value in ("shop", "SHOP", "/Users/u/projects/shop",
                                   "shop*", "shop-admin", "hop")
                 }
         self.assertEqual(cases["shop"], {"shop", "claude"})
         self.assertEqual(cases["SHOP"], {"shop", "claude"})
-        self.assertEqual(cases["/Users/runner/projects/shop"], {"shop"})
+        self.assertEqual(cases["/Users/u/projects/shop"], {"shop"})
         self.assertEqual(cases["shop*"], {"shop", "admin", "claude"})
         self.assertEqual(cases["shop-admin"], {"admin"})
         self.assertEqual(cases["hop"], set())
         # the JSONL scan, the semantic metadata predicate and the SQL function
         # all answer through the one policy helper
         for label, value, expected in (
-                ("/Users/runner/projects/shop", "shop", True),
-                ("/Users/runner/projects/shop-admin", "shop", False),
-                ("/Users/runner/projects/shop-admin", "shop*", True),
+                ("/Users/u/projects/shop", "shop", True),
+                ("/Users/u/projects/shop-admin", "shop", False),
+                ("/Users/u/projects/shop-admin", "shop*", True),
                 ("C:\\work\\Shop", "shop", True),
                 ("shop", "sh?p", True),
                 ("", "shop", False)):
@@ -250,7 +250,7 @@ class ExcludeProjectTests(unittest.TestCase):
                                return_value=True), \
                 mock.patch.object(search, "run_query", side_effect=run_query), \
                 mock.patch.object(search.surface.os, "getcwd",
-                                  return_value="/Users/runner/projects/shop"), \
+                                  return_value="/Users/u/projects/shop"), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             recall.main(["needle", "--lexical", "--json", "--no-auto",

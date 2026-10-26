@@ -37,15 +37,15 @@ import search  # noqa: E402
 
 SESSIONS = (
     {"session": "0199aaaa-1111-7000-8000-000000000001", "agent": "codex",
-     "project": "/Users/runner/webapp", "n": 12, "first_ts": 1000,
+     "project": "/home/u/webapp", "n": 12, "first_ts": 1000,
      "last_ts": 9000, "first_text": "fix the login race condition",
      "parent": ""},
     {"session": "0199bbbb-2222-7000-8000-000000000002", "agent": "claude",
-     "project": "/Users/runner/apartment-hunt", "n": 4, "first_ts": 2000,
+     "project": "/home/u/apartment-hunt", "n": 4, "first_ts": 2000,
      "last_ts": 8000, "first_text": "find me a two bedroom in sf",
      "parent": ""},
     {"session": "agent-a0000000000000001", "agent": "claude",
-     "project": "/Users/runner/webapp", "n": 2, "first_ts": 3000,
+     "project": "/home/u/webapp", "n": 2, "first_ts": 3000,
      "last_ts": 7000, "first_text": "spawned side task",
      "parent": "0199aaaa-1111-7000-8000-000000000001"},
 )
@@ -54,7 +54,7 @@ SESSIONS = (
 MESSAGES = tuple(
     {"session": "0199aaaa-1111-7000-8000-000000000001", "turn": turn,
      "who": "user", "text": f"turn {turn} about the login race",
-     "reply": f"answer {turn}", "agent": "codex", "project": "/Users/runner/webapp",
+     "reply": f"answer {turn}", "agent": "codex", "project": "/home/u/webapp",
      "ts": 1000 + turn}
     for turn in range(6))
 
@@ -197,7 +197,7 @@ class ChatsListTests(unittest.TestCase):
         for index, project in enumerate(("-shop", "-shop", "-bench", "other")):
             session = f"0199{index:04x}-1111-7000-8000-000000000001"
             indexed[session] = {
-                **SESSIONS[0], "session": session, "project": f"/Users/runner/{project}",
+                **SESSIONS[0], "session": session, "project": f"/home/u/{project}",
                 "last_ts": 9000 - index,
             }
         with mock.patch.object(explore, "_session_index", return_value=indexed), \
@@ -217,7 +217,7 @@ class ChatsListTests(unittest.TestCase):
         rc, out, _err = _run(["--project", "webapp"])
         self.assertEqual(rc, 0)
         self.assertEqual(_heads(out), ["@0199aaaa"])
-        rc, out, _err = _run(["--project", "/Users/runner/apartment-hunt"])
+        rc, out, _err = _run(["--project", "/home/u/apartment-hunt"])
         self.assertEqual(_heads(out), ["@0199bbbb"])
         # a bare substring is not a project; a glob is
         with mock.patch.object(
@@ -460,7 +460,7 @@ class ChatsDamagedAggregateTests(unittest.TestCase):
         message = {
             "id": "codex:0199cccc-3333-7000-8000-000000000003:1",
             "session": "0199cccc-3333-7000-8000-000000000003",
-            "agent": "codex", "project": "/Users/runner/webapp", "ts": 5000,
+            "agent": "codex", "project": "/home/u/webapp", "ts": 5000,
             "turn": 1, "text": "the corpus is fine", "who": "user",
         }
         common.MESSAGES_PATH.write_text(
@@ -1041,7 +1041,7 @@ class ChatsHandlePasteTests(unittest.TestCase):
             "now": 10_000, "window_s": 90,
             "sessions": [{
                 "active": True, "agent": "codex", "last_ts": 9_000,
-                "parent": None, "project": "/Users/runner/webapp", "recent": [],
+                "parent": None, "project": "/home/u/webapp", "recent": [],
                 "session": session, "state": "done", "sub": False,
                 "title": "fix the login race condition", "working": False,
             }],

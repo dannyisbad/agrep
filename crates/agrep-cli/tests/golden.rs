@@ -482,7 +482,7 @@ fn cursor_unrelated_workspace_schema_does_not_block_global_store() {
     fs::create_dir_all(&workspace).unwrap();
     fs::write(
         workspace.join("workspace.json"),
-        r#"{"folder":"file:///c%3A/Users/runner/Desktop/unrelated"}"#,
+        r#"{"folder":"file:///c%3A/Users/tester/Desktop/unrelated"}"#,
     )
     .unwrap();
     let conn = rusqlite::Connection::open(workspace.join("state.vscdb")).unwrap();

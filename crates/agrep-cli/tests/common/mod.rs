@@ -293,7 +293,7 @@ pub fn cursor_home() -> PathBuf {
     fs::create_dir_all(&ws).unwrap();
     fs::write(
         ws.join("workspace.json"),
-        r#"{"folder":"file:///c%3A/Users/runner/Desktop/flaky-app"}"#,
+        r#"{"folder":"file:///c%3A/Users/tester/Desktop/flaky-app"}"#,
     )
     .unwrap();
     let seed = fs::read_to_string(fixtures_dir().join("cursor").join("workspace.sql")).unwrap();

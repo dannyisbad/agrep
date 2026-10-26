@@ -426,7 +426,7 @@ class ChatsCompleteness(unittest.TestCase):
             for index in range(count):
                 handle.write(json.dumps({
                     "session": f"0199aaaa-1111-7000-8000-{index:012d}",
-                    "agent": "codex", "project": "/Users/runner/webapp",
+                    "agent": "codex", "project": "/home/u/webapp",
                     "n": 3, "first_ts": 1000 + index, "last_ts": 9000 + index,
                     "first_text": "fix the login race", "parent": "",
                 }) + "\n")

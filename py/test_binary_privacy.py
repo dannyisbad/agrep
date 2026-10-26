@@ -28,11 +28,11 @@ class BinaryPrivacyTests(unittest.TestCase):
 
     def test_rejects_platform_home_paths_without_exposing_them(self):
         cases = (
-            b"/Users/runner/.cargo/registry/src/lib.rs",
-            b"/Users/runner/project/src/main.rs",
+            b"/Users/private-name/.cargo/registry/src/lib.rs",
+            b"/home/private-name/project/src/main.rs",
             b"/root/.cargo/registry/src/lib.rs",
-            rb"/Users/runner\.cargo\registry\src\lib.rs",
-            b"/Users/runner/project/src/main.rs",
+            rb"C:\Users\private-name\.cargo\registry\src\lib.rs",
+            b"C:/Users/private-name/project/src/main.rs",
         )
         for data in cases:
             with self.subTest(data=data):
@@ -77,7 +77,7 @@ class BinaryPrivacyTests(unittest.TestCase):
         version = package_metadata.checkout_version()
         marker = f"Cli{version}".encode("ascii")
         binary[256:256 + len(marker)] = marker
-        binary[-40:] = b"/Users/runner/project/source-path"
+        binary[-40:] = b"/Users/private-name/project/source-path"
         with self.assertRaisesRegex(
                 validate_wheel.InvalidWheel, "privacy check"):
             validate_wheel.validate_native_binary(

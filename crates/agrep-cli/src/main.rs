@@ -9778,8 +9778,8 @@ mod tests {
     #[test]
     fn macos_default_data_dir_is_user_scoped() {
         assert_eq!(
-            platform_data_dir_from(Some("/Users/runner".into())).unwrap(),
-            std::path::PathBuf::from("/Users/runner/Library/Application Support/agrep")
+            platform_data_dir_from(Some("/Users/tester".into())).unwrap(),
+            std::path::PathBuf::from("/Users/tester/Library/Application Support/agrep")
         );
     }
 
@@ -9810,8 +9810,8 @@ mod tests {
     #[test]
     fn windows_default_data_dir_prefers_local_app_data() {
         assert_eq!(
-            platform_data_dir_from(Some(r"/Users/runner\AppData\Local".into()), None).unwrap(),
-            std::path::PathBuf::from(r"/Users/runner\AppData\Local\agrep")
+            platform_data_dir_from(Some(r"C:\Users\tester\AppData\Local".into()), None).unwrap(),
+            std::path::PathBuf::from(r"C:\Users\tester\AppData\Local\agrep")
         );
     }
 
@@ -9819,7 +9819,7 @@ mod tests {
     #[test]
     fn unix_default_data_dir_honors_xdg() {
         assert_eq!(
-            platform_data_dir_from(Some("/tmp/xdg".into()), Some("/Users/runner".into())).unwrap(),
+            platform_data_dir_from(Some("/tmp/xdg".into()), Some("/home/tester".into())).unwrap(),
             std::path::PathBuf::from("/tmp/xdg/agrep")
         );
     }

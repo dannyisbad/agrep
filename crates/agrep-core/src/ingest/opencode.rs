@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn platform_data_roots_are_native_first_with_legacy_fallback() {
-        let home = std::path::Path::new("/Users/runner");
+        let home = std::path::Path::new("/home/tester");
         let xdg = std::ffi::OsStr::new("/var/data");
         assert_eq!(
             data_dirs_for(home, Some(xdg), None, false, false),
@@ -871,11 +871,11 @@ mod tests {
     #[test]
     fn explicit_override_case_variant_is_not_discovered_twice() {
         let files = vec![std::path::PathBuf::from(
-            r"/Users/runner\AppData\Local\opencode\opencode.db",
+            r"C:\Users\tester\AppData\Local\opencode\opencode.db",
         )];
         assert!(contains_path(
             &files,
-            std::path::Path::new(r"/Users/runner\appdata\local\OpenCode\OpenCode.DB")
+            std::path::Path::new(r"c:\users\tester\appdata\local\OpenCode\OpenCode.DB")
         ));
     }
 

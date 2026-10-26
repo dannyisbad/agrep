@@ -1446,7 +1446,7 @@ mod tests {
         use std::ffi::OsStr;
 
         let roots = [
-            std::path::Path::new(r"/Users/runner\AppData\Local\Temp"),
+            std::path::Path::new(r"C:\Users\Example\AppData\Local\Temp"),
             std::path::Path::new("/private/tmp"),
             std::path::Path::new("/var/folders/xy/fixture/T"),
         ];
@@ -1665,11 +1665,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"type\":\"progress\",\"cwd\" : \"/Users/runner/Desktop/alpha\"}\n",
-                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"},\"cwd\":\"/Users/runner/Desktop/alpha\"}\n",
-                "{\"cwd\" : \"/Users/runner/Desktop/alpha\", \"message\" : {\"content\": \"two\", \"role\": \"user\"}, \"type\": \"user\"}\n",
-                "{\"message\":{\"role\":\"user\",\"content\":\"fake \\\"cwd\\\": \\\"attacker\\\"\"},\"cwd\":\"/Users/runner\\\\Desktop\\\\alpha\",\"type\":\"user\"}\n",
-                "{\"type\":\"user\",\"cwd\":\"/Users/runner/Desktop/\\u0061lpha\",\"message\":{\"role\":\"user\",\"content\":\"four\"}}\n",
+                "{\"type\":\"progress\",\"cwd\" : \"/Users/alice/Desktop/alpha\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"},\"cwd\":\"/Users/alice/Desktop/alpha\"}\n",
+                "{\"cwd\" : \"/Users/alice/Desktop/alpha\", \"message\" : {\"content\": \"two\", \"role\": \"user\"}, \"type\": \"user\"}\n",
+                "{\"message\":{\"role\":\"user\",\"content\":\"fake \\\"cwd\\\": \\\"attacker\\\"\"},\"cwd\":\"C:\\\\Users\\\\alice\\\\Desktop\\\\alpha\",\"type\":\"user\"}\n",
+                "{\"type\":\"user\",\"cwd\":\"/Users/alice/Desktop/\\u0061lpha\",\"message\":{\"role\":\"user\",\"content\":\"four\"}}\n",
             ),
         )
         .unwrap();
@@ -1736,21 +1736,21 @@ mod tests {
     fn project_root_skips_code_containers_but_keeps_real_segments() {
         let root = |dir: &str| super::project_root(dir);
         assert_eq!(
-            root("/Users/runner/Desktop/projects/shop").as_deref(),
+            root("/Users/alice/Desktop/projects/shop").as_deref(),
             Some("shop")
         );
         assert_eq!(
-            root("/Users/runner/Desktop/projects/shop/src/lib").as_deref(),
+            root("/Users/alice/Desktop/projects/shop/src/lib").as_deref(),
             Some("shop")
         );
-        assert_eq!(root("/Users/runner/repos/api/tests").as_deref(), Some("api"));
+        assert_eq!(root("/home/alice/repos/api/tests").as_deref(), Some("api"));
         assert_eq!(
-            root("/Users/runner\\code\\shop").as_deref(),
+            root("C:\\Users\\alice\\code\\shop").as_deref(),
             Some("shop")
         );
         assert_eq!(root("/work/alpha").as_deref(), Some("alpha"));
-        assert_eq!(root("/Users/runner/Desktop/projects"), None);
-        assert_eq!(root("/Users/runner"), None);
+        assert_eq!(root("/Users/alice/Desktop/projects"), None);
+        assert_eq!(root("/Users/alice"), None);
         assert_eq!(
             root("/private/tmp/agrep-mirror").as_deref(),
             Some("agrep-mirror")
@@ -1779,9 +1779,9 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"},\"cwd\":\"/Users/runner/Desktop/projects/shop\"}\n",
-                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"two\"},\"cwd\":\"/Users/runner/Desktop/projects/shop/docs\"}\n",
-                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"three\"},\"cwd\":\"/Users/runner/Desktop/projects\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"},\"cwd\":\"/Users/alice/Desktop/projects/shop\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"two\"},\"cwd\":\"/Users/alice/Desktop/projects/shop/docs\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"three\"},\"cwd\":\"/Users/alice/Desktop/projects\"}\n",
             ),
         )
         .unwrap();
@@ -1864,7 +1864,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"type\":\"progress\",\"cwd\" : \"/Users/runner/Desktop/alpha\"}\n",
+                "{\"type\":\"progress\",\"cwd\" : \"/Users/alice/Desktop/alpha\"}\n",
                 "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"turn\"}}\n",
             ),
         )

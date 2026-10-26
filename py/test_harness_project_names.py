@@ -59,9 +59,9 @@ class HarnessProjectNameTests(unittest.TestCase):
         (cls.data / "settings.json").write_text('{"embeddings":"off"}\n', encoding="utf-8")
         projects = cls.home / ".claude" / "projects"
         for slug, session, cwd, prompt in (
-                ("-home-u-code-control-plane", CONTROL, "/Users/runner/code/control_plane",
+                ("-home-u-code-control-plane", CONTROL, "/home/u/code/control_plane",
                  CONTROL_PROMPT),
-                ("-home-u-code-plane", PLAIN, "/Users/runner/code/plane", PLAIN_PROMPT)):
+                ("-home-u-code-plane", PLAIN, "/home/u/code/plane", PLAIN_PROMPT)):
             (projects / slug).mkdir(parents=True)
             (projects / slug / f"{session}.jsonl").write_text(
                 _transcript(session, cwd, prompt), encoding="utf-8")

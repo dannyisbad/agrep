@@ -344,31 +344,31 @@ class LiveParityEdges(unittest.TestCase):
         self.assertIn("cargo test", rendered)
 
     def test_project_names_match_rust_contract(self):
-        self.assertEqual(_project_of("/Users/runner"), "~")
+        self.assertEqual(_project_of("C:/Users/tester"), "~")
         self.assertEqual(_project_of("/repo/mobile"), "repo/mobile")
         self.assertEqual(_project_of("/src/web"), "src/web")
-        self.assertEqual(_project_of('/Users/runner/sample-project"'), "sample-project")
+        self.assertEqual(_project_of('C:/Users/tester/sample-project"'), "sample-project")
 
     def test_project_root_matches_rust_project_root(self):
         # the Rust unit test's table (ingest/claude.rs), run with the same home
         cases = (
-            ("/Users/runner/Desktop/projects/shop", "shop"),
-            ("/Users/runner/Desktop/projects/shop/src/lib", "shop"),
-            ("/Users/runner/repos/api/tests", "api"),
-            ("/Users/runner\\code\\shop", "shop"),
+            ("/Users/alice/Desktop/projects/shop", "shop"),
+            ("/Users/alice/Desktop/projects/shop/src/lib", "shop"),
+            ("/home/alice/repos/api/tests", "api"),
+            ("C:\\Users\\alice\\code\\shop", "shop"),
             ("/work/alpha", "alpha"),
-            ("/Users/runner/Desktop/projects", ""),
-            ("/Users/runner", ""),
+            ("/Users/alice/Desktop/projects", ""),
+            ("/Users/alice", ""),
             ("/private/tmp/agrep-mirror", "agrep-mirror"),
             ("/private/tmp", ""),
             ("/private/var/folders/zz/abc123/T/proj", "proj"),
             ("/private/var/folders/zz/abc123/T", ""),
-            ("/Users/runner/code/myapp", "myapp"),
+            ("/Users/alice/code/myapp", "myapp"),
             ("/work/evil", "evil"),
-            ("//wsl.localhost/Ubuntu/Users/runner/dev/tool", "tool"),
-            ("/Users/runner/Desktop/agrep/py/module.py", "agrep"),
+            ("//wsl.localhost/Ubuntu/home/bob/dev/tool", "tool"),
+            ("/Users/alice/Desktop/agrep/py/module.py", "agrep"),
         )
-        with mock.patch.object(live_mod, "HOME", "/Users/runner"), \
+        with mock.patch.object(live_mod, "HOME", "/Users/alice"), \
                 mock.patch.object(live_mod, "_USER_SEG", "alice"):
             for path, expected in cases:
                 with self.subTest(path=path):
@@ -391,13 +391,13 @@ class LiveParityEdges(unittest.TestCase):
 
     def test_live_claude_rows_under_code_containers_carry_the_indexed_project(self):
         # board/tail once labelled these `code`/`work`, so --project <chats label> missed
-        with mock.patch.object(live_mod, "HOME", "/Users/runner"), \
+        with mock.patch.object(live_mod, "HOME", "/Users/alice"), \
                 mock.patch.object(live_mod, "_USER_SEG", "alice"):
             watcher = LiveWatcher()
             for session, cwd, expected in (
-                    ("s-code", "/Users/runner/code/myapp", "myapp"),
+                    ("s-code", "/Users/alice/code/myapp", "myapp"),
                     ("s-work", "/work/evil", "evil"),
-                    ("s-projects", "/Users/runner/Desktop/projects/shop/docs", "shop")):
+                    ("s-projects", "/Users/alice/Desktop/projects/shop/docs", "shop")):
                 line = json.dumps({
                     "type": "user", "sessionId": session, "cwd": cwd,
                     "timestamp": "2026-01-01T00:00:00Z",

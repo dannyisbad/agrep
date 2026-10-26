@@ -929,7 +929,7 @@ fn cursor_wal_commit_is_ingested_and_workspace_move_relabels_cache() {
 
     fs::write(
         workspace,
-        r#"{"folder":"file:///c%3A/Users/runner/Desktop/renamed-app"}"#,
+        r#"{"folder":"file:///c%3A/Users/tester/Desktop/renamed-app"}"#,
     )
     .unwrap();
     ingest_into("cursor", &home, &data, false);
@@ -3776,10 +3776,10 @@ fn project_names_classify_as_harness_only_through_the_policy() {
         project.join(format!("{session}.jsonl")),
         format!(
             "{{\"type\":\"user\",\"userType\":\"external\",\"sessionId\":\"{session}\",\
-             \"timestamp\":\"2026-01-02T10:00:00.000Z\",\"cwd\":\"/Users/runner/code/control_plane\",\
+             \"timestamp\":\"2026-01-02T10:00:00.000Z\",\"cwd\":\"/home/u/code/control_plane\",\
              \"message\":{{\"role\":\"user\",\"content\":\"{prompt}\"}}}}\n\
              {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\
-             \"timestamp\":\"2026-01-02T10:00:05.000Z\",\"cwd\":\"/Users/runner/code/control_plane\",\
+             \"timestamp\":\"2026-01-02T10:00:05.000Z\",\"cwd\":\"/home/u/code/control_plane\",\
              \"message\":{{\"role\":\"assistant\",\"model\":\"claude-fable-5\",\
              \"content\":[{{\"type\":\"text\",\"text\":\"renewing them now\"}}]}}}}\n"
         ),

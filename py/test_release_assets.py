@@ -222,7 +222,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             ),
             "privacy": (
                 "agrep-rs-linux-aarch64",
-                lambda data: data[:200] + b"/Users/runner/" + data[223:],
+                lambda data: data[:200] + b"/Users/private-builder/" + data[223:],
                 "privacy",
             ),
             "macos": (

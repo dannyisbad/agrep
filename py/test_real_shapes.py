@@ -170,7 +170,7 @@ class InvariantDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as temp:
             path = Path(temp) / "s.jsonl"
             rows = [
-                {"type": "session", "id": "s1", "version": 3, "cwd": "/Users/runner/projects/x"},
+                {"type": "session", "id": "s1", "version": 3, "cwd": "/home/u/projects/x"},
                 {"type": "message", "id": "a", "parentId": None,
                  "message": {"role": "user", "synthetic": True, "content": [{"type": "text", "text": "m"}]}},
                 {"type": "message", "id": "b", "parentId": "a",
@@ -189,7 +189,7 @@ class InvariantDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as temp:
             path = Path(temp) / "s.jsonl"
             tallied = [
-                {"type": "session", "id": "s1", "version": 3, "cwd": "/Users/runner/projects/x"},
+                {"type": "session", "id": "s1", "version": 3, "cwd": "/home/u/projects/x"},
                 {"type": "message", "id": "a", "parentId": None,
                  "message": {"role": "user", "synthetic": True, "content": [{"type": "text", "text": "m"}]}},
                 {"type": "message", "id": "b", "parentId": "a",
@@ -228,7 +228,7 @@ class InvariantDetectionTests(unittest.TestCase):
         self.assertFalse(invariants.check_project_labels(
             [{"agent": "claude", "project": "projects"}]).ok)
         self.assertTrue(invariants.check_project_labels(
-            [{"agent": "pi", "project": "/Users/runner/Desktop/projects"},
+            [{"agent": "pi", "project": "/home/u/Desktop/projects"},
              {"agent": "claude", "project": "amber"}]).ok)
 
     def test_a_folder_named_like_a_container_is_its_own_label(self) -> None:
@@ -237,9 +237,9 @@ class InvariantDetectionTests(unittest.TestCase):
             sessions = []
             for session, cwd, label in (
                     ("01a10e65-7175-76a2-a9a0-881d2e8f05db",
-                     "/Users/runner/Documents/Codex/2026-10-05/t", "t"),
+                     "/Users/u/Documents/Codex/2026-10-05/t", "t"),
                     ("02b20e65-7175-76a2-a9a0-881d2e8f05db",
-                     "/Users/runner/projects/amber/src", "projects")):
+                     "/Users/u/projects/amber/src", "projects")):
                 path = Path(temp) / f"rollout-2026-10-05T16-28-11-{session}.jsonl"
                 meta = {"type": "session_meta", "payload": {"id": session, "cwd": cwd}}
                 path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
@@ -252,7 +252,7 @@ class InvariantDetectionTests(unittest.TestCase):
             self.assertEqual(check.counts["generic_container_labels"], {"codex": 1})
             claude = Path(temp) / "claude.jsonl"
             claude.write_text(json.dumps(
-                {"type": "user", "sessionId": "c1", "cwd": "/Users/runner/Desktop/projects/amber/t"}) + "\n",
+                {"type": "user", "sessionId": "c1", "cwd": "/Users/u/Desktop/projects/amber/t"}) + "\n",
                 encoding="utf-8")
             book[str(claude)] = {"agent": "claude"}
             check = invariants.check_project_labels(
@@ -340,7 +340,7 @@ class SnapshotTests(unittest.TestCase):
         store = self.home / ".claude" / "projects" / "-home-u-projects-x"
         store.mkdir(parents=True)
         self.transcript = store / "s1.jsonl"
-        self.transcript.write_text('{"type":"user","cwd":"/Users/runner/projects/x"}\n', encoding="utf-8")
+        self.transcript.write_text('{"type":"user","cwd":"/home/u/projects/x"}\n', encoding="utf-8")
         os.utime(self.transcript, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
         self.database = self.home / sandbox.OPENCODE_DB
         self.database.parent.mkdir(parents=True)

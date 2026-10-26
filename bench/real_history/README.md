@@ -35,7 +35,7 @@ so only what the registry would parse is read. Everything else is fail-closed sc
   markers such as `<command-name>` or `# AGENTS.md` kept, UTF-8 width classes kept);
 - ids become consistent fakes of the same format; timestamps shift by one run-wide offset
   so the earliest sample lands on 2001-01-01 and every interval survives;
-- paths collapse to `/Users/runner/projects/<word>` with words from the fixed neutral list;
+- paths collapse to `/home/u/projects/<word>` with words from the fixed neutral list;
 - only allowlisted (key, value) vocabulary survives: record types, roles, statuses, tool
   names, model names are replaced by `model-N`;
 - strings are capped at `--max-string-chars`, records over `--max-record-bytes` and files

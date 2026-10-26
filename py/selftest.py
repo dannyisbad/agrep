@@ -439,7 +439,7 @@ def t_live_state_integrity():
     parity_helpers = (not _noise("<repo> keeps failing to build")
                       and _noise("[SYSTEM NOTIFICATION: task completed]")
                       and _ts_ms(None) == 0 and _ts_ms("bad") == 0
-                      and _project_of('/Users/runner/sample-project"') == "sample-project")
+                      and _project_of('C:/Users/tester/sample-project"') == "sample-project")
     ok = (inline_clean and child_ok and internal_filtered and not errors
           and diagnostics and parity_helpers)
     return ("PASS" if ok else "FAIL",
@@ -3701,10 +3701,10 @@ def t_windows_hook_argv():
     import indexer
 
     command = ('"C:\\Program Files\\Python\\python.exe" '
-               '"/Users/runner User\\Desktop\\sample-app\\tool\\cli.py" enrich --auto')
+               '"C:\\Users\\Example User\\Desktop\\sample-app\\tool\\cli.py" enrich --auto')
     got = indexer.split_user_command(command)
     want = [r"C:\Program Files\Python\python.exe",
-            r"/Users/runner User\Desktop\sample-app\tool\cli.py", "enrich", "--auto"]
+            r"C:\Users\Example User\Desktop\sample-app\tool\cli.py", "enrich", "--auto"]
     return ("PASS" if got == want else "FAIL", f"argv={got!r}")
 
 

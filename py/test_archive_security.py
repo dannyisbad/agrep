@@ -190,7 +190,7 @@ class ArchiveSecurityTest(unittest.TestCase):
         source, _ = self._capture_codex()
         record = archive._records()[0]
         twin = copy.deepcopy(record)
-        twin["path"] = r"/Users/runner\.codex\sessions\rollout-archive-safe.jsonl"
+        twin["path"] = r"C:\Users\Example\.codex\sessions\rollout-archive-safe.jsonl"
         archive.MANIFEST.write_text(
             json.dumps(record) + "\n" + json.dumps(twin) + "\n", encoding="utf-8")
         source.unlink()
@@ -1514,7 +1514,7 @@ time.sleep(30)
         record = archive._records()[0]
         source.unlink()
         record["path"] = (
-            r"/Users/runner\.codex\sessions\rollout-archive-safe.jsonl")
+            r"C:\Users\Example\.codex\sessions\rollout-archive-safe.jsonl")
         archive.MANIFEST.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
         self.assertEqual(archive.restore("archive-safe"), 0)
@@ -1525,7 +1525,7 @@ time.sleep(30)
         source, original = self._capture_codex()
         record = archive._records()[0]
         record["path"] = (
-            r"/Users/runner\.codex\sessions\rollout-archive-safe.jsonl")
+            r"C:\Users\Example\.codex\sessions\rollout-archive-safe.jsonl")
         archive.MANIFEST.write_text(json.dumps(record) + "\n", encoding="utf-8")
         output = self.base / "out"
 
@@ -1538,14 +1538,14 @@ time.sleep(30)
 
     def test_portable_paths_reject_devices_unc_ads_and_traversal(self) -> None:
         values = (
-            r"\\?\/Users/runner\.codex\sessions\rollout-safe.jsonl",
+            r"\\?\C:\Users\Example\.codex\sessions\rollout-safe.jsonl",
             r"\\server\share\.codex\sessions\rollout-safe.jsonl",
-            r"/Users/runner\.codex\sessions\rollout-safe.jsonl:stream",
-            r"/Users/runner\.codex\sessions\..\rollout-safe.jsonl",
+            r"C:\Users\Example\.codex\sessions\rollout-safe.jsonl:stream",
+            r"C:\Users\Example\.codex\sessions\..\rollout-safe.jsonl",
             r"C:Users\Example\.codex\sessions\rollout-safe.jsonl",
-            r"/Users/runner/.codex/sessions/..\outside.jsonl",
-            r"/Users/runner/.codex/sessions/rollout-safe.jsonl:stream",
-            r"/Users/runner/.codex/sessions/CON.jsonl",
+            r"/Users/Example/.codex/sessions/..\outside.jsonl",
+            r"/Users/Example/.codex/sessions/rollout-safe.jsonl:stream",
+            r"/Users/Example/.codex/sessions/CON.jsonl",
         )
         for value in values:
             with self.subTest(value=value):
@@ -1555,13 +1555,13 @@ time.sleep(30)
     def test_crush_portable_source_accepts_the_nested_stores_it_captures(
             self) -> None:
         accepted = {
-            "/Users/runner/.local/share/crush/crush.db":
+            "/Users/Example/.local/share/crush/crush.db":
                 ".local/share/crush/crush.db",
-            "/Users/runner/.local/share/crush/projdir/crush.db":
+            "/Users/Example/.local/share/crush/projdir/crush.db":
                 ".local/share/crush/projdir/crush.db",
-            "/Users/runner/.local/share/crush/deep/nested/crush.db":
+            "/Users/Example/.local/share/crush/deep/nested/crush.db":
                 ".local/share/crush/deep/nested/crush.db",
-            r"/Users/runner\AppData\Local\crush\projdir\crush.db":
+            r"C:\Users\Example\AppData\Local\crush\projdir\crush.db":
                 "AppData/Local/crush/projdir/crush.db",
         }
         for value, relative in accepted.items():
@@ -1570,9 +1570,9 @@ time.sleep(30)
                     archive._portable_source_relative(value, "crush", True),
                     Path(relative))
         rejected = (
-            "/Users/runner/.local/share/crush/projdir/other.db",
-            "/Users/runner/.local/share/crush/projdir/crush.db.bak",
-            "/Users/runner/.local/share/elsewhere/projdir/crush.db",
+            "/Users/Example/.local/share/crush/projdir/other.db",
+            "/Users/Example/.local/share/crush/projdir/crush.db.bak",
+            "/Users/Example/.local/share/elsewhere/projdir/crush.db",
         )
         for value in rejected:
             with self.subTest(value=value):
@@ -1581,11 +1581,11 @@ time.sleep(30)
         # the registry is a root-only file, unlike the stores it points at
         self.assertEqual(
             archive._portable_source_relative(
-                "/Users/runner/.local/share/crush/projects.json",
+                "/Users/Example/.local/share/crush/projects.json",
                 "crush", False),
             Path(".local/share/crush/projects.json"))
         self.assertIsNone(archive._portable_source_relative(
-            "/Users/runner/.local/share/crush/projdir/projects.json",
+            "/Users/Example/.local/share/crush/projdir/projects.json",
             "crush", False))
 
     def test_archive_import_uses_authoritative_discovery_home(self) -> None:

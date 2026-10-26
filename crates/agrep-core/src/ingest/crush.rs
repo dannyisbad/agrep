@@ -1634,7 +1634,7 @@ mod tests {
 
     #[test]
     fn data_root_precedence_is_platform_explicit() {
-        let home = Path::new("/Users/runner");
+        let home = Path::new("/home/tester");
         let legacy = home.join(".local/share/crush");
         assert_eq!(
             data_roots_at(

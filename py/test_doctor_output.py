@@ -177,10 +177,10 @@ class InvocationResolverTests(unittest.TestCase):
         self.assertEqual(
             dist.semantic_install_argv(
                 installer="uv",
-                executable="/Users/runner/uv/tools/agrep/bin/python",
+                executable="/home/alice/uv/tools/agrep/bin/python",
                 version="0.2.0"),
             ("uv", "pip", "install", "--python",
-             "/Users/runner/uv/tools/agrep/bin/python", "agrep[semantic]==0.2.0"),
+             "/home/alice/uv/tools/agrep/bin/python", "agrep[semantic]==0.2.0"),
         )
         self.assertEqual(
             dist.semantic_install_argv(
@@ -192,9 +192,9 @@ class InvocationResolverTests(unittest.TestCase):
         self.assertEqual(
             dist.semantic_install_argv(
                 installer="pip",
-                executable="/Users/runner/pipx/venvs/agrep/bin/python",
+                executable="/home/alice/pipx/venvs/agrep/bin/python",
                 version="0.2.0"),
-            ("/Users/runner/pipx/venvs/agrep/bin/python", "-m", "pip", "install",
+            ("/home/alice/pipx/venvs/agrep/bin/python", "-m", "pip", "install",
              "agrep[semantic]==0.2.0"),
         )
 
@@ -202,23 +202,23 @@ class InvocationResolverTests(unittest.TestCase):
         with mock.patch.object(dist, "WIN", True):
             self.assertIsNone(dist.semantic_install_command(
                 installer="pip",
-                executable=r"/Users/runner&B\agrep\python.exe",
+                executable=r"C:\Users\Alice&B\agrep\python.exe",
                 version="0.2.0"))
             self.assertEqual(
                 dist.semantic_install_hint(
                     installer="pip",
-                    executable=r"/Users/runner&B\agrep\python.exe",
+                    executable=r"C:\Users\Alice&B\agrep\python.exe",
                     version="0.2.0"),
                 "install agrep[semantic] into this agrep environment "
                 "from a shell-safe path",
             )
             rendered = dist.semantic_install_command(
                 installer="uv",
-                executable=r"/Users/runner\agrep env\python.exe",
+                executable=r"C:\Users\Alice\agrep env\python.exe",
                 version="0.2.0")
         self.assertEqual(
             rendered,
-            'uv pip install --python "/Users/runner\\agrep env\\python.exe" '
+            'uv pip install --python "C:\\Users\\Alice\\agrep env\\python.exe" '
             '"agrep[semantic]==0.2.0"',
         )
 

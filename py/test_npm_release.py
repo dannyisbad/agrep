@@ -227,7 +227,7 @@ class NpmReleaseTests(unittest.TestCase):
             self._tarball(
                 primary, "@mundy/agrep", VERSION,
                 package_mutation=lambda package: package.update(
-                    privateBuilder="/Users/runner/release"))
+                    privateBuilder="/Users/private/release"))
             with self.assertRaisesRegex(RuntimeError, "package.json"):
                 npm_release.local_manifest(root, VERSION)
 

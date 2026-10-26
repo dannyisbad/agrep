@@ -207,7 +207,7 @@ class WheelManifestTests(unittest.TestCase):
             validate_wheel.validate(self.path)
 
     def test_rejects_zip_comment(self) -> None:
-        _wheel(self.path, zip_comment=b"/Users/runner/project")
+        _wheel(self.path, zip_comment=b"/Users/private-builder/project")
         with self.assertRaisesRegex(validate_wheel.InvalidWheel, "comments"):
             validate_wheel.validate(self.path)
 
