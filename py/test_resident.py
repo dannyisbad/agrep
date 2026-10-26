@@ -85,6 +85,9 @@ IMPORT_EXPORTS = (
     "AGREP_RUNTIME_BUILD_ID", "AGREP_DERIVED_WRITER_IDENTITY_BLOCKED",
     "AGREP_DERIVED_ADOPTION_OWNER_TOKEN", "AGREP_INDEXD_REFRESH_EXPECTED_WRITER",
 )
+# Each process owns its own continuation namespace; compare the protocol
+# while ignoring the intentionally random handle bytes.
+_MORE_HANDLE = re.compile(rb"m\.[A-Za-z0-9_-]{8}")
 # The slow-command self-explanation appears only when a loaded host crosses
 # its wall-clock threshold; it is not part of a command's answer.
 _SLOW_DISCLOSURE = re.compile(rb"(?m)^took \d+(?:\.\d+)?s\b.*\n?")
@@ -92,6 +95,8 @@ _SLOW_DISCLOSURE = re.compile(rb"(?m)^took \d+(?:\.\d+)?s\b.*\n?")
 
 def _comparable(result):
     code, stdout, stderr = result
+    stdout = _MORE_HANDLE.sub(b"m.<TOKEN>", stdout)
+    stderr = _MORE_HANDLE.sub(b"m.<TOKEN>", stderr)
     return code, stdout, _SLOW_DISCLOSURE.sub(b"", stderr)
 
 
