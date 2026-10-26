@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.6 — 2026-10-23
+
+### Performance
+
+- Streamed first-run searches keep the cold ingest path focused on returning the
+  first hit quickly while retaining the full cache and publication checks.
+- Release benchmarks cover selective search, large-hit sweeps, cold ingest, and
+  first-hit streaming with committed process-level budgets.
+
+### Release surface
+
+- Shortened the README around install, the core workflow, supported stores,
+  local-only behavior, and reproducible speed gates.
+- Added a Hacker News launch draft and release checklist.
+
 ## 0.4.5 — 2026-10-12
 
 ### Release safety

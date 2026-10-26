@@ -10,6 +10,7 @@ use std::fs;
 use std::path::Path;
 
 use memchr::memmem;
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -1098,6 +1099,7 @@ fn parse_file_with_tally(
 /// Walk all real project dirs and collect the user's Claude messages + tool events.
 pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
     let root = crate::ingest::home().join(".claude").join("projects");
+    let mut discovered_mtimes = None;
     let files = cache.preflight_source_paths(&root).unwrap_or_else(|| {
         let mut files = Vec::new();
         let dirs = match fs::symlink_metadata(&root) {
@@ -1122,8 +1124,8 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
                 None
             }
         };
+        let mut links = Vec::new();
         if let Some(dirs) = dirs {
-            let mut links = Vec::new();
             for entry in dirs {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -1143,16 +1145,19 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
                 }
             }
             files.sort_unstable();
-            warn_foreign_links(&root, &files, links);
         }
+        let (files, mtimes): (Vec<_>, Vec<_>) = files.into_iter().unzip();
+        warn_foreign_links(&root, &files, links);
+        discovered_mtimes = Some(mtimes);
         files
     });
 
-    let pass = crate::ingest_cache::collect_cached_stamped_for(
+    let pass = crate::ingest_cache::collect_cached_stamped_hinted_for(
         cache,
         "claude",
         &root,
         &files,
+        discovered_mtimes.as_deref(),
         parse_file_stamped,
     );
     (pass.messages, pass.events)
@@ -1164,7 +1169,7 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
 /// Links are collected for `warn_foreign_links`, which needs the finished file set.
 fn gather_jsonl(
     dir: &Path,
-    files: &mut Vec<std::path::PathBuf>,
+    files: &mut Vec<(std::path::PathBuf, i64)>,
     links: &mut Vec<std::path::PathBuf>,
     depth: u8,
 ) {
@@ -1189,30 +1194,55 @@ fn gather_jsonl(
             return;
         }
     };
-    for entry in rd {
-        let entry = match entry {
-            Ok(entry) => entry,
+    let entries: Vec<_> = rd
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
             Err(error) => {
                 crate::ingest::warn_source_skip("claude", dir, &error);
-                continue;
+                None
             }
-        };
-        let p = entry.path();
-        let metadata = match plain_entry_metadata(&entry) {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => {
-                links.push(p);
-                continue;
-            }
-            Err(error) => {
-                crate::ingest::warn_source_skip("claude", &p, &error);
-                continue;
-            }
-        };
-        if metadata.is_dir() {
-            gather_jsonl(&p, files, links, depth + 1);
-        } else if metadata.is_file() && p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            files.push(p);
+        })
+        .collect();
+    enum EntryKind {
+        Directory,
+        Link,
+        Jsonl(i64),
+        Other,
+        Error(String),
+    }
+    // Directory enumeration is sequential, but classifying the many transcript entries is
+    // independent work and should not delay the newest-file streamed first hit.
+    let classified: Vec<_> = entries
+        .into_par_iter()
+        .map(|entry| {
+            let path = entry.path();
+            let kind = match plain_entry_metadata(&entry) {
+                Ok(Some(metadata)) if metadata.is_dir() => EntryKind::Directory,
+                Ok(Some(metadata))
+                    if metadata.is_file()
+                        && path.extension().and_then(|e| e.to_str()) == Some("jsonl") =>
+                {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(crate::ingest_cache::epoch_ns)
+                        .unwrap_or(0);
+                    EntryKind::Jsonl(mtime)
+                }
+                Ok(None) => EntryKind::Link,
+                Ok(Some(_)) => EntryKind::Other,
+                Err(error) => EntryKind::Error(error.to_string()),
+            };
+            (path, kind)
+        })
+        .collect();
+    for (path, kind) in classified {
+        match kind {
+            EntryKind::Directory => gather_jsonl(&path, files, links, depth + 1),
+            EntryKind::Link => links.push(path),
+            EntryKind::Jsonl(mtime) => files.push((path, mtime)),
+            EntryKind::Other => {}
+            EntryKind::Error(error) => crate::ingest::warn_source_skip("claude", &path, error),
         }
     }
 }
@@ -1678,6 +1708,7 @@ mod tests {
             super::gather_jsonl(dir, &mut files, &mut links, 0);
         }
         files.sort_unstable();
+        let files: Vec<_> = files.into_iter().map(|(path, _)| path).collect();
         assert_eq!(files, std::slice::from_ref(&transcript));
         assert_eq!(links.len(), 2);
         let accepts = |path: &Path| path.extension().and_then(|e| e.to_str()) == Some("jsonl");

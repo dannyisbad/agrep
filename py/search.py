@@ -28,18 +28,79 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field, replace
-
-import boundary_rank
 import common
-import compact
-import console
-import display_policy
-import indexd_runtime
-import regex_guard
-import session_context
 import surface_policy as surface
 
+
+class _LazyModule:
+    """Defer non-streaming search helpers until the cold first-hit path is past."""
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._module = None
+
+    def _load(self):
+        module = self._module
+        if module is None:
+            module = __import__(self._name)
+            self._module = module
+        return module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name, value):
+        if name in {"_name", "_module"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._load(), name, value)
+
+    def __delattr__(self, name):
+        if name in {"_name", "_module"}:
+            raise AttributeError(name)
+        delattr(self._load(), name)
+
+
+boundary_rank = _LazyModule("boundary_rank")
+compact = _LazyModule("compact")
+console = _LazyModule("console")
+display_policy = _LazyModule("display_policy")
+regex_guard = _LazyModule("regex_guard")
+session_context = _LazyModule("session_context")
+
+
+class _LazyIndexdRuntime:
+    """Keep daemon identity hashing off the streamed first-hit path."""
+
+    def __init__(self) -> None:
+        self._module = None
+
+    def _load(self):
+        module = self._module
+        if module is None:
+            import indexd_runtime as module
+            self._module = module
+        return module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name, value):
+        if name == "_module":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._load(), name, value)
+
+    def __delattr__(self, name):
+        if name == "_module":
+            raise AttributeError(name)
+        delattr(self._load(), name)
+
+
+indexd_runtime = _LazyIndexdRuntime()
+
+
 corpusdb = None
+_stream_identity_warmup = None
 
 _SEMANTIC_WORKER_START_MISS = (
     "semantic worker did not become query-ready before the automatic deadline")
@@ -6615,6 +6676,11 @@ def _stream_first_run(q: str, mode: str, args, color: bool,
         return 2
     if pat is None:
         return None
+    # The Rust child inherits the Python half of the derived-writer identity from this
+    # module's import-time setup; initialize it before the direct cold launch.
+    if _stream_identity_warmup is not None:
+        _stream_identity_warmup.join()
+    _ = indexd_runtime.INDEXD_BUILD_ID
     cmd = [str(common.ingest_bin()), "index", "--agent", "all", "--emit-rows"]
     try:
         proc = subprocess.Popen(cmd, cwd=str(common.REPO_ROOT), stdout=subprocess.PIPE,
@@ -7003,6 +7069,22 @@ def filter_coverage(args) -> dict:
 
 
 def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
+    global _stream_identity_warmup
+    _stream_identity_warmup = None
+    if ("indexd_runtime" not in sys.modules
+            and not (common.DATA_DIR / "messages.jsonl").exists()
+            and common.ingest_bin().exists()):
+        import threading
+
+        def warm_stream_identity() -> None:
+            try:
+                _ = indexd_runtime.INDEXD_BUILD_ID
+            except BaseException:
+                pass
+
+        _stream_identity_warmup = threading.Thread(
+            target=warm_stream_identity, name="agrep-writer-identity", daemon=True)
+        _stream_identity_warmup.start()
     t0 = time.monotonic()
     common.lap("imports")
     common.utf8_stdio()

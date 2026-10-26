@@ -3499,6 +3499,22 @@ impl IngestCache {
                 .any(|(owner, absent)| owner == agent && source_path_eq(absent, root))
     }
 
+    /// Nothing cached or expected under `root` needs reconciling: every source listed under it
+    /// is a miss, and no rename, deletion or last-good guard has prior state there to act on.
+    fn cold_under(&self, root: &Path) -> bool {
+        let within = |path: &PathBuf| source_path_within(path, root);
+        !self.warm
+            && !self.force_reparse
+            && !self.repair_mode
+            && !self.coverage_expected_paths.iter().any(within)
+            && !self.repair_expected_paths.iter().any(within)
+            && !self
+                .entries
+                .keys()
+                .filter_map(|key| source_path_from_key(key))
+                .any(|path| within(&path))
+    }
+
     /// Name the instant before this run's first source stat (the preflight, when one feeds the
     /// cache). Entries whose stamp is not safely older are recorded racy and reparse next run.
     pub fn set_scan_start(&mut self, start: std::time::SystemTime) {
@@ -6244,6 +6260,154 @@ mod tests {
         assert!(!cache.entries.contains_key(&source_key(&legacy)));
         assert!(cache.entries.contains_key(&source_key(&current)));
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn parse_ahead_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agrep-cache-parse-ahead-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn cold_parse_ahead_dispatches_newest_first_and_admits_what_the_default_pass_does() {
+        let root = parse_ahead_root("equivalent");
+        let names = ["a", "b", "c", "d"];
+        let mut files: Vec<PathBuf> = names
+            .iter()
+            .map(|name| {
+                let path = root.join(format!("{name}.jsonl"));
+                fs::write(&path, name.repeat(3)).unwrap();
+                path
+            })
+            .collect();
+        // Discovered, then gone before its stat: guarded exactly like the default pass.
+        files.push(root.join("vanished.jsonl"));
+        let mtimes: [i64; 5] = [20, 40, 10, 30, 50];
+        let parse = |path: &std::path::Path, _: i64, size: u64| {
+            let text = fs::read_to_string(path).unwrap();
+            assert_eq!(text.len() as u64, size);
+            (vec![test_message(&text)], Vec::<Event>::new())
+        };
+
+        let mut default = IngestCache::cold();
+        let expected =
+            super::collect_cached_stamped_for(&mut default, "ingest", &root, &files, parse);
+
+        let order = std::sync::Mutex::new(Vec::new());
+        let mut ahead = IngestCache::cold();
+        assert!(ahead.cold_under(&root));
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let pass = single.install(|| {
+            super::collect_cached_stamped_retiring_for(
+                &mut ahead,
+                "ingest",
+                &root,
+                &files,
+                &HashSet::new(),
+                Some(&mtimes[..]),
+                |path: &std::path::Path, mtime: i64, size: u64| {
+                    order.lock().unwrap().push(path.to_path_buf());
+                    parse(path, mtime, size)
+                },
+            )
+        });
+
+        let order = order.into_inner().unwrap();
+        let newest_first: Vec<PathBuf> = [1, 3, 0, 2].iter().map(|i| files[*i].clone()).collect();
+        assert_eq!(
+            order, newest_first,
+            "one parse per source, newest hint first"
+        );
+        let texts = |pass: &super::Pass| -> Vec<String> {
+            pass.messages.iter().map(|m| m.text.to_string()).collect()
+        };
+        assert_eq!(texts(&pass), texts(&expected));
+        assert_eq!(pass.parsed, expected.parsed);
+        assert_eq!(ahead.entries.len(), names.len());
+        assert_eq!(
+            ahead.entries.keys().collect::<HashSet<_>>(),
+            default.entries.keys().collect::<HashSet<_>>()
+        );
+        for (key, entry) in &ahead.entries {
+            let reference = &default.entries[key];
+            assert!(
+                entry.mtime == reference.mtime
+                    && entry.size == reference.size
+                    && entry.identity == reference.identity
+                    && entry.msgs == reference.msgs,
+                "parse-ahead entry {key} differs from the default pass"
+            );
+        }
+        assert_eq!(ahead.source_read_issues, default.source_read_issues);
+        assert!(ahead.guarded_stale && default.guarded_stale);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_ahead_is_refused_whenever_the_root_has_state_to_reconcile() {
+        let root = parse_ahead_root("refused");
+        let elsewhere = parse_ahead_root("elsewhere");
+        let kept = root.join("kept.jsonl");
+        let deleted = root.join("deleted.jsonl");
+        fs::write(&kept, b"kept").unwrap();
+        fs::write(&deleted, b"deleted").unwrap();
+
+        let mut cache = IngestCache::cold();
+        assert!(cache.cold_under(&root));
+        collect_cached(&mut cache, &root, &[kept.clone(), deleted.clone()], |_| {
+            (vec![test_message("row")], Vec::<Event>::new())
+        });
+        // Not loaded warm, but its own earlier pass left entries under the root.
+        assert!(!cache.warm);
+        assert!(!cache.cold_under(&root));
+        assert!(cache.cold_under(&elsewhere));
+
+        // Hints never bypass deletion reconciliation of a cached root: the deleted source is
+        // forgotten and its session's unchanged sibling is reparsed, not admitted as a miss.
+        fs::remove_file(&deleted).unwrap();
+        let pass = super::collect_cached_stamped_retiring_for(
+            &mut cache,
+            "ingest",
+            &root,
+            std::slice::from_ref(&kept),
+            &HashSet::new(),
+            Some(&[1_i64][..]),
+            |_: &std::path::Path, _: i64, _: u64| (vec![test_message("row")], Vec::<Event>::new()),
+        );
+        assert_eq!(pass.parsed, 1);
+        assert_eq!(pass.messages.len(), 1);
+        assert!(cache.touched.contains("session"));
+        assert!(cache.entries.contains_key(&source_key(&kept)));
+        assert!(!cache.entries.contains_key(&source_key(&deleted)));
+
+        let expected_under_root = HashSet::from([root.join("expected.jsonl")]);
+        let mut covered = IngestCache::cold();
+        covered.set_source_coverage(expected_under_root.clone(), HashMap::new());
+        assert!(!covered.cold_under(&root));
+        let mut repairing = IngestCache::cold();
+        repairing.set_repair_expectations(HashSet::new(), expected_under_root);
+        assert!(!repairing.cold_under(&root));
+        for flag in 0..3 {
+            let mut flagged = IngestCache::cold();
+            match flag {
+                0 => flagged.warm = true,
+                1 => flagged.force_reparse = true,
+                _ => flagged.repair_mode = true,
+            }
+            assert!(!flagged.cold_under(&elsewhere), "flag {flag}");
+        }
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(elsewhere);
     }
 
     #[cfg(any(unix, windows))]
@@ -11994,7 +12158,34 @@ where
     F: Fn(&Path, i64, u64) -> R + Sync,
     R: IntoParsed,
 {
-    collect_cached_stamped_retiring_for(cache, agent, root, files, &HashSet::new(), parse)
+    collect_cached_stamped_retiring_for(cache, agent, root, files, &HashSet::new(), None, parse)
+}
+
+/// [`collect_cached_stamped_for`] given each file's discovery-time mtime (`discovered_mtimes[i]`
+/// for `files[i]`, epoch ns). A genuinely cold emit-only pass uses them to dispatch the newest
+/// sources first, each statted right before its own parse, instead of parsing only after every
+/// source is statted; every other pass ignores them.
+pub fn collect_cached_stamped_hinted_for<F, R>(
+    cache: &mut IngestCache,
+    agent: &'static str,
+    root: &Path,
+    files: &[PathBuf],
+    discovered_mtimes: Option<&[i64]>,
+    parse: F,
+) -> Pass
+where
+    F: Fn(&Path, i64, u64) -> R + Sync,
+    R: IntoParsed,
+{
+    collect_cached_stamped_retiring_for(
+        cache,
+        agent,
+        root,
+        files,
+        &HashSet::new(),
+        discovered_mtimes.filter(|_| crate::emit::on()),
+        parse,
+    )
 }
 
 /// [`collect_cached_for`] for a store where a file that still exists can stop being a source
@@ -12012,7 +12203,7 @@ where
     F: Fn(&Path) -> R + Sync,
     R: IntoParsed,
 {
-    collect_cached_stamped_retiring_for(cache, agent, root, files, retired, |path, _, _| {
+    collect_cached_stamped_retiring_for(cache, agent, root, files, retired, None, |path, _, _| {
         parse(path)
     })
 }
@@ -12023,6 +12214,7 @@ fn collect_cached_stamped_retiring_for<F, R>(
     root: &Path,
     files: &[PathBuf],
     retired: &HashSet<PathBuf>,
+    discovered_mtimes: Option<&[i64]>,
     parse: F,
 ) -> Pass
 where
@@ -12039,11 +12231,17 @@ where
         .keys()
         .filter_map(|key| source_path_from_key(key).map(|path| (key.clone(), path)))
         .collect();
+    let parse_ahead =
+        discovered_mtimes.filter(|mtimes| mtimes.len() == files.len() && cache.cold_under(root));
     let mut reconciled_files: Vec<PathBuf> = Vec::with_capacity(files.len());
+    let mut reconciled_mtimes: Vec<i64> = Vec::new();
     let mut listed_paths = HashSet::with_capacity(files.len());
-    for path in files.iter() {
+    for (index, path) in files.iter().enumerate() {
         if listed_paths.insert(path.clone()) {
             reconciled_files.push(path.clone());
+            if let Some(mtimes) = parse_ahead {
+                reconciled_mtimes.push(mtimes[index]);
+            }
         }
     }
     for path in &cache.coverage_expected_paths {
@@ -12158,41 +12356,90 @@ where
             }
         }
     }
-    let observed: Vec<ObservedFile> = reconciled_files
-        .into_par_iter()
-        .map(|p| {
-            let exact = exact_cached.get(p.as_path()).copied();
-            match exact {
-                Some((key, _entry)) => {
-                    let stat = cache
-                        .source_stamps
-                        .get(&p)
-                        .and_then(|stamp| preflight_file_stat(&p, stamp))
-                        .map(Some)
-                        .map(Ok)
-                        .unwrap_or_else(|| identified_file_stat(root, &p));
-                    (p, Some(key.to_string()), stat)
+    let observe = |p: &Path| -> IdentifiedStat {
+        cache
+            .source_stamps
+            .get(p)
+            .and_then(|stamp| preflight_file_stat(p, stamp))
+            .map(Some)
+            .map(Ok)
+            .unwrap_or_else(|| identified_file_stat(root, p))
+    };
+    // Parse-ahead results, aligned with `observed`.
+    let mut parsed_ahead: Vec<Option<IsolatedParse>> = Vec::new();
+    let observed: Vec<ObservedFile> = if parse_ahead.is_some() {
+        // Cold root: the listing is exact; each source is statted immediately before parsing,
+        // newest first, and that stat is the cache-admitted identity. Reconciliation still sees
+        // every stat result before any cache mutation.
+        crate::emit::total(reconciled_files.len());
+        let mut order: Vec<usize> = (0..reconciled_files.len()).collect();
+        order.sort_by_key(|&index| std::cmp::Reverse(reconciled_mtimes[index]));
+        let parse_ahead_one = |index: usize| {
+            let path = reconciled_files[index].as_path();
+            let stat = observe(path);
+            let parsed = match &stat {
+                Ok(Some((_, mtime, size, _))) => {
+                    let parsed = parse_isolated(agent, path, || parse(path, *mtime, *size));
+                    crate::emit::file_done(&parsed.0);
+                    Some(parsed)
                 }
-                None => {
-                    let stat = cache
-                        .source_stamps
-                        .get(&p)
-                        .and_then(|stamp| preflight_file_stat(&p, stamp))
-                        .map(Some)
-                        .map(Ok)
-                        .unwrap_or_else(|| identified_file_stat(root, &p));
-                    let fallback = if matches!(&stat, Ok(Some(_))) {
-                        None
-                    } else {
-                        exact_cached.iter().find_map(|(old, cached)| {
-                            source_path_eq(old, &p).then(|| cached.0.to_string())
-                        })
-                    };
-                    (p, fallback, stat)
+                // Announced in the total, so it still ticks progress.
+                _ => {
+                    crate::emit::file_done(&[]);
+                    None
                 }
-            }
-        })
-        .collect();
+            };
+            (index, stat, parsed)
+        };
+        let mut fused = Vec::with_capacity(order.len());
+        if let Some(first) = order.first().copied() {
+            // The newest source is the benchmark's and user's likely first hit. Parse it
+            // synchronously so the parallel reconciliation cannot delay the first row.
+            fused.push(parse_ahead_one(first));
+        }
+        fused.extend(
+            order
+                .into_iter()
+                .skip(1)
+                .par_bridge()
+                .map(parse_ahead_one)
+                .collect::<Vec<_>>(),
+        );
+        fused.sort_unstable_by_key(|(index, ..)| *index);
+        parsed_ahead.reserve(fused.len());
+        fused
+            .into_iter()
+            .zip(reconciled_files)
+            .map(|((_, stat, parsed), path)| {
+                parsed_ahead.push(parsed);
+                (path, None, stat)
+            })
+            .collect()
+    } else {
+        reconciled_files
+            .into_par_iter()
+            .map(|p| {
+                let exact = exact_cached.get(p.as_path()).copied();
+                match exact {
+                    Some((key, _entry)) => {
+                        let stat = observe(&p);
+                        (p, Some(key.to_string()), stat)
+                    }
+                    None => {
+                        let stat = observe(&p);
+                        let fallback = if matches!(&stat, Ok(Some(_))) {
+                            None
+                        } else {
+                            exact_cached.iter().find_map(|(old, cached)| {
+                                source_path_eq(old, &p).then(|| cached.0.to_string())
+                            })
+                        };
+                        (p, fallback, stat)
+                    }
+                }
+            })
+            .collect()
+    };
     drop(exact_cached);
     let mut stats: Vec<(PathBuf, String, i64, u64, CacheIdentity)> =
         Vec::with_capacity(observed.len());
@@ -12200,7 +12447,10 @@ where
     let mut discovered = HashSet::new();
     #[cfg(windows)]
     let mut observed_identities: HashMap<String, LogicalPathIndex<usize>> = HashMap::new();
+    let mut parsed_ahead = parsed_ahead.into_iter();
+    let mut ahead: HashMap<String, IsolatedParse> = HashMap::new();
     for (path, cached_key, stat) in observed {
+        let parsed = parsed_ahead.next().flatten();
         match stat {
             Ok(Some((key, mtime, size, identity))) => {
                 #[cfg(windows)]
@@ -12240,6 +12490,9 @@ where
                 }
                 cached_paths.insert(key.clone(), path.clone());
                 if discovered.insert(key.clone()) {
+                    if let Some(parsed) = parsed {
+                        ahead.insert(key.clone(), parsed);
+                    }
                     stats.push((path, key, mtime, size, identity));
                 }
             }
@@ -12302,18 +12555,24 @@ where
                     && e.size == *size
                     && e.identity.as_ref() == Some(identity))
             });
-    crate::emit::total(misses.len());
+    if parse_ahead.is_none() {
+        crate::emit::total(misses.len());
+    }
     if crate::emit::on() {
         // Emit-only recency order (newest first); the normal run keeps discovery order
         // (and byte-identical derived files).
         misses.sort_by_key(|(_, _, mtime, _, _)| std::cmp::Reverse(*mtime));
     }
 
-    let miss_parsed: Vec<ParsedMiss> = misses
-        .par_iter()
-        .map(|(p, key, mtime, size, identity)| {
-            let (m, e, healthy, panicked) = parse_isolated(agent, p, || parse(p, *mtime, *size));
-            crate::emit::file_done(&m);
+    let parse_miss =
+        |(p, key, mtime, size, identity): &(PathBuf, String, i64, u64, CacheIdentity),
+         ahead: Option<IsolatedParse>|
+         -> ParsedMiss {
+            let (m, e, healthy, panicked) = ahead.unwrap_or_else(|| {
+                let parsed = parse_isolated(agent, p, || parse(p, *mtime, *size));
+                crate::emit::file_done(&parsed.0);
+                parsed
+            });
             (
                 key.clone(),
                 p.clone(),
@@ -12325,8 +12584,22 @@ where
                 healthy,
                 panicked,
             )
-        })
-        .collect();
+        };
+    let miss_parsed: Vec<ParsedMiss> = if ahead.is_empty() {
+        misses
+            .par_iter()
+            .map(|miss| parse_miss(miss, None))
+            .collect()
+    } else {
+        let pending: Vec<_> = misses
+            .iter()
+            .map(|miss| (miss, ahead.remove(&miss.1)))
+            .collect();
+        pending
+            .into_par_iter()
+            .map(|(miss, parsed)| parse_miss(miss, parsed))
+            .collect()
+    };
 
     // sessions touched: from the fresh parses AND from the OLD cache entries of changed files
     // (so a session that moved between files is fully refreshed)
