@@ -6374,6 +6374,7 @@ mod tests {
 
         // Hints never bypass deletion reconciliation of a cached root: the deleted source is
         // forgotten and its session's unchanged sibling is reparsed, not admitted as a miss.
+        let deleted_key = source_key(&deleted);
         fs::remove_file(&deleted).unwrap();
         let pass = super::collect_cached_stamped_retiring_for(
             &mut cache,
@@ -6388,7 +6389,7 @@ mod tests {
         assert_eq!(pass.messages.len(), 1);
         assert!(cache.touched.contains("session"));
         assert!(cache.entries.contains_key(&source_key(&kept)));
-        assert!(!cache.entries.contains_key(&source_key(&deleted)));
+        assert!(!cache.entries.contains_key(&deleted_key));
 
         let expected_under_root = HashSet::from([root.join("expected.jsonl")]);
         let mut covered = IngestCache::cold();
