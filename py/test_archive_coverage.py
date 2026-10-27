@@ -298,6 +298,20 @@ class LiveAppendCaptureTests(_ArchiveSandbox):
         self.assertEqual(archive._reconstruct(archive._records()[-1]),
                          self.source.read_bytes())
 
+    def test_a_zero_byte_instant_is_never_published(self) -> None:
+        # An in-place rewriter truncates before it writes; a capture that lands in
+        # that gap must neither create an empty record nor bury the last real one.
+        before = self.source.read_bytes()
+        self.source.write_bytes(b"")
+        self.assertEqual(archive.capture()["full"], 0)
+        self.assertEqual(archive._records(), [])
+        self.source.write_bytes(before)
+        self.assertEqual(archive.capture()["full"], 1)
+        self.source.write_bytes(b"")
+        stats = archive.capture()
+        self.assertEqual((stats["full"], stats["failed"]), (0, 0), stats)
+        self.assertEqual(archive._reconstruct(archive._records()[-1]), before)
+
     def test_an_actively_rewritten_document_is_captured_consistent(self) -> None:
         """A cline history rewritten in place on every message, compression slower
         than the gap between rewrites: the published bytes are one instant's

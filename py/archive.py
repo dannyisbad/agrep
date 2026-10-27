@@ -2255,6 +2255,11 @@ def _capture_locked(verbose: bool, scheduled: bool = False) -> dict:
             if not grown:
                 sha, size, prefix_sha, suffix_sha, identity, _ = _hash_regular_file(
                     temp, ARCHIVE_DIR)
+            if not is_sqlite and size == 0:
+                # A zero-byte instant (an in-place rewrite between truncate and write)
+                # holds no history; publishing it would bury the last real version.
+                stats["unchanged"] += 1
+                continue
             if old and not rebase and old["sha256"] == sha:
                 rec = {**old, "mtime_ns": st.st_mtime_ns, "ts": int(time.time() * 1000)}
                 if source_sig is not None:

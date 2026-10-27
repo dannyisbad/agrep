@@ -11,6 +11,13 @@
   records a retryable start miss, so the bounded recovery starts the worker and
   the same search answers with meaning results.
 
+### Archive
+
+- A capture never publishes a zero-byte copy. Tools that rewrite a history
+  file in place truncate it before writing; a capture landing in that instant
+  used to record an empty "latest" version over the last real one. Those
+  instants are now skipped and the previous version stays current.
+
 ## 0.4.7 — 2026-10-27
 
 ### Meaning search
