@@ -609,10 +609,9 @@ class SegmentRefStore:
                 matches = [row for row in candidates
                            if _text_hash(str(row[0])) == record["text_hash"]]
                 if not matches or len({str(row[0]) for row in matches}) != 1:
-                    # No corpus row at all is coverage lag in a derived mirror
-                    # read stale by design; a present-but-different text is
-                    # damage evidence only against the generation the bundle
-                    # embedded (take_integrity_disclosure decides which).
+                    # An absent row is coverage lag in a mirror read stale by design;
+                    # changed text is damage evidence only against the generation the
+                    # bundle embedded (take_integrity_disclosure decides which).
                     if not candidates:
                         self._absent_drops.add(row_ref)
                     else:
@@ -1045,10 +1044,9 @@ def _verified_manifest(path: Path):
             changed = [artifact for artifact, identity in proof.items()
                        if observed.get(str(artifact)) != identity]
             if changed:
-                # A different file at a published path is either a newer
-                # publication or the same bytes relocated by a copy, restore
-                # or migration. Only a manifest that stayed put can tell: then
-                # the descriptor digest decides, once per relocation.
+                # A different file at a published path is a newer publication or the
+                # same bytes relocated by copy/restore/migration; with the manifest
+                # unchanged, the descriptor digest decides, once per relocation.
                 relocated = frozenset(
                     artifact for artifact in changed
                     if _current_identity_republished(

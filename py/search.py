@@ -2339,9 +2339,8 @@ def _finish_semantic_query_inner(pending) -> dict | None:
         return result
 
     # The fast attempt proved an exact transient. Convergence, owner handoff,
-    # cached-model load, and the one retry share one absolute recovery deadline
-    # counted from the lane's start; no phase gets to restart the clock. Every
-    # query/filter option is preserved.
+    # model load and the one retry share one deadline counted from the lane's
+    # start; no phase restarts the clock. Every query/filter option is kept.
     try:
         import semantic
         recovery_window = semantic.bounded_query_recovery_wait_s(

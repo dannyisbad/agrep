@@ -1880,10 +1880,9 @@ def _q8_grouped_pool(query: np.ndarray, refs: _MessageRefStore,
     if excluded_family_present:
         keep = groups != int(excluded_family_id)
         ordinals, scores, groups = ordinals[keep], scores[keep], groups[keep]
-    # Every scored head of each family, best first. When a family's best row
-    # changed or left the corpus since it was embedded (or no longer passes a
-    # filter on its current metadata), its next scored row stands in instead
-    # of the whole family dropping out.
+    # Every scored head of each family, best first: when the best row changed,
+    # left the corpus, or fails a filter on current metadata, the next scored
+    # row stands in instead of the whole family dropping out.
     heads: dict[int, list[int]] = {}
     for position in sorted(
             range(len(ordinals)),

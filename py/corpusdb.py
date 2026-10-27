@@ -52,11 +52,9 @@ DB_PATH = common.DATA_DIR / "corpus.db"
 BOUNDARY_STATS_PATH = common.DATA_DIR / "boundary_stats.json"
 INGEST_SIG_PATH = common.DATA_DIR / ".ingest.sig"
 _SCHEMA = "17"  # 17: reply_shape side table beside the agent rows
-# Every release through 0.4.2 published schema 15: exactly 17's search surface without the
-# reply_shape side table (16 never shipped). Readers serve it read-only - only the briefing
-# reads reply_shape and it falls back to the transcripts without it - and the Rust takeover
-# retains it for them (CORPUS_DB_RETAINED_SCHEMA_VERSION) until its atomic rebuild publishes 17.
-# No writer path accepts it: _valid_db and _incremental still require _SCHEMA.
+# Releases through 0.4.2 published schema 15: 17 without reply_shape (16 never shipped).
+# Readers serve it read-only while the Rust takeover retains it for its atomic rebuild;
+# no writer accepts it (_valid_db and _incremental still require _SCHEMA).
 _RETAINED_READER_SCHEMA = "15"
 _TRIGGER_SCHEMA = "4"  # 4: FTS triggers consume the normalized text sidecar
 # 1: codex's empty-text recap rows are indexed. A database lacking this meta value predates
@@ -4916,11 +4914,9 @@ def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> 
 _COVERAGE_COUNT_CACHE: dict[tuple, tuple[int | None, ...]] = {}
 _COVERAGE_COUNT_LOCK = threading.Lock()
 _COVERAGE_COUNT_CACHE_MAX = 4096
-# Exact term counts walk whole trigram posting lists: a common word costs
-# 0.3-1.5 s cold on a million-row corpus, paid again by every CLI process.
-# They only weight and gate ranking heuristics, so a count measured while the
-# FTS index held within this share of its current rows is reused across
-# processes. Terms are stored hashed: the cache never records query text.
+# Exact term counts walk whole posting lists (0.3-1.5 s per common word, per process); they
+# only weight ranking heuristics, so one measured within the FTS row-count tolerance is
+# reused across processes. Terms are stored hashed: the cache never records query text.
 _COVERAGE_DF_FILE = ".coverage-df.json"
 _COVERAGE_DF_VERSION = 2
 _COVERAGE_DF_TOLERANCE = 0.005

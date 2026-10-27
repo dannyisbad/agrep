@@ -220,10 +220,9 @@ class SemanticPublicationConvergenceTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
             self.assertGreater(len(observed), 0)
-            # A descheduled writer can exhaust the reader's bounded patience
-            # (SEMANTIC_PUBLICATION_WAIT_S), so the contract is no SILENT
-            # staleness: searchable-and-current, a searchable older generation
-            # that discloses its lag, or a disclosed transient state.
+            # A descheduled writer can exhaust the reader's bounded patience, so the
+            # contract is no SILENT staleness: current, an older generation that
+            # discloses its lag, or a disclosed transient state.
             transient = {"stale", "unstable-source", "unstable-embeddings"}
             for row in observed:
                 if row["searchable"] and row["state"] == "published":

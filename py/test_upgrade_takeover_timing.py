@@ -1458,10 +1458,9 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     check=False)
 
     def test_released_schema_index_serves_every_search_across_the_takeover(self) -> None:
-        # The 0.4.2 upgrade: the previous build left a schema-15 corpus.db. Before the
-        # successor's ingest takes over, while its rebuild is owed, and after it lands, every
-        # search answers from an index - never the transcript scan, which is a multi-second
-        # crawl on a real corpus, nor its publication timeout
+        # The 0.4.2 upgrade left a schema-15 corpus.db: before, during and after the
+        # successor's takeover, every search answers from an index - never the
+        # multi-second transcript scan nor its publication timeout.
         self.assertTrue(RELEASE_BIN.is_file(), RELEASE_BIN)
         with fixture_tree(prefix="agrep-released-schema-upgrade-") as raw:
             root = Path(raw)
