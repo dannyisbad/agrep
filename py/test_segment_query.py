@@ -1116,6 +1116,9 @@ class SegmentQueryTests(unittest.TestCase):
                         self.assertIs(
                             payload["semantic_coverage"]["source_current"], False)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows refuses to rename over a database a reader still holds open")
     def test_resident_reader_reconnects_after_the_corpus_is_replaced(
             self) -> None:
         import corpusdb

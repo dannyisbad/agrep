@@ -130,6 +130,13 @@ class SemanticWriterEntrypointTests(unittest.TestCase):
 
     def test_foreign_database_fences_direct_semantic_writer_entrypoints(
             self) -> None:
+        # A live foreign indexer still owns the stores: the query worker stays
+        # fenced along with every Python writer. (Started here, not in the
+        # `with` below: Python 3.10 caps a function at 20 nested blocks.)
+        live_owner = mock.patch.object(
+            indexd_runtime, "live_indexer_claim", return_value=True)
+        live_owner.start()
+        self.addCleanup(live_owner.stop)
         with tempfile.TemporaryDirectory(prefix="agrep-semantic-foreign-db-") as raw:
             base = Path(raw)
             root = base / "data"
@@ -204,10 +211,6 @@ class SemanticWriterEntrypointTests(unittest.TestCase):
                 mock.patch.object(
                     ask, "_quarantine_message_refs_path",
                     side_effect=AssertionError("foreign refs quarantined")),
-                # A live foreign indexer still owns the stores: the query worker
-                # stays fenced along with every Python writer.
-                mock.patch.object(
-                    indexd_runtime, "live_indexer_claim", return_value=True),
             ):
                 refusal = indexd_runtime.derived_writer_mutation_info()
                 self.assertFalse(refusal.writable)
