@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -457,6 +458,68 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
             search._SEMANTIC_WORKER_START_MISS)
         self.assertTrue(result["semantic_status"]["retryable"])
         guarded.assert_not_called()
+
+    def test_a_preflight_that_outruns_the_fast_pass_is_a_typed_miss(self) -> None:
+        # Pre-flight probes can outlast the fast pass on a cold first run; an
+        # untyped None skipped recovery and left meaning down with no cause.
+        import semworker
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_DAEMON": "", "AGREP_NO_SEM_WORKER": ""}), \
+                mock.patch.object(
+                    semworker, "resident_status", return_value={"running": True}), \
+                mock.patch.object(semworker, "search_worker") as worker:
+            result = search._semantic_local("staged checklists", 2, timeout_s=0.0)
+        worker.assert_not_called()
+        self.assertEqual(
+            result["semantic_status"]["reason"], search._SEMANTIC_WORKER_START_MISS)
+        self.assertTrue(result["semantic_status"]["retryable"])
+
+    def test_a_lane_thread_started_past_its_deadline_is_a_typed_miss(self) -> None:
+        with mock.patch.object(search, "run_query") as run_query:
+            pending = search._start_semantic_query(
+                "staged checklists", {"limit": 2},
+                _allow_recovery=False, _absolute_deadline=0.0)
+            result = search._finish_semantic_query(pending)
+        run_query.assert_not_called()
+        self.assertEqual(
+            result["semantic_status"]["reason"], search._SEMANTIC_WORKER_START_MISS)
+
+    def test_a_slow_first_preflight_recovers_and_answers(self) -> None:
+        # The first agent search after an upgrade: the fast pass's pre-flight
+        # outruns its deadline, and the lane must still launch and answer.
+        import semworker
+        calls = []
+
+        def resident_status(*_args, **_kwargs) -> dict:
+            calls.append(1)
+            if len(calls) == 1:
+                time.sleep(0.15)
+            return {"running": True}
+
+        answered = {"results": [], "semantic_coverage": {
+            "indexed": 2, "total": 2, "pending": 0, "complete": True}}
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_DAEMON": "", "AGREP_NO_SEM_WORKER": ""}), \
+                mock.patch.object(search, "_AUTO_SEMANTIC_TIMEOUT_S", 0.05), \
+                mock.patch.object(search, "_semantic_cold_start_cap_s",
+                                  return_value=1.0), \
+                mock.patch.object(search, "_semantic_index_update_active",
+                                  return_value=False), \
+                mock.patch.object(semworker, "resident_status",
+                                  side_effect=resident_status), \
+                mock.patch.object(semworker, "search_worker",
+                                  return_value=answered) as worker, \
+                mock.patch.object(semantic, "wait_for_query_recovery",
+                                  return_value={"state": "ready"}):
+            pending = search._start_semantic_query(
+                "staged checklists", {"limit": 2, "semantic_timeout_s": 0.05})
+            result = search._finish_semantic_query(pending)
+        self.assertIsNotNone(result)
+        self.assertFalse(result["fallback_recommended"], result)
+        self.assertTrue(surface.semantic_lane_answered(result["semantic_status"]))
+        worker.assert_called_once()
 
     def test_a_live_worker_of_another_build_fails_fast_not_after_the_deadline(
             self) -> None:

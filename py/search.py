@@ -785,7 +785,10 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
     try:
         available = remaining()
         if available is not None and available <= 0:
-            return None
+            # A slow pre-flight (cold caches, a takeover's I/O) outran the fast
+            # pass: a typed miss opens the bounded recovery that launches the worker.
+            return _semantic_runtime_unavailable(
+                q, requested, who, _SEMANTIC_WORKER_START_MISS)
         worker_timeout = ({}
                           if available is None else {
                               "timeout_s": available,
@@ -2255,6 +2258,9 @@ def _start_semantic_query(
         try:
             remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
+                state["result"] = _semantic_runtime_unavailable(
+                    query, int(kwargs.get("limit") or 0), kwargs.get("who"),
+                    _SEMANTIC_WORKER_START_MISS)
                 return
             call_kwargs = {
                 **kwargs, "semantic_timeout_s": remaining,

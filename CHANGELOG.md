@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.8 — 2026-10-27
+
+### Meaning search
+
+- The first search after an upgrade no longer prints "meaning unavailable;
+  keyword-only". When the meaning lane's startup checks ran past its short
+  first deadline (cold caches while the new build takes over the index), the
+  lane gave up without starting the semantic worker or naming a cause. It now
+  records a retryable start miss, so the bounded recovery starts the worker and
+  the same search answers with meaning results.
+
 ## 0.4.7 — 2026-10-27
 
 ### Meaning search
