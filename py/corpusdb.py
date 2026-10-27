@@ -52,6 +52,12 @@ DB_PATH = common.DATA_DIR / "corpus.db"
 BOUNDARY_STATS_PATH = common.DATA_DIR / "boundary_stats.json"
 INGEST_SIG_PATH = common.DATA_DIR / ".ingest.sig"
 _SCHEMA = "17"  # 17: reply_shape side table beside the agent rows
+# Every release through 0.4.2 published schema 15: exactly 17's search surface without the
+# reply_shape side table (16 never shipped). Readers serve it read-only - only the briefing
+# reads reply_shape and it falls back to the transcripts without it - and the Rust takeover
+# retains it for them (CORPUS_DB_RETAINED_SCHEMA_VERSION) until its atomic rebuild publishes 17.
+# No writer path accepts it: _valid_db and _incremental still require _SCHEMA.
+_RETAINED_READER_SCHEMA = "15"
 _TRIGGER_SCHEMA = "4"  # 4: FTS triggers consume the normalized text sidecar
 # 1: codex's empty-text recap rows are indexed. A database lacking this meta value predates
 # the shape and converges through one full parse and signature diff on its next refresh.
@@ -2776,12 +2782,18 @@ def _incremental(stamp: str, *,
                 pass
 
 
+def reader_schema_compatible(schema: object) -> bool:
+    """A published schema this build's read paths can serve: its own, or the released schema a
+    takeover retains until the rebuild lands (writers still require _SCHEMA)."""
+    return schema == _SCHEMA or schema == _RETAINED_READER_SCHEMA
+
+
 def _publication_compatible(
         meta: Mapping[str, object], expected_build_id: str | None) -> bool:
-    """The gate every stale reader applies before serving a published database: the current
-    schema, plus the writer build the lane requires (None in the foreign-publication lane)."""
+    """The gate every stale reader applies before serving a published database: a schema this
+    build reads, plus the writer build the lane requires (None in the foreign-publication lane)."""
     return bool(
-        meta.get("schema") == _SCHEMA
+        reader_schema_compatible(meta.get("schema"))
         and (expected_build_id is None
              or meta.get("build_id") == expected_build_id))
 
@@ -2809,7 +2821,8 @@ def _stale_db(
         expected_build_id: str | None = None,
 ) -> sqlite3.Connection | None:
     """The current published db regardless of stamp, for readers deferring to a live
-    freshener. Schema must still match - stale rows are fine, missing columns are not."""
+    freshener. Its schema must be one this build reads - stale rows are fine, missing
+    columns are not."""
     if not DB_PATH.exists():
         return None
     db = None
@@ -4903,6 +4916,113 @@ def content(db: sqlite3.Connection, q: str, k: int, flt: dict | None = None) -> 
 _COVERAGE_COUNT_CACHE: dict[tuple, tuple[int | None, ...]] = {}
 _COVERAGE_COUNT_LOCK = threading.Lock()
 _COVERAGE_COUNT_CACHE_MAX = 4096
+# Exact term counts walk whole trigram posting lists: a common word costs
+# 0.3-1.5 s cold on a million-row corpus, paid again by every CLI process.
+# They only weight and gate ranking heuristics, so a count measured while the
+# FTS index held within this share of its current rows is reused across
+# processes. Terms are stored hashed: the cache never records query text.
+_COVERAGE_DF_FILE = ".coverage-df.json"
+_COVERAGE_DF_VERSION = 2
+_COVERAGE_DF_TOLERANCE = 0.005
+_COVERAGE_DF_MIN_ROWS = 100_000
+_COVERAGE_DF_MAX_ENTRIES = 2048
+_COVERAGE_DF_MAX_BYTES = 1024 * 1024
+
+
+def _fts_row_count(db: sqlite3.Connection, fts_table: str = "msgs_fts") -> int | None:
+    """FTS5's own indexed-row count (the averages record), which deletes lower too."""
+    row = db.execute(f"SELECT block FROM {fts_table}_data WHERE id = 1").fetchone()
+    blob = row[0] if row else None
+    if not isinstance(blob, bytes) or not blob:
+        return None
+    value = 0
+    for index, byte in enumerate(blob[:9]):
+        if index == 8:
+            return (value << 8) | byte
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            return value
+    return None
+
+
+def _coverage_df_key(fts_table: str, term: str) -> str:
+    return "df:" + hashlib.blake2b(
+        f"{fts_table}\0{term}".encode("utf-8", "surrogatepass"),
+        digest_size=16).hexdigest()
+
+
+class _CoverageDfStore:
+    """Term statistics persisted beside one published corpus."""
+
+    def __init__(self, path: Path, basis: int, entries: dict) -> None:
+        self.path = path
+        self.basis = basis
+        self.entries = entries
+        self.dirty = False
+
+    @classmethod
+    def open(cls, db: sqlite3.Connection) -> "_CoverageDfStore | None":
+        basis = _fts_row_count(db)
+        if basis is None or basis < _COVERAGE_DF_MIN_ROWS:
+            return None
+        path = common.DATA_DIR / _COVERAGE_DF_FILE
+        entries: dict = {}
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(_COVERAGE_DF_MAX_BYTES + 1)
+            record = (json.loads(raw)
+                      if len(raw) <= _COVERAGE_DF_MAX_BYTES else None)
+            if (isinstance(record, dict)
+                    and record.get("version") == _COVERAGE_DF_VERSION
+                    and isinstance(record.get("entries"), dict)):
+                entries = record["entries"]
+        except (OSError, ValueError):
+            pass
+        return cls(path, basis, entries)
+
+    def get(self, key: str, *, sessions: bool) -> tuple[int, int | None] | None:
+        value = self.entries.get(key)
+        if not (isinstance(value, list) and len(value) == 3
+                and all(type(item) is int and item >= 0
+                        for item in (value[0], value[2]))
+                and (value[1] is None
+                     or (type(value[1]) is int and value[1] >= 0))):
+            return None
+        if sessions and value[1] is None:
+            return None
+        if abs(self.basis - value[2]) > _COVERAGE_DF_TOLERANCE * value[2]:
+            return None
+        return value[0], value[1]
+
+    def put(self, key: str, count: tuple[int, int | None]) -> None:
+        self.entries.pop(key, None)
+        self.entries[key] = [int(count[0]), count[1], self.basis]
+        self.dirty = True
+
+    def flush(self) -> None:
+        # Another build's data dir is read, never written (the integrity
+        # receipt and use markers follow the same rule).
+        if (not self.dirty or common.data_dir_readonly(common.DATA_DIR)
+                or _derived_write_ownership().state != "current"):
+            return
+        while len(self.entries) > _COVERAGE_DF_MAX_ENTRIES:
+            self.entries.pop(next(iter(self.entries)))
+        body = json.dumps(
+            {"version": _COVERAGE_DF_VERSION, "entries": self.entries},
+            separators=(",", ":")).encode("utf-8")
+        if len(body) > _COVERAGE_DF_MAX_BYTES:
+            return
+        tmp = self.path.with_name(
+            f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_bytes(body)
+            os.replace(tmp, self.path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        self.dirty = False
 
 
 @contextmanager
@@ -4945,12 +5065,31 @@ def _coverage_counts(
     with _coverage_count_snapshot(db) as snapshot:
         with _COVERAGE_COUNT_LOCK if snapshot is not None else nullcontext():
             cache = _COVERAGE_COUNT_CACHE if snapshot is not None else {}
+            store: _CoverageDfStore | None = None
+            store_opened = snapshot is None
+
+            def persisted() -> _CoverageDfStore | None:
+                nonlocal store, store_opened
+                if not store_opened:
+                    store_opened = True
+                    store = _CoverageDfStore.open(db)
+                return store
+
             population_key = (snapshot, None, session_df, prose_only)
             population = cache.get(population_key)
             if population is None:
-                total = (int(db.execute(
-                    "SELECT count(DISTINCT session) FROM msgs").fetchone()[0])
-                    if session_df else _document_count(db, prose_only=prose_only))
+                store_key = "pop\0" + ("sessions" if session_df
+                                       else "prose" if prose_only else "docs")
+                saved = persisted()
+                reused = saved.get(store_key, sessions=False) if saved else None
+                if reused is not None:
+                    total = reused[0]
+                else:
+                    total = (int(db.execute(
+                        "SELECT count(DISTINCT session) FROM msgs").fetchone()[0])
+                        if session_df else _document_count(db, prose_only=prose_only))
+                    if saved is not None:
+                        saved.put(store_key, (total, None))
                 population = (total,)
                 cache[population_key] = population
             counts = {}
@@ -4959,29 +5098,39 @@ def _coverage_counts(
                 key = (snapshot, fts_table, term)
                 count = cache.get(key)
                 if count is None or (session_df and count[1] is None):
-                    query = _fts_quote(term)
-                    if session_df:
-                        if count is None:
+                    store_key = _coverage_df_key(fts_table, term)
+                    saved = persisted()
+                    reused = (saved.get(store_key, sessions=session_df)
+                              if saved else None)
+                    if reused is not None:
+                        count = reused
+                    else:
+                        query = _fts_quote(term)
+                        if session_df and count is None:
                             count = tuple(int(n) for n in db.execute(
                                 f"SELECT count(*), count(DISTINCT m.session) FROM {fts_table} "
                                 f"JOIN msgs m ON m.id = {fts_table}.rowid "
                                 f"WHERE {fts_table} MATCH ?", (query,)).fetchone())
-                        else:
+                        elif session_df:
                             sessions = int(db.execute(
                                 f"SELECT count(DISTINCT m.session) FROM {fts_table} "
                                 f"JOIN msgs m ON m.id = {fts_table}.rowid "
                                 f"WHERE {fts_table} MATCH ?", (query,)).fetchone()[0])
                             count = (count[0], sessions)
-                    else:
-                        # Coverage-only callers need no joined session scan.
-                        rows = int(db.execute(
-                            f"SELECT count(*) FROM {fts_table} "
-                            f"WHERE {fts_table} MATCH ?", (query,)).fetchone()[0])
-                        count = (rows, None)
+                        else:
+                            # Coverage-only callers need no joined session scan.
+                            rows = int(db.execute(
+                                f"SELECT count(*) FROM {fts_table} "
+                                f"WHERE {fts_table} MATCH ?", (query,)).fetchone()[0])
+                            count = (rows, None)
+                        if saved is not None:
+                            saved.put(store_key, count)
                     cache[key] = count
                 counts[term] = count
             while len(cache) > _COVERAGE_COUNT_CACHE_MAX:
                 cache.pop(next(iter(cache)))
+            if store is not None:
+                store.flush()
             return population[0], counts
 
 

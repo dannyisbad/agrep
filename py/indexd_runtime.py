@@ -5022,32 +5022,12 @@ FRESHENER_OWNS_REFRESH_REASON = "the background indexer owns the refresh"
 REFRESH_DELEGATED_REASON = "search-index refresh is delegated to the background"
 _CONVERGING_CONTEXTS = frozenset(
     (FRESHENER_OWNS_REFRESH_REASON, REFRESH_DELEGATED_REASON))
-DELEGATED_PUBLICATION_WAIT_S = 1.0
 
 
 def foreground_refresh_converging(*, checked: bool = True) -> bool:
     """Whether this request already verified an owner for deferred refresh."""
     context = str(getattr(_FOREGROUND_SNAPSHOT, "context", "") or "")
     return checked and _refresh_owner_possible() and context in _CONVERGING_CONTEXTS
-
-
-def wait_for_delegated_publication(
-        *, timeout_s: float = DELEGATED_PUBLICATION_WAIT_S) -> bool:
-    """Give a newly spawned daemon one bounded chance to erase known drift."""
-    context = str(getattr(_FOREGROUND_SNAPSHOT, "context", "") or "")
-    if context != REFRESH_DELEGATED_REASON:
-        return False
-    deadline = time.monotonic() + max(0.0, timeout_s)
-    while True:
-        report = _drift_report()
-        if report.state == "current" and not report.absorbed:
-            return True
-        if not _daemon_will_converge():
-            return False
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            return False
-        time.sleep(min(0.025, remaining))
 
 
 # DriftReport "unknown" codes: the census could not vouch either way, so the

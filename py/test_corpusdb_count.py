@@ -571,6 +571,119 @@ class CorpusCoverageCountTests(unittest.TestCase):
                 finally:
                     db.close()
 
+class PersistedTermStatisticsTests(unittest.TestCase):
+    """Exact posting-list counts of a published corpus are reused by later
+    processes while the FTS row count stays within tolerance, and recounted
+    once it grows or shrinks past it."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="agrep-coverage-df-")
+        self.addCleanup(scratch.cleanup)
+        self.data = Path(scratch.name)
+        self.path = self.data / "corpus.db"
+        for patcher in (
+                mock.patch.object(corpusdb.common, "DATA_DIR", self.data),
+                mock.patch.object(corpusdb, "_COVERAGE_DF_MIN_ROWS", 10),
+                mock.patch.object(
+                    corpusdb, "_derived_write_ownership",
+                    return_value=corpusdb._DerivedWriteOwnership("current")),
+                mock.patch.dict(corpusdb._COVERAGE_COUNT_CACHE, clear=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        writer = sqlite3.connect(self.path)
+        try:
+            writer.executescript(corpusdb._SCHEMA_SQL)
+            writer.executemany("INSERT INTO meta VALUES(?, ?)", [
+                ("schema", corpusdb._SCHEMA), ("stamp", "same-stamp")])
+            writer.commit()
+        finally:
+            writer.close()
+        self._add(0, 100, "filler")
+        self._add(100, 20, "needle alpha")
+
+    def _add(self, start: int, count: int, text: str) -> None:
+        writer = sqlite3.connect(self.path)
+        try:
+            writer.executemany(corpusdb._INS, [
+                (f"s{index}", 0, index, "codex", "p", "", "", "", "agent", text)
+                for index in range(start, start + count)])
+            writer.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+            writer.commit()
+        finally:
+            writer.close()
+
+    def _counted(self, terms: list[str]) -> tuple[list[str], dict]:
+        """One fresh process: an empty in-memory cache and a new reader."""
+        corpusdb._COVERAGE_COUNT_CACHE.clear()
+        db = corpusdb._open(self.path)
+        trace: list[str] = []
+        db.set_trace_callback(trace.append)
+        try:
+            _total, counts = corpusdb._coverage_counts(db, terms)
+        finally:
+            db.close()
+        return [sql for sql in trace if " MATCH " in sql], counts
+
+    def test_a_count_is_reused_by_a_later_process_within_tolerance(self) -> None:
+        walked, first = self._counted(["needle"])
+        self.assertEqual(len(walked), 1)
+        self.assertEqual(first["needle"][0], 20)
+        self.assertTrue((self.data / corpusdb._COVERAGE_DF_FILE).exists())
+        walked, again = self._counted(["needle"])
+        self.assertEqual(walked, [])
+        self.assertEqual(again["needle"][0], 20)
+
+    def test_growth_past_the_tolerance_recounts(self) -> None:
+        self._counted(["needle"])
+        self._add(120, 30, "needle beta")
+        walked, counts = self._counted(["needle"])
+        self.assertEqual(len(walked), 1)
+        self.assertEqual(counts["needle"][0], 50)
+
+    def test_deletions_past_the_tolerance_recount(self) -> None:
+        self._counted(["needle"])
+        writer = sqlite3.connect(self.path)
+        try:
+            writer.execute("DELETE FROM msgs WHERE id > 110")
+            writer.execute("INSERT INTO msgs_fts(msgs_fts) VALUES('rebuild')")
+            writer.commit()
+        finally:
+            writer.close()
+        walked, counts = self._counted(["needle"])
+        self.assertEqual(len(walked), 1)
+        self.assertEqual(counts["needle"][0], 10)
+
+    def test_query_words_are_never_written_to_disk(self) -> None:
+        self._counted(["needle"])
+        stored = (self.data / corpusdb._COVERAGE_DF_FILE).read_text(encoding="utf-8")
+        self.assertNotIn("needle", stored)
+
+    def test_a_read_only_data_dir_is_never_written(self) -> None:
+        with mock.patch.object(corpusdb.common, "data_dir_readonly",
+                               return_value=True):
+            self._counted(["needle"])
+        self.assertFalse((self.data / corpusdb._COVERAGE_DF_FILE).exists())
+
+    def test_another_builds_data_dir_is_never_written(self) -> None:
+        with mock.patch.object(
+                corpusdb, "_derived_write_ownership",
+                return_value=corpusdb._DerivedWriteOwnership(
+                    "refused", "derived stores owned-by another build")):
+            walked, counts = self._counted(["needle"])
+        self.assertEqual(len(walked), 1)
+        self.assertEqual(counts["needle"][0], 20)
+        self.assertEqual(
+            sorted(path.name for path in self.data.iterdir()), ["corpus.db"])
+
+    def test_a_damaged_store_is_ignored_not_trusted(self) -> None:
+        key = corpusdb._coverage_df_key("msgs_fts", "needle")
+        (self.data / corpusdb._COVERAGE_DF_FILE).write_text(
+            '{"version": 2, "entries": {"' + key + '": [7, null, -1]}}',
+            encoding="utf-8")
+        walked, counts = self._counted(["needle"])
+        self.assertEqual(len(walked), 1)
+        self.assertEqual(counts["needle"][0], 20)
+
 
 if __name__ == "__main__":
     unittest.main()

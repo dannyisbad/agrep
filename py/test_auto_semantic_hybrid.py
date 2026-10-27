@@ -1217,7 +1217,7 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertEqual(
             stderr.count(surface.SEMANTIC_LANE_POLICY.keyword_only), 1)
 
-    def test_stuck_semantic_lane_keeps_keyword_exit_within_deadline(self) -> None:
+    def test_stuck_semantic_lane_keeps_keyword_exit_within_cold_start_cap(self) -> None:
         query = "why did the deployment keep retrying"
         keyword = [_hit("keyword", 1, "deployment kept retrying")]
         entered = threading.Event()
@@ -1235,6 +1235,8 @@ class AutoSemanticHybridTests(unittest.TestCase):
         started = time.monotonic()
         try:
             with mock.patch.object(search, "_AUTO_SEMANTIC_TIMEOUT_S", 0.02), \
+                    mock.patch.object(search, "_semantic_cold_start_cap_s",
+                                      return_value=0.1), \
                     mock.patch.object(search, "_semantic_runtime_installed",
                                       return_value=True):
                 rc, stdout, stderr = self._run([query], run_query)
@@ -1247,6 +1249,31 @@ class AutoSemanticHybridTests(unittest.TestCase):
         self.assertNotIn("late semantic evidence", stdout)
         self.assertEqual(
             stderr.count(surface.SEMANTIC_LANE_POLICY.keyword_only), 1)
+
+    def test_semantic_lane_answering_after_its_fast_deadline_is_merged(self) -> None:
+        # A cold worker start outlives the fast deadline; its answer must not be
+        # thrown away while it is still inside the cold-start cap.
+        query = "why did the deployment keep retrying"
+        keyword = [_hit("keyword", 1, "deployment kept retrying")]
+
+        def run_query(_query, *, mode="keyword", **_kwargs):
+            if mode == "semantic":
+                time.sleep(0.15)
+                return _result(
+                    [_hit("meaning", 2, "late semantic evidence", semantic=True)],
+                    semantic=True)
+            return _result(keyword)
+
+        with mock.patch.object(search, "_AUTO_SEMANTIC_TIMEOUT_S", 0.02), \
+                mock.patch.object(search, "_semantic_cold_start_cap_s",
+                                  return_value=2.0), \
+                mock.patch.object(search, "_semantic_runtime_installed",
+                                  return_value=True):
+            rc, stdout, stderr = self._run([query], run_query)
+        self.assertEqual(rc, 0)
+        self.assertIn("deployment kept retrying", stdout)
+        self.assertIn("late semantic evidence", stdout)
+        self.assertNotIn(surface.SEMANTIC_LANE_POLICY.keyword_only, stderr)
 
     def test_semantic_thread_start_failure_keeps_keyword_output(self) -> None:
         query = "why did the deployment keep retrying"

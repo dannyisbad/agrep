@@ -1526,11 +1526,13 @@ def _load_message_embeddings(dim: int, meta_path):
 
 
 def _require_current_message_index() -> dict:
-    """Validate the current full OR explicitly-partial message generation.
+    """Validate the committed full OR explicitly-partial message generation.
 
-    Partial does not mean stale: its marker binds every indexed row to the exact
-    current transcript and committed vector bundle while disclosing how many
-    source rows remain unembedded. Unmarked/stale bundles remain unusable.
+    A segmented generation is verified artifact by artifact and stays usable
+    after the transcript moves past it: candidate resolution re-proves every
+    row against the current corpus. A legacy flat bundle still needs a marker
+    binding every indexed row to the exact current transcript; unmarked or
+    stale flat bundles remain unusable.
     """
     meta_path = common.EMBEDDINGS_PATH.parent / "embeddings.meta"
     if segment_query.is_segmented(meta_path):
@@ -1878,33 +1880,38 @@ def _q8_grouped_pool(query: np.ndarray, refs: _MessageRefStore,
     if excluded_family_present:
         keep = groups != int(excluded_family_id)
         ordinals, scores, groups = ordinals[keep], scores[keep], groups[keep]
-    best: dict[int, int] = {}
-    for position, (ordinal, score, group) in enumerate(
-            zip(ordinals, scores, groups)):
-        previous = best.get(int(group))
-        if (previous is None or score > scores[previous]
-                or (score == scores[previous]
-                    and int(ordinal) < int(ordinals[previous]))):
-            best[int(group)] = position
-    selected = sorted(
-        best.values(), key=lambda i: (-float(scores[i]), int(ordinals[i])))
-    pool_n = min(SEMANTIC_MAX_POOL, max(k * 6, 40), len(selected))
-    chosen_ordinals = ordinals[selected]
-    rows = refs.resolve(chosen_ordinals)
-    selected_by_ordinal = {
-        int(ordinals[position]): position for position in selected}
-    kept_rows, kept_positions = [], []
-    for resolved_index, row in enumerate(rows):
-        if not _matches(row, row_filters):
-            continue
-        ordinal = int(row.get("ordinal", chosen_ordinals[resolved_index]))
-        position = selected_by_ordinal.get(ordinal)
-        if position is None:
-            continue
-        kept_rows.append(row)
-        kept_positions.append(position)
-        if len(kept_rows) >= pool_n:
-            break
+    # Every scored head of each family, best first. When a family's best row
+    # changed or left the corpus since it was embedded (or no longer passes a
+    # filter on its current metadata), its next scored row stands in instead
+    # of the whole family dropping out.
+    heads: dict[int, list[int]] = {}
+    for position in sorted(
+            range(len(ordinals)),
+            key=lambda i: (-float(scores[i]), int(ordinals[i]))):
+        heads.setdefault(int(groups[position]), []).append(position)
+    pool_n = min(SEMANTIC_MAX_POOL, max(k * 6, 40), len(heads))
+    chosen: dict[int, tuple[int, dict]] = {}
+    pending, depth = list(heads), 0
+    while pending:
+        wanted = [heads[group][depth] for group in pending]
+        wanted_ordinals = ordinals[np.asarray(wanted, dtype=np.int64)]
+        rows = refs.resolve(wanted_ordinals)
+        by_ordinal = {
+            int(row.get("ordinal", wanted_ordinals[index])): row
+            for index, row in enumerate(rows)}
+        for group, position in zip(pending, wanted):
+            row = by_ordinal.get(int(ordinals[position]))
+            if row is not None and _matches(row, row_filters):
+                chosen[group] = (position, row)
+        depth += 1
+        pending = [group for group in pending
+                   if group not in chosen and depth < len(heads[group])]
+    picked = sorted(
+        chosen.values(),
+        key=lambda item: (-float(scores[item[0]]), int(ordinals[item[0]])),
+    )[:pool_n]
+    kept_rows = [row for _position, row in picked]
+    kept_positions = [position for position, _row in picked]
     if family_count is not None:
         candidate_count = family_count
     elif eligible_count is not None:
@@ -1919,6 +1926,59 @@ def _q8_grouped_pool(query: np.ndarray, refs: _MessageRefStore,
         scores[np.asarray(kept_positions, dtype=np.int64)],
         max(0, candidate_count),
     )
+
+
+# Post-filtering against the current corpus can drop candidates the bundle
+# still ranks (text that moved on after it was embedded, metadata that drifted),
+# so a starved page widens the bounded native scan instead of coming back short.
+_SEMANTIC_WIDEN_FACTOR = 4
+_SEMANTIC_WIDEN_MAX = SEMANTIC_MAX_SESSION_CANDIDATES
+
+
+def _widened_pool(pool_n: int, kept: int, k: int, returned: int,
+                  available: int) -> int | None:
+    """The next candidate depth when post-filtering starved a page, else None."""
+    limit = min(int(available), _SEMANTIC_WIDEN_MAX)
+    if kept >= k or returned < pool_n or pool_n >= limit:
+        return None
+    return min(limit, pool_n * _SEMANTIC_WIDEN_FACTOR)
+
+
+def _resolve_new(refs, ordinals, resolved: dict) -> None:
+    """Resolve candidates not seen yet; a row resolve dropped maps to None."""
+    fresh = list(dict.fromkeys(
+        int(ordinal) for ordinal in ordinals if int(ordinal) not in resolved))
+    if not fresh:
+        return
+    rows = refs.resolve(np.asarray(fresh, dtype=np.int64))
+    resolved.update(dict.fromkeys(fresh))
+    for index, row in enumerate(rows):
+        resolved[int(row.get("ordinal", fresh[index]))] = row
+
+
+def _distinct_candidates(ordinals, resolved: dict,
+                         row_filters: dict | None) -> tuple[list[dict], list[int]]:
+    """Surviving rows with their positions, one per logical message and text.
+
+    Candidates arrive score-descending, so keeping a row's first surviving
+    ordinal max-pools its '#cN' chunk vectors into one logical result."""
+    seen_mid, seen_text, rows, kept = set(), set(), [], []
+    for position, ordinal in enumerate(ordinals):
+        row = resolved.get(int(ordinal))
+        if row is None or not _matches(row, row_filters):
+            continue
+        mid = str(row.get("mid") or "")
+        if mid and mid in seen_mid:
+            continue
+        key = " ".join((row.get("text") or "").split())[:140].lower()
+        if key in seen_text:
+            continue
+        if mid:
+            seen_mid.add(mid)
+        seen_text.add(key)
+        rows.append(row)
+        kept.append(position)
+    return rows, kept
 
 
 def _q8_flat_pool(query: np.ndarray, refs: _MessageRefStore,
@@ -1943,44 +2003,29 @@ def _q8_flat_pool(query: np.ndarray, refs: _MessageRefStore,
         candidate_count = eligible.count
     if not candidate_count:
         return [], np.empty(0, dtype=np.float32), 0
-    try:
-        import semantic_q8
-        pool_n = min(SEMANTIC_MAX_POOL, max(k * 6, 40), candidate_count)
-        result = semantic_q8.exact_candidates(
-            query, generation, k=pool_n, eligible=eligible)
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-        return None
-    if result is None:
-        return None
-    ordinals, scores = result
-    ordinals = np.asarray(ordinals, dtype=np.int64).reshape(-1)
-    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-    if len(scores) != len(ordinals) or not np.all(np.isfinite(scores)):
-        return None
-    resolved = refs.resolve(ordinals)
-    position_by_ordinal = {
-        int(ordinal): position for position, ordinal in enumerate(ordinals)}
-    # Candidates arrive score-descending, so keeping a row's first surviving
-    # ordinal max-pools its '#cN' chunk vectors into one logical result.
-    seen_mid, seen_text, rows, kept = set(), set(), [], []
-    for resolved_index, row in enumerate(resolved):
-        if not _matches(row, row_filters):
-            continue
-        mid = str(row.get("mid") or "")
-        if mid and mid in seen_mid:
-            continue
-        key = " ".join((row.get("text") or "").split())[:140].lower()
-        if key in seen_text:
-            continue
-        ordinal = int(row.get("ordinal", ordinals[resolved_index]))
-        position = position_by_ordinal.get(ordinal)
-        if position is None:
-            continue
-        if mid:
-            seen_mid.add(mid)
-        seen_text.add(key)
-        rows.append(row)
-        kept.append(position)
+    pool_n = min(SEMANTIC_MAX_POOL, max(k * 6, 40), candidate_count)
+    resolved: dict[int, dict] = {}
+    while True:
+        try:
+            import semantic_q8
+            result = semantic_q8.exact_candidates(
+                query, generation, k=pool_n, eligible=eligible)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if result is None:
+            return None
+        ordinals, scores = result
+        ordinals = np.asarray(ordinals, dtype=np.int64).reshape(-1)
+        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+        if len(scores) != len(ordinals) or not np.all(np.isfinite(scores)):
+            return None
+        _resolve_new(refs, ordinals, resolved)
+        rows, kept = _distinct_candidates(ordinals, resolved, row_filters)
+        widened = _widened_pool(pool_n, len(rows), k, len(ordinals),
+                                int(candidate_count))
+        if widened is None:
+            break
+        pool_n = widened
     return (rows, scores[np.asarray(kept, dtype=np.int64)],
             int(candidate_count))
 
@@ -2199,6 +2244,25 @@ def _attach_semantic_integrity(payload: dict, refs) -> dict:
     return payload
 
 
+def _attach_coverage(payload: dict, coverage: dict,
+                     accelerator: dict | None = None) -> dict:
+    """Coverage of the generation that served this page, against the live transcript.
+
+    A bundle bound to an older transcript generation answers for the rows it
+    embedded; rows written since are keyword-only until a refresh rebinds, so the
+    page is partial even when that bundle was complete for its own generation."""
+    served = segment_query.served_coverage(
+        coverage, _CURRENT_MESSAGE_STATE.get("source"))
+    payload["semantic_coverage"] = served
+    if accelerator is not None:
+        payload["semantic_accelerator_coverage"] = accelerator
+    payload["partial"] = (
+        not bool(served.get("complete"))
+        or served.get("source_current") is False
+        or bool(accelerator and not accelerator.get("complete")))
+    return payload
+
+
 def _mark_result(row: dict, meta: dict) -> dict:
     row["score_kind"] = meta["score_kind"]
     return row
@@ -2305,12 +2369,7 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
             rank_meta)
             for i in order]
         payload = _envelope(out, candidate_count, rank_meta)
-        payload["semantic_coverage"] = fast_coverage
-        if accelerator is not None:
-            payload["semantic_accelerator_coverage"] = accelerator
-        payload["partial"] = (not bool(fast_coverage.get("complete"))
-                              or bool(accelerator
-                                      and not accelerator.get("complete")))
+        _attach_coverage(payload, fast_coverage, accelerator)
         _attach_semantic_integrity(payload, fast_refs)
         return json.dumps(payload if envelope else out)
     _refuse_large_dense_fallback(fast_refs, fast_coverage)
@@ -2334,33 +2393,28 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
             reps = reps[family_keep]
         pool_n = min(SEMANTIC_MAX_POOL, max(k * 6, 40), len(reps))
         ordered = reps[_top_indices(sims[reps], min(pool_n, len(reps)))]
-        cand = refs.resolve(ordered)
+        kept_rows = [
+            (row, int(row.get("ordinal", ordered[index])))
+            for index, row in enumerate(refs.resolve(ordered))
+            if _matches(row, row_filters)]
+        cand = [row for row, _ordinal in kept_rows]
         ordered = np.asarray(
-            [row.get("ordinal", ordered[index])
-             for index, row in enumerate(cand)], dtype=np.int64)
+            [ordinal for _row, ordinal in kept_rows], dtype=np.int64)
         candidate_count = len(reps)
     else:
         eligible = refs.eligible(row_filters)
         pool_n = min(SEMANTIC_MAX_POOL, max(k * 6, 40), len(eligible))
-        local = _top_indices(sims[eligible], pool_n)
-        ordered = eligible[local]
-        resolved = refs.resolve(ordered)
-        # Score-descending resolution: a row's first surviving ordinal
-        # max-pools its '#cN' chunk vectors into one logical result.
-        seen_mid, seen_text, cand, kept = set(), set(), [], []
-        for resolved_index, m in enumerate(resolved):
-            mid = str(m.get("mid") or "")
-            if mid and mid in seen_mid:
-                continue
-            key = " ".join(m["text"].split())[:140].lower()
-            if key in seen_text:
-                continue
-            if mid:
-                seen_mid.add(mid)
-            seen_text.add(key)
-            cand.append(m)
-            kept.append(int(m.get("ordinal", ordered[resolved_index])))
-        ordered = np.asarray(kept, dtype=np.int64)
+        resolved: dict[int, dict] = {}
+        while True:
+            ordered = eligible[_top_indices(sims[eligible], pool_n)]
+            _resolve_new(refs, ordered, resolved)
+            cand, kept = _distinct_candidates(ordered, resolved, row_filters)
+            widened = _widened_pool(
+                pool_n, len(cand), k, len(ordered), len(eligible))
+            if widened is None:
+                break
+            pool_n = widened
+        ordered = ordered[np.asarray(kept, dtype=np.int64)]
         candidate_count = len(eligible)
     dense = sims[ordered] if len(ordered) else np.empty(0, dtype=np.float32)
     order, scores, rank_meta = _rank_candidates(dense, len(cand), k)
@@ -2374,8 +2428,7 @@ def tool_search_messages(query: str, k: int = 5, filters: dict | None = None,
          "text": " ".join(cand[i].get("text", "").split())[:240]}, rank_meta)
         for i in order]
     payload = _envelope(out, candidate_count, rank_meta)
-    payload["semantic_coverage"] = coverage
-    payload["partial"] = not bool(coverage.get("complete"))
+    _attach_coverage(payload, coverage)
     if q8_shadow is not None:
         payload["_semantic_q8_shadow"] = q8_shadow
     _attach_semantic_integrity(payload, refs)
@@ -2444,10 +2497,7 @@ def _tool_search_hybrid_q8(query: str, k: int, filters: dict | None,
             "semantic_source": "message",
         }, rank_meta))
     payload = _envelope(out, candidate_sessions, rank_meta)
-    payload["semantic_coverage"] = coverage
-    payload["semantic_accelerator_coverage"] = accelerator
-    payload["partial"] = (not bool(coverage.get("complete"))
-                          or not bool(accelerator.get("complete")))
+    _attach_coverage(payload, coverage, accelerator)
     _attach_semantic_integrity(payload, refs)
     timer.mark("enrichment")
     return timer.dumps(payload)
@@ -2496,8 +2546,7 @@ def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
     if not best:
         _, _, rank_meta = _rank_candidates(np.empty(0, dtype=np.float32), 0, k)
         payload = _envelope([], 0, rank_meta)
-        payload["semantic_coverage"] = coverage
-        payload["partial"] = not bool(coverage.get("complete"))
+        _attach_coverage(payload, coverage)
         if q8_shadow is not None:
             payload["_semantic_q8_shadow"] = q8_shadow
         _attach_semantic_integrity(payload, refs)
@@ -2546,7 +2595,7 @@ def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
     for resolved_index, row in enumerate(pool_rows):
         row_ref = int(row.get("ordinal", requested_refs[resolved_index]))
         p = pool_by_ref.get(row_ref)
-        if p is None:
+        if p is None or not _matches(row, row_filters):
             continue
         session = sessions[int(p)]
         summ = summary_recs.get(session) or {}
@@ -2575,8 +2624,7 @@ def tool_search_hybrid(query: str, k: int = 5, filters: dict | None = None,
             "semantic_source": "message",
         }, rank_meta))
     payload = _envelope(out, len(sessions), rank_meta)
-    payload["semantic_coverage"] = coverage
-    payload["partial"] = not bool(coverage.get("complete"))
+    _attach_coverage(payload, coverage)
     if q8_shadow is not None:
         payload["_semantic_q8_shadow"] = q8_shadow
     _attach_semantic_integrity(payload, refs)

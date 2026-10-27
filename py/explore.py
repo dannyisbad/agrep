@@ -413,7 +413,7 @@ def _primary_models(sessions: tuple[str, ...]) -> dict[str, str]:
             max_clone_bytes=corpusdb._ROUTINE_ALIAS_CLONE_MAX_BYTES)
         meta = dict(db.execute(
             "SELECT key, value FROM meta WHERE key IN ('stamp', 'schema')"))
-        if (meta.get("schema") != corpusdb._SCHEMA
+        if (not corpusdb.reader_schema_compatible(meta.get("schema"))
                 or not corpusdb._stamps_equal(
                     meta.get("stamp", ""), corpusdb._stamp())):
             return {}

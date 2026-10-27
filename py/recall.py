@@ -1850,8 +1850,6 @@ def _main(argv: list[str] | None = None, prog: str = "recall", *,
             exclusion_pending=True, index_unavailable=True)
         _note_freshness()
         return 2
-    if not args.no_auto:
-        indexd_runtime.wait_for_delegated_publication()
     common.lap("freshen")
 
 

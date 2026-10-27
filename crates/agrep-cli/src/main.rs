@@ -2449,6 +2449,7 @@ where
                 "corpus.db adoption declined: database changed while it was copied".to_string(),
             )
         })?;
+    agrep_core::fault_injection::park_gate("takeover-snapshot");
     if !corpus_db_checkpointed_delete(&snapshot.database)? {
         return Err(CorpusDbAdoptionError::Fatal(
             "corpus.db adoption declined: private snapshot is not checkpointed DELETE".to_string(),
@@ -2777,6 +2778,15 @@ where
 
 fn sweep_staging_temps(data: &Path) -> std::io::Result<(u64, u64)> {
     sweep_staging_temps_with(data, index_lock::pid_alive_for_cleanup)
+}
+
+fn sweep_reporting_failure(data: &Path) {
+    if let Err(error) = sweep_staging_temps(data) {
+        eprintln!(
+            "warning: could not sweep stale ingest staging files in {}: {error}",
+            data.display()
+        );
+    }
 }
 
 fn default_data_dir_selected() -> bool {
@@ -6075,6 +6085,10 @@ fn index_cmd_locked(
                 return Ok(());
             }
             index_lock.verify()?;
+            // A takeover stages a full private corpus.db copy under a per-attempt name; one
+            // killed mid-validation leaves it behind, so reap dead attempts' copies before
+            // staging another rather than stacking them.
+            sweep_reporting_failure(&data);
             takeover_discarded_cache = match take_over_foreign_derived_stores(&data, &reason) {
                 Ok(discarded) => discarded,
                 Err(refusal) => {
@@ -6093,12 +6107,7 @@ fn index_cmd_locked(
             return Ok(());
         }
     };
-    if let Err(error) = sweep_staging_temps(&data) {
-        eprintln!(
-            "warning: could not sweep stale ingest staging files in {}: {error}",
-            data.display()
-        );
-    }
+    sweep_reporting_failure(&data);
     let cache_path = data.join(".ingest_cache.bin");
     let source_path = data.join(SOURCE_SNAPSHOT_FILE);
     let policy_path = data.join(HARNESS_POLICY_SNAPSHOT_FILE);

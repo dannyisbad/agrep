@@ -1670,43 +1670,6 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(indexd._idle_reference(
             started=40.0, last_search=20.0, last_source_event=30.0), 40.0)
 
-    def test_new_daemon_gets_one_bounded_publication_wait(self) -> None:
-        indexd_runtime.defer_foreground_refresh(
-            indexd_runtime.REFRESH_DELEGATED_REASON)
-        drifted = indexd_runtime.DriftReport("drifted", 1, 120.0)
-        current = indexd_runtime.DriftReport("current")
-        try:
-            with mock.patch.object(
-                    indexd_runtime, "_drift_report",
-                    side_effect=[drifted, current]), \
-                    mock.patch.object(
-                        indexd_runtime, "_daemon_will_converge",
-                        return_value=True), \
-                    mock.patch.object(indexd_runtime.time, "sleep") as sleep:
-                self.assertTrue(
-                    indexd_runtime.wait_for_delegated_publication())
-            sleep.assert_called_once()
-        finally:
-            indexd_runtime.defer_foreground_refresh("")
-
-    def test_delegated_publication_wait_has_a_hard_timeout(self) -> None:
-        indexd_runtime.defer_foreground_refresh(
-            indexd_runtime.REFRESH_DELEGATED_REASON)
-        try:
-            with mock.patch.object(
-                    indexd_runtime, "_drift_report",
-                    return_value=indexd_runtime.DriftReport(
-                        "drifted", 1, 120.0)), \
-                    mock.patch.object(
-                        indexd_runtime, "_daemon_will_converge",
-                        return_value=True), \
-                    mock.patch.object(indexd_runtime.time, "sleep") as sleep:
-                self.assertFalse(indexd_runtime.wait_for_delegated_publication(
-                    timeout_s=0.0))
-            sleep.assert_not_called()
-        finally:
-            indexd_runtime.defer_foreground_refresh("")
-
     def test_semantic_backfill_uses_idle_capacity_and_throttles_pressure(self) -> None:
         state = {"state": "partial", "indexed": 1_000, "total": 20_000}
         fast = indexd.indexer._embedding_backfill_policy(

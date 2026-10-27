@@ -154,6 +154,54 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
         finally:
             db.close()
 
+    @classmethod
+    def _forge_released(cls, path: Path, owner: str, text: str, stamp: str,
+                        schema: str = "15") -> None:
+        """What every release through 0.4.2 published: this build's search surface without
+        the reply_shape side table, labelled schema 15."""
+        cls._forge(path, owner, text, stamp)
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("DROP TABLE reply_shape")
+            db.execute("UPDATE meta SET value=? WHERE key='schema'", (schema,))
+            db.commit()
+
+    def _foreign_owner_patches(self, path: Path):
+        """The upgrade's first moments: the previous build still owns every derived store."""
+        reason = f"derived stores owned-by {self.OLD_OWNER}; this build is {self.NEW_OWNER}"
+        return (
+            mock.patch.object(corpusdb, "DB_PATH", path),
+            mock.patch.object(
+                indexd_runtime, "derived_writer_build_id",
+                return_value=self.NEW_OWNER),
+            mock.patch.object(
+                indexd_runtime, "derived_owner_info",
+                return_value=indexd_runtime.DerivedOwnerInfo(
+                    "foreign", self.OLD_OWNER, None, reason)),
+            mock.patch.object(
+                indexd_runtime, "ingest_cache_owner_info",
+                return_value=indexd_runtime.IngestCacheOwnerInfo(
+                    "foreign", self.OLD_OWNER,
+                    f"parse cache owned-by {self.OLD_OWNER}; this build is {self.NEW_OWNER}")),
+            mock.patch.object(indexd_runtime, "assert_python_runtime_unchanged"),
+            mock.patch.object(indexd_runtime, "_set_fts_delegated"),
+            mock.patch.object(corpusdb, "_stamps_equal", side_effect=lambda a, b: a == b),
+        )
+
+    def _assert_serves_needle(self, reader) -> None:
+        self.assertIsNotNone(reader)
+        try:
+            hits = corpusdb.keyword(reader, "takeover snapshot needle", 10)["hits"]
+            self.assertEqual([(hit["session"], hit["who"]) for hit in hits], [("s", "user")])
+            self.assertEqual(
+                corpusdb.session_family_roots(reader, ["s"]), {"s": "s"})
+        finally:
+            reader.close()
+
+    @staticmethod
+    def _family(path: Path) -> tuple:
+        return (corpusdb._proof_file_identity(path),) + tuple(
+            Path(f"{path}{suffix}").exists() for suffix in ("-journal", "-wal", "-shm"))
+
     @staticmethod
     def _proof(path: Path) -> dict:
         identity = corpusdb._proof_file_identity(path)
@@ -276,6 +324,105 @@ class RetainedCorpusPublicationTests(unittest.TestCase):
                 self.assertIsNone(reader)
                 self.assertIsNone(corpusdb._foreign_stale_db(
                     expected_build_id=self.OLD_OWNER))
+
+    def test_released_schema_is_served_read_only_through_the_takeover(self) -> None:
+        # 0.4.2 published schema 15; the Rust takeover retains it for readers until the atomic
+        # rebuild lands, so every search in that window answers from it - current while its
+        # stamp matches, disclosed-stale once the successor republishes - never by a JSONL crawl
+        with fixture_tree(prefix="agrep-retained-released-") as raw:
+            path = Path(raw) / "corpus.db"
+            self._forge_released(path, self.OLD_OWNER, OLD_TEXT, "old")
+            proof = self._proof(path)
+            before = self._family(path)
+            with ExitStack() as stack:
+                for patch in self._ownership_patches(path, proof):
+                    stack.enter_context(patch)
+                ownership = corpusdb._derived_write_ownership(for_write=True)
+                self.assertTrue(ownership.replace_retained_db)
+                for stamp, current in (("old", True), ("new", False)):
+                    reader = corpusdb._interactive_snapshot(
+                        stamp, repair_required=False, ownership=ownership)
+                    self.assertIsNotNone(reader, stamp)
+                    self.assertTrue(reader._retained_snapshot)
+                    self.assertIs(reader._source_stamp_current, current)
+                    # the briefing's side table is the one surface the released schema
+                    # lacks: its read fails as a database error, which summary answers
+                    # from the transcripts, never as an empty shape
+                    with self.assertRaises(sqlite3.DatabaseError):
+                        corpusdb.reply_shapes(reader, [("s", 1)])
+                    self._assert_serves_needle(reader)
+                self._assert_serves_needle(corpusdb.connect(read_only=True))
+            self.assertEqual(self._family(path), before)
+
+    def test_writers_never_reuse_a_released_schema_database(self) -> None:
+        # reading the released schema grants no writer anything: even under this build's own
+        # owner its validation fails, so the refresh rebuilds rather than updating it in place
+        with fixture_tree(prefix="agrep-released-writer-") as raw:
+            path = Path(raw) / "corpus.db"
+            self._forge_released(path, self.NEW_OWNER, OLD_TEXT, "old")
+            with mock.patch.object(corpusdb, "DB_PATH", path), \
+                    mock.patch.object(
+                        indexd_runtime, "derived_writer_build_id",
+                        return_value=self.NEW_OWNER), \
+                    mock.patch.object(
+                        corpusdb, "_stamps_equal", side_effect=lambda a, b: a == b):
+                self.assertIsNone(corpusdb._valid_db("old", 0))
+                self._assert_serves_needle(
+                    corpusdb._stale_db(0, expected_build_id=self.NEW_OWNER))
+
+    def test_released_schema_is_served_while_the_previous_build_still_owns_it(self) -> None:
+        # before the successor's ingest takes over (and under AGREP_NO_DAEMON, for good) the
+        # 0.4.2 build still owns the stores: its publication is read-only, and readable
+        with fixture_tree(prefix="agrep-foreign-released-") as raw:
+            path = Path(raw) / "corpus.db"
+            self._forge_released(path, self.OLD_OWNER, OLD_TEXT, "old")
+            before = self._family(path)
+            with ExitStack() as stack:
+                for patch in self._foreign_owner_patches(path):
+                    stack.enter_context(patch)
+                ownership = corpusdb._derived_write_ownership(for_write=True)
+                self.assertFalse(ownership.writable)
+                self.assertFalse(ownership.replace_retained_db)
+                self._assert_serves_needle(corpusdb._interactive_snapshot(
+                    "old", repair_required=False, ownership=ownership))
+                self._assert_serves_needle(corpusdb._interactive_snapshot(
+                    "new", repair_required=False, ownership=ownership))
+                self._assert_serves_needle(corpusdb.connect(read_only=True))
+            self.assertEqual(self._family(path), before)
+
+    def test_only_the_released_schema_joins_the_readers(self) -> None:
+        # 16 never shipped, so nothing can be relying on it being served; a future schema is
+        # a newer build's and a damaged label is no schema at all
+        for schema in ("16", "18", ""):
+            with self.subTest(schema=schema), \
+                    fixture_tree(prefix="agrep-unreleased-schema-") as raw:
+                path = Path(raw) / "corpus.db"
+                self._forge_released(path, self.OLD_OWNER, OLD_TEXT, "old", schema=schema)
+                proof = self._proof(path)
+                with ExitStack() as stack:
+                    for patch in self._ownership_patches(path, proof):
+                        stack.enter_context(patch)
+                    ownership = corpusdb._derived_write_ownership(for_write=True)
+                    self.assertTrue(ownership.replace_retained_db)
+                    self.assertIsNone(corpusdb._interactive_snapshot(
+                        "old", repair_required=False, ownership=ownership))
+                with ExitStack() as stack:
+                    for patch in self._foreign_owner_patches(path):
+                        stack.enter_context(patch)
+                    self.assertIsNone(corpusdb._foreign_stale_db())
+
+    def test_readers_serve_exactly_the_schemas_the_rust_takeover_keeps(self) -> None:
+        # the takeover retains a previous release's database only for these readers: a schema
+        # bumped on one side alone either discards what readers could serve or retains what
+        # they refuse, and the upgrade crawls the transcripts until the rebuild lands
+        source = (ROOT / "crates" / "agrep-cli" / "src" / "main.rs").read_text(encoding="utf-8")
+        constants = dict(re.findall(
+            r'^const (CORPUS_DB_(?:RETAINED_)?SCHEMA_VERSION): &str = "([0-9]+)";',
+            source, re.MULTILINE))
+        self.assertEqual(constants, {
+            "CORPUS_DB_SCHEMA_VERSION": corpusdb._SCHEMA,
+            "CORPUS_DB_RETAINED_SCHEMA_VERSION": corpusdb._RETAINED_READER_SCHEMA,
+        })
 
     def test_final_retained_validation_hashes_once(self) -> None:
         with fixture_tree(prefix="agrep-retained-final-hash-") as raw:
@@ -1309,6 +1456,80 @@ class UpgradeTakeoverTimingTests(unittest.TestCase):
                     cwd=PY_DIR, env=env, capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=10,
                     check=False)
+
+    def test_released_schema_index_serves_every_search_across_the_takeover(self) -> None:
+        # The 0.4.2 upgrade: the previous build left a schema-15 corpus.db. Before the
+        # successor's ingest takes over, while its rebuild is owed, and after it lands, every
+        # search answers from an index - never the transcript scan, which is a multi-second
+        # crawl on a real corpus, nor its publication timeout
+        self.assertTrue(RELEASE_BIN.is_file(), RELEASE_BIN)
+        with fixture_tree(prefix="agrep-released-schema-upgrade-") as raw:
+            root = Path(raw)
+            home, data = root / "home", root / "data"
+            data.mkdir()
+            self._sources(home, OLD_TEXT, 1, 2)
+            previous = self._env(home, data, RELEASE_BIN)
+            previous.update(AGREP_NO_DAEMON="1", AGREP_NO_FETCH="1")
+            initial = subprocess.run(
+                [sys.executable, os.fspath(CLI), "index"], cwd=ROOT, env=previous,
+                capture_output=True, text=True, timeout=300)
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            with closing(sqlite3.connect(data / "corpus.db")) as db:
+                db.execute("DROP TABLE reply_shape")
+                db.execute("UPDATE meta SET value='15' WHERE key='schema'")
+                db.commit()
+            binary = self._successor_binary(root)
+            env = self._env(home, data, binary)
+            env.update(AGREP_NO_DAEMON="1", AGREP_NO_FETCH="1")
+
+            def search(text: str) -> tuple[dict, list[dict]]:
+                result, _elapsed = self._run_search(env, text)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                return json.loads(result.stdout.splitlines()[0]), self._json_rows(result)
+
+            def assert_indexed_hit(text: str) -> None:
+                meta, rows = search(text)
+                self.assertEqual(meta.get("engine"), "corpusdb", meta)
+                self.assertTrue(any(
+                    text in str(row.get("snippet") or "") for row in rows), rows)
+
+            # the previous build still owns every store
+            assert_indexed_hit(OLD_TEXT)
+
+            task = home / ".cline" / "data" / "tasks" / "2"
+            task.mkdir(parents=True)
+            (task / "api_conversation_history.json").write_text(json.dumps([
+                {"role": "user", "content": NEW_TEXT, "ts": 2},
+            ]), encoding="utf-8")
+            writer = subprocess.run(
+                [sys.executable, "-c",
+                 "import json, indexd_runtime; env = indexd_runtime.rust_writer_env(); "
+                 "print(json.dumps({key: env[key] for key in ("
+                 "'AGREP_RUNTIME_BUILD_ID', 'AGREP_PYTHON_RUNTIME_BUILD_ID')}))"],
+                cwd=PY_DIR, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(writer.returncode, 0, writer.stderr)
+            takeover = subprocess.run(
+                [os.fspath(binary), "index", "--agent", "all"], cwd=ROOT,
+                env={**env, **json.loads(writer.stdout)},
+                capture_output=True, text=True, timeout=300)
+            self.assertEqual(takeover.returncode, 0, takeover.stderr)
+            self.assertIn("search db retained read-only for atomic rebuild", takeover.stderr)
+            owner = json.loads((data / ".derived-owner.json").read_text(encoding="utf-8"))
+            self.assertIn("retained_corpus_db", owner)
+            self.assertIn(NEW_TEXT, (data / "messages.jsonl").read_text(encoding="utf-8"))
+
+            # the successor owns the stores, its rebuild is owed: the retained index serves,
+            # behind the transcripts and saying so
+            assert_indexed_hit(OLD_TEXT)
+
+            rebuilt = subprocess.run(
+                [sys.executable, os.fspath(CLI), "index"], cwd=ROOT, env=env,
+                capture_output=True, text=True, timeout=300)
+            self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+            with closing(sqlite3.connect(data / "corpus.db")) as db:
+                self.assertEqual(db.execute(
+                    "SELECT value FROM meta WHERE key='schema'").fetchone()[0], corpusdb._SCHEMA)
+            assert_indexed_hit(NEW_TEXT)
 
     def test_slow_successor_adoption_outlives_foreground_search(self) -> None:
         self.assertTrue(RELEASE_BIN.is_file(), RELEASE_BIN)

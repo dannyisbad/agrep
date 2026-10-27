@@ -396,6 +396,46 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
         self.assertAlmostEqual(joins[0], 0.01)
         self.assertAlmostEqual(clock[0], 100.05)
 
+    def test_recovery_budget_counts_from_the_lane_start(self) -> None:
+        # A first attempt that used 4 s of its cold-start allowance leaves the
+        # recovery pass 8 s of the 12 s budget, not a fresh 12 s.
+        clock = [104.0]
+        first = _unavailable(search._SEMANTIC_WORKER_START_MISS)
+        waited: list[float] = []
+
+        class DoneThread:
+            def join(self, *, timeout: float) -> None:
+                pass
+
+            @staticmethod
+            def is_alive() -> bool:
+                return False
+
+        initial = (
+            DoneThread(),
+            {"query": "staged checklists",
+             "kwargs": {"limit": 4, "semantic_timeout_s": 0.75},
+             "allow_recovery": True, "result": first, "started": 100.0},
+            100.75,
+        )
+
+        def wait_for_recovery(*, timeout_s: float) -> dict:
+            waited.append(timeout_s)
+            return {"state": "not-converging"}
+
+        with mock.patch.object(
+                search.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(
+                    semantic, "SEMANTIC_QUERY_RECOVERY_WAIT_S", 12.0), \
+                mock.patch.object(
+                    semantic, "wait_for_query_recovery",
+                    side_effect=wait_for_recovery):
+            result = search._finish_semantic_query(initial)
+
+        self.assertIs(result, first)
+        self.assertEqual(len(waited), 1)
+        self.assertAlmostEqual(waited[0], 8.0)
+
     def test_hot_preflight_miss_is_typed_and_retryable(self) -> None:
         import semworker
         with mock.patch.dict(
@@ -417,6 +457,30 @@ class AutomaticSemanticRetryTests(unittest.TestCase):
             search._SEMANTIC_WORKER_START_MISS)
         self.assertTrue(result["semantic_status"]["retryable"])
         guarded.assert_not_called()
+
+    def test_a_live_worker_of_another_build_fails_fast_not_after_the_deadline(
+            self) -> None:
+        # Before a takeover lands, an older build's live worker keeps the model
+        # owner lease until its idle exit; a local pass could only wait out its
+        # whole deadline and miss anyway.
+        import semworker
+        reason = ("another agrep build's semantic worker (pid 4242) holds the "
+                  "model until it idles out")
+        with mock.patch.dict(
+                os.environ,
+                {"AGREP_NO_DAEMON": "", "AGREP_NO_SEM_WORKER": ""}), \
+                mock.patch.object(
+                    semworker, "resident_status", return_value={"running": True}), \
+                mock.patch.object(semworker, "search_worker", return_value=None), \
+                mock.patch.object(
+                    semworker, "foreign_live_worker_reason", return_value=reason), \
+                mock.patch.object(search, "_guarded_semantic_local_fallback") \
+                as guarded:
+            result = search._semantic_local(
+                "staged checklists", 2, timeout_s=12.0)
+        guarded.assert_not_called()
+        self.assertEqual(result["semantic_status"]["reason"], reason)
+        self.assertFalse(result["semantic_status"].get("retryable"))
 
     def test_known_transient_preflight_preserves_exact_reason(self) -> None:
         import semworker

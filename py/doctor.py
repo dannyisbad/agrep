@@ -3920,6 +3920,14 @@ def report(*, deep: bool = False, fix_actions: bool = False,
             detail = "partial - searchable now; " + (
                 f"a build is closing the gap{live_cov}" if running else
                 paused or f"background passes close the gap{cov}")
+        elif state == "published":
+            # Searchable, but bound to an older transcript generation: rows
+            # written since are keyword-only until the background pass rebinds.
+            embedded = (f"{coverage['indexed']:,}/{coverage['total']:,} rows embedded"
+                        if coverage else "searchable now")
+            detail = f"published - {embedded} · index moved on since; " + (
+                f"a build is catching up{live_cov}" if running else
+                paused or "background pass catches up")
         elif state == "stale":
             detail = "stale - " + (
                 f"rebuilding{live_cov}" if running else

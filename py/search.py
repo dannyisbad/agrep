@@ -855,6 +855,9 @@ def _semantic_local(q: str, k: int, level: str = "hybrid", *,
                     preflight_retry_reason or preflight_reason
                     or _SEMANTIC_WORKER_START_MISS)
         if timeout_s is not None or constrained_fallback:
+            blocked_by = semworker.foreign_live_worker_reason()
+            if blocked_by is not None:
+                return _semantic_runtime_unavailable(q, requested, who, blocked_by)
             available = remaining()
             try:
                 guarded = _guarded_semantic_local_fallback(
@@ -2057,22 +2060,31 @@ _AUTO_SEMANTIC_FETCH = 8
 # Headroom preserves meaning without charging the faster macOS failure path.
 _AUTO_SEMANTIC_TIMEOUT_S = 1.25 if common.WIN else 0.75
 _AUTO_SEMANTIC_START_S = 0.50 if common.WIN else 0.35
+# The lane's first attempt runs with this flag set; the recovery retry does not.
+_SEMANTIC_LANE = threading.local()
 
 
 def _semantic_worker_start_timeout(available_s: float) -> float:
     """Keep the first automatic attempt cheap, but let recovery join startup.
 
-    The initial optional lane owns only ``_AUTO_SEMANTIC_TIMEOUT_S`` and keeps
-    the reviewed short discovery budget.  A typed pre-acceptance miss opens the
-    separately bounded recovery pass; that pass must be able to wait for the
-    resident worker it just launched instead of racing it again for 350 ms and
-    then contending with it through the guarded local fallback.
+    The initial optional lane keeps the reviewed short discovery budget, even
+    when a live publication extends its overall deadline, so a cold worker
+    returns a typed pre-acceptance miss before the lane's deadline.  That miss
+    opens the separately bounded recovery pass, which waits for the resident
+    worker it just launched instead of racing it again for 350 ms.
     """
     available = max(0.0, float(available_s))
-    if available <= _AUTO_SEMANTIC_TIMEOUT_S + 0.10:
+    if (getattr(_SEMANTIC_LANE, "initial_pass", False)
+            or available <= _AUTO_SEMANTIC_TIMEOUT_S + 0.10):
         return min(available, _AUTO_SEMANTIC_START_S)
     import semworker
     return min(available, semworker.START_TIMEOUT_S)
+
+
+def _semantic_cold_start_cap_s() -> float:
+    """How long an in-flight first attempt is awaited before it is abandoned."""
+    import semworker
+    return semworker.START_TIMEOUT_S + _AUTO_SEMANTIC_TIMEOUT_S
 
 
 def _hybrid_text_key(hit: dict) -> str:
@@ -2222,14 +2234,24 @@ def _start_semantic_query(
     if timeout_s > 0 and _semantic_index_update_active():
         timeout_s = max(
             timeout_s, _QUERY_PUBLICATION_WAIT_S + timeout_s)
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
     if _absolute_deadline is not None:
         absolute_deadline = float(_absolute_deadline)
         if not math.isfinite(absolute_deadline):
             raise ValueError("semantic deadline must be finite")
         deadline = min(deadline, absolute_deadline)
+    state["started"] = started
+    # A first attempt still running at the fast deadline is usually finishing
+    # its corpus-side checks; its answer is awaited up to this cap rather than
+    # discarded. The cap counts against the lane's single recovery budget.
+    state["cold_deadline"] = (
+        max(deadline, started + _semantic_cold_start_cap_s())
+        if _allow_recovery and timeout_s > 0 else deadline)
+    initial_pass = bool(_allow_recovery)
 
     def work() -> None:
+        _SEMANTIC_LANE.initial_pass = initial_pass
         try:
             remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
@@ -2242,6 +2264,8 @@ def _start_semantic_query(
                 query, mode="semantic", **call_kwargs)
         except Exception as exc:  # noqa: BLE001 -- optional meaning cannot wound grep
             state["error"] = exc
+        finally:
+            _SEMANTIC_LANE.initial_pass = False
 
     try:
         thread = threading.Thread(
@@ -2294,12 +2318,11 @@ def _finish_semantic_query_inner(pending) -> dict | None:
         return None
     thread, state, deadline = pending
     thread.join(timeout=max(0.0, deadline - time.monotonic()))
-    timed_out = thread.is_alive()
-    if timed_out:
+    cold_deadline = float(state.get("cold_deadline", deadline))
+    if thread.is_alive() and cold_deadline > deadline:
+        thread.join(timeout=max(0.0, cold_deadline - time.monotonic()))
+    if thread.is_alive():
         common.dbg("automatic semantic lane exceeded its deadline; keeping keyword results", "!")
-        # The serving deadline is a hard boundary; transport owns later cleanup.
-        # Retain typed failures returned by that deadline, but never delay lexical
-        # output for a still-running optional meaning call.
         return None
     error = state.get("error")
     if error is not None:
@@ -2316,14 +2339,15 @@ def _finish_semantic_query_inner(pending) -> dict | None:
         return result
 
     # The fast attempt proved an exact transient. Convergence, owner handoff,
-    # cached-model load, and the one retry share one absolute recovery deadline;
-    # no phase gets to restart the clock. Every query/filter option is preserved.
+    # cached-model load, and the one retry share one absolute recovery deadline
+    # counted from the lane's start; no phase gets to restart the clock. Every
+    # query/filter option is preserved.
     try:
         import semantic
         recovery_window = semantic.bounded_query_recovery_wait_s(
             semantic.SEMANTIC_QUERY_RECOVERY_WAIT_S)
         recovery_deadline = (
-            time.monotonic() + recovery_window)
+            float(state.get("started", time.monotonic())) + recovery_window)
         recovery_remaining = max(
             0.0, recovery_deadline - time.monotonic())
         if recovery_remaining <= 0.0:
@@ -7581,8 +7605,6 @@ def main(argv: list[str] | None = None, *, _force_compact: bool = False) -> int:
             exclusion_pending=True, index_unavailable=True)
         _note_freshness()
         return 2
-    if not args.no_auto:
-        indexd_runtime.wait_for_delegated_publication()
     common.lap("freshen")
 
     if args.chat:

@@ -254,7 +254,7 @@ def _reader_lane(meta: dict | None, ownership) -> tuple[str, str | None]:
         except OSError as exc:
             return "scan", f"writer identity unavailable ({exc})"
     if not corpusdb._publication_compatible(meta, expected):
-        if meta.get("schema") != corpusdb._SCHEMA:
+        if not corpusdb.reader_schema_compatible(meta.get("schema")):
             return "scan", f"schema {meta.get('schema')}, this build reads {corpusdb._SCHEMA}"
         return "scan", "published by another agrep build"
     lane = corpusdb.interactive_snapshot_lane(

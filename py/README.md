@@ -82,20 +82,27 @@ One pinned model, two engines that can run it:
   publish/yield at 500-row boundaries if an active transcript advances. An idle
   AC-powered machine runs bounded catch-up passes back-to-back; battery,
   activity, CPU load, and memory pressure shrink or pause them. The one
-  exception is a lane nobody can query (stale, missing, or unbound after an
-  upgrade): its bounded bootstrap or rebind runs through battery and CPU load,
-  still niced and thread-limited, and only memory pressure defers it. A delta
-  publication writes only new segment and shadow artifacts; compaction is a
-  separate bounded operation.
-- `semantic.py` - the local engine every semantic owner calls: generation-exact
+  exception is a lane nobody can query (missing, corrupt, built by another
+  profile, or a legacy flat bundle the transcript moved past): its bounded
+  bootstrap or rebind runs through battery and CPU load, still niced and
+  thread-limited, and only memory pressure defers it. A delta publication
+  writes only new segment and shadow artifacts; compaction is a separate
+  bounded operation.
+- `semantic.py` - the local engine every semantic owner calls: generation-aware
   freshness (`embedding_coherence`), one deduped background refresh
   (`ensure_fresh_async`), and `search()` through q8 candidate selection with f16
   reranking. `semworker.py`
   keeps headless agent searches hot in one serial process, then exits after an
-  adaptive idle lease so native RSS is actually returned. A stale lane degrades
-  to keyword and heals in the background; it never serves old vectors. Missing
-  candidate refs also fall back immediately and start a claim-deduped
-  `embed.py --background --refs-only` repair, before ONNX is loaded.
+  adaptive idle lease so native RSS is actually returned. A segmented bundle the
+  transcript has moved past keeps answering: every candidate is re-proved
+  against the current corpus row by text hash and carries that row's current
+  metadata, a row that changed or vanished since it was embedded is held back,
+  and rows written since are keyword-only until the background refresh rebinds
+  the bundle (the page reports partial coverage). A lane that cannot answer
+  (missing, corrupt, wrong profile) degrades to keyword and heals in the
+  background. Missing candidate refs also fall back immediately and start a
+  claim-deduped `embed.py --background --refs-only` repair, before ONNX is
+  loaded.
 - `ask.py` - retrieval internals (sealed immutable candidate-refs snapshots with
   compact source byte locators, cached vectorized session grouping, root/child
   conversation-family diversification, and summary-vector enrichment when an enricher's
@@ -111,11 +118,14 @@ labeled `"lane": "semantic"`); `-s` forces meaning; `--lexical` opts out.
 
 The first semantic publication is a bounded newest-first slice, so semantic
 coverage becomes usable before a full historical backfill finishes. Later passes
-publish immutable deltas and disclose partial coverage until complete. Missing or
-stale vectors and refs cause an immediate keyword fallback plus one deduplicated
-background repair; a query never reads a mixed generation. The resident worker's
-idle lease adapts to artifact size, reuse, and available memory. Background work
-also adapts thread count and priority to battery, CPU load, and memory pressure.
+publish immutable deltas and disclose partial coverage until complete. Missing
+vectors and refs cause an immediate keyword fallback plus one deduplicated
+background repair. A generation the transcript has moved past stays queryable
+(resolution drops any row whose text changed since it was embedded) while the
+background refresh rebinds it; a query never reads a mixed generation. The
+resident worker's idle lease adapts to artifact size, reuse, and available
+memory. Background work also adapts thread count and priority to battery, CPU
+load, and memory pressure.
 
 Scale, resource, and quality measurements belong to the executable harnesses and
 their reports under `bench/`; keeping machine-specific snapshots out of this data

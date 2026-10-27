@@ -172,8 +172,11 @@ class SegmentedEmbedPublicationTests(unittest.TestCase):
                 shutil.copy2(path, replacement)
                 replacement.replace(path)
             segment_query.close_cache()
-            with self.assertRaises(segment_query.SegmentQueryError):
-                segment_query.open_current(meta)
+            # Readers accept byte-identical relocated artifacts (digest-checked
+            # once); the no-change pass below still rebinds the proof.
+            relocated, _, _, _ = segment_query.open_current(meta)
+            self.assertEqual(relocated["generation"], before["generation"])
+            segment_query.close_cache()
 
             self.assertEqual(embed._run(self._args()), 0)
 

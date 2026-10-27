@@ -98,15 +98,38 @@ def _protective_refusal_reason() -> str | None:
 
 
 def _ownership_refusal_reason() -> str | None:
-    """The derived stores belong to another build: no worker may be launched
-    or its records republished from this one."""
+    """The derived stores belong to another build: its workers are not this
+    build's to signal or retire."""
     ownership = indexd_runtime.derived_writer_mutation_info()
     if ownership.writable or ownership.journal_blocked:
         return None
     return ownership.reason
 
 
+def _query_worker_ownership_refusal_reason() -> str | None:
+    """Whether another LIVE build fences this build's query worker.
+
+    A foreign anchor no live indexer holds is a dead owner's - the upgrade
+    window before this build's ingest takes over. The query worker only reads
+    the stores, and fencing it there sent every search to a cold in-process
+    model load; Python writers keep refusing on identity alone."""
+    reason = _ownership_refusal_reason()
+    if reason is None:
+        return None
+    ownership = indexd_runtime.derived_writer_mutation_info()
+    if (indexd_runtime.derived_writer_launchable(ownership)
+            and not indexd_runtime.live_indexer_claim()):
+        return None
+    return reason
+
+
 def _worker_coordination_refusal_reason() -> str | None:
+    return _protective_refusal_reason() or _query_worker_ownership_refusal_reason()
+
+
+def _foreign_worker_signal_refusal_reason() -> str | None:
+    """Stopping or retiring another build's live worker needs real ownership:
+    before a takeover lands, that worker still serves the owning build."""
     return _protective_refusal_reason() or _ownership_refusal_reason()
 
 
@@ -1522,7 +1545,7 @@ def _retire_incompatible(
         rec: dict, observed: ownerfile.Snapshot, *, bound_owner: bool,
         deadline: float | None = None) -> None:
     """Retire the exact old semantic process without a 4s failed-start detour."""
-    if _worker_coordination_refusal_reason() is not None:
+    if _foreign_worker_signal_refusal_reason() is not None:
         return
     pid = int(rec["pid"])
     expected_start = str(rec.get("process_start") or "")
@@ -1658,6 +1681,22 @@ def _inspect_descriptor() -> _DescriptorObservation:
         _DescriptorState.PROTECTED, rec, observed)
 
 
+def foreign_live_worker_reason() -> str | None:
+    """Why no local inference can run now: another build's live worker holds
+    the model owner lease and is not this build's to retire. It keeps that
+    lease until its idle exit, so a local pass would only wait out its deadline."""
+    inspected = _inspect_descriptor()
+    if (inspected.state not in (
+            _DescriptorState.INCOMPATIBLE, _DescriptorState.LEGACY)
+            or not inspected.bound_owner
+            or inspected.record is None):
+        return None
+    if _foreign_worker_signal_refusal_reason() is None:
+        return None
+    return (f"another agrep build's semantic worker (pid "
+            f"{inspected.record.get('pid')}) holds the model until it idles out")
+
+
 def _reconcile_descriptor(
         *, deadline: float | None = None
         ) -> tuple[dict, ownerfile.Snapshot] | None:
@@ -1670,19 +1709,21 @@ def _reconcile_descriptor(
         return rec, observed
     if _worker_coordination_refusal_reason() is not None:
         return None
-    if (inspected.state is _DescriptorState.LEGACY
-            and rec is not None and observed is not None):
-        remaining = (
-            0.5 if deadline is None
-            else max(0.0, min(0.5, deadline - time.monotonic())))
-        if remaining > 0:
-            _request_worker_stop(rec, timeout_s=remaining)
-        _discard_record(descriptor_path(), observed)
-    elif (inspected.state is _DescriptorState.INCOMPATIBLE
-          and rec is not None and observed is not None):
-        _retire_incompatible(
-            rec, observed, bound_owner=inspected.bound_owner,
-            deadline=deadline)
+    if inspected.state in (_DescriptorState.LEGACY, _DescriptorState.INCOMPATIBLE):
+        if (rec is None or observed is None
+                or _foreign_worker_signal_refusal_reason() is not None):
+            return None
+        if inspected.state is _DescriptorState.LEGACY:
+            remaining = (
+                0.5 if deadline is None
+                else max(0.0, min(0.5, deadline - time.monotonic())))
+            if remaining > 0:
+                _request_worker_stop(rec, timeout_s=remaining)
+            _discard_record(descriptor_path(), observed)
+        else:
+            _retire_incompatible(
+                rec, observed, bound_owner=inspected.bound_owner,
+                deadline=deadline)
     elif (inspected.state in (
             _DescriptorState.MALFORMED_STALE,
             _DescriptorState.RECLAIMABLE,

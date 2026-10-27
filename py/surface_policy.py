@@ -2613,8 +2613,8 @@ SEMANTIC_WORKER_TRANSIENT_REASON = (
 # (integrity), legacy-publication (`agrep index`), unknown and empty (a crashed
 # probe) stay doctor alarms.
 SEMANTIC_SELF_HEALING_GENERATION_STATES = frozenset({
-    "current", "partial", "stale", "missing-embeddings", "missing-source",
-    "unstable-source", "unstable-embeddings",
+    "current", "partial", "published", "stale", "missing-embeddings",
+    "missing-source", "unstable-source", "unstable-embeddings",
     "profile-mismatch", "profile-unavailable", "legacy-embeddings",
 })
 
@@ -2787,11 +2787,27 @@ def semantic_integrity_notice(
     if dropped <= 0:
         return None
     row = "row" if dropped == 1 else "rows"
-    # Rows the derived mirror has not ingested yet prove nothing about the
-    # embedded text, so they are stated as the coverage gap they are.
+    # Rows the derived mirror has not ingested yet, or that the transcript
+    # moved past after an older generation embedded them, prove nothing about
+    # the embedded text, so they are stated as the coverage gap they are.
     if int(integrity.get("mismatched", dropped) or 0) <= 0:
         if suppress_trivial and dropped <= SEMANTIC_TRIVIAL_MIRROR_LAG_ROWS:
             return None
+        changed = int(integrity.get("changed") or 0)
+        if changed > 0 or integrity.get("source_current") is False:
+            # Against an older generation, an absent row was removed from the
+            # transcript; it is not coming back for a mirror to catch up on.
+            absent = int(integrity.get("absent") or 0)
+            if changed and absent:
+                return (f"semantic integrity: {dropped} {row} held back - changed "
+                        "or removed since they were embedded; changed rows are "
+                        "re-embedded in the background")
+            if changed:
+                return (f"semantic integrity: {dropped} {row} held back - changed "
+                        "since they were embedded; the background refresh "
+                        "re-embeds them")
+            return (f"semantic integrity: {dropped} {row} held back - removed "
+                    "from the transcript since they were embedded")
         return (f"semantic integrity: {dropped} {row} held back - the search "
                 "index has not mirrored them yet; it catches up in the background")
     repair = (" a full rebuild is running"
@@ -2845,12 +2861,18 @@ def semantic_coverage_notice(
     base_partial = not coverage.get("complete", True)
     accelerator_partial = bool(accelerator) and not accelerator.get(
         "complete", True)
-    if not base_partial and not accelerator_partial:
+    # A generation the transcript moved past still answers for every row it
+    # embedded; only rows written since wait for the background refresh.
+    lagging = coverage.get("source_current") is False
+    if not base_partial and not accelerator_partial and not lagging:
         return None
     indexed = coverage.get("indexed", "?")
     total = coverage.get("total", "?")
     if suppress_trivial and semantic_coverage_usable(coverage, accelerator):
         return None
+    if lagging and not base_partial and not accelerator_partial:
+        return ("semantic coverage is partial: rows written since the last "
+                "embedding pass are keyword-only until it catches up")
 
     searched = accelerator.get("indexed") if accelerator else None
     if searched is not None and searched != indexed:

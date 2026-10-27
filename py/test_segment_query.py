@@ -228,6 +228,83 @@ class SegmentQueryTests(unittest.TestCase):
                         "artifact changed after publication"):
                     segment_query.open_current(meta)
 
+    def test_relocated_artifacts_with_published_bytes_are_accepted_once(
+            self) -> None:
+        # A copied, restored or migrated data dir gives every artifact a new
+        # inode at the same path; no newer manifest will ever appear, so
+        # treating that as a republication refused semantic search forever.
+        with _temporary_root() as root:
+            _source, meta, manifest, corpus, _ = self._fixture(root)
+            segments = meta.parent / embedding_segments.SEGMENT_DIR
+            proof = embedding_segments.publication_artifact_identities(manifest)
+            self.assertIsNotNone(proof)
+
+            def relocate(path: Path, payload: bytes | None = None) -> None:
+                replacement = path.with_name(f".relocated-{path.name}")
+                replacement.write_bytes(
+                    path.read_bytes() if payload is None else payload)
+                os.replace(replacement, path)
+
+            for path in sorted(segments.iterdir()):
+                relocate(path)
+            for artifact, identity in proof.items():
+                self.assertTrue(embedding_segments.identity_republished(
+                    identity, embedding_segments._file_identity(artifact)))
+            hashed = []
+            original_hash = segment_query._sha256_file
+
+            def counting_hash(path):
+                hashed.append(Path(path))
+                return original_hash(path)
+
+            with mock.patch.object(
+                    segment_query, "_sha256_file", side_effect=counting_hash):
+                opened, _, refs, coverage = segment_query.open_current(meta)
+                self.assertEqual(opened["generation"], manifest["generation"])
+                self.assertEqual(coverage["indexed"], manifest["live_rows"])
+                refs.corpus_connect = lambda: sqlite3.connect(corpus)
+                self.assertEqual(
+                    [row["text"] for row in refs.resolve([2, 3])],
+                    ["current alpha", "current gamma"])
+                self.assertEqual(set(hashed), set(proof))
+                # The receipt records the relocated identities: the next cold
+                # open pays no hash at all.
+                hashed.clear()
+                segment_query.close_cache()
+                segment_query.open_current(meta)
+                self.assertEqual(hashed, [])
+
+            # Different bytes under a new inode at a published path is a
+            # same-name republication, never damage.
+            segment_query.close_cache()
+            descriptor = manifest["segments"][-1]["artifacts"]["f16"]
+            active = embedding_segments.artifact_path(manifest, descriptor)
+            payload = active.read_bytes()
+            midpoint = len(payload) // 2
+            relocate(active, payload[midpoint:] + payload[:midpoint])
+            with self.assertRaisesRegex(
+                    segment_query.SegmentArtifactMoved,
+                    "artifact was republished"):
+                segment_query.open_current(meta)
+            relocate(active, payload)
+            segment_query.close_cache()
+            segment_query.open_current(meta)
+
+            # A manifest that moved while a relocation was being judged is a
+            # newer publication: the reader retries it instead of hashing.
+            segment_query.close_cache()
+            relocate(active)
+            settled = segment_query._stamp(meta)
+            republished = (*settled[:3], settled[3] + 1, settled[4])
+            with mock.patch.object(
+                    segment_query, "_stamp",
+                    side_effect=[settled, republished]), \
+                    mock.patch.object(
+                        segment_query, "_sha256_file",
+                        side_effect=AssertionError("moved manifest hashed")), \
+                    self.assertRaises(segment_query.SegmentArtifactMoved):
+                segment_query._verified_manifest(meta)
+
     def test_explicit_search_refusal_names_the_cause_not_the_command(self) -> None:
         # The reader of this line has just run `agrep -s`; telling them to run
         # `agrep -s` is not a remedy. The cause is.
@@ -617,15 +694,8 @@ class SegmentQueryTests(unittest.TestCase):
             source, meta, _, corpus, _ = self._fixture(root)
             race = common.TranscriptPublicationRace(
                 "session-family publication precedes its ingest signature")
-            publication = common.FamilyPublication(
-                signature="committed",
-                signature_sha256=source["ingest_signature"],
-                stamp="stable", moving=True)
             with mock.patch.object(
-                    common, "transcript_generation", side_effect=race), \
-                    mock.patch.object(
-                        common, "read_family_publication",
-                        return_value=publication):
+                    common, "transcript_generation", side_effect=race):
                 _, matrix, refs, coverage = segment_query.open_current(
                     meta, need_matrix=True)
                 refs.corpus_connect = lambda: sqlite3.connect(corpus)
@@ -885,6 +955,220 @@ class SegmentQueryTests(unittest.TestCase):
                     "reason": "the derived corpus has not mirrored these rows yet",
                     "repair": "corpus-refresh-pending",
                 })
+
+    @staticmethod
+    def _older_generation_fixture(root: Path):
+        """A bundle embedded at generation ``older`` and a corpus that moved on.
+
+        Row 0 kept its text but its metadata drifted, row 1 is a streaming
+        message that grew, row 2 left the corpus, and row 3 was written after
+        the bundle (it was never embedded)."""
+        older = {"ingest_signature": "older"}
+        embedded = [
+            _row("a", "stable alpha", [1.0, 0.0], agent="codex",
+                 project="old-proj", session="s-a", ts=100, turn=1,
+                 who="user", model="gpt-5", family_id=1),
+            _row("b", "streaming beta", [0.9, 0.1], agent="codex",
+                 project="old-proj", session="s-b", ts=200, turn=2,
+                 who="assistant", model="gpt-5", family_id=2),
+            _row("c", "pruned gamma", [0.8, 0.2], agent="claude",
+                 project="old-proj", session="s-c", ts=300, turn=3,
+                 who="user", model="sonnet", family_id=3),
+        ]
+        artifacts, hashes, refs = _inputs(root, "older", embedded)
+        meta = root / "embeddings.meta"
+        manifest = embedding_segments.publish_base(
+            meta, source=older, model_id="model", dim=2, artifacts=artifacts,
+            ids=[row["mid"] for row in embedded], hashes=hashes, refs=refs,
+            coverage={"total": 3})
+        current = [
+            _row("a", "stable alpha", [1.0, 0.0], agent="codex",
+                 project="new-proj", session="s-a", ts=150, turn=1,
+                 who="user", model="gpt-5.1", family_id=1,
+                 model_source="inferred"),
+            _row("b", "streaming beta, now with the rest of the reply",
+                 [0.9, 0.1], agent="codex", project="old-proj",
+                 session="s-b", ts=200, turn=2, who="assistant",
+                 model="gpt-5", family_id=2),
+            _row("d", "written after the bundle", [0.0, 1.0], agent="codex",
+                 project="new-proj", session="s-d", ts=400, turn=4,
+                 who="user", model="gpt-5.1", family_id=4),
+        ]
+        corpus = root / "corpus.db"
+        _corpus(corpus, current)
+        db = sqlite3.connect(corpus)
+        try:
+            db.execute(
+                "CREATE TABLE session_family(session TEXT PRIMARY KEY, "
+                "root TEXT NOT NULL, side INTEGER NOT NULL)")
+            db.executemany("INSERT INTO session_family VALUES(?,?,?)", (
+                ("s-a", "s-root", 1), ("s-b", "s-b", 0), ("s-d", "s-d", 0)))
+            db.commit()
+        finally:
+            db.close()
+        return older, meta, manifest, corpus
+
+    def test_older_generation_serves_unchanged_rows_with_current_metadata(
+            self) -> None:
+        import semantic
+        with _temporary_root() as root:
+            older, meta, manifest, corpus = self._older_generation_fixture(root)
+            newer = {"ingest_signature": "newer"}
+            with mock.patch.object(
+                    common, "transcript_generation", return_value=newer):
+                # Ingest moved the transcript: the committed bundle still opens.
+                opened, matrix, refs, coverage = segment_query.open_current(
+                    meta, need_matrix=True)
+                self.assertEqual(opened["generation"], manifest["generation"])
+                self.assertEqual(
+                    segment_query.semantic_source_status(older), (True, False))
+                np.testing.assert_allclose(
+                    matrix @ np.asarray([1.0, 0.0], dtype=np.float32),
+                    [1.0, 0.9, 0.8])
+                refs.corpus_connect = lambda: sqlite3.connect(corpus)
+                resolved = refs.resolve([0, 1, 2])
+                # Only the row whose text is unchanged is served, and it
+                # carries the corpus row's current metadata.
+                self.assertEqual(len(resolved), 1)
+                row = resolved[0]
+                self.assertEqual(
+                    (row["ordinal"], row["session"], row["turn"], row["text"]),
+                    (0, "s-a", 1, "stable alpha"))
+                self.assertEqual(
+                    (row["project"], row["ts"], row["model"],
+                     row["model_source"], row["side"]),
+                    ("new-proj", 150, "gpt-5.1", "inferred", True))
+                disclosure = refs.take_integrity_disclosure()
+                self.assertEqual(disclosure, {
+                    "state": "rows-uncorroborated",
+                    "dropped": 2,
+                    "mismatched": 0,
+                    "absent": 1,
+                    "changed": 1,
+                    "considered": 3,
+                    "reason": (
+                        "these rows changed or were removed after they were "
+                        "embedded"),
+                    "repair": "embedding-refresh-pending",
+                    "source_current": False,
+                })
+                self.assertFalse(
+                    semantic.integrity_verdict_escalates(disclosure))
+                self.assertIn(
+                    "changed or removed since they were embedded",
+                    surface.semantic_integrity_notice(disclosure))
+                # Absent rows under an older bundle were removed; nothing
+                # will mirror them back.
+                removed = surface.semantic_integrity_notice({
+                    **disclosure, "dropped": 70, "changed": 0, "absent": 70})
+                self.assertIn("removed from the transcript", removed)
+                self.assertNotIn("catches up", removed)
+                served = segment_query.served_coverage(coverage, older)
+                self.assertIs(served["source_current"], False)
+                self.assertEqual(served["indexed"], 3)
+
+                # A family whose best scored row changed since it was embedded
+                # falls back to its next scored row instead of vanishing.
+                grouped = (np.asarray([1, 0], dtype=np.int64),
+                           np.asarray([0.95, 0.9], dtype=np.float32),
+                           np.asarray([2, 2], dtype=np.uint32), 5)
+                with mock.patch.object(
+                        semantic_q8, "grouped_exact_candidates",
+                        return_value=grouped), \
+                        mock.patch.dict(
+                            ask._CURRENT_MESSAGE_STATE,
+                            {"generation": manifest["generation"],
+                             "source": older}, clear=False):
+                    family_rows, family_scores, _ = ask._q8_grouped_pool(
+                        np.asarray([1.0, 0.0], dtype=np.float32), refs,
+                        {"_exclude_who": ("tool",)}, 2)
+                self.assertEqual(
+                    [entry["session"] for entry in family_rows], ["s-a"])
+                np.testing.assert_allclose(family_scores, [0.9])
+                refs.take_integrity_disclosure()
+
+                filters_cases = (
+                    (None, ["s-a"]),
+                    # Filters judge the current row, not the bundle's copy.
+                    ({"project": "old-proj"}, []),
+                    ({"until_ms": 120}, []),
+                    ({"model": "gpt-5"}, []),
+                )
+                candidates = (np.asarray([0, 1, 2], dtype=np.int64),
+                              np.asarray([0.9, 0.8, 0.7], dtype=np.float32))
+                for filters, sessions in filters_cases:
+                    with self.subTest(filters=filters), \
+                            mock.patch.object(
+                                semantic_q8, "exact_candidates",
+                                return_value=candidates), \
+                            mock.patch.dict(
+                                ask._CURRENT_MESSAGE_STATE,
+                                {"generation": manifest["generation"],
+                                 "source": older}, clear=False):
+                        pooled = ask._q8_flat_pool(
+                            np.asarray([1.0, 0.0], dtype=np.float32), refs,
+                            filters, 2)
+                        self.assertEqual(
+                            [entry["session"] for entry in pooled[0]], sessions)
+                        refs.take_integrity_disclosure()
+                        payload = ask._attach_coverage({}, coverage)
+                        self.assertTrue(payload["partial"])
+                        self.assertIs(
+                            payload["semantic_coverage"]["source_current"], False)
+
+    def test_resident_reader_reconnects_after_the_corpus_is_replaced(
+            self) -> None:
+        import corpusdb
+        with _temporary_root() as root:
+            source, meta, _manifest, corpus, live_rows = self._fixture(root)
+            connections = []
+
+            def connect():
+                db = sqlite3.connect(
+                    corpus, factory=corpusdb._PublishedConnection)
+                db._source_identity = corpusdb._sqlite_file_identity(corpus)
+                db._source_path = corpus
+                connections.append(db)
+                return db
+
+            with mock.patch.object(
+                    common, "transcript_generation", return_value=source):
+                _, _, refs, _ = segment_query.open_current(meta)
+                refs.corpus_connect = connect
+                self.assertEqual(
+                    [row["text"] for row in refs.resolve([2, 3])],
+                    ["current alpha", "current gamma"])
+                # A rebuild publishes a new corpus by rename: one row's text
+                # changed and the other row is gone.
+                rebuilt = root / "rebuilt-corpus.db"
+                _corpus(rebuilt, [{**live_rows[0], "text": "rewritten alpha"}])
+                os.replace(rebuilt, corpus)
+                self.assertEqual(refs.resolve([2, 3]), [])
+                self.assertEqual(len(connections), 2)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connections[0].execute("SELECT 1")
+                self.assertEqual(refs.take_integrity_disclosure()["dropped"], 2)
+                refs.close()
+
+    def test_changed_row_against_the_newest_generation_is_still_evidence(
+            self) -> None:
+        with _temporary_root() as root:
+            older, meta, _manifest, corpus = self._older_generation_fixture(root)
+            # The transcript still IS the bundle's generation, so a corpus row
+            # whose text differs speaks against the bundle, as before.
+            with mock.patch.object(
+                    common, "transcript_generation", return_value=older):
+                _, _, refs, coverage = segment_query.open_current(meta)
+                refs.corpus_connect = lambda: sqlite3.connect(corpus)
+                self.assertEqual(
+                    [row["ordinal"] for row in refs.resolve([0, 1, 2])], [0])
+                disclosure = refs.take_integrity_disclosure()
+                self.assertEqual(
+                    segment_query.served_coverage(coverage, older), coverage)
+        self.assertEqual(disclosure["state"], "rows-dropped")
+        self.assertEqual(
+            (disclosure["mismatched"], disclosure["absent"]), (1, 1))
+        self.assertNotIn("changed", disclosure)
 
 
 if __name__ == "__main__":

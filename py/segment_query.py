@@ -63,20 +63,37 @@ class SegmentArtifactMoved(SegmentQueryError):
 
 
 def semantic_source_status(source: object) -> tuple[bool, bool]:
-    """Return (queryable, newest); only a typed family-publication race may use
-    the still-committed ingest signature."""
+    """Return (queryable, newest) for a committed bundle bound to ``source``.
+
+    Every ingest publication moves the transcript generation, so a committed
+    bundle stays queryable after the transcript passes it: ``resolve`` proves
+    each candidate against the current corpus row, and a row whose text moved
+    on since it was embedded is dropped, never served. ``newest`` holds only
+    while the bundle binds the current generation; a publication race leaves
+    it unproven, so it reads False."""
+    if not isinstance(source, dict) or not source:
+        return False, False
     try:
         current = common.transcript_generation()
     except common.TranscriptPublicationRace:
-        publication = common.read_family_publication()
-        queryable = bool(
-            publication is not None
-            and publication.moving
-            and isinstance(source, dict)
-            and source.get("ingest_signature") == publication.signature_sha256)
-        return queryable, False
-    newest = current == source
-    return newest, newest
+        return True, False
+    if current is None:
+        return False, False
+    return True, current == source
+
+
+def served_coverage(coverage: dict, source: object) -> dict:
+    """``coverage`` as a page served from the bundle bound to ``source`` reports it.
+
+    The counts describe what the bundle embedded of its own generation. Once
+    the transcript has moved past that generation, rows it gained since are not
+    embedded yet (keyword search covers them), so the served coverage carries
+    ``source_current: False`` and the page is partial until a refresh rebinds."""
+    try:
+        newest = semantic_source_status(source)[1]
+    except (OSError, RuntimeError, ValueError):
+        newest = False
+    return dict(coverage) if newest else {**coverage, "source_current": False}
 
 
 # Publication replaces artifacts atomically, so a vanished path or a new inode
@@ -209,6 +226,18 @@ def register_metadata_functions(db: sqlite3.Connection) -> None:
 
 
 _text_hash = common.semantic_text_hash
+# Row metadata that can drift between transcript generations while the text
+# stays the same; resolve reads it from the current corpus row.
+_CURRENT_ROW_METADATA = ("project", "ts", "model", "model_source")
+
+
+def _current_int(current: dict, name: str, fallback) -> int:
+    if name not in current:
+        return int(fallback)
+    try:
+        return int(current[name] or 0)
+    except (TypeError, ValueError, OverflowError):
+        return int(fallback)
 
 
 def _liveness(manifest: embedding_segments.LoadedManifest) -> np.ndarray:
@@ -522,6 +551,11 @@ class SegmentRefStore:
         if not requested:
             return []
         metadata = self._metadata(requested)
+        if self.corpus is not None and self._corpus_replaced():
+            # A resident reader must prove rows against the corpus as
+            # published now, not a file a rebuild renamed away (which this
+            # connection would also keep pinned on disk).
+            self._close_corpus()
         if self.corpus is None and self._connect_current_corpus() is None:
             reason = (surface.SEMANTIC_INDEX_UPDATE_REASON
                       if corpus_update_active() else
@@ -537,11 +571,12 @@ class SegmentRefStore:
                 self._corpus_has_digest = any(
                     row[1] == "content_digest"
                     for row in self.corpus.execute("PRAGMA table_info(msgs)"))
+            current_columns, family_side = self._current_metadata_shape()
             index_hint = (
                 " INDEXED BY msgs_session"
                 if self._corpus_has_session_index else "")
             unique = list(dict.fromkeys(requested))
-            observed: dict[int, list[tuple[str, object]]] = {}
+            observed: dict[int, list[tuple]] = {}
             for start in range(0, len(unique), 150):
                 page = unique[start:start + 150]
                 values = ",".join("(?,?,?,?,?)" for _ in page)
@@ -556,48 +591,63 @@ class SegmentRefStore:
                     f"(VALUES {values}) "
                     "SELECT wanted.row_ref,msgs.text"
                     + (",msgs.content_digest" if self._corpus_has_digest else ",NULL")
+                    + "".join(f",msgs.{name}" for name in current_columns)
+                    + (",family.side" if family_side else "")
                     + " FROM wanted "
                     f"JOIN msgs{index_hint} "
                     "ON msgs.agent=wanted.agent AND msgs.session=wanted.session "
-                    "AND msgs.turn=wanted.turn AND msgs.who=wanted.who",
+                    "AND msgs.turn=wanted.turn AND msgs.who=wanted.who"
+                    + (" LEFT JOIN session_family AS family "
+                       "ON family.session=msgs.session" if family_side else ""),
                     params)
-                for raw_ref, raw_text, raw_digest in rows:
-                    observed.setdefault(int(raw_ref), []).append(
-                        (str(raw_text), raw_digest))
+                for raw in rows:
+                    observed.setdefault(int(raw[0]), []).append(tuple(raw[1:]))
             self._resolve_considered += len(unique)
             for row_ref in unique:
                 record = metadata[row_ref]
                 candidates = observed.get(row_ref, ())
-                matches = [(text, digest) for text, digest in candidates
-                           if _text_hash(text) == record["text_hash"]]
-                if not matches or len({text for text, _digest in matches}) != 1:
+                matches = [row for row in candidates
+                           if _text_hash(str(row[0])) == record["text_hash"]]
+                if not matches or len({str(row[0]) for row in matches}) != 1:
                     # No corpus row at all is coverage lag in a derived mirror
-                    # read stale by design; only a present-but-different text
-                    # is evidence about what was embedded.
+                    # read stale by design; a present-but-different text is
+                    # damage evidence only against the generation the bundle
+                    # embedded (take_integrity_disclosure decides which).
                     if not candidates:
                         self._absent_drops.add(row_ref)
                     else:
                         self._integrity_drops.add(row_ref)
                     continue
-                text, digest = matches[0]
+                text, digest, *values = matches[0]
+                text = str(text)
                 try:
                     digest = (compact.content_digest(text) if digest is None else
                               compact.require_content_digest(digest))
                 except compact.CompactError as exc:
                     raise SegmentQueryError(
                         "current corpus content digest is invalid") from exc
+                # Filters and display read the corpus row as it is now; the
+                # bundle's copy is only a fallback for a column it lacks.
+                current = dict(zip(current_columns, values))
                 found[row_ref] = {
                     # A '#cN' chunk hit maps back to its logical row: callers
                     # see the base id, never the chunk-vector store id.
                     "ordinal": row_ref,
                     "mid": common.semantic_chunk_split(record["mid"])[0],
-                    "agent": record["agent"], "project": record["project"],
-                    "session": record["session"], "ts": int(record["ts"]),
+                    "agent": record["agent"],
+                    "project": (str(current["project"] or "")
+                                if "project" in current else record["project"]),
+                    "session": record["session"],
+                    "ts": _current_int(current, "ts", record["ts"]),
                     "turn": int(record["turn"]), "who": record["who"],
-                    "model": record["model"] or "",
-                    "model_source": record["model_source"],
+                    "model": (str(current["model"] or "")
+                              if "model" in current else record["model"] or ""),
+                    "model_source": (
+                        str(current["model_source"] or "unknown")
+                        if "model_source" in current else record["model_source"]),
                     "family_id": int(record["family_id"]),
-                    "side": bool(record["side"]),
+                    "side": (bool(values[len(current_columns)] or 0)
+                             if family_side else bool(record["side"])),
                     "text": text, "content_digest": digest,
                 }
         except sqlite3.DatabaseError as exc:
@@ -610,6 +660,52 @@ class SegmentRefStore:
         self.assert_current()
         return [found[row_ref] for row_ref in requested if row_ref in found]
 
+    def _current_metadata_shape(self) -> tuple[tuple[str, ...], bool]:
+        """The query-visible row metadata and family side the corpus supplies."""
+        columns = {str(row[1]) for row in self.corpus.execute(
+            "PRAGMA table_info(msgs)")}
+        family = {str(row[1]) for row in self.corpus.execute(
+            "PRAGMA table_info(session_family)")}
+        return (tuple(name for name in _CURRENT_ROW_METADATA if name in columns),
+                {"session", "side"} <= family)
+
+    def _source_newest(self) -> bool:
+        try:
+            return semantic_source_status(self.manifest["source"])[1]
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _corpus_replaced(self) -> bool:
+        """Whether the open connection reads a corpus file publication replaced.
+
+        The same identity comparison `corpusdb._coverage_count_snapshot` trusts:
+        a direct connection's file must still sit at its path, an aliased
+        snapshot must still match the sources it was cloned from."""
+        import corpusdb
+        corpus = self.corpus
+        if (not isinstance(corpus, corpusdb._PublishedConnection)
+                or corpus._source_identity is None):
+            return False
+        if isinstance(corpus, corpusdb._AliasedConnection):
+            return not corpus.source_stable()
+        if corpus._source_path is None:
+            return False
+        try:
+            return (corpusdb._sqlite_file_identity(corpus._source_path)
+                    != corpus._source_identity)
+        except OSError:
+            return True
+
+    def _close_corpus(self) -> None:
+        if self.corpus is not None:
+            try:
+                self.corpus.close()
+            except sqlite3.DatabaseError:
+                pass
+        self.corpus = None
+        self._corpus_has_session_index = None
+        self._corpus_has_digest = None
+
 
     def take_integrity_disclosure(self) -> dict | None:
         mismatched = len(self._integrity_drops)
@@ -620,16 +716,34 @@ class SegmentRefStore:
         self._resolve_considered = 0
         if not (mismatched or absent):
             return None
+        # Against an older generation, text that moved on and rows that left
+        # the transcript are the lag the background refresh prunes or
+        # re-embeds, not proof against the bundle.
+        older = not self._source_newest()
+        changed = mismatched if older else 0
+        mismatched -= changed
         if not mismatched:
-            return {
+            disclosure = {
                 "state": "rows-uncorroborated",
-                "dropped": absent,
+                "dropped": absent + changed,
                 "mismatched": 0,
                 "absent": absent,
                 "considered": considered,
-                "reason": "the derived corpus has not mirrored these rows yet",
-                "repair": "corpus-refresh-pending",
+                "reason": (
+                    ("these rows changed or were removed after they were "
+                     "embedded" if changed and absent else
+                     "these rows changed after they were embedded" if changed
+                     else "these rows were removed after they were embedded")
+                    if older else
+                    "the derived corpus has not mirrored these rows yet"),
+                "repair": (
+                    "embedding-refresh-pending" if older else
+                    "corpus-refresh-pending"),
             }
+            if older:
+                disclosure["changed"] = changed
+                disclosure["source_current"] = False
+            return disclosure
         return {
             "state": "rows-dropped",
             "dropped": mismatched + absent,
@@ -651,12 +765,7 @@ class SegmentRefStore:
         self._integrity_drops.clear()
         self._absent_drops.clear()
         self._resolve_considered = 0
-        if self.corpus is not None:
-            try:
-                self.corpus.close()
-            except sqlite3.DatabaseError:
-                pass
-            self.corpus = None
+        self._close_corpus()
 
 
 class _SegmentIndex:
@@ -677,16 +786,7 @@ class _SegmentIndex:
         self.refs = SegmentRefStore(
             manifest, self.live, self.assert_artifacts_current)
 
-    def assert_current(self) -> None:
-        try:
-            queryable, _newest = semantic_source_status(self.manifest["source"])
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise SegmentQueryError("semantic source generation is unavailable") from exc
-        if not queryable:
-            raise SegmentQueryError("segmented semantic source is stale")
-
     def assert_artifacts_current(self) -> None:
-        self.assert_current()
         for path, expected in self._artifact_identities:
             try:
                 current = embedding_segments._file_identity(path)
@@ -897,13 +997,17 @@ def _metadata_only_change(expected, observed) -> bool:
 
 def _reverify_metadata_changes(
         manifest: embedding_segments.LoadedManifest,
-        changed: list, observed: dict) -> None:
-    """Accept a metadata-only change once its bytes still match the descriptor.
+        changed: list, observed: dict, relocated=frozenset()) -> None:
+    """Accept a metadata-only change or a relocation once its bytes still
+    match the descriptor.
 
     The verdict and the artifact's current identity land in the integrity
     receipt - the reader's own record - so the next cold open does not pay
     the hash again. The publisher repairs the proof itself at its next
-    publication (`embedding_segments._verified_prefix_identities`)."""
+    publication (`embedding_segments._verified_prefix_identities`).
+
+    A relocated artifact (a different file at the published path) whose bytes
+    differ is a same-name republication, never damage: the reader retries."""
     descriptors = _artifact_descriptors(manifest)
     receipt = _read_integrity_receipt(manifest.path)
     verified = dict(receipt)
@@ -918,6 +1022,9 @@ def _reverify_metadata_changes(
                 and cached.get("sha256") == expected
                 and cached.get("identity") == identity):
             if _sha256_file(path) != expected:
+                if artifact in relocated:
+                    raise SegmentArtifactMoved(
+                        f"semantic artifact was republished: {path}")
                 raise SegmentIntegrityError(
                     f"active semantic artifact changed after publication: {path}")
             hashed = True
@@ -938,19 +1045,28 @@ def _verified_manifest(path: Path):
             changed = [artifact for artifact, identity in proof.items()
                        if observed.get(str(artifact)) != identity]
             if changed:
-                first = changed[0]
-                if _current_identity_republished(Path(first), proof[first]):
-                    raise SegmentArtifactMoved(
-                        f"semantic artifact was republished: {first}")
+                # A different file at a published path is either a newer
+                # publication or the same bytes relocated by a copy, restore
+                # or migration. Only a manifest that stayed put can tell: then
+                # the descriptor digest decides, once per relocation.
+                relocated = frozenset(
+                    artifact for artifact in changed
+                    if _current_identity_republished(
+                        Path(artifact), proof[artifact]))
+                if relocated:
+                    _assert_settled(
+                        path, before_meta, before_artifacts, before_artifacts)
                 damaged = next((
                     artifact for artifact in changed
-                    if not _metadata_only_change(
+                    if artifact not in relocated
+                    and not _metadata_only_change(
                         proof[artifact], observed.get(str(artifact)))), None)
                 if damaged is not None:
                     raise SegmentIntegrityError(
                         f"active semantic artifact changed after publication: "
                         f"{damaged}")
-                _reverify_metadata_changes(candidate, changed, observed)
+                _reverify_metadata_changes(
+                    candidate, changed, observed, relocated)
             after_artifacts = _artifact_stamp(candidate)
             _assert_settled(path, before_meta, before_artifacts, after_artifacts)
             return candidate, before_meta, after_artifacts
@@ -992,7 +1108,6 @@ def _open_current_once(path: Path, *, need_matrix: bool):
         index = _SegmentIndex(manifest, artifact_stamp)
         _CACHE.update(
             stamp=stamp, artifact_stamp=artifact_stamp, index=index)
-    index.assert_current()
     return (index.manifest, index.matrix() if need_matrix else None,
             index.refs, index.coverage())
 

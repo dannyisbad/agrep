@@ -48,7 +48,7 @@ class SemanticPublicationDeadlineTests(unittest.TestCase):
         self.assertEqual(
             pending[2] - started, search._QUERY_PUBLICATION_WAIT_S + base)
 
-    def test_stuck_publisher_cannot_extend_past_the_shared_horizon(self) -> None:
+    def test_stuck_first_attempt_is_abandoned_at_the_cold_start_cap(self) -> None:
         thread = self._unstarted_thread()
         started = 300.0
         base = 0.25
@@ -70,7 +70,31 @@ class SemanticPublicationDeadlineTests(unittest.TestCase):
 
         maximum = search._QUERY_PUBLICATION_WAIT_S + base
         self.assertEqual(deadline - started, maximum)
-        thread.join.assert_called_once_with(timeout=maximum)
+        # A still-running first attempt is usually a cold worker start: it is
+        # awaited up to the cold-start cap, never beyond it.
+        self.assertEqual(thread.join.call_args_list, [
+            mock.call(timeout=maximum),
+            mock.call(timeout=search._semantic_cold_start_cap_s()),
+        ])
+
+    def test_recovery_retry_is_never_extended_past_its_deadline(self) -> None:
+        thread = self._unstarted_thread()
+        started = 400.0
+        with (
+            mock.patch.object(
+                search, "_semantic_index_update_active", return_value=False),
+            mock.patch.object(search.time, "monotonic", return_value=started),
+            mock.patch.object(threading, "Thread", return_value=thread),
+        ):
+            pending = search._start_semantic_query(
+                "meaningful query", {"semantic_timeout_s": 2.0},
+                _allow_recovery=False, _absolute_deadline=started + 1.5)
+        with (
+            mock.patch.object(search.time, "monotonic", return_value=started),
+            mock.patch.object(search.common, "dbg"),
+        ):
+            self.assertIsNone(search._finish_semantic_query(pending))
+        thread.join.assert_called_once_with(timeout=1.5)
 
     def test_publication_extension_preserves_the_semantic_call(self) -> None:
         captured = {}

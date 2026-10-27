@@ -33,6 +33,7 @@ pub fn owner_vanish_evaluations() -> Vec<usize> {
 /// `consent-promote` (before the first promotion), `consent-promoted-<n>` (after its n-th derived
 /// file), `consent-proof` and `consent-signature` (before and after the derived proof),
 /// `consent-signed` (signature written) and `consent-published` (before it clears its record);
+/// a takeover's `takeover-snapshot` (its private corpus.db copy staged, before validation);
 /// and the postflight snapshot's `postflight-open-wal` ([`postflight_wal_gate`]).
 #[cfg(feature = "owner-vanish-injection")]
 pub fn park_gate(step: &str) {

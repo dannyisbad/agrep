@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.7 — 2026-10-27
+
+### Meaning search
+
+- Meaning search keeps answering while new transcripts arrive. An embedding
+  bundle built for an older transcript generation now serves every row whose
+  text is unchanged in the current search database, with current metadata and
+  filters, instead of refusing with "embeddings stale for the current
+  generation" until the background refresh caught up. New or edited rows stay
+  keyword-searchable until the background pass embeds them.
+- A data directory restored from backup or moved to a new machine keeps its
+  meaning search: embedding files whose bytes still match the published digests
+  are accepted at their new location instead of reading as a publication that
+  never settles ("index update in progress", indefinitely).
+- The automatic meaning lane no longer runs out its deadline on a worker that is
+  still starting while an index publication is live: the first attempt gives up
+  on worker start quickly and the bounded recovery pass joins the started
+  worker. An answer that lands shortly after the fast deadline is kept, and the
+  whole lane shares one recovery budget from its start.
+- During an upgrade, before the new build owns the index, the new build starts
+  its own semantic worker instead of falling back to a 12–14 s in-process model
+  load. A still-running worker of the previous build is never stopped by it;
+  while that worker holds the model, the lane reports so at once instead of
+  waiting out a local fallback that cannot succeed.
+
+### Upgrades
+
+- Upgrading from 0.4.2 or earlier no longer sends searches to the slow
+  transcript scan, or fails them with "no verified transcript snapshot…", while
+  the new build takes over and rebuilds: the previous release's search database
+  is served read-only until the rebuild lands.
+- A takeover interrupted while validating the previous search database no
+  longer leaves a full-size `corpus.db.tmp.*` copy behind for every retry; the
+  next pass reaps it before staging its own.
+
+### Speed
+
+- A search that starts the background indexer no longer blocks up to 1 s
+  waiting for it to publish; it answers from the last published index while the
+  daemon catches up.
+- Corpus term statistics for the coverage hint are reused across processes
+  instead of re-walking common words' posting lists on every search.
+
 ## 0.4.6 — 2026-10-23
 
 ### Performance

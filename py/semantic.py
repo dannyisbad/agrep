@@ -7,11 +7,18 @@ in-process fallback preserves availability when local IPC is unavailable.
 Freshness is generation-based and self-healing:
   - `embedding_coherence()` compares the transcript generation against the
     segmented manifest, or against the generation marker for a legacy flat
-    bundle, so queries never read stale vectors.
-  - a stale lane calls `ensure_fresh_async()`, which spawns ONE detached
-    `embed.py` (embed.py itself holds the cross-process claim, so concurrent
-    CLIs and indexd can both ask without stacking embedders) and
-    reports `SemanticUnavailable` for this query - callers fall back to keyword.
+    bundle. A committed segmented bundle stays searchable after ingest moves
+    the transcript past it ("published"): candidate resolution proves every row
+    against the current corpus by text hash, so a row that changed or vanished
+    since it was embedded is dropped, never served, and rows written since are
+    keyword-only until a refresh rebinds. The page reports partial coverage.
+  - a lane that is behind or unsearchable calls `ensure_fresh_async()`, which
+    spawns ONE detached `embed.py` (embed.py itself holds the cross-process
+    claim, so concurrent CLIs and indexd can both ask without stacking
+    embedders). A searchable lane answers first and schedules that refresh
+    after the answer; only an unsearchable lane (missing, corrupt, wrong
+    profile, stale flat marker) reports `SemanticUnavailable` - callers fall
+    back to keyword.
   - a capped newest-first pass publishes an explicitly PARTIAL generation. Its
     vectors are source/hash coherent and immediately searchable while later
     background passes drain history; results disclose indexed/total coverage.
@@ -589,7 +596,10 @@ def embedding_coherence() -> dict:
                         "state": "unstable-source", "basis": None,
                         "reason": str(exc), "source_mtime_ns": source_mtime}
         else:
-            queryable_before = newest_before = output_source == source
+            # A committed manifest stays queryable when the transcript moves
+            # past it; only `newest` needs the exact binding.
+            queryable_before = isinstance(output_source, dict) and bool(output_source)
+            newest_before = output_source == source
         try:
             output_after = output_generation()
         except (OSError, RuntimeError, ValueError, TypeError,
@@ -627,10 +637,15 @@ def embedding_coherence() -> dict:
                         "state": "unstable-source", "basis": None,
                         "reason": str(exc), "source_mtime_ns": source_mtime}
             else:
-                queryable_after = newest_after = output_source == source_after
+                queryable_after = source_after is not None
+                newest_after = output_source == source_after
         queryable = bool(queryable_before and queryable_after)
         newest = bool(newest_before and newest_after)
         coverage = output.get("coverage") if queryable else None
+        if isinstance(coverage, dict) and not newest:
+            # Rows the transcript gained since this generation are not embedded
+            # yet; keyword search covers them until a refresh rebinds.
+            coverage = {**coverage, "source_current": False}
         searchable = isinstance(coverage, dict)
         exact = bool(searchable and newest and coverage.get("complete"))
         output_mtime = min(
@@ -1044,7 +1059,10 @@ def query_readiness(
     return {
         "state": "ready" if searchable else "not-ready",
         "generation_state": state,
-        "current_generation": bool(
+        # The served generation answers for the current transcript even when
+        # ingest has moved past it; `source_current` says whether it has.
+        "current_generation": searchable,
+        "source_current": bool(
             searchable and coherence.get("source_current", True)),
         "complete": bool(coherence.get("coherent")),
         "coverage": coherence.get("coverage"),
@@ -1160,122 +1178,33 @@ def _query_corpus_update_active() -> bool:
         return False
 
 
-def _semantic_refresh_delegate_alive() -> bool:
-    """Whether this exact build has a responsive freshness owner to delegate to.
-
-    Agent sandboxes can read and query the local corpus yet be forbidden from
-    launching the detached embed refresher.  The already-running compatible
-    index daemon performs that same deduplicated refresh after publication. Its
-    public liveness probe binds process identity, build/writer identity,
-    topology, readiness, and responsiveness; a mere lock file is never enough.
-    """
-    try:
-        import indexd_runtime
-        status = indexd_runtime.indexd_resource_status(
-            observe_only=True, include_rss=False)
-        return status.get("running") is True
-    except Exception:  # noqa: BLE001 -- a recovery hint fails closed
-        return False
-
-
 def wait_for_query_recovery(*, timeout_s: float | None = None) -> dict:
     """Wait for one queryable immutable generation, never unbound data."""
     wait_s = bounded_query_recovery_wait_s(
         SEMANTIC_QUERY_RECOVERY_WAIT_S if timeout_s is None else timeout_s)
     deadline = time.monotonic() + wait_s
-    refresh: dict | None = None
     waited = False
-    delegate_check_at = 0.0
 
     while True:
         coherence = embedding_coherence()
-        state = str(coherence.get("state") or "unknown")
         searchable = bool(
             coherence.get("searchable", coherence.get("coherent", False)))
         if searchable:
-            return {
-                "state": "ready", "waited": waited,
-                "coherence": coherence, "refresh": refresh,
-            }
-        corpus_active = _query_corpus_update_active()
-
-        # Source movement over an immutable segmented bundle is the safe,
-        # incremental rebase case.  Start at most one deduplicated refresher;
-        # changed/deleted rows remain excluded by the existing hash proof.
-        if (refresh is None and state == "stale"
-                and coherence.get("layout") == "segments-v2"):
-            try:
-                refresh = ensure_fresh_async(
-                    max_new=SEMANTIC_BOOTSTRAP_MAX_NEW,
-                    allow_model_download=False)
-            except Exception as exc:  # noqa: BLE001 -- caller keeps original status
-                # A sandbox can forbid launching detached work while the exact
-                # compatible daemon already owns semantic catch-up: wait on that
-                # proven delegate, same deadline; other failures stay explicit.
-                coherence_after = embedding_coherence()
-                searchable_after = bool(coherence_after.get(
-                    "searchable", coherence_after.get("coherent", False)))
-                if searchable_after:
-                    return {
-                        "state": "ready", "waited": waited,
-                        "coherence": coherence_after, "refresh": refresh,
-                    }
-                corpus_active = _query_corpus_update_active()
-                coherence = coherence_after
-                if (isinstance(exc, SemanticRefreshSpawnDenied)
-                        and _semantic_refresh_delegate_alive()):
-                    refresh = {
-                        "state": "delegated-indexd",
-                        "reason": "compatible freshness owner is active",
-                        "coherence": coherence,
-                    }
-                    delegate_check_at = time.monotonic() + 0.25
-                    common.dbg(
-                        "semantic refresh launch denied; waiting on the "
-                        "compatible freshness owner")
-                else:
-                    return {
-                        "state": "launch-failed", "waited": waited,
-                        "reason": type(exc).__name__, "coherence": coherence,
-                    }
-            repaired = refresh.get("coherence")
-            if (refresh.get("state") == "ready"
-                    and isinstance(repaired, dict)
-                    and repaired.get(
-                        "searchable", repaired.get("coherent", False))):
-                return {
-                    "state": "ready", "waited": waited,
-                    "coherence": repaired, "refresh": refresh,
-                }
-
-        embed_active = embed_running()
-        delegated = (refresh or {}).get("state") == "delegated-indexd"
-        if (delegated and not corpus_active and not embed_active
-                and time.monotonic() >= delegate_check_at):
-            if not _semantic_refresh_delegate_alive():
-                return {
-                    "state": "not-converging", "waited": waited,
-                    "coherence": coherence, "refresh": refresh,
-                }
-            delegate_check_at = time.monotonic() + 0.25
-        refresh_running = bool(
-            (refresh or {}).get("state") == "running"
-            or delegated or embed_active)
+            return {"state": "ready", "waited": waited, "coherence": coherence}
         # Millisecond source/manifest movement is transient only while a real
-        # publication owner exists.  Never turn an unexplained stale state into
-        # an eight-second sleep on every command.
-        converging = bool(corpus_active or refresh_running)
+        # publication owner exists.  Never turn an unexplained unsearchable
+        # state into an eight-second sleep on every command.
+        converging = bool(_query_corpus_update_active() or embed_running())
         if not converging:
             return {
                 "state": "not-converging", "waited": waited,
-                "coherence": coherence, "refresh": refresh,
+                "coherence": coherence,
             }
 
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
             return {
-                "state": "timeout", "waited": waited,
-                "coherence": coherence, "refresh": refresh,
+                "state": "timeout", "waited": waited, "coherence": coherence,
             }
         waited = True
         time.sleep(min(SEMANTIC_QUERY_RECOVERY_POLL_S, remaining))
@@ -1778,10 +1707,11 @@ def _transient_semantic_publication_error(error: BaseException) -> bool:
 def _await_publishing_coherence(initial: dict) -> dict:
     """Wait briefly for a verified corpus publication to rebind semantics.
 
-    Strict source equality remains the gate: this returns a searchable record
-    only after ``embedding_coherence`` proves it.  Persistent stale/missing,
-    model, profile, and integrity states return immediately when no live corpus
-    publisher accounts for them.
+    This returns a searchable record only after ``embedding_coherence`` proves
+    it. A segmented bundle the transcript merely moved past is already
+    searchable and never waits here; persistent stale/missing, model, profile,
+    and integrity states return immediately when no live corpus publisher
+    accounts for them.
     """
     transient = frozenset(("stale", "unstable-source", "unstable-embeddings"))
     if (initial.get("searchable", initial.get("coherent", False))

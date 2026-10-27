@@ -127,18 +127,23 @@ labeled evidence; they do not overwrite keyword scores.
 `--lexical` disables automatic meaning evidence. `-s` forces semantic-only
 search and fails explicitly when the optional runtime or a coherent vector
 generation is unavailable. Automatic hybrid paths keep the keyword result when
-semantic search is unavailable, stale, times out, or has no confident hit.
+semantic search is unavailable, times out, or has no confident hit.
 
 Semantic ranking is conversation-family aware by default so one root chat and
 its side chats do not consume every slot. `--all-side-chats` expands them for an
 explicit semantic search. Partial embedding coverage is disclosed as
-indexed/total; old or generation-mismatched vectors are never queried.
+indexed/total. A vector generation the transcript has moved past keeps
+answering: every candidate is re-proved against the current corpus row by text
+hash and filtered and displayed with that row's current metadata, a row whose
+text changed since it was embedded is held back rather than served, and rows
+written since are keyword-only until the background refresh rebinds the
+generation.
 
 Which engine wrote a vector is part of that identity, not a runtime detail. Two
 lanes can produce vectors: ONNX int8 on CPU, and MLX fp16 on Metal, which is
 the default on Apple silicon, where the base install carries mlx - and a query is
 always embedded by the lane recorded in the store it is querying. A lane the
-running machine cannot open degrades exactly like a stale generation: keyword
+running machine cannot open degrades like any unavailable generation: keyword
 results with one disclosure, never a query answered across two vector spaces.
 See `py/README.md` for the lane contract.
 

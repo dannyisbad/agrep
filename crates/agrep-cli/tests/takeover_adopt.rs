@@ -1478,3 +1478,112 @@ fn previous_reader_schema_with_wrong_postings_is_rebuilt() {
     assert_eq!(owner["build_id"], owner_b);
     assert!(owner["retained_corpus_db"].is_null());
 }
+
+/// `corpus.db.tmp.*` copies a takeover stages: one 3.9 GB file each on a real corpus.
+#[cfg(unix)]
+fn staged_corpus_copies(data: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(data)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("corpus.db.tmp."))
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+fn spawn_parked_takeover(
+    home: &Path,
+    data: &Path,
+    build_id: &str,
+    park: &Path,
+) -> std::process::Child {
+    let mut command = Command::new(BIN);
+    command
+        .args(["index", "--agent", "claude"])
+        .env("AGREP_HOME", home)
+        .env("AGREP_DATA_DIR", data)
+        .env("AGREP_RUNTIME_BUILD_ID", build_id)
+        .env("AGREP_TEST_PARK", park)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for key in [
+        "USERPROFILE",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "AGREP_RS_BIN",
+        "AGREP_PYTHON_RUNTIME_BUILD_ID",
+    ] {
+        command.env_remove(key);
+    }
+    command.spawn().expect("spawn parked takeover")
+}
+
+#[cfg(unix)]
+fn await_park(child: &mut std::process::Child, park: &Path, step: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !park.join(step).exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            use std::io::Read;
+            child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+            panic!("exited {status} before {step}: {stderr}");
+        }
+        assert!(std::time::Instant::now() < deadline, "never reached {step}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A takeover killed while validating its private corpus.db copy leaves that copy behind. The
+/// next attempt must reap it before staging its own, or every interrupted upgrade stacks another
+/// full-size copy in the data dir.
+#[cfg(unix)]
+#[test]
+fn a_killed_takeovers_corpus_copy_is_reaped_before_the_next_one_stages() {
+    let owner_a = "aaaaaaaaaaaaaaaaaaaa";
+    let owner_b = "bbbbbbbbbbbbbbbbbbbb";
+    let home = temp_dir("takeover-killed-home");
+    copy_dir(&fixtures_dir().join("claude").join("home"), &home);
+    let data = temp_dir("takeover-killed-data");
+    let park = temp_dir("takeover-killed-park");
+    // Every other gate passes straight through; only the staged takeover copy parks.
+    for step in [
+        "mutex",
+        "rename",
+        "restore",
+        "warm-lane",
+        "cursor-open",
+        "cursor-read",
+        "event-proof",
+        "postflight-open-wal",
+    ] {
+        fs::write(park.join(format!("{step}.go")), b"").unwrap();
+    }
+    assert!(run(&home, &data, owner_a, true).status.success());
+    forge_owned_corpus(&data, owner_a);
+
+    let mut first = spawn_parked_takeover(&home, &data, owner_b, &park);
+    await_park(&mut first, &park, "takeover-snapshot");
+    first.kill().unwrap();
+    first.wait().unwrap();
+    let orphaned = staged_corpus_copies(&data);
+    assert_eq!(orphaned.len(), 1, "{orphaned:?}");
+
+    fs::remove_file(park.join("takeover-snapshot")).unwrap();
+    let mut second = spawn_parked_takeover(&home, &data, owner_b, &park);
+    await_park(&mut second, &park, "takeover-snapshot");
+    let staged = staged_corpus_copies(&data);
+    assert_eq!(staged.len(), 1, "the dead attempt's copy survived: {staged:?}");
+    assert!(!staged.contains(&orphaned[0]), "{staged:?}");
+    fs::write(park.join("takeover-snapshot.go"), b"").unwrap();
+    let output = second.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("search db verified and adopted"), "{stderr}");
+    assert_eq!(staged_corpus_copies(&data), Vec::<String>::new());
+    assert_eq!(owner_at(&data.join("corpus.db")), owner_b);
+    fs::remove_dir_all(&park).unwrap();
+    fs::remove_dir_all(&home).unwrap();
+    fs::remove_dir_all(&data).unwrap();
+}

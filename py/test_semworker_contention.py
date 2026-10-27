@@ -319,6 +319,47 @@ class SemanticWorkerContentionTests(unittest.TestCase):
         request.assert_not_called()
         retire.assert_not_called()
 
+    def test_dead_foreign_owner_never_signals_the_owning_builds_live_worker(
+            self) -> None:
+        # The upgrade window: this build may launch its own query worker, but
+        # a live worker of the build that still owns the stores is not its to
+        # stop, retire or unpublish.
+        foreign = semworker.indexd_runtime.DerivedMutationInfo(
+            "foreign", "a" * 20,
+            "derived stores owned-by aaaaaaaaaaaaaaaaaaaa; this build is bbbb")
+        for state in (semworker._DescriptorState.INCOMPATIBLE,
+                      semworker._DescriptorState.LEGACY):
+            with self.subTest(state=state):
+                rec = self._record()
+                rec["build_id"] = "owning-build"
+                observation = semworker._DescriptorObservation(
+                    state, rec, self._snapshot("descriptor"), True)
+                with self._clear_worker_env(), \
+                        mock.patch.object(
+                            semworker.indexd_runtime,
+                            "derived_writer_mutation_info",
+                            return_value=foreign), \
+                        mock.patch.object(
+                            semworker.indexd_runtime, "live_indexer_claim",
+                            return_value=False), \
+                        mock.patch.object(
+                            semworker, "_protective_refusal_reason",
+                            return_value=None), \
+                        mock.patch.object(
+                            semworker, "_inspect_descriptor",
+                            return_value=observation), \
+                        mock.patch.object(
+                            semworker, "_request_worker_stop") as stop, \
+                        mock.patch.object(
+                            semworker, "_terminate_worker_tree") as terminate, \
+                        mock.patch.object(
+                            semworker, "_discard_record") as discard:
+                    self.assertIsNone(semworker._worker_coordination_refusal_reason())
+                    self.assertIsNone(semworker._reconcile_descriptor())
+                stop.assert_not_called()
+                terminate.assert_not_called()
+                discard.assert_not_called()
+
     def test_foreign_writer_owner_can_reclaim_request_coordination(self) -> None:
         path = semworker.request_lock_path()
         path.write_bytes(b"stale malformed owner")

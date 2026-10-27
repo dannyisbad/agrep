@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -1440,13 +1439,6 @@ class CorpusSessionFamilyTests(unittest.TestCase):
             path = root / "corpus.db"
             with _data_dir(root):
                 committed = common.session_family_source_stamp()
-                publication = common.read_family_publication()
-                self.assertEqual(
-                    publication,
-                    common.FamilyPublication(
-                        "2:committed",
-                        hashlib.sha256(b"2:committed\n").hexdigest(),
-                        committed, False))
                 generation = common.transcript_generation(root)
                 with closing(sqlite3.connect(path)) as db:
                     db.executescript("""
@@ -1476,9 +1468,6 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                     encoding="utf-8")
 
                 self.assertEqual(common.session_family_source_stamp(), committed)
-                moving = common.read_family_publication()
-                self.assertEqual(
-                    moving, publication._replace(moving=True))
                 with self.assertRaisesRegex(
                         common.TranscriptPublicationRace,
                         "outputs precede their ingest signature"):
@@ -1495,10 +1484,8 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                     root, rows + [{**rows[0], "session": "twig",
                                    "id": "codex:twig:1"}],
                     common, corpusdb, signature="3:next")
-                landed = common.read_family_publication()
-                self.assertEqual(landed.signature, "3:next")
-                self.assertFalse(landed.moving)
-                self.assertNotEqual(landed.stamp, committed)
+                self.assertNotEqual(
+                    common.session_family_source_stamp(), committed)
                 self.assertNotEqual(common.transcript_generation(root), generation)
                 self.assertIsNone(common.indexed_family_roots(("child",)))
                 with mock.patch.object(
@@ -1509,7 +1496,8 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                         {"child": "root"})
                     self.assertTrue(session_context.family_index_behind())
 
-    def test_family_meta_ahead_of_the_signature_reads_as_moving(self) -> None:
+    def test_family_meta_ahead_of_the_signature_has_no_committed_stamp(
+            self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             self._publish_families(root, [{"session": "root"}], "2:gen0")
@@ -1518,11 +1506,6 @@ class CorpusSessionFamilyTests(unittest.TestCase):
                 "2:gen1")
             with _data_dir(root):
                 self.assertIsNone(common.session_family_source_stamp())
-                self.assertEqual(
-                    common.read_family_publication(),
-                    common.FamilyPublication(
-                        "2:gen0", hashlib.sha256(b"2:gen0\n").hexdigest(),
-                        None, True))
 
 
 if __name__ == "__main__":

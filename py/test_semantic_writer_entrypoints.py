@@ -204,6 +204,10 @@ class SemanticWriterEntrypointTests(unittest.TestCase):
                 mock.patch.object(
                     ask, "_quarantine_message_refs_path",
                     side_effect=AssertionError("foreign refs quarantined")),
+                # A live foreign indexer still owns the stores: the query worker
+                # stays fenced along with every Python writer.
+                mock.patch.object(
+                    indexd_runtime, "live_indexer_claim", return_value=True),
             ):
                 refusal = indexd_runtime.derived_writer_mutation_info()
                 self.assertFalse(refusal.writable)
@@ -292,6 +296,47 @@ class SemanticWriterEntrypointTests(unittest.TestCase):
                     semworker.worker_lock_path(),
                 ])
             self.assertEqual(_census(root), before)
+
+    def test_dead_foreign_owner_lets_the_query_worker_serve(self) -> None:
+        # The upgrade window: the previous build's anchor is still on the
+        # stores but no live indexer holds them. The query worker only reads,
+        # so it may start; Python writers still refuse on identity alone.
+        foreign = indexd_runtime.DerivedMutationInfo(
+            "foreign", BUILD_B,
+            f"derived stores owned-by {BUILD_B}; this build is {BUILD_A}")
+        unanchored = indexd_runtime.DerivedMutationInfo(
+            "unavailable", None,
+            "derived-store ownership is not established for this writer")
+        with (
+            mock.patch.object(
+                indexd_runtime, "derived_writer_mutation_info",
+                return_value=foreign),
+            mock.patch.object(
+                indexd_runtime, "live_indexer_claim",
+                return_value=False) as live,
+            mock.patch.dict(
+                os.environ, {"AGREP_DATA_READONLY": ""}, clear=False),
+        ):
+            self.assertIsNone(semworker._query_worker_ownership_refusal_reason())
+            self.assertIsNone(semworker._worker_coordination_refusal_reason())
+            # Signalling another build's worker (removal) stays identity-fenced.
+            self.assertEqual(
+                semworker._ownership_refusal_reason(), foreign.reason)
+            self.assertEqual(semantic.ensure_fresh_async()["state"], "read-only")
+            live.return_value = True
+            self.assertEqual(
+                semworker._query_worker_ownership_refusal_reason(), foreign.reason)
+        with (
+            mock.patch.object(
+                indexd_runtime, "derived_writer_mutation_info",
+                return_value=unanchored),
+            mock.patch.object(
+                indexd_runtime, "live_indexer_claim", return_value=False),
+        ):
+            # A verdict no writer may act on stays closed even with no owner.
+            self.assertEqual(
+                semworker._query_worker_ownership_refusal_reason(),
+                unanchored.reason)
 
     def test_refs_publications_recheck_ownership_after_long_build_and_at_pointer(
             self) -> None:

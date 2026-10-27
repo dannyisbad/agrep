@@ -139,7 +139,8 @@ worker powers meaning search. No hosted service is required.
 
 The index is refreshed on demand. Later searches can reuse a lightweight
 freshness daemon while the previous complete publication remains readable.
-The semantic lane has its own generation and coverage disclosures, so stale or
+The semantic lane has its own generation and coverage disclosures, and every
+meaning hit is re-proved against the current transcript text, so changed or
 mismatched vectors are not served as current evidence.
 
 ## Development

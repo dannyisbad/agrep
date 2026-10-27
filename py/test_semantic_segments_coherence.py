@@ -80,14 +80,8 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
         self._publish(source, total=3)
         race = common.TranscriptPublicationRace(
             "session-family publication precedes its ingest signature")
-        publication = common.FamilyPublication(
-            signature="committed", signature_sha256=source["ingest_signature"],
-            stamp="stable", moving=True)
         with mock.patch.object(
-                common, "transcript_generation", side_effect=race), \
-                mock.patch.object(
-                    common, "read_family_publication",
-                    return_value=publication):
+                common, "transcript_generation", side_effect=race):
             coherence = semantic.embedding_coherence()
 
         self.assertFalse(coherence["coherent"])
@@ -102,7 +96,10 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
         )
         readiness = semantic.query_readiness(coherence)
         self.assertEqual(readiness["state"], "ready")
-        self.assertFalse(readiness["current_generation"])
+        # The committed snapshot answers queries for the current transcript;
+        # whether it binds the newest generation is a separate fact.
+        self.assertTrue(readiness["current_generation"])
+        self.assertFalse(readiness["source_current"])
         self.assertFalse(readiness["complete"])
 
     def test_every_searchable_coherence_state_keeps_the_full_governor(
@@ -113,34 +110,29 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
 
         source = _source("current")
         self._publish(source)
-        seen = {}
+        seen = []
         with mock.patch.object(semantic, "source_generation", return_value=source):
-            seen["current"] = semantic.embedding_coherence()
+            seen.append(("current", semantic.embedding_coherence()))
         self.meta.unlink()
         for path in (self.root / embedding_segments.SEGMENT_DIR).iterdir():
             path.unlink()
         self._publish(source, total=3)
         with mock.patch.object(semantic, "source_generation", return_value=source):
-            seen["partial"] = semantic.embedding_coherence()
-        publication = common.FamilyPublication(
-            signature="committed", signature_sha256=source["ingest_signature"],
-            stamp="stable", moving=True)
+            seen.append(("partial", semantic.embedding_coherence()))
         with mock.patch.object(
                 common, "transcript_generation",
-                side_effect=common.TranscriptPublicationRace("mid-publish")), \
-                mock.patch.object(
-                    common, "read_family_publication",
-                    return_value=publication):
-            seen["published"] = semantic.embedding_coherence()
+                side_effect=common.TranscriptPublicationRace("mid-publish")):
+            seen.append(("published", semantic.embedding_coherence()))
+        # Ingest moved the transcript past the bundle: it keeps serving.
         with mock.patch.object(
                 semantic, "source_generation", return_value=_source("newer")):
-            seen["stale"] = semantic.embedding_coherence()
-        for label, coherence in seen.items():
+            seen.append(("published", semantic.embedding_coherence()))
+        for label, coherence in seen:
             with self.subTest(state=label):
                 self.assertEqual(coherence["state"], label)
-                self.assertEqual(
-                    coherence["state"] in surface.SEMANTIC_SEARCHABLE_STATES,
-                    bool(coherence["searchable"]))
+                self.assertTrue(coherence["searchable"])
+                self.assertIn(
+                    coherence["state"], surface.SEMANTIC_SEARCHABLE_STATES)
         probes = (lambda: 0.9, lambda: (True, 10), lambda: 30.0)
         for state in surface.SEMANTIC_SEARCHABLE_STATES:
             with self.subTest(state=state):
@@ -149,11 +141,30 @@ class SemanticSegmentCoherenceTests(unittest.TestCase):
                     "battery")
         self.assertIsNone(surface.lane_semantic_deferral("stale", *probes))
 
-    def test_v2_stale_corrupt_and_movement_fail_closed(self) -> None:
+    def test_moved_transcript_keeps_v2_searchable_but_corruption_fails_closed(
+            self) -> None:
         source = _source("published")
         self._publish(source)
         with mock.patch.object(semantic, "source_generation", return_value=_source("newer")):
-            self.assertEqual(semantic.embedding_coherence()["state"], "stale")
+            moved = semantic.embedding_coherence()
+        self.assertEqual(moved["state"], "published")
+        self.assertEqual(moved["basis"], "published-generation")
+        self.assertTrue(moved["searchable"])
+        self.assertFalse(moved["coherent"])
+        self.assertFalse(moved["source_current"])
+        # The bundle's own counts stand; the lag marker makes the page partial.
+        self.assertEqual(
+            {key: moved["coverage"][key]
+             for key in ("indexed", "total", "pending", "complete")},
+            {"indexed": 2, "total": 2, "pending": 0, "complete": True})
+        self.assertIs(moved["coverage"]["source_current"], False)
+        # Moving past the bundle never relaxes the profile contract.
+        with mock.patch.object(semantic, "source_generation", return_value=_source("newer")), \
+                mock.patch.object(semantic, "_active_embedding_profile",
+                                  return_value=(2, "other-model")):
+            mismatched = semantic.embedding_coherence()
+        self.assertEqual(mismatched["state"], "profile-mismatch")
+        self.assertFalse(mismatched["searchable"])
 
         first = semantic.output_generation()
         moved = {**first, "generation": "f" * 32}
