@@ -63,16 +63,22 @@ def cli_invocation(
     return (*base, *(str(arg) for arg in args))
 
 
+def package_version_on_disk() -> str:
+    """The version the files on disk declare now. A long-running process's imported
+    `agrep.__version__` stops tracking it once its install is replaced in place."""
+    init = REPO_ROOT / ("agrep/__init__.py" if _is_dev_checkout() else "__init__.py")
+    try:
+        raw = init.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return "dev"
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)', raw)
+    return match.group(1) if match else "dev"
+
+
 def package_version() -> str:
     """The Python package/release version without importing the CLI tree."""
     if _is_dev_checkout():
-        try:
-            raw = (REPO_ROOT / "agrep" / "__init__.py").read_text(
-                encoding="utf-8")
-            match = re.search(r'__version__\s*=\s*["\']([^"\']+)', raw)
-            return match.group(1) if match else "dev"
-        except Exception:  # noqa: BLE001 -- an unreadable checkout is not installed
-            return "dev"
+        return package_version_on_disk()
     try:
         from agrep import __version__  # noqa: PLC0415
         return str(__version__)

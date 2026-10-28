@@ -144,7 +144,7 @@ def _superseded_in_place(rec: dict) -> bool:
     """Whether this build's script now sits where an older build's live worker
     was launched from. No client of that build can start one there again, so an
     idle retirement cannot start a ping-pong; a stale process of this build can't
-    claim it, because its own files no longer hash to its build id."""
+    claim it, because its files on disk, version included, no longer hash to its id."""
     if str(rec.get("build_id") or "") == WORKER_BUILD_ID:
         return False
     try:
@@ -167,7 +167,8 @@ def _superseded_in_place(rec: dict) -> bool:
             return False
     except (OSError, RuntimeError, ValueError):
         return False
-    return _compute_build_id() == WORKER_BUILD_ID
+    import dist
+    return _compute_build_id(dist.package_version_on_disk()) == WORKER_BUILD_ID
 
 
 def _worker_lock_coordination_refusal_reason() -> str | None:
@@ -188,7 +189,7 @@ def _semantic_timing_enabled() -> bool:
     return common.DEBUG or value.lower() not in ("", "0", "false", "no", "off")
 
 
-def _compute_build_id() -> str:
+def _compute_build_id(version: str | None = None) -> str:
     """Behavior identity that changes across in-place installs/dev edits.
 
     A package version alone is insufficient during development and editable-wheel
@@ -216,7 +217,7 @@ def _compute_build_id() -> str:
         except OSError:
             digest.update(b"<missing>")
     # The detached script starts with py/ on sys.path, while its client starts at repo root.
-    digest.update(common.package_version().encode())
+    digest.update((common.package_version() if version is None else version).encode())
     return digest.hexdigest()[:24]
 
 
@@ -1728,7 +1729,7 @@ def foreign_live_worker_reason() -> str | None:
             or not inspected.bound_owner
             or inspected.record is None):
         return None
-    if _foreign_worker_signal_refusal_reason(inspected.record) is None:
+    if _foreign_worker_signal_refusal_reason() is None:
         return None
     return (f"another agrep build's semantic worker (pid "
             f"{inspected.record.get('pid')}) holds the model until it idles out")

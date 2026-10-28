@@ -392,6 +392,7 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 return_value=own_build_id or semworker.WORKER_BUILD_ID),
         )
 
+    @unittest.skipIf(os.name == "nt", "Windows never reads another process's argv")
     def test_a_worker_this_build_replaced_in_place_is_retired_while_no_query_runs(
             self) -> None:
         # After an in-place upgrade the old build can never relaunch from its own
@@ -417,7 +418,6 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 semworker, "_terminate_worker_tree",
                 side_effect=lambda *_a: events.append("terminate") or True))
             stack.enter_context(mock.patch.object(semworker, "_discard_record"))
-            self.assertIsNone(semworker.foreign_live_worker_reason())
             self.assertIsNone(semworker._reconcile_descriptor())
         self.assertEqual(events, ["slot", "stop", "terminate", "release"])
 
@@ -450,23 +450,60 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 terminate.assert_not_called()
                 discard.assert_not_called()
 
-    def test_a_superseded_worker_mid_query_is_not_stopped(self) -> None:
+    def test_a_superseded_worker_that_cannot_be_retired_still_fails_fast(
+            self) -> None:
+        # Mid-query (slot busy) or with the old build's indexer still live, the
+        # worker keeps the model: the search must say so at once, not wait out
+        # a local fallback that cannot get the lease.
+        here = str(Path(semworker.__file__).resolve())
+        blockers = {
+            "a query of that build is running": (
+                "_acquire_request_slot",
+                semworker.ResidentSemanticPreflightTimeout(
+                    "semantic request expired while queued")),
+            "that build's indexer is live": None,
+        }
+        for label, blocker in blockers.items():
+            with self.subTest(label):
+                rec, patches = self._superseded_case(
+                    ["/venv/bin/python", here, "--serve"])
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    if blocker is None:
+                        stack.enter_context(mock.patch.object(
+                            semworker.indexd_runtime, "live_indexer_claim",
+                            return_value=True))
+                    else:
+                        stack.enter_context(mock.patch.object(
+                            semworker, blocker[0], side_effect=blocker[1]))
+                    stop = stack.enter_context(
+                        mock.patch.object(semworker, "_request_worker_stop"))
+                    terminate = stack.enter_context(
+                        mock.patch.object(semworker, "_terminate_worker_tree"))
+                    self.assertIsNone(semworker._reconcile_descriptor())
+                    self.assertIn("holds the model",
+                                  semworker.foreign_live_worker_reason() or "")
+                stop.assert_not_called()
+                terminate.assert_not_called()
+
+    def test_a_process_older_than_the_files_on_disk_never_claims_the_exemption(
+            self) -> None:
+        # A release can leave every hashed module unchanged and bump only the
+        # version: the stale process must still see that its install moved on.
+        import dist
         here = str(Path(semworker.__file__).resolve())
         rec, patches = self._superseded_case(["/venv/bin/python", here, "--serve"])
-        with contextlib.ExitStack() as stack:
-            for patch in patches:
-                stack.enter_context(patch)
-            stack.enter_context(mock.patch.object(
-                semworker, "_acquire_request_slot",
-                side_effect=semworker.ResidentSemanticPreflightTimeout(
-                    "semantic request expired while queued")))
-            stop = stack.enter_context(
-                mock.patch.object(semworker, "_request_worker_stop"))
-            terminate = stack.enter_context(
-                mock.patch.object(semworker, "_terminate_worker_tree"))
-            self.assertIsNone(semworker._reconcile_descriptor())
-        stop.assert_not_called()
-        terminate.assert_not_called()
+        real_build_id = semworker._compute_build_id
+        for on_disk, expected in ((dist.package_version(), True), ("99.0.0", False)):
+            with self.subTest(on_disk=on_disk), contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    semworker, "_compute_build_id", side_effect=real_build_id))
+                stack.enter_context(mock.patch.object(
+                    dist, "package_version_on_disk", return_value=on_disk))
+                self.assertIs(semworker._superseded_in_place(rec), expected)
 
     @unittest.skipUnless(
         sys.platform == "darwin" or sys.platform.startswith("linux"),
@@ -478,9 +515,15 @@ class SemanticWorkerContentionTests(unittest.TestCase):
             stdin=subprocess.DEVNULL)
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
+        expected = ["-c", "import time; time.sleep(30)", "--serve"]
+        deadline = time.monotonic() + 5.0
         argv = procscan.process_argv(child.pid)
+        # Right after spawn the child may not have exec'd yet.
+        while (argv is None or argv[1:] != expected) and time.monotonic() < deadline:
+            time.sleep(0.01)
+            argv = procscan.process_argv(child.pid)
         self.assertIsNotNone(argv)
-        self.assertEqual(argv[1:], ["-c", "import time; time.sleep(30)", "--serve"])
+        self.assertEqual(argv[1:], expected)
         self.assertIsNone(procscan.process_argv(0x7FFFFFFF))
 
     def test_foreign_writer_owner_can_reclaim_request_coordination(self) -> None:
