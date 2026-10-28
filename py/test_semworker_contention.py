@@ -360,6 +360,129 @@ class SemanticWorkerContentionTests(unittest.TestCase):
                 terminate.assert_not_called()
                 discard.assert_not_called()
 
+    def _superseded_case(self, argv: list[str] | None, *, own_build_id=None):
+        """A dead foreign owner and its live incompatible worker, observed with
+        `argv` as that worker's command line."""
+        foreign = semworker.indexd_runtime.DerivedMutationInfo(
+            "foreign", "a" * 20,
+            "derived stores owned-by aaaaaaaaaaaaaaaaaaaa; this build is bbbb")
+        rec = self._record()
+        rec["build_id"] = "owning-build"
+        observation = semworker._DescriptorObservation(
+            semworker._DescriptorState.INCOMPATIBLE, rec,
+            self._snapshot("descriptor"), True)
+        from hookless import procscan
+        return rec, (
+            self._clear_worker_env(),
+            mock.patch.object(
+                semworker.indexd_runtime, "derived_writer_mutation_info",
+                return_value=foreign),
+            mock.patch.object(
+                semworker.indexd_runtime, "live_indexer_claim", return_value=False),
+            mock.patch.object(
+                semworker, "_protective_refusal_reason", return_value=None),
+            mock.patch.object(
+                semworker, "_inspect_descriptor", return_value=observation),
+            mock.patch.object(
+                semworker, "_process_owner",
+                return_value=ownerfile.ProcessOwner.EXACT_LIVE),
+            mock.patch.object(procscan, "process_argv", return_value=argv),
+            mock.patch.object(
+                semworker, "_compute_build_id",
+                return_value=own_build_id or semworker.WORKER_BUILD_ID),
+        )
+
+    def test_a_worker_this_build_replaced_in_place_is_retired_while_no_query_runs(
+            self) -> None:
+        # After an in-place upgrade the old build can never relaunch from its own
+        # path, so its idle worker must not hold meaning search hostage until it
+        # idles out. Its own queries share the request slot held across the stop.
+        here = str(Path(semworker.__file__).resolve())
+        rec, patches = self._superseded_case(["/venv/bin/python", here, "--serve"])
+        events: list[str] = []
+        slot = mock.Mock()
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(
+                semworker, "_acquire_request_slot",
+                side_effect=lambda *_: events.append("slot") or slot))
+            stack.enter_context(mock.patch.object(
+                semworker, "_release_request_slot",
+                side_effect=lambda held: events.append("release")))
+            stack.enter_context(mock.patch.object(
+                semworker, "_request_worker_stop",
+                side_effect=lambda *_a, **_k: events.append("stop") or True))
+            stack.enter_context(mock.patch.object(
+                semworker, "_terminate_worker_tree",
+                side_effect=lambda *_a: events.append("terminate") or True))
+            stack.enter_context(mock.patch.object(semworker, "_discard_record"))
+            self.assertIsNone(semworker.foreign_live_worker_reason())
+            self.assertIsNone(semworker._reconcile_descriptor())
+        self.assertEqual(events, ["slot", "stop", "terminate", "release"])
+
+    def test_a_live_worker_of_another_install_or_a_newer_build_is_left_alone(
+            self) -> None:
+        here = str(Path(semworker.__file__).resolve())
+        cases = {
+            "another install": (["/other/bin/python", "/other/py/semworker.py",
+                                 "--serve"], None),
+            "unreadable argv": (None, None),
+            "this process is stale": (["/venv/bin/python", here, "--serve"],
+                                      "newer-build-on-disk"),
+        }
+        for label, (argv, on_disk) in cases.items():
+            with self.subTest(label):
+                rec, patches = self._superseded_case(argv, own_build_id=on_disk)
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    stop = stack.enter_context(
+                        mock.patch.object(semworker, "_request_worker_stop"))
+                    terminate = stack.enter_context(
+                        mock.patch.object(semworker, "_terminate_worker_tree"))
+                    discard = stack.enter_context(
+                        mock.patch.object(semworker, "_discard_record"))
+                    self.assertIn("holds the model",
+                                  semworker.foreign_live_worker_reason() or "")
+                    self.assertIsNone(semworker._reconcile_descriptor())
+                stop.assert_not_called()
+                terminate.assert_not_called()
+                discard.assert_not_called()
+
+    def test_a_superseded_worker_mid_query_is_not_stopped(self) -> None:
+        here = str(Path(semworker.__file__).resolve())
+        rec, patches = self._superseded_case(["/venv/bin/python", here, "--serve"])
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(
+                semworker, "_acquire_request_slot",
+                side_effect=semworker.ResidentSemanticPreflightTimeout(
+                    "semantic request expired while queued")))
+            stop = stack.enter_context(
+                mock.patch.object(semworker, "_request_worker_stop"))
+            terminate = stack.enter_context(
+                mock.patch.object(semworker, "_terminate_worker_tree"))
+            self.assertIsNone(semworker._reconcile_descriptor())
+        stop.assert_not_called()
+        terminate.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "argv of another process is read only on macOS and Linux")
+    def test_process_argv_reads_a_live_child_exactly(self) -> None:
+        from hookless import procscan
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", "--serve"],
+            stdin=subprocess.DEVNULL)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        argv = procscan.process_argv(child.pid)
+        self.assertIsNotNone(argv)
+        self.assertEqual(argv[1:], ["-c", "import time; time.sleep(30)", "--serve"])
+        self.assertIsNone(procscan.process_argv(0x7FFFFFFF))
+
     def test_foreign_writer_owner_can_reclaim_request_coordination(self) -> None:
         path = semworker.request_lock_path()
         path.write_bytes(b"stale malformed owner")

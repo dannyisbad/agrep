@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.9 — 2026-10-27
+
+### Meaning search
+
+- Upgrading no longer turns meaning search off for minutes. The previous
+  build's semantic worker kept the model until its idle exit (up to ten
+  minutes), and the new build refused to stop it until its own index takeover
+  landed, so every agent search printed "meaning unavailable; keyword-only
+  (another agrep build's semantic worker ... holds the model until it idles
+  out)". When the new build has replaced that worker's own files in place, it
+  now stops the worker while none of its searches is running and starts its
+  own, so the first search after an upgrade answers with meaning results. A
+  worker launched from a different install is still left alone, and so is
+  any worker when the reader is itself an outdated process. Windows keeps the
+  previous behavior: there the worker's command line is not read.
+
 ## 0.4.8 — 2026-10-27
 
 ### Meaning search

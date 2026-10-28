@@ -127,10 +127,47 @@ def _worker_coordination_refusal_reason() -> str | None:
     return _protective_refusal_reason() or _query_worker_ownership_refusal_reason()
 
 
-def _foreign_worker_signal_refusal_reason() -> str | None:
+def _foreign_worker_signal_refusal_reason(rec: dict | None = None) -> str | None:
     """Stopping or retiring another build's live worker needs real ownership:
-    before a takeover lands, that worker still serves the owning build."""
-    return _protective_refusal_reason() or _ownership_refusal_reason()
+    before a takeover lands, that worker still serves the owning build - unless
+    this build replaced that worker's own script in place, so nothing relaunches it."""
+    protective = _protective_refusal_reason()
+    if protective is not None:
+        return protective
+    reason = _ownership_refusal_reason()
+    if reason is not None and rec is not None and _superseded_in_place(rec):
+        return None
+    return reason
+
+
+def _superseded_in_place(rec: dict) -> bool:
+    """Whether this build's script now sits where an older build's live worker
+    was launched from. No client of that build can start one there again, so an
+    idle retirement cannot start a ping-pong; a stale process of this build can't
+    claim it, because its own files no longer hash to its build id."""
+    if str(rec.get("build_id") or "") == WORKER_BUILD_ID:
+        return False
+    try:
+        pid = int(rec["pid"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    start = str(rec.get("process_start") or "")
+    if pid <= 0 or pid == os.getpid() or start in _UNVERIFIABLE_STARTS:
+        return False
+    if _process_owner(pid, start) is not ownerfile.ProcessOwner.EXACT_LIVE:
+        return False
+    from hookless import procscan
+    argv = procscan.process_argv(pid)
+    if (not argv or len(argv) < 3 or "--serve" not in argv[2:]
+            or _process_owner(pid, start) is not ownerfile.ProcessOwner.EXACT_LIVE):
+        return False
+    try:
+        here = Path(__file__).resolve()
+        if Path(argv[1]).resolve() != here:
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return _compute_build_id() == WORKER_BUILD_ID
 
 
 def _worker_lock_coordination_refusal_reason() -> str | None:
@@ -1545,7 +1582,7 @@ def _retire_incompatible(
         rec: dict, observed: ownerfile.Snapshot, *, bound_owner: bool,
         deadline: float | None = None) -> None:
     """Retire the exact old semantic process without a 4s failed-start detour."""
-    if _foreign_worker_signal_refusal_reason() is not None:
+    if _foreign_worker_signal_refusal_reason(rec) is not None:
         return
     pid = int(rec["pid"])
     expected_start = str(rec.get("process_start") or "")
@@ -1691,7 +1728,7 @@ def foreign_live_worker_reason() -> str | None:
             or not inspected.bound_owner
             or inspected.record is None):
         return None
-    if _foreign_worker_signal_refusal_reason() is None:
+    if _foreign_worker_signal_refusal_reason(inspected.record) is None:
         return None
     return (f"another agrep build's semantic worker (pid "
             f"{inspected.record.get('pid')}) holds the model until it idles out")
@@ -1711,19 +1748,35 @@ def _reconcile_descriptor(
         return None
     if inspected.state in (_DescriptorState.LEGACY, _DescriptorState.INCOMPATIBLE):
         if (rec is None or observed is None
-                or _foreign_worker_signal_refusal_reason() is not None):
+                or _foreign_worker_signal_refusal_reason(rec) is not None):
             return None
-        if inspected.state is _DescriptorState.LEGACY:
-            remaining = (
-                0.5 if deadline is None
-                else max(0.0, min(0.5, deadline - time.monotonic())))
-            if remaining > 0:
-                _request_worker_stop(rec, timeout_s=remaining)
-            _discard_record(descriptor_path(), observed)
-        else:
-            _retire_incompatible(
-                rec, observed, bound_owner=inspected.bound_owner,
-                deadline=deadline)
+        slot = None
+        if _ownership_refusal_reason() is not None:
+            # Retiring a superseded build's worker: hold the shared request slot so
+            # none of that build's queries is in flight when the worker stops.
+            try:
+                slot = _acquire_request_slot(min(
+                    time.monotonic() + 0.5,
+                    deadline if deadline is not None else math.inf))
+            except ResidentSemanticUnavailable:
+                return None
+            if slot is None:
+                return None
+        try:
+            if inspected.state is _DescriptorState.LEGACY:
+                remaining = (
+                    0.5 if deadline is None
+                    else max(0.0, min(0.5, deadline - time.monotonic())))
+                if remaining > 0:
+                    _request_worker_stop(rec, timeout_s=remaining)
+                _discard_record(descriptor_path(), observed)
+            else:
+                _retire_incompatible(
+                    rec, observed, bound_owner=inspected.bound_owner,
+                    deadline=deadline)
+        finally:
+            if slot is not None:
+                _release_request_slot(slot)
     elif (inspected.state in (
             _DescriptorState.MALFORMED_STALE,
             _DescriptorState.RECLAIMABLE,

@@ -289,6 +289,23 @@ def _mac_procargs(pid: int) -> list[str]:
     return argv
 
 
+def process_argv(pid: int) -> list[str] | None:
+    """One live process's argv, or None where this platform or process hides it."""
+    try:
+        if LINUX:
+            with open(f"/proc/{int(pid)}/cmdline", "rb") as stream:
+                raw = stream.read()
+            argv = [part.decode("utf-8", "replace")
+                    for part in raw.rstrip(b"\0").split(b"\0")] if raw else []
+        elif MAC:
+            argv = _mac_procargs(int(pid))
+        else:
+            return None
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        return None
+    return argv or None
+
+
 def _mac_cwd(libproc, pid: int) -> str:
     import ctypes
 

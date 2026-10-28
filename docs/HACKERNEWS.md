@@ -36,16 +36,16 @@ I would especially like feedback on which agent store should be supported next,
 what evidence people need before trusting a local cross-agent index, and where
 the search workflow breaks down.
 
-**Release:** https://github.com/dannyisbad/agrep/releases/tag/v0.4.8
-**Install:** https://pypi.org/project/agrep/0.4.8/
+**Release:** https://github.com/dannyisbad/agrep/releases/tag/v0.4.9
+**Install:** https://pypi.org/project/agrep/0.4.9/
 **Source:** https://github.com/dannyisbad/agrep
 
 ## Launch checklist
 
-- [ ] `v0.4.8` tag and GitHub release are published and non-draft.
-- [ ] PyPI `agrep==0.4.8` is installable from a clean environment.
-- [ ] npm `@mundy/agrep@0.4.8` is published through trusted publishing.
-- [ ] `python bench/release_identity.py --tag v0.4.8` passes.
+- [ ] `v0.4.9` tag and GitHub release are published and non-draft.
+- [ ] PyPI `agrep==0.4.9` is installable from a clean environment.
+- [ ] npm `@mundy/agrep@0.4.9` is published through trusted publishing.
+- [ ] `python bench/release_identity.py --tag v0.4.9` passes.
 - [ ] `python bench/validate_repo_privacy.py --index --all-refs` passes.
 - [ ] `python bench/perf.py --check` passes, including first-hit streaming.
 - [ ] Semantic scale is either green or its platform limitation is stated.
