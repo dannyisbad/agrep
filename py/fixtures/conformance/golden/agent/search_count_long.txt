@@ -1,5 +1,0 @@
-exit: 0
---- stdout ---
-12
---- stderr ---
-excluded 1 hit from the current window

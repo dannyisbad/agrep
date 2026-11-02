@@ -1,5 +1,0 @@
-exit: 1
---- stdout ---
---- stderr ---
-0 open items across 4 chats in the last 30d, most confident first
-excluded 1 chat from the current window

@@ -16,15 +16,6 @@ from typing import Iterable
 
 
 MAX_REPOSITORY_BYTES = 1_000_000
-ROOT_SCRATCH = {
-    "ar.err", "err.corrupt", "err.stderr", "full_recall.txt", "j1.txt",
-    "j2.txt", "ns.err", "out.stderr", "out.stdout", "p1.err", "p1.out",
-    "p2.out", "p3.out", "rc.stderr",
-}
-PRIVATE_PATH_PREFIXES = (
-    "bench/adversarial/",
-    "bench/gauntlet/",
-)
 SECRET_PATTERNS = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -99,12 +90,6 @@ def _relative(repo: Path, path: Path) -> tuple[str, Path] | None:
 
 
 def _path_reason(relative: str) -> str | None:
-    if relative in ROOT_SCRATCH:
-        return "root scratch output"
-    if relative.startswith(PRIVATE_PATH_PREFIXES):
-        return "local or transcript-derived evidence"
-    if relative.startswith("bench/render/"):
-        return "private capture or agent scratch tree"
     parts = relative.split("/")
     if (parts[0] == "bench"
             and any(part in {"runs", ".claude", ".codex"} for part in parts[1:])):

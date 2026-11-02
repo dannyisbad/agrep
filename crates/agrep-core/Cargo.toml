@@ -4,11 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+
 [dependencies]
+candle-core = { version = "=0.9.2", default-features = false }
+candle-nn = { version = "=0.9.2", default-features = false }
+candle-transformers = { version = "=0.9.2", default-features = false }
+tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls-rustcrypto = "=0.0.2-alpha"
+memmap2 = "0.9"
+half = "2"
+
+fs2 = "0.4"
+tempfile = "3"
+fancy-regex = "0.14"
+regex = "1"
+regex-syntax = "0.8"
+globset = "0.4"
+lz4_flex = "0.11"
+blake2b_simd = "1"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 memchr = { workspace = true }
-bincode = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 chrono = { workspace = true }
@@ -18,28 +38,32 @@ unicode-segmentation = { workspace = true }
 flate2 = { workspace = true }
 # bundled => compiles SQLite from C source (needs cl.exe under the MSVC toolchain on Windows).
 # Used by the opencode sqlite adapter (per-build chat stores live in *.db files).
-# hooks => the progress handler that ends an event write whose busy wait gave up.
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "functions", "backup"] }
 # kimi-cli keys its per-workdir session dirs by md5(workdir path); ~/.kimi/kimi.json holds
 # the real paths, so we hash each registered path to find its sessions dir.
 md5 = "0.7"
-
-[features]
-# Enabled only by agrep-ingest's dev-dependency, so shipped `cargo build` binaries never carry it;
-# AGREP_TEST_PARSE_PANIC then names the one source whose parse panics (see intake::keyed).
-parse-panic-injection = []
-# Same contract: AGREP_TEST_OWNER_VANISH then makes the derived writer's owner fence observe
-# records vanishing between its scan and its read (see fault_injection).
-owner-vanish-injection = []
+getrandom = "0.2"
+crossterm = "0.28"
 
 [target.'cfg(unix)'.dependencies]
 # Hardened opens need the per-architecture O_* values, and SQLite snapshots probe a writer's
 # lock on the live database; the linear-time proofs time their own thread's CPU.
 libc = "0.2"
+signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Globalization",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Kernel",
+    "Wdk_System_Threading",
     "Win32_Security_Cryptography",
     "Win32_Storage_Compression",
     "Win32_Storage_FileSystem",
@@ -47,3 +71,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Ioctl",
     "Win32_System_SystemServices",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "=0.9.2", default-features = false, features = ["metal", "accelerate"] }
+candle-nn = { version = "=0.9.2", default-features = false, features = ["metal", "accelerate"] }
+candle-transformers = { version = "=0.9.2", default-features = false, features = ["metal", "accelerate"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -32,7 +32,7 @@ use crate::ingest::registry::{metadata_is_link, path_eq, relative_path};
 use crate::ingest::{
     cap_event_output, cap_str, is_wrapper, project_name, summarize_tool_input_with_chars, EVENT_CAP,
 };
-use crate::ingest_cache::ReadOutcome;
+use crate::intake_batch::ReadOutcome;
 use crate::model::{Event, Message};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -175,7 +175,7 @@ fn contains_path(paths: &[std::path::PathBuf], wanted: &Path) -> bool {
 /// True for opencode-injected "text" parts that are NOT something the user typed:
 /// tool-call narration, tool results, and file-attachment payloads. These appear
 /// as `type:"text"` parts inside user messages alongside the real typed prompt.
-fn is_injected_part(text: &str) -> bool {
+pub(crate) fn is_injected_part(text: &str) -> bool {
     let t = text.trim_start();
     // File-attachment payload: <path>...</path><type>file</type><content>...
     t.starts_with("<path>")
@@ -359,11 +359,11 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
         Ok(c) => c,
         Err(e) => {
             // the file exists (callers filter on that), so a failed open is real news
-            eprintln!(
+            crate::intake::diagnostic(format_args!(
                 "  ! opencode: cannot open {}: {}",
                 crate::ingest::terminal_safe(path.display()),
                 crate::ingest::terminal_safe(&e)
-            );
+            ));
             tally.error(&format!("cannot open: {e}"));
             crate::ingest::note_read_failure(path, e.to_string());
             // A database that moved under its snapshot is read again by the next pass; a lock or
@@ -737,7 +737,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
 /// Cache-driven like claude/codex: a DB whose (mtime, size) hasn't moved is served from the
 /// parse cache instead of a full table scan. The cache stamp includes the committed WAL,
 /// so a WAL-only commit cannot be mistaken for a main-file cache hit.
-pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
     let dirs = data_dirs_at(&crate::ingest::home());
     let explicit = explicit_db_at(&dirs[0]);
     let mut messages = Vec::new();
@@ -760,7 +760,7 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
             }
         }
         let pass =
-            crate::ingest_cache::collect_cached_for(cache, "opencode", &dir, &files, collect_db);
+            crate::intake_batch::collect_cached_for(cache, "opencode", &dir, &files, collect_db);
         messages.extend(pass.messages);
         events.extend(pass.events);
     }
@@ -771,7 +771,7 @@ pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, V
             &[]
         };
         let pass =
-            crate::ingest_cache::collect_cached_for(cache, "opencode", &path, files, collect_db);
+            crate::intake_batch::collect_cached_for(cache, "opencode", &path, files, collect_db);
         messages.extend(pass.messages);
         events.extend(pass.events);
     }
@@ -787,7 +787,7 @@ impl crate::ingest::registry::Adapter for Opencode {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Stat
     }
-    fn collect(&self, cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+    fn collect(&self, cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
         collect(cache)
     }
     fn may_read_partially(&self) -> bool {
@@ -806,489 +806,12 @@ impl crate::ingest::registry::Adapter for Opencode {
             || explicit_db_at(&data_dirs_at(&crate::ingest::home())[0])
                 .is_some_and(|explicit| path_eq(&explicit, path))
     }
+    fn archive_content(&self, path: &std::path::Path) -> bool {
+        self.store_content(path)
+            || (path.extension().is_some_and(|e| e == "json")
+                && path.components().any(|p| p.as_os_str() == "storage"))
+    }
     fn freshness_content(&self, path: &std::path::Path) -> bool {
         self.store_content(path)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(windows)]
-    use super::contains_path;
-    use super::{collect_db, data_dirs_for, databases_in, explicit_db_from, ReadOutcome};
-    use crate::ingest_cache::{collect_cached_for, IngestCache};
-
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "agrep-opencode-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn platform_data_roots_are_native_first_with_legacy_fallback() {
-        let home = std::path::Path::new("/home/tester");
-        let xdg = std::ffi::OsStr::new("/var/data");
-        assert_eq!(
-            data_dirs_for(home, Some(xdg), None, false, false),
-            [
-                std::path::PathBuf::from("/var/data/opencode"),
-                home.join(".local/share/opencode"),
-            ]
-        );
-        assert_eq!(
-            data_dirs_for(
-                home,
-                None,
-                Some(std::ffi::OsStr::new("C:/Local")),
-                false,
-                true,
-            )[0],
-            std::path::PathBuf::from("C:/Local").join("opencode")
-        );
-        assert_eq!(
-            data_dirs_for(home, Some(xdg), None, true, false),
-            [home.join(".local/share/opencode")]
-        );
-    }
-
-    #[test]
-    fn explicit_override_is_absolute_or_one_filename() {
-        let root = std::path::Path::new("/data/opencode");
-        assert_eq!(
-            explicit_db_from(std::ffi::OsStr::new("nightly.db"), root),
-            Some(root.join("nightly.db"))
-        );
-        assert!(explicit_db_from(std::ffi::OsStr::new("nested/nightly.db"), root).is_none());
-        assert!(explicit_db_from(std::ffi::OsStr::new("nested\\nightly.db"), root).is_none());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn explicit_override_case_variant_is_not_discovered_twice() {
-        let files = vec![std::path::PathBuf::from(
-            r"C:\Users\tester\AppData\Local\opencode\opencode.db",
-        )];
-        assert!(contains_path(
-            &files,
-            std::path::Path::new(r"c:\users\tester\appdata\local\OpenCode\OpenCode.DB")
-        ));
-    }
-
-    #[test]
-    fn discovers_channel_databases_but_not_backups_or_symlinks() {
-        let dir = temp_dir("channels");
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["opencode.db", "opencode-nightly.db", "OpenCode-Beta.DB"] {
-            std::fs::write(dir.join(name), b"db").unwrap();
-        }
-        for name in ["opencode.bak.db", "opencode.corrupted.db", "unrelated.db"] {
-            std::fs::write(dir.join(name), b"skip").unwrap();
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.join("opencode.db"), dir.join("opencode-link.db")).unwrap();
-        let names: Vec<_> = databases_in(&dir)
-            .into_iter()
-            .map(|path| path.file_name().unwrap().to_owned())
-            .collect();
-        assert_eq!(names.len(), 3);
-        assert!(names.contains(&std::ffi::OsString::from("opencode-nightly.db")));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn dropped_leading_turns_do_not_leak_replies_across_sessions() {
-        let dir = temp_dir("xsession");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            // Session sb's only user message is injected tool narration (dropped), so
-            // its assistant reply has no user turn of its own to attach to.
-            conn.execute_batch(
-                "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, title TEXT, time_created INTEGER);
-                 CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                 INSERT INTO session VALUES ('sa', '/work/alpha', NULL, NULL, 1000);
-                 INSERT INTO session VALUES ('sb', '/work/beta', NULL, NULL, 2000);
-                 INSERT INTO message VALUES ('m1', 'sa', '{\"role\":\"user\"}', 1000);
-                 INSERT INTO message VALUES ('m2', 'sa', '{\"role\":\"assistant\"}', 1001);
-                 INSERT INTO message VALUES ('m3', 'sb', '{\"role\":\"user\"}', 2000);
-                 INSERT INTO message VALUES ('m4', 'sb', '{\"role\":\"assistant\",\"modelID\":\"leaked-model\"}', 2001);
-                 INSERT INTO part VALUES ('p1', 'm1', 'sa', '{\"type\":\"text\",\"text\":\"session a question\"}', 1000);
-                 INSERT INTO part VALUES ('p2', 'm2', 'sa', '{\"type\":\"text\",\"text\":\"session a answer\"}', 1001);
-                 INSERT INTO part VALUES ('p3', 'm3', 'sb', '{\"type\":\"text\",\"text\":\"Called the read tool with the following input: {}\"}', 2000);
-                 INSERT INTO part VALUES ('p4', 'm4', 'sb', '{\"type\":\"text\",\"text\":\"SESSION B LEAKED REPLY\"}', 2001);",
-            )
-            .unwrap();
-        }
-        let (messages, _, outcome) = collect_db(&path);
-        let healthy = outcome == ReadOutcome::Complete;
-        assert!(healthy);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].text, "session a question");
-        assert_eq!(&*messages[0].reply, "session a answer");
-        assert_eq!(&*messages[0].model, "");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn embedded_nul_tool_output_survives_ingest_and_cache_discloses_source_units() {
-        let dir = temp_dir("nul-output");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        let short_output = "abc\0déf".to_string();
-        let long_output = format!("head\0{}", "é🙂".repeat(super::EVENT_CAP));
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, title TEXT, time_created INTEGER);
-                 CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                 INSERT INTO session VALUES ('s1', '/work/alpha', NULL, NULL, 1000);
-                 INSERT INTO message VALUES ('m1', 's1', '{\"role\":\"assistant\"}', 1000);",
-            )
-            .unwrap();
-            for (id, call_id, output, timestamp) in [
-                ("p1", "call-short", &short_output, 1000_i64),
-                ("p2", "call-long", &long_output, 1001_i64),
-            ] {
-                let data = serde_json::json!({
-                    "type": "tool",
-                    "tool": "shell",
-                    "callID": call_id,
-                    "state": {
-                        "status": "completed",
-                        "input": {},
-                        "output": output,
-                    },
-                })
-                .to_string();
-                conn.execute(
-                    "INSERT INTO part VALUES (?1, 'm1', 's1', ?2, ?3)",
-                    rusqlite::params![id, data, timestamp],
-                )
-                .unwrap();
-            }
-        }
-
-        let (_, events, outcome) = collect_db(&path);
-        let healthy = outcome == ReadOutcome::Complete;
-        assert!(healthy);
-        assert_eq!(events.len(), 2);
-        let short = events
-            .iter()
-            .find(|event| event.call_id == "call-short")
-            .unwrap();
-        assert_eq!(short.output, short_output);
-        assert_eq!(short.output_chars, short_output.chars().count());
-        assert_eq!(short.output_bytes, short_output.len());
-        let long = events
-            .iter()
-            .find(|event| event.call_id == "call-long")
-            .unwrap();
-        assert_eq!(long.output, super::cap_str(&long_output, super::EVENT_CAP));
-        assert_eq!(long.output_chars, long_output.chars().count());
-        assert_eq!(long.output_bytes, long_output.len());
-
-        let event_dir = dir.join("events");
-        let event_name = crate::cache::event_fname("opencode", "s1");
-        let keep = std::collections::HashSet::from([event_name.clone()]);
-        crate::cache::write_events(
-            &events,
-            &event_dir,
-            &keep,
-            &["opencode"],
-            true,
-            &std::collections::HashSet::new(),
-        )
-        .unwrap();
-        let event_store =
-            rusqlite::Connection::open(event_dir.join(crate::cache::EVENT_STORE_NAME)).unwrap();
-        let payload: Vec<u8> = event_store
-            .query_row(
-                "SELECT payload FROM event_sessions WHERE name=?1",
-                [&event_name],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let rows: Vec<serde_json::Value> = std::str::from_utf8(&payload)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let short = rows
-            .iter()
-            .find(|row| row["call_id"] == "call-short")
-            .unwrap();
-        assert_eq!(short["output"], short_output);
-        assert_eq!(short["output_chars"], short_output.chars().count());
-        assert_eq!(short["output_bytes"], short_output.len());
-        assert!(short.get("output_truncated").is_none());
-        let long = rows
-            .iter()
-            .find(|row| row["call_id"] == "call-long")
-            .unwrap();
-        assert_eq!(
-            long["output"],
-            super::cap_str(&long_output, super::EVENT_CAP)
-        );
-        assert_eq!(long["output_chars"], long_output.chars().count());
-        assert_eq!(long["output_bytes"], long_output.len());
-        assert_eq!(long["output_truncated"], true);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn malformed_matching_part_does_not_abort_later_rows() {
-        let dir = temp_dir("malformed-row");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, title TEXT, time_created INTEGER);
-                   CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                   CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                   INSERT INTO session VALUES ('s1', '/work/alpha', NULL, NULL, 1000);
-                   INSERT INTO message VALUES ('m1', 's1', '{"role":"user"}', 1000);
-                   INSERT INTO message VALUES ('m2', 's1', '{"role":"user"}', 2000);
-                   INSERT INTO message VALUES ('m3', 's1', '{"role":"user"}', 3000);
-                   INSERT INTO part VALUES ('p1', 'm1', 's1', '{"type":"text","text":"valid before"}', 1000);
-                   INSERT INTO part VALUES ('p2', 'm2', 's1', '{"type":"text","text":"broken"', 2000);
-                   INSERT INTO part VALUES ('p3', 'm3', 's1', '{"type":"text","text":"valid after"}', 3000);"#,
-            )
-            .unwrap();
-        }
-
-        let (messages, events, outcome) = collect_db(&path);
-        assert_eq!(
-            outcome,
-            ReadOutcome::Partial,
-            "malformed part JSON must yield Partial, not Complete",
-        );
-        assert!(events.is_empty());
-        assert_eq!(messages.len(), 2);
-        assert_eq!(&*messages[0].text, "valid before");
-        assert_eq!(&*messages[1].text, "valid after");
-        assert_eq!(messages[1].turn, 1);
-
-        let cache_path = dir.join("ingest-cache.bin");
-        let files = [path.clone()];
-        let mut cache = IngestCache::cold();
-        let first = collect_cached_for(&mut cache, "opencode", &dir, &files, collect_db);
-        assert_eq!(first.parsed, 1);
-        assert_eq!(first.messages.len(), 2);
-        assert!(!cache.source_snapshot_safe());
-        assert_eq!(cache.source_read_issues().len(), 1);
-        assert_eq!(
-            cache.source_read_issues()[0].reason,
-            "source parser could not cover part of the read"
-        );
-        cache.save(&cache_path).unwrap();
-
-        let mut unchanged = IngestCache::load(&cache_path);
-        let second = collect_cached_for(&mut unchanged, "opencode", &dir, &files, collect_db);
-        assert_eq!(
-            second.parsed, 1,
-            "an unchanged partial source must be reparsed, not cache-hit"
-        );
-        assert_eq!(second.messages.len(), 2);
-        assert!(!unchanged.source_snapshot_safe());
-        assert_eq!(unchanged.source_read_issues().len(), 1);
-        assert_eq!(unchanged.source_read_issues()[0].kind, "source-read-failed");
-        unchanged.save(&cache_path).unwrap();
-
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"INSERT INTO message VALUES ('m4', 's1', '{"role":"user"}', 4000);
-                   INSERT INTO part VALUES ('p4', 'm4', 's1', '{"type":"text","text":"new valid row"}', 4000);"#,
-            )
-            .unwrap();
-        }
-        let mut changed = IngestCache::load(&cache_path);
-        let third = collect_cached_for(&mut changed, "opencode", &dir, &files, collect_db);
-        assert_eq!(third.parsed, 1);
-        assert_eq!(third.messages.len(), 3);
-        assert_eq!(&*third.messages[2].text, "new valid row");
-        assert!(!changed.source_snapshot_safe());
-        assert_eq!(changed.source_read_issues().len(), 1);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn malformed_message_json_yields_partial_outcome() {
-        let dir = temp_dir("malformed-msg-json");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, title TEXT, time_created INTEGER);
-                   CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                   CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                   INSERT INTO session VALUES ('s1', '/work/alpha', NULL, NULL, 1000);
-                   INSERT INTO message VALUES ('m1', 's1', '{"role":"user"}', 1000);
-                   INSERT INTO message VALUES ('m2', 's1', 'BROKEN_MSG_JSON', 2000);
-                   INSERT INTO message VALUES ('m3', 's1', '{"role":"user"}', 3000);
-                   INSERT INTO part VALUES ('p1', 'm1', 's1', '{"type":"text","text":"before"}', 1000);
-                   INSERT INTO part VALUES ('p2', 'm2', 's1', '{"type":"text","text":"mid"}', 2000);
-                   INSERT INTO part VALUES ('p3', 'm3', 's1', '{"type":"text","text":"after"}', 3000);"#,
-            )
-            .unwrap();
-        }
-        let (messages, _events, outcome) = collect_db(&path);
-        assert_eq!(
-            outcome,
-            ReadOutcome::Partial,
-            "malformed message JSON must yield Partial, not Complete",
-        );
-        assert_eq!(messages.len(), 2);
-        assert_eq!(&*messages[0].text, "before");
-        assert_eq!(&*messages[1].text, "after");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn undecodable_child_session_row_yields_partial_outcome() {
-        let dir = temp_dir("null-child-ts");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, title TEXT, time_created INTEGER);
-                   CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                   CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                   INSERT INTO session VALUES ('parent', '/work/alpha', NULL, NULL, 1000);
-                   INSERT INTO session VALUES ('child', '/work/alpha', 'parent', 'probe task', 1500);
-                   INSERT INTO message VALUES ('m1', 'parent', '{"role":"user"}', 1000);
-                   INSERT INTO part VALUES ('p1', 'm1', 'parent', '{"type":"text","text":"launch a subagent"}', 1000);"#,
-            )
-            .unwrap();
-        }
-        let (messages, events, outcome) = collect_db(&path);
-        assert_eq!(outcome, ReadOutcome::Complete);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.kind == "subagent_start")
-                .count(),
-            1
-        );
-
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "UPDATE session SET time_created = NULL WHERE id = 'child'",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        let (messages, events, outcome) = collect_db(&path);
-        assert_eq!(outcome, ReadOutcome::Partial);
-        assert_eq!(messages.len(), 1);
-        assert!(events.iter().all(|event| event.kind != "subagent_start"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn failing_child_session_query_yields_partial_outcome() {
-        let dir = temp_dir("no-title-column");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, time_created INTEGER);
-                   CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                   CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                   INSERT INTO session VALUES ('s1', '/work/alpha', NULL, 1000);
-                   INSERT INTO message VALUES ('m1', 's1', '{"role":"user"}', 1000);
-                   INSERT INTO part VALUES ('p1', 'm1', 's1', '{"type":"text","text":"still readable"}', 1000);"#,
-            )
-            .unwrap();
-        }
-        let (messages, _, outcome) = collect_db(&path);
-        assert_eq!(outcome, ReadOutcome::Partial);
-        assert_eq!(messages.len(), 1);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn undecodable_message_row_yields_partial_outcome() {
-        let dir = temp_dir("null-message-ts");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, title TEXT, time_created INTEGER);
-                   CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
-                   CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-                   INSERT INTO session VALUES ('s1', '/work/alpha', NULL, NULL, 1000);
-                   INSERT INTO message VALUES ('m1', 's1', '{"role":"user"}', NULL);
-                   INSERT INTO message VALUES ('m2', 's1', '{"role":"user"}', 2000);
-                   INSERT INTO part VALUES ('p1', 'm1', 's1', '{"type":"text","text":"lost to decode"}', 1000);
-                   INSERT INTO part VALUES ('p2', 'm2', 's1', '{"type":"text","text":"survivor"}', 2000);"#,
-            )
-            .unwrap();
-        }
-        let (messages, _, outcome) = collect_db(&path);
-        assert_eq!(outcome, ReadOutcome::Partial);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].text, "survivor");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A hot rollback journal no writer holds needs recovery by its agent: a durable defect, as a
-    /// file SQLite rejects as no database is. Windows cannot probe a journal's writer, so there a
-    /// nonempty journal is named and retried instead. An empty journal is no failure.
-    #[test]
-    fn an_idle_hot_journal_and_a_non_database_are_durable() {
-        let dir = temp_dir("open-hot-journal");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opencode.db");
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY);")
-            .unwrap();
-        let journal = dir.join("opencode.db-journal");
-        std::fs::write(&journal, b"").unwrap();
-        assert!(crate::ingest::open_sqlite_ro(&path).is_ok());
-        std::fs::write(&journal, b"hot").unwrap();
-        let files = [path.clone()];
-        let refused = crate::ingest::open_sqlite_ro(&path).err().unwrap();
-        #[cfg(not(windows))]
-        {
-            assert_eq!(crate::ingest::sqlite_open_defect(&path, &refused), Some("needs-recovery"));
-            assert_eq!(collect_db(&path).2, ReadOutcome::Invalid);
-            let mut hot = IngestCache::cold();
-            collect_cached_for(&mut hot, "opencode", &dir, &files, collect_db);
-            assert!(!hot.output_complete());
-            let issue = &hot.source_read_issues()[0];
-            assert!(!issue.retryable && !issue.moving && issue.unreadable_material(), "{issue:?}");
-        }
-        #[cfg(windows)]
-        {
-            assert!(refused.to_string().contains(crate::ingest::JOURNAL_PRESENT), "{refused}");
-            assert_eq!(crate::ingest::sqlite_open_defect(&path, &refused), None);
-            assert_eq!(collect_db(&path).2, ReadOutcome::Unavailable);
-        }
-
-        std::fs::remove_file(&journal).unwrap();
-        std::fs::write(&path, b"not a database, and never one").unwrap();
-        assert_eq!(collect_db(&path).2, ReadOutcome::Invalid);
-        let mut foreign = IngestCache::cold();
-        collect_cached_for(&mut foreign, "opencode", &dir, &files, collect_db);
-        assert!(foreign.output_complete_past_unreadable());
-        assert!(!foreign.output_complete());
-        assert!(foreign.source_read_issues()[0].unreadable_material());
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

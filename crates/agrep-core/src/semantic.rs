@@ -1,0 +1,721 @@
+//! In-process semantic retrieval and short-lived background queue draining.
+use crate::{
+    data::DataRoot,
+    query::{self, Hit, Options, Results},
+    semantic_model::{self, Embedder},
+    semantic_policy, semantic_store, store,
+};
+use anyhow::{bail, Result};
+use rusqlite::{params, Connection};
+pub use semantic_model::{installed, provision};
+pub use semantic_policy::eligible;
+pub use semantic_store::{coverage, initialize, reclaim, Coverage};
+use std::collections::HashSet;
+
+pub struct SearchResults {
+    pub result: Results,
+    pub coverage: Coverage,
+}
+/// Spawn only for a prepared model. Automatic hybrid never downloads anything.
+pub fn schedule(root: &DataRoot) -> Result<()> {
+    if crate::data::read_only() {
+        return Ok(());
+    }
+    let embeddings = root.config()?.embeddings != "off" && installed(root);
+    if embeddings {
+        initialize(root)?;
+    }
+    if !(root.config()?.archive.enabled
+        || (embeddings && semantic_store::pending(&store::reader(root)?)?)
+        || post_index_pending(root)?)
+    {
+        return Ok(());
+    }
+    let Some(lock) = root.work_lock(false)? else {
+        return Ok(());
+    };
+    drop(lock);
+    let logs = root.path().join("log");
+    std::fs::create_dir_all(&logs)?;
+    let log = logs.join("agrep.log");
+    if log.metadata().is_ok_and(|m| m.len() > 1024 * 1024) {
+        let old = logs.join("agrep.log.1");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&log, &old)?;
+    }
+    let errors = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg("__work")
+        .env("AGREP_DATA_DIR", root.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(errors);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A separate session has no controlling terminal and survives CLI exit.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getpriority(libc::PRIO_PROCESS, 0) < 10
+                    && libc::setpriority(libc::PRIO_PROCESS, 0, 10) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000008 | 0x00000200 | 0x00004000);
+    }
+    command.spawn()?;
+    Ok(())
+}
+/// A single process holds work.lock, reuses weights, and commits every bounded batch.
+pub fn work(root: &DataRoot) -> Result<usize> {
+    work_inner(root, false)
+}
+pub fn work_explicit(root: &DataRoot) -> Result<usize> {
+    work_inner(root, true)
+}
+fn work_inner(root: &DataRoot, explicit: bool) -> Result<usize> {
+    if !installed(root) {
+        bail!("semantic model not installed: run agrep setup");
+    }
+    if !explicit && root.config()?.embeddings == "off" {
+        return Ok(0);
+    }
+    let Some(_work) = root.work_lock(explicit)? else {
+        return Ok(0);
+    };
+    drain(root, explicit)
+}
+/// Caller holds work.lock for the ordered background tasks.
+pub fn drain(root: &DataRoot, explicit: bool) -> Result<usize> {
+    if !installed(root) || (!explicit && root.config()?.embeddings == "off") {
+        return Ok(0);
+    }
+    semantic_store::initialize_wait(root)?;
+    if !semantic_store::pending(&store::reader(root)?)? {
+        return Ok(0);
+    }
+    let embedder = Embedder::background(root)?;
+    let mut total = 0;
+    loop {
+        if !explicit && root.config()?.embeddings == "off" {
+            break;
+        }
+        let c = store::reader(root)?;
+        let pending = semantic_store::batch(&c, 128)?;
+        if pending.is_empty() {
+            break;
+        }
+        let mut seen = HashSet::new();
+        let mut texts = vec![];
+        let mut refs = vec![];
+        for p in &pending {
+            if !seen.insert(p.key.clone()) || semantic_store::known(&c, &p.key)? {
+                continue;
+            }
+            for (n, text) in p.chunks.iter().enumerate() {
+                refs.push((p.key.clone(), n));
+                texts.push(text.clone());
+            }
+        }
+        drop(c);
+        let vectors = embedder.embed(&texts)?;
+        total += semantic_store::publish(root, &pending, &refs, &vectors)?;
+        std::thread::yield_now();
+    }
+    Ok(total)
+}
+struct VectorScan {
+    blocks: Vec<semantic_store::Block>,
+    vector: Vec<f32>,
+    candidates: Vec<(usize, usize, f32)>,
+    total_rows: usize,
+}
+impl VectorScan {
+    fn new(blocks: Vec<semantic_store::Block>, vector: Vec<f32>) -> Result<Self> {
+        let (q, scale) = semantic_store::quantize(&vector)?;
+        let total_rows = blocks.iter().map(|b| b.rows).sum();
+        let mut candidates = Vec::new();
+        for (b, block) in blocks.iter().enumerate() {
+            candidates.extend(
+                block
+                    .candidates(&q, scale, semantic_policy::FLOOR as f32)
+                    .into_iter()
+                    .map(|(slot, upper)| (b, slot, upper)),
+            );
+        }
+        candidates
+            .sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        Ok(Self {
+            blocks,
+            vector,
+            candidates,
+            total_rows,
+        })
+    }
+}
+/// Owns model inference and q8 scanning while the caller runs its keyword lane.
+/// No SQL connection crosses a thread; `finish` resolves against the caller's snapshot.
+pub struct QueryWork {
+    coverage: Coverage,
+    options: Options,
+    family_diverse: bool,
+    lane: Option<std::thread::JoinHandle<Result<VectorScan>>>,
+}
+pub fn begin(
+    root: &DataRoot,
+    c: &Connection,
+    o: &Options,
+    family_diverse: bool,
+) -> Result<QueryWork> {
+    if !installed(root) {
+        bail!("semantic model not installed: run agrep setup");
+    }
+    if !semantic_policy::allowed(&o.pattern) {
+        bail!("semantic query requires natural language; use --lexical for identifiers");
+    }
+    // This first read pins the same WAL snapshot used by the lexical query.
+    let coverage = coverage(c)?;
+    let lane = if coverage.embedded == 0 {
+        None
+    } else {
+        let blocks = semantic_store::blocks(root, c)?;
+        let root = root.clone();
+        let pattern = o.pattern.clone();
+        Some(std::thread::spawn(move || {
+            let model = Embedder::query(&root)?;
+            let vector = model.embed(&[pattern])?.remove(0);
+            VectorScan::new(blocks, vector)
+        }))
+    };
+    Ok(QueryWork {
+        coverage,
+        options: o.clone(),
+        family_diverse,
+        lane,
+    })
+}
+pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
+    let mut result = if let Some(lane) = work.lane {
+        let scan = lane
+            .join()
+            .map_err(|_| anyhow::anyhow!("semantic query failed"))??;
+        resolve_scan(c, &work.options, work.family_diverse, scan)?
+    } else {
+        let mut r = Results::default();
+        r.total_basis = "exact".into();
+        r
+    };
+    if work.coverage.partial() {
+        result.total_basis = "floor".into();
+    }
+    Ok(SearchResults {
+        result,
+        coverage: work.coverage,
+    })
+}
+pub fn search(root: &DataRoot, o: &Options, family_diverse: bool) -> Result<SearchResults> {
+    let c = store::reader(root)?;
+    finish(&c, begin(root, &c, o, family_diverse)?)
+}
+/// Public for reproducible retrieval tests using frozen normalized vectors.
+pub fn search_vector(
+    root: &DataRoot,
+    c: &Connection,
+    o: &Options,
+    family_diverse: bool,
+    vector: &[f32],
+) -> Result<Results> {
+    resolve_scan(
+        c,
+        o,
+        family_diverse,
+        VectorScan::new(semantic_store::blocks(root, c)?, vector.to_vec())?,
+    )
+}
+fn resolve_scan(
+    c: &Connection,
+    o: &Options,
+    family_diverse: bool,
+    scan: VectorScan,
+) -> Result<Results> {
+    let VectorScan {
+        blocks,
+        vector,
+        candidates,
+        total_rows,
+    } = scan;
+    let want = if o.limit == 0 { 200 } else { o.limit.min(200) };
+    let mut result = Results::default();
+    let mut resolve=c.prepare("SELECT p.id,p.session,p.agent,p.project,p.position,p.who,p.model,p.model_source,p.ts,p.text,s.family,s.side,v.ordinal FROM semantic_chunks v JOIN semantic_refs r ON r.content_key=v.content_key JOIN prose p ON p.id=r.row_id AND p.digest=r.digest JOIN sessions s ON s.id=p.session AND s.agent=p.agent WHERE v.block=? AND v.slot=? AND p.visible=1")?;
+    let mut hits = Vec::<Hit>::new();
+    let mut matched_groups = HashSet::new();
+    let compare = |a: &Hit, b: &Hit| {
+        let order = match o.sort.as_str() {
+            "time" => b.ts.cmp(&a.ts).then(b.score.total_cmp(&a.score)),
+            "position" => a
+                .session
+                .cmp(&b.session)
+                .then(a.turn.cmp(&b.turn))
+                .then(b.score.total_cmp(&a.score)),
+            _ => b
+                .score
+                .total_cmp(&a.score)
+                .then(b.ts.cmp(&a.ts))
+                .then(a.session.cmp(&b.session))
+                .then(a.turn.cmp(&b.turn)),
+        };
+        order
+            .then(a.agent.cmp(&b.agent))
+            .then(a.session.cmp(&b.session))
+            .then(a.turn.cmp(&b.turn))
+            .then(a.who.cmp(&b.who))
+    };
+    let mut exhausted = true;
+    for (block, slot, upper) in candidates {
+        if o.sort == "score" && hits.len() > want && upper < hits[want].score as f32 {
+            exhausted = false;
+            break;
+        }
+        let score = blocks[block].exact_score(slot, &vector);
+        if (score as f64) < semantic_policy::FLOOR {
+            continue;
+        }
+        if o.sort == "score" && hits.len() > want && (score as f64) < hits[want].score {
+            // This exact cosine cannot enter the retained page, regardless of
+            // metadata filters. Avoid fetching a long source row just to reject it.
+            exhausted = false;
+            continue;
+        }
+        let rows = resolve.query_map(params![blocks[block].name, slot], |r| {
+            Ok((
+                Hit {
+                    rowid: r.get(0)?,
+                    session: r.get(1)?,
+                    agent: r.get(2)?,
+                    project: r.get(3)?,
+                    turn: r.get(4)?,
+                    who: r.get(5)?,
+                    model: r.get(6)?,
+                    model_source: r.get(7)?,
+                    ts: r.get(8)?,
+                    text: store::decode("prose", r.get::<_, Vec<u8>>(9)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Blob,
+                            e.into_boxed_dyn_error(),
+                        )
+                    })?,
+                    family: r.get(10)?,
+                    side: r.get(11)?,
+                    score: score as f64,
+                    matched: "semantic".into(),
+                    ..Default::default()
+                },
+                r.get::<_, usize>(12)?,
+            ))
+        })?;
+        for row in rows {
+            let (mut h, ordinal) = row?;
+            if !matches_filters(&h, o) {
+                continue;
+            }
+            let group = (
+                h.agent.clone(),
+                if family_diverse && !h.family.is_empty() {
+                    h.family.clone()
+                } else {
+                    h.session.clone()
+                },
+            );
+            matched_groups.insert(group);
+            let same = |old: &Hit| {
+                old.agent == h.agent
+                    && (old.session == h.session
+                        || (family_diverse && !h.family.is_empty() && old.family == h.family))
+            };
+            if let Some(at) = hits.iter().position(same) {
+                if compare(&h, &hits[at]).is_ge() {
+                    continue;
+                }
+                hits.remove(at);
+            }
+            if hits.len() > want && compare(&h, hits.last().unwrap()).is_ge() {
+                continue;
+            }
+            h.handle = format!(
+                "{}:{}.{}",
+                session_target(&h.session)?,
+                h.turn,
+                query::content_digest(&h.text)
+            );
+            let chunks = semantic_model::chunks(&h.agent, &h.who, &h.text);
+            let matched_chunk = chunks
+                .get(ordinal)
+                .ok_or_else(|| anyhow::anyhow!("semantic chunk ordinal exceeds source text"))?;
+            h.snippet = query::snippet(matched_chunk, &o.pattern, 280);
+            hits.push(h);
+            hits.sort_by(compare);
+            hits.truncate(want + 1);
+        }
+    }
+    result.total = matched_groups.len();
+    hits.truncate(want);
+    result.hits = hits;
+    result.total_basis = if exhausted { "exact" } else { "floor" }.into();
+    result.examined = total_rows;
+    result.blocks = blocks.len();
+    Ok(result)
+}
+
+fn project_matches(value: &str, pattern: &str) -> bool {
+    let v = value.to_lowercase();
+    let p = pattern.to_lowercase();
+    if p.contains(['*', '?', '[']) {
+        globset::GlobBuilder::new(&p)
+            .literal_separator(false)
+            .build()
+            .is_ok_and(|g| g.compile_matcher().is_match(&v))
+    } else {
+        v == p || v.rsplit(['/', '\\']).next() == Some(p.as_str())
+    }
+}
+fn matches_filters(h: &Hit, o: &Options) -> bool {
+    let f = &o.filters;
+    if f.who.is_none() && ["control", "synthetic", "recap", "harness"].contains(&h.who.as_str()) {
+        return false;
+    }
+    !f.agent
+        .as_ref()
+        .is_some_and(|s| !s.split(',').any(|a| a == h.agent))
+        && !f
+            .chat
+            .as_ref()
+            .is_some_and(|s| !h.session.starts_with(s.trim_start_matches('@')))
+        && !f
+            .project
+            .as_ref()
+            .is_some_and(|s| !project_matches(&h.project, s))
+        && !f
+            .exclude_project
+            .as_ref()
+            .is_some_and(|s| project_matches(&h.project, s))
+        && !f
+            .who
+            .as_ref()
+            .is_some_and(|s| !s.split(',').any(|w| w == h.who))
+        && !f
+            .no_who
+            .as_ref()
+            .is_some_and(|s| s.split(',').any(|w| w == h.who))
+        && !(f.no_meta && ["control", "harness", "synthetic"].contains(&h.who.as_str()))
+        && !(f.no_side && h.side)
+        && !f.since.is_some_and(|ts| h.ts < ts)
+        && !f.until.is_some_and(|ts| h.ts >= ts)
+        && !f.model.as_ref().is_some_and(|m| {
+            if f.model_soft {
+                !h.model
+                    .to_ascii_lowercase()
+                    .contains(&m.to_ascii_lowercase())
+            } else {
+                h.model != *m
+            }
+        })
+}
+fn session_target(session: &str) -> Result<String> {
+    if (3..=128).contains(&session.len())
+        && session.as_bytes()[0].is_ascii_alphanumeric()
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Ok(format!("@{session}"));
+    }
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let (mut token, mut bits, mut available) = (String::new(), 0u32, 0);
+    for b in session.bytes() {
+        bits = (bits << 8) | b as u32;
+        available += 8;
+        while available >= 6 {
+            available -= 6;
+            token.push(A[((bits >> available) & 63) as usize] as char);
+        }
+    }
+    if available != 0 {
+        token.push(A[((bits << (6 - available)) & 63) as usize] as char);
+    }
+    if token.is_empty() || token.len() > 1024 {
+        bail!("session id cannot be encoded safely");
+    }
+    Ok(format!("@~{token}"))
+}
+
+fn post_index_pending(root: &DataRoot) -> Result<bool> {
+    if root.config()?.post_index.is_none() {
+        return Ok(false);
+    }
+    let c = store::reader(root)?;
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM state WHERE key='post_index_pending')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+pub fn mark_index_changed(root: &DataRoot) -> Result<()> {
+    if root.config()?.post_index.is_some() {
+        let _guard = root.lock(true)?;
+        store::writer(root)?.execute(
+            "INSERT OR REPLACE INTO state VALUES('post_index_pending','1')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+pub fn post_index(root: &DataRoot) -> Result<()> {
+    if !post_index_pending(root)? {
+        return Ok(());
+    }
+    let Some(command) = root.config()?.post_index else {
+        return Ok(());
+    };
+    {
+        let _guard = root.lock(true)?;
+        store::writer(root)?.execute("DELETE FROM state WHERE key='post_index_pending'", [])?;
+    }
+    #[cfg(windows)]
+    let status = std::process::Command::new("cmd")
+        .args(["/C", &command])
+        .status()?;
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("sh")
+        .args(["-c", &command])
+        .status()?;
+    if !status.success() {
+        bail!("post_index command failed: {status}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn setup() -> (tempfile::TempDir, DataRoot, Options) {
+        let t = tempfile::tempdir().unwrap();
+        let r = DataRoot::open(t.path().join("data"), true).unwrap();
+        store::writer(&r).unwrap();
+        initialize(&r).unwrap();
+        let o = Options {
+            pattern: "connection pool timeout".into(),
+            regex: false,
+            word: false,
+            sort: "score".into(),
+            limit: 10,
+            exact: false,
+            count_only: false,
+            count_by_tier: false,
+            content: false,
+            chats: true,
+            tools: false,
+            filters: Default::default(),
+        };
+        (t, r, o)
+    }
+    fn insert(r: &DataRoot, id: i64, family: &str, project: &str) {
+        let c = store::writer(r).unwrap();
+        let session = format!("session-{id}");
+        c.execute("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES('codex',?,?, '',?,?,'',0,0)",params![session,project,family,id>1]).unwrap();
+        let text = format!("connection timeout row {id}");
+        c.execute("INSERT INTO prose(id,source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra) VALUES(?,1,'codex',?,?,1,'user','model','observed',?,?,?,'')",params![id,session,project,id,text.as_bytes(),store::digest(&text)]).unwrap();
+    }
+    fn embed(r: &DataRoot) {
+        let p = semantic_store::batch(&store::reader(r).unwrap(), 128).unwrap();
+        let mut v = vec![0f32; semantic_model::DIM];
+        v[0] = 1.;
+        let refs: Vec<_> = p.iter().map(|p| (p.key.clone(), 0)).collect();
+        semantic_store::publish(r, &p, &refs, &vec![v; p.len()]).unwrap();
+    }
+    #[test]
+    fn semantic_filters_family_diversity_and_handles() {
+        let (_t, r, mut o) = setup();
+        insert(&r, 1, "root", "alpha");
+        insert(&r, 2, "root", "alpha");
+        insert(&r, 3, "other", "beta");
+        embed(&r);
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        let c = store::reader(&r).unwrap();
+        let diverse = search_vector(&r, &c, &o, true, &q).unwrap();
+        assert_eq!(diverse.hits.len(), 2);
+        assert!(diverse.hits[0].handle.starts_with("@session-"));
+        assert_eq!(diverse.hits[0].matched, "semantic");
+        assert_eq!(search_vector(&r, &c, &o, false, &q).unwrap().hits.len(), 3);
+        o.filters.model = Some("MOD".into());
+        o.filters.model_soft = true;
+        assert_eq!(search_vector(&r, &c, &o, false, &q).unwrap().hits.len(), 3);
+        o.filters.model = None;
+        o.filters.project = Some("ALP*".into());
+        assert_eq!(search_vector(&r, &c, &o, false, &q).unwrap().hits.len(), 2);
+        o.filters.no_side = true;
+        assert_eq!(search_vector(&r, &c, &o, false, &q).unwrap().hits.len(), 1);
+        o.filters.since = Some(5);
+        assert!(search_vector(&r, &c, &o, false, &q)
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+    #[test]
+    fn semantic_caller_exclusion_precedes_the_result_limit() {
+        let (_t, r, mut options) = setup();
+        insert(&r, 1, "first", "alpha");
+        insert(&r, 2, "second", "alpha");
+        embed(&r);
+        options.limit = 1;
+        let c = store::reader(&r).unwrap();
+        let caller = crate::caller::Caller {
+            resolved: true,
+            agent: "codex".into(),
+            session: "session-2".into(),
+            ..Default::default()
+        };
+        let mut q = vec![0.; semantic_model::DIM];
+        q[0] = 1.;
+        let result = crate::caller::scoped(&c, &caller, false, false, || {
+            search_vector(&r, &c, &options, false, &q)
+        })
+        .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].session, "session-1");
+    }
+    #[test]
+    fn equal_scores_and_session_names_have_stable_agent_order() {
+        let (_t, r, mut o) = setup();
+        insert(&r, 1, "root", "alpha");
+        insert(&r, 2, "other", "alpha");
+        let c = store::writer(&r).unwrap();
+        c.execute("INSERT INTO sessions(agent,id,project,parent,family,side,title,first_ts,last_ts) VALUES('pi','session-1','alpha','','other',0,'',0,0)",[]).unwrap();
+        c.execute("UPDATE prose SET ts=0", []).unwrap();
+        c.execute(
+            "UPDATE prose SET source=2,agent='pi',session='session-1' WHERE id=2",
+            [],
+        )
+        .unwrap();
+        embed(&r);
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        o.limit = 1;
+        let result = search_vector(&r, &store::reader(&r).unwrap(), &o, false, &q).unwrap();
+        assert_eq!(result.hits[0].agent, "codex");
+    }
+    #[test]
+    fn deferred_semantic_resolution_uses_the_keyword_snapshot() {
+        let (_t, r, o) = setup();
+        insert(&r, 1, "root", "alpha");
+        embed(&r);
+        let c = store::reader(&r).unwrap();
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        let scan = VectorScan::new(semantic_store::blocks(&r, &c).unwrap(), q.clone()).unwrap();
+        store::writer(&r)
+            .unwrap()
+            .execute(
+                "UPDATE prose SET text='new body',digest=? WHERE id=1",
+                [store::digest("new body")],
+            )
+            .unwrap();
+        let old = resolve_scan(&c, &o, true, scan).unwrap();
+        assert_eq!(old.hits[0].text, "connection timeout row 1");
+        assert!(search_vector(&r, &store::reader(&r).unwrap(), &o, true, &q)
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+    #[test]
+    fn stale_vectors_never_resolve_to_new_text() {
+        let (_t, r, o) = setup();
+        insert(&r, 1, "root", "alpha");
+        embed(&r);
+        store::writer(&r)
+            .unwrap()
+            .execute(
+                "UPDATE prose SET text='changed',digest=? WHERE id=1",
+                [store::digest("changed")],
+            )
+            .unwrap();
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[0] = 1.;
+        let c = store::reader(&r).unwrap();
+        assert!(search_vector(&r, &c, &o, true, &q).unwrap().hits.is_empty());
+        assert!(coverage(&c).unwrap().partial());
+    }
+    #[test]
+    fn semantic_snippet_comes_from_the_winning_long_row_chunk() {
+        let (_t, r, mut o) = setup();
+        insert(&r, 1, "root", "alpha");
+        let text = format!("{} connection exception explanation", "x".repeat(1022));
+        store::writer(&r)
+            .unwrap()
+            .execute(
+                "UPDATE prose SET text=?,digest=? WHERE id=1",
+                params![text.as_bytes(), store::digest(&text)],
+            )
+            .unwrap();
+        let p = semantic_store::batch(&store::reader(&r).unwrap(), 1).unwrap();
+        assert_eq!(p[0].chunks.len(), 2);
+        let mut first = vec![0f32; semantic_model::DIM];
+        first[1] = 1.;
+        let mut last = vec![0f32; semantic_model::DIM];
+        last[0] = 1.;
+        semantic_store::publish(
+            &r,
+            &p,
+            &[(p[0].key.clone(), 0), (p[0].key.clone(), 1)],
+            &[first, last.clone()],
+        )
+        .unwrap();
+        o.pattern = "database failure".into();
+        let found = search_vector(&r, &store::reader(&r).unwrap(), &o, true, &last).unwrap();
+        assert!(found.hits[0]
+            .snippet
+            .contains("connection exception explanation"));
+        assert_eq!(found.hits[0].text, text);
+    }
+    #[test]
+    fn low_similarity_is_a_true_zero() {
+        let (_t, r, o) = setup();
+        insert(&r, 1, "root", "alpha");
+        embed(&r);
+        let mut q = vec![0f32; semantic_model::DIM];
+        q[1] = 1.;
+        assert!(search_vector(&r, &store::reader(&r).unwrap(), &o, true, &q)
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+    #[test]
+    fn work_lock_is_exclusive_and_pending_order_is_newest_first() {
+        let (_t, r, _o) = setup();
+        insert(&r, 1, "root", "alpha");
+        insert(&r, 2, "other", "beta");
+        let lock = r.work_lock(false).unwrap().unwrap();
+        assert!(r.work_lock(false).unwrap().is_none());
+        drop(lock);
+        assert!(r.work_lock(false).unwrap().is_some());
+        assert_eq!(
+            semantic_store::batch(&store::reader(&r).unwrap(), 1).unwrap()[0].id,
+            2
+        );
+    }
+}

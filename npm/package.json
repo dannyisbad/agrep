@@ -1,16 +1,10 @@
 {
   "name": "@mundy/agrep",
-  "version": "0.4.9",
-  "description": "Find, open, resume and watch your AI agents' work (Claude Code, Codex, opencode, Antigravity, Kimi, Cline, Gemini, crush, Cursor, pi, oh-my-pi) - npm shim that runs the real package via uv/pipx",
-  "bin": { "agrep": "bin.js" },
-  "scripts": {
-    "postinstall": "node postinstall.js"
-  },
-  "files": ["bin.js", "postinstall.js", "README.md", "LICENSE"],
-  "engines": { "node": ">=16" },
-  "keywords": ["claude", "codex", "opencode", "antigravity", "kimi", "cline", "gemini", "crush", "cursor", "pi", "oh-my-pi", "agent", "chat", "history", "grep", "cli"],
-  "repository": { "type": "git", "url": "git+https://github.com/dannyisbad/agrep.git" },
-  "homepage": "https://github.com/dannyisbad/agrep#readme",
-  "author": "mundy (https://mundy.sh)",
-  "license": "MIT"
+  "version": "0.5.0",
+  "description": "Search, recall and resume your local AI agent history.",
+  "bin": {"agrep": "bin.js"},
+  "files": ["bin.js", "checksums.json", "LICENSE", "THIRD_PARTY_LICENSES.txt", "README.md"],
+  "engines": {"node": ">=22.15.0"},
+  "license": "MIT",
+  "repository": {"type": "git", "url": "https://github.com/dannyisbad/agrep.git"}
 }

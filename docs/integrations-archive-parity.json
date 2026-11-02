@@ -1,0 +1,315 @@
+{
+  "settings": [
+    {
+      "implementation": "reference",
+      "args": [
+        "set"
+      ],
+      "exit": 0,
+      "stdout": "  tools = on   (on/off)\n  embeddings = auto   (auto/off)\n  post_index = off   (any command, or off)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "set",
+        "tools",
+        "off"
+      ],
+      "exit": 0,
+      "stdout": "tools = off  (search index picks it up on the next query)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "set",
+        "embeddings",
+        "off"
+      ],
+      "exit": 0,
+      "stdout": "embeddings = off  (off blocks model downloads and background builds)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "set",
+        "post_index",
+        "echo done"
+      ],
+      "exit": 0,
+      "stdout": "post_index = echo done  (runs after each successful index)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "set",
+        "tools",
+        "bad"
+      ],
+      "exit": 2,
+      "stdout": "",
+      "stderr": "agrep set: tools must be on/off; to search for the word \"set\": agrep search set tools bad\n"
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "archive",
+        "--off"
+      ],
+      "exit": 0,
+      "stdout": "archive auto-capture disabled\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "archive",
+        "--keep",
+        "0"
+      ],
+      "exit": 0,
+      "stdout": "archive keep = 0 (never prune) version(s) per source file\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "archive",
+        "--purge"
+      ],
+      "exit": 0,
+      "stdout": "archive holds no captured copies; nothing to purge\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "reference",
+      "args": [
+        "restore",
+        "nothing"
+      ],
+      "exit": 1,
+      "stdout": "no archived file matches 'nothing'\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "set"
+      ],
+      "exit": 0,
+      "stdout": "  tools = on   (on/off)\n  embeddings = auto   (auto/off)\n  post_index = off   (any command, or off)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "set",
+        "tools",
+        "off"
+      ],
+      "exit": 0,
+      "stdout": "tools = off  (search index picks it up on the next query)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "set",
+        "embeddings",
+        "off"
+      ],
+      "exit": 0,
+      "stdout": "embeddings = off  (off blocks model downloads and background builds)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "set",
+        "post_index",
+        "echo done"
+      ],
+      "exit": 0,
+      "stdout": "post_index = echo done  (runs after each successful index)\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "set",
+        "tools",
+        "bad"
+      ],
+      "exit": 2,
+      "stdout": "",
+      "stderr": "agrep: tools must be on/off\n"
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "archive",
+        "--off"
+      ],
+      "exit": 0,
+      "stdout": "archive auto-capture disabled\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "archive",
+        "--keep",
+        "0"
+      ],
+      "exit": 0,
+      "stdout": "archive keep = 0 (never prune) version(s) per source file\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "archive",
+        "--purge"
+      ],
+      "exit": 0,
+      "stdout": "archive holds no captured copies; nothing to purge\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "args": [
+        "restore",
+        "nothing"
+      ],
+      "exit": 1,
+      "stdout": "no archived file matches 'nothing'\n",
+      "stderr": ""
+    }
+  ],
+  "archive": [
+    {
+      "implementation": "reference",
+      "source_sha256": "a88b8bb42eb786da8b2d5e14e45f55373b29db45b95b0c0e1f3fbe7044a1b67d",
+      "cases": [
+        {
+          "args": [
+            "archive"
+          ],
+          "exit": 0,
+          "stdout": "archive: 1 files - 0 unchanged, 0 appended, 1 full captures, 46 B new content in 0.1s\n",
+          "stderr": "archive: captured rollout-2026-10-30-12345678-abcd-abcd-abcd-123456789012.jsonl (46 bytes)\n"
+        },
+        {
+          "args": [
+            "restore",
+            "12345678"
+          ],
+          "exit": 1,
+          "stdout": "exists, not overwriting (--force to replace): <fixture>/home/.codex/sessions/2026/10/30/rollout-2026-10-30-12345678-abcd-abcd-abcd-123456789012.jsonl\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "restore",
+            "12345678"
+          ],
+          "exit": 0,
+          "stdout": "restored <fixture>/home/.codex/sessions/2026/10/30/rollout-2026-10-30-12345678-abcd-abcd-abcd-123456789012.jsonl (46 bytes, sha256 verified: a88b8bb42eb786da8b2d5e14e45f55373b29db45b95b0c0e1f3fbe7044a1b67d)\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "archive",
+            "--purge"
+          ],
+          "exit": 1,
+          "stdout": "archive purge would delete 677 B of archived copies in <fixture>/data/archive; pass --yes to confirm\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "archive",
+            "--purge",
+            "--yes"
+          ],
+          "exit": 0,
+          "stdout": "archive purged: 677 B of archived copies deleted from <fixture>/data/archive\n",
+          "stderr": ""
+        }
+      ],
+      "restored_sha256": "a88b8bb42eb786da8b2d5e14e45f55373b29db45b95b0c0e1f3fbe7044a1b67d"
+    },
+    {
+      "implementation": "rust",
+      "source_sha256": "a88b8bb42eb786da8b2d5e14e45f55373b29db45b95b0c0e1f3fbe7044a1b67d",
+      "cases": [
+        {
+          "args": [
+            "archive"
+          ],
+          "exit": 0,
+          "stdout": "archive: 1 files - 0 unchanged, 0 appended, 1 full captures, 63 bytes new content in 0.0s\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "restore",
+            "12345678"
+          ],
+          "exit": 1,
+          "stdout": "exists, not overwriting (--force to replace): <fixture>/home/.codex/sessions/2026/10/30/rollout-2026-10-30-12345678-abcd-abcd-abcd-123456789012.jsonl\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "restore",
+            "12345678"
+          ],
+          "exit": 0,
+          "stdout": "restored <fixture>/home/.codex/sessions/2026/10/30/rollout-2026-10-30-12345678-abcd-abcd-abcd-123456789012.jsonl (46 bytes, sha256 verified: a88b8bb42eb786da8b2d5e14e45f55373b29db45b95b0c0e1f3fbe7044a1b67d)\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "archive",
+            "--purge"
+          ],
+          "exit": 1,
+          "stdout": "archive purge would delete 63 bytes of archived copies in <fixture>/data/archive; pass --yes to confirm\n",
+          "stderr": ""
+        },
+        {
+          "args": [
+            "archive",
+            "--purge",
+            "--yes"
+          ],
+          "exit": 0,
+          "stdout": "archive purged; on/off and keep settings preserved\n",
+          "stderr": ""
+        }
+      ],
+      "restored_sha256": "a88b8bb42eb786da8b2d5e14e45f55373b29db45b95b0c0e1f3fbe7044a1b67d"
+    }
+  ],
+  "instructions": [
+    {
+      "implementation": "reference",
+      "exit": 0,
+      "stdout": "installed True True True\nremoved True\n",
+      "stderr": ""
+    },
+    {
+      "implementation": "rust",
+      "install_exit": 0,
+      "remove_exit": 0,
+      "outside_before_unchanged": true,
+      "outside_after_unchanged": true,
+      "old_block_replaced": true,
+      "removed_preserves_user_bytes": true
+    }
+  ]
+}

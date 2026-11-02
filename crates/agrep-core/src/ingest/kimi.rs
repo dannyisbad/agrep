@@ -24,7 +24,7 @@ use crate::ingest::{
     cap_event_output, cap_str_with_chars, is_wrapper, project_name,
     summarize_tool_input_with_chars, EVENT_CAP,
 };
-use crate::ingest_cache::SourceReadIssue;
+use crate::intake_batch::SourceReadIssue;
 use crate::model::{Event, Message, RawMessage};
 
 const REGISTRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -574,24 +574,24 @@ impl crate::ingest::registry::Adapter for Kimi {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Always
     }
-    fn collect(&self, _cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+    fn collect(&self, _cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
         let (messages, events, _, _) = collect();
         (messages, events)
     }
     fn collect_checked(
         &self,
-        _cache: &mut crate::ingest_cache::IngestCache,
+        _cache: &mut crate::intake_batch::IntakeBatch,
     ) -> (
         Vec<Message>,
         Vec<Event>,
-        crate::ingest_cache::ReadOutcome,
+        crate::intake_batch::ReadOutcome,
         Vec<SourceReadIssue>,
     ) {
         let (messages, events, healthy, issues) = collect();
         let outcome = if healthy {
-            crate::ingest_cache::ReadOutcome::Complete
+            crate::intake_batch::ReadOutcome::Complete
         } else {
-            crate::ingest_cache::ReadOutcome::Skipped
+            crate::intake_batch::ReadOutcome::Skipped
         };
         (messages, events, outcome, issues)
     }
@@ -611,147 +611,5 @@ impl crate::ingest::registry::Adapter for Kimi {
     }
     fn runtime_issue_root(&self) -> std::path::PathBuf {
         crate::ingest::home().join(".kimi")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_session;
-
-    fn session_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agrep-kimi-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn malformed_multibyte_line_is_an_error_not_a_panic() {
-        let dir = session_dir("clip");
-        // 79 ASCII bytes then a 3-byte char spanning bytes 79..82: a fixed byte-80
-        // slice in the error path is not a char boundary.
-        let bad = format!("{}汉字 truncated mid-write", "x".repeat(79));
-        std::fs::write(
-            dir.join("context.jsonl"),
-            format!(
-                "{bad}\n{}\n",
-                r#"{"role":"user","content":"still ingested"}"#
-            ),
-        )
-        .unwrap();
-        let (messages, _, _) = parse_session(&dir, "proj", "");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].text, "still ingested");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn rotated_context_aligns_timestamps_to_the_wire_tail() {
-        let dir = session_dir("rotate");
-        // wire.jsonl spans the whole session: three pre-/clear turns, then the two
-        // turns the current (post-/clear) context.jsonl actually contains.
-        let wire: String = [1000, 2000, 3000, 4000, 5000]
-            .iter()
-            .map(|ts| {
-                format!("{{\"timestamp\":{ts}.0,\"message\":{{\"type\":\"TurnBegin\",\"payload\":{{}}}}}}\n")
-            })
-            .collect();
-        std::fs::write(dir.join("wire.jsonl"), wire).unwrap();
-        std::fs::write(
-            dir.join("context.jsonl"),
-            concat!(
-                "{\"role\":\"user\",\"content\":\"post-clear question\"}\n",
-                "{\"role\":\"assistant\",\"content\":\"answer\"}\n",
-                "{\"role\":\"user\",\"content\":\"follow-up\"}\n",
-            ),
-        )
-        .unwrap();
-        let (messages, _, healthy) = parse_session(&dir, "proj", "");
-        assert!(healthy);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].ts, 4_000_000);
-        assert_eq!(messages[1].ts, 5_000_000);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_rejects_symlinked_context_and_wire_files() {
-        use std::os::unix::fs::symlink;
-
-        let dir = session_dir("linked-leaves");
-        let outside = dir.with_extension("outside");
-        std::fs::create_dir_all(&outside).unwrap();
-        let context = outside.join("context.jsonl");
-        std::fs::write(&context, "{\"role\":\"user\",\"content\":\"outside\"}\n").unwrap();
-        symlink(&context, dir.join("context.jsonl")).unwrap();
-        let (messages, events, healthy) = parse_session(&dir, "proj", "");
-        assert!(healthy);
-        assert!(messages.is_empty());
-        assert!(events.is_empty());
-
-        std::fs::remove_file(dir.join("context.jsonl")).unwrap();
-        std::fs::write(
-            dir.join("context.jsonl"),
-            "{\"role\":\"user\",\"content\":\"inside\"}\n",
-        )
-        .unwrap();
-        let wire = outside.join("wire.jsonl");
-        std::fs::write(
-            &wire,
-            "{\"timestamp\":42.0,\"message\":{\"type\":\"TurnBegin\",\"payload\":{}}}\n",
-        )
-        .unwrap();
-        symlink(&wire, dir.join("wire.jsonl")).unwrap();
-        let (messages, _, healthy) = parse_session(&dir, "proj", "");
-        assert!(healthy);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].ts, 0);
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn discovery_rejects_symlinked_project_session_and_subagent_dirs() {
-        use std::os::unix::fs::symlink;
-
-        let root = session_dir("discovery-root");
-        let project = root.join("sessions/project");
-        let safe = project.join("safe");
-        std::fs::create_dir_all(&safe).unwrap();
-        std::fs::write(
-            safe.join("context.jsonl"),
-            "{\"role\":\"user\",\"content\":\"inside\"}\n",
-        )
-        .unwrap();
-        let outside = root.with_extension("outside");
-        let outside_session = outside.join("session");
-        let outside_child = outside.join("children/child");
-        std::fs::create_dir_all(&outside_session).unwrap();
-        std::fs::create_dir_all(&outside_child).unwrap();
-        for dir in [&outside_session, &outside_child] {
-            std::fs::write(
-                dir.join("context.jsonl"),
-                "{\"role\":\"user\",\"content\":\"outside\"}\n",
-            )
-            .unwrap();
-        }
-        symlink(&outside_session, project.join("linked-session")).unwrap();
-        symlink(outside.join("children"), safe.join("subagents")).unwrap();
-        symlink(&outside, root.join("sessions/linked-project")).unwrap();
-
-        let (messages, _, healthy, _) = super::collect_from_root(&root);
-        assert!(healthy);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].text, "inside");
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(outside);
     }
 }

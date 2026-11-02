@@ -1,0 +1,105 @@
+{
+  "platform_inapplicable": [
+    {
+      "test": "crates/agrep/tests/browse.rs::run_preserves_argv_cwd_status_and_liveness",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_side_uses_parent_id_origin_cwd_and_native_arguments",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_relays_termination_and_drains_descendants",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::windows_run_and_resume_preserve_native_argv_without_records",
+      "gates": [
+        "cfg(windows)"
+      ],
+      "reason": "Exercises native Windows consoles/processes; POSIX behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::doctor_rebuilds_corrupt_index_only_after_terminal_consent",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_hands_the_terminal_to_an_interactive_child",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::resume_chooses_omp_for_windows_origin_paths",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::pty::paste_is_inert_and_terminal_restored",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::pty::prefix_selector_focuses_and_stdout_flags_stay_blocking",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::pty::ui_serves_while_browser_opener_is_running",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "POSIX executable opener and loopback server fixture; Windows uses native console tests."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::pty::tail_serve_and_ui_keep_default_suspension",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::pty::signal_and_suspend_restore",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::native_console_ctrl_c_and_break_restore_modes",
+      "gates": [
+        "cfg(windows)"
+      ],
+      "reason": "Exercises native Windows consoles/processes; POSIX behavior is covered separately."
+    }
+  ],
+  "partial_assertions": [
+    {
+      "test": "crates/agrep/tests/live.rs::ready_precedes_delta_and_filters_events",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "POSIX signal exit assertion; native_console_ctrl_c_and_break_restore_modes tests Windows control events."
+    }
+  ],
+  "reason": "Only these exact compile-time platform gates are permitted. No runtime skips or ignored tests."
+}

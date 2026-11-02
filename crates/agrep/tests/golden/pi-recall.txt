@@ -1,0 +1,6 @@
+── @01930000:2.18ba · pi · alpha · 2026-01-02 03:04
+     0 user: why did the retry backoff cap at 30s
+     0 agent: the 60s ceiling tripped the account throttle
+     1 recap: earlier: capped the backoff at 30s with jitter after the throttle
+     2 user: now add jitter to the retry
+       [+1 tool calls - agrep around 01930000 2 -C 2 --tool-output 200]

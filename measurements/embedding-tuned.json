@@ -1,0 +1,102 @@
+{
+  "phase": "embed",
+  "window": 1024,
+  "nice": 10,
+  "load_average": [
+    23.6484375,
+    250.15478515625,
+    370.24853515625
+  ],
+  "runs": [
+    {
+      "argv": [
+        "target/release/examples/semantic_eval",
+        "scratch/model",
+        "cpu",
+        "batch",
+        "1024"
+      ],
+      "wall_ms": 18496.091084,
+      "exit": 0,
+      "stdout": "{\"inference_s\":18.006101791,\"load_s\":0.445660125,\"rows\":128,\"rows_s\":7.1087013438954525}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "target/release/examples/semantic_eval",
+        "scratch/model",
+        "cpu",
+        "batch",
+        "1024"
+      ],
+      "wall_ms": 19279.21683400018,
+      "exit": 0,
+      "stdout": "{\"inference_s\":18.72169275,\"load_s\":0.516280291,\"rows\":128,\"rows_s\":6.8369886051035635}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "target/release/examples/semantic_eval",
+        "scratch/model",
+        "cpu",
+        "batch",
+        "1024"
+      ],
+      "wall_ms": 21147.65295899997,
+      "exit": 0,
+      "stdout": "{\"inference_s\":20.661610208,\"load_s\":0.440620792,\"rows\":128,\"rows_s\":6.195064117047349}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "target/release/examples/semantic_eval",
+        "scratch/model",
+        "metal",
+        "batch",
+        "1024"
+      ],
+      "wall_ms": 3273.4504580002977,
+      "exit": 0,
+      "stdout": "{\"inference_s\":2.538053375,\"load_s\":0.577107375,\"rows\":128,\"rows_s\":50.43235152609822}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "target/release/examples/semantic_eval",
+        "scratch/model",
+        "metal",
+        "batch",
+        "1024"
+      ],
+      "wall_ms": 3090.4770830002235,
+      "exit": 0,
+      "stdout": "{\"inference_s\":2.3093339999999998,\"load_s\":0.559995166,\"rows\":128,\"rows_s\":55.42723573116752}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "target/release/examples/semantic_eval",
+        "scratch/model",
+        "metal",
+        "batch",
+        "1024"
+      ],
+      "wall_ms": 3072.6566249995813,
+      "exit": 0,
+      "stdout": "{\"inference_s\":2.301522417,\"load_s\":0.585583167,\"rows\":128,\"rows_s\":55.615360969130194}\n",
+      "stderr": ""
+    }
+  ],
+  "gates": {
+    "cpu_rows_s": {
+      "observed": 6.8369886051035635,
+      "required": 60,
+      "pass": false
+    },
+    "metal_rows_s": {
+      "observed": 55.42723573116752,
+      "required": 600,
+      "pass": false
+    }
+  }
+}

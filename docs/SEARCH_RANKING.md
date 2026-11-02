@@ -89,7 +89,7 @@ variation selectors, skin-tone modifiers, Hangul clusters, and emoji ZWJ
 sequences stay attached to their base. NFKC case-folded matching maps spans back
 to the original text before grading boundaries.
 
-For token `t`, ingest publishes generation-bound short-token statistics:
+For token `t`, ingest commits short-token statistics:
 
 - `n_t`: root conversation families containing `t` anywhere;
 - `s_t`: those families containing `t` as an aligned identifier subtoken.
@@ -104,7 +104,7 @@ B    = geometric_mean(p_t for each query token)
 ```
 
 The sidecar covers normalized identifier subtokens up to four grapheme clusters
-and changes only with an ingest generation. If a token has no observation, the
+and changes only with committed source updates. If a token has no observation, the
 cold prior is:
 
 | Token class | 1-2 clusters | 3 | 4 | 5+ |
@@ -124,43 +124,19 @@ classic output may try semantic search after a prose-shaped query returns zero
 exact hits, and prose recall can combine both lanes. Semantic rows remain
 labeled evidence; they do not overwrite keyword scores.
 
-`--lexical` disables automatic meaning evidence. `-s` forces semantic-only
-search and fails explicitly when the optional runtime or a coherent vector
-generation is unavailable. Automatic hybrid paths keep the keyword result when
-semantic search is unavailable, times out, or has no confident hit.
+`--lexical` disables automatic meaning evidence. `-s` requests semantic-only
+search. If the model is missing, explicit semantic search exits 2 with the setup
+instruction; automatic hybrid search uses keywords and status names the missing
+model. Query embedding runs in process with the pinned Candle model. There is
+one embedding space, with Metal acceleration on supported Apple hardware.
 
 Semantic ranking is conversation-family aware by default so one root chat and
 its side chats do not consume every slot. `--all-side-chats` expands them for an
-explicit semantic search. Partial embedding coverage is disclosed as
-indexed/total. A vector generation the transcript has moved past keeps
-answering: every candidate is re-proved against the current corpus row by text
-hash and filtered and displayed with that row's current metadata, a row whose
-text changed since it was embedded is held back rather than served, and rows
-written since are keyword-only until the background refresh rebinds the
-generation.
-
-Which engine wrote a vector is part of that identity, not a runtime detail. Two
-lanes can produce vectors: ONNX int8 on CPU, and MLX fp16 on Metal, which is
-the default on Apple silicon, where the base install carries mlx - and a query is
-always embedded by the lane recorded in the store it is querying. A lane the
-running machine cannot open degrades like any unavailable generation: keyword
-results with one disclosure, never a query answered across two vector spaces.
-See `py/README.md` for the lane contract.
-
-A meaning row is trusted at or above the strong band (cosine 0.84) and shown at
-all from the floor (0.82); between them it is labeled a weak meaning match.
-`bench/semantic_calibration.py` places those bands against a committed text
-baseline: unrelated short rows reach 0.79, rows sharing one content noun reach
-0.85, paraphrases start at 0.85 and centre near 0.93. Scores carry about ±0.02
-of int8 batch-padding noise on the CPU lane (a row embedded alone and the same
-row embedded in a padded batch agree to ~0.99 cosine); a query always embeds
-alone, so a row within that distance of a band may land on either side.
-
-Each meaning row is also anchored on the query's content words (three or more
-characters, not a stopword): a row whose full indexed text carries fewer than
-half of them is a weak meaning match whatever its cosine, because one shared
-noun buys a strong-band score on its own. Weak meaning rows sort after
-confident ones and never lead a page.
+explicit semantic search. Partial coverage is shown as indexed/total rows.
+A vector belongs only to the exact text it embedded; changed rows are
+keyword-searchable until embedded. A completed semantic miss with partial
+coverage exits 1 and reports that coverage. See [OUTPUT_CONTRACTS.md](OUTPUT_CONTRACTS.md)
+and [PORTING.md](PORTING.md) for the interface and implementation status.
 
 In the automatic hybrid merge, a meaning row is corroborated when its
 conversation family also holds a strong lexical row; bag-of-words scatter
@@ -287,7 +263,6 @@ must be shortened to fit. `agrep --more <handle>` reads the next page from a
 short-lived frozen snapshot; it does not rerun the query. The versioned snapshot
 also pins the query, any exact total, and a structured deeper-search command, so
 an exact total survives every continuation when available, and the final page
-can give an opaque `agrep --deeper <handle>` action beyond the frozen top 40.
 Query text never passes through shell rendering. Result handles also paste
 directly into `agrep around` and `agrep recall`.
 

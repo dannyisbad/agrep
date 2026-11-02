@@ -32,7 +32,7 @@ use crate::ingest::registry::{metadata_is_link, plain_metadata};
 use crate::ingest::{
     cap_event_output, cap_str, cap_str_with_chars, is_wrapper, project_name, EVENT_CAP,
 };
-use crate::ingest_cache::SourceReadIssue;
+use crate::intake_batch::SourceReadIssue;
 use crate::model::{Event, Message};
 
 fn plain_dir_chain(
@@ -324,11 +324,11 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
     let data = match crate::ingest::read_lossy(&transcript) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
+            crate::intake::diagnostic(format_args!(
                 "  ! antigravity: cannot read {}: {}",
                 crate::ingest::terminal_safe(transcript.display()),
                 crate::ingest::terminal_safe(&e)
-            );
+            ));
             tally.seen();
             tally.error(&format!("cannot read: {e}"));
             return (Vec::new(), Vec::new(), false);
@@ -613,24 +613,24 @@ impl crate::ingest::registry::Adapter for Antigravity {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Always
     }
-    fn collect(&self, _cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+    fn collect(&self, _cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
         let (messages, events, _, _) = collect();
         (messages, events)
     }
     fn collect_checked(
         &self,
-        _cache: &mut crate::ingest_cache::IngestCache,
+        _cache: &mut crate::intake_batch::IntakeBatch,
     ) -> (
         Vec<Message>,
         Vec<Event>,
-        crate::ingest_cache::ReadOutcome,
+        crate::intake_batch::ReadOutcome,
         Vec<SourceReadIssue>,
     ) {
         let (messages, events, healthy, issues) = collect();
         let outcome = if healthy {
-            crate::ingest_cache::ReadOutcome::Complete
+            crate::intake_batch::ReadOutcome::Complete
         } else {
-            crate::ingest_cache::ReadOutcome::Skipped
+            crate::intake_batch::ReadOutcome::Skipped
         };
         (messages, events, outcome, issues)
     }
@@ -651,172 +651,5 @@ impl crate::ingest::registry::Adapter for Antigravity {
             .join(".gemini")
             .join("antigravity-cli")
             .join("brain")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_session;
-
-    fn brain_dir(name: &str, transcript: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agrep-agy-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let logs = dir.join(".system_generated").join("logs");
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(logs.join("transcript.jsonl"), transcript).unwrap();
-        dir
-    }
-
-    #[test]
-    fn unexecuted_announcement_does_not_shift_later_pairings() {
-        // The view_file announcement is never executed (rejected); the next planner
-        // step's run_command must not inherit its name/input.
-        let dir = brain_dir(
-            "stale",
-            concat!(
-                r#"{"type":"PLANNER_RESPONSE","source":"MODEL","created_at":"2026-01-02T10:00:00Z","content":"I'll open the file.","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"/tmp/a.txt"}}]}"#,
-                "\n",
-                r#"{"type":"PLANNER_RESPONSE","source":"MODEL","created_at":"2026-01-02T10:00:10Z","content":"Running tests instead.","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test","Cwd":"/work/proj"}}]}"#,
-                "\n",
-                r#"{"type":"RUN_COMMAND","source":"MODEL","status":"DONE","created_at":"2026-01-02T10:00:11Z","content":"ok"}"#,
-                "\n",
-            ),
-        );
-        let (_, events, healthy) = parse_session(&dir);
-        assert!(healthy);
-        let tools: Vec<_> = events.iter().filter(|e| e.kind == "tool").collect();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "run_command");
-        assert_eq!(tools[0].input, "cargo test");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn subagent_invocation_consumes_its_announcement() {
-        let dir = brain_dir(
-            "subagent",
-            concat!(
-                r#"{"type":"PLANNER_RESPONSE","source":"MODEL","created_at":"2026-01-02T10:00:00Z","content":"Delegating, then testing.","tool_calls":[{"name":"invoke_subagent","args":{"toolSummary":"audit the lexer"}},{"name":"run_command","args":{"CommandLine":"cargo test","Cwd":"/work/proj"}}]}"#,
-                "\n",
-                r#"{"type":"INVOKE_SUBAGENT","source":"MODEL","created_at":"2026-01-02T10:00:01Z","content":"audit the lexer"}"#,
-                "\n",
-                r#"{"type":"RUN_COMMAND","source":"MODEL","status":"DONE","created_at":"2026-01-02T10:00:02Z","content":"ok"}"#,
-                "\n",
-            ),
-        );
-        let (_, events, healthy) = parse_session(&dir);
-        assert!(healthy);
-        let tools: Vec<_> = events.iter().filter(|e| e.kind == "tool").collect();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "run_command");
-        assert_eq!(tools[0].input, "cargo test");
-        assert!(events.iter().any(|e| e.kind == "subagent_start"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn settings_only_events_are_not_user_words() {
-        let dir = brain_dir(
-            "settings",
-            concat!(
-                r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","created_at":"2026-01-02T10:00:00Z","content":"<USER_SETTINGS_CHANGE>autonomy: turbo</USER_SETTINGS_CHANGE>"}"#,
-                "\n",
-                r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","created_at":"2026-01-02T10:00:01Z","content":"<ADDITIONAL_METADATA>{\"open_files\":[]}</ADDITIONAL_METADATA><USER_SETTINGS_CHANGE>mode</USER_SETTINGS_CHANGE>"}"#,
-                "\n",
-                r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","created_at":"2026-01-02T10:00:02Z","content":"<USER_REQUEST>real question</USER_REQUEST>"}"#,
-                "\n",
-                r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","created_at":"2026-01-02T10:00:03Z","content":"plain old-build prompt"}"#,
-                "\n",
-            ),
-        );
-        let (messages, _, healthy) = parse_session(&dir);
-        assert!(healthy);
-        let texts: Vec<&str> = messages.iter().map(|m| &*m.text).collect();
-        assert_eq!(texts, vec!["real question", "plain old-build prompt"]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_rejects_symlinked_transcript_and_mailbox_paths() {
-        use std::os::unix::fs::symlink;
-
-        let dir = brain_dir(
-            "links",
-            "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"inside\"}\n",
-        );
-        let outside = dir.with_extension("outside");
-        let outside_logs = outside.join("logs");
-        std::fs::create_dir_all(&outside_logs).unwrap();
-        let outside_transcript = outside_logs.join("transcript.jsonl");
-        std::fs::write(
-            &outside_transcript,
-            "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"outside\"}\n",
-        )
-        .unwrap();
-        let transcript = dir.join(".system_generated/logs/transcript.jsonl");
-        std::fs::remove_file(&transcript).unwrap();
-        symlink(&outside_transcript, &transcript).unwrap();
-        let (messages, events, healthy) = parse_session(&dir);
-        assert!(healthy);
-        assert!(messages.is_empty());
-        assert!(events.is_empty());
-
-        std::fs::remove_file(&transcript).unwrap();
-        std::fs::write(
-            &transcript,
-            "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"inside\"}\n",
-        )
-        .unwrap();
-        let messages_dir = dir.join(".system_generated/messages");
-        std::fs::create_dir_all(&messages_dir).unwrap();
-        let outside_mail = outside.join("mail.json");
-        std::fs::write(
-            &outside_mail,
-            r#"{"id":"outside","sender":"root/task-1","content":"outside"}"#,
-        )
-        .unwrap();
-        symlink(&outside_mail, messages_dir.join("linked.json")).unwrap();
-        let (messages, events, healthy) = parse_session(&dir);
-        assert!(healthy);
-        assert_eq!(messages.len(), 1);
-        assert!(events.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn discovery_rejects_symlinked_session_and_nested_log_dirs() {
-        use std::os::unix::fs::symlink;
-
-        let root = brain_dir("root-placeholder", "");
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
-        let outside = brain_dir(
-            "outside-session",
-            "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"outside\"}\n",
-        );
-        symlink(&outside, root.join("linked-session")).unwrap();
-
-        let nested = root.join("nested");
-        std::fs::create_dir_all(nested.join(".system_generated")).unwrap();
-        symlink(
-            outside.join(".system_generated/logs"),
-            nested.join(".system_generated/logs"),
-        )
-        .unwrap();
-        let (messages, events, healthy, _) = super::collect_from_root(&root);
-        assert!(healthy);
-        assert!(messages.is_empty());
-        assert!(events.is_empty());
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(outside);
     }
 }

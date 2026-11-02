@@ -1,0 +1,1 @@
+phrase_aligned=3 phrase_partial=0 phrase_interior=0 all_terms=0 total=3

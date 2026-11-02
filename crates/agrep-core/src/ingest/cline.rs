@@ -69,39 +69,39 @@ struct TaskMeta {
 type DetailedRead = (
     Vec<Message>,
     Vec<Event>,
-    crate::ingest_cache::ReadOutcome,
-    Vec<crate::ingest_cache::SourceReadIssue>,
+    crate::intake_batch::ReadOutcome,
+    Vec<crate::intake_batch::SourceReadIssue>,
 );
 
 fn issue(
     path: &Path,
     kind: &'static str,
     reason: impl Into<String>,
-) -> crate::ingest_cache::SourceReadIssue {
-    crate::ingest_cache::SourceReadIssue::new("cline", path, kind, reason)
+) -> crate::intake_batch::SourceReadIssue {
+    crate::intake_batch::SourceReadIssue::new("cline", path, kind, reason)
 }
 
 fn task_index(
     root: &Path,
 ) -> (
     HashMap<String, TaskMeta>,
-    crate::ingest_cache::ReadOutcome,
-    Vec<crate::ingest_cache::SourceReadIssue>,
+    crate::intake_batch::ReadOutcome,
+    Vec<crate::intake_batch::SourceReadIssue>,
 ) {
     let mut map = HashMap::new();
     let state = root.join("state");
     match fs::symlink_metadata(&state) {
         Ok(meta) if meta.is_dir() && !metadata_is_link(&meta) => {}
-        Ok(_) => return (map, crate::ingest_cache::ReadOutcome::Complete, Vec::new()),
+        Ok(_) => return (map, crate::intake_batch::ReadOutcome::Complete, Vec::new()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (map, crate::ingest_cache::ReadOutcome::Complete, Vec::new())
+            return (map, crate::intake_batch::ReadOutcome::Complete, Vec::new())
         }
         Err(error) => {
             crate::ingest::warn_source_skip("cline", &state, &error);
             let problem = issue(&state, "source-stat-failed", error.to_string());
             return (
                 map,
-                crate::ingest_cache::ReadOutcome::Skipped,
+                crate::intake_batch::ReadOutcome::Skipped,
                 vec![problem],
             );
         }
@@ -109,16 +109,16 @@ fn task_index(
     let p = state.join("taskHistory.json");
     match fs::symlink_metadata(&p) {
         Ok(meta) if meta.is_file() && !metadata_is_link(&meta) => {}
-        Ok(_) => return (map, crate::ingest_cache::ReadOutcome::Complete, Vec::new()),
+        Ok(_) => return (map, crate::intake_batch::ReadOutcome::Complete, Vec::new()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (map, crate::ingest_cache::ReadOutcome::Complete, Vec::new())
+            return (map, crate::intake_batch::ReadOutcome::Complete, Vec::new())
         }
         Err(error) => {
             crate::ingest::warn_source_skip("cline", &p, &error);
             let problem = issue(&p, "source-stat-failed", error.to_string());
             return (
                 map,
-                crate::ingest_cache::ReadOutcome::Skipped,
+                crate::intake_batch::ReadOutcome::Skipped,
                 vec![problem],
             );
         }
@@ -126,14 +126,14 @@ fn task_index(
     let data = match crate::ingest::read_lossy(&p) {
         Ok(d) => d,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (map, crate::ingest_cache::ReadOutcome::Complete, Vec::new())
+            return (map, crate::intake_batch::ReadOutcome::Complete, Vec::new())
         }
         Err(error) => {
             crate::ingest::warn_source_skip("cline", &p, &error);
             let problem = issue(&p, "source-read-failed", error.to_string());
             return (
                 map,
-                crate::ingest_cache::ReadOutcome::Skipped,
+                crate::intake_batch::ReadOutcome::Skipped,
                 vec![problem],
             );
         }
@@ -141,7 +141,7 @@ fn task_index(
     let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&data) else {
         return (
             map,
-            crate::ingest_cache::ReadOutcome::Invalid,
+            crate::intake_batch::ReadOutcome::Invalid,
             vec![issue(
                 &p,
                 "source-invalid",
@@ -170,7 +170,7 @@ fn task_index(
             },
         );
     }
-    (map, crate::ingest_cache::ReadOutcome::Complete, Vec::new())
+    (map, crate::intake_batch::ReadOutcome::Complete, Vec::new())
 }
 
 /// The user's actual words from a cline user turn: drop the bulky injected
@@ -210,7 +210,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             return (
                 Vec::new(),
                 Vec::new(),
-                crate::ingest_cache::ReadOutcome::Complete,
+                crate::intake_batch::ReadOutcome::Complete,
                 Vec::new(),
             )
         }
@@ -218,7 +218,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             return (
                 Vec::new(),
                 Vec::new(),
-                crate::ingest_cache::ReadOutcome::Complete,
+                crate::intake_batch::ReadOutcome::Complete,
                 Vec::new(),
             )
         }
@@ -227,7 +227,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             return (
                 Vec::new(),
                 Vec::new(),
-                crate::ingest_cache::ReadOutcome::Skipped,
+                crate::intake_batch::ReadOutcome::Skipped,
                 vec![issue(&path, "source-stat-failed", error.to_string())],
             );
         }
@@ -243,7 +243,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             return (
                 Vec::new(),
                 Vec::new(),
-                crate::ingest_cache::ReadOutcome::Skipped,
+                crate::intake_batch::ReadOutcome::Skipped,
                 vec![issue(&path, "source-read-failed", e.to_string())],
             );
         }
@@ -257,11 +257,11 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             // an indexed-but-unparseable task is incomplete; an unindexed orphan may be
             // mid-write (its content hash moves on completion)
             let outcome = if meta.is_none() {
-                crate::ingest_cache::ReadOutcome::Complete
+                crate::intake_batch::ReadOutcome::Complete
             } else {
-                crate::ingest_cache::ReadOutcome::Invalid
+                crate::intake_batch::ReadOutcome::Invalid
             };
-            let problems = (outcome == crate::ingest_cache::ReadOutcome::Invalid)
+            let problems = (outcome == crate::intake_batch::ReadOutcome::Invalid)
                 .then(|| issue(&path, "source-invalid", e.to_string()))
                 .into_iter()
                 .collect();
@@ -271,11 +271,11 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
             tally.seen();
             tally.error("expected top-level message array");
             let outcome = if meta.is_none() {
-                crate::ingest_cache::ReadOutcome::Complete
+                crate::intake_batch::ReadOutcome::Complete
             } else {
-                crate::ingest_cache::ReadOutcome::Invalid
+                crate::intake_batch::ReadOutcome::Invalid
             };
-            let problems = (outcome == crate::ingest_cache::ReadOutcome::Invalid)
+            let problems = (outcome == crate::intake_batch::ReadOutcome::Invalid)
                 .then(|| issue(&path, "source-invalid", "expected top-level message array"))
                 .into_iter()
                 .collect();
@@ -471,7 +471,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
     (
         out.into_iter().map(RawMessage::freeze).collect(),
         events,
-        crate::ingest_cache::ReadOutcome::Complete,
+        crate::intake_batch::ReadOutcome::Complete,
         Vec::new(),
     )
 }
@@ -479,7 +479,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
 /// Walk every editor's cline globalStorage (plus ~/.cline/data) and collect tasks.
 fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
     let mut work: Vec<(PathBuf, Option<TaskMeta>)> = Vec::new();
-    let mut outcome = crate::ingest_cache::ReadOutcome::Complete;
+    let mut outcome = crate::intake_batch::ReadOutcome::Complete;
     let mut issues = Vec::new();
     for root in store_roots {
         match fs::symlink_metadata(&root) {
@@ -488,7 +488,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cline", &root, &error);
-                outcome = outcome.merge(crate::ingest_cache::ReadOutcome::Skipped);
+                outcome = outcome.merge(crate::intake_batch::ReadOutcome::Skipped);
                 issues.push(issue(&root, "source-stat-failed", error.to_string()));
                 continue;
             }
@@ -500,7 +500,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cline", &tasks, &error);
-                outcome = outcome.merge(crate::ingest_cache::ReadOutcome::Skipped);
+                outcome = outcome.merge(crate::intake_batch::ReadOutcome::Skipped);
                 issues.push(issue(&tasks, "source-stat-failed", error.to_string()));
                 continue;
             }
@@ -510,7 +510,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 crate::ingest::warn_source_skip("cline", &tasks, &error);
-                outcome = outcome.merge(crate::ingest_cache::ReadOutcome::Skipped);
+                outcome = outcome.merge(crate::intake_batch::ReadOutcome::Skipped);
                 issues.push(issue(&tasks, "source-read-failed", error.to_string()));
                 continue;
             }
@@ -523,7 +523,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
                 Ok(entry) => entry,
                 Err(error) => {
                     crate::ingest::warn_source_skip("cline", &tasks, &error);
-                    outcome = outcome.merge(crate::ingest_cache::ReadOutcome::Skipped);
+                    outcome = outcome.merge(crate::intake_batch::ReadOutcome::Skipped);
                     issues.push(issue(&tasks, "source-read-failed", error.to_string()));
                     continue;
                 }
@@ -534,7 +534,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
                 Ok(None) => false,
                 Err(error) => {
                     crate::ingest::warn_source_skip("cline", &dir, &error);
-                    outcome = outcome.merge(crate::ingest_cache::ReadOutcome::Skipped);
+                    outcome = outcome.merge(crate::intake_batch::ReadOutcome::Skipped);
                     issues.push(issue(&dir, "source-stat-failed", error.to_string()));
                     continue;
                 }
@@ -554,7 +554,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
                     (
                         Vec::new(),
                         Vec::new(),
-                        crate::ingest_cache::ReadOutcome::Skipped,
+                        crate::intake_batch::ReadOutcome::Skipped,
                         vec![issue(dir, "source-read-failed", panic.reason)],
                     )
                 })
@@ -563,7 +563,7 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
     let mut msgs = Vec::new();
     let mut evts = Vec::new();
     for (m, e, task_outcome, task_issues) in pairs {
-        if task_outcome == crate::ingest_cache::ReadOutcome::Complete {
+        if task_outcome == crate::intake_batch::ReadOutcome::Complete {
             msgs.extend(m);
             evts.extend(e);
         }
@@ -575,12 +575,12 @@ fn collect_from_roots_detailed(store_roots: Vec<PathBuf>) -> DetailedRead {
 
 fn collect_from_roots(
     store_roots: Vec<PathBuf>,
-) -> (Vec<Message>, Vec<Event>, crate::ingest_cache::ReadOutcome) {
+) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
     let (messages, events, outcome, _) = collect_from_roots_detailed(store_roots);
     (messages, events, outcome)
 }
 
-pub fn collect() -> (Vec<Message>, Vec<Event>, crate::ingest_cache::ReadOutcome) {
+pub fn collect() -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
     collect_from_roots(roots())
 }
 
@@ -593,15 +593,20 @@ impl crate::ingest::registry::Adapter for Cline {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Always
     }
-    fn collect(&self, _cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+    fn collect(&self, _cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
         let (messages, events, _) = collect();
         (messages, events)
     }
-    fn collect_checked(&self, _cache: &mut crate::ingest_cache::IngestCache) -> DetailedRead {
+    fn collect_checked(&self, _cache: &mut crate::intake_batch::IntakeBatch) -> DetailedRead {
         collect_from_roots_detailed(roots())
     }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
         roots().into_iter().map(|r| r.join("tasks")).collect()
+    }
+    fn archive_content(&self, path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|e| e == "json")
+            && (path.components().any(|p| p.as_os_str() == "tasks")
+                || path.file_name().is_some_and(|n| n == "taskHistory.json"))
     }
     fn store_content(&self, path: &std::path::Path) -> bool {
         // the conversation itself; task_metadata/ui_messages are auxiliary state
@@ -632,9 +637,25 @@ impl crate::ingest::registry::Adapter for Cline {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    fn symlink(
+        from: impl AsRef<std::path::Path>,
+        to: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(from, to)
+        }
+        #[cfg(windows)]
+        {
+            if from.as_ref().is_dir() {
+                std::os::windows::fs::symlink_dir(from, to)
+            } else {
+                std::os::windows::fs::symlink_file(from, to)
+            }
+        }
+    }
 
     fn root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -670,7 +691,7 @@ mod tests {
         .unwrap();
 
         let (messages, _, healthy) = super::collect_from_roots(vec![store.clone()]);
-        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(healthy, crate::intake_batch::ReadOutcome::Complete);
         assert_eq!(messages.len(), 1);
         assert_eq!(&*messages[0].text, "inside");
         let _ = std::fs::remove_dir_all(store);
@@ -695,7 +716,7 @@ mod tests {
 
         let (messages, events, healthy) =
             super::collect_from_roots(vec![store_link.clone(), store.clone()]);
-        assert_eq!(healthy, crate::ingest_cache::ReadOutcome::Complete);
+        assert_eq!(healthy, crate::intake_batch::ReadOutcome::Complete);
         assert!(messages.is_empty());
         assert!(events.is_empty());
         let _ = std::fs::remove_file(store_link);
@@ -714,7 +735,7 @@ mod tests {
         std::fs::write(&history, b"{broken").unwrap();
 
         let (_, _, outcome, issues) = super::collect_from_roots_detailed(vec![store.clone()]);
-        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Invalid);
+        assert_eq!(outcome, crate::intake_batch::ReadOutcome::Invalid);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].path, history);
         let _ = std::fs::remove_dir_all(store);

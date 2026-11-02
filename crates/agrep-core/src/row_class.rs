@@ -75,7 +75,10 @@ pub fn is_subagent_turn(m: &Message) -> bool {
 pub fn is_harness_turn(project: &str, text: &str, policy: &HarnessPolicy) -> bool {
     let t = text.trim_start();
     is_harness_project(project, &policy.project_prefixes)
-        || policy.text_prefixes.iter().any(|p| t.starts_with(p.as_str()))
+        || policy
+            .text_prefixes
+            .iter()
+            .any(|p| t.starts_with(p.as_str()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,5 +122,140 @@ pub fn row_kind(m: &Message, policy: &HarnessPolicy) -> RowKind {
         RowKind::Subagent
     } else {
         RowKind::User
+    }
+}
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+#[inline]
+fn set_arc_str(value: &mut Arc<str>, desired: &str) {
+    if value.as_ref() != desired {
+        *value = Arc::from(desired);
+    }
+}
+
+pub fn normalize_messages(msgs: Vec<Message>, harness: &HarnessPolicy) -> Vec<Message> {
+    // row_kind is cheap per row: one sequential pass is faster and less scheduler-sensitive
+    // than dispatching thousands of tiny rayon jobs.
+    let kinds: Vec<RowKind> = msgs
+        .iter()
+        .map(|message| row_kind(message, harness))
+        .collect();
+    let needs_model_backfill = msgs.iter().zip(&kinds).any(|(m, kind)| {
+        matches!(kind, RowKind::User | RowKind::Subagent) && m.model.trim().is_empty()
+    });
+
+    type SessionKey = (&'static str, Arc<str>);
+    type ModelTimeline = Vec<(u32, Arc<str>)>;
+    let mut session_models: HashMap<SessionKey, HashSet<Arc<str>>> = HashMap::new();
+    let mut session_timeline: HashMap<SessionKey, ModelTimeline> = HashMap::new();
+    // The common case is an adapter that already attached a model to every real row. In that
+    // case no lookup below is possible, so avoid hashing/cloning every session and model just
+    // to build two maps that would never be read.
+    if needs_model_backfill {
+        for (m, kind) in msgs.iter().zip(&kinds) {
+            let model = m.model.trim();
+            if model.is_empty() || !matches!(kind, RowKind::User | RowKind::Subagent) {
+                continue;
+            }
+            session_models
+                .entry((m.agent, m.session.clone()))
+                .or_default()
+                .insert(m.model.clone());
+            session_timeline
+                .entry((m.agent, m.session.clone()))
+                .or_default()
+                .push((m.turn, m.model.clone()));
+        }
+        for models in session_timeline.values_mut() {
+            models.sort_by_key(|(turn, _)| *turn);
+        }
+    }
+
+    msgs.into_iter()
+        .zip(kinds)
+        .map(|(mut m, kind)| {
+            let raw_model_empty = m.model.trim().is_empty();
+            let (who, model_source): (&str, &str) = match kind {
+                RowKind::Synthetic => ("synthetic", "synthetic"),
+                RowKind::Control => {
+                    set_arc_str(&mut m.model, "<control>");
+                    ("control", "control")
+                }
+                RowKind::Recap => {
+                    set_arc_str(&mut m.model, "<recap>");
+                    ("recap", "recap")
+                }
+                RowKind::Harness => {
+                    if raw_model_empty {
+                        set_arc_str(&mut m.model, "<harness>");
+                        ("harness", "harness")
+                    } else {
+                        ("harness", "explicit_harness")
+                    }
+                }
+                RowKind::User | RowKind::Subagent => {
+                    // side turns are real work: same model attribution as user
+                    // turns (their child sessions carry their own model pool)
+                    let who = if kind == RowKind::Subagent {
+                        "subagent"
+                    } else {
+                        "user"
+                    };
+                    if !raw_model_empty {
+                        (who, "explicit")
+                    } else {
+                        let models = session_models.get(&(m.agent, m.session.clone()));
+                        match models.map(|s| s.len()).unwrap_or(0) {
+                            1 => {
+                                m.model = models
+                                    .and_then(|s| s.iter().next())
+                                    .cloned()
+                                    .unwrap_or_else(|| Arc::from(""));
+                                (who, "session")
+                            }
+                            0 => (who, "unknown"),
+                            _ => {
+                                let timeline = session_timeline.get(&(m.agent, m.session.clone()));
+                                if let Some(model) =
+                                    timeline.and_then(|rows| temporal_backfill(rows, m.turn))
+                                {
+                                    m.model = model;
+                                    (who, "temporal_session")
+                                } else {
+                                    (who, "ambiguous_session")
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            // Normalize in place. Parsed/cache rows already carry these labels in the common
+            // explicit-user case, so this avoids rebuilding every Message and allocating two
+            // short Arc strings per row. A changed classification still overwrites stale labels.
+            set_arc_str(&mut m.who, who);
+            set_arc_str(&mut m.model_source, model_source);
+            m
+        })
+        .collect()
+}
+
+fn temporal_backfill(rows: &[(u32, Arc<str>)], turn: u32) -> Option<Arc<str>> {
+    let before = rows
+        .iter()
+        .rev()
+        .find(|(known_turn, _)| *known_turn < turn)
+        .map(|(_, model)| model);
+    let after = rows
+        .iter()
+        .find(|(known_turn, _)| *known_turn > turn)
+        .map(|(_, model)| model);
+    match (before, after) {
+        (Some(a), Some(b)) if a == b => Some(a.clone()),
+        (None, Some(model)) => Some(model.clone()),
+        (Some(model), None) => Some(model.clone()),
+        _ => None,
     }
 }

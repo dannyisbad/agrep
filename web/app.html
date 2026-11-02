@@ -575,7 +575,6 @@
                       aria-pressed="true">recent history</button>
               <div class="mode-switch" aria-label="Search mode">
                 <button type="button" data-mode="keyword" aria-pressed="true">grep</button>
-                <button type="button" data-mode="semantic" aria-pressed="false">meaning</button>
               </div>
               <div class="sort-switch" id="sort-switch"
                    aria-label="Search result order" hidden>
@@ -609,7 +608,7 @@
       view: "recent", historyView: "recent", query: "",
       hits: [], searchPayload: null, chats: [], chatTotal: 0,
       chatTotalsExact: true, chatLimit: 80, searchLimit: 40,
-      indexed: true, active: -1, ready: false,
+      active: -1, ready: false,
       searchEpoch: 0, contextEpoch: 0, searchController: null,
       contextController: null, contextRadius: 4,
       recentEpoch: 0, recentController: null, recentLoading: false,
@@ -813,9 +812,7 @@
         ? `${state.chats.length} of ${total.toLocaleString()}${totalSuffix} recent`
         : `${state.chats.length}${totalSuffix} recent`;
       if (!state.chats.length) {
-        const message = state.indexed
-          ? "No main chats are indexed yet."
-          : "No history index yet. Run `agrep index` in a terminal.";
+        const message = "No main chats are indexed yet.";
         showRailNotice(message);
         if (!preserveReader) showReaderNotice("No recent chats.", message);
         return;
@@ -919,48 +916,31 @@
 
     function meaningSuffix(semantic) {
       if (!semantic) return "";
-      if (semantic.complete) return " · meaning complete";
-      const indexed = Number(semantic.indexed || 0);
-      const total = Number(semantic.total || 0);
-      if (total > 0) {
-        return ` · meaning ${indexed.toLocaleString()} of ${total.toLocaleString()} rows`;
-      }
-      return semantic.fallback_recommended ? " · meaning unavailable" : " · meaning partial";
+      return ` · meaning ${Number(semantic.indexed || 0).toLocaleString()} of ${Number(semantic.total || 0).toLocaleString()} rows`;
     }
 
     function searchCount(payload) {
       const shown = state.hits.length;
       const total = Math.max(shown, Number(payload.total || 0));
       const exact = payload.totals_exact !== false;
-      const eventsDown = payload.tools_excluded?.reason === "events-unavailable";
-      const tools = !payload.tools_excluded ? ""
-        : eventsDown ? " · tool events are unavailable right now" : " · tool output still indexing";
-      if (!exact && total === 0) return `no returned hits · total unknown${meaningSuffix(payload.semantic)}${tools}`;
+      if (!exact && total === 0) return `no returned hits · total unknown${meaningSuffix(payload.semantic)}`;
       const noun = total === 1 ? "hit" : "hits";
       const base = total > shown
         ? `${shown} of ${total.toLocaleString()}${exact ? "" : "+ known"} ${noun}`
         : `${total.toLocaleString()}${exact ? "" : "+ known"} ${noun}`;
-      return base + meaningSuffix(payload.semantic) + tools;
+      return base + meaningSuffix(payload.semantic);
     }
 
     function emptySearchMessage(payload) {
       const semantic = payload.semantic;
-      if (state.mode === "semantic" && semantic?.fallback_recommended) {
-        return "Meaning search is unavailable for this query. Try Grep.";
-      }
       if (state.mode === "semantic" && semantic && !semantic.complete
           && Number(semantic.total || 0) > 0) {
         return `No meaning matches in ${Number(semantic.indexed || 0).toLocaleString()} of ${Number(semantic.total).toLocaleString()} indexed rows.`;
       }
-      if (payload.tools_excluded) {
-        return payload.tools_excluded.reason === "events-unavailable"
-          ? "No prose hits; tool events are unavailable right now."
-          : "No prose hits; tool output is still indexing.";
-      }
       if (payload.totals_exact === false) {
         return "No hits were returned; this search did not prove there are none.";
       }
-      return "No matches in the published index.";
+      return "No matches in the index.";
     }
 
     function renderResults(payload) {
@@ -1042,9 +1022,6 @@
           windowData.omitted_events ? `${windowData.omitted_events} tool events` : ""
         ].filter(Boolean).join(" · ");
         head.append(node("div", "cut", `view clipped${omitted ? ` · ${omitted} omitted` : ""}`));
-      }
-      if (windowData.events_unavailable) {
-        head.append(node("div", "cut", "tool events are unavailable right now · the event store is locked by an index pass, or a crashed pass left it unreadable until the next one (`agrep index` runs one where no background indexer does)"));
       }
       const turnNumbers = (windowData.turns || [])
         .map(turn => Number(turn.turn)).filter(Number.isFinite);
@@ -1135,7 +1112,7 @@
       if (Date.now() - Number(payload.updated_at || 0) > staleAfter) {
         lines.push({ kind: "warn", text: `Live view is stale; last update ${preciseAge(payload.updated_at)}.` });
       }
-      if (payload.truncated || payload.recent_trimmed || payload.recent_events_omitted) {
+      if (payload.truncated) {
         lines.push({ kind: "warn", text: "Older live sessions or activity were trimmed from this view." });
       }
       const hiddenSide = Number(payload.hidden_orphan_sides || 0);
@@ -1372,7 +1349,7 @@
         empty.append(node("div", `empty-glyph${state.board.lastError ? "" : " spinner"}`, "//"));
         empty.append(node("h1", "", state.board.lastError ? "Live board unavailable." : "Connecting to live activity…"));
         empty.append(node("p", "", state.board.lastError
-          ? "The explorer will retry while this view stays open."
+          ? "The last live refresh failed."
           : "This view is local, read-only, and updates while visible."));
         reader.replaceChildren(empty);
         return;
@@ -1408,7 +1385,7 @@
       } catch (error) {
         if (error.name === "AbortError" || epoch !== state.board.epoch) return;
         state.board.failures += 1;
-        state.board.lastError = "Live refresh failed; retrying.";
+        state.board.lastError = "Live refresh failed.";
         renderBoard();
       } finally {
         if (state.board.controller === controller) state.board.controller = null;
@@ -1486,7 +1463,7 @@
         showHistoryDetail();
       } catch (error) {
         if (error.name === "AbortError" || epoch !== state.contextEpoch) return;
-        state.board.navigationError = "This live chat is not in the published history yet.";
+        state.board.navigationError = "This live chat is not in the indexed history yet.";
         renderBoardDetail(session, state.board.payload);
       }
     }
@@ -1494,7 +1471,7 @@
     async function searchNow(rowLimit = SEARCH_PAGE_STEP) {
       const query = input.value.trim();
       if (!query) {
-        const message = "Enter a query to search the published index.";
+        const message = "Enter a query to search the index.";
         showRailNotice(message);
         showReaderNotice("Nothing to search yet.", message);
         return;
@@ -1639,10 +1616,7 @@
         const [status, chats] = await Promise.all([
           request("/api/status"), request("/api/chats?n=80")
         ]);
-        state.indexed = Boolean(status.indexed);
-        corpus.textContent = status.indexed
-          ? `${Number(status.sessions).toLocaleString()} chats · ${Number(status.messages).toLocaleString()} rows`
-          : "index not built";
+        corpus.textContent = `${Number(status.sessions).toLocaleString()} chats · ${Number(status.messages).toLocaleString()} rows`;
         renderChats(chats);
         state.ready = true;
         state.lastRecentRequestAt = Date.now();

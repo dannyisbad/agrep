@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate notices for the locked Rust graph used to build agrep-rs."""
+"""Generate notices for the locked Rust graph used to build agrep."""
 
 from __future__ import annotations
 
@@ -18,12 +18,30 @@ OUTPUT = ROOT / "THIRD_PARTY_LICENSES.txt"
 
 
 def _metadata() -> dict:
-    run = subprocess.run(
-        ["cargo", "metadata", "--locked", "--format-version", "1"],
-        cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
-    if run.returncode:
-        raise RuntimeError(run.stderr.strip() or "cargo metadata failed")
-    return json.loads(run.stdout)
+    # Only dependencies that can ship in one of the six release binaries.
+    packages = {}
+    targets = json.loads((ROOT / "bench/targets.json").read_text())
+    for target in targets:
+        run = subprocess.run(
+            ["cargo", "metadata", "--locked", "--format-version", "1",
+             "--filter-platform", target["target"]],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+        if run.returncode:
+            raise RuntimeError(run.stderr.strip() or "cargo metadata failed")
+        metadata = json.loads(run.stdout)
+        by_id = {p["id"]: p for p in metadata["packages"]}
+        nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
+        pending = [p["id"] for p in by_id.values() if p["name"] == "agrep" and p["source"] is None]
+        seen = set()
+        while pending:
+            ident = pending.pop()
+            if ident in seen:
+                continue
+            seen.add(ident)
+            packages[ident] = by_id[ident]
+            pending.extend(d["pkg"] for d in nodes[ident]["deps"]
+                           if any(k["kind"] != "dev" for k in d["dep_kinds"]))
+    return {"packages": list(packages.values())}
 
 
 def _license_files(package: dict) -> list[Path]:
@@ -38,15 +56,31 @@ def _license_files(package: dict) -> list[Path]:
             raise RuntimeError(
                 f"{package['name']} {package['version']} has a non-regular license file")
         found.append(path)
-    if not found:
+    return found
+
+
+def _license_texts(package: dict) -> list[tuple[str, str]]:
+    found = _license_files(package)
+    if found:
+        return [(path.name, _normalized_text(path)) for path in found]
+    # Several published crates (Candle, objc2, ...) omit their license files.
+    # Their Cargo metadata grants MIT alone or as one alternative, so the notice
+    # is the MIT text attributed to the Cargo authors.
+    expression = package.get("license") or ""
+    choices = {part.strip("() ") for part in expression.replace("/", " OR ").split(" OR ")}
+    if " AND " in expression or "MIT" not in choices:
         raise RuntimeError(
             f"{package['name']} {package['version']} has no license file")
-    return found
+    holders = ", ".join(author.split(" <")[0] for author in package.get("authors") or [])
+    holder = holders or f"the {package['name']} authors"
+    template = (ROOT / "bench/licenses/MIT.txt").read_text(encoding="utf-8")
+    return [("MIT from Cargo metadata", template.replace("{holder}", holder))]
 
 
 def _normalized_text(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
-    return text.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    return "\n".join(line.rstrip() for line in lines).rstrip() + "\n"
 
 
 def generate() -> str:
@@ -64,17 +98,19 @@ def generate() -> str:
         repository = package.get("repository") or package.get("homepage") or "-"
         inventory.append(
             f"{package['name']} {package['version']} | {license_id} | {repository}")
-        for path in _license_files(package):
-            label = f"{package['name']} {package['version']} ({path.name})"
-            texts.setdefault(_normalized_text(path), []).append(label)
+        for source, text in _license_texts(package):
+            label = f"{package['name']} {package['version']} ({source})"
+            texts.setdefault(text, []).append(label)
 
     lines = [
         "agrep third-party software notices",
         "==================================",
         "",
-        "This file covers the locked Rust dependency graph used to build agrep-rs",
+        "This file covers the locked Rust dependency graph used to build agrep",
         "and the Unicode 16.0 data compiled into its boundary-ranking tables.",
         "It is generated from Cargo.lock by bench/third_party_licenses.py.",
+        "Crates whose published archive omits a license file are listed with the",
+        "MIT grant from their Cargo metadata, attributed to their Cargo authors.",
         "",
         "Package inventory",
         "-----------------",

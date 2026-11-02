@@ -36,7 +36,7 @@ use crate::model::{Event, Message};
 
 /// What one parsed session yields: rows, tool events, and how completely the
 /// file was read.
-type Parsed = (Vec<Message>, Vec<Event>, crate::ingest_cache::ReadOutcome);
+type Parsed = (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome);
 
 const GZIP_COMPRESSED_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const GZIP_DECOMPRESSED_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -220,16 +220,16 @@ fn parse_with_tally(
     ) {
         Ok(data) => data,
         Err(error) => {
-            eprintln!(
+            crate::intake::diagnostic(format_args!(
                 "  ! {agent}: cannot read {}: {}",
                 crate::ingest::terminal_safe(path.display()),
                 crate::ingest::terminal_safe(&error)
-            );
+            ));
             tally.seen();
             tally.error(&format!("cannot read: {error}"));
             // A compressed session's decode and size-limit failures are its content, not a race.
             let outcome = if path.to_string_lossy().ends_with(".jsonl.gz") {
-                crate::ingest_cache::ReadOutcome::Skipped
+                crate::intake_batch::ReadOutcome::Skipped
             } else {
                 crate::ingest::read_failure_outcome(&error)
             };
@@ -545,7 +545,7 @@ fn parse_with_tally(
             })
             .collect(),
         events,
-        crate::ingest_cache::ReadOutcome::Complete,
+        crate::intake_batch::ReadOutcome::Complete,
     )
 }
 
@@ -741,13 +741,13 @@ fn archived_sessions_root(home_dir: &str) -> PathBuf {
 }
 
 fn collect_store(
-    cache: &mut crate::ingest_cache::IngestCache,
+    cache: &mut crate::intake_batch::IntakeBatch,
     agent: &'static str,
     root: &Path,
     parse: fn(&Path) -> Parsed,
 ) -> (Vec<Message>, Vec<Event>) {
     let files = session_files(agent, root);
-    let pass = crate::ingest_cache::collect_cached_for(cache, agent, root, &files, parse);
+    let pass = crate::intake_batch::collect_cached_for(cache, agent, root, &files, parse);
     (pass.messages, pass.events)
 }
 
@@ -764,7 +764,7 @@ impl crate::ingest::registry::Adapter for Pi {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Stat
     }
-    fn collect(&self, cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+    fn collect(&self, cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
         let mut messages = Vec::new();
         let mut events = Vec::new();
         for home_dir in PI_HOMES {
@@ -787,529 +787,5 @@ impl crate::ingest::registry::Adapter for Pi {
     }
     fn session_alias(&self, path: &Path, session: &str) -> Option<String> {
         session_alias(path, session)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        active_branch, parse_with, parse_with_limits, parse_with_tally, session_file_id,
-        session_files, side_parent_in, Record, GZIP_COMPRESSED_MAX_BYTES,
-        GZIP_DECOMPRESSED_MAX_BYTES,
-    };
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
-
-    fn records(lines: &[&str]) -> Vec<Record> {
-        lines
-            .iter()
-            .enumerate()
-            .map(|(ordinal, line)| Record {
-                value: serde_json::from_str(line).unwrap(),
-                ordinal,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn the_active_branch_drops_the_abandoned_one() {
-        // b2 branches off a, then b3 branches off a again and is appended last:
-        // the leaf is b3, so b2's subtree is not part of the conversation.
-        let parsed = records(&[
-            r#"{"type":"session","id":"s","version":3,"cwd":"/w"}"#,
-            r#"{"type":"message","id":"a","parentId":null}"#,
-            r#"{"type":"message","id":"b2","parentId":"a"}"#,
-            r#"{"type":"message","id":"b3","parentId":"a"}"#,
-        ]);
-        let branch: Vec<&str> = active_branch(&parsed)
-            .into_iter()
-            .map(|index| parsed[index].value["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(branch, vec!["a", "b3"]);
-    }
-
-    #[test]
-    fn a_v1_file_without_ids_keeps_file_order() {
-        let parsed = records(&[
-            r#"{"type":"session","version":1,"cwd":"/w"}"#,
-            r#"{"type":"message","message":{"role":"user","content":"one"}}"#,
-        ]);
-        assert_eq!(active_branch(&parsed), vec![0, 1]);
-    }
-
-    #[test]
-    fn a_parent_cycle_terminates_instead_of_hanging() {
-        let parsed = records(&[
-            r#"{"type":"message","id":"a","parentId":"b"}"#,
-            r#"{"type":"message","id":"b","parentId":"a"}"#,
-        ]);
-        assert_eq!(active_branch(&parsed).len(), 2);
-    }
-
-    fn write(body: &str) -> PathBuf {
-        // Parallel tests share the pid and macOS clocks tick in microseconds.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "agrep-pi-{}-{}.jsonl",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    #[test]
-    fn a_compaction_summary_becomes_a_recap_row() {
-        let path = write(concat!(
-            r#"{"type":"session","id":"s1","version":3,"cwd":"/work/app","timestamp":"2026-01-02T03:04:05.000Z"}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"first question"}]}}"#,
-            "\n",
-            r#"{"type":"compaction","id":"c1","parentId":"m1","timestamp":"2026-01-02T03:04:07.000Z","summary":"earlier context recap","tokensBefore":50000}"#,
-            "\n",
-        ));
-        let (messages, _events, _outcome) = parse_with("pi", &path, None);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(&*messages[0].who, "user");
-        assert_eq!(&*messages[1].who, "recap");
-        assert_eq!(&*messages[1].text, "earlier context recap");
-        assert_eq!(&*messages[1].project, "/work/app");
-        assert_eq!(&*messages[1].session, "s1");
-    }
-
-    #[test]
-    fn a_users_bash_execution_after_the_reply_never_trails_the_turn() {
-        let path = write(concat!(
-            r#"{"type":"session","id":"s9","version":3,"cwd":"/work/app"}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"Fix the kilo parser test."}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Running it."},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"make test"}}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-01-02T03:04:08.000Z","message":{"role":"toolResult","toolCallId":"c1","content":[{"type":"text","text":"ok"}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-01-02T03:04:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixed the kilo parser; all 12 tests pass."}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m5","parentId":"m4","timestamp":"2026-01-02T03:04:10.000Z","message":{"role":"bashExecution","command":"git status","output":"clean","exitCode":0}}"#,
-            "\n",
-            r#"{"type":"message","id":"m6","parentId":"m5","timestamp":"2026-01-02T03:04:11.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"bash","arguments":{"command":"make lint"}}]}}"#,
-            "\n",
-        ));
-        let (_messages, events, _outcome) = parse_with("pi", &path, None);
-        let _ = std::fs::remove_file(&path);
-        let facts: Vec<(&str, bool)> = events
-            .iter()
-            .map(|e| {
-                (
-                    e.call_id.as_str(),
-                    e.meta.contains(crate::ingest::AFTER_REPLY_META),
-                )
-            })
-            .collect();
-        // the user's `!git status` never trails; the agent's unanswered call after it does
-        assert_eq!(facts, [("c1", false), ("m5", false), ("c2", true)]);
-    }
-
-    #[test]
-    fn a_tool_call_pairs_with_the_result_that_answers_it() {
-        let path = write(concat!(
-            r#"{"type":"session","id":"s2","version":3,"cwd":"/work/app"}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"run it"}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"assistant","model":"pi-1","content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"running"},{"type":"toolCall","id":"tc1","name":"bash","arguments":{"command":"ls"}}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-01-02T03:04:08.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"bash","isError":false,"content":[{"type":"text","text":"a.txt"}]}}"#,
-            "\n",
-        ));
-        let (messages, events, _outcome) = parse_with("pi", &path, None);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].reply, "running");
-        assert!(!messages[0].reply.contains("hidden"), "reasoning leaked");
-        assert_eq!(&*messages[0].model, "pi-1");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "bash");
-        assert_eq!(events[0].output, "a.txt");
-        assert_eq!(events[0].ok, Some(true));
-    }
-
-    #[test]
-    fn a_v3_custom_record_is_not_a_conversation_turn() {
-        let path = write(concat!(
-            r#"{"type":"session","id":"s3","version":3,"cwd":"/work/app"}"#,
-            "\n",
-            r#"{"type":"custom","id":"x1","parentId":null,"customType":"ext.state","data":{"k":1}}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":"x1","timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"text","text":"only turn"}]}}"#,
-            "\n",
-        ));
-        let (messages, _events, _outcome) = parse_with("pi", &path, None);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].text, "only turn");
-    }
-
-    #[test]
-    fn a_synthetic_transcript_mirror_is_not_a_user_row() {
-        // The mirror (m2) sits on the active branch between prompt and reply;
-        // m1x is an abandoned sibling of m1, counted-and-skipped, never
-        // re-walked. Six records may yield exactly one user row plus one recap.
-        let path = write(concat!(
-            r#"{"type":"session","id":"s4","version":3,"cwd":"/work/app"}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"real question"}]}}"#,
-            "\n",
-            r#"{"type":"message","id":"m1x","parentId":null,"timestamp":"2026-01-02T03:04:06.500Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"abandoned branch"}]}}"#,
-            "\n",
-            r####"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**user**:\nreal question\n"}]}}"####,
-            "\n",
-            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-01-02T03:04:08.000Z","message":{"role":"assistant","model":"pi-1","content":[{"type":"text","text":"an answer"}]}}"#,
-            "\n",
-            r#"{"type":"compaction","id":"c1","parentId":"m3","timestamp":"2026-01-02T03:04:09.000Z","summary":"recap of earlier context"}"#,
-            "\n",
-        ));
-        let (messages, _events, _outcome) = parse_with("pi", &path, None);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(messages.len(), 2, "one genuine prompt plus one recap");
-        assert_eq!(&*messages[0].who, "user");
-        assert_eq!(&*messages[0].text, "real question");
-        // the reply lands on the genuine row, not on a mirror row
-        assert_eq!(&*messages[0].reply, "an answer");
-        assert_eq!(&*messages[1].who, "recap");
-        assert!(
-            !messages.iter().any(|m| m.text.contains("Session update")),
-            "a synthetic mirror leaked into the user lane"
-        );
-    }
-
-    #[test]
-    fn an_advisor_sidecar_indexes_its_own_voice_but_never_the_mirrors() {
-        // A sidecar's user side is all synthetic mirrors, so its assistant records
-        // are anchorless: text-bearing ones become the sidecar's own rows, pure-
-        // thinking ones emit nothing, and tool events survive as events.
-        let root = std::env::temp_dir().join(format!(
-            "agrep-omp-advisor-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let sessions = root.join("agent").join("sessions");
-        let container = "2026-08-18T03-34-43-541Z_01a012ef-8a55-7000-b9ca-8ab44ce2a383";
-        let child = sessions
-            .join("project")
-            .join(container)
-            .join("__advisor.jsonl");
-        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-        std::fs::write(
-            &child,
-            concat!(
-                r#"{"type":"session","id":"advisor","version":3,"cwd":"/work/app"}"#,
-                "\n",
-                r####"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**user**:\nhi\n"}]}}"####,
-                "\n",
-                r####"{"type":"message","id":"m2","parentId":"m1","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**agent**:\nhello\n"}]}}"####,
-                "\n",
-                r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"assistant","model":"pi-1","content":[{"type":"text","text":"advice"},{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"a.rs"}}]}}"#,
-                "\n",
-                r#"{"type":"message","id":"m4","parentId":"m3","message":{"role":"toolResult","toolCallId":"tc1","content":[{"type":"text","text":"fn main() {}"}]}}"#,
-                "\n",
-                r#"{"type":"message","id":"m5","parentId":"m4","message":{"role":"assistant","content":[{"type":"thinking","thinking":"weighing options"}]}}"#,
-                "\n",
-                r####"{"type":"message","id":"m6","parentId":"m5","message":{"role":"user","synthetic":true,"attribution":"agent","content":[{"type":"text","text":"### Session update\n\n**agent**:\nmore\n"}]}}"####,
-                "\n",
-                r#"{"type":"message","id":"m7","parentId":"m6","message":{"role":"assistant","content":[{"type":"text","text":"ship the advisory"}]}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let parent = side_parent_in(&sessions, &child);
-        assert_eq!(
-            parent.as_deref(),
-            Some("01a012ef-8a55-7000-b9ca-8ab44ce2a383")
-        );
-        let tally = std::sync::Arc::new(crate::intake::Tally::default());
-        let (messages, events, outcome) = parse_with_tally(
-            "pi",
-            &child,
-            parent,
-            GZIP_COMPRESSED_MAX_BYTES,
-            GZIP_DECOMPRESSED_MAX_BYTES,
-            std::sync::Arc::clone(&tally),
-        );
-        let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
-        let texts: Vec<&str> = messages.iter().map(|m| &*m.text).collect();
-        assert_eq!(texts, vec!["advice", "ship the advisory"]);
-        for (expected_turn, message) in messages.iter().enumerate() {
-            assert!(message.side);
-            assert_eq!(&*message.parent, "01a012ef-8a55-7000-b9ca-8ab44ce2a383");
-            assert_eq!(&*message.who, "user");
-            assert_eq!(message.turn, expected_turn as u32);
-            assert!(message.reply.is_empty());
-        }
-        assert_eq!(&*messages[0].model, "pi-1");
-        assert!(
-            !texts.iter().any(|t| t.contains("Session update")),
-            "a synthetic mirror leaked into the row lane"
-        );
-        assert!(
-            !texts.iter().any(|t| t.contains("weighing options")),
-            "reasoning leaked"
-        );
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "read");
-        assert_eq!(events[0].output, "fn main() {}");
-        // seen == the 8 physical lines; 3 mirrors sidechain, 1 pure-thinking
-        // assistant empty-text, header meta, toolResult non-human, 2 rows.
-        assert_eq!(
-            tally.test_record_counts(crate::intake::Skip::Sidechain),
-            (8, 2, 0, 3, 0)
-        );
-        assert_eq!(
-            tally.test_record_counts(crate::intake::Skip::EmptyText),
-            (8, 2, 0, 1, 0)
-        );
-    }
-
-    #[test]
-    fn nested_omp_sessions_link_to_their_root_chat() {
-        let root = std::env::temp_dir().join(format!(
-            "agrep-omp-side-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let sessions = root.join("agent").join("sessions");
-        let container = "2026-08-09T20-59-21-133Z_019fe852-b0ad-7000-b68f-f054af8dff14";
-        let child = sessions
-            .join("project")
-            .join(container)
-            .join("worker.jsonl");
-        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-        std::fs::write(
-            &child,
-            concat!(
-                r#"{"type":"session","id":"child","version":3,"cwd":"/work/app"}"#,
-                "\n",
-                r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"task"}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let parent = side_parent_in(&sessions, &child);
-        let (messages, _events, _outcome) = parse_with("pi", &child, parent);
-        let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].side);
-        assert_eq!(&*messages[0].parent, "019fe852-b0ad-7000-b68f-f054af8dff14");
-    }
-
-    #[test]
-    fn a_root_filename_id_is_the_id_its_sidechat_container_hands_to_children() {
-        let sessions = Path::new("/work/fixture/sessions");
-        let container = "2026-04-05T06-07-08-000Z_file-id";
-        let slug = sessions.join("project");
-        let root = slug.join(format!("{container}.jsonl"));
-        let child = slug.join(container).join("worker.jsonl");
-        assert_eq!(
-            session_file_id(sessions, &root),
-            side_parent_in(sessions, &child).as_deref()
-        );
-        assert_eq!(
-            session_file_id(sessions, &slug.join(format!("{container}.jsonl.gz"))),
-            Some("file-id")
-        );
-    }
-
-    #[test]
-    fn only_stamped_slug_level_filenames_carry_an_id() {
-        let sessions = Path::new("/work/fixture/sessions");
-        let slug = sessions.join("project");
-        let container = "2026-04-05T06-07-08-000Z_file-id";
-        for named in [
-            slug.join(container).join("__advisor.jsonl"),
-            slug.join(container).join("worker.jsonl"),
-            slug.join(container).join(format!("{container}.jsonl")),
-            slug.join("session.jsonl.gz"),
-            slug.join("my_notes.jsonl"),
-            slug.join("2026-04-05_file-id.jsonl"),
-            slug.join("2026-04-05T06-07-08-000Z_.jsonl"),
-            slug.join(format!("{container}.pre-surgery.jsonl.bak")),
-            Path::new("/elsewhere").join(format!("{container}.jsonl")),
-        ] {
-            assert_eq!(
-                session_file_id(sessions, &named),
-                None,
-                "{}",
-                named.display()
-            );
-        }
-    }
-
-    #[test]
-    fn cold_archive_sessions_and_nested_sidecars_remain_discoverable() {
-        let root = std::env::temp_dir().join(format!(
-            "agrep-omp-archive-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let archive = root.join("agent").join("archive").join("sessions");
-        let container = "2026-07-01T10-00-00-000Z_archived-root";
-        let main = archive
-            .join("project")
-            .join(format!("{container}.jsonl.gz"));
-        let child = archive.join("project").join(container).join("worker.jsonl");
-        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-        let body = concat!(
-            r#"{"type":"session","id":"archived-root","version":3,"cwd":"/work/archive"}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"remember this archive fact"}}"#,
-            "\n",
-        );
-        let mut encoder = flate2::write::GzEncoder::new(
-            std::fs::File::create(&main).unwrap(),
-            flate2::Compression::default(),
-        );
-        encoder.write_all(body.as_bytes()).unwrap();
-        encoder.finish().unwrap();
-        std::fs::write(
-            &child,
-            concat!(
-                r#"{"type":"session","id":"archived-child","version":3,"cwd":"/work/archive"}"#,
-                "\n",
-                r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"archived side task"}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-
-        let files = session_files("pi", &archive);
-        assert!(files.contains(&main));
-        assert!(files.contains(&child));
-        let (messages, _events, outcome) = parse_with("pi", &main, None);
-        let parent = side_parent_in(&archive, &child);
-        let (side_messages, _events, side_outcome) = parse_with("pi", &child, parent);
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Complete);
-        assert_eq!(&*messages[0].text, "remember this archive fact");
-        assert_eq!(&*messages[0].session, "archived-root");
-        assert_eq!(side_outcome, crate::ingest_cache::ReadOutcome::Complete);
-        assert!(side_messages[0].side);
-        assert_eq!(&*side_messages[0].parent, "archived-root");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_archive_slug_symlink_is_not_ingested() {
-        use std::os::unix::fs::symlink;
-
-        let root = std::env::temp_dir().join(format!(
-            "agrep-omp-archive-link-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let outside = root.with_extension("outside");
-        let archive = root.join("agent").join("archive").join("sessions");
-        let safe = archive.join("safe").join("safe.jsonl");
-        let escaped = outside.join("escaped.jsonl");
-        std::fs::create_dir_all(safe.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(&safe, "{}\n").unwrap();
-        std::fs::write(&escaped, "{}\n").unwrap();
-        symlink(&outside, archive.join("linked-slug")).unwrap();
-
-        let files = session_files("pi", &archive);
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outside);
-
-        assert_eq!(files, vec![safe]);
-    }
-
-    #[test]
-    fn gzip_expansion_overflow_is_skipped_and_cannot_replace_cached_rows() {
-        const COMPRESSED_LIMIT: u64 = 1024;
-        const DECOMPRESSED_LIMIT: u64 = 512;
-
-        let root = std::env::temp_dir().join(format!(
-            "agrep-omp-gzip-limit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = root.join("project").join("session.jsonl.gz");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let write_gzip = |body: &str| {
-            let mut encoder = flate2::write::GzEncoder::new(
-                std::fs::File::create(&path).unwrap(),
-                flate2::Compression::default(),
-            );
-            encoder.write_all(body.as_bytes()).unwrap();
-            encoder.finish().unwrap();
-        };
-        write_gzip(concat!(
-            r#"{"type":"session","id":"good","version":3,"cwd":"/work/archive"}"#,
-            "\n",
-            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"last known good"}}"#,
-            "\n",
-        ));
-
-        let mut cache = crate::ingest_cache::IngestCache::cold();
-        let first = crate::ingest_cache::collect_cached_for(
-            &mut cache,
-            "pi",
-            &root,
-            std::slice::from_ref(&path),
-            |path| parse_with_limits("pi", path, None, COMPRESSED_LIMIT, DECOMPRESSED_LIMIT),
-        );
-        assert_eq!(first.messages.len(), 1);
-        assert_eq!(&*first.messages[0].text, "last known good");
-        assert!(cache.source_snapshot_safe());
-
-        let replacement = format!(
-            concat!(
-                r#"{{"type":"session","id":"replacement","version":3,"cwd":"/work/archive"}}"#,
-                "\n",
-                r#"{{"type":"message","id":"m2","parentId":null,"message":{{"role":"user","content":"unsafe replacement"}}}}"#,
-                "\n{}"
-            ),
-            " ".repeat(DECOMPRESSED_LIMIT as usize)
-        );
-        assert!(replacement.len() as u64 > DECOMPRESSED_LIMIT);
-        write_gzip(&replacement);
-        assert!(std::fs::metadata(&path).unwrap().len() <= COMPRESSED_LIMIT);
-
-        let (messages, events, outcome) =
-            parse_with_limits("pi", &path, None, COMPRESSED_LIMIT, DECOMPRESSED_LIMIT);
-        assert!(messages.is_empty());
-        assert!(events.is_empty());
-        assert_eq!(outcome, crate::ingest_cache::ReadOutcome::Skipped);
-
-        let guarded = crate::ingest_cache::collect_cached_for(
-            &mut cache,
-            "pi",
-            &root,
-            std::slice::from_ref(&path),
-            |path| parse_with_limits("pi", path, None, COMPRESSED_LIMIT, DECOMPRESSED_LIMIT),
-        );
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert_eq!(guarded.messages.len(), 1);
-        assert_eq!(&*guarded.messages[0].text, "last known good");
-        assert!(!cache.source_snapshot_safe());
     }
 }

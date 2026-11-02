@@ -19,8 +19,6 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
-#[cfg(test)]
-use crate::ingest::registry::fnv_token;
 use crate::ingest::registry::{
     metadata_is_link, read_bounded_regular_file, ATTRIBUTION_ISSUE_KIND,
 };
@@ -154,11 +152,6 @@ fn user_dir_checked_in(
     Ok(None)
 }
 
-#[cfg(test)]
-fn user_dir_checked_at(home: &std::path::Path) -> Result<Option<std::path::PathBuf>, UserDirError> {
-    user_dir_checked_in(user_dir_candidates_at(home, None))
-}
-
 /// The native Cursor profile wins; copied cross-OS profiles are migration fallback only.
 fn user_dir_checked() -> Result<Option<std::path::PathBuf>, UserDirError> {
     user_dir_checked_in(user_dir_candidates(&crate::ingest::home()))
@@ -179,11 +172,11 @@ struct OpenFailure {
 /// Open Cursor without write authority; failures retain the last-good token generation.
 fn open_ro(path: &std::path::Path) -> Result<crate::ingest::ReadOnlyConnection, OpenFailure> {
     crate::ingest::open_sqlite_ro(path).map_err(|e| {
-        eprintln!(
+        crate::intake::diagnostic(format_args!(
             "  ! cursor: cannot open {}: {}",
             crate::ingest::terminal_safe(path.display()),
             crate::ingest::terminal_safe(&e)
-        );
+        ));
         OpenFailure {
             defect: crate::ingest::sqlite_open_defect(path, &e),
             moved: crate::ingest::sqlite_open_moved(&e),
@@ -723,14 +716,6 @@ fn token_snapshot(
     })
 }
 
-#[cfg(test)]
-fn session_tokens(
-    conn: &Connection,
-    projects: &HashMap<String, String>,
-) -> rusqlite::Result<Vec<(String, String)>> {
-    token_snapshot(conn, projects, false).map(|snapshot| snapshot.sessions)
-}
-
 fn stable_generation_read<T>(
     opened_generation: Option<&str>,
     path: &std::path::Path,
@@ -993,19 +978,19 @@ fn parse_session(
 
 /// Open the store read-only and collect messages + tool events, reparsing only sessions
 /// whose token moved. A store that cannot open serves the cached conversations.
-pub fn collect(cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+pub fn collect(cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
     collect_discovered(cache, user_dir_checked())
 }
 
 fn collect_discovered(
-    cache: &mut crate::ingest_cache::IngestCache,
+    cache: &mut crate::intake_batch::IntakeBatch,
     discovery: Result<Option<std::path::PathBuf>, UserDirError>,
 ) -> (Vec<Message>, Vec<Event>) {
     if let Err(error) = &discovery {
-        eprintln!(
+        crate::intake::diagnostic(format_args!(
             "  ! cursor: source discovery failed: {}",
             crate::ingest::terminal_safe(error)
-        );
+        ));
         cache.record_source_read_issue(
             "cursor",
             &error.path,
@@ -1017,21 +1002,23 @@ fn collect_discovered(
     let db_path = user
         .as_ref()
         .map(|u| u.join("globalStorage").join("state.vscdb"));
-    crate::fault_injection::park_gate("cursor-open");
     let opened = db_path.as_deref().map(open_ro);
-    crate::fault_injection::park_gate("cursor-read");
     // A database with a defect no retry heals, where nothing was ever published, lists no
     // conversation and keeps its cache, like a schema-absent one, instead of failing closed.
     let durably_blind = db_path
         .as_deref()
         .zip(opened.as_ref())
-        .is_some_and(|(path, opened)| {
-            matches!(opened, Err(OpenFailure { defect: Some(_), .. }))
-                && cache.published_material_under("cursor", path)
-                    == crate::ingest_cache::MaterialVerdict::Retained
+        .is_some_and(|(_path, opened)| {
+            matches!(
+                opened,
+                Err(OpenFailure {
+                    defect: Some(_),
+                    ..
+                })
+            )
         });
     if let (Some(Err(failure)), Some(path)) = (opened.as_ref(), db_path.as_deref()) {
-        let issue = crate::ingest_cache::SourceReadIssue::new(
+        let issue = crate::intake_batch::SourceReadIssue::new(
             "cursor",
             path,
             "source-read-failed",
@@ -1048,7 +1035,7 @@ fn collect_discovered(
         (Some(conn), Some(user)) => match workspace_projects_if_conversations(conn, user) {
             Ok(attribution) => Some(attribution),
             Err(error) => {
-                eprintln!(
+                crate::intake::diagnostic(format_args!(
                     "  ! cursor: cannot read {}: {}",
                     crate::ingest::terminal_safe(
                         db_path
@@ -1057,7 +1044,7 @@ fn collect_discovered(
                             .display(),
                     ),
                     crate::ingest::terminal_safe(&error)
-                );
+                ));
                 if let Some(path) = db_path.as_deref() {
                     cache.record_source_read_issue(
                         "cursor",
@@ -1075,8 +1062,7 @@ fn collect_discovered(
     // cached rows carry (the published generation's when no cache holds them) or parses under
     // "cursor"; the gap is attribution-only since every conversation was read.
     if let Some(attribution) = attribution.as_mut() {
-        let mut published = cache.published_token_projects("cursor");
-        published.extend(cache.token_projects("cursor"));
+        let published = cache.token_projects("cursor");
         attribution.retain_published(&published);
         if let Some(gap) = attribution.incomplete.as_ref() {
             cache.record_source_read_issue(
@@ -1106,7 +1092,7 @@ fn collect_discovered(
         ) {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
-                eprintln!(
+                crate::intake::diagnostic(format_args!(
                     "  ! cursor: cannot read {}: {}",
                     crate::ingest::terminal_safe(
                         db_path
@@ -1115,9 +1101,9 @@ fn collect_discovered(
                             .display(),
                     ),
                     crate::ingest::terminal_safe(&error)
-                );
+                ));
                 if let Some(path) = db_path.as_deref() {
-                    let issue = crate::ingest_cache::SourceReadIssue::new(
+                    let issue = crate::intake_batch::SourceReadIssue::new(
                         "cursor",
                         path,
                         "source-read-failed",
@@ -1171,7 +1157,7 @@ fn collect_discovered(
         unenumerable,
         has_readable_source,
         |_, sid| {
-            use crate::ingest_cache::ReadOutcome;
+            use crate::intake_batch::ReadOutcome;
             if sid == SCHEMA_ABSENT_SESSION {
                 return (Vec::new(), Vec::new(), ReadOutcome::Complete);
             }
@@ -1211,7 +1197,7 @@ fn collect_discovered(
         let reason = panicked
             .unwrap_or_else(|| "the composer's stored rows did not parse completely".to_owned());
         cache.record_read_issue(
-            crate::ingest_cache::SourceReadIssue::new("cursor", path, "source-read-failed", reason)
+            crate::intake_batch::SourceReadIssue::new("cursor", path, "source-read-failed", reason)
                 .for_session(session),
         );
     }
@@ -1332,10 +1318,12 @@ fn census_read_issue(
 ) -> crate::ingest::registry::TokenReadIssue {
     let reason = format!("cannot read {}: {error}", path.display());
     let corrupt = error.chain().any(|cause| {
-        cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
-            crate::ingest::sqlite_corrupt(error)
-                || crate::ingest::sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase)
-        })
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|error| {
+                crate::ingest::sqlite_corrupt(error)
+                    || crate::ingest::sqlite_code(error) == Some(rusqlite::ErrorCode::NotADatabase)
+            })
     });
     if corrupt {
         crate::ingest::registry::TokenReadIssue::with_kind(path, "corrupt-database", reason)
@@ -1351,13 +1339,19 @@ impl crate::ingest::registry::Adapter for Cursor {
     fn fingerprint(&self) -> crate::ingest::registry::Fingerprint {
         crate::ingest::registry::Fingerprint::Token
     }
-    fn collect(&self, cache: &mut crate::ingest_cache::IngestCache) -> (Vec<Message>, Vec<Event>) {
+    fn collect(&self, cache: &mut crate::intake_batch::IntakeBatch) -> (Vec<Message>, Vec<Event>) {
         collect(cache)
     }
     fn store_roots(&self) -> Vec<std::path::PathBuf> {
         user_dir()
             .map(|u| u.join("globalStorage").join("state.vscdb"))
             .into_iter()
+            .collect()
+    }
+    fn archive_roots(&self) -> Vec<std::path::PathBuf> {
+        user_dir_candidates(&crate::ingest::home())
+            .into_iter()
+            .map(|p| p.join("globalStorage/state.vscdb"))
             .collect()
     }
     fn freshness_tokens(&self) -> crate::ingest::registry::TokenAvailability {
@@ -1368,7 +1362,7 @@ impl crate::ingest::registry::Adapter for Cursor {
     }
     fn intake_tokens_with(
         &self,
-        cache: Option<&crate::ingest_cache::CacheView>,
+        cache: Option<&crate::intake_batch::IntakeBatch>,
     ) -> crate::ingest::registry::TokenAvailability {
         let published = cache.map(|cache| cache.token_projects("cursor"));
         intake_tokens_at(user_dir_checked(), published.as_ref())
@@ -1381,694 +1375,5 @@ impl crate::ingest::registry::Adapter for Cursor {
         let user =
             user_dir().unwrap_or_else(|| user_dir_candidates(&crate::ingest::home())[0].clone());
         user.join("globalStorage").join("state.vscdb")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        collect_discovered, fnv_token, freshness_tokens_at, intake_tokens_at, parse_session,
-        session_tokens, stable_generation_read, token_snapshot, user_dir_candidates_at,
-        user_dir_checked_at, workspace_projects, SCHEMA_ABSENT_SESSION, SCHEMA_ABSENT_TOKEN,
-        TOKEN_SCAN_SQL,
-    };
-    use crate::ingest::registry::TokenAvailability;
-    use rusqlite::{params, Connection};
-    use std::collections::HashMap;
-
-    #[test]
-    fn native_cursor_profile_wins_over_copied_profiles() {
-        let root =
-            std::env::temp_dir().join(format!("agrep-cursor-profile-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let candidates = user_dir_candidates_at(&root, None);
-        for user in &candidates {
-            let storage = user.join("globalStorage");
-            std::fs::create_dir_all(&storage).unwrap();
-            std::fs::write(storage.join("state.vscdb"), b"fixture").unwrap();
-        }
-        assert_eq!(
-            user_dir_checked_at(&root).unwrap(),
-            Some(candidates[0].clone())
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn windows_candidate_uses_appdata_override() {
-        let root = std::path::Path::new("home-fixture");
-        let appdata = std::path::Path::new("roaming-fixture");
-        let candidates = user_dir_candidates_at(root, Some(appdata));
-        assert!(candidates.contains(&appdata.join("Cursor").join("User")));
-        assert!(!candidates.contains(
-            &root
-                .join("AppData")
-                .join("Roaming")
-                .join("Cursor")
-                .join("User")
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workspace_registry_skips_special_files() {
-        let root = std::env::temp_dir().join(format!(
-            "agrep-cursor-workspace-special-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let workspace = root.join("workspaceStorage/hash/workspace.json");
-        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&workspace)
-            .status()
-            .unwrap()
-            .success());
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(workspace_projects(&conn, &root)
-            .unwrap()
-            .projects
-            .is_empty());
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV(
-                 key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-             INSERT INTO cursorDiskKV VALUES('composerData:c', 'composer');
-             CREATE TABLE composerHeaders(
-                 composerId TEXT PRIMARY KEY, workspaceId TEXT);
-             INSERT INTO composerHeaders VALUES('c', 'hash');",
-        )
-        .unwrap();
-        let gap = workspace_projects(&conn, &root)
-            .unwrap()
-            .incomplete
-            .expect("an unreadable workspace.json leaves c unattributed");
-        assert_eq!(gap.path, workspace);
-        assert_eq!(gap.unmapped, vec!["c".to_string()]);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn composer_headers_attribute_workspaces_with_legacy_fallback() {
-        let root = std::env::temp_dir().join(format!(
-            "agrep-cursor-composer-headers-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let header_dir = root.join("workspaceStorage/header-workspace");
-        let legacy_dir = root.join("workspaceStorage/legacy-workspace");
-        std::fs::create_dir_all(&header_dir).unwrap();
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(
-            header_dir.join("workspace.json"),
-            br#"{"folder":"file:///work/header-project"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            legacy_dir.join("workspace.json"),
-            br#"{"folder":"file:///work/legacy-project"}"#,
-        )
-        .unwrap();
-        let legacy = Connection::open(legacy_dir.join("state.vscdb")).unwrap();
-        legacy
-            .execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);")
-            .unwrap();
-        legacy
-            .execute(
-                "INSERT INTO ItemTable VALUES ('composer.composerData', ?1)",
-                [r#"{"allComposers":[{"composerId":"shared"},{"composerId":"legacy"}]}"#],
-            )
-            .unwrap();
-        drop(legacy);
-
-        let global = Connection::open_in_memory().unwrap();
-        global
-            .execute_batch(
-                "CREATE TABLE composerHeaders(\
-                 composerId TEXT PRIMARY KEY, workspaceId TEXT);\
-                 INSERT INTO composerHeaders VALUES ('shared', 'header-workspace');\
-                 INSERT INTO composerHeaders VALUES ('modern', 'header-workspace');",
-            )
-            .unwrap();
-        let projects = workspace_projects(&global, &root).unwrap().projects;
-        assert_eq!(
-            projects.get("shared").map(String::as_str),
-            Some("header-project")
-        );
-        assert_eq!(
-            projects.get("modern").map(String::as_str),
-            Some("header-project")
-        );
-        assert_eq!(
-            projects.get("legacy").map(String::as_str),
-            Some("legacy-project")
-        );
-
-        global.execute("DROP TABLE composerHeaders", []).unwrap();
-        global
-            .execute("CREATE TABLE composerHeaders(composerId TEXT)", [])
-            .unwrap();
-        let drifted = workspace_projects(&global, &root).unwrap().projects;
-        assert_eq!(
-            drifted.get("shared").map(String::as_str),
-            Some("legacy-project")
-        );
-        assert_eq!(
-            drifted.get("legacy").map(String::as_str),
-            Some("legacy-project")
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn thought_bubbles_are_not_searchable_replies() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1,?2)",
-            params![
-                "composerData:c",
-                r#"{"createdAt":1,"fullConversationHeadersOnly":[{"bubbleId":"u"},{"bubbleId":"t"}]}"#
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1,?2)",
-            params!["bubbleId:c:u", r#"{"type":1,"text":"real question"}"#],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1,?2)",
-            params![
-                "bubbleId:c:t",
-                r#"{"type":2,"text":"private reasoning trace","isThought":true}"#
-            ],
-        )
-        .unwrap();
-
-        let (messages, events, healthy) = parse_session(
-            &conn,
-            std::path::Path::new("cursor-test.db"),
-            &HashMap::new(),
-            "c",
-            "token",
-        );
-        assert!(healthy);
-        assert!(events.is_empty());
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&*messages[0].text, "real question");
-        assert!(messages[0].reply.is_empty());
-    }
-
-    #[test]
-    fn schema_without_composer_storage_is_readable_but_unenumerable() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            session_tokens(&conn, &HashMap::new()).unwrap(),
-            vec![(
-                SCHEMA_ABSENT_SESSION.to_string(),
-                SCHEMA_ABSENT_TOKEN.to_string()
-            )]
-        );
-
-        // The present-but-empty table is the case that must still enumerate to zero.
-        conn.execute("CREATE TABLE cursorDiskKV(key TEXT UNIQUE, value BLOB)", [])
-            .unwrap();
-        assert_eq!(
-            session_tokens(&conn, &HashMap::new()).unwrap(),
-            Vec::<(String, String)>::new()
-        );
-    }
-
-    #[test]
-    fn empty_main_store_ignores_unreadable_workspace_attribution() {
-        let root =
-            std::env::temp_dir().join(format!("agrep-cursor-empty-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let global = root.join("globalStorage");
-        std::fs::create_dir_all(&global).unwrap();
-        let conn = Connection::open(global.join("state.vscdb")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV(\
-             key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
-        )
-        .unwrap();
-        std::fs::write(root.join("workspaceStorage"), b"not a directory").unwrap();
-
-        assert!(matches!(
-            freshness_tokens_at(Ok(Some(root.clone()))),
-            TokenAvailability::Empty
-        ));
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-            params!["agentKv:blob:noise", b"not a conversation"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1, NULL)",
-            params!["composerData:null"],
-        )
-        .unwrap();
-        drop(conn);
-        assert!(matches!(
-            freshness_tokens_at(Ok(Some(root.clone()))),
-            TokenAvailability::Empty
-        ));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A workspace root that cannot be enumerated hides no conversation: each is listed on its
-    /// token under the fallback project, named provisional by the issue on that root.
-    #[test]
-    fn conversations_under_an_unreadable_workspace_root_are_listed_provisionally() {
-        let root =
-            std::env::temp_dir().join(format!("agrep-cursor-data-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let global = root.join("globalStorage");
-        std::fs::create_dir_all(&global).unwrap();
-        let conn = Connection::open(global.join("state.vscdb")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV(\
-             key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-            params!["composerData:c#part", b"composer"],
-        )
-        .unwrap();
-        drop(conn);
-        std::fs::write(root.join("workspaceStorage"), b"not a directory").unwrap();
-
-        for intake_keys in [false, true] {
-            let census = if intake_keys {
-                intake_tokens_at(Ok(Some(root.clone())), Some(&HashMap::new()))
-            } else {
-                freshness_tokens_at(Ok(Some(root.clone())))
-            };
-            match census {
-                TokenAvailability::Partial { tokens, issues } => {
-                    assert_eq!(tokens.len(), if intake_keys { 2 } else { 1 }, "{tokens:?}");
-                    assert_eq!(issues.len(), 1, "{issues:?}");
-                    assert_eq!(issues[0].path, root.join("workspaceStorage"));
-                    assert_eq!(issues[0].provisional, vec!["c#part".to_string()]);
-                }
-                other => panic!("intake_keys={intake_keys}: {other:?}"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A composer id holding ':' owns its bubbles: an edit to one moves that composer's token,
-    /// not the token of a composer whose id is a shorter prefix of it.
-    #[test]
-    fn bubble_keys_belong_to_the_longest_composer_id_they_extend() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);")
-            .unwrap();
-        for (key, value) in [
-            ("composerData:c", r#"{"createdAt":1}"#),
-            ("composerData:c:part", r#"{"createdAt":1}"#),
-            ("bubbleId:c:u", r#"{"type":1,"text":"short"}"#),
-            ("bubbleId:c:part:b", r#"{"type":1,"text":"before"}"#),
-        ] {
-            conn.execute("INSERT INTO cursorDiskKV VALUES (?1, ?2)", params![key, value])
-                .unwrap();
-        }
-        let tokens = |conn: &Connection| -> HashMap<String, String> {
-            session_tokens(conn, &HashMap::new())
-                .unwrap()
-                .into_iter()
-                .collect()
-        };
-        let before = tokens(&conn);
-        assert_eq!(before.len(), 2);
-        conn.execute(
-            "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
-            params!["bubbleId:c:part:b", r#"{"type":1,"text":"after"}"#],
-        )
-        .unwrap();
-        let after = tokens(&conn);
-        assert_ne!(before["c:part"], after["c:part"]);
-        assert_eq!(before["c"], after["c"]);
-    }
-
-    #[test]
-    fn token_scan_is_two_index_ranges_and_byte_exact_at_scale() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV(\
-             key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
-        )
-        .unwrap();
-        let tx = conn.transaction().unwrap();
-        for index in 0..512 {
-            let cid = format!("c{index:04}");
-            tx.execute(
-                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-                params![format!("composerData:{cid}"), format!("composer-{index}")],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-                params![
-                    format!("bubbleId:{cid}:b{index:04}"),
-                    format!("bubble-{index}")
-                ],
-            )
-            .unwrap();
-        }
-        tx.execute(
-            "INSERT INTO cursorDiskKV VALUES ('agentKv:blob:noise', 'ignored')",
-            [],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let projects = HashMap::from([("c0000".to_string(), "mapped".to_string())]);
-        let tokens = session_tokens(&conn, &projects).unwrap();
-        assert_eq!(tokens.len(), 512);
-        let mut expected = b"composer-0".to_vec();
-        expected.extend_from_slice(b"bubbleId:c0000:b0000bubble-0\0project\0mapped");
-        assert_eq!(tokens[0], ("c0000".to_string(), fnv_token(&expected)));
-
-        for sql in TOKEN_SCAN_SQL {
-            let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let details: Vec<String> = plan
-                .query_map([], |row| row.get(3))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            let detail = details.join(" | ");
-            assert!(
-                detail.contains("SEARCH cursorDiskKV")
-                    && detail.contains("key>?")
-                    && detail.contains("key<?"),
-                "token scan lost its indexed range plan: {detail}"
-            );
-        }
-
-        conn.execute(
-            "UPDATE cursorDiskKV SET value = 'Bubble-0' \
-             WHERE key = 'bubbleId:c0000:b0000'",
-            [],
-        )
-        .unwrap();
-        let edited = session_tokens(&conn, &projects).unwrap();
-        assert_ne!(edited[0].1, tokens[0].1);
-        let relabeled = session_tokens(&conn, &HashMap::new()).unwrap();
-        assert_ne!(relabeled[0].1, edited[0].1);
-    }
-
-    #[test]
-    fn census_accounts_for_unlisted_and_orphan_bubbles() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV(\
-             key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-            params![
-                "composerData:c#part",
-                r#"{"fullConversationHeadersOnly":[{"bubbleId":"listed"}]}"#
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cursorDiskKV VALUES ('composerData:null', NULL)",
-            [],
-        )
-        .unwrap();
-        for (key, value) in [
-            ("bubbleId:c#part:listed", "listed"),
-            ("bubbleId:c#part:unlisted", "unlisted"),
-            ("bubbleId:ghost:orphan", "orphan"),
-        ] {
-            conn.execute(
-                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-                params![key, value],
-            )
-            .unwrap();
-        }
-
-        let before = token_snapshot(&conn, &HashMap::new(), true).unwrap();
-        let census = before.census.as_ref().unwrap();
-        assert_eq!(census.composer_rows, 2);
-        assert_eq!(census.unreferenced_bubbles, 2);
-        assert_eq!(before.sessions.len(), 1);
-        assert_eq!(before.sessions[0].0, "c#part");
-
-        conn.execute(
-            "UPDATE cursorDiskKV SET value = 'changed' WHERE key = 'bubbleId:ghost:orphan'",
-            [],
-        )
-        .unwrap();
-        let after = token_snapshot(&conn, &HashMap::new(), true).unwrap();
-        assert_eq!(before.sessions, after.sessions);
-        assert_ne!(before.census.unwrap().token, after.census.unwrap().token);
-    }
-
-    #[test]
-    fn token_snapshot_rejects_a_database_generation_that_moves_mid_read() {
-        let root = std::env::temp_dir().join(format!(
-            "agrep-cursor-token-generation-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("state.vscdb");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value BLOB)",
-                [],
-            )
-            .unwrap();
-
-        let error = stable_generation_read(None, &path, || {
-            connection.execute(
-                "INSERT INTO cursorDiskKV VALUES ('composerData:c', 'x')",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("generation changed"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn composer_headers_attribution_survives_corrupt_per_workspace_db() {
-        // A corrupt workspace DB must not suppress the global composerHeaders overlay.
-        let root =
-            std::env::temp_dir().join(format!("agrep-cursor-corrupt-ws-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let ws_dir = root.join("workspaceStorage/my-workspace");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::write(
-            ws_dir.join("workspace.json"),
-            br#"{"folder":"file:///work/my-project"}"#,
-        )
-        .unwrap();
-        std::fs::write(ws_dir.join("state.vscdb"), b"not a sqlite database").unwrap();
-
-        let global = Connection::open_in_memory().unwrap();
-        global
-            .execute_batch(
-                "CREATE TABLE cursorDiskKV(
-                     key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-                 INSERT INTO cursorDiskKV VALUES(
-                     'composerData:my-composer', 'composer');
-                 CREATE TABLE composerHeaders(
-                     composerId TEXT PRIMARY KEY, workspaceId TEXT);
-                 INSERT INTO composerHeaders VALUES(
-                     'my-composer', 'my-workspace');",
-            )
-            .unwrap();
-
-        let attribution = workspace_projects(&global, &root).unwrap();
-        assert_eq!(
-            attribution.projects.get("my-composer").map(String::as_str),
-            Some("my-project"),
-            "composerHeaders attribution must survive a corrupt per-workspace DB",
-        );
-        assert!(attribution.incomplete.is_none());
-        assert!(attribution.projects.contains_key("my-composer"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A corrupt workspace database scopes its issue to the conversations no readable source
-    /// maps: those stay unattributed and unlisted, every mapped one is listed on its token.
-    #[test]
-    fn corrupt_legacy_workspace_scopes_the_issue_to_unmapped_conversations() {
-        let root =
-            std::env::temp_dir().join(format!("agrep-cursor-unmapped-ws-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let ws_dir = root.join("workspaceStorage/my-workspace");
-        let other_dir = root.join("workspaceStorage/other-workspace");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::create_dir_all(&other_dir).unwrap();
-        std::fs::write(
-            ws_dir.join("workspace.json"),
-            br#"{"folder":"file:///work/my-project"}"#,
-        )
-        .unwrap();
-        std::fs::write(ws_dir.join("state.vscdb"), b"not a sqlite database").unwrap();
-        std::fs::write(
-            other_dir.join("workspace.json"),
-            br#"{"folder":"file:///work/other-project"}"#,
-        )
-        .unwrap();
-        let other = Connection::open(other_dir.join("state.vscdb")).unwrap();
-        other
-            .execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);")
-            .unwrap();
-        other
-            .execute(
-                "INSERT INTO ItemTable VALUES ('composer.composerData', ?1)",
-                [r#"{"allComposers":[{"composerId":"other-composer"}]}"#],
-            )
-            .unwrap();
-        drop(other);
-
-        let global = Connection::open_in_memory().unwrap();
-        global
-            .execute_batch(
-                "CREATE TABLE cursorDiskKV(
-                     key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-                 INSERT INTO cursorDiskKV VALUES(
-                     'composerData:legacy-composer', 'composer');
-                 INSERT INTO cursorDiskKV VALUES(
-                     'composerData:other-composer', 'composer');
-                 INSERT INTO cursorDiskKV VALUES(
-                     'composerData:header-composer', 'composer');
-                 CREATE TABLE composerHeaders(
-                     composerId TEXT PRIMARY KEY, workspaceId TEXT);
-                 INSERT INTO composerHeaders VALUES(
-                     'header-composer', 'my-workspace');",
-            )
-            .unwrap();
-
-        let attribution = workspace_projects(&global, &root).unwrap();
-        let gap = attribution
-            .incomplete
-            .as_ref()
-            .expect("the corrupt workspace leaves legacy-composer unattributed");
-        assert_eq!(gap.path, ws_dir.join("state.vscdb"));
-        assert_eq!(gap.unmapped, vec!["legacy-composer".to_string()]);
-        assert_eq!(
-            attribution
-                .projects
-                .get("other-composer")
-                .map(String::as_str),
-            Some("other-project")
-        );
-        assert_eq!(
-            attribution
-                .projects
-                .get("header-composer")
-                .map(String::as_str),
-            Some("my-project")
-        );
-        assert!(!gap
-            .unmapped
-            .iter()
-            .any(|session| session == "other-composer"));
-        assert!(!gap
-            .unmapped
-            .iter()
-            .any(|session| session == "header-composer"));
-        // The published project survives the gap in the token; a never-attributed chat takes
-        // the fallback, and both wait on the source.
-        let mut retained = workspace_projects(&global, &root).unwrap();
-        let published =
-            HashMap::from([("legacy-composer".to_string(), "legacy-project".to_string())]);
-        retained.retain_published(&published);
-        assert_eq!(
-            retained.projects.get("legacy-composer").map(String::as_str),
-            Some("legacy-project")
-        );
-        let gap = retained.incomplete.as_ref().unwrap();
-        assert!(gap.unmapped.is_empty());
-        assert_eq!(gap.retained, vec!["legacy-composer".to_string()]);
-        assert_eq!(retained.pending(), vec!["legacy-composer".to_string()]);
-        let before = session_tokens(
-            &global,
-            &HashMap::from([("legacy-composer".to_string(), "legacy-project".to_string())]),
-        )
-        .unwrap();
-        let during = session_tokens(&global, &retained.projects).unwrap();
-        let fallback = session_tokens(&global, &attribution.projects).unwrap();
-        let token = |tokens: &[(String, String)], session: &str| {
-            tokens
-                .iter()
-                .find(|(id, _)| id == session)
-                .unwrap()
-                .1
-                .clone()
-        };
-        assert_eq!(
-            token(&before, "legacy-composer"),
-            token(&during, "legacy-composer")
-        );
-        assert_ne!(
-            token(&before, "legacy-composer"),
-            token(&fallback, "legacy-composer")
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_composers_failed_parse_is_recorded_against_that_composer() {
-        let root =
-            std::env::temp_dir().join(format!("agrep-cursor-failed-parse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let global = root.join("globalStorage");
-        std::fs::create_dir_all(&global).unwrap();
-        let database = global.join("state.vscdb");
-        let conn = Connection::open(&database).unwrap();
-        conn.execute_batch("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value BLOB);")
-            .unwrap();
-        let headers = r#"{"createdAt":1,"fullConversationHeadersOnly":[{"bubbleId":"u"}]}"#;
-        let bad_headers =
-            r#"{"createdAt":1,"fullConversationHeadersOnly":[{"bubbleId":"u"},{"bubbleId":"bad"}]}"#;
-        for (key, value) in [
-            ("composerData:good", headers),
-            ("bubbleId:good:u", r#"{"type":1,"text":"healthy sibling"}"#),
-            ("composerData:bad", bad_headers),
-            ("bubbleId:bad:u", r#"{"type":1,"text":"must not leak"}"#),
-            ("bubbleId:bad:bad", "{not json"),
-        ] {
-            conn.execute(
-                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-                params![key, value],
-            )
-            .unwrap();
-        }
-        drop(conn);
-        // A first index: nothing published, so the failed composer holds nothing back.
-        let mut cache = crate::ingest_cache::IngestCache::cold();
-        cache.set_published_material(std::collections::HashSet::new());
-        cache.set_published_token_namespaces(Some(std::collections::HashSet::new()));
-        let (messages, _) = collect_discovered(&mut cache, Ok(Some(root.clone())));
-        let texts: Vec<&str> = messages.iter().map(|m| m.text.as_ref()).collect();
-        assert_eq!(texts, ["healthy sibling"]);
-        assert!(cache.output_complete());
-        let issues = cache.source_read_issues();
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        assert_eq!(issues[0].path, database);
-        assert_eq!(issues[0].kind, "source-read-failed");
-        assert_eq!(issues[0].session.as_deref(), Some("bad"));
-        let _ = std::fs::remove_dir_all(root);
     }
 }

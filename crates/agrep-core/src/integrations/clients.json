@@ -1,0 +1,366 @@
+{
+  "teach_targets": [
+    {
+      "id": "claude",
+      "label": "claude",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".claude"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".claude",
+          "CLAUDE.md"
+        ]
+      }
+    },
+    {
+      "id": "codex",
+      "label": "codex",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".codex"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".codex",
+          "AGENTS.md"
+        ]
+      }
+    },
+    {
+      "id": "opencode",
+      "label": "opencode",
+      "kind": "markdown",
+      "proof": {
+        "base": "opencode_data",
+        "parts": []
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "opencode",
+          "AGENTS.md"
+        ]
+      }
+    },
+    {
+      "id": "gemini-antigravity",
+      "label": "gemini/antigravity",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".gemini"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".gemini",
+          "GEMINI.md"
+        ]
+      }
+    },
+    {
+      "id": "qwen",
+      "label": "qwen",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".qwen"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".qwen",
+          "QWEN.md"
+        ]
+      }
+    },
+    {
+      "id": "crush",
+      "label": "crush",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "crush"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "crush",
+          "CRUSH.md"
+        ]
+      }
+    },
+    {
+      "id": "kimi",
+      "label": "kimi",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".kimi"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".kimi",
+          "AGENTS.md"
+        ]
+      }
+    },
+    {
+      "id": "windsurf",
+      "label": "windsurf",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".codeium",
+          "windsurf"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".codeium",
+          "windsurf",
+          "memories",
+          "global_rules.md"
+        ]
+      }
+    },
+    {
+      "id": "cline",
+      "label": "cline",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          "Documents",
+          "Cline",
+          "Rules"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          "Documents",
+          "Cline",
+          "Rules",
+          "agrep-recall.md"
+        ]
+      }
+    },
+    {
+      "id": "roo",
+      "label": "roo",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".roo"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".roo",
+          "rules",
+          "agrep-recall.md"
+        ]
+      }
+    },
+    {
+      "id": "goose",
+      "label": "goose",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "goose"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "goose",
+          ".goosehints"
+        ]
+      }
+    },
+    {
+      "id": "amp",
+      "label": "amp",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "amp"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".config",
+          "amp",
+          "AGENTS.md"
+        ]
+      }
+    },
+    {
+      "id": "copilot",
+      "label": "copilot",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".copilot"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".copilot",
+          "copilot-instructions.md"
+        ]
+      }
+    },
+    {
+      "id": "droid",
+      "label": "droid",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".factory"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".factory",
+          "AGENTS.md"
+        ]
+      }
+    },
+    {
+      "id": "grok",
+      "label": "grok",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".grok"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".grok",
+          "GROK.md"
+        ]
+      }
+    },
+    {
+      "id": "continue",
+      "label": "continue",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".continue"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".continue",
+          "rules",
+          "agrep-recall.md"
+        ]
+      }
+    },
+    {
+      "id": "cursor",
+      "label": "cursor",
+      "kind": "skill",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".cursor"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".cursor",
+          "skills",
+          "agrep-recall",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "pi",
+      "label": "pi",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".pi",
+          "agent"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".pi",
+          "agent",
+          "AGENTS.md"
+        ]
+      }
+    },
+    {
+      "id": "omp",
+      "label": "pi",
+      "kind": "markdown",
+      "proof": {
+        "base": "home",
+        "parts": [
+          ".omp",
+          "agent"
+        ]
+      },
+      "target": {
+        "base": "home",
+        "parts": [
+          ".omp",
+          "agent",
+          "AGENTS.md"
+        ]
+      }
+    }
+  ]
+}

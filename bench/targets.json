@@ -1,0 +1,56 @@
+[
+  {
+    "target": "x86_64-unknown-linux-gnu",
+    "platform": "manylinux_2_28_x86_64",
+    "os": "linux",
+    "arch": "x64",
+    "runner": "ubuntu-24.04",
+    "asset": "agrep-linux-x64",
+    "exe": "agrep"
+  },
+  {
+    "target": "aarch64-unknown-linux-gnu",
+    "platform": "manylinux_2_28_aarch64",
+    "os": "linux",
+    "arch": "arm64",
+    "runner": "ubuntu-24.04-arm",
+    "asset": "agrep-linux-arm64",
+    "exe": "agrep"
+  },
+  {
+    "target": "aarch64-apple-darwin",
+    "platform": "macosx_11_0_arm64",
+    "os": "darwin",
+    "arch": "arm64",
+    "runner": "macos-14",
+    "asset": "agrep-macos-arm64",
+    "exe": "agrep"
+  },
+  {
+    "target": "x86_64-apple-darwin",
+    "platform": "macosx_11_0_x86_64",
+    "os": "darwin",
+    "arch": "x64",
+    "runner": "macos-15-intel",
+    "asset": "agrep-macos-x64",
+    "exe": "agrep"
+  },
+  {
+    "target": "x86_64-pc-windows-msvc",
+    "platform": "win_amd64",
+    "os": "win32",
+    "arch": "x64",
+    "runner": "windows-latest",
+    "asset": "agrep-windows-x64.exe",
+    "exe": "agrep.exe"
+  },
+  {
+    "target": "aarch64-pc-windows-msvc",
+    "platform": "win_arm64",
+    "os": "win32",
+    "arch": "arm64",
+    "runner": "windows-11-arm",
+    "asset": "agrep-windows-arm64.exe",
+    "exe": "agrep.exe"
+  }
+]

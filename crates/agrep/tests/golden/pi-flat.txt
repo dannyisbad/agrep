@@ -1,0 +1,3 @@
+01930000-0000-7000-8000-000000000001	pi	alpha	2	user	now add jitter to the retry
+01930000-0000-7000-8000-000000000001	pi	alpha	0	user	why did the retry backoff cap at 30s
+01930000-0000-7000-8000-000000000001	pi	alpha	0	tool	bash: grep -rn backoff src/ src/retry.rs:88: cap = Duration::from_secs(30)

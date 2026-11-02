@@ -110,8 +110,7 @@ fn sqlite_uri_path(path: &std::path::Path) -> Result<String, rusqlite::Error> {
 /// snapshot was taken, one with a file the user may not read, and one whose journal needs recovery.
 const SQLITE_CANTOPEN_MOVED: std::os::raw::c_int = rusqlite::ffi::SQLITE_CANTOPEN | (0x40 << 8);
 const SQLITE_CANTOPEN_DENIED: std::os::raw::c_int = rusqlite::ffi::SQLITE_CANTOPEN | (0x41 << 8);
-const SQLITE_CANTOPEN_RECOVERY: std::os::raw::c_int =
-    rusqlite::ffi::SQLITE_CANTOPEN | (0x42 << 8);
+const SQLITE_CANTOPEN_RECOVERY: std::os::raw::c_int = rusqlite::ffi::SQLITE_CANTOPEN | (0x42 << 8);
 
 fn sqlite_open_io_error(path: &Path, error: std::io::Error) -> rusqlite::Error {
     let code = match error.kind() {
@@ -128,7 +127,9 @@ fn sqlite_open_io_error(path: &Path, error: std::io::Error) -> rusqlite::Error {
 
 #[cfg(not(windows))]
 fn hot_journal(error: &std::io::Error) -> bool {
-    error.get_ref().is_some_and(|inner| inner.is::<HotJournal>())
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<HotJournal>())
 }
 
 #[cfg(windows)]
@@ -318,7 +319,6 @@ impl ClonedSqliteFile {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SnapshotFileMode {
     Frozen,
-    LiveHardlink,
 }
 
 #[cfg(not(windows))]
@@ -418,139 +418,15 @@ fn rollback_journal_state(source: &Path) -> std::io::Result<Option<String>> {
     ))))
 }
 
-#[cfg(unix)]
-fn owned_private_snapshot(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-    }
-    metadata.uid() == unsafe { geteuid() } && metadata.mode() & 0o077 == 0
-}
-
-#[cfg(not(unix))]
-fn owned_private_snapshot(_metadata: &std::fs::Metadata) -> bool {
-    true
-}
-
-#[cfg(not(windows))]
-fn snapshot_directory_owner(name: &std::ffi::OsStr) -> Option<u32> {
-    let name = name.to_str()?;
-    let suffix = name.strip_prefix(".agrep-sqlite-")?;
-    let mut fields = suffix.split('-');
-    let pid = fields.next()?.parse().ok()?;
-    matches!(fields.next(), Some(nonce) if !nonce.is_empty() && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then_some(())?;
-    matches!(fields.next(), Some(sequence) if !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then_some(())?;
-    fields.next().is_none().then_some(pid)
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    if pid > i32::MAX as u32 {
-        return true;
-    }
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    let result = unsafe { kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
-}
-
-#[cfg(not(windows))]
-fn plain_snapshot_contents(path: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    let mut count = 0;
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        count += 1;
-        if count > 3
-            || !matches!(
-                entry.file_name().to_str(),
-                Some("snapshot.db" | "snapshot.db-wal" | "snapshot.db-shm")
-            )
-        {
-            return false;
-        }
-        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
-            return false;
-        };
-        if crate::ingest::registry::metadata_is_link(&metadata) || !metadata.is_file() {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(not(windows))]
-fn cleanup_stale_sqlite_snapshots(
-    root: &Path,
-    minimum_age: std::time::Duration,
-    limit: usize,
-) -> std::io::Result<usize> {
-    let mut removed = 0;
-    for entry in std::fs::read_dir(root)?.filter_map(Result::ok) {
-        let Some(pid) = snapshot_directory_owner(&entry.file_name()) else {
-            continue;
-        };
-        if removed == limit || process_is_alive(pid) {
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(entry.path()) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let old_enough = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age >= minimum_age);
-        if crate::ingest::registry::metadata_is_link(&metadata)
-            || !metadata.is_dir()
-            || !owned_private_snapshot(&metadata)
-            || !old_enough
-            || !plain_snapshot_contents(&entry.path())
-        {
-            continue;
-        }
-        if std::fs::remove_dir_all(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
 #[cfg(not(windows))]
 impl SqliteSnapshot {
-    fn private_directory(source: &Path) -> std::io::Result<PathBuf> {
+    fn private_directory(_source: &Path) -> std::io::Result<PathBuf> {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NEXT_ALIAS: AtomicU64 = AtomicU64::new(0);
-        let mut roots = Vec::new();
-        if let Some(parent) = source.parent() {
-            roots.push(parent.to_path_buf());
-        }
-        let temp = std::env::temp_dir();
-        if !roots.iter().any(|root| root == &temp) {
-            roots.push(temp);
-        }
+        let roots = [std::env::temp_dir()];
         let mut last_error = None;
         for root in roots {
-            let _ = cleanup_stale_sqlite_snapshots(
-                &root,
-                std::time::Duration::from_secs(6 * 60 * 60),
-                8,
-            );
             for attempt in 0..32_u64 {
                 let sequence = NEXT_ALIAS.fetch_add(1, Ordering::Relaxed);
                 let nonce = std::time::SystemTime::now()
@@ -558,7 +434,7 @@ impl SqliteSnapshot {
                     .unwrap_or_default()
                     .as_nanos();
                 let candidate = root.join(format!(
-                    ".agrep-sqlite-{}-{nonce:x}-{:x}",
+                    ".agrep-05-input-{}-{nonce:x}-{:x}",
                     std::process::id(),
                     sequence ^ attempt
                 ));
@@ -614,84 +490,14 @@ impl SqliteSnapshot {
             journal,
         };
         let database_alias = snapshot.database.clone();
-        let database_mode = snapshot
+        let _database_mode = snapshot
             .clone_file_with(source, &database_alias, true, false, cloner)?
             .expect("required database snapshot cannot be absent");
         let wal_source = sqlite_sidecar(source, "-wal");
         let wal_alias = sqlite_sidecar(&snapshot.database, "-wal");
-        let wal_mode = snapshot.clone_file_with(&wal_source, &wal_alias, false, false, cloner)?;
-        if database_mode == SnapshotFileMode::LiveHardlink
-            || wal_mode == Some(SnapshotFileMode::LiveHardlink)
-        {
-            snapshot.reset_files()?;
-            let forced = |_: &std::fs::File, _: &Path| Ok(false);
-            let database_mode = snapshot
-                .clone_file_with(source, &database_alias, true, false, forced)?
-                .expect("required database snapshot cannot be absent");
-            if database_mode != SnapshotFileMode::LiveHardlink {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "SQLite hardlink fallback unexpectedly copied the main database",
-                ));
-            }
-            let wal_mode =
-                snapshot.clone_file_with(&wal_source, &wal_alias, false, false, forced)?;
-            let shm_source = sqlite_sidecar(source, "-shm");
-            let shm_alias = sqlite_sidecar(&snapshot.database, "-shm");
-            match wal_mode {
-                Some(SnapshotFileMode::LiveHardlink) => {
-                    let shm_mode = snapshot
-                        .clone_file_with(&shm_source, &shm_alias, true, true, forced)?
-                        .expect("required SQLite SHM snapshot cannot be absent");
-                    if shm_mode != SnapshotFileMode::LiveHardlink {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "SQLite hardlink fallback unexpectedly copied shared memory",
-                        ));
-                    }
-                }
-                Some(SnapshotFileMode::Frozen) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "SQLite hardlink fallback unexpectedly copied the WAL",
-                    ));
-                }
-                None => match std::fs::symlink_metadata(&shm_source) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        snapshot.shm_missing = true;
-                    }
-                    Ok(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "SQLite SHM exists without its WAL",
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                },
-            }
-            snapshot.live_hardlinks = true;
-        }
+        let _wal_mode = snapshot.clone_file_with(&wal_source, &wal_alias, false, false, cloner)?;
         snapshot.verify()?;
         Ok(snapshot)
-    }
-
-    fn reset_files(&mut self) -> std::io::Result<()> {
-        self.cloned.clear();
-        for suffix in ["", "-wal", "-shm"] {
-            let path = if suffix.is_empty() {
-                self.database.clone()
-            } else {
-                sqlite_sidecar(&self.database, suffix)
-            };
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        self.wal_missing = false;
-        self.shm_missing = false;
-        Ok(())
     }
 
     fn clone_file_with(
@@ -712,47 +518,21 @@ impl SqliteSnapshot {
         };
         #[cfg(target_os = "linux")]
         let mut metadata = metadata;
-        #[cfg(target_os = "linux")]
-        let mut mode = SnapshotFileMode::Frozen;
-        #[cfg(not(target_os = "linux"))]
         let mode = SnapshotFileMode::Frozen;
         if !cloner(&opened, destination)? {
             use std::io::Seek;
-
-            const COPY_FALLBACK_MAX: u64 = 16 * 1024 * 1024;
-            #[cfg(target_os = "linux")]
-            let hardlinked = match std::fs::hard_link(source, destination) {
-                Ok(()) => {
-                    metadata = opened.metadata()?;
-                    mode = SnapshotFileMode::LiveHardlink;
-                    true
-                }
-                Err(_) => false,
-            };
-            #[cfg(not(target_os = "linux"))]
-            let hardlinked = false;
-            if !hardlinked {
-                if metadata.len() > COPY_FALLBACK_MAX {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        format!("{} cannot be cloned safely", source.display()),
-                    ));
-                }
-                let mut output = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(destination)?;
-                opened.seek(std::io::SeekFrom::Start(0))?;
-                std::io::copy(&mut opened, &mut output)?;
-                output.sync_all()?;
-            }
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            opened.seek(std::io::SeekFrom::Start(0))?;
+            std::io::copy(&mut opened, &mut output)?;
+            output.sync_all()?;
         }
         let destination_metadata = std::fs::symlink_metadata(destination)?;
         if crate::ingest::registry::metadata_is_link(&destination_metadata)
             || !destination_metadata.is_file()
             || destination_metadata.len() != metadata.len()
-            || (mode == SnapshotFileMode::LiveHardlink
-                && !same_plain_file(&metadata, &destination_metadata))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1028,16 +808,10 @@ pub(crate) fn sqlite_corrupt(error: &rusqlite::Error) -> bool {
 /// write in flight: a file (or SQLite sidecar) modified or changed within a timestamp tick of the
 /// observation. Two such catches of one torn state share an identity, so neither proves it stays.
 pub fn failure_observation_racy(path: &Path, scan_start: std::time::SystemTime) -> bool {
-    let (start_ns, now_ns) = match crate::fault_injection::pinned_now_ns() {
-        Some(pinned) => (pinned, pinned),
-        None => match (
-            crate::ingest_cache::epoch_ns(scan_start),
-            crate::ingest_cache::epoch_ns(std::time::SystemTime::now()),
-        ) {
-            (Some(start), Some(now)) => (start, now),
-            _ => return true,
-        },
-    };
+    let (start_ns, now_ns) = (
+        crate::intake_batch::epoch_ns(scan_start).unwrap_or(0),
+        crate::intake_batch::epoch_ns(std::time::SystemTime::now()).unwrap_or(0),
+    );
     // A SQLite store's ctime moves under agrep's own hard-link snapshot, as its identity knows.
     let store = crate::ingest::registry::sqlite_database(path);
     let files: Vec<PathBuf> = if store {
@@ -1048,13 +822,15 @@ pub fn failure_observation_racy(path: &Path, scan_start: std::time::SystemTime) 
     } else {
         vec![path.to_path_buf()]
     };
-    files.iter().any(|file| match std::fs::symlink_metadata(file) {
-        Ok(metadata) => {
-            let (modified, changed) = metadata_stamps_ns(&metadata);
-            racy_failure_stamps(modified, changed.filter(|_| !store), start_ns, now_ns)
-        }
-        Err(_) => false,
-    })
+    files
+        .iter()
+        .any(|file| match std::fs::symlink_metadata(file) {
+            Ok(metadata) => {
+                let (modified, changed) = metadata_stamps_ns(&metadata);
+                racy_failure_stamps(modified, changed.filter(|_| !store), start_ns, now_ns)
+            }
+            Err(_) => false,
+        })
 }
 
 /// The stamp rule of [`failure_observation_racy`], granule-aware as the cache's racy entries.
@@ -1067,7 +843,7 @@ pub(crate) fn racy_failure_stamps(
     [modified_ns, changed_ns]
         .into_iter()
         .flatten()
-        .any(|stamp| crate::ingest_cache::racy_stamp(stamp, start_ns, now_ns))
+        .any(|stamp| crate::intake_batch::racy_stamp(stamp, start_ns, now_ns))
 }
 
 #[cfg(unix)]
@@ -1086,7 +862,7 @@ fn metadata_stamps_ns(metadata: &std::fs::Metadata) -> (Option<i64>, Option<i64>
         metadata
             .modified()
             .ok()
-            .and_then(crate::ingest_cache::epoch_ns),
+            .and_then(crate::intake_batch::epoch_ns),
         None,
     )
 }
@@ -1203,8 +979,8 @@ pub(crate) fn sqlite_open_moved(error: &rusqlite::Error) -> bool {
 
 /// What a per-file read error says about the source: a denial, an absence or a special file is
 /// skipped as before; one that changed under the read moved; any other error may clear.
-pub(crate) fn read_failure_outcome(error: &std::io::Error) -> crate::ingest_cache::ReadOutcome {
-    use crate::ingest_cache::ReadOutcome;
+pub(crate) fn read_failure_outcome(error: &std::io::Error) -> crate::intake_batch::ReadOutcome {
+    use crate::intake_batch::ReadOutcome;
     match error.kind() {
         std::io::ErrorKind::PermissionDenied
         | std::io::ErrorKind::NotFound
@@ -1657,11 +1433,11 @@ pub fn terminal_safe(value: impl std::fmt::Display) -> String {
 /// Report a source that could not join this generation without letting store-derived paths or
 /// errors write terminal controls.
 pub fn warn_source_skip(agent: &str, path: &std::path::Path, reason: impl std::fmt::Display) {
-    eprintln!(
+    crate::intake::diagnostic(format_args!(
         "  ! {agent}: skipping {}: {}",
         terminal_safe(path.display()),
         terminal_safe(reason)
-    );
+    ));
 }
 
 /// Truncate to `cap` characters (UTF-8 safe), appending an ellipsis when cut.
@@ -1760,895 +1536,4 @@ pub fn is_wrapper(text: &str) -> bool {
                 || t.contains("\"task_completed\"")
                 || t.contains("\"shutdown_request\"")
                 || t.contains("\"type\":\"idle\"")))
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(not(windows))]
-    use super::cleanup_stale_sqlite_snapshots;
-    #[cfg(unix)]
-    use super::open_sqlite_ro_with_hook;
-    use super::sqlite_generation_token;
-    #[cfg(target_os = "linux")]
-    use super::SqliteSnapshot;
-    use super::{open_sqlite_ro, read_lossy, sqlite_sidecar, sqlite_uri_path, terminal_safe};
-
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("agrep-{tag}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    #[cfg(unix)]
-    fn fifo(path: &std::path::Path) {
-        let status = std::process::Command::new("mkfifo")
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    #[test]
-    fn sqlite_uri_path_quotes_query_and_fragment_bytes() {
-        let encoded = sqlite_uri_path(std::path::Path::new("/tmp/a?b#c%d e.db")).unwrap();
-        assert_eq!(encoded, "/tmp/a%3Fb%23c%25d%20e.db");
-    }
-
-    fn raw() -> crate::model::RawMessage {
-        crate::model::RawMessage {
-            agent: "claude",
-            project: String::new(),
-            session: String::new(),
-            ts: 0,
-            turn: 0,
-            text: String::new(),
-            model: String::new(),
-            reply: String::new(),
-            reply_chars: 0,
-            reply_shape: Default::default(),
-            side: false,
-            parent: String::new(),
-        }
-    }
-
-    /// 0.4.2's append, kept as the oracle for the text and the count.
-    fn legacy_append(buf: &mut String, t: &str, cap: usize) -> usize {
-        let t = t.trim();
-        if t.is_empty() {
-            return 0;
-        }
-        let source_chars = t.chars().count() + usize::from(!buf.is_empty());
-        if buf.chars().count() >= cap {
-            return source_chars;
-        }
-        if !buf.is_empty() {
-            buf.push(' ');
-        }
-        buf.push_str(t);
-        if buf.chars().count() > cap {
-            let kept: String = buf.chars().take(cap).collect();
-            *buf = kept;
-            buf.push('…');
-        }
-        source_chars
-    }
-
-    #[test]
-    fn reply_text_and_count_stay_what_0_4_2_published_while_the_shape_rides_beside() {
-        let cap = super::REPLY_CAP;
-        let long = "z".repeat(cap + 500);
-        let exact = "e".repeat(cap);
-        let almost = "x".repeat(cap - 1);
-        let cases: Vec<Vec<&str>> = vec![
-            vec![
-                "Ported it.\n\n**Next steps:**\n- a\n- b",
-                "Updated the callers.",
-            ],
-            vec!["one", "  ", "two", "three\n\nfour"],
-            vec!["lone block"],
-            vec![
-                "a diff:\n```diff\n-old\n \n+new\n```",
-                "Want me to run them?",
-            ],
-            vec!["step 1 ok\n \nstep 2 ok", "\n \n", "done"],
-            vec!["head\n\nwith paragraphs", long.as_str(), "ending"],
-            vec![exact.as_str(), "after the exact cap"],
-            vec![almost.as_str(), "crosses at the join"],
-            vec!["汉字", "字汉", long.as_str()],
-        ];
-        for blocks in cases {
-            let mut raw = raw();
-            let mut oracle = String::new();
-            let mut oracle_chars = 0;
-            for block in &blocks {
-                let chars = super::append_reply(&mut raw, block);
-                let expected = legacy_append(&mut oracle, block, cap);
-                oracle_chars += expected;
-                assert_eq!(chars, expected);
-            }
-            assert_eq!(raw.reply, oracle, "{:?}", &blocks[0][..8]);
-            assert_eq!(raw.reply_chars, oracle_chars);
-            let shape = &raw.reply_shape;
-            assert_eq!(shape.head_chars as usize, raw.reply.chars().count());
-            // every break is a joining space, and the block after it is the block appended
-            let text: Vec<char> = raw.reply.chars().collect();
-            let kept: Vec<&str> = blocks
-                .iter()
-                .map(|b| b.trim())
-                .filter(|b| !b.is_empty())
-                .collect();
-            let mut stops: Vec<usize> = shape.breaks.iter().map(|b| *b as usize).collect();
-            stops.push(text.len());
-            for (index, &offset) in shape.breaks.iter().enumerate() {
-                assert_eq!(text[offset as usize], ' ');
-                let mut segment: String =
-                    text[offset as usize + 1..stops[index + 1]].iter().collect();
-                // the last segment of a capped head ends where the cap cut the block
-                if raw.reply_chars > cap && stops[index + 1] == text.len() {
-                    segment.pop();
-                    assert!(kept[index + 1].starts_with(&segment), "{index}");
-                } else {
-                    assert_eq!(segment, kept[index + 1]);
-                }
-            }
-            let capped = raw.reply_chars > cap;
-            assert_eq!(!shape.end.is_empty(), capped);
-            if capped {
-                let last = kept.last().unwrap();
-                assert!(last.ends_with(shape.end.as_str()));
-                assert_eq!(shape.end_cut, last.chars().count() > super::REPLY_TAIL_CAP);
-                assert!(shape.end.chars().count() <= super::REPLY_TAIL_CAP);
-            }
-        }
-    }
-
-    #[test]
-    fn each_join_records_whether_work_came_between_its_blocks() {
-        use crate::model::{WORKED_NO, WORKED_UNKNOWN, WORKED_YES};
-        fn tool(name: &str) -> crate::model::Event {
-            crate::model::Event {
-                agent: "claude",
-                session: "s".to_string(),
-                ts: 0,
-                kind: "tool",
-                name: name.to_string(),
-                input: String::new(),
-                output: String::new(),
-                input_chars: 0,
-                output_chars: 0,
-                output_bytes: 0,
-                ok: None,
-                call_id: name.to_string(),
-                child_session: String::new(),
-                meta: String::new(),
-                state: String::new(),
-            }
-        }
-        // blocks and calls in order: text, call, text, text, call(bookkeeping), text
-        let mut message = raw();
-        let mut order = super::ReplyOrder::default();
-        let mut events = Vec::new();
-        super::append_reply(&mut message, "plan");
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        assert!(message.reply_shape.worked.is_empty());
-        assert_eq!(message.reply_shape.lead, WORKED_NO);
-        events.push(tool("Bash"));
-        super::append_reply(&mut message, "ran it");
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        super::append_reply(&mut message, "and more");
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        events.push(tool("TaskCreate"));
-        super::append_reply(&mut message, "noted");
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        assert_eq!(
-            message.reply_shape.worked,
-            [WORKED_YES, WORKED_NO, WORKED_NO]
-        );
-        assert_eq!(message.reply_shape.joins, 3);
-
-        // past the cap the tail's join covers every block it replaced: a call before a
-        // replaced block still counts once the final tail lands
-        let mut message = raw();
-        let mut order = super::ReplyOrder::default();
-        let mut events = Vec::new();
-        let long = "z".repeat(super::REPLY_CAP + 1);
-        super::append_reply(&mut message, &long);
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        events.push(tool("Edit"));
-        super::append_reply(&mut message, "replaced tail");
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        super::append_reply(&mut message, "final tail");
-        order.joined(&mut message.reply_shape, &events, events.len());
-        order.reply(events.len());
-        assert_eq!(message.reply_shape.end, "final tail");
-        assert_eq!(
-            (message.reply_shape.joins, &message.reply_shape.worked[..]),
-            (1, &[WORKED_YES][..])
-        );
-
-        // an adapter whose store orders prose and calls itself records the fact per block;
-        // a join never recorded stays unknown
-        let mut message = raw();
-        for (block, worked) in [
-            ("a", true),
-            ("b", false),
-            (long.as_str(), true),
-            ("tail", false),
-        ] {
-            super::append_reply(&mut message, block);
-            super::ReplyOrder::joined_known(&mut message.reply_shape, worked);
-        }
-        assert_eq!(message.reply_shape.breaks.len(), 2);
-        assert_eq!(
-            (message.reply_shape.lead, &message.reply_shape.worked[..]),
-            (WORKED_YES, &[WORKED_NO, WORKED_YES, WORKED_NO][..])
-        );
-        let mut message = raw();
-        super::append_reply(&mut message, "a");
-        super::append_reply(&mut message, "b");
-        assert_eq!(message.reply_shape.lead, WORKED_UNKNOWN);
-        assert!(message.reply_shape.worked.is_empty());
-
-        // a delegation is work; a recap row's first block records the work since the previous
-        // row's last block as its lead join (no prompt reset the order between them)
-        let mut events = Vec::new();
-        let mut order = super::ReplyOrder::default();
-        let mut first = raw();
-        super::append_reply(&mut first, "plan");
-        order.joined(&mut first.reply_shape, &events, events.len());
-        order.reply(events.len());
-        let mut delegated = tool("Agent");
-        delegated.kind = "subagent_start";
-        events.push(delegated);
-        let mut recap = raw();
-        super::append_reply(&mut recap, "done");
-        order.joined(&mut recap.reply_shape, &events, events.len());
-        order.reply(events.len());
-        assert_eq!(
-            (first.reply_shape.lead, recap.reply_shape.lead),
-            (WORKED_NO, WORKED_YES)
-        );
-        let mut prompted = raw();
-        order.prompt(&mut events);
-        super::append_reply(&mut prompted, "next");
-        order.joined(&mut prompted.reply_shape, &events, events.len());
-        assert_eq!(prompted.reply_shape.lead, WORKED_NO);
-    }
-
-    #[test]
-    fn blocks_past_the_cap_cost_their_own_length_only() {
-        let block = "b".repeat(400);
-        let mut timings = Vec::new();
-        for blocks in [3_000usize, 20_000, 60_000] {
-            let started = std::time::Instant::now();
-            let mut raw = raw();
-            for _ in 0..blocks {
-                super::append_reply(&mut raw, &block);
-            }
-            let new = started.elapsed();
-            let started = std::time::Instant::now();
-            let mut oracle = String::new();
-            let mut chars = 0;
-            for _ in 0..blocks {
-                chars += legacy_append(&mut oracle, &block, super::REPLY_CAP);
-            }
-            let old = started.elapsed();
-            assert_eq!(raw.reply, oracle);
-            assert_eq!(raw.reply_chars, chars);
-            timings.push((blocks, new, old));
-        }
-        eprintln!("append_reply vs 0.4.2: {timings:?}");
-        for (blocks, new, old) in timings {
-            assert!(
-                new <= old * 2 + std::time::Duration::from_millis(50),
-                "{blocks}: {new:?} vs {old:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn reply_order_leaves_user_run_commands_out() {
-        let event = |name: &str| crate::model::Event {
-            agent: "pi",
-            session: "s".to_string(),
-            ts: 0,
-            kind: "tool",
-            name: name.to_string(),
-            input: String::new(),
-            output: String::new(),
-            input_chars: 0,
-            output_chars: 0,
-            output_bytes: 0,
-            ok: None,
-            call_id: name.to_string(),
-            child_session: String::new(),
-            meta: String::new(),
-            state: String::new(),
-        };
-        let mut events = Vec::new();
-        let mut order = super::ReplyOrder::new();
-        order.prompt(&mut events);
-        events.push(event("t1"));
-        order.reply(events.len());
-        events.push(event("user-bash"));
-        order.exclude(events.len() - 1);
-        events.push(event("t2"));
-        order.finish(&mut events);
-        let metas: Vec<&str> = events.iter().map(|e| e.meta.as_str()).collect();
-        assert_eq!(metas, ["", "", "after_reply=1"]);
-    }
-
-    #[test]
-    fn task_state_keeps_list_facts_whole_and_nothing_else() {
-        let todos = serde_json::json!({
-            "todos": [
-                {"content": "Port the loader", "status": "pending", "activeForm": "Porting",
-                 "priority": "high", "id": 7},
-                "bare item",
-                {"notes": "no name"},
-                42
-            ]
-        });
-        assert_eq!(
-            super::task_state("TodoWrite", Some(&todos)),
-            r#"{"todos":[{"content":"Port the loader","id":7,"status":"pending"},"bare item",{}]}"#
-        );
-        let cursor =
-            serde_json::json!({"merge": true, "todos": [{"id": "a", "status": "completed"}]});
-        assert_eq!(
-            super::task_state("todo_write", Some(&cursor)),
-            r#"{"merge":true,"todos":[{"id":"a","status":"completed"}]}"#
-        );
-        let omp = serde_json::json!({
-            "op": "init", "list": [{"phase": "Port", "items": ["a", "b", 3], "extra": 1}],
-            "items": ["c"], "phase": "Port", "task": "a", "explain": "why"
-        });
-        assert_eq!(
-            super::task_state("todo", Some(&omp)),
-            r#"{"items":["c"],"list":[{"items":["a","b"],"phase":"Port"}],"op":"init","phase":"Port","task":"a"}"#
-        );
-        let update = serde_json::json!({"taskId": "3", "status": "completed",
-                                        "description": "long prose", "subject": "Ship it"});
-        assert_eq!(
-            super::task_state("TaskUpdate", Some(&update)),
-            r#"{"status":"completed","subject":"Ship it","taskId":"3"}"#
-        );
-        let plan =
-            serde_json::json!({"plan": [{"step": "a", "status": "pending"}], "explanation": "x"});
-        assert_eq!(
-            super::task_state("update_plan", Some(&plan)),
-            r#"{"plan":[{"status":"pending","step":"a"}]}"#
-        );
-        assert_eq!(super::task_state("Bash", Some(&todos)), "");
-        assert_eq!(
-            super::task_state("TodoRead", Some(&serde_json::json!({}))),
-            ""
-        );
-        assert_eq!(
-            super::task_state("TodoWrite", Some(&serde_json::json!({"other": 1}))),
-            ""
-        );
-        assert_eq!(super::task_state("TodoWrite", None), "");
-        assert_eq!(
-            super::task_state("SetTodoList", Some(&serde_json::json!(["x", "y"]))),
-            r#"["x","y"]"#
-        );
-        let huge = serde_json::json!({"todos": [{"content": "z".repeat(super::REPLY_CAP)}]});
-        assert_eq!(super::task_state("TodoWrite", Some(&huge)), "");
-        assert_eq!(
-            super::task_listing("#1 [pending] Port\n#2 [completed] Ship"),
-            "{\"listing\":\"#1 [pending] Port\\n#2 [completed] Ship\"}"
-        );
-        assert_eq!(super::task_listing("  "), "");
-        assert_eq!(super::task_listing(&"z".repeat(super::REPLY_CAP + 1)), "");
-    }
-
-    #[test]
-    fn reply_order_marks_the_calls_no_reply_followed() {
-        fn event(name: &str, meta: &str) -> crate::model::Event {
-            crate::model::Event {
-                agent: "codex",
-                session: "s".to_string(),
-                ts: 0,
-                kind: "tool",
-                name: name.to_string(),
-                input: String::new(),
-                output: String::new(),
-                input_chars: 0,
-                output_chars: 0,
-                output_bytes: 0,
-                ok: None,
-                call_id: name.to_string(),
-                child_session: String::new(),
-                meta: meta.to_string(),
-                state: String::new(),
-            }
-        }
-        let mut events = Vec::new();
-        let mut order = super::ReplyOrder::new();
-        // turn 1: text, tool, text (answered); turn 2: text, tool, tool (cut off)
-        order.prompt(&mut events);
-        order.reply(events.len());
-        events.push(event("t1", "name=x"));
-        order.reply(events.len());
-        order.prompt(&mut events);
-        order.reply(events.len());
-        events.push(event("t2", ""));
-        events.push(event("t3", "to=y"));
-        order.finish(&mut events);
-        let metas: Vec<&str> = events.iter().map(|e| e.meta.as_str()).collect();
-        assert_eq!(metas, ["name=x", "after_reply=1", "to=y after_reply=1"]);
-        // a turn that wrote no reply at all: every call trails
-        let mut events = vec![];
-        let mut order = super::ReplyOrder::new();
-        order.prompt(&mut events);
-        events.push(event("t4", ""));
-        order.prompt(&mut events);
-        events.push(event("t5", ""));
-        order.reply(events.len());
-        order.finish(&mut events);
-        assert_eq!(events[0].meta, "after_reply=1");
-        assert_eq!(events[1].meta, "");
-        // a reset after discarded events settles nothing stale
-        let mut events = vec![event("stale", "")];
-        let mut order = super::ReplyOrder::new();
-        events.clear();
-        order.reset(&events);
-        order.finish(&mut events);
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn terminal_diagnostics_escape_controls_and_bidi() {
-        let rendered = terminal_safe("before\u{1b}]52;c;payload\u{7}\r\u{202e}after");
-        assert_eq!(
-            rendered,
-            "before\\u001b]52;c;payload\\u0007\\u000d\\u202eafter"
-        );
-    }
-
-    /// A live agent session is appended to continuously; the transcript reader must serve
-    /// the prefix it opened rather than refuse every source that grew under it.
-    #[test]
-    fn lossy_reader_serves_a_live_appended_transcript() {
-        let dir = temp_dir("lossy-live-append");
-        let path = dir.join("rollout.jsonl");
-        let line = format!("{{\"role\":\"user\",\"pad\":\"{}\"}}\n", "x".repeat(4000));
-        let seeded = line.repeat(500);
-        std::fs::write(&path, &seeded).unwrap();
-
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Each read follows at least one more landed append, so growth under the
-        // reader is guaranteed rather than left to thread scheduling.
-        let (appended, landed) = std::sync::mpsc::channel::<()>();
-        let writer = {
-            let (path, line, stop) = (path.clone(), line.clone(), stop.clone());
-            std::thread::spawn(move || {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .unwrap();
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    file.write_all(line.as_bytes()).unwrap();
-                    if appended.send(()).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-            })
-        };
-
-        let mut lengths = Vec::new();
-        let mut sample = String::new();
-        for _ in 0..20 {
-            landed
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("the appender must make progress");
-            let text = read_lossy(&path).expect("a growing source stays readable");
-            assert!(text.len() >= seeded.len());
-            lengths.push(text.len());
-            sample = text;
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        writer.join().unwrap();
-        assert_eq!(lengths.len(), 20);
-        assert!(lengths.windows(2).all(|pair| pair[0] <= pair[1]));
-        // Without real growth the reads never raced anything and prove nothing.
-        assert!(lengths.last().unwrap() > &seeded.len());
-
-        // Once the writer stops, the reader converges on the whole file, and every
-        // extent served along the way was a true prefix of it.
-        let settled = read_lossy(&path).unwrap();
-        assert_eq!(settled.len() as u64, path.metadata().unwrap().len());
-        assert!(settled.starts_with(&sample));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn source_read_errors_name_the_path() {
-        let path = std::env::temp_dir().join(format!(
-            "agrep-missing-source-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let error = read_lossy(&path).unwrap_err();
-        assert!(error.to_string().contains(&path.display().to_string()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lossy_reader_rejects_fifo_without_waiting() {
-        let dir = temp_dir("lossy-fifo");
-        let path = dir.join("transcript.jsonl");
-        fifo(&path);
-        let error = read_lossy(&path).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains(&path.display().to_string()));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sqlite_path_swap_to_fifo_cannot_reach_sqlite_open() {
-        let dir = temp_dir("sqlite-fifo-swap");
-        let path = dir.join("state.vscdb");
-        let held = dir.join("held.db");
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer.execute("CREATE TABLE rows(value TEXT)", []).unwrap();
-        drop(writer);
-
-        let error = open_sqlite_ro_with_hook(&path, || {
-            std::fs::rename(&path, &held).unwrap();
-            fifo(&path);
-        })
-        .err()
-        .expect("source replacement must invalidate the snapshot");
-        assert!(error.to_string().contains("cannot safely open"));
-        std::fs::remove_file(&path).unwrap();
-        std::fs::rename(&held, &path).unwrap();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A FIFO, or a link to one, where a store's rollback journal belongs fails that store's
-    /// open at once; it never blocks the pass waiting for a writer to the FIFO.
-    #[cfg(unix)]
-    #[test]
-    fn a_fifo_journal_fails_the_open_without_blocking() {
-        for linked in [false, true] {
-            let dir = temp_dir("sqlite-fifo-journal");
-            let path = dir.join("state.vscdb");
-            rusqlite::Connection::open(&path)
-                .unwrap()
-                .execute("CREATE TABLE rows(value TEXT)", [])
-                .unwrap();
-            let journal = sqlite_sidecar(&path, "-journal");
-            if linked {
-                let target = dir.join("elsewhere");
-                fifo(&target);
-                std::os::unix::fs::symlink(&target, &journal).unwrap();
-            } else {
-                fifo(&journal);
-            }
-            let (done, outcome) = std::sync::mpsc::channel();
-            let opened = path.clone();
-            std::thread::spawn(move || {
-                let _ = done.send(open_sqlite_ro(&opened).is_err());
-            });
-            let failed = outcome
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("the open blocked on the journal");
-            assert!(failed, "linked {linked}");
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sqlite_snapshot_does_not_change_source_freshness() {
-        let dir = temp_dir("sqlite-source-freshness");
-        let path = dir.join("state.vscdb");
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer.execute("CREATE TABLE rows(value TEXT)", []).unwrap();
-        drop(writer);
-        let metadata = std::fs::symlink_metadata(&path).unwrap();
-        let before = crate::ingest::registry::metadata_change_token(&path, &metadata).unwrap();
-        let generation = sqlite_generation_token(&path).unwrap();
-        drop(open_sqlite_ro(&path).unwrap());
-        let metadata = std::fs::symlink_metadata(&path).unwrap();
-        let after = crate::ingest::registry::metadata_change_token(&path, &metadata).unwrap();
-        assert_eq!(before, after);
-        assert_eq!(generation, sqlite_generation_token(&path).unwrap());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A read-only open of a WAL-mode database creates the -wal itself. That empty file carries
-    /// no committed frames, so it must read as the same generation as no WAL at all - otherwise
-    /// every checkpointed store answers "generation changed while opening" forever.
-    #[test]
-    fn generation_reads_an_empty_wal_as_no_wal() {
-        let dir = temp_dir("sqlite-empty-wal");
-        let path = dir.join("state.vscdb");
-        std::fs::write(&path, b"sqlite fixture").unwrap();
-        let wal = sqlite_sidecar(&path, "-wal");
-        let absent = sqlite_generation_token(&path).unwrap();
-        std::fs::write(&wal, b"").unwrap();
-        assert_eq!(absent, sqlite_generation_token(&path).unwrap());
-        std::fs::write(&wal, b"committed frame").unwrap();
-        assert_ne!(absent, sqlite_generation_token(&path).unwrap());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn generation_detects_same_size_restored_mtime_edit() {
-        let dir = temp_dir("sqlite-restored-mtime");
-        let path = dir.join("state.vscdb");
-        let stamp = dir.join("stamp");
-        std::fs::write(&path, b"original").unwrap();
-        std::fs::write(&stamp, b"stamp").unwrap();
-        assert!(std::process::Command::new("touch")
-            .args(["-r", path.to_str().unwrap(), stamp.to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success());
-        let before = sqlite_generation_token(&path).unwrap();
-        std::fs::write(&path, b"mutation").unwrap();
-        assert!(std::process::Command::new("touch")
-            .args(["-r", stamp.to_str().unwrap(), path.to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success());
-        assert_ne!(before, sqlite_generation_token(&path).unwrap());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_no_reflink_fallback_is_fast_and_freshness_neutral() {
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = temp_dir("sqlite-linux-hardlink");
-        let path = dir.join("state.vscdb");
-        std::fs::write(&path, b"sqlite fixture").unwrap();
-        let before_metadata = std::fs::symlink_metadata(&path).unwrap();
-        let generic_before =
-            crate::ingest::registry::metadata_change_token(&path, &before_metadata).unwrap();
-        crate::ingest::registry::wait_for_next_ctime_tick(&path);
-        let generation = sqlite_generation_token(&path).unwrap();
-        let snapshot = SqliteSnapshot::create_with(&path, |_, _| Ok(false)).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().ino(),
-            std::fs::metadata(&snapshot.database).unwrap().ino()
-        );
-        snapshot.verify().unwrap();
-        assert_eq!(generation, sqlite_generation_token(&path).unwrap());
-        drop(snapshot);
-        assert_eq!(generation, sqlite_generation_token(&path).unwrap());
-        let after_metadata = std::fs::symlink_metadata(&path).unwrap();
-        let generic_after =
-            crate::ingest::registry::metadata_change_token(&path, &after_metadata).unwrap();
-        assert_ne!(generic_before, generic_after);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_hardlink_fallback_shares_wal_locking_with_a_writer() {
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = temp_dir("sqlite-linux-live-wal");
-        let path = dir.join("state.vscdb");
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer.pragma_update(None, "journal_mode", "wal").unwrap();
-        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-        writer
-            .execute("CREATE TABLE rows(value INTEGER)", [])
-            .unwrap();
-        writer.execute("INSERT INTO rows VALUES (0)", []).unwrap();
-        assert!(sqlite_sidecar(&path, "-shm").exists());
-        let snapshot = SqliteSnapshot::create_with(&path, |_, _| Ok(false)).unwrap();
-        assert!(snapshot.live_hardlinks);
-        for suffix in ["", "-wal", "-shm"] {
-            let source = if suffix.is_empty() {
-                path.clone()
-            } else {
-                sqlite_sidecar(&path, suffix)
-            };
-            let alias = if suffix.is_empty() {
-                snapshot.database.clone()
-            } else {
-                sqlite_sidecar(&snapshot.database, suffix)
-            };
-            assert_eq!(
-                std::fs::metadata(source).unwrap().ino(),
-                std::fs::metadata(alias).unwrap().ino()
-            );
-        }
-        let reader = rusqlite::Connection::open_with_flags(
-            &snapshot.database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let writes = std::thread::spawn(move || {
-            for value in 1..=100 {
-                writer
-                    .execute("INSERT INTO rows VALUES (?1)", [value])
-                    .unwrap();
-            }
-        });
-        for _ in 0..100 {
-            let count: i64 = reader
-                .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
-                .unwrap();
-            assert!(count >= 1);
-        }
-        writes.join().unwrap();
-        let count: i64 = reader
-            .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 101);
-        assert!(snapshot.verify().is_err());
-        drop(reader);
-        drop(snapshot);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_snapshot_cleanup_is_exact_and_does_not_follow_links() {
-        let dir = temp_dir("sqlite-stale-cleanup");
-        let mut exited = std::process::Command::new("true").spawn().unwrap();
-        let dead_pid = exited.id();
-        assert!(exited.wait().unwrap().success());
-        let stale = dir.join(format!(".agrep-sqlite-{dead_pid}-abcd-0"));
-        let unrelated = dir.join(".agrep-sqlite-not-ours");
-        let target = dir.join("target");
-        let linked = dir.join(format!(".agrep-sqlite-{dead_pid}-abcd-1"));
-        let live = dir.join(format!(".agrep-sqlite-{}-abcd-2", std::process::id()));
-        std::fs::create_dir(&stale).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(stale.join("snapshot.db"), b"clone").unwrap();
-        std::fs::create_dir(&unrelated).unwrap();
-        std::fs::create_dir(&target).unwrap();
-        std::fs::create_dir(&live).unwrap();
-        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(live.join("snapshot.db"), b"live").unwrap();
-        std::os::unix::fs::symlink(&target, &linked).unwrap();
-        assert_eq!(
-            cleanup_stale_sqlite_snapshots(&dir, std::time::Duration::ZERO, 8).unwrap(),
-            1
-        );
-        assert!(!stale.exists());
-        assert!(unrelated.exists());
-        assert!(linked.exists());
-        assert!(target.exists());
-        assert!(live.exists());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn read_only_sqlite_rejects_rollback_journal() {
-        let dir = temp_dir("sqlite-rollback-journal");
-        let path = dir.join("state.vscdb");
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer.execute("CREATE TABLE rows(value TEXT)", []).unwrap();
-        drop(writer);
-        std::fs::write(sqlite_sidecar(&path, "-journal"), b"hot").unwrap();
-        assert!(open_sqlite_ro(&path).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn read_only_sqlite_sees_committed_wal_without_blocking_writer() {
-        let dir = temp_dir("sqlite-live-wal");
-        #[cfg(windows)]
-        let path = dir.join("history #% space.db");
-        #[cfg(not(windows))]
-        let path = dir.join("history #?% space.db");
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer.pragma_update(None, "journal_mode", "wal").unwrap();
-        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-        writer.execute("CREATE TABLE rows(value TEXT)", []).unwrap();
-        writer
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-            .unwrap();
-        writer
-            .execute("INSERT INTO rows VALUES ('wal-one')", [])
-            .unwrap();
-        assert!(
-            std::fs::metadata(sqlite_sidecar(&path, "-wal"))
-                .unwrap()
-                .len()
-                > 0
-        );
-
-        let reader = open_sqlite_ro(&path).unwrap();
-        let first: String = reader
-            .query_row("SELECT value FROM rows", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(first, "wal-one");
-        writer
-            .execute("INSERT INTO rows VALUES ('wal-two')", [])
-            .unwrap();
-        drop(reader);
-
-        let reader = open_sqlite_ro(&path).unwrap();
-        let count: i64 = reader
-            .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
-        drop(reader);
-        drop(writer);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A SQLite store's failure identity ignores what agrep's own snapshot does to it: a hard
-    /// link (the fallback where no reflink exists) moves the store's ctime, never its identity.
-    #[cfg(unix)]
-    #[test]
-    fn a_hard_link_snapshot_leaves_a_stores_failure_identity_unchanged() {
-        let dir = temp_dir("failure-identity-link");
-        let path = dir.join("store.db");
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch("CREATE TABLE t(x);")
-            .unwrap();
-        let before = super::failure_identity(&path);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::hard_link(&path, dir.join("snapshot.db")).unwrap();
-        assert_eq!(super::failure_identity(&path), before);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A file's failure identity covers its content: torn, whole and torn again at one length
-    /// and one modification time, the whole copy reads as another failure.
-    #[test]
-    fn a_files_failure_identity_covers_its_content() {
-        let dir = temp_dir("failure-identity-content");
-        let path = dir.join("session.json");
-        let digest = |body: &[u8]| {
-            std::fs::write(&path, body).unwrap();
-            let identity = super::failure_identity(&path);
-            identity.rsplit(':').next().unwrap().to_owned()
-        };
-        let torn = digest(b"{\"torn\": tru");
-        let whole = digest(b"{\"whole\": 1}");
-        assert_ne!(torn, whole);
-        assert_eq!(digest(b"{\"torn\": tru"), torn);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A failure whose file was stamped within a timestamp tick of the observation is racy: a
-    /// whole-second stamp (a 1 s filesystem) stays racy for its two-second granule, then is not.
-    #[cfg(not(windows))]
-    #[test]
-    fn a_failure_stamped_within_a_tick_of_its_observation_is_racy() {
-        const SECOND: i64 = 1_000_000_000;
-        let stamp = 100 * SECOND;
-        let fine = 100 * SECOND - 50_000_123;
-        assert!(super::racy_failure_stamps(Some(stamp), Some(fine), stamp + SECOND / 2, stamp + SECOND));
-        assert!(super::racy_failure_stamps(Some(fine), Some(stamp), stamp + SECOND, stamp + SECOND));
-        assert!(!super::racy_failure_stamps(
-            Some(stamp),
-            Some(fine),
-            stamp + 10 * SECOND,
-            stamp + 10 * SECOND
-        ));
-        assert!(!super::racy_failure_stamps(None, None, stamp, stamp));
-    }
 }

@@ -1,26 +1,12 @@
-//! Intake accounting: every record an adapter sees lands in exactly one counted
-//! bucket - emitted, consumed (agent-side), a named skip, or a parse error. The
-//! silent `continue` is banned; `agrep audit` (python) re-censuses the raw stores
-//! and holds each file to the identity `seen == rows + agent_rows + Σskips + errors`,
-//! making ingest coverage mechanically auditable.
-//!
-//! Tallies are per file (or per conversation for token-fingerprinted sqlite stores),
-//! lock-free on the hot path (atomics behind an Arc), and persisted to
-//! `data/intake_stats.json` keyed by a freshness fingerprint - so files served from
-//! the parse cache keep the tally from the run that actually parsed them, and the
-//! accounting stays complete across incremental runs.
-
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-
-use serde::{Deserialize, Serialize};
-
-/// Why a seen record did not become an indexed row. Adding a category is cheap;
-/// renaming one invalidates saved tallies only cosmetically (audit treats unknown
-/// names as explained skips of that name).
+//! Parser-local accounting. Nothing is published outside SQLite.
+use std::{
+    cell::RefCell,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
     /// Command/system wrapper markup, not something a human typed (`is_wrapper`).
@@ -156,8 +142,7 @@ impl Tally {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_record_counts(&self, skip: Skip) -> (u64, u64, u64, u64, u64) {
+    pub fn test_record_counts(&self, skip: Skip) -> (u64, u64, u64, u64, u64) {
         (
             self.seen.load(Ordering::Relaxed),
             self.rows.load(Ordering::Relaxed),
@@ -182,431 +167,54 @@ pub(crate) fn clip(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// One persisted tally. `key` is the freshness fingerprint of the source at parse
-/// time (`s:<mtime_ms>:<size>` for stat files, the registry token for conversations);
-/// audit only trusts entries whose key still matches the store.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct FileEntry {
-    pub agent: String,
-    pub key: String,
-    pub seen: u64,
-    pub rows: u64,
-    pub agent_rows: u64,
-    pub events: u64,
-    pub skips: BTreeMap<String, u64>,
-    pub errors: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_error: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct Book {
-    version: u32,
-    /// Path or framed token-conversation identity -> entry.
-    files: BTreeMap<String, FileEntry>,
-}
-
-const BOOK_VERSION: u32 = 1;
-pub const TOKEN_ID_PREFIX: &str = "\0agrep-intake-token-v1\0";
-
-type OpenTally = (String, Option<String>, &'static str, String, Arc<Tally>);
-
-struct Run {
-    /// Tallies opened this run, with the fingerprint captured at open time.
-    open: Mutex<Vec<OpenTally>>,
-    /// Book ids whose source an adapter stopped reading while the file stays on disk.
-    forgotten: Mutex<Vec<String>>,
-}
-
-static RUN: LazyLock<Run> = LazyLock::new(|| Run {
-    open: Mutex::new(Vec::new()),
-    forgotten: Mutex::new(Vec::new()),
-});
-
-thread_local! {
-    /// Tallies opened by each guarded parse running on this thread, innermost last.
-    static GUARDED: RefCell<Vec<Vec<Arc<Tally>>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Run `parse`, which must not unwind, and return the tallies it opened on this thread.
-pub(crate) fn scoped<T>(parse: impl FnOnce() -> T) -> (T, Vec<Arc<Tally>>) {
-    GUARDED.with(|scopes| scopes.borrow_mut().push(Vec::new()));
-    let value = parse();
-    let opened = GUARDED.with(|scopes| {
-        let mut scopes = scopes.borrow_mut();
-        let opened = scopes.pop().unwrap_or_default();
-        if let Some(outer) = scopes.last_mut() {
-            outer.extend(opened.iter().cloned());
+thread_local! { static SCOPES: RefCell<Vec<Vec<Arc<Tally>>>> = const { RefCell::new(Vec::new()) }; }
+pub(crate) fn scoped<T>(f: impl FnOnce() -> T) -> (T, Vec<Arc<Tally>>) {
+    SCOPES.with(|s| s.borrow_mut().push(vec![]));
+    let v = f();
+    let t = SCOPES.with(|s| {
+        let mut s = s.borrow_mut();
+        let t = s.pop().unwrap();
+        if let Some(outer) = s.last_mut() {
+            outer.extend(t.iter().cloned());
         }
-        opened
+        t
     });
-    (value, opened)
+    (v, t)
 }
-
-/// Withdraw the tallies of a parse that never finished: a half-counted tally would otherwise
-/// replace the book entry of the run that last parsed the source, whose rows are still served.
-pub(crate) fn discard(tallies: &[Arc<Tally>]) {
-    if tallies.is_empty() {
-        return;
-    }
-    RUN.open
-        .lock()
-        .unwrap()
-        .retain(|(.., tally)| !tallies.iter().any(|gone| Arc::ptr_eq(gone, tally)));
+pub(crate) fn discard(_: &[Arc<Tally>]) {}
+pub fn forget(_: &Path) {}
+pub fn file(a: &'static str, p: &Path) -> Arc<Tally> {
+    keyed(a, &p.to_string_lossy(), String::new())
 }
-
-/// Serializes unit tests that inspect or drain the process-wide run book.
-#[cfg(test)]
-pub(crate) static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[cfg(test)]
-pub(crate) fn is_open(tally: &Arc<Tally>) -> bool {
-    RUN.open
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|(.., open)| Arc::ptr_eq(open, tally))
+pub fn file_stamped(a: &'static str, p: &Path, _: i64, _: u64) -> Arc<Tally> {
+    file(a, p)
 }
-
-fn opened(tally: &Arc<Tally>) {
-    // try_with: thread teardown has no guarded parse left to attribute the tally to.
-    let _ = GUARDED.try_with(|scopes| {
-        if let Some(scope) = scopes.borrow_mut().last_mut() {
-            scope.push(Arc::clone(tally));
-        }
-    });
-}
-
-/// Panics the parse that opens a tally for the source `AGREP_TEST_PARSE_PANIC` names, after the
-/// tally is registered, quoting store text the way std's `unwrap` of a hostile-input error does.
-#[cfg(feature = "parse-panic-injection")]
-fn inject_parse_panic(source: &str) {
-    if std::env::var_os("AGREP_TEST_PARSE_PANIC").is_some_and(|target| target == source) {
-        let excerpt: Result<(), String> = Err("injected transcript excerpt".to_owned());
-        std::hint::black_box(excerpt).unwrap();
-    }
-}
-
-/// Drop `path`'s entry at the next [`commit`]. For a file that still exists but is no longer a
-/// source (a newer sibling supersedes it): commit keeps every unparsed entry, and audit reads a
-/// present, undiscovered, tallied path as a coverage gap.
-pub fn forget(path: &Path) {
-    RUN.forgotten
-        .lock()
-        .unwrap()
-        .push(path.to_string_lossy().to_string());
-}
-
-/// Stat-file fingerprint. Deliberately weaker than the ingest cache's staleness key: the
-/// cache stamp also folds in the filesystem change token (catching preserved-mtime edits),
-/// but audit recomputes this key independently in Python, so both sides stay on the plain
-/// millisecond-mtime + size shape. A preserved-mtime edit reparses correctly via the cache
-/// yet still reads as "fresh" here.
-pub fn stat_key(path: &Path) -> String {
-    match std::fs::metadata(path) {
-        Ok(md) => {
-            let mt = md
-                .modified()
-                .ok()
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            format!("s:{mt}:{}", md.len())
-        }
-        Err(_) => "s:0:0".to_string(),
-    }
-}
-
-fn stat_key_stamped(mtime_ns: i64, size: u64) -> String {
-    format!("s:{}:{size}", mtime_ns.max(0) / 1_000_000)
-}
-
-/// Open the tally for one source file (stat-fingerprinted).
-pub fn file(agent: &'static str, path: &Path) -> Arc<Tally> {
-    keyed(agent, &path.to_string_lossy(), stat_key(path))
-}
-
-/// Open a tally from the source stamp already validated by the ingest cache.
-pub fn file_stamped(agent: &'static str, path: &Path, mtime_ns: i64, size: u64) -> Arc<Tally> {
-    keyed(
-        agent,
-        &path.to_string_lossy(),
-        stat_key_stamped(mtime_ns, size),
-    )
-}
-
-/// Open the tally for one caller-defined keyed unit.
-pub fn keyed(agent: &'static str, id: &str, fingerprint: String) -> Arc<Tally> {
+pub fn keyed(_: &'static str, _: &str, _: String) -> Arc<Tally> {
     let t = Arc::new(Tally::default());
-    RUN.open
-        .lock()
-        .unwrap()
-        .push((id.to_string(), None, agent, fingerprint, Arc::clone(&t)));
-    opened(&t);
-    #[cfg(feature = "parse-panic-injection")]
-    inject_parse_panic(id);
+    SCOPES.with(|s| {
+        if let Some(v) = s.borrow_mut().last_mut() {
+            v.push(t.clone())
+        }
+    });
     t
 }
-
-pub fn token_id(path: &Path, session: &str) -> String {
-    let path = path.to_string_lossy();
-    let payload = serde_json::to_string(&(&*path, session))
-        .expect("serializing two strings to JSON cannot fail");
-    format!("{TOKEN_ID_PREFIX}{payload}")
+pub fn keyed_token(a: &'static str, p: &Path, s: &str, f: String) -> Arc<Tally> {
+    keyed(a, &token_id(p, s), f)
+}
+pub fn token_id(p: &Path, s: &str) -> String {
+    serde_json::to_string(&(p.to_string_lossy(), s)).unwrap()
+}
+pub fn parse_token_id(s: &str) -> Option<(String, String)> {
+    serde_json::from_str(s).ok()
+}
+pub(crate) fn errors(t: &[Arc<Tally>]) -> bool {
+    t.iter().any(|v| v.errors.load(Ordering::Relaxed) > 0)
 }
 
-pub fn parse_token_id(id: &str) -> Option<(String, String)> {
-    let payload = id.strip_prefix(TOKEN_ID_PREFIX)?;
-    let (path, session): (String, String) = serde_json::from_str(payload).ok()?;
-    (!path.is_empty() && !session.is_empty()).then_some((path, session))
+thread_local! {static DIAGNOSTICS:RefCell<Vec<String>>=const {RefCell::new(Vec::new())};}
+pub fn diagnostic(message: std::fmt::Arguments<'_>) {
+    DIAGNOSTICS.with(|d| d.borrow_mut().push(message.to_string()));
 }
-
-fn legacy_token_id(path: &Path, session: &str) -> String {
-    format!("{}#{session}", path.to_string_lossy())
-}
-
-/// Open a token-store tally and retire its ambiguous pre-v1 identity when committed.
-pub fn keyed_token(
-    agent: &'static str,
-    path: &Path,
-    session: &str,
-    fingerprint: String,
-) -> Arc<Tally> {
-    let id = token_id(path, session);
-    let legacy = legacy_token_id(path, session);
-    let tally = Arc::new(Tally::default());
-    RUN.open
-        .lock()
-        .unwrap()
-        .push((id, Some(legacy), agent, fingerprint, Arc::clone(&tally)));
-    opened(&tally);
-    // A reserved session (a store census, "\0…\0") is bookkeeping outside any guarded parse.
-    #[cfg(feature = "parse-panic-injection")]
-    if !session.starts_with('\0') {
-        inject_parse_panic(&path.to_string_lossy());
-    }
-    tally
-}
-
-fn replace_entry(book: &mut Book, id: String, legacy_id: Option<String>, entry: FileEntry) {
-    if let Some(legacy_id) = legacy_id {
-        book.files.remove(&legacy_id);
-    }
-    book.files.insert(id, entry);
-}
-
-/// Per-agent rollup for the ingest stdout summary.
-#[derive(Default, Clone)]
-pub struct AgentSummary {
-    pub files: u64,
-    pub seen: u64,
-    pub rows: u64,
-    pub agent_rows: u64,
-    pub events: u64,
-    pub skips: u64,
-    pub errors: u64,
-}
-
-fn publish(path: &Path, book: &Book) -> anyhow::Result<()> {
-    let body = serde_json::to_vec(book)?;
-    crate::cache::write_bytes_atomic(path, &body)
-}
-
-/// The persisted book as [`commit`] wrote it: `None` before any ingest, an error for an
-/// unreadable, malformed, or differently versioned file. Diagnostics read it; only commit writes.
-pub fn read_book(path: &Path) -> anyhow::Result<Option<BTreeMap<String, FileEntry>>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let book: Book = serde_json::from_str(&text)?;
-    anyhow::ensure!(
-        book.version == BOOK_VERSION,
-        "intake book version {} is not {BOOK_VERSION}",
-        book.version
-    );
-    Ok(Some(book.files))
-}
-
-/// Fold this run's tallies into the persisted book at `path`: parsed units replace
-/// their old entries, ids passed to [`forget`] leave, unparsed-but-still-present entries survive
-/// (their source was served from the parse cache), entries whose source vanished are dropped
-/// by the audit rather than here (path existence is adapter-specific). Returns per-agent
-/// rollups of THIS run for the stdout summary.
-pub fn commit(path: &Path) -> anyhow::Result<BTreeMap<&'static str, AgentSummary>> {
-    let mut book: Book = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .filter(|b: &Book| b.version == BOOK_VERSION)
-        .unwrap_or_default();
-    book.version = BOOK_VERSION;
-
-    let mut summaries: BTreeMap<&'static str, AgentSummary> = BTreeMap::new();
-    let opened = std::mem::take(&mut *RUN.open.lock().unwrap());
-    for id in std::mem::take(&mut *RUN.forgotten.lock().unwrap()) {
-        book.files.remove(&id);
-    }
-    for (id, legacy_id, agent, fingerprint, t) in opened {
-        let mut skips = BTreeMap::new();
-        let mut skip_total = 0u64;
-        for (i, s) in Skip::ALL.iter().enumerate() {
-            let n = t.skips[i].load(Ordering::Relaxed);
-            if n > 0 {
-                skips.insert(s.key().to_string(), n);
-                skip_total += n;
-            }
-        }
-        let entry = FileEntry {
-            agent: agent.to_string(),
-            key: fingerprint,
-            seen: t.seen.load(Ordering::Relaxed),
-            rows: t.rows.load(Ordering::Relaxed),
-            agent_rows: t.agent_rows.load(Ordering::Relaxed),
-            events: t.events.load(Ordering::Relaxed),
-            skips,
-            errors: t.errors.load(Ordering::Relaxed),
-            first_error: t.first_error.lock().unwrap().clone(),
-        };
-        let s = summaries.entry(agent).or_default();
-        s.files += 1;
-        s.seen += entry.seen;
-        s.rows += entry.rows;
-        s.agent_rows += entry.agent_rows;
-        s.events += entry.events;
-        s.skips += skip_total;
-        s.errors += entry.errors;
-        replace_entry(&mut book, id, legacy_id, entry);
-    }
-
-    publish(path, &book)?;
-    Ok(summaries)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn skip_indices_follow_persisted_key_order() {
-        for (index, skip) in Skip::ALL.into_iter().enumerate() {
-            assert_eq!(skip.index(), index, "{}", skip.key());
-        }
-        assert_eq!(Skip::Throwaway.key(), "throwaway");
-    }
-
-    #[test]
-    fn clip_respects_char_boundaries() {
-        let three_byte = format!("{}汉tail", "x".repeat(79));
-        assert_eq!(clip(&three_byte, 80), "x".repeat(79));
-        let four_byte = format!("{}🦀tail", "x".repeat(78));
-        assert_eq!(clip(&four_byte, 80), "x".repeat(78));
-        assert_eq!(clip("short", 80), "short");
-        assert_eq!(clip("aé", 3), "aé"); // boundary exactly at the cap keeps the char
-    }
-
-    #[test]
-    fn stamped_stat_key_uses_audit_millisecond_shape() {
-        assert_eq!(stat_key_stamped(1_234_567_890, 42), "s:1234:42");
-        assert_eq!(stat_key_stamped(-1, 9), "s:0:9");
-    }
-
-    #[test]
-    fn token_ids_are_unambiguous_and_retire_the_exact_legacy_key() {
-        let path = Path::new("db#part.sqlite");
-        let first = token_id(path, "session#part");
-        let second = token_id(Path::new("db"), "part.sqlite#session#part");
-        assert_ne!(first, second);
-        assert!(first.starts_with(TOKEN_ID_PREFIX));
-        assert_eq!(
-            parse_token_id(&first),
-            Some(("db#part.sqlite".into(), "session#part".into()))
-        );
-        assert_eq!(parse_token_id("db#part.sqlite#session#part"), None);
-        assert_eq!(parse_token_id(&format!("{TOKEN_ID_PREFIX}[\"db\"]")), None);
-
-        let legacy = legacy_token_id(path, "session#part");
-        let mut book = Book::default();
-        let old = FileEntry {
-            agent: "cursor".into(),
-            key: "old".into(),
-            seen: 1,
-            rows: 1,
-            agent_rows: 0,
-            events: 0,
-            skips: BTreeMap::new(),
-            errors: 0,
-            first_error: None,
-        };
-        book.files.insert(legacy.clone(), old.clone());
-        replace_entry(&mut book, first.clone(), Some(legacy.clone()), old);
-        assert!(!book.files.contains_key(&legacy));
-        assert!(book.files.contains_key(&first));
-    }
-
-    #[test]
-    fn identity_and_persistence_round_trip() {
-        let _run = RUN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let t = keyed("testagent", "x.jsonl", "s:1:2".into());
-        t.seen_n(4);
-        t.seen();
-        t.row();
-        t.agent_row();
-        t.skip_n(Skip::Wrapper, 1);
-        t.skip(Skip::NonMessage);
-        t.error("bad json {");
-
-        let dir = std::env::temp_dir().join(format!("agrep-intake-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("intake_stats.json");
-        let _ = std::fs::remove_file(&p);
-        let sums = commit(&p).unwrap();
-        let s = &sums["testagent"];
-        assert_eq!(
-            (s.seen, s.rows, s.agent_rows, s.skips, s.errors),
-            (5, 1, 1, 2, 1)
-        );
-        // the audit identity
-        assert_eq!(s.seen, s.rows + s.agent_rows + s.skips + s.errors);
-
-        // second commit with no opened tallies keeps the persisted entry
-        let sums2 = commit(&p).unwrap();
-        assert!(!sums2.contains_key("testagent"));
-        let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        assert_eq!(book.files["x.jsonl"].seen, 5);
-        assert_eq!(
-            book.files["x.jsonl"].first_error.as_deref(),
-            Some("bad json {")
-        );
-
-        let replacement = keyed("testagent", "x.jsonl", "s:2:2".into());
-        replacement.seen();
-        replacement.row();
-        commit(&p).unwrap();
-        let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        assert_eq!(book.files["x.jsonl"].seen, 1);
-        assert_eq!(book.files["x.jsonl"].rows, 1);
-
-        // a forgotten source leaves the book; one re-tallied in the same run stays
-        keyed("testagent", "y.jsonl", "s:3:3".into()).seen();
-        commit(&p).unwrap();
-        forget(Path::new("x.jsonl"));
-        forget(Path::new("y.jsonl"));
-        keyed("testagent", "y.jsonl", "s:4:4".into()).seen();
-        commit(&p).unwrap();
-        let book: Book = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        assert!(!book.files.contains_key("x.jsonl"));
-        assert_eq!(book.files["y.jsonl"].key, "s:4:4");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn publication_failure_is_returned() {
-        let dir = std::env::temp_dir().join(format!("agrep-intake-error-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(publish(&dir, &Book::default()).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+pub fn take_diagnostics() -> Vec<String> {
+    DIAGNOSTICS.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }

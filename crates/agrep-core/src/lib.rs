@@ -1,24 +1,42 @@
-//! Native storage and retrieval primitives for agrep.
-//!
-//! The crate parses supported agent stores into normalized [`Message`] and event rows, maintains
-//! incremental ingest state, publishes corpus artifacts, and implements boundary, substring, and
-//! quantized-vector scoring. Python owns command orchestration and the user-facing search policy.
-
+//! agrep 0.5: local agent history in one transactional store.
+pub mod archive;
 pub mod boundary_rank;
 pub mod boundary_stats;
-pub mod cache;
-pub mod emit;
-pub mod fallback_scan;
-pub mod fault_injection;
+pub mod data;
 pub mod ingest;
-pub mod ingest_cache;
 pub mod intake;
+pub mod intake_batch;
+pub mod integrations;
 pub mod model;
-pub mod row_class;
+pub mod query;
+pub mod render;
+pub mod safe_fs;
 pub mod semantic_q8;
-
-#[cfg(any(unix, windows))]
-mod mapped_file;
+pub mod store;
 mod unicode_v16;
-
 pub use model::Message;
+
+pub mod row_class;
+
+pub mod briefing;
+pub mod caller;
+pub mod caller_process;
+pub mod coverage;
+pub mod diagnostics;
+pub mod evidence;
+pub mod explorer;
+pub mod handles;
+pub mod history;
+pub mod hybrid;
+pub mod launch;
+pub mod live;
+pub mod pages;
+pub mod process;
+pub mod recovery;
+pub mod semantic;
+mod semantic_bert;
+pub mod semantic_model;
+mod semantic_policy;
+mod semantic_store;
+pub mod surface;
+pub mod terminal;

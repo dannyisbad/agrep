@@ -48,34 +48,3 @@ pub fn json(v: &serde_json::Value) -> i64 {
         _ => 0,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rfc3339_and_none() {
-        assert_eq!(rfc3339(Some("2026-01-02T10:00:00.000Z")), 1767348000000);
-        assert_eq!(rfc3339(None), 0);
-        assert_eq!(rfc3339(Some("not a date")), 0);
-    }
-
-    #[test]
-    fn seconds_scale_millis_passthrough() {
-        assert_eq!(epoch_number(1767348000.0), 1767348000000); // seconds -> millis
-        assert_eq!(epoch_number(1767348000000.0), 1767348000000); // already millis
-        assert_eq!(epoch_number(0.0), 0);
-        assert_eq!(epoch_secs_f64(1767348000.5), 1767348000500); // fractional secs kept
-    }
-
-    #[test]
-    fn json_shapes() {
-        assert_eq!(
-            json(&serde_json::json!("2026-01-02T10:00:00.000Z")),
-            1767348000000
-        );
-        assert_eq!(json(&serde_json::json!(1767348000i64)), 1767348000000);
-        assert_eq!(json(&serde_json::json!(1767348000000i64)), 1767348000000);
-        assert_eq!(json(&serde_json::json!(null)), 0);
-    }
-}

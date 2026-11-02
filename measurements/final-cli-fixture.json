@@ -1,0 +1,123 @@
+{
+  "nice": 10,
+  "runs": [
+    {
+      "argv": [
+        "index",
+        "--semantic"
+      ],
+      "exit": 0,
+      "stdout": "{\"sources\":20,\"parsed\":20,\"changed_rows\":20,\"errors\":0,\"skipped_lock\":false,\"census_ms\":0.9596669999999999,\"total_ms\":71.235208,\"parse_ms\":22.499834,\"write_ms\":5.7979579999999995,\"bounds_ms\":3.549792,\"stats_ms\":3.1215}\n",
+      "stderr": "agrep: indexing 20 source files\u2026\nsemantic 20/20 rows\n",
+      "wall_ms": 16741.869208000935
+    },
+    {
+      "argv": [
+        "search",
+        "-s",
+        "--json",
+        "-n",
+        "1",
+        "--",
+        "where is the connection pool timeout configured?"
+      ],
+      "exit": 0,
+      "stdout": "{\"completeness\":{\"shown\":1,\"tool_rows\":0,\"total\":1,\"total_basis\":\"exact\",\"truncated\":false,\"unit\":\"chat\"},\"engine\":\"semantic\",\"filter_coverage\":{\"checked\":true},\"filters\":{\"agent\":null,\"chat\":null,\"exclude_project\":null,\"model\":null,\"model_soft\":false,\"no_meta\":false,\"no_side\":false,\"no_who\":null,\"project\":null,\"since\":null,\"until\":null,\"who\":null},\"freshness\":{\"checked\":true,\"state\":\"committed\"},\"kind\":\"agrep-meta\",\"query\":\"where is the connection pool timeout configured?\",\"self_exclusion\":{\"active\":false,\"reason\":\"caller-unknown\"},\"semantic_coverage\":{\"complete\":true,\"fraction\":1.0,\"indexed\":20,\"order\":\"newest-first\",\"pending\":0,\"total\":20},\"semantic_partial\":false,\"work\":{\"blocks\":1,\"examined\":20}}\n{\"agent\":\"pi\",\"boundary_class\":\"\",\"family\":\"semantic-fixture-000\",\"handle\":\"@semantic-fixture-000:0.d9df\",\"lane\":\"semantic\",\"matched\":\"semantic\",\"model\":\"\",\"model_source\":\"unknown\",\"project\":\"/fixture/semantic\",\"score\":0.921032190322876,\"self\":false,\"sem_score\":0.921032190322876,\"session\":\"semantic-fixture-000\",\"side\":false,\"snippet\":\"The PostgreSQL connection pool timeout is configured in src/db/pool.rs. Set acquire_timeout to Duration::from_secs(5), and cap max_connections at 12. The request deadline must be longer than the pool deadline.\",\"text\":\"The PostgreSQL connection pool timeout is configured in src/db/pool.rs. Set acquire_timeout to Duration::from_secs(5), and cap max_connections at 12. The request deadline must be longer than the pool deadline.\",\"ts\":1793268060000,\"turn\":0,\"who\":\"user\"}\n",
+      "stderr": "",
+      "wall_ms": 120.3793750009936,
+      "reference_handle": "@semantic-fixture-000:0.d9df",
+      "reference_score": 0.915167,
+      "top_handle": "@semantic-fixture-000:0.d9df",
+      "score": 0.921032190322876
+    },
+    {
+      "argv": [
+        "search",
+        "-s",
+        "--json",
+        "-n",
+        "1",
+        "--",
+        "fix the Rust borrow checker error"
+      ],
+      "exit": 0,
+      "stdout": "{\"completeness\":{\"shown\":1,\"tool_rows\":0,\"total\":1,\"total_basis\":\"exact\",\"truncated\":false,\"unit\":\"chat\"},\"engine\":\"semantic\",\"filter_coverage\":{\"checked\":true},\"filters\":{\"agent\":null,\"chat\":null,\"exclude_project\":null,\"model\":null,\"model_soft\":false,\"no_meta\":false,\"no_side\":false,\"no_who\":null,\"project\":null,\"since\":null,\"until\":null,\"who\":null},\"freshness\":{\"checked\":true,\"state\":\"committed\"},\"kind\":\"agrep-meta\",\"query\":\"fix the Rust borrow checker error\",\"self_exclusion\":{\"active\":false,\"reason\":\"caller-unknown\"},\"semantic_coverage\":{\"complete\":true,\"fraction\":1.0,\"indexed\":20,\"order\":\"newest-first\",\"pending\":0,\"total\":20},\"semantic_partial\":false,\"work\":{\"blocks\":1,\"examined\":20}}\n{\"agent\":\"pi\",\"boundary_class\":\"\",\"family\":\"semantic-fixture-001\",\"handle\":\"@semantic-fixture-001:0.3325\",\"lane\":\"semantic\",\"matched\":\"semantic\",\"model\":\"\",\"model_source\":\"unknown\",\"project\":\"/fixture/semantic\",\"score\":0.9092650413513184,\"self\":false,\"sem_score\":0.9092650413513184,\"session\":\"semantic-fixture-001\",\"side\":false,\"snippet\":\"The borrow checker rejected a mutable borrow while the map iterator still held an immutable reference. Collect the keys into Vec<String>, drop the iterator, then update the map. ```rust let keys: Vec<_> = map.keys().cloned().collect(); for key in keys { map.get_mut(&key).unwrap()\u2026\",\"text\":\"The borrow checker rejected a mutable borrow while the map iterator still held an immutable reference. Collect the keys into Vec<String>, drop the iterator, then update the map.\\n```rust\\nlet keys: Vec<_> = map.keys().cloned().collect();\\nfor key in keys { map.get_mut(&key).unwrap().count += 1; }\\n```\",\"ts\":1793268060000,\"turn\":0,\"who\":\"user\"}\n",
+      "stderr": "",
+      "wall_ms": 126.81616599911649,
+      "reference_handle": "@semantic-fixture-001:0.3325",
+      "reference_score": 0.898544,
+      "top_handle": "@semantic-fixture-001:0.3325",
+      "score": 0.9092650413513184
+    },
+    {
+      "argv": [
+        "search",
+        "-s",
+        "--json",
+        "-n",
+        "1",
+        "--",
+        "how did we resolve the database migration failure?"
+      ],
+      "exit": 0,
+      "stdout": "{\"completeness\":{\"shown\":1,\"tool_rows\":0,\"total\":1,\"total_basis\":\"exact\",\"truncated\":false,\"unit\":\"chat\"},\"engine\":\"semantic\",\"filter_coverage\":{\"checked\":true},\"filters\":{\"agent\":null,\"chat\":null,\"exclude_project\":null,\"model\":null,\"model_soft\":false,\"no_meta\":false,\"no_side\":false,\"no_who\":null,\"project\":null,\"since\":null,\"until\":null,\"who\":null},\"freshness\":{\"checked\":true,\"state\":\"committed\"},\"kind\":\"agrep-meta\",\"query\":\"how did we resolve the database migration failure?\",\"self_exclusion\":{\"active\":false,\"reason\":\"caller-unknown\"},\"semantic_coverage\":{\"complete\":true,\"fraction\":1.0,\"indexed\":20,\"order\":\"newest-first\",\"pending\":0,\"total\":20},\"semantic_partial\":false,\"work\":{\"blocks\":1,\"examined\":20}}\n{\"agent\":\"pi\",\"boundary_class\":\"\",\"family\":\"semantic-fixture-002\",\"handle\":\"@semantic-fixture-002:0.e956\",\"lane\":\"semantic\",\"matched\":\"semantic\",\"model\":\"\",\"model_source\":\"unknown\",\"project\":\"/fixture/semantic\",\"score\":0.8852468132972717,\"self\":false,\"sem_score\":0.8852468132972717,\"session\":\"semantic-fixture-002\",\"side\":false,\"snippet\":\"We fixed the migration failure by splitting the schema change into two transactions. First add the nullable column, backfill in batches, and only then add the NOT NULL constraint. The deployment now resumes from the last committed batch.\",\"text\":\"We fixed the migration failure by splitting the schema change into two transactions. First add the nullable column, backfill in batches, and only then add the NOT NULL constraint. The deployment now resumes from the last committed batch.\",\"ts\":1793268060000,\"turn\":0,\"who\":\"user\"}\n",
+      "stderr": "",
+      "wall_ms": 130.01074999920093,
+      "reference_handle": "@semantic-fixture-002:0.e956",
+      "reference_score": 0.879869,
+      "top_handle": "@semantic-fixture-002:0.e956",
+      "score": 0.8852468132972717
+    },
+    {
+      "argv": [
+        "search",
+        "-s",
+        "--json",
+        "-n",
+        "1",
+        "--",
+        "why does Metal attention produce NaNs?"
+      ],
+      "exit": 0,
+      "stdout": "{\"completeness\":{\"shown\":1,\"tool_rows\":0,\"total\":1,\"total_basis\":\"exact\",\"truncated\":false,\"unit\":\"chat\"},\"engine\":\"semantic\",\"filter_coverage\":{\"checked\":true},\"filters\":{\"agent\":null,\"chat\":null,\"exclude_project\":null,\"model\":null,\"model_soft\":false,\"no_meta\":false,\"no_side\":false,\"no_who\":null,\"project\":null,\"since\":null,\"until\":null,\"who\":null},\"freshness\":{\"checked\":true,\"state\":\"committed\"},\"kind\":\"agrep-meta\",\"query\":\"why does Metal attention produce NaNs?\",\"self_exclusion\":{\"active\":false,\"reason\":\"caller-unknown\"},\"semantic_coverage\":{\"complete\":true,\"fraction\":1.0,\"indexed\":20,\"order\":\"newest-first\",\"pending\":0,\"total\":20},\"semantic_partial\":false,\"work\":{\"blocks\":1,\"examined\":20}}\n{\"agent\":\"pi\",\"boundary_class\":\"\",\"family\":\"semantic-fixture-004\",\"handle\":\"@semantic-fixture-004:0.27b8\",\"lane\":\"semantic\",\"matched\":\"semantic\",\"model\":\"\",\"model_source\":\"unknown\",\"project\":\"/fixture/semantic\",\"score\":0.9272720813751221,\"self\":false,\"sem_score\":0.9272720813751221,\"session\":\"semantic-fixture-004\",\"side\":false,\"snippet\":\"Metal attention produced NaNs because a half-precision mask converted the minimum float32 value to negative infinity. Check padding rows, avoid fully masked softmax inputs, and compute normalization in float32.\",\"text\":\"Metal attention produced NaNs because a half-precision mask converted the minimum float32 value to negative infinity. Check padding rows, avoid fully masked softmax inputs, and compute normalization in float32.\",\"ts\":1793268060000,\"turn\":0,\"who\":\"user\"}\n",
+      "stderr": "",
+      "wall_ms": 127.34650000129477,
+      "reference_handle": "@semantic-fixture-004:0.27b8",
+      "reference_score": 0.916306,
+      "top_handle": "@semantic-fixture-004:0.27b8",
+      "score": 0.9272720813751221
+    },
+    {
+      "argv": [
+        "status"
+      ],
+      "exit": 0,
+      "stdout": "agrep 0.5.0 \u00b7 21 sessions \u00b7 21 prose rows \u00b7 0 tool rows\nsemantic 20/21 rows\n",
+      "stderr": "",
+      "wall_ms": 22.20191599917598
+    }
+  ],
+  "background_observations": [
+    {
+      "elapsed_ms": 1.129749998654006,
+      "pending": 1,
+      "refs": 20
+    },
+    {
+      "elapsed_ms": 105.66124999968451,
+      "pending": 1,
+      "refs": 20
+    },
+    {
+      "elapsed_ms": 209.34849999866856,
+      "pending": 0,
+      "refs": 21
+    },
+    {
+      "elapsed_ms": 313.74337499983085,
+      "pending": 0,
+      "refs": 21
+    }
+  ],
+  "background_work_lock_released": true
+}

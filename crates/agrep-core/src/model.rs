@@ -145,7 +145,7 @@ pub const WORKED_UNKNOWN: u8 = 2;
 /// One tool call or subagent step inside a session. Written to per-session files under
 /// `data/events/`, separate from the canonical message stream. Inputs/outputs are capped
 /// summaries; original lengths disclose loss.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Event {
     /// Source agent: "claude", "codex", "opencode", "antigravity".
     pub agent: &'static str,

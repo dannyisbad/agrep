@@ -1,4 +1,0 @@
-exit: 1
---- stdout ---
---- stderr ---
-keyword: 0 matching rows across 23 indexed messages

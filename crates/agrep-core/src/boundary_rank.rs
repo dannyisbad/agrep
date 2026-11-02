@@ -1154,7 +1154,7 @@ mod tests {
     #[test]
     fn python_oracle_matches() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../py/fixtures/boundary_conformance.json");
+            .join("tests/fixtures/boundary_conformance.json");
         let fixture: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(fixture["schema"], 2);
