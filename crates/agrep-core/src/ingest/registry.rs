@@ -10,11 +10,12 @@ use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::sync::{OnceLock, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{OnceLock, RwLock},
+};
 
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
-use sha2::{Digest as _, Sha256};
 
 use crate::intake_batch::IntakeBatch;
 use crate::model::{Event, Message};
@@ -326,33 +327,6 @@ impl ChangeToken {
                 output.extend_from_slice(value);
             }
         }
-    }
-}
-
-#[cfg(windows)]
-mod windows_path_serde {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::path::{Path, PathBuf};
-
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        path.as_os_str()
-            .encode_wide()
-            .collect::<Vec<_>>()
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let units = Vec::<u16>::deserialize(deserializer)?;
-        Ok(PathBuf::from(OsString::from_wide(&units)))
     }
 }
 
@@ -783,12 +757,12 @@ pub fn nofollow_read_options(options: &mut fs::OpenOptions) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn secure_read_options(options: &mut fs::OpenOptions) {
+pub(crate) fn secure_read_options(options: &mut fs::OpenOptions) {
     nofollow_read_options(options);
 }
 
 #[cfg(windows)]
-fn secure_read_options(options: &mut fs::OpenOptions) {
+pub(crate) fn secure_read_options(options: &mut fs::OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -800,7 +774,7 @@ fn secure_read_options(options: &mut fs::OpenOptions) {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn secure_read_options(_options: &mut fs::OpenOptions) {}
+pub(crate) fn secure_read_options(_options: &mut fs::OpenOptions) {}
 
 #[cfg(unix)]
 fn same_plain_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {

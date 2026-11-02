@@ -7,10 +7,23 @@ use agrep_core::{
 use rusqlite::Connection;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 use tempfile::TempDir;
+fn make_writable(path: &Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o600);
+    }
+    // Windows permissions expose only the read-only attribute; clearing it is the intent.
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions).unwrap();
+}
 struct Fixture {
     _tmp: TempDir,
     home: PathBuf,
@@ -194,15 +207,7 @@ fn setup_headless_optouts_readonly_and_user_payload() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(fs::read_to_string(&p).unwrap(), "user\n");
     assert!(f.home.join(".codex/hooks.json").exists());
-    let mut permissions = fs::metadata(&p).unwrap().permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o600);
-    }
-    #[cfg(windows)]
-    permissions.set_readonly(false);
-    fs::set_permissions(&p, permissions).unwrap();
+    make_writable(&p);
     fs::create_dir_all(f.home.join(".pi/agent/extensions")).unwrap();
     let payload = f.home.join(".pi/agent/extensions/agrep-postcompact.ts");
     fs::write(&payload, "user extension").unwrap();
@@ -653,15 +658,7 @@ fn restore_readonly_and_orphan_wal_refusal() {
         Some(1)
     );
     assert_eq!(fs::read(&source).unwrap(), b"changed");
-    let mut p = fs::metadata(&source).unwrap().permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        p.set_mode(0o600);
-    }
-    #[cfg(windows)]
-    p.set_readonly(false);
-    fs::set_permissions(&source, p).unwrap();
+    make_writable(&source);
     let path = f.home.join(".local/share/opencode/opencode.db");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let db = Connection::open(&path).unwrap();
@@ -718,15 +715,7 @@ fn every_target_missing_and_readonly_files() {
         fs::set_permissions(&t.path, p).unwrap();
         assert!(integrations::install_block(&t).is_err(), "{}", t.name);
         assert_eq!(fs::read(&t.path).unwrap(), before);
-        let mut p = fs::metadata(&t.path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            p.set_mode(0o600);
-        }
-        #[cfg(windows)]
-        p.set_readonly(false);
-        fs::set_permissions(&t.path, p).unwrap();
+        make_writable(&t.path);
     }
 }
 

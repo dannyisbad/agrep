@@ -149,12 +149,13 @@ fn utterance(i: usize, tool: bool, dense: bool) -> String {
     }
     s
 }
-fn generate(home: &Path, rows: usize, dense: bool) -> Result<PathBuf> {
+fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)> {
     let base = home.join(".pi/agent/sessions/bench");
     fs::create_dir_all(&base)?;
     let sessions = (rows / 170).max(1);
     let mut last = PathBuf::new();
     let mut at = 0;
+    let mut text_bytes = 0u64;
     for sid in 0..sessions {
         let codex = !dense && sid % 5 == 1;
         let file_base = if codex {
@@ -191,6 +192,7 @@ fn generate(home: &Path, rows: usize, dense: bool) -> Result<PathBuf> {
             let tool = !dense && j % 9 != 0 && !assistant;
             let id = format!("e{j}");
             let text = utterance(at, tool, dense);
+            text_bytes += text.len() as u64;
             if codex {
                 if !assistant {
                     writeln!(
@@ -206,10 +208,12 @@ fn generate(home: &Path, rows: usize, dense: bool) -> Result<PathBuf> {
                 )?;
             } else if tool {
                 let call = format!("c{j}");
+                let command = format!("inspect source {at}");
+                text_bytes += command.len() as u64 + 1;
                 writeln!(
                     f,
                     "{}",
-                    json!({"type":"message","id":&call,"parentId":parent,"timestamp":date,"message":{"role":"assistant","content":[{"type":"toolCall","id":&id,"name":"shell","arguments":{"command":format!("inspect source {at}")}}]}})
+                    json!({"type":"message","id":&call,"parentId":parent,"timestamp":date,"message":{"role":"assistant","content":[{"type":"toolCall","id":&id,"name":"shell","arguments":{"command":command}}]}})
                 )?;
                 writeln!(
                     f,
@@ -231,7 +235,7 @@ fn generate(home: &Path, rows: usize, dense: bool) -> Result<PathBuf> {
             last = path;
         }
     }
-    Ok(last)
+    Ok((last, text_bytes))
 }
 fn invoke(
     bin: &Path,
@@ -460,18 +464,21 @@ fn main() -> Result<()> {
     if a.reuse && !data.join("index.db").is_file() {
         bail!("--reuse requires an existing index.db")
     }
-    let last = if a.real {
-        None
+    let (last, mut text_bytes) = if a.real {
+        (None, 0)
     } else {
-        Some(generate(&home, a.rows, a.dense)?)
+        let (last, text_bytes) = generate(&home, a.rows, a.dense)?;
+        (Some(last), text_bytes)
     };
     if a.semantic {
         let path = last.as_ref().expect("synthetic semantic source");
         let mut source = fs::OpenOptions::new().append(true).open(path)?;
+        let fixture = "The cobalt lantern project's migration checklist is stored beside its release plan. We agreed to preserve the deployment instructions there.";
+        text_bytes += fixture.len() as u64;
         writeln!(
             source,
             "{}",
-            json!({"type":"message","id":"semantic-fixture","timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":"The cobalt lantern project's migration checklist is stored beside its release plan. We agreed to preserve the deployment instructions there."}})
+            json!({"type":"message","id":"semantic-fixture","timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":fixture}})
         )?;
     }
     let source_bytes = if a.real { 0 } else { bytes(&home) };
@@ -696,13 +703,13 @@ fn main() -> Result<()> {
     )?
     .2;
     let failures = if a.check {
-        perf::check(&cases, a.dense, a.semantic, a.rows, source_bytes)
+        perf::check(&cases, a.dense, a.semantic, a.rows, text_bytes)
             .err()
             .unwrap_or_default()
     } else {
         Vec::new()
     };
-    let report = json!({"corpus":corpus,"scope":"fresh process through full exit, no discarded warm-up, normal refresh, nice inherited","real_history":a.real,"reuse":a.reuse,"dense":a.dense,"requested_rows":a.rows,"source_bytes":source_bytes,"index_bytes":bytes(&data),"cases":cases});
+    let report = json!({"corpus":corpus,"scope":"fresh process through full exit, no discarded warm-up, normal refresh, nice inherited","real_history":a.real,"reuse":a.reuse,"dense":a.dense,"requested_rows":a.rows,"source_bytes":source_bytes,"text_bytes":text_bytes,"index_bytes":bytes(&data),"cases":cases});
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(p) = a.output {
         fs::write(p, serde_json::to_vec_pretty(&report)?)?;

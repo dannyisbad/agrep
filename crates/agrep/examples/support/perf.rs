@@ -5,7 +5,7 @@ pub fn check(
     dense: bool,
     semantic: bool,
     rows: usize,
-    source_bytes: u64,
+    text_bytes: u64,
 ) -> Result<(), Vec<String>> {
     let budgets: Value = serde_json::from_str(include_str!("../../../../docs/perf-budgets.json"))
         .expect("committed performance budget JSON");
@@ -83,11 +83,12 @@ pub fn check(
             "version_control",
         ]
     };
-    if source_bytes == 0 {
-        failures.push("source byte count is required".into());
+    if text_bytes == 0 {
+        failures.push("indexed text byte count is required".into());
     }
-    let scale =
-        (source_bytes as f64 / budgets["reference_source_bytes"].as_f64().unwrap()).min(1.0);
+    let index_scale = (rows as f64 / budgets["reference_rows"].as_f64().unwrap())
+        .max(text_bytes as f64 / budgets["reference_text_bytes"].as_f64().unwrap())
+        .min(1.0);
     for name in required {
         if !cases.iter().any(|c| c["name"] == *name) {
             failures.push(format!("missing benchmark case {name}"));
@@ -141,6 +142,9 @@ pub fn check(
         if samples.unwrap().len() < minimum {
             failures.push(format!("{name}: requires at least {minimum} samples"));
         }
+        if semantic && name == "first_index" {
+            continue;
+        }
         let key = match name {
             "compact_first_hybrid" => "hybrid_first_ms",
             "compact_warm_hybrid" => "hybrid_p50_ms",
@@ -159,13 +163,10 @@ pub fn check(
             case["median_ms"].as_f64(),
             &budgets,
             key,
-            if key.starts_with("hybrid")
-                || (dense && key.starts_with("dense_p"))
-                || name == "version_control"
-            {
-                1.0
+            if name == "first_index" {
+                index_scale
             } else {
-                scale
+                1.0
             },
             &mut failures,
         );
@@ -184,11 +185,7 @@ pub fn check(
                 case["p95_ms"].as_f64(),
                 &budgets,
                 tail,
-                if dense || name == "version_control" {
-                    1.0
-                } else {
-                    scale
-                },
+                1.0,
                 &mut failures,
             );
         }

@@ -127,14 +127,47 @@ fn gate_rejects_empty_answers_and_unexpected_no_match() {
         &json!({"bench_stdout_bytes":200,"bench_result_rows":0})
     ));
 }
+fn errors(cases: &[Value], dense: bool, semantic: bool, rows: usize, text_bytes: u64) -> String {
+    perf::check(cases, dense, semantic, rows, text_bytes)
+        .err()
+        .unwrap_or_default()
+        .join(" ")
+}
 #[test]
-fn small_source_indexes_receive_proportionate_deadlines() {
-    let mut cases = dense();
-    cases[0]["median_ms"] = json!(budget("dense_index_ms") / 5.0);
-    assert!(perf::check(&cases, true, false, 2_000_000, 88_600_000)
-        .unwrap_err()
-        .iter()
-        .any(|e| e.contains("first_index median")));
+fn latency_limits_do_not_shrink_with_corpus_size() {
+    let mut release = case("release");
+    release["median_ms"] = json!(budget("keyword_p50_ms") - 1.0);
+    release["p95_ms"] = json!(budget("keyword_p95_ms") - 1.0);
+    let mut census = case("no_change_census");
+    census["median_ms"] = json!(budget("census_ms") - 1.0);
+    let report = errors(&[release, census], false, false, 100_000, 1_000_000);
+    for text in ["release median", "release p95", "no_change_census median"] {
+        assert!(!report.contains(text), "{report}");
+    }
+}
+#[test]
+fn index_limit_scales_by_the_larger_workload_fraction() {
+    let mut index = case("first_index");
+    index["median_ms"] = json!(budget("first_index_ms") * 0.45);
+    let rows_dominate = errors(&[index.clone()], false, false, 600_000, 88_600_000);
+    assert!(
+        !rows_dominate.contains("first_index median"),
+        "{rows_dominate}"
+    );
+    let bytes_dominate = errors(&[index], false, false, 100_000, 88_600_000);
+    assert!(
+        bytes_dominate.contains("first_index median"),
+        "{bytes_dominate}"
+    );
+    let mut dense_index = dense();
+    dense_index[0]["median_ms"] = json!(budget("dense_index_ms") + 1.0);
+    assert!(errors(&dense_index, true, false, 2_000_000, 1_000_000).contains("first_index median"));
+}
+#[test]
+fn semantic_workload_build_time_is_not_budgeted() {
+    let mut index = case("first_index");
+    index["median_ms"] = json!(budget("first_index_ms") * 10.0);
+    assert!(!errors(&[index], false, true, 1000, 200_000).contains("first_index median"));
 }
 
 #[path = "../examples/support/process.rs"]

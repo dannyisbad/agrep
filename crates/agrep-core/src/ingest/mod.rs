@@ -516,8 +516,6 @@ impl SqliteSnapshot {
             }
             Err(error) => return Err(error),
         };
-        #[cfg(target_os = "linux")]
-        let mut metadata = metadata;
         let mode = SnapshotFileMode::Frozen;
         if !cloner(&opened, destination)? {
             use std::io::Seek;
@@ -604,7 +602,7 @@ impl Drop for SqliteSnapshot {
 
 #[cfg(windows)]
 struct WindowsSqliteGuard {
-    files: Vec<std::fs::File>,
+    _files: Vec<std::fs::File>,
 }
 
 #[cfg(windows)]
@@ -677,7 +675,7 @@ impl WindowsSqliteGuard {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        Ok(Self { files })
+        Ok(Self { _files: files })
     }
 }
 

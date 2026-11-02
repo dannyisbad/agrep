@@ -9,31 +9,33 @@
   "dense_index_ms": 30000,
   "dense_p50_ms": 20,
   "dense_p95_ms": 40,
+  "hybrid_p50_ms": 200,
+  "hybrid_first_ms": 1000,
+  "reference_rows": 1202377,
+  "reference_text_bytes": 886000000,
   "runner_classes": {
-    "ubuntu-24.04": "The source-scaled SPEC \u00a79 limits below apply on hosted x64 Linux, without host-specific slack.",
+    "ubuntu-24.04": "SPEC \u00a79 limits on hosted x64 Linux, without host-specific slack.",
     "ubuntu-24.04-arm": "Same limits on hosted arm64 Linux; architecture is not grounds for widening.",
-    "macos-14": "SPEC \u00a79 M-series reference class with the source-size derivation below.",
-    "windows-latest": "Same end-to-end limits on hosted x64 Windows, including process startup.",
-    "windows-11-arm": "Same limits on hosted arm64 Windows, including process startup.",
-    "macos-15-intel": "Same derived limits on hosted x64 macOS; architecture is not grounds for widening."
+    "macos-14": "SPEC \u00a79 M-series reference class; the limits apply directly.",
+    "macos-15-intel": "Same limits on hosted x64 macOS; architecture is not grounds for widening.",
+    "windows-latest": "Same limits on hosted x64 Windows, including process startup.",
+    "windows-11-arm": "Same limits on hosted arm64 Windows, including process startup."
   },
   "reasons": {
+    "latency_scope": "Every latency limit below is the SPEC \u00a79 number, applied unscaled on every synthetic workload. Per-call cost is dominated by process start, database open and bounded top-k work rather than corpus size, so a smaller corpus gets no smaller limit, and passing on a small corpus is not evidence for the full history, which is measured separately on the owner's history. The 2M-row dense workload carries the 2x headroom SPEC \u00a79 requires of 2M-row workloads on hosted runners.",
     "keyword_p50_ms": "SPEC \u00a79 warm keyword p50 <=40 ms; all search shapes, including counts and compact rendering, finish the full process.",
     "keyword_p95_ms": "SPEC \u00a79 warm keyword p95 <=80 ms; 20 samples minimum, none discarded.",
     "navigation_ms": "SPEC \u00a79 around/chats/status <=40 ms warm.",
     "recall_ms": "SPEC \u00a79 recall <=250 ms warm; pack shares its retrieval/window budget.",
     "census_ms": "SPEC \u00a79 no-change census <=15 ms, measured conservatively through full index command exit.",
     "incremental_ms": "SPEC \u00a79 one-session incremental refresh <=50 ms through full index command exit.",
-    "first_index_ms": "SPEC \u00a79 full-history index target 60000 ms; applied limit scales by measured source bytes. Example: 124500000 bytes gives 60000 \u00d7 124500000 / 886000000 = 8431.15 ms.",
-    "dense_index_ms": "SPEC \u00a79 60000 ms full-history index deadline with 2x headroom, then scaled by measured source bytes: 30000 \u00d7 min(1, source_bytes / 886000000).",
+    "first_index_ms": "SPEC \u00a79 first full index of the owner's history (reference_rows visible rows, reference_text_bytes of indexed text) <=60 s. A synthetic workload gets 60000 x min(1, max(rows / reference_rows, text_bytes / reference_text_bytes)): with build cost linear in rows and indexed text, that is the longest an engine meeting the full-history target could take on it. Example: 100000 rows with 88600000 text bytes gives 60000 x 0.1 = 6000 ms. The 1000-row semantic workload has no build limit: fixed per-build costs dominate at that size, and builds are gated by the mixed and dense workloads.",
+    "dense_index_ms": "The first_index_ms derivation with the 2x headroom SPEC \u00a79 requires of 2M-row workloads: 30000 x the same factor, which is 1 because 2M rows exceed reference_rows.",
     "dense_p50_ms": "SPEC \u00a79 requires 2x headroom for 2M scale workloads: half the 40 ms keyword p50 deadline.",
     "dense_p95_ms": "SPEC \u00a79 requires 2x headroom for 2M scale workloads: half the 80 ms keyword p95 deadline.",
-    "hybrid_p50_ms": "1000 semantic rows versus SPEC \u00a75/9 173524 rows: fixed query embedding 107 ms (SPEC \u00a75 warm CPU measurement) + variable retrieval allowance (200 - 107) \u00d7 1000 / 173524 = 107.536 ms. This gate does not claim target-scale vector-scan validation.",
-    "hybrid_first_ms": "1000 semantic rows: fixed cold query embedding 323 ms (SPEC \u00a75 CPU measurement) + (1000 - 323) \u00d7 1000 / 173524 = 326.901 ms; the first query must include meaning results.",
-    "source_scaling": "SPEC \u00a79 refers to 886,000,000 source bytes. For mixed and dense first-index, census, incremental, navigation, recall and mixed keyword cases, applied limit = listed real-history limit \u00d7 min(1, measured source_bytes / 886000000). The measured byte count is mandatory; the 100k mixed corpus is not treated as full history. Dense keyword has 2M rows, exceeds the real row count, and retains the 2x-headroom limits."
-  },
-  "hybrid_p50_ms": 107.53594891772896,
-  "hybrid_first_ms": 326.9014776054033,
-  "reference_source_bytes": 886000000,
-  "reference_semantic_rows": 173524
+    "hybrid_p50_ms": "SPEC \u00a79 warm agent hybrid p50 <=200 ms, with a labeled semantic row required. The CI semantic workload holds 1000 vectors, so this limit covers model load, query embedding, keyword retrieval, fusion and rendering; vector-scan cost at owner scale is measured on the 200000-reference semantic workload.",
+    "hybrid_first_ms": "SPEC \u00a79 first hybrid query with the model installed <=1 s: a fresh CLI process after model installation and corpus embedding, with meaning results required.",
+    "reference_rows": "Visible rows in the owner's full-history build: 130469 prose + 1071908 tool rows.",
+    "reference_text_bytes": "Indexed text in the owner's history: about 820 MB of tool text plus 66 MB of prose."
+  }
 }

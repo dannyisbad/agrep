@@ -476,7 +476,7 @@ impl Watcher {
     ) -> Result<()> {
         let mut options = fs::OpenOptions::new();
         options.read(true);
-        registry::nofollow_read_options(&mut options);
+        registry::secure_read_options(&mut options);
         let file = options.open(path)?;
         let meta = file.metadata()?;
         anyhow::ensure!(meta.is_file(), "source is not a regular file");

@@ -124,16 +124,17 @@ fn ready_precedes_delta_and_filters_events() {
     assert_eq!(next["type"], "user");
     assert_eq!(next["text"], "new event");
     #[cfg(unix)]
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGINT);
+    {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        assert_eq!(child.wait().unwrap().code(), Some(130));
     }
     #[cfg(windows)]
     {
         child.kill().unwrap();
+        child.wait().unwrap();
     }
-    let status = child.wait().unwrap();
-    #[cfg(unix)]
-    assert_eq!(status.code(), Some(130));
     reader.join().unwrap();
 }
 #[cfg(unix)]
