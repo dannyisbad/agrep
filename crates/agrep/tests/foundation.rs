@@ -1157,6 +1157,101 @@ fn all_terms_page_rules_out_lower_weight_tool_blocks() {
     );
 }
 
+fn append_tool_results(path: &Path, parent: &str, from: usize, texts: &[String]) -> String {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    let mut parent = parent.to_string();
+    for (i, text) in texts.iter().enumerate() {
+        let n = from + i;
+        let call = format!("call-{n}");
+        let result = format!("result-{n}");
+        // Spread over two weeks so block recency ceilings order the plan.
+        let ts = chrono::DateTime::from_timestamp(1_793_000_000 + (n as i64 * 7919) % 1_209_600, 0)
+            .unwrap()
+            .to_rfc3339();
+        writeln!(file,"{}",serde_json::json!({"type":"message","id":&call,"parentId":&parent,"timestamp":&ts,"message":{"role":"assistant","content":[{"type":"toolCall","id":&result,"name":"shell","arguments":{"command":"inspect"}}]}})).unwrap();
+        writeln!(file,"{}",serde_json::json!({"type":"message","id":&result,"parentId":&call,"timestamp":&ts,"message":{"role":"toolResult","toolCallId":&result,"toolName":"shell","content":[{"type":"text","text":text}]}})).unwrap();
+        parent = result;
+    }
+    parent
+}
+fn handles(h: &Path, d: &Path, args: &[&str]) -> (Value, Vec<Value>) {
+    let out = ok(cli(h, d, args));
+    let mut rows: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let meta = rows.remove(0);
+    (meta, rows.iter().map(|r| r["handle"].clone()).collect())
+}
+#[test]
+fn tool_block_word_plans_keep_exhaustive_pages() {
+    let t = TempDir::new().unwrap();
+    let h = t.path().join("h");
+    let d = t.path().join("d");
+    let path = transcript(&h, &["release workflow notes", "how did the release go"]);
+    // Words containing the terms differ by block: some blocks hold only one
+    // term, only concatenations, or Unicode separators the regex accepts.
+    let shapes = [
+        "prerelease workflows staged",
+        "unreleased_workflowid pending",
+        "releaseworkflow joined",
+        "release\u{2192}workflow arrow",
+        "release\u{e000}workflow private",
+        "workflow then release reversed",
+        "how did the release go today",
+        "plain filler without either",
+    ];
+    let texts: Vec<String> = (0..1700)
+        .map(|i| {
+            let block = i / 400;
+            let shape = match block {
+                0 => i % 3,
+                1 => 3 + i % 3,
+                2 => 6 + i % 2,
+                _ => i % 8,
+            };
+            if i % 5 == 4 {
+                format!("{} {i}", shapes[7])
+            } else {
+                format!("{} {i}", shapes[shape])
+            }
+        })
+        .collect();
+    let parent = append_tool_results(&path, "m1", 0, &texts);
+    ok(cli(&h, &d, &["index"]));
+    let check = |label: &str| {
+        for pattern in [
+            "release workflow",
+            "workflow release",
+            "elease orkflo",
+            "how did the release go",
+            "unreleased workflowid",
+        ] {
+            for extra in [&[][..], &["--who", "tool"][..], &["-l"][..]] {
+                let mut all = vec![pattern, "--json", "--no-auto", "-n", "0"];
+                all.extend(extra);
+                let (meta, every) = handles(&h, &d, &all);
+                for n in ["1", "7", "40"] {
+                    let mut page = vec![pattern, "--json", "--no-auto", "-n", n];
+                    page.extend(extra);
+                    let (_, shown) = handles(&h, &d, &page);
+                    let want: Vec<_> = every.iter().take(n.parse().unwrap()).cloned().collect();
+                    assert_eq!(shown, want, "{label} {pattern} {extra:?} -n {n} {meta}");
+                }
+            }
+        }
+    };
+    check("first build");
+    let more: Vec<String> = (0..300)
+        .map(|i| format!("{} late{i}", shapes[(i % 7) as usize]))
+        .collect();
+    append_tool_results(&path, &parent, 1700, &more);
+    ok(cli(&h, &d, &["index"]));
+    check("append");
+}
+
 #[test]
 fn reader_does_not_parse_changed_sources_and_work_lock_arbitrates_refresh() {
     let t = TempDir::new().unwrap();

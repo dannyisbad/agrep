@@ -28,7 +28,7 @@ def validate(path, assets):
             raise ValueError(f'npm {name} differs from reviewed source')
     if contents['THIRD_PARTY_LICENSES.txt'] != (ROOT / 'THIRD_PARTY_LICENSES.txt').read_bytes():
         raise ValueError('npm notices mismatch')
-    targets = json.loads((ROOT / 'bench/targets.json').read_text())
+    targets = json.loads((ROOT / 'bench/targets.json').read_text(encoding='utf-8'))
     expected = {t['os'] + '-' + t['arch']: {
         'asset': t['asset'], 'sha256': hashlib.sha256((assets / t['asset']).read_bytes()).hexdigest()
     } for t in targets}

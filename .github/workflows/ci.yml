@@ -46,19 +46,32 @@ jobs:
           python bench/release_identity.py
           python bench/validate_repo_privacy.py --worktree --index
           nice -n 10 python bench/third_party_licenses.py --check
-      - name: Full-process blocking performance gates
+      - name: Install the agrep 0.4.9 reference in an isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts=bin
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then scripts=Scripts; suffix=.exe; fi
+          python -m venv "$RUNNER_TEMP/agrep-0.4.9"
+          "$RUNNER_TEMP/agrep-0.4.9/$scripts/python$suffix" -m pip install --disable-pip-version-check --no-input agrep==0.4.9
+          echo "AGREP_REFERENCE=$RUNNER_TEMP/agrep-0.4.9/$scripts/agrep$suffix" >> "$GITHUB_ENV"
+      - name: Matched performance gate against agrep 0.4.9
         shell: bash
         run: |
           set -euo pipefail
           nice -n 10 cargo build --locked --release --workspace --bins --examples
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          model="$RUNNER_TEMP/agrep-model"
+          matched=(nice -n 10 "target/release/examples/matched$suffix" --reference "$AGREP_REFERENCE" --candidate "target/release/agrep$suffix" --runs 20 --build-runs 3 --check)
           performance_status=0
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --rows 100000 --runs 20 --build-runs 3 --check --output mixed.json || performance_status=1
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --semantic --data "$RUNNER_TEMP/agrep-semantic-data" --rows 1000 --runs 20 --build-runs 3 --check --output semantic.json || performance_status=1
-          nice -n 10 "target/release/examples/semantic_eval$suffix" "$RUNNER_TEMP/agrep-semantic-data/model/granite-embedding-small-english-r2" cpu || performance_status=1
-          nice -n 10 python bench/semantic_owner.py --binary "target/release/agrep$suffix" --builder "target/release/examples/semantic_scale$suffix" --evaluator "target/release/examples/semantic_eval$suffix" --model "$RUNNER_TEMP/agrep-semantic-data/model/granite-embedding-small-english-r2" --runs 20 --output semantic.json.owner.json || performance_status=1
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --dense --rows 2000000 --runs 20 --build-runs 3 --check --output dense.json || performance_status=1
+          nice -n 10 "target/release/examples/semantic_eval$suffix" "$model" provision || performance_status=1
+          nice -n 10 "target/release/examples/semantic_eval$suffix" "$model" cpu || performance_status=1
+          "${matched[@]}" --workload mixed --output matched-mixed.json || performance_status=1
+          "${matched[@]}" --workload semantic --model-dir "$model" --output matched-semantic.json || performance_status=1
+          nice -n 10 python bench/semantic_owner.py --binary "target/release/agrep$suffix" --builder "target/release/examples/semantic_scale$suffix" --evaluator "target/release/examples/semantic_eval$suffix" --model "$model" --runs 20 --output semantic-owner.json || performance_status=1
+          "${matched[@]}" --workload dense --output matched-dense.json || performance_status=1
           exit "$performance_status"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -66,9 +79,8 @@ jobs:
           name: evidence-${{ matrix.os }}
           path: |
             *-tests.log
-            mixed.json*
-            dense.json*
-            semantic.json*
+            matched-*.json*
+            semantic-owner.json
   privacy-history:
     runs-on: ubuntu-24.04
     steps:

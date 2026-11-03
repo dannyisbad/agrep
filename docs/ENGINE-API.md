@@ -91,3 +91,13 @@ unchanged; the lossless decoder implementation now uses zlib-rs.
 Opt-in profiling includes process entry/exit timestamps, `cli_parse`,
 `reader_open`, `reader_pragmas`, and `reader_schema` spans, and aggregate query
 phase counters. Normal commands do not force the diagnostic schema read.
+
+The private tool dictionary adds `tool_words.blocks` and `tool_trigrams(gram,
+doc)`. `blocks` lists the 512-row tool blocks whose visible rows contain the
+word, taken from the same unicode61 tokens FTS5 stores (through the FTS5
+tokenizer API); removed rows may leave a block listed, never omit one.
+`tool_trigrams` holds, per lowercase ASCII trigram, the summed frequency of the
+dictionary words containing it, so a three-character term is planned without
+expanding it. Both require a fresh index; an index without the column fails
+loudly. Reader tables, `query::search`, `Options`, `Hit` and `Results` are
+unchanged.

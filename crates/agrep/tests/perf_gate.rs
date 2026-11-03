@@ -1,5 +1,7 @@
 #[path = "../examples/support/perf.rs"]
 mod perf;
+#[path = "../examples/support/results.rs"]
+mod results;
 use serde_json::{json, Value};
 
 fn case(name: &str) -> Value {
@@ -19,28 +21,37 @@ fn dense() -> Vec<Value> {
     .chain(std::iter::once(case("search_changed_source")))
     .collect()
 }
-#[test]
-fn gate_accepts_complete_fast_evidence() {
-    assert!(perf::check(&dense(), true, false, 2_000_000, 886_000_000).is_ok());
+fn budget(key: &str) -> f64 {
+    let b: Value = serde_json::from_str(include_str!("../../../docs/perf-budgets.json")).unwrap();
+    b[key].as_f64().unwrap()
+}
+fn failures(cases: &[Value], dense: bool, semantic: bool, rows: usize, text_bytes: u64) -> String {
+    perf::check(cases, dense, semantic, rows, text_bytes)
+        .failures
+        .join(" ")
+}
+fn targets(cases: &[Value], dense: bool, semantic: bool, rows: usize, text_bytes: u64) -> String {
+    perf::check(cases, dense, semantic, rows, text_bytes)
+        .targets
+        .join("\n")
 }
 #[test]
-fn gate_refuses_failure_in_any_command() {
+fn check_accepts_complete_fast_evidence() {
+    assert_eq!(failures(&dense(), true, false, 2_000_000, 886_000_000), "");
+}
+#[test]
+fn check_refuses_failure_in_any_command() {
     let mut cases = dense();
     cases[5]["exit_codes"][0] = json!(2);
-    assert!(perf::check(&cases, true, false, 2_000_000, 886_000_000)
-        .unwrap_err()
-        .iter()
-        .any(|s| s.contains("failed CLI exit")));
+    assert!(failures(&cases, true, false, 2_000_000, 886_000_000).contains("failed CLI exit"));
 }
 #[test]
-fn gate_refuses_missing_cases_small_corpus_and_tail_samples() {
+fn check_refuses_missing_cases_small_corpus_and_tail_samples() {
     let mut cases = dense();
     cases.retain(|c| c["name"] != "version_control");
     cases[3]["p95_ms"] = Value::Null;
     cases[3]["samples_ms"] = json!([1.0]);
-    let errors = perf::check(&cases, true, false, 1000, 886_000_000)
-        .unwrap_err()
-        .join(" ");
+    let errors = failures(&cases, true, false, 1000, 886_000_000);
     for text in [
         "missing benchmark",
         "2000000",
@@ -51,30 +62,34 @@ fn gate_refuses_missing_cases_small_corpus_and_tail_samples() {
     }
 }
 #[test]
-fn gate_enforces_tail_and_median_separately() {
+fn latency_above_a_target_is_reported_never_failed() {
     let mut cases = dense();
     cases[3]["p95_ms"] = json!(budget("dense_p95_ms") + 1.0);
     cases[4]["median_ms"] = json!(budget("dense_p50_ms") + 1.0);
-    let errors = perf::check(&cases, true, false, 2_000_000, 886_000_000)
-        .unwrap_err()
-        .join(" ");
-    assert!(errors.contains("old_dense p95"));
-    assert!(errors.contains("old_dense_no_auto median"));
+    let checked = perf::check(&cases, true, false, 2_000_000, 886_000_000);
+    assert!(checked.failures.is_empty(), "{:?}", checked.failures);
+    let lines = checked.targets.join("\n");
+    assert!(
+        lines.contains("old_dense p95: 41.00 ms (target 40.00 ms, above target)"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("old_dense_no_auto median: 21.00 ms (target 20.00 ms, above target)"),
+        "{lines}"
+    );
 }
 #[test]
-fn gate_refuses_missing_nonfinite_or_negative_samples() {
+fn check_refuses_missing_nonfinite_or_negative_samples() {
     let mut cases = dense();
     cases[0]["samples_ms"][0] = json!(-1.0);
     cases[1]["median_ms"] = Value::Null;
-    let errors = perf::check(&cases, true, false, 2_000_000, 886_000_000)
-        .unwrap_err()
-        .join(" ");
+    let errors = failures(&cases, true, false, 2_000_000, 886_000_000);
     assert!(errors.contains("invalid measurement samples"));
     assert!(errors.contains("missing or non-finite"));
 }
 
 #[test]
-fn hybrid_gate_requires_meaning_results_and_startup_deadline() {
+fn hybrid_check_requires_meaning_results_but_not_a_startup_deadline() {
     let mut cases: Vec<Value> = [
         "first_index",
         "no_change_census",
@@ -88,86 +103,77 @@ fn hybrid_gate_requires_meaning_results_and_startup_deadline() {
     .chain(std::iter::once(case("search_changed_source")))
     .collect();
     cases[3]["median_ms"] = json!(budget("hybrid_first_ms") + 1.0);
-    let errors = perf::check(&cases, false, true, 1000, 886_000_000)
-        .unwrap_err()
-        .join(" ");
+    let errors = failures(&cases, false, true, 1000, 886_000_000);
     assert!(errors.contains("no meaning results"));
-    assert!(errors.contains("compact_first_hybrid median"));
+    assert!(!errors.contains("compact_first_hybrid median"));
 }
 
 #[test]
-fn gate_refuses_reduced_mixed_and_hybrid_workloads() {
-    let mixed = perf::check(&dense(), false, false, 99999, 886_000_000)
-        .unwrap_err()
-        .join(" ");
-    assert!(mixed.contains("at least 100000 rows"));
-    let hybrid = perf::check(&dense(), false, true, 999, 886_000_000)
-        .unwrap_err()
-        .join(" ");
-    assert!(hybrid.contains("at least 1000 rows"));
+fn check_refuses_reduced_mixed_and_hybrid_workloads() {
+    assert!(failures(&dense(), false, false, 99999, 886_000_000).contains("at least 100000 rows"));
+    assert!(failures(&dense(), false, true, 999, 886_000_000).contains("at least 1000 rows"));
 }
 
-fn budget(key: &str) -> f64 {
-    let b: Value = serde_json::from_str(include_str!("../../../docs/perf-budgets.json")).unwrap();
-    b[key].as_f64().unwrap()
-}
 #[test]
-fn gate_rejects_empty_answers_and_unexpected_no_match() {
+fn check_rejects_empty_answers_and_unexpected_no_match() {
     let mut cases = dense();
     cases[3]["exit_codes"][0] = json!(1);
     cases[4]["verified_results"][0] = json!(false);
-    let errors = perf::check(&cases, true, false, 2_000_000, 886_000_000)
-        .unwrap_err()
-        .join(" ");
+    let errors = failures(&cases, true, false, 2_000_000, 886_000_000);
     assert!(errors.contains("failed CLI exit"));
     assert!(errors.contains("empty result evidence"));
-    assert!(!perf::valid_result("count", &json!({"bench_count":0})));
-    assert!(!perf::valid_result(
+    assert!(!results::valid_result("count", &json!({"bench_count":0})));
+    assert!(!results::valid_result(
         "json",
         &json!({"bench_stdout_bytes":200,"bench_result_rows":0})
     ));
 }
-fn errors(cases: &[Value], dense: bool, semantic: bool, rows: usize, text_bytes: u64) -> String {
-    perf::check(cases, dense, semantic, rows, text_bytes)
-        .err()
-        .unwrap_or_default()
-        .join(" ")
-}
 #[test]
-fn latency_limits_do_not_shrink_with_corpus_size() {
+fn latency_targets_do_not_shrink_with_corpus_size() {
     let mut release = case("release");
     release["median_ms"] = json!(budget("keyword_p50_ms") - 1.0);
-    release["p95_ms"] = json!(budget("keyword_p95_ms") - 1.0);
     let mut census = case("no_change_census");
     census["median_ms"] = json!(budget("census_ms") - 1.0);
-    let report = errors(&[release, census], false, false, 100_000, 1_000_000);
-    for text in ["release median", "release p95", "no_change_census median"] {
-        assert!(!report.contains(text), "{report}");
+    let lines = targets(&[release, census], false, false, 100_000, 1_000_000);
+    for text in [
+        "release median: 39.00 ms (target 40.00 ms)",
+        "release p95: 2.00 ms (target 80.00 ms)",
+        "no_change_census median: 14.00 ms (target 15.00 ms)",
+    ] {
+        assert!(lines.contains(text), "{lines}");
     }
 }
 #[test]
-fn index_limit_scales_by_the_larger_workload_fraction() {
+fn index_target_scales_by_the_larger_workload_fraction() {
     let mut index = case("first_index");
     index["median_ms"] = json!(budget("first_index_ms") * 0.45);
-    let rows_dominate = errors(&[index.clone()], false, false, 600_000, 88_600_000);
+    let rows_target = budget("first_index_ms") * 600_000.0 / budget("reference_rows");
+    let rows_dominate = targets(&[index.clone()], false, false, 600_000, 88_600_000);
     assert!(
-        !rows_dominate.contains("first_index median"),
+        rows_dominate.contains(&format!(
+            "first_index median: 27000.00 ms (target {rows_target:.2} ms)"
+        )),
         "{rows_dominate}"
     );
-    let bytes_dominate = errors(&[index], false, false, 100_000, 88_600_000);
+    let bytes_dominate = targets(&[index], false, false, 100_000, 88_600_000);
     assert!(
-        bytes_dominate.contains("first_index median"),
+        bytes_dominate
+            .contains("first_index median: 27000.00 ms (target 6000.00 ms, above target)"),
         "{bytes_dominate}"
     );
-    let mut dense_index = dense();
-    dense_index[0]["median_ms"] = json!(budget("dense_index_ms") + 1.0);
-    assert!(errors(&dense_index, true, false, 2_000_000, 1_000_000).contains("first_index median"));
+    let mut dense_index = case("first_index");
+    dense_index["median_ms"] = json!(budget("dense_index_ms") + 1.0);
+    let dense = targets(&[dense_index], true, false, 2_000_000, 1_000_000);
+    assert!(
+        dense.contains("first_index median: 30001.00 ms (target 30000.00 ms, above target)"),
+        "{dense}"
+    );
 }
 #[test]
-fn semantic_workload_build_time_is_not_budgeted() {
+fn semantic_workload_build_time_has_no_target() {
     let mut index = case("first_index");
     index["median_ms"] = json!(budget("first_index_ms") * 10.0);
-    assert!(!errors(&[index], false, true, 1000, 200_000).contains("first_index median"));
+    assert!(!targets(&[index], false, true, 1000, 200_000).contains("first_index median"));
 }
 
 #[path = "../examples/support/process.rs"]
@@ -200,72 +206,98 @@ fn benchmark_children_have_isolated_homes_and_windows_system_root() {
 
 #[test]
 fn benchmark_verifies_nonterminal_tsv_hit_rows() {
-    assert!(perf::flat_hit(
+    assert!(results::flat_hit(
         "example-session\tpi\tdemo\t2\tuser\trelease workflow"
     ));
-    assert!(!perf::flat_hit("no results"));
-    assert!(!perf::flat_hit("session\tpi\tdemo\tnot-a-turn\tuser\ttext"));
-    assert!(!perf::flat_hit("session\tpi\tdemo\t2\tuser\t"));
+    assert!(!results::flat_hit("no results"));
+    assert!(!results::flat_hit(
+        "session\tpi\tdemo\tnot-a-turn\tuser\ttext"
+    ));
+    assert!(!results::flat_hit("session\tpi\tdemo\t2\tuser\t"));
 }
 
 #[test]
-fn every_dense_latency_has_twofold_headroom() {
-    for (name, key, limit) in [
-        ("no_change_census", "median_ms", budget("census_ms") / 2.0),
-        ("no_change_census", "p95_ms", budget("census_ms") / 2.0),
-        (
-            "one_session_refresh",
-            "median_ms",
-            budget("incremental_ms") / 2.0,
-        ),
-        (
-            "one_session_refresh",
-            "p95_ms",
-            budget("incremental_ms") / 2.0,
-        ),
-        (
-            "search_changed_source",
-            "median_ms",
-            budget("keyword_p50_ms") / 2.0,
-        ),
-        (
-            "search_changed_source",
-            "p95_ms",
-            budget("keyword_p95_ms") / 2.0,
-        ),
-        (
-            "version_control",
-            "median_ms",
-            budget("keyword_p50_ms") / 2.0,
-        ),
-        ("version_control", "p95_ms", budget("keyword_p95_ms") / 2.0),
+fn evidence_counts_rows_hits_counts_and_meaning_matches() {
+    let rows = results::evidence(
+        b"{\"kind\":\"agrep-meta\"}\n{\"session\":\"s\",\"handle\":\"@s:1.ab\"}\n{\"session\":\"t\",\"lane\":\"semantic\",\"sem_score\":0.9}\n",
+        b"",
+    );
+    assert_eq!(rows["kind"], "agrep-meta");
+    assert_eq!(rows["bench_result_rows"], 2);
+    assert_eq!(rows["bench_semantic_rows"], 1);
+    assert_eq!(rows["bench_handles"], json!(["@s:1.ab"]));
+    let rendered = results::evidence(
+        b"@s:1.ab pi/user demo 0m ~semantic (meaning match) text\n@t:2.cd pi/user demo 0m ~all text\n",
+        b"",
+    );
+    assert_eq!(rendered["bench_meaning_lines"], 1);
+    assert_eq!(rendered["bench_text_hits"], 2);
+    assert!(results::valid_result("warm_hybrid", &rendered));
+    let keyword_only = results::evidence(b"@t:2.cd pi/user demo 0m ~all text\n", b"");
+    assert!(!results::valid_result("warm_hybrid", &keyword_only));
+    let count = results::evidence(b"2555\n", b"");
+    assert_eq!(count["bench_count"], 2555);
+    assert!(results::valid_result("count", &count));
+    let empty = results::evidence(b"", b"keyword: 0 matching rows\n");
+    assert!(!results::valid_result("release", &empty));
+    assert!(!results::valid_result("status", &empty));
+}
+
+#[test]
+fn every_dense_latency_target_has_twofold_headroom() {
+    let mut cases = Vec::new();
+    for name in [
+        "no_change_census",
+        "one_session_refresh",
+        "search_changed_source",
+        "version_control",
     ] {
         let mut c = case(name);
-        c[key] = json!(limit + 0.1);
-        assert!(
-            errors(&[c], true, false, 2_000_000, 886_000_000).contains(name),
-            "{name} {key}"
-        );
+        c["median_ms"] = json!(100.0);
+        c["p95_ms"] = json!(100.0);
+        cases.push(c);
+    }
+    let lines = targets(&cases, true, false, 2_000_000, 886_000_000);
+    for (name, key, tail) in [
+        ("no_change_census", "census_ms", "census_ms"),
+        ("one_session_refresh", "incremental_ms", "incremental_ms"),
+        ("search_changed_source", "keyword_p50_ms", "keyword_p95_ms"),
+        ("version_control", "keyword_p50_ms", "keyword_p95_ms"),
+    ] {
+        for (stat, target) in [("median", budget(key) / 2.0), ("p95", budget(tail) / 2.0)] {
+            let line = format!("{name} {stat}: 100.00 ms (target {target:.2} ms, above target)");
+            assert!(lines.contains(&line), "{line}\n{lines}");
+        }
     }
 }
 #[test]
-fn every_warm_case_checks_its_tail_and_each_first_index_is_bounded() {
-    for (name, limit) in [
-        ("around", budget("navigation_ms")),
-        ("recall", budget("recall_ms")),
-        ("compact_warm_hybrid", budget("hybrid_p50_ms")),
+fn every_warm_case_reports_its_tail_and_each_first_index_sample() {
+    let lines = targets(
+        &[
+            case("around"),
+            case("recall"),
+            case("compact_warm_hybrid"),
+            case("first_index"),
+        ],
+        false,
+        false,
+        100_000,
+        886_000_000,
+    );
+    for (name, key) in [
+        ("around", "navigation_ms"),
+        ("recall", "recall_ms"),
+        ("compact_warm_hybrid", "hybrid_p50_ms"),
     ] {
-        let mut c = case(name);
-        c["p95_ms"] = json!(limit + 1.0);
-        assert!(errors(&[c], false, false, 100_000, 886_000_000).contains(&format!("{name} p95")));
+        let line = format!("{name} p95: 2.00 ms (target {:.2} ms)", budget(key));
+        assert!(lines.contains(&line), "{line}\n{lines}");
     }
-    let mut c = case("first_index");
-    c["samples_ms"][1] = json!(budget("first_index_ms") + 1.0);
-    assert!(errors(&[c], false, false, 100_000, 886_000_000).contains("first_index sample"));
+    assert_eq!(lines.matches("first_index sample").count(), 20, "{lines}");
 }
 #[test]
 fn raw_samples_cannot_hide_behind_an_understated_summary() {
     let mut c = case("release");
     c["samples_ms"] = json!(vec![budget("keyword_p50_ms") + 1.0; 20]);
-    assert!(errors(&[c], false, false, 100_000, 886_000_000).contains("release median"));
+    assert!(targets(&[c], false, false, 100_000, 886_000_000)
+        .contains("release median: 41.00 ms (target 40.00 ms, above target)"));
 }

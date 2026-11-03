@@ -59,7 +59,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     agrep_core::coverage::validate(&mut f)?;
     let coverage = agrep_core::coverage::dimensions(&c, &f)?;
     if let Some(chat) = &f.chat {
-        let candidates = agrep_core::handles::candidates(&c, chat)?;
+        let candidates = agrep_core::handles::SessionIndex::load(&c)?.candidates(&c, chat)?;
         if candidates.len() != 1 {
             bail!("chat is missing or ambiguous");
         }

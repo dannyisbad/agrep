@@ -28,13 +28,13 @@ def smoke(command, semantic=False):
             {'type': 'message', 'id': 'm1', 'timestamp': '2026-10-29T12:00:01Z',
              'message': {'role': 'user', 'content': TEXT}},
         ]
-        path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
+        path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n', encoding='utf-8')
         for i, text in enumerate(DISTRACTORS):
             distractor = [
                 {'type':'session', 'version':3, 'id':f'distractor-{i}', 'cwd':'/work/smoke'},
                 {'type':'message', 'id':'m1', 'message':{'role':'user','content':text}},
             ]
-            path.with_name(f'distractor-{i}.jsonl').write_text('\n'.join(json.dumps(r) for r in distractor) + '\n')
+            path.with_name(f'distractor-{i}.jsonl').write_text('\n'.join(json.dumps(r) for r in distractor) + '\n', encoding='utf-8')
         env = dict(os.environ)
         # Remove caller/source overrides so no real agent stores enter the smoke.
         for key in list(env):
@@ -46,7 +46,7 @@ def smoke(command, semantic=False):
                    LOCALAPPDATA=str(root / 'cache'), APPDATA=str(home / '.config'), AGREP_PROFILE='classic')
 
         def run(*args, expected=0):
-            result = subprocess.run([*command, *args], env=env, capture_output=True, text=True, timeout=300)
+            result = subprocess.run([*command, *args], env=env, capture_output=True, text=True, encoding='utf-8', timeout=300)
             if result.returncode != expected:
                 raise AssertionError(f'{args}: exit {result.returncode}, expected {expected}\n{result.stdout}\n{result.stderr}')
             return result.stdout

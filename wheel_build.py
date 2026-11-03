@@ -14,12 +14,12 @@ ROOT = Path(__file__).resolve().parent
 
 
 def version():
-    return re.search(r'^version = "([^"]+)"', (ROOT / 'pyproject.toml').read_text(), re.M)[1]
+    return re.search(r'^version = "([^"]+)"', (ROOT / 'pyproject.toml').read_text(encoding='utf-8'), re.M)[1]
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     platform = os.environ.get('AGREP_WHEEL_PLAT')
-    target = next((t for t in json.loads((ROOT / 'bench/targets.json').read_text())
+    target = next((t for t in json.loads((ROOT / 'bench/targets.json').read_text(encoding='utf-8'))
                    if t['platform'] == platform), None)
     if target is None:
         raise RuntimeError('AGREP_WHEEL_PLAT must name a supported release platform')
@@ -37,7 +37,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
              'Summary: Search, recall and resume your local AI agent history.\n'
              'Requires-Python: >=3.10\nLicense-Expression: MIT\n'
              'License-File: LICENSE\nLicense-File: THIRD_PARTY_LICENSES.txt\n'
-             'Description-Content-Type: text/markdown\n\n' + (ROOT / 'README.md').read_text()).encode(),
+             'Description-Content-Type: text/markdown\n\n' + (ROOT / 'README.md').read_text(encoding='utf-8')).encode(),
         f'{info}/WHEEL': f'Wheel-Version: 1.0\nGenerator: agrep\nRoot-Is-Purelib: false\nTag: {tag}\n'.encode(),
         f'{info}/entry_points.txt': b'[console_scripts]\nagrep = agrep:main\n',
     }

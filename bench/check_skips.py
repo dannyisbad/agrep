@@ -107,14 +107,14 @@ def gated_tests(text):
 
 def validate(logs, root=ROOT):
     root = root.resolve()
-    policy = json.loads((root / 'bench/test-skips.json').read_text())
+    policy = json.loads((root / 'bench/test-skips.json').read_text(encoding='utf-8'))
     actual, partial, visited = {}, {}, set()
 
     def source(path, inherited=()):
         path = path.resolve()
         if path in visited: return
         visited.add(path)
-        text = path.read_text()
+        text = path.read_text(encoding='utf-8')
         if re.search(r'#\s*!?\s*\[\s*(?:ignore\b|cfg_attr\([^\n]*\bignore\b)', text):
             raise ValueError(f'unlisted ignored test: {path.relative_to(root)}')
         full, body, children = scan_rust(text, inherited)
@@ -141,13 +141,13 @@ def validate(logs, root=ROOT):
             stale = sorted(set(registered) - set(found))
             raise ValueError(f'unlisted platform test gates ({field}): {missing}; stale registry entries: {stale}')
     for path in (root / 'bench').glob('test_*.py'):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             if isinstance(node, ast.ImportFrom) and node.module == 'unittest' and any(item.name in ('skip', 'skipIf', 'skipUnless', 'expectedFailure') for item in node.names):
                 raise ValueError(f'unlisted test skip or expected failure import: {path.name}')
             if ((isinstance(node, ast.Attribute) and node.attr in ('skip', 'skipIf', 'skipUnless', 'skipTest', 'expectedFailure')) or (isinstance(node, ast.Name) and node.id in ('skip', 'skipIf', 'skipUnless', 'skipTest', 'expectedFailure'))):
                 raise ValueError(f'unlisted test skip or expected failure: {path.name}')
     for path in (root / 'npm').glob('test_*.js'):
-        text = path.read_text()
+        text = path.read_text(encoding='utf-8')
         def mask(match):
             token = match.group()
             if token[0] in ('"', "'") and token[1:-1] in ('skip', 'todo') and text[match.end():].lstrip().startswith(':'):
@@ -157,7 +157,7 @@ def validate(logs, root=ROOT):
         if re.search(r'\b(?:test|it|t)\.(?:skip|todo)\s*\(|\b(?:skip|todo)\s*:\s*(?:true|LITERAL)\b', code):
             raise ValueError(f'unlisted test skip or todo: {path.name}')
     for path in logs:
-        if re.search(r'\b[1-9][0-9]* ignored\b|\.\.\. ignored\b|\bskipped=[1-9]|\b(?:skipped|todo)\s+[1-9]|# (?:SKIP|TODO)\b|\bexpected failures=[1-9]', path.read_text(), re.I):
+        if re.search(r'\b[1-9][0-9]* ignored\b|\.\.\. ignored\b|\bskipped=[1-9]|\b(?:skipped|todo)\s+[1-9]|# (?:SKIP|TODO)\b|\bexpected failures=[1-9]', path.read_text(encoding='utf-8'), re.I):
             raise ValueError(f'unlisted skipped or todo test in {path}')
 
 

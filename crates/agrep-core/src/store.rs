@@ -685,6 +685,7 @@ fn refresh_inner(
             "stats_dirty",
             "session_sources",
             "tool_words",
+            "tool_trigrams",
             "tool_lexicon",
             "tool_word_dirty",
             "tool_word_batch",
@@ -880,11 +881,9 @@ fn refresh_inner(
     let phase = Instant::now();
     canonicalize(&tx, &canonical_sessions, &fast_sessions, &mut dirty, first)?;
     info.canonical_ms = phase.elapsed().as_secs_f64() * 1000.;
-    if first {
-        build_fts(&tx)?;
-    }
+    let presence = if first { build_fts(&tx)? } else { None };
     let phase = Instant::now();
-    crate::tool_index::refresh(&tx, first || rebuild)?;
+    crate::tool_index::refresh(&tx, first || rebuild, presence)?;
     info.dictionary_ms = phase.elapsed().as_secs_f64() * 1000.;
     info.write_ms = write_start.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
@@ -937,6 +936,9 @@ fn refresh_inner(
 }
 type FtsInput = Vec<(i64, Vec<u8>)>;
 type FtsPrepared = Vec<(i64, String)>;
+type FtsWords = Vec<(i64, Vec<Box<[u8]>>)>;
+/// A prepared row: its id, indexed text and distinct dictionary words.
+type FtsRow = (i64, String, Vec<Box<[u8]>>);
 fn read_fts_batch(rows: &mut rusqlite::Rows<'_>) -> Result<FtsInput> {
     let mut input = Vec::with_capacity(1024);
     for _ in 0..1024 {
@@ -945,24 +947,43 @@ fn read_fts_batch(rows: &mut rusqlite::Rows<'_>) -> Result<FtsInput> {
     }
     Ok(input)
 }
-fn prepare_fts_batch(table: &str, input: FtsInput) -> Result<FtsPrepared> {
-    input
+fn prepare_fts_batch(
+    table: &str,
+    input: FtsInput,
+    tokenizers: Option<&crate::tool_index::Tokenizers<'_>>,
+) -> Result<(FtsPrepared, FtsWords)> {
+    let rows: Vec<FtsRow> = input
         .into_par_iter()
-        .map(|(id, bytes)| {
-            let text = normalize(&decode(table, bytes)?);
-            Ok((
-                id,
-                if table == "tools" {
-                    crate::tool_index::index_text(&text).into_owned()
-                } else {
-                    text
-                },
-            ))
-        })
-        .collect()
+        .map_init(
+            || tokenizers.map(|t| t.tokenizer()),
+            |tokenizer, (id, bytes)| {
+                let text = normalize(&decode(table, bytes)?);
+                if table != "tools" {
+                    return Ok((id, text, Vec::new()));
+                }
+                let text = crate::tool_index::index_text(&text).into_owned();
+                let words = match tokenizer {
+                    Some(Ok(tokenizer)) => crate::tool_index::row_words(tokenizer, &text)?,
+                    Some(Err(error)) => anyhow::bail!("{error:#}"),
+                    None => Vec::new(),
+                };
+                Ok((id, text, words))
+            },
+        )
+        .collect::<Result<_>>()?;
+    let mut prepared = Vec::with_capacity(rows.len());
+    let mut words = Vec::with_capacity(rows.len());
+    for (id, text, row_words) in rows {
+        prepared.push((id, text));
+        words.push((id, row_words));
+    }
+    Ok((prepared, words))
 }
-fn build_fts(tx: &Transaction<'_>) -> Result<()> {
+/// Returns tool word presence, gathered beside the inserts from the same text.
+fn build_fts(tx: &Transaction<'_>) -> Result<Option<crate::tool_index::Presence>> {
     let _timer = WriteTimer::new(true);
+    let tokenizers = crate::tool_index::Tokenizers::new(tx)?;
+    let mut collected = None;
     for table in ["prose", "tools"] {
         tx.execute_batch(&format!("INSERT INTO {table}_fts({table}_fts,rank) VALUES('automerge',0);INSERT INTO {table}_fts({table}_fts,rank) VALUES('crisismerge',64);INSERT INTO {table}_fts({table}_fts,rank) VALUES('hashsize',16777216);"))?;
         let mut source = tx.prepare(&format!(
@@ -975,14 +996,28 @@ fn build_fts(tx: &Transaction<'_>) -> Result<()> {
         std::thread::scope(|scope| -> Result<()> {
             let (send, input) = std::sync::mpsc::sync_channel::<FtsInput>(1);
             let (output, receive) = std::sync::mpsc::sync_channel::<Result<FtsPrepared>>(1);
-            let worker = scope.spawn(move || {
+            let tokenizers = (table == "tools").then_some(&tokenizers);
+            // Word presence is merged here, after the batch is handed to the
+            // writer, so it overlaps the FTS inserts.
+            let worker = scope.spawn(move || -> Result<Option<crate::tool_index::Presence>> {
+                let mut presence = tokenizers.map(|_| crate::tool_index::new_presence());
                 while let Ok(batch) = input.recv() {
-                    let prepared = prepare_fts_batch(table, batch);
-                    let failed = prepared.is_err();
-                    if output.send(prepared).is_err() || failed {
-                        break;
+                    match prepare_fts_batch(table, batch, tokenizers) {
+                        Ok((prepared, words)) => {
+                            if output.send(Ok(prepared)).is_err() {
+                                break;
+                            }
+                            if let Some(presence) = presence.as_mut() {
+                                crate::tool_index::add_rows(presence, words)?;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = output.send(Err(error));
+                            break;
+                        }
                     }
                 }
+                Ok(presence)
             });
             let result = (|| -> Result<()> {
                 let mut queued = 0;
@@ -1028,10 +1063,14 @@ fn build_fts(tx: &Transaction<'_>) -> Result<()> {
             })();
             drop(send);
             drop(receive);
-            worker
+            let presence = worker
                 .join()
-                .map_err(|_| anyhow::anyhow!("FTS preparation panicked"))?;
-            result
+                .map_err(|_| anyhow::anyhow!("FTS preparation panicked"))??;
+            result?;
+            if presence.is_some() {
+                collected = presence;
+            }
+            Ok(())
         })?;
         tx.execute(
             &format!("INSERT INTO {table}_fts({table}_fts) VALUES('optimize')"),
@@ -1039,7 +1078,7 @@ fn build_fts(tx: &Transaction<'_>) -> Result<()> {
         )?;
         tx.execute_batch(&format!("INSERT INTO {table}_fts({table}_fts,rank) VALUES('automerge',4);INSERT INTO {table}_fts({table}_fts,rank) VALUES('crisismerge',16);INSERT INTO {table}_fts({table}_fts,rank) VALUES('hashsize',1048576);"))?;
     }
-    Ok(())
+    Ok(collected)
 }
 fn insert_fts(tx: &Transaction<'_>, table: &str, id: i64, text: &str) -> Result<()> {
     let _timer = WriteTimer::new(true);
@@ -2196,14 +2235,14 @@ fn gram_text(code: u32) -> Result<String> {
     }
     Ok(String::from_utf8(out)?)
 }
-fn put_varint(mut n: u32, out: &mut Vec<u8>) {
+pub(crate) fn put_varint(mut n: u32, out: &mut Vec<u8>) {
     while n >= 128 {
         out.push(n as u8 | 128);
         n >>= 7;
     }
     out.push(n as u8);
 }
-fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u32> {
+pub(crate) fn take_varint(bytes: &[u8], at: &mut usize) -> Result<u32> {
     let mut n = 0;
     for shift in (0..=28).step_by(7) {
         let b = *bytes

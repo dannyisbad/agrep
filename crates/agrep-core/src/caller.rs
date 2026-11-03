@@ -272,10 +272,10 @@ pub fn excludes(
 }
 /// Presentation-only decoration: caller exclusions already ran before ranking.
 pub fn decorate_semantic(c: &Connection, result: &mut Results, caller: &Caller) -> Result<()> {
-    let index = handles::sessions(c)?;
+    let index = handles::SessionIndex::load(c)?;
     for h in &mut result.hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;
-        h.handle = handles::mint(&h.session, h.turn, &h.text, &index);
+        h.handle = index.mint(&h.session, h.turn, &h.text);
     }
     Ok(())
 }
@@ -298,10 +298,10 @@ fn decorate(c: &Connection, result: &mut Results, caller: &Caller, o: &Options) 
         None
     };
     let boundary = crate::boundary_rank::prepare_query(&o.pattern, &Default::default());
-    let index = handles::sessions(c)?;
+    let index = handles::SessionIndex::load(c)?;
     for h in &mut result.hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;
-        h.handle = handles::mint(&h.session, h.turn, &h.text, &index);
+        h.handle = index.mint(&h.session, h.turn, &h.text);
         if h.who == "tool" {
             let matched = if let Some(matcher) = &explicit {
                 matcher.find(&h.text)?.map(|m| {

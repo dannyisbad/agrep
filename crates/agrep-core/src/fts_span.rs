@@ -117,9 +117,8 @@ unsafe extern "C" fn span(
         Err(rc) => ffi::sqlite3_result_error_code(context, rc),
     }
 }
-/// The API pointer is borrowed from this connection; only the auxiliary function
-/// is registered. Neither the database nor the connection's read transaction changes.
-pub(crate) fn install(c: &Connection) -> Result<()> {
+/// The FTS5 extension API of this connection; valid while the connection lives.
+pub(crate) fn api(c: &Connection) -> Result<*mut ffi::fts5_api> {
     unsafe {
         let mut api: *mut ffi::fts5_api = ptr::null_mut();
         let mut statement = ptr::null_mut();
@@ -149,6 +148,14 @@ pub(crate) fn install(c: &Connection) -> Result<()> {
         if step != ffi::SQLITE_ROW || api.is_null() {
             bail!("FTS5 extension API is unavailable: {step}");
         }
+        Ok(api)
+    }
+}
+/// The API pointer is borrowed from this connection; only the auxiliary function
+/// is registered. Neither the database nor the connection's read transaction changes.
+pub(crate) fn install(c: &Connection) -> Result<()> {
+    let api = api(c)?;
+    unsafe {
         let Some(create) = (*api).xCreateFunction else {
             bail!("FTS5 function registration is unavailable");
         };

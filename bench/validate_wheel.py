@@ -16,7 +16,7 @@ from binary_format import validate_target
 
 def validate(path):
     v = version()
-    target = next((t for t in json.loads((ROOT / 'bench/targets.json').read_text())
+    target = next((t for t in json.loads((ROOT / 'bench/targets.json').read_text(encoding='utf-8'))
                    if path.name == f'agrep-{v}-py3-none-{t["platform"]}.whl'), None)
     if target is None:
         raise ValueError(f'unsupported wheel filename: {path.name}')

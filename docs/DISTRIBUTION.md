@@ -26,29 +26,50 @@ POSIX and common argv, stdio and exit behavior on every platform.
 
 ## Performance
 
-`docs/perf-budgets.json` is the only budget file. Each limit states its SPEC §9
-basis, and each runner class states its policy. There are no environmental slack
-multipliers. Changes to a limit require a written reason in the same commit.
+The blocking performance gate is a matched comparison with agrep 0.4.9, the
+release 0.5 replaces, on the same machine, corpus and load. CI installs
+`agrep==0.4.9` from PyPI into an isolated virtual environment on all six hosted
+runners, then runs:
 
 ```sh
 nice -n 10 cargo build --release --bins --examples
-nice -n 10 target/release/examples/bench --binary target/release/agrep \
-  --rows 100000 --runs 20 --build-runs 3 --check --output mixed.json
-nice -n 10 target/release/examples/bench --binary target/release/agrep \
-  --semantic --rows 1000 --runs 20 --build-runs 3 --check --output semantic.json
-nice -n 10 target/release/examples/bench --binary target/release/agrep \
-  --dense --rows 2000000 --runs 20 --build-runs 3 --check --output dense.json
+target/release/examples/semantic_eval "$MODEL" provision
+target/release/examples/semantic_eval "$MODEL" cpu
+for workload in mixed semantic dense; do
+  nice -n 10 target/release/examples/matched --reference "$AGREP_049/bin/agrep" \
+    --candidate target/release/agrep --workload "$workload" --model-dir "$MODEL" \
+    --runs 20 --build-runs 3 --check --output "matched-$workload.json"
+done
 ```
 
-Use `.exe` on Windows. Samples time a fresh process through full output and exit;
-none are discarded. Reports retain all samples and exit codes. p95 needs at
-least 20 samples. First-index medians use three complete builds. Dense tests
-require exactly 2M requested rows and budgets reserving 2x headroom. Hybrid
-checks require a meaning row (`sem_score` or `lane: semantic`), not just a fast
-keyword answer. They download the model into a temporary data root, drain the
-fixture embedding backlog, then measure first and repeated query processes.
-Installation/download time is outside the query deadline. The full suite is
-blocking on six hosted runners. Current engine performance limitations are
+(`--model-dir` matters only for the semantic workload; use `Scripts` and `.exe`
+on Windows.) The workloads are the generated mixed 100,000-row and dense
+2,000,000-row stores and a 1,000-row semantic store with a planted meaning
+answer. Each version gets its own temporary data directory and both read the
+same stores; 0.4.9 also gets a temporary model directory. 0.4.9 runs in its
+default configuration, so its resident fork server, freshness daemon and
+semantic worker start as they would for a user; every case begins with one
+recorded warm-up invocation per version, and background processes of both
+versions are ended between cases. Samples alternate 0.4.9 and 0.5, each a fresh
+process measured to exit, kept and recorded with the load average: 20 per warm
+case, 3 first builds and 3 cold first hybrid queries. 0.4.9's `index` returns
+while its daemon is still building the search database, so its index samples
+end when the build request it queued has been served; the process exit is
+recorded too.
+
+Every sample of both versions is verified: exit codes, non-empty answers where
+matches exist, meaning rows for hybrid and `-s` cases, and on the dense corpus
+0.5's exact top-40 handles and counts against an independent full-corpus
+oracle. A case is a win only when 0.5's median and its p95 are both strictly
+below 0.4.9's. A case 0.4.9 fails is reported as a reference failure, never a
+win. The gate fails unless every case is a win; the report lists both
+statistics, their ratios and every sample for each case.
+
+`docs/perf-budgets.json` keeps the SPEC §9 numbers as documented targets with
+their reasons. `examples/bench --check` (see CONTRIBUTING.md) and
+`bench/semantic_owner.py` verify results and print measured-vs-target lines;
+missing or wrong results fail them, a missed target does not. `semantic_eval
+cpu` remains the blocking recall@k quality gate. Current engine limitations are
 recorded in [ENGINE.md](ENGINE.md); gate failures remain failures.
 
 ## Packages

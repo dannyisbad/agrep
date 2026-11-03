@@ -18,7 +18,7 @@ pub(crate) fn run(a: Postcompact, no_auto: bool) -> Result<i32> {
         let c = store::reader(&root)?;
         let mut identity = Identity::detect();
         if let Some(session) = &a.session {
-            let candidates = handles::candidates(&c, session)?;
+            let candidates = handles::SessionIndex::load(&c)?.candidates(&c, session)?;
             if candidates.len() != 1 {
                 bail!("requested session is missing or ambiguous")
             }

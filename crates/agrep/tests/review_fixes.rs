@@ -179,7 +179,10 @@ fn alias_resolution_uses_source_metadata_and_safe_followups() {
     )
     .unwrap();
     assert_eq!(
-        agrep_core::handles::candidates(&c, &w.target).unwrap(),
+        agrep_core::handles::SessionIndex::load(&c)
+            .unwrap()
+            .candidates(&c, &w.target)
+            .unwrap(),
         vec!["sameprefix-session-one"]
     );
 }

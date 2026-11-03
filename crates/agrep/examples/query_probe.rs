@@ -38,6 +38,12 @@ struct Args {
     cache_mib: Option<u32>,
     #[arg(long)]
     mmap_mib: Option<u32>,
+    /// Run the same search repeatedly in this process, for sampling profilers.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// Print each page hit's handle, tier and exact score.
+    #[arg(long)]
+    handles: bool,
 }
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -100,7 +106,15 @@ fn main() -> Result<()> {
             ..Default::default()
         },
     };
-    let r = query::search(&c, &options)?;
+    let mut r = query::search(&c, &options)?;
+    for _ in 1..a.repeat {
+        r = query::search(&c, &options)?;
+    }
+    if a.handles {
+        for h in &r.hits {
+            println!("{} {} {:.17}", h.handle, h.tier, h.score);
+        }
+    }
     println!(
         "{}",
         serde_json::json!({"total":r.total,"shown":r.hits.len(),"total_basis":r.total_basis,"examined":r.examined,"blocks":r.blocks,"timings":r.timings,"optimize_ms":optimize_ms,"gap_ms":gap_ms,"bounds_ms":bounds_ms,"cache_kib":c.pragma_query_value(None,"cache_size",|r|r.get::<_,i64>(0))?,"mmap_bytes":c.pragma_query_value(None,"mmap_size",|r|r.get::<_,i64>(0))?})

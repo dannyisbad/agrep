@@ -2,8 +2,9 @@
 
 Release requires formatting, strict all-target clippy, workspace tests, package
 contract tests, the exact platform-test registry, working-tree/index and history
-privacy gates, generated dependency notices, and the full-process performance
-gates in `docs/perf-budgets.json`. Failing measurements remain failures.
+privacy gates, generated dependency notices, and the matched full-process
+performance comparison with agrep 0.4.9 described in `DISTRIBUTION.md`. Failing
+measurements remain failures; `docs/perf-budgets.json` records the SPEC targets.
 
 Every executable smoke uses a temporary HOME, agent home, data root and model
 location. Semantic smoke contains unrelated distractors and must rank the

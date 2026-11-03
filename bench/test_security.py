@@ -8,13 +8,13 @@ ROOT=Path(__file__).resolve().parents[1]
 class SecurityContracts(unittest.TestCase):
     def test_actions_are_pinned_and_tag_is_never_shell_source(self):
         for name in ('ci.yml','release.yml'):
-            text=(ROOT/'.github/workflows'/name).read_text()
+            text=(ROOT/'.github/workflows'/name).read_text(encoding='utf-8')
             actions=re.findall(r'^\s*uses:\s*(\S+)|^\s*-\s*uses:\s*(\S+)',text,re.M)
             for groups in actions:
                 action=next(part for part in groups if part)
                 if action.startswith('./'): continue
                 self.assertRegex(action,r'^[\w-]+/[\w-]+@[0-9a-f]{40}$')
-        release=(ROOT/'.github/workflows/release.yml').read_text()
+        release=(ROOT/'.github/workflows/release.yml').read_text(encoding='utf-8')
         for line in release.splitlines():
             if 'github.ref_name' in line:
                 self.assertRegex(line.strip(),r'^(run-name:|RELEASE_TAG:)')
@@ -22,7 +22,7 @@ class SecurityContracts(unittest.TestCase):
         self.assertIn('gh release edit "$RELEASE_TAG"',release)
 
     def test_explorer_sends_auth_only_as_an_explicit_header(self):
-        source=(ROOT/'web/app.html').read_text()
+        source=(ROOT/'web/app.html').read_text(encoding='utf-8')
         start=source.index('    let authorization')
         end=source.index('    function abortHistoryRequests',start)
         script=source[start:end]
@@ -38,7 +38,7 @@ await request('/api/chats',{credentials:'include'});
 assert.equal(calls[1][1].headers.get('Authorization'),'Bearer example-token');
 assert.equal(calls[1][1].credentials,'omit');assert.equal(calls[1][1].mode,'same-origin');
 })().catch(e=>{console.error(e);process.exitCode=1;});'''.replace('SCRIPT',script)
-        result=subprocess.run(['node','-e',probe],capture_output=True,text=True)
+        result=subprocess.run(['node','-e',probe],capture_output=True,text=True,encoding='utf-8')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertNotIn('sessionStorage',source)
         self.assertNotIn('document.cookie',source)

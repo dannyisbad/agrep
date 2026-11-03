@@ -27,7 +27,7 @@ from build_binary import build_environment
 sys.path.insert(0, str(ROOT))
 import wheel_build
 
-TARGETS = json.loads((ROOT / 'bench/targets.json').read_text())
+TARGETS = json.loads((ROOT / 'bench/targets.json').read_text(encoding='utf-8'))
 
 
 def executable_header(target):
@@ -100,8 +100,8 @@ class DistributionTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)
         package = self.root / 'npm/package.json'
-        data = json.loads(package.read_text()); data['version'] = '0.0.0'
-        package.write_text(json.dumps(data))
+        data = json.loads(package.read_text(encoding='utf-8')); data['version'] = '0.0.0'
+        package.write_text(json.dumps(data), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'version mismatch'):
             identity(root=self.root)
 
@@ -140,10 +140,10 @@ class DistributionTests(unittest.TestCase):
 
     def test_skip_gate_rejects_positive_ignored_counts(self):
         path = self.root / 'test.log'
-        path.write_text('test result: ok. 2 passed; 0 ignored; 0 failed\n')
+        path.write_text('test result: ok. 2 passed; 0 ignored; 0 failed\n', encoding='utf-8')
         check_skips([path])
         for text in ('test result: ok. 2 passed; 1 ignored; 0 failed\n', 'ℹ skipped 1', 'ok 1 # SKIP unsupported', 'OK (skipped=1)'):
-            path.write_text(text)
+            path.write_text(text, encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'skipped'):
                 check_skips([path])
 
@@ -151,12 +151,12 @@ class DistributionTests(unittest.TestCase):
         text = '#[cfg(unix)] mod pty { #[test] fn suspend() {} #[test] fn restore() {} } #[cfg(windows)] #[test] fn console() {}'
         self.assertEqual(gated_tests(text), {'pty::suspend':['cfg(unix)'], 'pty::restore':['cfg(unix)'], 'console':['cfg(windows)']})
         source = self.root / 'crates/probe.rs'; source.parent.mkdir()
-        source.write_text(text)
+        source.write_text(text, encoding='utf-8')
         policy = self.root / 'bench/test-skips.json'; policy.parent.mkdir()
-        policy.write_text(json.dumps({'platform_inapplicable':[]}))
+        policy.write_text(json.dumps({'platform_inapplicable':[]}), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'unlisted platform'):
             check_skips([],root=self.root)
-        policy.write_text(json.dumps({'platform_inapplicable':[{'test':'crates/probe.rs::'+name,'gates':gates,'reason':'platform API'} for name,gates in gated_tests(text).items()]}))
+        policy.write_text(json.dumps({'platform_inapplicable':[{'test':'crates/probe.rs::'+name,'gates':gates,'reason':'platform API'} for name,gates in gated_tests(text).items()]}), encoding='utf-8')
         check_skips([],root=self.root)
 
     def test_semantic_smoke_requires_correct_first_neighbor(self):
@@ -169,7 +169,7 @@ class DistributionTests(unittest.TestCase):
             assert_semantic_ranking(json.dumps({'session':SESSION}))
 
     def test_release_stays_prerelease_until_publish_gates(self):
-        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
         self.assertIn('prerelease: true',workflow)
         self.assertIn('make_latest: false',workflow)
         promote = workflow.split('  promote:')[1]
@@ -191,7 +191,7 @@ class DistributionTests(unittest.TestCase):
         (assets / TARGETS[0]['asset']).write_bytes(b'changed')
         with self.assertRaisesRegex(ValueError, 'hashes'):
             npm_validate(tarball, assets)
-        manifest = json.loads((self.root / 'sealed/npm/checksums.json').read_text())
+        manifest = json.loads((self.root / 'sealed/npm/checksums.json').read_text(encoding='utf-8'))
         self.assertEqual(len(manifest), 6)
         for target in TARGETS:
             entry = manifest[target['os'] + '-' + target['arch']]
@@ -208,11 +208,11 @@ class LauncherTests(unittest.TestCase):
         cls.exe = cls.root / ('probe.exe' if os.name == 'nt' else 'probe')
         source = cls.root / 'probe.rs'
         source.write_text('''use std::{env,io::{self,Write},thread,time::Duration};
-fn main() { let a:Vec<String>=env::args().skip(1).collect();
- if a.first().map(String::as_str)==Some("wait") {println!("ready");io::stdout().flush().unwrap();thread::sleep(Duration::from_secs(60));}
- if a.first().map(String::as_str)==Some("exit") {std::process::exit(a[1].parse().unwrap());}
- for s in a {println!("{}:{}",s.len(),s);} eprintln!("stderr intact");
-}''')
+        fn main() { let a:Vec<String>=env::args().skip(1).collect();
+         if a.first().map(String::as_str)==Some("wait") {println!("ready");io::stdout().flush().unwrap();thread::sleep(Duration::from_secs(60));}
+         if a.first().map(String::as_str)==Some("exit") {std::process::exit(a[1].parse().unwrap());}
+         for s in a {println!("{}:{}",s.len(),s);} eprintln!("stderr intact");
+        }''', encoding='utf-8')
         subprocess.run(['rustc', str(source), '-o', str(cls.exe)], check=True)
 
     @classmethod
@@ -248,7 +248,7 @@ fn main() { let a:Vec<String>=env::args().skip(1).collect();
         platform = {'darwin': 'darwin', 'win32': 'win32'}.get(sys.platform, 'linux')
         arch = subprocess.check_output(['node', '-p', 'process.arch'], text=True).strip()
         digest = hashlib.sha256(self.exe.read_bytes()).hexdigest()
-        (npm / 'checksums.json').write_text(json.dumps({platform + '-' + arch: {'asset': 'agrep-test', 'sha256': digest}}))
+        (npm / 'checksums.json').write_text(json.dumps({platform + '-' + arch: {'asset': 'agrep-test', 'sha256': digest}}), encoding='utf-8')
         cache = self.work / 'cache'
         binary = cache / 'agrep/bin' / version() / (platform + '-' + arch) / digest / ('agrep.exe' if os.name == 'nt' else 'agrep')
         binary.parent.mkdir(parents=True); shutil.copy2(self.exe, binary)

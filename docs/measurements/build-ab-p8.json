@@ -1,0 +1,213 @@
+{
+ "scope": "alternating first builds of the owner real history from scratch, previous binary (separate presence pass) then new binary; ab = presence merged on the FTS worker thread, ab2 = merged in parallel by shard",
+ "samples": [
+  {
+   "campaign": "build-ab",
+   "label": "previous",
+   "build_ms": 264946.4,
+   "load_before": [
+    29.18,
+    30.34,
+    36.66
+   ],
+   "load_after": [
+    31.6,
+    42.48,
+    41.48
+   ],
+   "index_bytes": 2428432384,
+   "parse_ms": 39836.1,
+   "write_ms": 205215.0,
+   "fts_ms": 36550.2,
+   "dictionary_ms": 20606.3,
+   "row_diff_ms": 44363.0,
+   "node_chunks_ms": 74849.9,
+   "canonical_ms": 10514.4,
+   "bounds_ms": 11341.9,
+   "stats_ms": 7387.9,
+   "commit_ms": 365.3
+  },
+  {
+   "campaign": "build-ab",
+   "label": "new",
+   "build_ms": 224905.7,
+   "load_before": [
+    31.6,
+    42.48,
+    41.48
+   ],
+   "load_after": [
+    23.94,
+    33.51,
+    37.87
+   ],
+   "index_bytes": 2428895232,
+   "parse_ms": 30388.7,
+   "write_ms": 173350.5,
+   "fts_ms": 44528.6,
+   "dictionary_ms": 16325.5,
+   "row_diff_ms": 39181.3,
+   "node_chunks_ms": 47375.1,
+   "canonical_ms": 9512.3,
+   "bounds_ms": 11897.6,
+   "stats_ms": 7989.9,
+   "commit_ms": 349.1
+  },
+  {
+   "campaign": "build-ab",
+   "label": "previous",
+   "build_ms": 214891.7,
+   "load_before": [
+    23.94,
+    33.51,
+    37.87
+   ],
+   "load_after": [
+    88.77,
+    58.01,
+    47.11
+   ],
+   "index_bytes": 2429190144,
+   "parse_ms": 31593.6,
+   "write_ms": 162017.0,
+   "fts_ms": 35112.3,
+   "dictionary_ms": 25738.6,
+   "row_diff_ms": 36489.1,
+   "node_chunks_ms": 41849.6,
+   "canonical_ms": 8260.1,
+   "bounds_ms": 11730.5,
+   "stats_ms": 8349.9,
+   "commit_ms": 364.0
+  },
+  {
+   "campaign": "build-ab",
+   "label": "new",
+   "build_ms": 216732.5,
+   "load_before": [
+    88.77,
+    58.01,
+    47.11
+   ],
+   "load_after": [
+    61.2,
+    72.5,
+    56.9
+   ],
+   "index_bytes": 2431500288,
+   "parse_ms": 35230.3,
+   "write_ms": 162647.5,
+   "fts_ms": 43640.1,
+   "dictionary_ms": 15916.3,
+   "row_diff_ms": 35954.4,
+   "node_chunks_ms": 41743.5,
+   "canonical_ms": 9193.9,
+   "bounds_ms": 9779.0,
+   "stats_ms": 8117.7,
+   "commit_ms": 329.2
+  },
+  {
+   "campaign": "build-ab2",
+   "label": "previous",
+   "build_ms": 185846.4,
+   "load_before": [
+    26.83,
+    49.69,
+    51.14
+   ],
+   "load_after": [
+    17.66,
+    34.81,
+    44.59
+   ],
+   "index_bytes": 2433982464,
+   "parse_ms": 26955.1,
+   "write_ms": 141946.2,
+   "fts_ms": 35646.5,
+   "dictionary_ms": 19178.7,
+   "row_diff_ms": 32897.2,
+   "node_chunks_ms": 31942.7,
+   "canonical_ms": 8521.4,
+   "bounds_ms": 8718.3,
+   "stats_ms": 6983.0,
+   "commit_ms": 267.9
+  },
+  {
+   "campaign": "build-ab2",
+   "label": "new",
+   "build_ms": 191513.4,
+   "load_before": [
+    17.66,
+    34.81,
+    44.59
+   ],
+   "load_after": [
+    47.23,
+    35.26,
+    42.47
+   ],
+   "index_bytes": 2435080192,
+   "parse_ms": 30841.0,
+   "write_ms": 139879.1,
+   "fts_ms": 41202.8,
+   "dictionary_ms": 15567.9,
+   "row_diff_ms": 31878.3,
+   "node_chunks_ms": 29232.7,
+   "canonical_ms": 7952.9,
+   "bounds_ms": 10546.4,
+   "stats_ms": 8648.4,
+   "commit_ms": 353.4
+  },
+  {
+   "campaign": "build-ab2",
+   "label": "previous",
+   "build_ms": 389567.4,
+   "load_before": [
+    47.23,
+    35.26,
+    42.47
+   ],
+   "load_after": [
+    156.4,
+    95.27,
+    67.91
+   ],
+   "index_bytes": 2435452928,
+   "parse_ms": 39202.3,
+   "write_ms": 304220.6,
+   "fts_ms": 51306.2,
+   "dictionary_ms": 56414.5,
+   "row_diff_ms": 53465.2,
+   "node_chunks_ms": 104167.1,
+   "canonical_ms": 15189.2,
+   "bounds_ms": 21965.1,
+   "stats_ms": 22925.0,
+   "commit_ms": 493.9
+  },
+  {
+   "campaign": "build-ab2",
+   "label": "new",
+   "build_ms": 431590.8,
+   "load_before": [
+    156.4,
+    95.27,
+    67.91
+   ],
+   "load_after": [
+    152.57,
+    139.47,
+    104.24
+   ],
+   "index_bytes": 2436087808,
+   "parse_ms": 65391.8,
+   "write_ms": 326177.9,
+   "fts_ms": 93336.5,
+   "dictionary_ms": 40159.9,
+   "row_diff_ms": 56234.9,
+   "node_chunks_ms": 91966.5,
+   "canonical_ms": 20240.2,
+   "bounds_ms": 20062.6,
+   "stats_ms": 18672.3,
+   "commit_ms": 394.9
+  }
+ ]
+}

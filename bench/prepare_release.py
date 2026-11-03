@@ -12,7 +12,7 @@ from validate_npm import validate as npm_validate
 
 
 def prepare(assets, wheels, output):
-    targets = json.loads((ROOT / 'bench/targets.json').read_text())
+    targets = json.loads((ROOT / 'bench/targets.json').read_text(encoding='utf-8'))
     expected = {t['asset'] for t in targets}
     if {p.name for p in assets.iterdir()} != expected:
         raise ValueError('release requires exactly the six target binaries')
@@ -36,9 +36,9 @@ def prepare(assets, wheels, output):
         asset = staged / target['asset']
         binary_privacy(asset)
         digest = hashlib.sha256(asset.read_bytes()).hexdigest()
-        asset.with_name(asset.name + '.sha256').write_text(f'{digest}  {asset.name}\n')
+        asset.with_name(asset.name + '.sha256').write_text(f'{digest}  {asset.name}\n', encoding='utf-8')
         manifest[f'{target["os"]}-{target["arch"]}'] = {'asset': asset.name, 'sha256': digest}
-    (npm / 'checksums.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (npm / 'checksums.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     for name in ('LICENSE', 'THIRD_PARTY_LICENSES.txt'):
         shutil.copy2(ROOT / name, staged / name)
         shutil.copy2(ROOT / name, npm / name)

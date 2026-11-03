@@ -20,7 +20,7 @@ OUTPUT = ROOT / "THIRD_PARTY_LICENSES.txt"
 def _metadata() -> dict:
     # Only dependencies that can ship in one of the six release binaries.
     packages = {}
-    targets = json.loads((ROOT / "bench/targets.json").read_text())
+    targets = json.loads((ROOT / "bench/targets.json").read_text(encoding='utf-8'))
     for target in targets:
         run = subprocess.run(
             ["cargo", "metadata", "--locked", "--format-version", "1",

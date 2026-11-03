@@ -12,9 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def version(root=ROOT):
     versions = []
     for name in ('Cargo.toml', 'pyproject.toml'):
-        text = (root / name).read_text()
+        text = (root / name).read_text(encoding='utf-8')
         versions.append(re.search(r'^version = "([^"]+)"', text, re.M)[1])
-    versions.append(json.loads((root / 'npm/package.json').read_text())['version'])
+    versions.append(json.loads((root / 'npm/package.json').read_text(encoding='utf-8'))['version'])
     if len(set(versions)) != 1:
         raise ValueError(f'version mismatch: Cargo, Python, npm = {versions}')
     return versions[0]

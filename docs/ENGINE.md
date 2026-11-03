@@ -1,5 +1,82 @@
 # 0.5.0 keyword engine
 
+## V9: recall and pack windows and depth
+
+A measured checkpoint, **not SPEC §9 acceptance**. The previous head (ffc57df4) and this binary ran on one isolated index of the owner's history, built read-only by the previous head, in ABBA-interleaved pairs of fresh processes with normal census and detached refresh, so both saw the same load. The machine was far busier than for V8 (median loads 60–113). Every sample and load is kept: [report](measurements/recall-pack-w3.json).
+
+### What changed
+
+- **One sorted session index.** A window resolved its session by reading every session row with its title and family (8–14 ms each, eight times per recall), then read every id again for its shortest unique target. `SessionIndex` reads the distinct ids once per batch; exact and prefix references resolve by binary search, and the target comes from the two sorted neighbors, whose common prefix is the longest any id shares. Other references still read every session. Search hit handles use the same index, and the handle pattern compiles once per process.
+- **Incremental budget trimming.** Recall rebuilt every block for each dropped context row (33 full renders of about 450 KB for `release workflow`). Each row's line now depends only on the cap, so a drop re-renders nothing, a smaller cap renders each remaining row once, and the page length is a sum. JSON pages serialize only the block a drop changed.
+- **Shallow rankings for selection.** Recall searched 12 hits per wanted hit (96) to pick one per family, and search cost grows with depth: `release workflow` took 11 ms at 16 hits and 342 ms at 96 in one process. Without a meaning lane or `--probe`, each query is first searched twice the target deep; a ranking prefix selects exactly what the full ranking selects unless selection ran past its end, and only such a query is searched again at full depth.
+- **Tool text** is split at character offsets by slicing instead of collecting characters, and stored counts are not recomputed.
+
+Results are unchanged: with one interposed wall-clock instant (recency scores read the clock), stdout, stderr and exit codes are byte-identical on **315 of 315** cases: recall and pack in text and JSON at budgets from 64 bytes to unbounded, context 0 and 5, `--hits`, `--probe`, colour, tool and filtered scopes, direct handles, `around` by handle, session, prefix and title, `--chat` searches and `chats`. Tests compare the incremental pages with full re-rendering at every budget, deepened selection with full rankings over random families and depths, sorted targets and candidates with a scan of every session, and offset splitting with collected characters.
+
+| Case | 0.4.9 ms | Previous head ms | This binary ms | Head ÷ new | 0.4.9 ÷ new | Load 1 / 5 / 15 |
+|---|---:|---:|---:|---:|---:|---|
+| recall | 849.74 | 735.3 | 351.4 | 2.09× | 2.42× | 113 / 96 / 78 |
+| pack | 1057.00 | 782.2 | 284.9 | 2.75× | 3.71× | 105 / 95 / 78 |
+| around | 329.71 | 118.0 | 134.8 | 0.88× | 2.45× | 100 / 94 / 78 |
+| release | 457.09 | 187.0 | 223.4 | 0.84× | 2.05× | 98 / 93 / 78 |
+| json | 505.40 | 228.6 | 240.9 | 0.95× | 2.10× | 99 / 94 / 78 |
+| error | 347.78 | 85.5 | 96.4 | 0.89× | 3.61× | 99 / 94 / 78 |
+| chats | 287.44 | 176.4 | 193.2 | 0.91× | 1.49× | 99 / 94 / 78 |
+
+Seven pairs per case. The searches, `around` and `chats` change only in how handles find their targets, and at load 100 their seven-pair medians sit within the spread of the samples. Fifteen further pairs at load 61–62 measured around 97.3 → 93.0, error 124.8 → 111.3 and release 218.2 → 209.6 ms; all samples are in the report.
+
+### Where the remaining time goes
+
+- **recall / pack**: the shallow searches; event decoding for windows with thousands of tool calls (about 30 ms of decompression, 15 ms of JSON parsing and 10 ms of hashing across 4 MB in one profile); the concurrent census. Decoding events in parallel was measured and dropped: in its campaign at load 85, `around` took 131.3 ms against the previous head's 90.0 (samples in the report).
+- **short** (`hi`) and the fixed startup and census floor of error, count, chats, status and around are unchanged from V8.
+
+## V8: exact tool word presence
+
+A measured checkpoint, **not SPEC §9 acceptance**. The machine was far busier than for V7 (median loads about 40 / 48 / 45 against 14 / 26 / 27), so the comparison below pairs adjacent seven-process campaigns of the previous head and this binary under the same conditions instead of comparing with V7's quieter numbers. Every sample and its load is kept: [previous head](measurements/real-query-p8-head.json), [this binary, run A](measurements/real-query-p8-v2.json), [run B](measurements/real-query-p8-v2b.json).
+
+### What changed
+
+- **Tool word presence.** Each dictionary word now records the 512-row tool blocks containing it (`tool_words.blocks`), computed with the FTS5 unicode61 tokenizer itself, so it lists exactly the tokens FTS5 stores. Removed rows may leave a block listed; a block is never omitted. Block bounds drop tool blocks in which a fully expandable term has no word, and each block's FTS expression lists only the words that block holds.
+- **No corpus-wide stream of broad expansions.** FTS5 advances every OR child on each step. `release workflow` expands to 1,741 tool words; its single corpus-wide positional stream alone cost 171–272 ms. Expressions above 32 words now use the bounded per-block plan, whose expressions average 10–27 words.
+- **Three-character terms plan without expansion.** `tool_trigrams` keeps, per trigram, the summed frequency of the words containing it, equal to the expansion's total. Words are read only for the groups a plan uses, so `the`, `run` and `did` (8,149 words) are no longer read for the natural query.
+- **Presence, not counts, in the matcher.** Outside the phrase tier, which counts its own regex matches, a term's occurrence count was never used; `contains` replaces counting every occurrence.
+
+Results are unchanged: the previous head and this binary return identical pages, order, totals, total basis and exit codes on **62 of 62** real-history cases on one index ([equivalence](measurements/equivalence-p8.json); scores compared within 1e-5 for the process clock). A new integration test compares bounded pages with the exhaustive `-n 0` ranking across blocks with differing words, Unicode separators and an incremental append, and fails when one block loses one word. Unit tests check stored presence against FTS5 for every word, its growth after changes, and trigram totals against expansions.
+
+### Real history, paired campaigns
+
+| Case | 0.4.9 ms | V7 ms | Previous head now | This binary A / B | Head ÷ best |
+|---|---:|---:|---:|---:|---:|
+| release | 457.09 | 186.01 | 575.3 | 93.7 / 119.8 | 6.14× |
+| natural | 270.82 | 206.91 | 562.8 | 104.1 / 154.7 | 5.41× |
+| list | 862.46 | 326.63 | 1024.3 | 248.7 / 495.7 | 4.12× |
+| json | 505.40 | 182.46 | 454.7 | 121.7 / 141.6 | 3.74× |
+| compact_release | 508.09 | 193.39 | 392.7 | 112.8 / 132.3 | 3.48× |
+| compact_natural | 362.40 | 210.78 | 458.2 | 175.8 / 180.3 | 2.61× |
+| short | 408.58 | 145.61 | 283.6 | 238.0 / 247.5 | 1.19× |
+| error | 347.78 | 43.74 | 130.7 | 70.1 / 68.5 | 1.91× |
+| count | 462.77 | 57.00 | 149.7 | 119.1 / 127.2 | 1.26× |
+| recall | 849.74 | 465.86 | 1000.9 | 788.2 / 453.4 | 2.21× |
+| pack | 1057.00 | 408.75 | 692.9 | 852.4 / 408.0 | 1.70× |
+| chats | 287.44 | 60.11 | 126.2 | 79.6 / 86.0 | 1.59× |
+| status | 568.60 | 55.02 | 86.7 | 110.7 / 89.6 | 0.97× |
+| around | 329.71 | 50.02 | 63.3 | 71.1 / 65.3 | 0.97× |
+| no_change_census | — | 38.98 | 108.7 | 64.2 / 72.7 | 1.69× |
+
+The reports hold every other case (flaky, rare, regex, filtered, tool and all-lane searches); none moved beyond the spread of these loaded runs. Status and around run no changed code. On one index, query-only medians changed from 166–172 to 42–45 ms for `release workflow` and from 192–199 to 77 ms for the natural query.
+
+### Where the remaining time goes
+
+- **natural**: about 300 tool blocks have a ceiling above the 40th score and hold every term; 143 of them return no row. Their per-block FTS queries (~107 µs each) take 32–39 ms, tool planning 17–21 ms (the two selected expansions and the bounds), prose candidates 5.5 ms.
+- **release / json / list**: about 62 tool blocks at ~200 µs, plus ~10 ms planning; `list` adds per-session grouping.
+- **short** (`hi`): 112–116 ms scoring 3,219 rows. For rows with non-ASCII text, `BoundaryOnlyText::new` hashes every cluster boundary of the row into `HashSet`s (61% of samples). Next: evaluate boundaries only at match positions.
+- **error, count, chats, status, around**: process start and the census join; the census is 29 ms internally on a quiet machine, 64–109 ms at these loads.
+- **recall / pack**: their search is faster; the window and expansion work around hits (~400 ms in run B) is unchanged.
+
+First build took 386.6 s at load 71 / 66 / 45 (previous head: 186.0 s at 22 / 34 / 31); that pair ran at different loads. The first build now collects word presence while its FTS rows are prepared, instead of re-reading and decoding every tool row in a second pass; a rebuild still uses the separate pass. Alternating from-scratch builds of the separate-pass binary and this one ([every sample](measurements/build-ab-p8.json)) cut the dictionary phase from 19.2–25.7 s to 15.6–16.3 s but lengthened the FTS phase from 35.1–36.6 s to 41.2–44.5 s: word merging now bounds the FTS worker, even with one thread per shard. The closest-load pair took 185.8 s (separate pass, load 27 / 50 / 51) and 191.5 s (load 18 / 35 / 45); the total is unchanged within the load noise. The dictionary phase is still about 7 s above V7's 8.2 s, from inserting every word and its block list row by row. Results stay identical (62 of 62 cases on the newest build). The index is 2,428,379,136 bytes; presence adds about 9.6 MB to `tool_words`.
+
+Synthetic, seven processes and one build each, all oracle checks valid: [mixed 100k](measurements/synthetic-p8-mixed-100k.json) first index 11.2 s, census 30.1 ms, one-session append refresh 43.0 / 50.1 ms p50 / p95; [dense 2M](measurements/synthetic-p8-dense-2m.json) `old_dense` 65.1 / 69.1 ms (V7 58.2 / 60.7 at 13.5 / 15.8 / 21.1) at load 54 / 47 / 46, append 73.4 / 82.0 ms. The dense corpus has no tool rows, so its path is unchanged.
+
 ## V7: measured retrieval, append and build changes
 
 This is a measured checkpoint, **not SPEC §9 acceptance**. All real-history cases that succeeded in 0.4.9 remain faster than that release, but the unchanged keyword, census, append, first-build and dense limits still fail. The index is **2,365,624,320 bytes (2.366 GB)**, below the 2.5 GB storage limit. Measurements include every sample and load; no outlier was removed. The real source snapshot grew from 10,629 to 10,657 sources between V6 and V7.

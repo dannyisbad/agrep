@@ -15,5 +15,6 @@
   `-s` requires the model. Coverage is reported as indexed/total rows.
 - Six platform wheels bundle the executable. npm verifies package-pinned hashes
   before caching and executing the matching GitHub release binary.
-- CI runs tests and blocking full-process performance gates on Linux, macOS and
-  Windows, including arm64 runners. Release publication requires those gates.
+- CI runs tests and a blocking full-process performance comparison with agrep
+  0.4.9 on Linux, macOS and Windows, including arm64 runners: every measured case
+  must beat 0.4.9 at median and p95. Release publication requires it.

@@ -135,9 +135,62 @@ struct CoverageBounds {
     rows: HashMap<i64, f64>,
     blocks: HashMap<i64, f64>,
 }
+/// Every indexed tool word containing one term, with its exact block presence.
+struct Expansion {
+    words: Vec<crate::tool_index::Word>,
+    doc: usize,
+    blocks: Vec<u64>,
+    by_block: std::sync::OnceLock<HashMap<u32, Vec<u32>>>,
+}
+impl Expansion {
+    fn new(words: Vec<crate::tool_index::Word>) -> Self {
+        let mut blocks = Vec::new();
+        for word in &words {
+            for &block in &word.blocks {
+                let (slot, bit) = (block as usize / 64, block % 64);
+                if slot >= blocks.len() {
+                    blocks.resize(slot + 1, 0u64);
+                }
+                blocks[slot] |= 1 << bit;
+            }
+        }
+        Self {
+            doc: words.iter().map(|w| w.doc).sum(),
+            words,
+            blocks,
+            by_block: std::sync::OnceLock::new(),
+        }
+    }
+    /// Words present in one block, as indexes into `words`.
+    fn in_block(&self, block: u32) -> &[u32] {
+        self.by_block
+            .get_or_init(|| {
+                let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+                for (index, word) in self.words.iter().enumerate() {
+                    for &block in &word.blocks {
+                        map.entry(block).or_default().push(index as u32);
+                    }
+                }
+                map
+            })
+            .get(&block)
+            .map_or(&[], Vec::as_slice)
+    }
+}
+fn has_block(blocks: &[u64], block: i64) -> bool {
+    usize::try_from(block)
+        .ok()
+        .and_then(|block| {
+            blocks
+                .get(block / 64)
+                .map(|bits| bits & (1 << (block % 64)) != 0)
+        })
+        .unwrap_or(false)
+}
 #[derive(Default)]
 struct PlanCache {
-    words: HashMap<String, Option<Vec<(String, usize)>>>,
+    words: HashMap<String, Option<std::sync::Arc<Expansion>>>,
+    trigram_docs: HashMap<String, Option<usize>>,
     postings: HashMap<(i64, String), Vec<store::Posting>>,
     candidates: HashMap<String, CandidateGroups>,
     rejected_candidates: HashSet<String>,
@@ -284,12 +337,29 @@ impl PlanCache {
         self.candidates.insert(key, rows.clone());
         Ok(Some(rows))
     }
-    fn words(&mut self, c: &Connection, term: &str) -> Result<Option<Vec<(String, usize)>>> {
+    fn words(&mut self, c: &Connection, term: &str) -> Result<Option<std::sync::Arc<Expansion>>> {
         if !self.words.contains_key(term) {
-            self.words
-                .insert(term.to_owned(), crate::tool_index::expand(c, term)?);
+            let expansion = crate::tool_index::expand(c, term)?
+                .map(|words| std::sync::Arc::new(Expansion::new(words)));
+            self.words.insert(term.to_owned(), expansion);
         }
         Ok(self.words[term].clone())
+    }
+    /// A three-character term's word frequency total without expanding it.
+    fn trigram_doc(&mut self, c: &Connection, term: &str) -> Result<Option<usize>> {
+        if let Some(&doc) = self.trigram_docs.get(term) {
+            return Ok(doc);
+        }
+        let doc = crate::tool_index::trigram_doc(c, term)?;
+        self.trigram_docs.insert(term.to_owned(), doc);
+        Ok(doc)
+    }
+    /// The summed tool word frequency of a term; None if it cannot use the dictionary.
+    fn tool_doc(&mut self, c: &Connection, term: &str) -> Result<Option<usize>> {
+        if let Some(doc) = self.trigram_doc(c, term)? {
+            return Ok(Some(doc));
+        }
+        Ok(self.words(c, term)?.map(|words| words.doc))
     }
 }
 struct Matcher {
@@ -305,7 +375,11 @@ struct Matcher {
     query_chars: usize,
     required: Vec<String>,
     idf: Vec<f64>,
-    tool_terms: HashMap<String, Vec<String>>,
+    tool_terms: HashMap<String, std::sync::Arc<Expansion>>,
+    /// Variants the tool dictionary can expand; plans expand only those they read.
+    tool_supported: HashSet<String>,
+    /// Per query term: blocks holding any word of every variant, when all expand.
+    tool_presence: Vec<Option<Vec<u64>>>,
     coverage_term: Option<usize>,
     coverage_excluded: HashSet<usize>,
     minimum_coverage: f64,
@@ -391,6 +465,8 @@ impl Matcher {
             required,
             idf: vec![],
             tool_terms: HashMap::new(),
+            tool_supported: HashSet::new(),
+            tool_presence: Vec::new(),
             coverage_term: None,
             coverage_excluded: HashSet::new(),
             minimum_coverage: 0.,
@@ -405,7 +481,12 @@ impl Matcher {
             self.terms.clone()
         };
         self.tool_terms.clear();
+        self.tool_supported.clear();
+        self.tool_presence.clear();
         if table == "tools" {
+            if self.explicit.is_none() {
+                self.tool_presence = vec![None; self.terms.len()];
+            }
             let mut ordered = vec![];
             let mut estimate = if self.partial { 0 } else { usize::MAX };
             let mut indexed = false;
@@ -414,16 +495,32 @@ impl Matcher {
                 let mut expanded = vec![];
                 let mut supported = true;
                 for v in &variants {
-                    if let Some(words) = cache.words(c, v)? {
-                        df = df.saturating_add(words.iter().map(|(_, n)| *n).sum::<usize>());
-                        expanded
-                            .push((v.clone(), words.into_iter().map(|(word, _)| word).collect()));
+                    // A trigram's block postings already bound where it occurs;
+                    // its words are read only if a plan uses them.
+                    if let Some(doc) = cache.trigram_doc(c, v)? {
+                        df = df.saturating_add(doc);
+                    } else if let Some(words) = cache.words(c, v)? {
+                        df = df.saturating_add(words.doc);
+                        expanded.push((v.clone(), words));
                     } else {
                         supported = false;
                         break;
                     }
                 }
                 if supported {
+                    if self.explicit.is_none() && expanded.len() == variants.len() {
+                        let mut blocks: Vec<u64> = Vec::new();
+                        for (_, words) in &expanded {
+                            if words.blocks.len() > blocks.len() {
+                                blocks.resize(words.blocks.len(), 0);
+                            }
+                            for (slot, bits) in blocks.iter_mut().zip(&words.blocks) {
+                                *slot |= bits;
+                            }
+                        }
+                        self.tool_presence[self.coverage_term.unwrap_or(i)] = Some(blocks);
+                    }
+                    self.tool_supported.extend(variants.iter().cloned());
                     self.tool_terms.extend(expanded);
                     indexed = true;
                     if self.partial {
@@ -438,6 +535,26 @@ impl Matcher {
             }
             ordered.sort_by_key(|v| (v.0, v.1));
             self.ordered_terms = ordered.into_iter().map(|v| v.2).collect();
+            // Disjunctions and counts read every group; other plans read the two rarest.
+            let read = if self.partial || self.quick_count {
+                usize::MAX
+            } else {
+                2
+            };
+            let needed: Vec<String> = self
+                .ordered_terms
+                .iter()
+                .filter(|group| group.iter().all(|v| self.tool_supported.contains(v)))
+                .take(read)
+                .flatten()
+                .filter(|v| !self.tool_terms.contains_key(*v))
+                .cloned()
+                .collect();
+            for v in needed {
+                if let Some(words) = cache.words(c, &v)? {
+                    self.tool_terms.insert(v, words);
+                }
+            }
             self.estimated = if indexed { estimate } else { usize::MAX };
             return Ok(());
         }
@@ -515,17 +632,17 @@ impl Matcher {
             };
             return Ok(found.then(|| (0, 0., "counted".into())));
         }
-        let mut occurrences = usize::MAX;
         let mut found = Vec::new();
         let mut found_weight = 0.;
         for (i, variants) in self.terms.iter().enumerate() {
-            let n = variants.iter().map(|v| low.match_indices(v).count()).sum();
-            if (n > 0 && self.coverage_excluded.contains(&i))
-                || (n == 0 && self.coverage_term == Some(i))
+            // Only presence matters here; the phrase tier counts its own matches.
+            let present = variants.iter().any(|v| low.contains(v.as_str()));
+            if (present && self.coverage_excluded.contains(&i))
+                || (!present && self.coverage_term == Some(i))
             {
                 return Ok(None);
             }
-            if n == 0 {
+            if !present {
                 if self.partial {
                     continue;
                 } else {
@@ -534,7 +651,6 @@ impl Matcher {
             }
             found_weight += self.idf.get(i).copied().unwrap_or(1.);
             found.push(variants[0].clone());
-            occurrences = occurrences.min(n);
         }
         if found.is_empty()
             || (self.partial && found_weight < self.minimum_coverage * self.idf.iter().sum::<f64>())
@@ -547,9 +663,7 @@ impl Matcher {
         if (self.phase == 1 && !is_phrase) || (self.phase == 2 && is_phrase) {
             return Ok(None);
         }
-        if is_phrase {
-            occurrences = matches.len();
-        }
+        let occurrences = matches.len();
         let tier = if self.partial {
             2
         } else {
@@ -783,21 +897,39 @@ impl Matcher {
             )
         })
     }
-    fn fts(&self) -> Option<String> {
+    /// Indexed words for one query group. A block keeps only the words its rows contain.
+    fn group_words(&self, group: &[String], block: Option<i64>) -> Vec<&str> {
+        let mut words: Vec<&str> = Vec::new();
+        for v in group {
+            let expansion = &self.tool_terms[v];
+            match block {
+                None => words.extend(expansion.words.iter().map(|w| w.term.as_str())),
+                Some(block) => {
+                    if let Ok(block) = u32::try_from(block) {
+                        words.extend(
+                            expansion
+                                .in_block(block)
+                                .iter()
+                                .map(|&i| expansion.words[i as usize].term.as_str()),
+                        );
+                    }
+                }
+            }
+        }
+        words.sort_unstable();
+        words.dedup();
+        words
+    }
+    fn fts(&self, block: Option<i64>) -> Option<String> {
         let mut clauses = vec![];
         for group in &self.ordered_terms {
-            if group.iter().any(|v| !self.tool_terms.contains_key(v)) {
+            if group.iter().any(|v| !self.tool_supported.contains(v)) {
                 if self.partial {
                     return None;
                 }
                 continue;
             }
-            let mut words: Vec<_> = group
-                .iter()
-                .flat_map(|v| self.tool_terms[v].iter())
-                .collect();
-            words.sort_unstable();
-            words.dedup();
+            let words = self.group_words(group, block);
             if words.is_empty() {
                 if self.partial {
                     continue;
@@ -821,7 +953,7 @@ impl Matcher {
         // for each block in a long all-terms query.
         (!clauses.is_empty()).then(|| clauses.join(if self.partial { " OR " } else { " AND " }))
     }
-    fn word_positions(&self) -> Option<(String, Vec<u8>)> {
+    fn word_positions(&self, block: Option<i64>) -> Option<(String, Vec<u8>)> {
         if self.phase != 1
             || self.partial
             // A selective term in a longer sentence is cheaper to drive once
@@ -838,7 +970,7 @@ impl Matcher {
             .terms
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.iter().all(|v| self.tool_terms.contains_key(v)))
+            .filter(|(_, group)| group.iter().all(|v| self.tool_supported.contains(v)))
             .collect();
         // A phrase prefilter needs only a necessary positional condition.
         // Intersecting every common word stream makes long questions expensive
@@ -859,12 +991,7 @@ impl Matcher {
             groups.sort_by_key(|(i, _)| *i);
         }
         for (i, group) in groups {
-            let mut words: Vec<_> = group
-                .iter()
-                .flat_map(|v| self.tool_terms[v].iter())
-                .collect();
-            words.sort_unstable();
-            words.dedup();
+            let words = self.group_words(group, block);
             if words.is_empty() {
                 return None;
             }
@@ -1164,6 +1291,17 @@ fn block_bounds(
                     group_ts = group_ts.max(timestamp);
                 }
             }
+            // A tool block without any expanded word cannot contain the term,
+            // even when its trigrams occur separately.
+            if m.tool_presence
+                .get(i)
+                .and_then(Option::as_ref)
+                .is_some_and(|blocks| !has_block(blocks, id))
+            {
+                sum = 0;
+                group_clock = 0.;
+                group_ts = 0;
+            }
             if m.coverage_term == Some(i) && sum > 0 {
                 selected_possible = true;
             }
@@ -1421,9 +1559,7 @@ fn count_tool_terms(
     let mut selected: Option<HashSet<i64>> = None;
     let mut query = c.prepare_cached("SELECT rowid FROM tools_fts WHERE tools_fts MATCH ?")?;
     for group in &m.ordered_terms {
-        let mut words: Vec<_> = group.iter().flat_map(|v| m.tool_terms[v].iter()).collect();
-        words.sort_unstable();
-        words.dedup();
+        let words = m.group_words(group, None);
         let mut matched = HashSet::new();
         for word in words {
             let expression = format!("\"{}\"", word.replace('"', "\"\""));
@@ -1512,12 +1648,7 @@ fn search_pass(
                                 .min()
                                 .unwrap_or(n as usize);
                             let tools = if o.tools || o.filters.who.as_deref() == Some("tool") {
-                                cache
-                                    .words(c, v)
-                                    .ok()
-                                    .flatten()
-                                    .map(|words| words.iter().map(|(_, n)| *n).sum::<usize>())
-                                    .unwrap_or(n as usize)
+                                cache.tool_doc(c, v).ok().flatten().unwrap_or(n as usize)
                             } else {
                                 0
                             };
@@ -1598,12 +1729,12 @@ fn search_pass(
                 || m.terms
                     .iter()
                     .flatten()
-                    .all(|t| m.tool_terms.contains_key(t)))
+                    .all(|t| m.tool_supported.contains(t)))
         {
             let expression = if table == "prose" {
                 m.prose_fts(&o.pattern)
             } else {
-                m.fts()
+                m.fts(None)
             };
             if let Some(expression) = expression {
                 let f = &o.filters;
@@ -1666,7 +1797,7 @@ fn search_pass(
                 .saturating_mul(if table == "tools" { 8 } else { 4 })
                 >= lane_total;
         let span_plan = if table == "tools" && !common_scan {
-            m.word_positions()
+            m.word_positions(None)
         } else if table == "prose" {
             m.prose_positions()
         } else {
@@ -1679,7 +1810,7 @@ fn search_pass(
         } else if table == "prose" {
             m.prose_fts(&o.pattern)
         } else {
-            m.fts()
+            m.fts(None)
         };
         let has_scope = o.filters.agent.is_some()
             || o.filters.chat.is_some()
@@ -1760,7 +1891,14 @@ fn search_pass(
         // bounds planner memory, not matches or result accuracy.
         let mut adaptive_prose = table == "prose" && bounded && !partial && m.terms.len() > 1;
         let mut ids = None;
-        if table == "tools" && bounded && m.estimated.saturating_mul(8) <= lane_total {
+        // FTS5 advances every OR child on each step, so one corpus-wide stream
+        // of a broad substring expansion costs more than the bounded blocks
+        // reading only the words each block holds.
+        if table == "tools"
+            && bounded
+            && m.estimated.saturating_mul(8) <= lane_total
+            && fts.as_ref().is_some_and(|f| f.matches('"').count() <= 64)
+        {
             if let Some(expression) = &fts {
                 let tick = Instant::now();
                 ids = cache.candidate_rows(
@@ -1793,7 +1931,26 @@ fn search_pass(
                 result.timings.plan_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
             visited.insert(block);
-            let fts = fts.clone();
+            let (fts, block_span) = if table == "tools"
+                && bounded
+                && block >= 0
+                && !selective
+                && ids.is_none()
+                && fts.is_some()
+            {
+                let found = if span_plan.is_some() {
+                    m.word_positions(Some(block))
+                        .map(|(expression, ordinals)| (Some(expression), Some(ordinals)))
+                } else {
+                    m.fts(Some(block))
+                        .map(|expression| (Some(expression), None))
+                };
+                // A required group without any word in this block cannot match here.
+                let Some(found) = found else { continue };
+                found
+            } else {
+                (fts.clone(), span_plan.as_ref().map(|(_, v)| v.clone()))
+            };
             if bounded && result.hits.len() >= o.limit {
                 let last = &result.hits[o.limit - 1];
                 if o.sort == "time" {
@@ -1869,7 +2026,7 @@ fn search_pass(
             let mut sql=format!("SELECT p.id,p.session,p.agent,NULL,p.position,p.who,NULL,NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
             bind.extend(values.clone());
             if uses_fts {
-                if let Some((_, ordinals)) = &span_plan {
+                if let Some(ordinals) = &block_span {
                     sql.push_str(&if table == "tools" {
                         " AND agrep_word_span(tools_fts,?,CASE WHEN (SELECT ascii FROM tool_blobs WHERE id=p.blob) THEN 0 ELSE ? END)".into()
                     } else {

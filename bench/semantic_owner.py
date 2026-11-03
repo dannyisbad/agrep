@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Blocking owner-scale gate: synthetic vectors, real model, fresh CLI processes."""
+"""Owner-scale semantic check: synthetic vectors, real model, fresh CLI processes.
+
+Every query must succeed with meaning results. Latency is printed against the SPEC
+targets in docs/perf-budgets.json and does not fail the check; speed is gated by the
+matched comparison with agrep 0.4.9 (crates/agrep/examples/matched.rs)."""
 import argparse
 import hashlib
 import json
@@ -18,8 +22,9 @@ def percentile(values, fraction):
     return sorted(values)[math.ceil(len(values) * fraction) - 1]
 
 
-def check(report, budgets):
-    errors = []
+def check(report, targets):
+    """Correctness failures, and one measured-vs-target line per statistic."""
+    errors, lines = [], []
     if report.get('references', 0) < 200_000:
         errors.append('owner workload requires at least 200000 vector references')
     for mode, prefix in [('semantic', 'semantic_owner'), ('hybrid', 'hybrid_owner')]:
@@ -34,12 +39,13 @@ def check(report, budgets):
             continue
         for stat, value in [('p50', statistics.median(values)), ('p95', percentile(values, .95))]:
             key = f'{prefix}_{stat}_ms'
-            limit = budgets.get(key)
+            limit = targets.get(key)
             if not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0:
-                errors.append(f'{key}: missing positive budget')
-            elif value > limit:
-                errors.append(f'{mode} {stat}: {value:.3f} > {limit:.3f} ms')
-    return errors
+                errors.append(f'{key}: missing positive target')
+            else:
+                above = ', above target' if value > limit else ''
+                lines.append(f'{mode} {stat}: {value:.3f} ms (target {limit:.3f} ms{above})')
+    return errors, lines
 
 
 def load():
@@ -48,8 +54,8 @@ def load():
 
 def run(a):
     binary, builder, evaluator = (str(p.resolve()) for p in (a.binary, a.builder, a.evaluator))
-    budgets = json.loads((ROOT / 'docs/perf-budgets.json').read_text())
-    queries = json.loads((ROOT / 'crates/agrep-core/tests/fixtures/semantic-eval.json').read_text())['texts'][:10]
+    targets = json.loads((ROOT / 'docs/perf-budgets.json').read_text(encoding='utf-8'))
+    queries = json.loads((ROOT / 'crates/agrep-core/tests/fixtures/semantic-eval.json').read_text(encoding='utf-8'))['texts'][:10]
     report = {'references': 0, 'kind': 'native synthetic sources and deterministic oracle-vector perturbations; real query model',
               'samples': [], 'threads': 6, 'blas_threads': 1,
               'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
@@ -68,9 +74,9 @@ def run(a):
                    VECLIB_MAXIMUM_THREADS='1', TOKENIZERS_PARALLELISM='false')
         subprocess.run([evaluator, str(model), 'provision'], env=env, check=True, capture_output=True)
         # Runs the unchanged model/tokenizer/top-5/recall/long-tail gate before timing.
-        quality = subprocess.run([evaluator, str(model), 'cpu'], env=env, check=True, capture_output=True, text=True)
+        quality = subprocess.run([evaluator, str(model), 'cpu'], env=env, check=True, capture_output=True, text=True, encoding='utf-8')
         report['model_quality'] = json.loads(quality.stdout)
-        built = subprocess.run([builder, str(data), '200000'], env=env, check=True, capture_output=True, text=True)
+        built = subprocess.run([builder, str(data), '200000'], env=env, check=True, capture_output=True, text=True, encoding='utf-8')
         fixture = json.loads(built.stdout)
         report['references'] = fixture['coverage']['indexed']
         report['coverage'] = fixture['coverage']
@@ -87,7 +93,7 @@ def run(a):
                 if os.name == 'posix':
                     row['uptime'] = subprocess.check_output(['uptime'], text=True).strip()
                 start = time.perf_counter()
-                result = subprocess.run(command, env=env, capture_output=True, text=True)
+                result = subprocess.run(command, env=env, capture_output=True, text=True, encoding='utf-8')
                 row.update(wall_ms=(time.perf_counter()-start)*1000, exit=result.returncode,
                            meaning_rows=result.stdout.count('meaning match'), load_after=load())
                 row['phases'] = []
@@ -100,12 +106,12 @@ def run(a):
                         row['phases'].append(event)
                 report['samples'].append(row)
                 # Persist each complete sample, including failures, before the next process.
-                a.output.write_text(json.dumps(report, indent=2) + '\n')
-        report['failures'] = check(report, budgets)
+                a.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+        report['failures'], report['targets'] = check(report, targets)
         report['passed'] = not report['failures']
-        a.output.write_text(json.dumps(report, indent=2) + '\n')
-    for error in report['failures']:
-        print(error)
+        a.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+    for line in report['targets'] + report['failures']:
+        print(line)
     return 0 if report['passed'] else 1
 
 

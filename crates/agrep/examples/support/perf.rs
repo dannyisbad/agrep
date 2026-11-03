@@ -1,4 +1,14 @@
+//! Correctness of a complete benchmark report. Latencies are printed against the SPEC §9
+//! targets in docs/perf-budgets.json and never fail it: speed is gated by the matched
+//! comparison with agrep 0.4.9 (examples/matched.rs).
 use serde_json::Value;
+
+pub struct Checked {
+    /// One measured-vs-target line per reported statistic.
+    pub targets: Vec<String>,
+    /// Missing cases, failed commands, unverified results and malformed measurements.
+    pub failures: Vec<String>,
+}
 
 pub fn check(
     cases: &[Value],
@@ -6,10 +16,11 @@ pub fn check(
     semantic: bool,
     rows: usize,
     text_bytes: u64,
-) -> Result<(), Vec<String>> {
-    let budgets: Value = serde_json::from_str(include_str!("../../../../docs/perf-budgets.json"))
-        .expect("committed performance budget JSON");
+) -> Checked {
+    let targets: Value = serde_json::from_str(include_str!("../../../../docs/perf-budgets.json"))
+        .expect("committed performance target JSON");
     let mut failures = Vec::new();
+    let mut lines = Vec::new();
     if dense && rows != 2_000_000 {
         failures.push("dense acceptance requires exactly 2000000 rows".into());
     }
@@ -86,8 +97,8 @@ pub fn check(
     if text_bytes == 0 {
         failures.push("indexed text byte count is required".into());
     }
-    let index_scale = (rows as f64 / budgets["reference_rows"].as_f64().unwrap())
-        .max(text_bytes as f64 / budgets["reference_text_bytes"].as_f64().unwrap())
+    let index_scale = (rows as f64 / targets["reference_rows"].as_f64().unwrap())
+        .max(text_bytes as f64 / targets["reference_text_bytes"].as_f64().unwrap())
         .min(1.0);
     for name in required {
         if !cases.iter().any(|c| c["name"] == *name) {
@@ -173,18 +184,21 @@ pub fn check(
         let median = case["median_ms"]
             .as_f64()
             .map(|summary| summary.max(observed[observed.len() / 2]));
-        measure(name, "median", median, &budgets, key, scale, &mut failures);
+        let mut report = |stat: &str, measured: Option<f64>, key: &str| match target(
+            measured, &targets, key, scale,
+        ) {
+            Some((value, limit)) => lines.push(format!(
+                "{name} {stat}: {value:.2} ms (target {limit:.2} ms{})",
+                if value > limit { ", above target" } else { "" }
+            )),
+            None => failures.push(format!(
+                "{name} {stat}: missing or non-finite measurement or target"
+            )),
+        };
+        report("median", median, key);
         if matches!(name, "first_index" | "compact_first_hybrid") {
             for (index, value) in samples.unwrap().iter().enumerate() {
-                measure(
-                    name,
-                    &format!("sample {index}"),
-                    value.as_f64(),
-                    &budgets,
-                    key,
-                    scale,
-                    &mut failures,
-                );
+                report(&format!("sample {index}"), value.as_f64(), key);
             }
         } else {
             let tail = if key == "keyword_p50_ms" {
@@ -197,92 +211,22 @@ pub fn check(
             let tail_value = case["p95_ms"]
                 .as_f64()
                 .map(|summary| summary.max(measured_tail));
-            measure(
-                name,
-                "p95",
-                tail_value,
-                &budgets,
-                tail,
-                scale,
-                &mut failures,
-            );
+            report("p95", tail_value, tail);
         }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures)
+    Checked {
+        targets: lines,
+        failures,
     }
 }
 
-fn measure(
-    name: &str,
-    stat: &str,
-    measured: Option<f64>,
-    budgets: &Value,
-    key: &str,
-    scale: f64,
-    failures: &mut Vec<String>,
-) {
-    let budget = budgets[key]
+/// The measured value and its (scaled) SPEC target, when both are finite.
+fn target(measured: Option<f64>, targets: &Value, key: &str, scale: f64) -> Option<(f64, f64)> {
+    let limit = targets[key]
         .as_f64()
         .map(|n| n * scale)
-        .filter(|n| n.is_finite() && *n > 0.);
-    match (measured, budget) {
-        (Some(value), Some(limit)) if value.is_finite() && value >= 0. => {
-            eprintln!("{name} {stat}: {value:.2} ms / {limit:.2} ms budget");
-            if value > limit {
-                failures.push(format!("{name} {stat}: {value:.2} > {limit:.2} ms"));
-            }
-        }
-        _ => failures.push(format!(
-            "{name} {stat}: missing or non-finite measurement/budget"
-        )),
-    }
-}
-
-/// Every timed sample must prove its expected result, not merely exit quickly.
-pub fn valid_result(name: &str, evidence: &Value) -> bool {
-    if matches!(name, "rare" | "compact_rare" | "rare_filtered") {
-        return true;
-    }
-    if matches!(name, "count" | "count_filtered") {
-        return evidence["bench_count"].as_u64().is_some_and(|n| n > 0);
-    }
-    if matches!(
-        name,
-        "first_index" | "no_change_census" | "one_session_refresh"
-    ) {
-        return true;
-    }
-    if name.contains("hybrid") {
-        return evidence["bench_semantic_rows"]
-            .as_u64()
-            .is_some_and(|n| n > 0);
-    }
-    if matches!(
-        name,
-        "json" | "json_filtered" | "tool_error" | "all_error" | "old_dense" | "old_dense_no_auto"
-    ) {
-        return evidence["bench_result_rows"]
-            .as_u64()
-            .is_some_and(|n| n > 0);
-    }
-    if matches!(name, "status" | "version_control") {
-        return evidence["bench_stdout_bytes"]
-            .as_u64()
-            .is_some_and(|n| n > 0);
-    }
-    evidence["bench_result_rows"].as_u64().unwrap_or(0)
-        + evidence["bench_text_hits"].as_u64().unwrap_or(0)
-        > 0
-}
-
-/// Non-terminal keyword output is the documented six-column TSV surface.
-pub fn flat_hit(line: &str) -> bool {
-    let columns: Vec<_> = line.split('\t').collect();
-    columns.len() == 6
-        && !columns[0].is_empty()
-        && columns[3].parse::<u64>().is_ok()
-        && !columns[5].is_empty()
+        .filter(|n| n.is_finite() && *n > 0.)?;
+    measured
+        .filter(|value| value.is_finite() && *value >= 0.)
+        .map(|value| (value, limit))
 }

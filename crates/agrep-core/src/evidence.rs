@@ -1,6 +1,6 @@
 //! Canonical transcript windows, read together with events in one SQLite snapshot.
 use crate::{
-    handles::{self, Claim},
+    handles::{self, Claim, SessionIndex},
     query::content_digest,
     store, surface,
 };
@@ -75,6 +75,9 @@ impl Request {
     }
 }
 pub fn load(c: &Connection, request: &Request) -> Result<Window> {
+    load_in(c, &SessionIndex::load(c)?, request)
+}
+fn load_in(c: &Connection, index: &SessionIndex, request: &Request) -> Result<Window> {
     let claim = if request.exact {
         Some(handles::parse(&request.target)?)
     } else {
@@ -93,7 +96,7 @@ pub fn load(c: &Connection, request: &Request) -> Result<Window> {
     } else {
         (request.target.clone(), request.turn)
     };
-    let candidates = handles::candidates(c, &target)?;
+    let candidates = index.candidates(c, &target)?;
     if candidates.is_empty() {
         bail!("no indexed session matches {target}; rerun the search for a current handle")
     }
@@ -146,7 +149,7 @@ pub fn load(c: &Connection, request: &Request) -> Result<Window> {
                         holders.push(p)
                     }
                 }
-                match holders.len(){0=>bail!("result handle no longer names the cited content; rerun the search for a current handle"),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle content moved: turn {requested} → {center} (session was renumbered)")}));},_=>bail!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",handles::target(&session,&[]),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))}
+                match holders.len(){0=>bail!("result handle no longer names the cited content; rerun the search for a current handle"),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle content moved: turn {requested} → {center} (session was renumbered)")}));},_=>bail!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",SessionIndex::default().target(&session),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))}
             }
         }
     }
@@ -162,7 +165,7 @@ pub fn load(c: &Connection, request: &Request) -> Result<Window> {
     let rows = load_rows(c, &session, lo, hi)?;
     let events = load_events(c, &session, lo, hi)?;
     Ok(Window {
-        target: handles::target(&session, &handles::sessions(c)?),
+        target: index.target(&session),
         session,
         agent,
         project,
@@ -287,10 +290,10 @@ pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Ve
             kind: raw["kind"].as_str().unwrap_or("tool").into(),
             input_chars: raw["input_chars"]
                 .as_u64()
-                .unwrap_or(input.chars().count() as u64) as usize,
+                .map_or_else(|| input.chars().count(), |v| v as usize),
             output_chars: raw["output_chars"]
                 .as_u64()
-                .unwrap_or(output.chars().count() as u64) as usize,
+                .map_or_else(|| output.chars().count(), |v| v as usize),
             output_bytes: raw["output_bytes"].as_u64().map(|v| v as usize),
             ok: raw["ok"].as_bool(),
             input,
@@ -304,7 +307,8 @@ pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Ve
 }
 /// Batch all windows on the same connection/snapshot; no source file is reopened.
 pub fn windows(c: &Connection, requests: &[Request]) -> Result<Vec<Window>> {
-    requests.iter().map(|r| load(c, r)).collect()
+    let index = SessionIndex::load(c)?;
+    requests.iter().map(|r| load_in(c, &index, r)).collect()
 }
 #[derive(Clone, Debug)]
 pub struct Display {
