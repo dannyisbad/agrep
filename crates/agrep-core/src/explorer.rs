@@ -193,7 +193,7 @@ struct State {
     auth: String,
     bootstrap: Mutex<String>,
     live: Mutex<Option<Service>>,
-    freshen: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    freshen: Option<Arc<dyn Fn() -> Result<usize> + Send + Sync>>,
 }
 impl Explorer {
     pub fn bind(root: DataRoot, port: u16) -> Result<Self> {
@@ -218,6 +218,18 @@ impl Explorer {
     pub fn with_refresh(
         mut self,
         freshen: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("server not yet shared")
+            .freshen = Some(Arc::new(move || {
+            freshen()?;
+            Ok(0)
+        }));
+        self
+    }
+    pub fn with_freshness(
+        mut self,
+        freshen: impl Fn() -> Result<usize> + Send + Sync + 'static,
     ) -> Self {
         Arc::get_mut(&mut self.state)
             .expect("server not yet shared")
@@ -394,9 +406,7 @@ impl State {
         if !["/api/status", "/api/chats", "/api/around", "/api/search"].contains(&r.path.as_str()) {
             return Ok(Response::error(404, "not found"));
         }
-        if let Some(freshen) = &self.freshen {
-            freshen()?;
-        }
+        let pending = self.freshen.as_ref().map(|f| f()).transpose()?;
         let c = store::reader(&self.root)?;
         match r.path.as_str() {
             "/api/status" => {
@@ -409,7 +419,7 @@ impl State {
                 )?;
                 Ok(Response::json(
                     200,
-                    json!({"messages":messages,"sessions":sessions,"indexed":true}),
+                    json!({"messages":messages,"sessions":sessions,"indexed":true,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0))}),
                 ))
             }
             "/api/chats" => {
@@ -459,43 +469,67 @@ impl State {
                 if !["keyword", "semantic"].contains(&mode.as_str()) {
                     return Ok(Response::error(400, "mode must be keyword or semantic"));
                 }
+                if mode == "semantic" && !crate::semantic::installed(&self.root) {
+                    return Ok(Response::error(
+                        400,
+                        "semantic model not installed: run agrep setup",
+                    ));
+                }
                 let sort = param("sort", "score");
                 if !["score", "time"].contains(&sort.as_str()) {
                     return Ok(Response::error(400, "sort must be score or time"));
                 }
-                if mode == "semantic" {
-                    return Ok(Response::error(400, "this explorer accepts keyword search"));
-                }
+
                 let n = match param("n", "40").parse::<i64>() {
                     Ok(n) => n.clamp(1, 100) as usize,
                     Err(_) => return Ok(Response::error(400, "n must be an integer")),
                 };
-                let result = match query::search(
-                    &c,
-                    &Options {
-                        pattern: q.clone(),
-                        regex: false,
-                        word: false,
-                        sort: sort.clone(),
-                        limit: n,
-                        exact: false,
-                        count_only: false,
-                        count_by_tier: false,
-                        content: false,
-                        chats: false,
-                        tools: self.root.config()?.tools,
-                        filters: Filters::default(),
-                    },
-                ) {
-                    Ok(result) => result,
-                    Err(e) if e.downcast_ref::<rusqlite::Error>().is_none() => {
-                        return Ok(Response::error(400, &e.to_string()))
+                let options = Options {
+                    pattern: q.clone(),
+                    regex: false,
+                    word: false,
+                    sort: sort.clone(),
+                    limit: n,
+                    exact: false,
+                    count_only: false,
+                    count_by_tier: false,
+                    content: false,
+                    chats: false,
+                    tools: self.root.config()?.tools,
+                    filters: Filters::default(),
+                };
+                let mut fallback = None;
+                let config = self.root.config()?;
+                let use_semantic = mode == "semantic"
+                    || (sort == "score"
+                        && config.embeddings != "off"
+                        && crate::semantic::eligible(&q)
+                        && crate::semantic::installed(&self.root));
+                let lane =
+                    use_semantic.then(|| crate::semantic::begin(&self.root, &c, &options, true));
+                let keyword = query::search(&c, &options)?;
+                let result = if let Some(lane) = lane {
+                    match lane.and_then(|work| crate::semantic::finish(&c, work)) {
+                        Ok(found) if mode == "semantic" => found.result,
+                        Ok(found) => crate::hybrid::merge(
+                            keyword,
+                            Some(found.result),
+                            n,
+                            true,
+                            crate::hybrid::Lane::Compact,
+                        ),
+                        Err(error) => {
+                            crate::logging::semantic_failure(&self.root, &error);
+                            fallback = Some("meaning search unavailable; showing keyword matches");
+                            keyword
+                        }
                     }
-                    Err(e) => return Err(e),
+                } else {
+                    keyword
                 };
                 Ok(Response::json(
                     200,
-                    json!({"query":q,"mode":mode,"sort":sort,"engine":"keyword","total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
+                    json!({"query":q,"mode":mode,"sort":sort,"engine":if result.hits.iter().any(|h| h.matched=="semantic"){"keyword+semantic"}else{"keyword"},"notice":fallback,"freshness":crate::render::freshness(pending.is_some(),pending.unwrap_or(0)),"total":result.total,"totals_exact":result.total_basis=="exact","hits":result.hits}),
                 ))
             }
             _ => Ok(Response::error(404, "not found")),

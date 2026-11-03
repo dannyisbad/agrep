@@ -1,0 +1,14 @@
+{
+  "checks": [
+    "cargo fmt --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo test --workspace"
+  ],
+  "tests": 43,
+  "failed": 0,
+  "ignored": 0,
+  "notes": [
+    "The two former inline-refresh expectations were replaced with the requested committed-snapshot/worker behavior.",
+    "New tests cover exact positional tool counts without text hydration, caller window/family predicates, IDF-weighted bounded coverage, and bounded regex retrieval."
+  ]
+}

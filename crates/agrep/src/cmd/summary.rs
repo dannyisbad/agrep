@@ -72,7 +72,7 @@ fn days(intervals: &[(i64, i64)], group: &str) -> Result<BTreeMap<String, i64>> 
     Ok(out)
 }
 pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
-    let root = ready(no_auto)?;
+    let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let all = h::sessions(&c)?;
     let until = args
@@ -290,9 +290,10 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         }
     };
     let caveats=vec![format!("estimated active time is estimated from turn timestamps with a {} idle cap; it is not elapsed session span and not billable time",args.idle_cap),"side chats are folded into their family; overlapping minutes count once".into()];
+    let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     if args.json {
-        let mut meta = json!({"kind":"agrep-meta","mode":args.mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until},"timezone":chrono::Local::now().format("%Z %z").to_string(),"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":"estimated active time","chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(args.include_self,args.no_self),"caveats":caveats,"freshness":render::freshness(checked,0),"total_estimated_active_ms":total});
+        let mut meta = json!({"kind":"agrep-meta","mode":args.mode,"window":{"since":since_text,"since_ts":since,"until":args.until,"until_ts":until},"timezone":chrono::Local::now().format("%Z %z").to_string(),"idle_cap":args.idle_cap,"idle_cap_ms":cap,"metric":"estimated active time","chats":families.len(),"side_chats":side_count,"unknown_timestamp_rows":unknown,"family_dedup_ms":dedup,"self_excluded":excluded,"self_exclusion":caller.metadata(args.include_self,args.no_self),"caveats":caveats,"freshness":render::freshness(checked,pending_sources),"total_estimated_active_ms":total});
         if rows.is_empty() {
             meta["hits"] = json!([])
         }

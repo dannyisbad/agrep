@@ -8,6 +8,7 @@ pub mod intake;
 pub mod intake_batch;
 pub mod integrations;
 pub mod model;
+mod prose_index;
 pub mod query;
 pub mod render;
 pub mod safe_fs;
@@ -18,6 +19,17 @@ pub use model::Message;
 
 pub mod row_class;
 
+pub mod freshness;
+
+pub mod incremental;
+
+mod row_stats;
+
+mod tool_index;
+mod tool_store;
+
+mod fts_span;
+
 pub mod briefing;
 pub mod caller;
 pub mod caller_process;
@@ -27,6 +39,7 @@ pub mod evidence;
 pub mod explorer;
 pub mod handles;
 pub mod history;
+mod history_meta;
 pub mod hybrid;
 pub mod json_output;
 pub mod launch;
@@ -42,3 +55,5 @@ mod semantic_policy;
 mod semantic_store;
 pub mod surface;
 pub mod terminal;
+
+pub mod tool_text;

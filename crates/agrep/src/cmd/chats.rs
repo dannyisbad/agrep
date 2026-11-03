@@ -12,7 +12,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     if args.pattern.iter().any(|s| s.trim().is_empty()) {
         bail!("pattern arguments must not be empty")
     }
-    let root = ready(no_auto)?;
+    let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let all = h::sessions(&c)?;
     let mut filters = args.scope.filters()?;
@@ -115,9 +115,10 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
     if args.max > 0 {
         selected.truncate(args.max);
     }
+    let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     if args.json {
-        let mut meta = json!({"kind":"agrep-meta","engine":"keyword","filters":filters,"freshness":render::freshness(checked,0),"self_exclusion":caller.metadata(!apply_self,args.scope.no_self),"self_excluded":excluded,"completeness":{"shown":selected.len(),"total":total,"total_basis":if exact{"exact"}else{"floor"},"truncated":selected.len()<total||!exact}});
+        let mut meta = json!({"kind":"agrep-meta","engine":"keyword","filters":filters,"freshness":render::freshness(checked,pending_sources),"self_exclusion":caller.metadata(!apply_self,args.scope.no_self),"self_excluded":excluded,"completeness":{"shown":selected.len(),"total":total,"total_basis":if exact{"exact"}else{"floor"},"truncated":selected.len()<total||!exact}});
         if selected.is_empty() {
             meta["hits"] = json!([]);
         }

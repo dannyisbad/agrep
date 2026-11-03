@@ -207,11 +207,7 @@ fn post_index_hook_runs_after_changed_rows_and_only_once() {
         format!("printf x >> '{}'", output.display())
     };
     ok(&t, &["set", "post_index", &command]);
-    let root = DataRoot(t.path().join("data"));
-    {
-        let _lock = root.work_lock(true).unwrap();
-        ok(&t, &["index"]);
-    }
+    ok(&t, &["index"]);
     ok(&t, &["__work"]);
     assert_eq!(
         fs::read(&output).unwrap(),
@@ -221,10 +217,7 @@ fn post_index_hook_runs_after_changed_rows_and_only_once() {
             b"x".as_slice()
         }
     );
-    {
-        let _lock = root.work_lock(true).unwrap();
-        ok(&t, &["index"]);
-    }
+    ok(&t, &["index"]);
     ok(&t, &["__work"]);
     assert_eq!(
         fs::read(output).unwrap(),

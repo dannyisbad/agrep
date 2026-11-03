@@ -14,6 +14,7 @@ mod perf;
 #[path = "support/process.rs"]
 mod process;
 
+static DENSE_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static TRACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 fn trace(value: &Value) -> Result<()> {
     if let Some(path) = TRACE.get() {
@@ -58,7 +59,12 @@ struct Args {
 }
 fn utterance(i: usize, tool: bool, dense: bool) -> String {
     if dense {
-        return format!("ticket {i:08} deepold ordinary historical explanation with a single aligned occurrence");
+        return match i % 9 {
+            0 => format!("ticket {i:08} deepold ordinary historical explanation with a single aligned occurrence"),
+            3 => format!("ticket {i:08} deepold's ordinary historical explanation with a possessive occurrence"),
+            6 => format!("ticket {i:08} xdeepoldx ordinary historical explanation with an interior occurrence"),
+            _ => format!("ticket {i:08} contemporary unrelated status without the target token"),
+        };
     }
     const WORDS: &[&str] = &[
         "the",
@@ -149,6 +155,88 @@ fn utterance(i: usize, tool: bool, dense: bool) -> String {
     }
     s
 }
+static DENSE_ANCHOR: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+fn dense_ts(i: usize, rows: usize) -> i64 {
+    let now = *DENSE_ANCHOR.get_or_init(|| chrono::Utc::now().timestamp_millis());
+    now - if i.is_multiple_of(3) {
+        180 * 86_400_000
+    } else {
+        86_400_000
+    } - ((i * 7919) % rows.max(1)) as i64 * 1000
+}
+/// A full corpus oracle without retrieval, block bounds, FTS or candidate budgets.
+/// The three fixed source forms have precomputed boundary factors; selection
+/// compares all eligible rows and only retains the best forty identities.
+fn dense_expected(rows: usize, args: &[&str]) -> Result<(Vec<String>, usize)> {
+    let word = args.contains(&"-w");
+    let explicit = word || args.contains(&"-E");
+    let phrase = args.first() == Some(&"deepold ordinary");
+    let time = args.windows(2).any(|p| p == ["--sort", "time"]);
+    let project = args.contains(&"--project");
+    let pattern = if phrase {
+        "deepold ordinary"
+    } else {
+        "deepold"
+    };
+    let boundary = agrep_core::boundary_rank::prepare_query(pattern, &Default::default());
+    let mut factors = [0.; 3];
+    for (slot, ordinal) in [0, 3, 6].into_iter().enumerate() {
+        factors[slot] = if explicit {
+            0.5
+        } else {
+            0.175
+                * boundary
+                    .evaluate(&utterance(ordinal, false, true), None, true)?
+                    .factor
+        };
+    }
+    let sessions = (rows / 170).max(1);
+    let names: Vec<_> = (0..sessions).map(|s| format!("bench-{s}")).collect();
+    let mut best: Vec<(f64, i64, usize, usize, usize)> = Vec::new();
+    let compare = |a: &(f64, i64, usize, usize, usize), b: &(f64, i64, usize, usize, usize)| {
+        (if time {
+            b.1.cmp(&a.1).then(b.0.total_cmp(&a.0))
+        } else {
+            b.0.total_cmp(&a.0).then(b.1.cmp(&a.1))
+        })
+        .then(names[a.2].cmp(&names[b.2]))
+        .then(a.3.cmp(&b.3))
+    };
+    let (mut at, mut count) = (0, 0);
+    for sid in 0..sessions {
+        let n = (rows - at) / (sessions - sid);
+        for turn in 0..n {
+            let i = at + turn;
+            if !i.is_multiple_of(3)
+                || (word && i % 9 == 6)
+                || (phrase && i % 9 != 0)
+                || (project && sid % 50 != 7)
+            {
+                continue;
+            }
+            count += 1;
+            let candidate = (factors[(i % 9) / 3], dense_ts(i, rows), sid, turn, i);
+            if best.len() < 40 || compare(&candidate, best.last().unwrap()).is_lt() {
+                best.push(candidate);
+                best.sort_by(compare);
+                best.truncate(40);
+            }
+        }
+        at += n;
+    }
+    let handles = best
+        .iter()
+        .map(|(_, _, sid, turn, i)| {
+            agrep_core::handles::mint(
+                &names[*sid],
+                *turn as i64,
+                &utterance(*i, false, true),
+                &names,
+            )
+        })
+        .collect();
+    Ok((handles, count))
+}
 fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)> {
     let base = home.join(".pi/agent/sessions/bench");
     fs::create_dir_all(&base)?;
@@ -188,6 +276,13 @@ fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)> {
         let n = (rows - at) / (sessions - sid);
         let mut parent: Option<String> = None;
         for j in 0..n {
+            let date = if dense {
+                chrono::DateTime::from_timestamp_millis(dense_ts(at, rows))
+                    .unwrap()
+                    .to_rfc3339()
+            } else {
+                date.clone()
+            };
             let assistant = !dense && j % 80 == 1;
             let tool = !dense && j % 9 != 0 && !assistant;
             let id = format!("e{j}");
@@ -244,6 +339,25 @@ fn invoke(
     args: &[&str],
     profile: &str,
 ) -> Result<(f64, i32, Value)> {
+    #[cfg(unix)]
+    let load = std::process::Command::new("uptime")
+        .output()
+        .ok()
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let (_, values) = text
+                .split_once("load averages:")
+                .or_else(|| text.split_once("load average:"))?;
+            Some(
+                values
+                    .split([',', ' '])
+                    .filter_map(|v| v.trim().parse::<f64>().ok())
+                    .take(3)
+                    .collect::<Vec<_>>(),
+            )
+        });
+    #[cfg(not(unix))]
+    let load: Option<Vec<f64>> = None;
     let t = Instant::now();
     let out = process::command(
         bin,
@@ -269,6 +383,7 @@ fn invoke(
         parsed = json!({"value":parsed});
     }
     if parsed.is_object() {
+        parsed["bench_load_averages"] = json!(load);
         let semantic_rows = String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -287,6 +402,10 @@ fn invoke(
             .filter(|r| r["kind"] != "agrep-meta" && r["session"].is_string())
             .count();
         parsed["bench_result_rows"] = json!(rows);
+        parsed["bench_handles"] = json!(objects
+            .iter()
+            .filter_map(|r| r["handle"].as_str())
+            .collect::<Vec<_>>());
         parsed["bench_text_hits"] = json!(String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|line| perf::flat_hit(line)
@@ -315,8 +434,15 @@ fn case(
 ) -> Result<Value> {
     let mut times = vec![];
     let mut codes = vec![];
+    let mut loads = vec![];
     let mut evidence = Value::Null;
     let mut verified = vec![];
+    let expected = if name.starts_with("old_dense") {
+        let rows = DENSE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        Some(dense_expected(rows, args)?)
+    } else {
+        None
+    };
     for i in 0..runs {
         if name == "first_index" && i > 0 {
             fs::remove_dir_all(data)?;
@@ -332,16 +458,25 @@ fn case(
                 "classic"
             },
         )?;
-        verified.push(perf::valid_result(name, &p));
+        verified.push(if let Some((handles, count)) = &expected {
+            if args.contains(&"-c") {
+                p["bench_count"].as_u64() == Some(*count as u64)
+            } else {
+                p["bench_handles"] == json!(handles)
+            }
+        } else {
+            perf::valid_result(name, &p)
+        });
         times.push(ms);
         codes.push(rc);
+        loads.push(p["bench_load_averages"].clone());
         evidence = p;
     }
     let mut sorted = times.clone();
     sorted.sort_by(f64::total_cmp);
     let median = sorted[sorted.len() / 2];
     eprintln!("{name:24} {median:10.2} ms  rc={:?}", codes);
-    let value = json!({"name":name,"args":args,"median_ms":median,"p95_ms":if runs>=20{Some(sorted[(runs*95).div_ceil(100)-1])}else{None},"samples_ms":times,"exit_codes":codes,"verified_results":verified,"evidence":evidence});
+    let value = json!({"name":name,"args":args,"median_ms":median,"p95_ms":if runs>=20{Some(sorted[(runs*95).div_ceil(100)-1])}else{None},"samples_ms":times,"exit_codes":codes,"verified_results":verified,"load_averages":loads,"oracle_expected_handles":expected.as_ref().map(|e|&e.0),"oracle_expected_count":expected.as_ref().map(|e|e.1),"evidence":evidence});
     trace(&value)?;
     Ok(value)
 }
@@ -425,6 +560,7 @@ fn layout(t: &Path) -> Result<Value> {
 }
 fn main() -> Result<()> {
     let a = Args::parse();
+    DENSE_ROWS.store(a.rows, std::sync::atomic::Ordering::Relaxed);
     if a.runs == 0 || a.build_runs == Some(0) {
         bail!("--runs must be positive")
     }
@@ -524,7 +660,7 @@ fn main() -> Result<()> {
         sorted.sort_by(f64::total_cmp);
         let median = sorted[sorted.len() / 2];
         eprintln!("one_session_refresh {median:.2} ms");
-        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"samples_ms":times,"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
+        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
         trace(&value)?;
         cases.push(value);
     }
@@ -537,11 +673,13 @@ fn main() -> Result<()> {
             "release workflow"
         };
         for i in 0..a.runs {
+            let source = fs::read_to_string(path)?;
+            let parent: Value = serde_json::from_str(source.lines().last().unwrap())?;
             let mut f = fs::OpenOptions::new().append(true).open(path)?;
             writeln!(
                 f,
                 "{}",
-                json!({"type":"message","id":format!("pending-{i}"),"timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":format!("active session update {i}")}})
+                json!({"type":"message","id":format!("pending-{i}"),"parentId":parent["id"],"timestamp":chrono::Utc::now().to_rfc3339(),"message":{"role":"user","content":format!("active session update {i}")}})
             )?;
             drop(f);
             trials.push(invoke(&bin, &home, &data, &[query, "--json"], "classic")?);
@@ -553,7 +691,7 @@ fn main() -> Result<()> {
         let mut times: Vec<_> = trials.iter().map(|t| t.0).collect();
         let samples = times.clone();
         times.sort_by(f64::total_cmp);
-        let value = json!({"name":"search_changed_source","median_ms":times[times.len()/2],"p95_ms":if times.len()>=20 { Some(times[(times.len()*95).div_ceil(100)-1]) }else{None},"samples_ms":samples,"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":trials.iter().map(|t|perf::valid_result("json", &t.2)).collect::<Vec<_>>()});
+        let value = json!({"name":"search_changed_source","median_ms":times[times.len()/2],"p95_ms":if times.len()>=20 { Some(times[(times.len()*95).div_ceil(100)-1]) }else{None},"samples_ms":samples,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":trials.iter().map(|t|perf::valid_result("json", &t.2)).collect::<Vec<_>>()});
         trace(&value)?;
         cases.push(value);
     }
@@ -581,22 +719,44 @@ fn main() -> Result<()> {
             a.runs,
         )?);
     } else if a.dense {
-        cases.push(case(
-            &bin,
-            &home,
-            &data,
-            "old_dense",
-            &["deepold", "--json", "-n", "40"],
-            a.runs,
-        )?);
-        cases.push(case(
-            &bin,
-            &home,
-            &data,
-            "old_dense_no_auto",
-            &["deepold", "--json", "-n", "40", "--no-auto"],
-            a.runs,
-        )?);
+        for (name, args) in [
+            ("old_dense", vec!["deepold", "--json", "-n", "40"]),
+            (
+                "old_dense_no_auto",
+                vec!["deepold", "--json", "-n", "40", "--no-auto"],
+            ),
+            (
+                "old_dense_word",
+                vec!["deepold", "-w", "--json", "-n", "40"],
+            ),
+            (
+                "old_dense_regex",
+                vec!["-E", "deepold", "--json", "-n", "40"],
+            ),
+            (
+                "old_dense_time",
+                vec!["deepold", "--sort", "time", "--json", "-n", "40"],
+            ),
+            (
+                "old_dense_agent",
+                vec!["deepold", "--agent", "pi", "--json", "-n", "40"],
+            ),
+            (
+                "old_dense_project",
+                vec!["deepold", "--project", "project-7", "--json", "-n", "40"],
+            ),
+            (
+                "old_dense_since",
+                vec!["deepold", "--since", "400d", "--json", "-n", "40"],
+            ),
+            (
+                "old_dense_phrase",
+                vec!["deepold ordinary", "--json", "-n", "40"],
+            ),
+            ("old_dense_count", vec!["deepold", "-c"]),
+        ] {
+            cases.push(case(&bin, &home, &data, name, &args, a.runs)?);
+        }
     } else {
         let list: Vec<(&str, Vec<&str>)> = vec![
             ("release", vec!["release workflow"]),

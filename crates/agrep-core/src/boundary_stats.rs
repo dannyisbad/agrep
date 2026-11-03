@@ -38,6 +38,10 @@ fn script_boundary(left: GraphemeKind, right: GraphemeKind) -> bool {
 fn normalize(graphemes: &[&str]) -> String {
     let mut out = String::new();
     for grapheme in graphemes {
+        if grapheme.is_ascii() {
+            out.extend(grapheme.bytes().map(|b| char::from(b.to_ascii_lowercase())));
+            continue;
+        }
         let compatible: String = grapheme.nfkc().collect();
         out.push_str(&crate::unicode_v16::case_fold(&compatible));
     }

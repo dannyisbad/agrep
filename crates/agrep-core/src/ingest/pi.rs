@@ -111,23 +111,139 @@ fn active_branch(records: &[Record]) -> Vec<usize> {
 
 /// Outputs of every toolResult on the branch, keyed by the call they answer, so
 /// a toolCall can be emitted with its result even though they are separate rows.
-fn tool_results(records: &[Record], branch: &[usize]) -> HashMap<String, (String, Option<bool>)> {
+fn tool_results(
+    records: &[Record],
+    branch: &[usize],
+) -> HashMap<String, (String, Option<bool>, usize, usize)> {
     let mut results = HashMap::new();
     for &index in branch {
-        let message = match records[index].value.get("message") {
-            Some(message) if is_role(message, "toolResult") => message,
-            _ => continue,
-        };
-        let Some(call) = message.get("toolCallId").and_then(|c| c.as_str()) else {
+        let Some(m) = records[index]
+            .value
+            .get("message")
+            .filter(|m| is_role(m, "toolResult"))
+        else {
             continue;
         };
-        let ok = message
-            .get("isError")
-            .and_then(|e| e.as_bool())
-            .map(|errored| !errored);
-        results.insert(call.to_string(), (text_of(message.get("content")), ok));
+        let Some(id) = m.get("toolCallId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let raw = text_of(m.get("content"));
+        let (text, chars, bytes) = if let (Some(chars), Some(bytes)) = (
+            m.get("__agrep_chars").and_then(|v| v.as_u64()),
+            m.get("__agrep_bytes").and_then(|v| v.as_u64()),
+        ) {
+            (raw, chars as usize, bytes as usize)
+        } else {
+            cap_event_output(&raw)
+        };
+        results.insert(
+            id.to_string(),
+            (
+                text,
+                m.get("isError").and_then(|v| v.as_bool()).map(|v| !v),
+                chars,
+                bytes,
+            ),
+        );
     }
     results
+}
+/// Retain native graph records without duplicating unbounded ignored/thinking/tool text.
+pub fn compact_record(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(m) = v.get_mut("message") {
+        if is_role(m, "user") && m["synthetic"] == true {
+            m["content"] = serde_json::Value::Null;
+        }
+        if is_role(m, "bashExecution") && m.get("__agrep_chars").is_none() {
+            let raw = m.get("output").and_then(|v| v.as_str()).unwrap_or_default();
+            let (text, chars, bytes) = cap_event_output(raw);
+            m["output"] = serde_json::json!(text);
+            m["__agrep_chars"] = serde_json::json!(chars);
+            m["__agrep_bytes"] = serde_json::json!(bytes);
+        }
+        if is_role(m, "toolResult") && m.get("__agrep_chars").is_none() {
+            let raw = text_of(m.get("content"));
+            let (text, chars, bytes) = cap_event_output(&raw);
+            m["content"] = serde_json::json!(text);
+            m["__agrep_chars"] = serde_json::json!(chars);
+            m["__agrep_bytes"] = serde_json::json!(bytes);
+        } else if let Some(blocks) = m.get_mut("content").and_then(|v| v.as_array_mut()) {
+            blocks.retain(|b| {
+                matches!(
+                    b.get("type").and_then(|v| v.as_str()),
+                    Some("text" | "toolCall")
+                )
+            });
+            for block in blocks {
+                if block["type"] == "toolCall" && block.get("__agrep_input").is_none() {
+                    let (input, chars) = block
+                        .get("arguments")
+                        .map(summarize_tool_input_with_chars)
+                        .unwrap_or_default();
+                    let state = crate::ingest::task_state(
+                        block["name"].as_str().unwrap_or("?"),
+                        block.get("arguments"),
+                    );
+                    block["__agrep_input"] = serde_json::json!(input);
+                    block["__agrep_input_chars"] = serde_json::json!(chars);
+                    block["__agrep_state"] = serde_json::json!(state);
+                }
+                if let Some(fields) = block.as_object_mut() {
+                    fields.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "type"
+                                | "text"
+                                | "id"
+                                | "name"
+                                | "__agrep_input"
+                                | "__agrep_input_chars"
+                                | "__agrep_state"
+                        )
+                    });
+                }
+            }
+        }
+        if let Some(fields) = m.as_object_mut() {
+            fields.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "role"
+                        | "content"
+                        | "model"
+                        | "timestamp"
+                        | "synthetic"
+                        | "toolCallId"
+                        | "isError"
+                        | "command"
+                        | "output"
+                        | "cancelled"
+                        | "exitCode"
+                        | "__agrep_chars"
+                        | "__agrep_bytes"
+                )
+            });
+        }
+    }
+    if let Some(fields) = v.as_object_mut() {
+        fields.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "type"
+                    | "id"
+                    | "parentId"
+                    | "timestamp"
+                    | "version"
+                    | "cwd"
+                    | "modelId"
+                    | "model"
+                    | "summary"
+                    | "message"
+                    | "__agrep_ordinal"
+            )
+        });
+    }
+    v
 }
 
 fn is_role(message: &serde_json::Value, role: &str) -> bool {
@@ -211,8 +327,6 @@ fn parse_with_tally(
     gzip_decompressed_max_bytes: u64,
     tally: std::sync::Arc<crate::intake::Tally>,
 ) -> Parsed {
-    let side = parent.is_some();
-    let parent = parent.unwrap_or_default();
     let data = match read_session_with_limits(
         path,
         gzip_compressed_max_bytes,
@@ -236,13 +350,82 @@ fn parse_with_tally(
             return (Vec::new(), Vec::new(), outcome);
         }
     };
+    parse_data(agent, path, parent, tally, &data, None).0
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PiState {
+    out: Vec<crate::model::RawMessage>,
+    events: Vec<Event>,
+    order: crate::ingest::ReplyOrder,
+    pending: HashMap<String, usize>,
+    recap_turns: Vec<u32>,
+    turn: u32,
+    model: String,
+    mirrored_anchor: bool,
+    session: String,
+    project: String,
+    parent: String,
+    side: bool,
+    ordinal: usize,
+}
+pub(crate) fn resume_parse(
+    path: &Path,
+    data: &str,
+    previous: Option<&str>,
+) -> anyhow::Result<(
+    Vec<Message>,
+    Vec<Event>,
+    crate::intake_batch::ReadOutcome,
+    String,
+)> {
+    let state = previous.map(serde_json::from_str).transpose()?;
+    let ((m, e, o), next) = parse_data(
+        "pi",
+        path,
+        side_parent(path),
+        crate::intake::file("pi", path),
+        data,
+        state,
+    );
+    Ok((m, e, o, serde_json::to_string(&next)?))
+}
+fn parse_data(
+    agent: &'static str,
+    path: &Path,
+    parent: Option<String>,
+    tally: std::sync::Arc<crate::intake::Tally>,
+    data: &str,
+    previous: Option<PiState>,
+) -> (Parsed, PiState) {
+    let resumed = previous.is_some();
+    let state = previous.unwrap_or_default();
+    let side = if resumed {
+        state.side
+    } else {
+        parent.is_some()
+    };
+    let parent = if resumed {
+        state.parent
+    } else {
+        parent.unwrap_or_default()
+    };
+    let ordinal = state.ordinal;
     let mut records: Vec<Record> = Vec::new();
-    for (ordinal, line) in data.lines().enumerate() {
+    for (offset, line) in data.lines().enumerate() {
+        let ordinal = ordinal + offset;
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => records.push(Record { value, ordinal }),
+            Ok(value) => {
+                let value = compact_record(value);
+                let ordinal = value
+                    .get("__agrep_ordinal")
+                    .and_then(|v| v.as_u64())
+                    .map_or(ordinal, |v| v as usize);
+                records.push(Record { value, ordinal });
+            }
             Err(error) => {
                 tally.seen();
                 tally.error(&format!("{error}: {}", crate::intake::clip(line, 80)));
@@ -256,6 +439,9 @@ fn parse_with_tally(
         .and_then(|record| record.value.get("id").and_then(|i| i.as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| {
+            if resumed {
+                return state.session.clone();
+            }
             path.file_stem()
                 .map(|stem| stem.to_string_lossy().to_string())
                 .unwrap_or_default()
@@ -264,7 +450,13 @@ fn parse_with_tally(
         .and_then(|record| record.value.get("cwd").and_then(|c| c.as_str()))
         .filter(|cwd| !cwd.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| slug_project(path));
+        .unwrap_or_else(|| {
+            if resumed {
+                state.project.clone()
+            } else {
+                slug_project(path)
+            }
+        });
 
     let branch = active_branch(&records);
     let results = tool_results(&records, &branch);
@@ -278,13 +470,23 @@ fn parse_with_tally(
             tally.skip(crate::intake::Skip::Unreferenced);
         }
     }
-    let mut out: Vec<crate::model::RawMessage> = Vec::new();
-    let mut events: Vec<Event> = Vec::new();
-    let mut order = crate::ingest::ReplyOrder::new();
-    let mut recap_turns: Vec<u32> = Vec::new();
-    let mut turn = 0u32;
-    let mut model = String::new();
-    let mut mirrored_anchor = false;
+    let mut out = state.out;
+    let mut events = state.events;
+    let mut pending = state.pending;
+    for (id, (text, ok, chars, bytes)) in &results {
+        if let Some(i) = pending.remove(id) {
+            let e = &mut events[i];
+            e.output = text.clone();
+            e.ok = *ok;
+            e.output_chars = *chars;
+            e.output_bytes = *bytes;
+        }
+    }
+    let mut order = state.order;
+    let mut recap_turns = state.recap_turns;
+    let mut turn = state.turn;
+    let mut model = state.model;
+    let mut mirrored_anchor = state.mirrored_anchor;
     for &index in &branch {
         let record = &records[index];
         tally.seen();
@@ -441,11 +643,26 @@ fn parse_with_tally(
                             continue;
                         }
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                        let (input, input_chars) = block
-                            .get("arguments")
-                            .map(summarize_tool_input_with_chars)
-                            .unwrap_or_default();
-                        let state = crate::ingest::task_state(name, block.get("arguments"));
+                        let (input, input_chars) = if let Some(input) =
+                            block.get("__agrep_input").and_then(|v| v.as_str())
+                        {
+                            (
+                                input.to_owned(),
+                                block["__agrep_input_chars"].as_u64().unwrap_or(0) as usize,
+                            )
+                        } else {
+                            block
+                                .get("arguments")
+                                .map(summarize_tool_input_with_chars)
+                                .unwrap_or_default()
+                        };
+                        let state = block
+                            .get("__agrep_state")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                crate::ingest::task_state(name, block.get("arguments"))
+                            });
                         let call_id = block
                             .get("id")
                             .and_then(|i| i.as_str())
@@ -454,10 +671,14 @@ fn parse_with_tally(
                             .unwrap_or_else(|| {
                                 format!("{agent}:{}:{call_ordinal}", record.ordinal)
                             });
-                        let (raw_output, ok) = results.get(&call_id).cloned().unwrap_or_default();
-                        let (output, output_chars, output_bytes) = cap_event_output(&raw_output);
+                        let (output, ok, output_chars, output_bytes) =
+                            results.get(&call_id).cloned().unwrap_or_default();
+                        if !results.contains_key(&call_id) {
+                            pending.insert(call_id.clone(), events.len());
+                        }
                         tally.event();
                         events.push(Event {
+                            turn: out.last().map(|m| m.turn),
                             agent,
                             session: session.clone(),
                             ts,
@@ -482,12 +703,18 @@ fn parse_with_tally(
                         .get("command")
                         .and_then(|c| c.as_str())
                         .unwrap_or_default();
-                    let (output, output_chars, output_bytes) = cap_event_output(
-                        message
-                            .get("output")
-                            .and_then(|o| o.as_str())
-                            .unwrap_or_default(),
-                    );
+                    let raw_output = message
+                        .get("output")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or_default();
+                    let (output, output_chars, output_bytes) = if let (Some(chars), Some(bytes)) = (
+                        message["__agrep_chars"].as_u64(),
+                        message["__agrep_bytes"].as_u64(),
+                    ) {
+                        (raw_output.to_owned(), chars as usize, bytes as usize)
+                    } else {
+                        cap_event_output(raw_output)
+                    };
                     let cancelled = message
                         .get("cancelled")
                         .and_then(|c| c.as_bool())
@@ -498,6 +725,7 @@ fn parse_with_tally(
                         .map(|code| code == 0 && !cancelled);
                     tally.event();
                     events.push(Event {
+                        turn: out.last().map(|m| m.turn),
                         agent,
                         session: session.clone(),
                         ts,
@@ -532,20 +760,47 @@ fn parse_with_tally(
         }
     }
     order.finish(&mut events);
-    (
-        out.into_iter()
-            .map(|raw| {
-                let turn = raw.turn;
-                let mut message = raw.freeze();
-                if recap_turns.binary_search(&turn).is_ok() {
-                    message.who = "recap".into();
-                    message.model_source = "recap".into();
-                }
-                message
-            })
+
+    let mut keep: Vec<_> = pending.values().copied().collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let next = PiState {
+        out: out.last().cloned().into_iter().collect(),
+        events: keep.iter().map(|i| events[*i].clone()).collect(),
+        order: order.checkpoint(&events, &keep),
+        pending: pending
+            .into_iter()
+            .map(|(id, i)| (id, keep.binary_search(&i).unwrap()))
             .collect(),
-        events,
-        crate::intake_batch::ReadOutcome::Complete,
+        recap_turns: out
+            .last()
+            .filter(|m| recap_turns.contains(&m.turn))
+            .map(|m| vec![m.turn])
+            .unwrap_or_default(),
+        turn,
+        model,
+        mirrored_anchor,
+        session,
+        project,
+        parent,
+        side,
+        ordinal: ordinal + data.lines().count(),
+    };
+    let messages = out
+        .into_iter()
+        .map(|raw| {
+            let turn = raw.turn;
+            let mut m = raw.freeze();
+            if recap_turns.contains(&turn) {
+                m.who = "recap".into();
+                m.model_source = "recap".into();
+            }
+            m
+        })
+        .collect();
+    (
+        (messages, events, crate::intake_batch::ReadOutcome::Complete),
+        next,
     )
 }
 
@@ -746,7 +1001,9 @@ fn collect_store(
     root: &Path,
     parse: fn(&Path) -> Parsed,
 ) -> (Vec<Message>, Vec<Event>) {
-    let files = session_files(agent, root);
+    let files = cache
+        .preflight_source_paths(root)
+        .unwrap_or_else(|| session_files(agent, root));
     let pass = crate::intake_batch::collect_cached_for(cache, agent, root, &files, parse);
     (pass.messages, pass.events)
 }

@@ -229,12 +229,69 @@ pub fn query_tokens(query: &str) -> Vec<&str> {
 }
 
 pub fn normalize_token(token: &str) -> String {
-    let mut out = String::new();
-    for cluster in clusters(token) {
-        let compatible: String = token[cluster.start_byte..cluster.end_byte].nfkc().collect();
-        out.push_str(&unicode_v16::case_fold(&compatible));
+    if token.is_ascii() {
+        return token.to_ascii_lowercase();
     }
-    out
+    let mut out = Vec::with_capacity(token.len());
+    let mut at = 0;
+    while at < token.len() {
+        // Leave the final ASCII character with the Unicode tail: an attachment
+        // or ZWJ may make it part of the next normalization cluster.
+        let ascii = token.as_bytes()[at..]
+            .iter()
+            .take_while(|b| b.is_ascii())
+            .count();
+        let safe = if at + ascii < token.len() {
+            ascii.saturating_sub(1)
+        } else {
+            ascii
+        };
+        if safe > 0 {
+            out.extend(
+                token.as_bytes()[at..at + safe]
+                    .iter()
+                    .map(u8::to_ascii_lowercase),
+            );
+            at += safe;
+            continue;
+        }
+        let mut chars = token[at..].char_indices().peekable();
+        let (_, head) = chars.next().unwrap();
+        let mut hangul = hangul_kind(head);
+        while let Some(&(_, character)) = chars.peek() {
+            if unicode_v16::is_attachment(character) {
+                chars.next();
+                continue;
+            }
+            let next = hangul_kind(character);
+            if hangul == HangulKind::L && next == HangulKind::V {
+                hangul = HangulKind::Lv;
+                chars.next();
+                continue;
+            }
+            if hangul == HangulKind::Lv && next == HangulKind::T {
+                hangul = HangulKind::Lvt;
+                chars.next();
+                continue;
+            }
+            if character == '\u{200d}' && chars.clone().nth(1).is_some() {
+                chars.next();
+                chars.next();
+                continue;
+            }
+            break;
+        }
+        let end = at + chars.peek().map_or(token.len() - at, |&(byte, _)| byte);
+        let original = &token[at..end];
+        if original.is_ascii() {
+            out.extend(original.bytes().map(|b| b.to_ascii_lowercase()));
+        } else {
+            let compatible: String = original.nfkc().collect();
+            out.extend_from_slice(unicode_v16::case_fold(&compatible).as_bytes());
+        }
+        at = end;
+    }
+    String::from_utf8(out).expect("normalized clusters preserve UTF-8")
 }
 
 pub fn term_variants(token: &str) -> Vec<String> {
@@ -362,7 +419,7 @@ pub fn cold_prior(token: &str) -> f64 {
 }
 
 impl PreparedQuery {
-    fn evaluate_compact(
+    pub(crate) fn evaluate_compact(
         &self,
         text: &str,
         spans: Option<&[Option<Span>]>,
@@ -373,6 +430,35 @@ impl PreparedQuery {
         }
         if text.is_ascii() && self.terms.iter().all(|term| term.ascii_variants.is_some()) {
             return self.evaluate_ascii_compact(text, spans, validate_spans);
+        }
+        if spans.is_none()
+            && !self.terms.is_empty()
+            && self.terms.iter().all(|term| {
+                term.ascii_variants.as_ref().is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .any(|needle| aligned_ascii_occurrence(text, needle))
+                })
+            })
+        {
+            // One certified aligned occurrence is already the maximum quality.
+            // Unicode elsewhere in a long row cannot improve that maximum.
+            return Ok(CompactBoundaryScore {
+                factor: 1.,
+                match_class: "aligned",
+            });
+        }
+        if spans.is_none()
+            && self.terms.iter().all(|term| {
+                term.ascii_variants.as_ref().is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .all(|v| v.bytes().all(|b| b.is_ascii_alphanumeric()))
+                })
+            })
+            && ascii_separators_only(text)
+        {
+            return self.evaluate_ascii_compact(text, None, validate_spans);
         }
         if let Some(spans) = spans.filter(|_| !validate_spans) {
             return self.evaluate_boundary_only_compact(text, spans);
@@ -531,6 +617,22 @@ impl PreparedQuery {
         }
         if text.is_ascii() && self.terms.iter().all(|term| term.ascii_variants.is_some()) {
             self.evaluate_ascii(text, spans, validate_spans)
+        } else if spans.is_none()
+            && self.terms.iter().all(|term| {
+                term.ascii_variants.as_ref().is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .all(|v| v.bytes().all(|b| b.is_ascii_alphanumeric()))
+                })
+            })
+            && ascii_separators_only(text)
+        {
+            let mut score = self.evaluate_ascii(text, None, validate_spans)?;
+            for span in score.spans.iter_mut().flatten() {
+                span[0] = text[..span[0] as usize].chars().count() as i64;
+                span[1] = text[..span[1] as usize].chars().count() as i64;
+            }
+            Ok(score)
         } else {
             self.evaluate_unicode(text, spans, validate_spans)
         }
@@ -651,6 +753,53 @@ impl PreparedQuery {
         }
         Ok(finish_score(&self.terms, qualities, selected, matched))
     }
+}
+
+// Separators cannot introduce an ASCII word occurrence or join an ASCII word
+// across a normalization boundary. Apostrophe joiners deliberately take the
+// full Unicode path. Original byte offsets remain sufficient for ASCII terms.
+fn ascii_separators_only(text: &str) -> bool {
+    text.chars().filter(|c| !c.is_ascii()).all(|c| {
+        if matches!(c, '\u{2019}' | '\u{02bc}') || !unicode_v16::is_separator(c) {
+            return false;
+        }
+        let folded = unicode_v16::case_fold(&c.to_string().nfkc().collect::<String>());
+        !folded.is_empty()
+            && folded.chars().all(|v| {
+                !unicode_v16::is_alphanumeric(v)
+                    && !unicode_v16::is_attachment(v)
+                    && v != '\u{200d}'
+            })
+    })
+}
+
+fn aligned_ascii_occurrence(text: &str, needle: &str) -> bool {
+    if needle.is_empty() || !needle.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let first = needle.as_bytes()[0];
+    let mut from = 0;
+    while let Some(offset) = memchr::memchr2(
+        first.to_ascii_lowercase(),
+        first.to_ascii_uppercase(),
+        &bytes[from..],
+    ) {
+        let start = from + offset;
+        let end = start + needle.len();
+        if end > bytes.len() {
+            break;
+        }
+        if bytes[start..end].eq_ignore_ascii_case(needle.as_bytes())
+            && bytes[start.saturating_sub(2)..(end + 2).min(bytes.len())].is_ascii()
+            && ascii_boundary(bytes, start)
+            && ascii_boundary(bytes, end)
+        {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn checked_span(start: i64, end: i64, length: usize) -> Result<(usize, usize), BoundaryError> {
@@ -853,7 +1002,14 @@ impl PreparedText {
         let mut starts = Vec::new();
         let mut ends = Vec::new();
         for cluster in &grouped {
-            let compatible: String = text[cluster.start_byte..cluster.end_byte].nfkc().collect();
+            let original = &text[cluster.start_byte..cluster.end_byte];
+            if original.is_ascii() {
+                folded.extend(original.bytes().map(|b| char::from(b.to_ascii_lowercase())));
+                starts.extend(std::iter::repeat_n(cluster.start, original.len()));
+                ends.extend(std::iter::repeat_n(cluster.end, original.len()));
+                continue;
+            }
+            let compatible: String = original.nfkc().collect();
             let normalized = unicode_v16::case_fold(&compatible);
             let length = normalized.chars().count();
             folded.extend(normalized.chars());
@@ -1091,6 +1247,22 @@ mod tests {
     };
 
     #[test]
+    fn aligned_ascii_shortcut_preserves_unicode_quality() {
+        for token in ["error", "hi", "release workflow", "don't"] {
+            let query = prepare_query(token, &Stats::new());
+            for left in ["", " ", "a", "界", "e\u{301}", "\u{200d}", "'", "("] {
+                for right in ["", " ", "a", "界", "\u{301}", "\u{200d}", "'s", ")"] {
+                    let text = format!("界 {left}{token}{right} end");
+                    let expected = query.evaluate_unicode(&text, None, true).unwrap();
+                    let actual = query.evaluate_compact(&text, None, true).unwrap();
+                    assert_eq!(actual.match_class, expected.match_class, "{text:?}");
+                    assert!((actual.factor - expected.factor).abs() < 1e-14, "{text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn query_shape_and_normalization_match_python() {
         assert_eq!(
             query_tokens(" cyber-filter_thing "),
@@ -1227,6 +1399,26 @@ mod tests {
     }
 
     #[test]
+    fn separator_fast_path_matches_full_boundary_scores() {
+        for query in ["hi", "error", "foo bar", "12"] {
+            let prepared = prepare_query(query, &Stats::new());
+            for separator in [
+                '…', '—', '–', '\u{00a0}', '“', '”', '\u{ff07}', '℃', '™', '\u{200d}', '\u{2019}',
+            ] {
+                for text in [
+                    format!("this{separator}hi errorCode foo{separator}bar 12"),
+                    format!("{separator}error{separator}"),
+                    format!("shi{separator}pper"),
+                ] {
+                    let full = prepared.evaluate(&text, None, true).unwrap();
+                    let compact = prepared.evaluate_compact(&text, None, true).unwrap();
+                    assert_eq!(full.factor, compact.factor, "{query}: {text}");
+                    assert_eq!(full.match_class, compact.match_class, "{query}: {text}");
+                }
+            }
+        }
+    }
+    #[test]
     fn native_decut_matches_snippet_edge_rules() {
         assert_eq!(decut_text("plain", true), "plain");
         assert_eq!(decut_text("a…b", false), "aab");
@@ -1262,5 +1454,65 @@ mod tests {
             serde_json::from_value::<Vec<Option<[i64; 2]>>>(expected["spans"].clone()).unwrap(),
             "{name}"
         );
+    }
+}
+
+#[cfg(test)]
+mod normalization_stream_tests {
+    use super::*;
+    #[test]
+    fn ascii_runs_preserve_every_custom_cluster_boundary() {
+        let cases = [
+            "",
+            "é",
+            "e\u{301}",
+            "\u{301}",
+            "\u{200d}X",
+            "X\u{200d}Y\u{301}",
+            "\u{1100}\u{1161}\u{11a8}",
+            "ß",
+            "ﬀ",
+            "中",
+            "\u{e000}",
+            "👩\u{200d}💻",
+            "a\u{fe0f}",
+        ];
+        for left in cases {
+            for right in cases {
+                let text = format!("ASCII_AbC{left}DEfg{right} HIJK");
+                let expected = clusters(&text)
+                    .into_iter()
+                    .map(|c| {
+                        let compatible: String = text[c.start_byte..c.end_byte].nfkc().collect();
+                        unicode_v16::case_fold(&compatible)
+                    })
+                    .collect::<String>();
+                assert_eq!(normalize_token(&text), expected, "{text:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod separator_span_tests {
+    use super::*;
+    #[test]
+    fn separator_fast_path_preserves_character_spans_and_full_scores() {
+        for separator in ["—", "…", "\u{a0}", "\u{2028}", "★", "→"] {
+            for text in [
+                format!("{separator}error{separator}workflow"),
+                format!("xerror{separator}HTTPWorkflow{separator}error"),
+                format!("ERROR{separator}workflows{separator}"),
+            ] {
+                let q = prepare_query("error workflow", &Stats::new());
+                let fast = q.evaluate(&text, None, true).unwrap();
+                let full = q.evaluate_unicode(&text, None, true).unwrap();
+                assert_eq!(
+                    serde_json::to_value(fast).unwrap(),
+                    serde_json::to_value(full).unwrap(),
+                    "{text}"
+                );
+            }
+        }
     }
 }

@@ -4788,6 +4788,11 @@ fn ranged_value<T: Copy + Default>(codepoint: u32, ranges: &[(u32, u32, T)]) -> 
 }
 
 fn has(character: char, flag: u16) -> bool {
+    static ASCII: std::sync::LazyLock<[u16; 128]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|i| ranged_value(i as u32, PROPERTIES)));
+    if character.is_ascii() {
+        return ASCII[character as usize] & flag != 0;
+    }
     ranged_value(character as u32, PROPERTIES) & flag != 0
 }
 
@@ -4826,6 +4831,11 @@ pub fn is_separator(character: char) -> bool {
 }
 
 pub fn script(character: char) -> u8 {
+    static ASCII: std::sync::LazyLock<[u8; 128]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|i| ranged_value(i as u32, SCRIPTS)));
+    if character.is_ascii() {
+        return ASCII[character as usize];
+    }
     ranged_value(character as u32, SCRIPTS)
 }
 
@@ -4836,6 +4846,10 @@ pub fn is_unsegmented(script: u8) -> bool {
 pub fn case_fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
+        if character.is_ascii() {
+            out.push(character.to_ascii_lowercase());
+            continue;
+        }
         match CASEFOLD.binary_search_by_key(&(character as u32), |(key, _)| *key) {
             Ok(index) => out.push_str(CASEFOLD[index].1),
             Err(_) => out.push(character),

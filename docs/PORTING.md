@@ -4,7 +4,7 @@ Every documented command is wired. No command invokes Python, an older agrep, a 
 
 | Command | Status | Reference for the remaining slice |
 |---|---|---|
-| search / bare pattern | Partial until engine merge: keyword engine plus JSON/TSV/classic/compact presentation, caller exclusion, counts, dimension coverage, frozen SQLite continuation pages | `cmd/search.rs`; rendering/identity details below |
+| search / bare pattern | Implemented: keyword engine plus JSON/TSV/classic/compact presentation, caller exclusion, counts, dimension coverage, frozen SQLite continuation pages | `cmd/search.rs`; rendering/identity details below |
 | index | Implemented: census, changed-source parsing, transactional row diff | `py/indexer.py`, Rust adapters |
 | reindex | Implemented: one-transaction rebuild of derived rows | `reindex.py`; semantic rebuild follows semantic slice |
 | set | Done: reference listing/confirmation text; validated tools, embeddings and post_index; preserves other config fields | `cmd/set.rs`; executing post-index is owned by __work integration |
@@ -13,7 +13,7 @@ Every documented command is wired. No command invokes Python, an older agrep, a 
 | around | Implemented | `cmd/around.rs`, `evidence.rs`: digest/event verification, bounded moved-content rescue, positional clamping, role/tool selection, source and render truncation |
 | recall | Implemented | `cmd/recall.rs`: ranked windows, family selection, direct handles, probe, one JSON object, UTF-8 byte budgets |
 | pack | Implemented | `cmd/pack.rs`: query round-robin, turn deduplication, merged overlapping windows, shared recall budget |
-| postcompact | Partial (single-session refresh pending) | `cmd/postcompact.rs`, `recovery.rs`: explicit/exported caller, structural boundary, root packet capped at eight blocks and 8000/16000 bytes |
+| postcompact | Implemented: caller-source-only refresh; failures produce a partial packet and exit 2 | `cmd/postcompact.rs`, `recovery.rs`: explicit/exported caller, structural boundary, root packet capped at eight blocks and 8000/16000 bytes |
 | summary pending/time | Done: project briefings, evidence-backed pending states, capped interval union and local grouping | `cmd/summary.rs`, `briefing.rs`; [browse contracts](BROWSE.md) |
 | board | Implemented: direct live observer, family filters, JSON/once, interactive terminal ownership | `docs/LIVE_PORT.md` |
 | tail | Implemented: JSONL events, complete-census readiness, scoped snapshots, emit-before-ack | `docs/LIVE_PORT.md` |
@@ -121,21 +121,31 @@ Diagnostics read semantic coverage directly and check typed integration enrollme
 `main.rs` only dispatches the Slice A commands and contains their clap types. Search
 `max`, recall `hits`, and around `context`/`max_chars` retain option presence; around positional
 turns are signed. Shared `Scope` still constructs the foundation `Filters`.
-`lib.rs` exports `caller`, `caller_process`, `coverage`, `evidence`, `handles`,
-`hybrid`, `pages`, `recovery`, and `surface`. No store/query/intake/boundary module
-was edited and no `Filters`, `Options`, `Hit`, or `Results` field was added.
+`lib.rs` exports the engine and presentation modules. The merged read path runs a
+parallel stat census concurrently with retrieval. It reports the actual pending
+source count and schedules one detached `__work` pass; only a missing index is
+built inline. `__work` owns the work lock and orders source refresh, embeddings,
+vector reclamation, scheduled archive, and the post-index hook. Explicit `index`
+and `reindex` drain the post-refresh work in the foreground.
 
-The engine can replace the temporary-view bridge in `caller::search` with native
-caller predicates. Inputs are `Caller::{agent, session, members, live_members,
-boundary, resolved}`, `include_self`, and `no_self`; apply the exclusion before
-ranking/counts, and mark only the exact caller transcript. `cmd/postcompact.rs`
-currently calls `store::refresh(&root, false, false)` before opening its reader;
-replace that call with the engine's single-session inline refresh. `Style` has a
-`pending_sources` input; the foundation has no such count in `Refresh`, so its
-current callers pass zero. Wire the engine's factual pending count there. The broader retrieval requested by
-`Search::coverage` also needs the new planner hook; the current surface reports
-filter-dimension coverage, but does not invent additional matches outside the
-foundation query API.
+Caller identity becomes `Filters::caller` before lexical or semantic candidate
+selection. `CallerFilter::excluded_sessions` covers live descendants and explicit
+family exclusion; `exclude_from_turn` covers the current transcript window. No
+temporary SQL views implement caller exclusion. Only the exact caller transcript
+receives the self marker.
+
+`postcompact` calls `store::refresh_session` for the indexed sources of its own
+caller. Unrelated source stamps and the global harness-policy stamp do not advance.
+A failed or disabled refresh produces a partial packet and exit 2. Event readers
+use recorded timestamp, assigned turn and input/output offsets, including control
+events; `tool_text` owns formatting and extraction. `--coverage` invokes the
+native IDF-weighted recovery planner and renders a separate evidence section,
+without changing the primary result's exit status or machine framing.
+
+The explorer uses the same keyword, semantic, fusion and fallback APIs, and
+reports its census result. Native input remains authenticated by the integrated
+header/bootstrap policy. Performance acceptance is still tracked in ENGINE.md;
+implementation status does not assert that every latency target passes.
 
 `hybrid::merge(keyword, optional_semantic, limit, family_diverse, Lane)` is the
 semantic seam. Semantic `Hit::score` is cosine, `matched` becomes `semantic`, weak

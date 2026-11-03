@@ -296,6 +296,7 @@ fn parse_session(dir: &Path, project: &str, parent: &str) -> (Vec<Message>, Vec<
                         }
                         tally.event();
                         events.push(Event {
+                            turn: None,
                             agent: "kimi",
                             session: session.clone(),
                             ts,

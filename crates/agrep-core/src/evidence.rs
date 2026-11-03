@@ -250,44 +250,36 @@ pub fn load_rows(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Vec<
     Ok(rows)
 }
 pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Vec<Event>> {
-    let mut q=c.prepare("SELECT p.position,p.ts,p.text,e.body FROM tools p LEFT JOIN events e ON e.source=p.source AND e.session=p.session AND e.call_id=p.extra WHERE p.visible=1 AND p.session=? AND p.position BETWEEN ? AND ? ORDER BY p.position,p.ts,p.id")?;
+    let mut q=c.prepare("SELECT json_extract(e.body,'$.turn'),json_extract(e.body,'$.ts'),p.text,e.body FROM events e LEFT JOIN tools p ON p.source=e.source AND p.session=e.session AND p.extra=e.call_id AND p.visible=1 WHERE e.session=? AND coalesce(json_extract(e.body,'$.visible'),1)=1 AND json_extract(e.body,'$.turn') BETWEEN ? AND ? ORDER BY json_extract(e.body,'$.turn'),json_extract(e.body,'$.ts'),e.call_id")?;
     let mut events = Vec::new();
     let mut seen = BTreeSet::new();
     for r in q.query_map(params![session, lo, hi], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
-            r.get::<_, Vec<u8>>(2)?,
-            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<Vec<u8>>>(2)?,
+            r.get::<_, String>(3)?,
         ))
     })? {
         let (turn, ts, bytes, body) = r?;
-        let text = store::decode("tools", bytes)?;
-        let raw = body
-            .map(|b| serde_json::from_str::<Value>(&b))
+        let text = bytes
+            .map(|bytes| store::decode("tools", bytes))
             .transpose()?
-            .unwrap_or_else(|| json!({}));
+            .unwrap_or_default();
+        let raw: Value = serde_json::from_str(&body)?;
         let string = |key: &str| raw[key].as_str().unwrap_or_default().to_owned();
-        let identity = handles::event_id(session, ts, &text);
+        let identity = handles::event_id(session, ts, if text.is_empty() { &body } else { &text });
         if !seen.insert(identity.clone()) {
             continue;
         }
-        let (head, tail) = text.split_once('\n').unwrap_or((&text, ""));
-        let prefix = format!(
-            "{}{}: ",
-            string("name"),
-            if raw["ok"] == false { " [failed]" } else { "" }
+        let (input, output) = crate::tool_text::split(
+            &text,
+            raw["kind"].as_str().unwrap_or("tool"),
+            &string("name"),
+            raw["ok"].as_bool(),
+            raw["input_end"].as_u64().map(|v| v as usize),
+            raw["output_start"].as_u64().map(|v| v as usize),
         );
-        let input = if raw["input"].is_string() {
-            string("input")
-        } else {
-            head.strip_prefix(&prefix).unwrap_or(head).to_owned()
-        };
-        let output = if raw["output"].is_string() {
-            string("output")
-        } else {
-            tail.to_owned()
-        };
         events.push(Event {
             turn,
             ts,
@@ -326,6 +318,7 @@ pub struct Display {
     pub who: Option<String>,
     pub color: bool,
     pub checked: bool,
+    pub pending_sources: usize,
 }
 pub fn cap(text: &str, n: usize, command: &str) -> (String, usize) {
     let count = text.chars().count();
@@ -445,9 +438,7 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
         let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_some(){"bounded_inclusive"}else{"root_prose"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if w.claim.as_ref().is_some_and(|c|c.event.is_some()){"tool"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":w.events.len(),"shown":events.len(),"hidden":w.events.len()-events.len()},"prose":{"available_by_role":counts(&all),"shown_by_role":counts(&rows),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":rows.iter().filter(|r|r.source_chars>r.text.chars().count()).count(),"source_truncated_events":events.iter().filter(|e|e.input_chars>e.input.chars().count()||e.output_chars>e.output.chars().count()).count()},"expansion_argv":expansion}});
         meta["self_exclusion"] = d.caller.metadata(true, false);
         meta["self_exclusion"]["reason"] = json!("chat-filter");
-        if !d.checked {
-            meta["freshness"] = crate::render::freshness(false, 0);
-        }
+        meta["freshness"] = crate::render::freshness(d.checked, d.pending_sources);
         if !w.notes.is_empty() {
             meta["served"] = json!({"served_as_requested":false,"divergences":w.notes});
         }

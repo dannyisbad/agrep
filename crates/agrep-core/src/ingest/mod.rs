@@ -1165,7 +1165,10 @@ pub const AFTER_REPLY_META: &str = "after_reply=1";
 /// block (every call of a turn that wrote none) gain `after_reply=1` in `meta`, so a turn cut
 /// off mid-work can be told from one that answered after its tools. Compaction recaps are not
 /// prompts: the reply they carry continues the turn before them.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReplyOrder {
+    turn_start: usize,
+    prior_work: bool,
     text_at: usize,
     /// Calls the user ran (pi's `!cmd`), never the agent's work: left out of the fact.
     excluded: Vec<usize>,
@@ -1181,6 +1184,8 @@ impl ReplyOrder {
     pub fn new() -> Self {
         Self {
             text_at: 0,
+            turn_start: 0,
+            prior_work: false,
             excluded: Vec::new(),
         }
     }
@@ -1189,6 +1194,8 @@ impl ReplyOrder {
     pub fn prompt(&mut self, events: &mut [crate::model::Event]) {
         self.settle(events);
         self.text_at = events.len();
+        self.turn_start = events.len();
+        self.prior_work = false;
     }
 
     /// A reply block was appended after `recorded` events: every call so far was answered, and
@@ -1196,6 +1203,7 @@ impl ReplyOrder {
     /// the block before it.
     pub fn reply(&mut self, recorded: usize) {
         self.text_at = recorded;
+        self.prior_work = false;
     }
 
     /// Whether the agent made a work call (a tool or a delegation) between its previous reply
@@ -1208,11 +1216,12 @@ impl ReplyOrder {
         events: &[crate::model::Event],
         recorded: usize,
     ) {
-        let worked = events[..recorded.min(events.len())]
-            .iter()
-            .enumerate()
-            .skip(self.text_at)
-            .any(|(index, event)| is_work_event(event) && !self.excluded.contains(&index));
+        let worked = self.prior_work
+            || events[..recorded.min(events.len())]
+                .iter()
+                .enumerate()
+                .skip(self.text_at)
+                .any(|(index, event)| is_work_event(event) && !self.excluded.contains(&index));
         Self::joined_known(shape, worked);
     }
 
@@ -1238,6 +1247,8 @@ impl ReplyOrder {
     /// The events so far were discarded (a replayed parent transcript): nothing to settle.
     pub fn reset(&mut self, events: &[crate::model::Event]) {
         self.text_at = events.len();
+        self.turn_start = events.len();
+        self.prior_work = false;
         self.excluded.clear();
     }
 
@@ -1246,13 +1257,40 @@ impl ReplyOrder {
         self.excluded.push(index);
     }
 
+    /// Keep only unresolved calls while carrying whether completed work preceded the next reply.
+    pub fn checkpoint(&self, events: &[crate::model::Event], keep: &[usize]) -> Self {
+        Self {
+            turn_start: keep.iter().filter(|i| **i < self.turn_start).count(),
+            text_at: keep.iter().filter(|i| **i < self.text_at).count(),
+            prior_work: self.prior_work
+                || events
+                    .iter()
+                    .enumerate()
+                    .skip(self.text_at)
+                    .any(|(i, e)| is_work_event(e) && !self.excluded.contains(&i)),
+            excluded: keep
+                .iter()
+                .enumerate()
+                .filter_map(|(n, i)| self.excluded.contains(i).then_some(n))
+                .collect(),
+        }
+    }
     /// The file ended: the last turn's trailing calls are settled.
-    pub fn finish(self, events: &mut [crate::model::Event]) {
+    pub fn finish(&self, events: &mut [crate::model::Event]) {
         self.settle(events);
     }
 
     fn settle(&self, events: &mut [crate::model::Event]) {
-        for (index, event) in events.iter_mut().enumerate().skip(self.text_at) {
+        for (index, event) in events.iter_mut().enumerate().skip(self.turn_start) {
+            event.meta = event
+                .meta
+                .split_whitespace()
+                .filter(|s| *s != AFTER_REPLY_META)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if index < self.text_at {
+                continue;
+            }
             if self.excluded.contains(&index) {
                 continue;
             }

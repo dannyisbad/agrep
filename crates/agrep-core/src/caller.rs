@@ -197,9 +197,29 @@ impl Caller {
         serde_json::json!({"active":active,"reason":if include_self{"explicit-include"}else if !requested{"machine-surface"}else if !self.resolved{"caller-unresolved"}else if no_self{"forced"}else{"window"},"identity":self.identity.reason,"scope":if no_self{"family"}else{"window"},"session":self.identity.session,"from_turn":self.boundary.unwrap_or(0),"excluded_hits":null,"excluded_hits_known":false})
     }
 }
-/// Temporary views pass caller predicates into the engine's normal SQL plans.
-/// The main database remains read-only. The engine can replace this bridge with
-/// native Filters fields without changing identity or evidence renderers.
+/// Attach caller identity before either retrieval lane ranks or counts rows.
+pub fn options(o: &Options, caller: &Caller, include_self: bool, no_self: bool) -> Options {
+    let mut o = o.clone();
+    if caller.resolved {
+        o.filters.caller = Some(query::CallerFilter {
+            agent: caller.agent.clone(),
+            session: caller.session.clone(),
+            family: caller.root.clone(),
+            exclude_from_turn: (!include_self && !no_self).then_some(caller.boundary.unwrap_or(0)),
+            exclude_family: false,
+            excluded_sessions: if include_self {
+                vec![]
+            } else if no_self {
+                let mut sessions = caller.members.clone();
+                sessions.push(caller.session.clone());
+                sessions
+            } else {
+                caller.live_members.clone()
+            },
+        });
+    }
+    o
+}
 pub fn search(
     c: &Connection,
     o: &Options,
@@ -207,44 +227,12 @@ pub fn search(
     include_self: bool,
     no_self: bool,
 ) -> Result<Results> {
-    let mut result = scoped(c, caller, include_self, no_self, || query::search(c, o))?;
-    decorate(c, &mut result, caller, o)?;
+    let options = options(o, caller, include_self, no_self);
+    let mut result = query::search(c, &options)?;
+    decorate(c, &mut result, caller, &options)?;
     Ok(result)
 }
-pub fn scoped<T>(
-    c: &Connection,
-    caller: &Caller,
-    include_self: bool,
-    no_self: bool,
-    query: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let exclude = caller.resolved && !include_self;
-    if exclude {
-        c.execute_batch("PRAGMA query_only=OFF; CREATE TEMP TABLE IF NOT EXISTS agrep_caller_sessions(session TEXT PRIMARY KEY,all_rows INTEGER NOT NULL); DELETE FROM agrep_caller_sessions;")?;
-        for s in if no_self {
-            &caller.members
-        } else {
-            &caller.live_members
-        } {
-            c.execute(
-                "INSERT OR REPLACE INTO temp.agrep_caller_sessions VALUES(?,1)",
-                [s],
-            )?;
-        }
-        c.execute(
-            "INSERT OR REPLACE INTO temp.agrep_caller_sessions VALUES(?,?)",
-            rusqlite::params![caller.session, i32::from(no_self)],
-        )?;
-        for t in ["prose", "tools"] {
-            c.execute_batch(&format!("CREATE TEMP VIEW {t} AS SELECT * FROM main.{t} p WHERE NOT (p.agent='{}' AND EXISTS(SELECT 1 FROM temp.agrep_caller_sessions x WHERE x.session=p.session AND (x.all_rows=1 OR p.position>={})));",caller.agent.replace('\'',"''"),caller.boundary.unwrap_or(0)))?;
-        }
-    }
-    let result = query();
-    if exclude {
-        c.execute_batch("DROP VIEW temp.prose; DROP VIEW temp.tools; PRAGMA query_only=ON;")?;
-    }
-    result
-}
+/// Session-list surfaces use the same native row predicate as retrieval.
 pub fn excludes(
     caller: &Caller,
     agent: &str,
@@ -253,28 +241,37 @@ pub fn excludes(
     include_self: bool,
     no_self: bool,
 ) -> bool {
-    caller.resolved
-        && !include_self
-        && agent == caller.agent
-        && (if no_self {
-            caller.members.iter().any(|s| s == session)
-        } else {
-            caller.live_members.iter().any(|s| s == session)
-                || (session == caller.session && turn >= caller.boundary.unwrap_or(0))
-        })
+    let filters = query::Filters {
+        caller: caller.resolved.then(|| query::CallerFilter {
+            agent: caller.agent.clone(),
+            session: caller.session.clone(),
+            family: caller.root.clone(),
+            exclude_from_turn: (!include_self && !no_self).then_some(caller.boundary.unwrap_or(0)),
+            exclude_family: false,
+            excluded_sessions: if include_self {
+                vec![]
+            } else if no_self {
+                let mut s = caller.members.clone();
+                s.push(caller.session.clone());
+                s
+            } else {
+                caller.live_members.clone()
+            },
+        }),
+        ..Default::default()
+    };
+    !query::caller_allows(
+        &filters,
+        &query::Hit {
+            agent: agent.into(),
+            session: session.into(),
+            turn,
+            ..Default::default()
+        },
+    )
 }
-pub fn filter_results(
-    c: &Connection,
-    result: &mut Results,
-    caller: &Caller,
-    include_self: bool,
-    no_self: bool,
-) -> Result<()> {
-    let before = result.hits.len();
-    result
-        .hits
-        .retain(|h| !excludes(caller, &h.agent, &h.session, h.turn, include_self, no_self));
-    result.total = result.total.saturating_sub(before - result.hits.len());
+/// Presentation-only decoration: caller exclusions already ran before ranking.
+pub fn decorate_semantic(c: &Connection, result: &mut Results, caller: &Caller) -> Result<()> {
     let index = handles::sessions(c)?;
     for h in &mut result.hits {
         h.self_marker = caller.resolved && h.agent == caller.agent && h.session == caller.session;

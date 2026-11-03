@@ -1,0 +1,215 @@
+{
+  "deflate_node_payload_bytes": 62030445,
+  "layouts": [
+    {
+      "build_ms": 9825.247916,
+      "bytes": 67043328,
+      "layout": "trigram_full",
+      "queries": [
+        {
+          "count": 3780,
+          "median_ms": 0.6514169999999999,
+          "args": [
+            "error"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1657,
+          "median_ms": 1.487375,
+          "args": [
+            "release workflow"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1586,
+          "median_ms": 1.0827499999999999,
+          "args": [
+            "how did the drafting go last run"
+          ],
+          "term_index": 3
+        },
+        {
+          "count": 7,
+          "median_ms": 0.082833,
+          "args": [
+            "000d"
+          ],
+          "term_index": 0
+        }
+      ],
+      "rows": 28553,
+      "vocabulary": 109356
+    },
+    {
+      "build_ms": 4888.832875,
+      "bytes": 16646144,
+      "layout": "trigram_none",
+      "queries": [
+        {
+          "count": 3786,
+          "median_ms": 0.550709,
+          "args": [
+            "error"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1742,
+          "median_ms": 1.190542,
+          "args": [
+            "release workflow"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1620,
+          "median_ms": 1.429875,
+          "args": [
+            "how did the drafting go last run"
+          ],
+          "term_index": 3
+        },
+        {
+          "count": 26,
+          "median_ms": 0.074042,
+          "args": [
+            "000d"
+          ],
+          "term_index": 0
+        }
+      ],
+      "rows": 28553,
+      "vocabulary": 109356
+    },
+    {
+      "layout": "word_with_lexicon",
+      "lexicon_bytes": 4001792,
+      "queries": [
+        {
+          "alternatives": 465,
+          "count": 3780,
+          "median_ms": 24.520833,
+          "args": [
+            "error"
+          ],
+          "term_index": 0
+        },
+        {
+          "alternatives": 106,
+          "count": 1657,
+          "median_ms": 3.11675,
+          "args": [
+            "release workflow"
+          ],
+          "term_index": 0
+        },
+        {
+          "alternatives": 48,
+          "count": 1586,
+          "median_ms": 1.109375,
+          "args": [
+            "how did the drafting go last run"
+          ],
+          "term_index": 3
+        },
+        {
+          "alternatives": 5,
+          "count": 7,
+          "median_ms": 0.103458,
+          "args": [
+            "000d"
+          ],
+          "term_index": 0
+        }
+      ],
+      "rows": 28553
+    },
+    {
+      "build_ms": 735.803333,
+      "bytes": 13516800,
+      "layout": "word_full",
+      "queries": [
+        {
+          "count": 2095,
+          "median_ms": 0.08791600000000001,
+          "args": [
+            "error"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1263,
+          "median_ms": 0.062208,
+          "args": [
+            "release workflow"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1558,
+          "median_ms": 0.070959,
+          "args": [
+            "how did the drafting go last run"
+          ],
+          "term_index": 3
+        },
+        {
+          "count": 0,
+          "median_ms": 0.02025,
+          "args": [
+            "000d"
+          ],
+          "term_index": 0
+        }
+      ],
+      "rows": 28553,
+      "vocabulary": 89132
+    },
+    {
+      "build_ms": 6105.0822499999995,
+      "bytes": 66834432,
+      "layout": "head_tail_full",
+      "queries": [
+        {
+          "count": 3770,
+          "median_ms": 0.6522910000000001,
+          "args": [
+            "error"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1650,
+          "median_ms": 2.8224169999999997,
+          "args": [
+            "release workflow"
+          ],
+          "term_index": 0
+        },
+        {
+          "count": 1585,
+          "median_ms": 1.505167,
+          "args": [
+            "how did the drafting go last run"
+          ],
+          "term_index": 3
+        },
+        {
+          "count": 7,
+          "median_ms": 0.328709,
+          "args": [
+            "000d"
+          ],
+          "term_index": 0
+        }
+      ],
+      "rows": 28553,
+      "vocabulary": 109555
+    }
+  ],
+  "new_node_payload_bytes": 79501353,
+  "nodes": 176028,
+  "old_node_payload_bytes": 344499933
+}

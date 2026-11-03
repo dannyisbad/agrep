@@ -262,6 +262,7 @@ fn compaction_marker(
     record_ordinal: usize,
 ) -> Event {
     Event {
+        turn: None,
         agent: "codex",
         session: session
             .map(str::to_string)
@@ -417,6 +418,7 @@ struct SubmissionItem<'a> {
 }
 
 /// Only native submission events attest composed `role:user` input as human prose.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Submissions {
     /// Sorted and deduped, so `attests` binary-searches instead of scanning.
     texts: Vec<String>,
@@ -571,6 +573,7 @@ fn extract_assistant(blocks: &[Block<'_>]) -> Option<String> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SubagentContext {
     agent_path: Option<String>,
     start_turn_id: Option<String>,
@@ -858,21 +861,77 @@ fn parse_file_with_tally(
         }
     };
 
-    let submissions = Submissions::collect(&data);
-    let mut out: Vec<crate::model::RawMessage> = Vec::new();
-    let mut recap_turns = Vec::new();
-    let mut events: Vec<Event> = Vec::new();
-    let mut order = crate::ingest::ReplyOrder::new();
+    parse_data(path, tally, &data, None).0
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct CodexState {
+    out: Vec<crate::model::RawMessage>,
+    recap_turns: Vec<u32>,
+    events: Vec<Event>,
+    order: crate::ingest::ReplyOrder,
+    pending: HashMap<String, usize>,
+    turn: u32,
+    project: Option<String>,
+    session: Option<String>,
+    first_meta_seen: bool,
+    subagent: Option<SubagentContext>,
+    internal_guardian: bool,
+    current_model: String,
+    submissions: Submissions,
+    ordinal: usize,
+    reset: bool,
+}
+pub(crate) fn resume_parse(
+    path: &Path,
+    data: &str,
+    previous: Option<&str>,
+) -> anyhow::Result<(
+    Vec<Message>,
+    Vec<Event>,
+    crate::intake_batch::ReadOutcome,
+    String,
+)> {
+    let state = previous.map(serde_json::from_str).transpose()?;
+    let ((m, e, o), next) = parse_data(path, crate::intake::file("codex", path), data, state);
+    Ok((m, e, o, serde_json::to_string(&next)?))
+}
+fn parse_data(
+    path: &Path,
+    tally: std::sync::Arc<crate::intake::Tally>,
+    data: &str,
+    previous: Option<CodexState>,
+) -> (
+    (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome),
+    CodexState,
+) {
+    let state = previous.unwrap_or_default();
+    let mut submissions = state.submissions;
+    let fresh = Submissions::collect(data);
+    submissions.texts.extend(fresh.texts);
+    submissions.texts.sort_unstable();
+    submissions.texts.dedup();
+    submissions.desktop.extend(fresh.desktop);
+    submissions.desktop.sort_unstable();
+    submissions.desktop.dedup();
+    let mut out = state.out;
+    let mut carried_rows = out.len();
+    let mut recap_turns = state.recap_turns;
+    let mut events = state.events;
+    let mut carried_events = events.len();
+    let mut order = state.order;
     // call_id -> index into `events`, so the *_output line can pair up.
-    let mut pending: HashMap<String, usize> = HashMap::new();
-    let mut turn = 0u32;
-    let mut project: Option<String> = None;
-    let mut session: Option<String> = None;
-    let mut first_meta_seen = false;
-    let mut subagent: Option<SubagentContext> = None;
-    let mut internal_guardian = false;
+    let mut pending = state.pending;
+    let mut turn = state.turn;
+    let ordinal = state.ordinal;
+    let mut reset = false;
+    let mut project = state.project;
+    let mut session = state.session;
+    let mut first_meta_seen = state.first_meta_seen;
+    let mut subagent = state.subagent;
+    let mut internal_guardian = state.internal_guardian;
     // The active model, updated by each turn_context line and stamped onto turns.
-    let mut current_model = String::new();
+    let mut current_model = state.current_model;
 
     // Prefilter needles - admission invariant documented on this fn.
     let f_role = memmem::Finder::new(b"\"role\":");
@@ -892,7 +951,8 @@ fn parse_file_with_tally(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("rollout");
-    for (record_ordinal, line) in data.lines().enumerate() {
+    for (offset, line) in data.lines().enumerate() {
+        let record_ordinal = ordinal + offset;
         if line.is_empty() {
             continue;
         }
@@ -1141,12 +1201,18 @@ fn parse_file_with_tally(
                         if !ctx.started {
                             ctx.started = true;
                             pending.clear();
-                            tally.discard_rows_as_replay(out.len() as u64);
-                            tally.discard_events(events.len() as u64);
+                            tally.discard_rows_as_replay(
+                                out.len().saturating_sub(carried_rows) as u64
+                            );
+                            tally
+                                .discard_events(events.len().saturating_sub(carried_events) as u64);
                             events.clear();
                             order.reset(&events);
                             out.clear();
                             turn = 0;
+                            carried_rows = 0;
+                            carried_events = 0;
+                            reset = true;
                         }
                         tally.row();
                         order.prompt(&mut events);
@@ -1219,12 +1285,15 @@ fn parse_file_with_tally(
                     if !ctx.started {
                         ctx.started = true;
                         pending.clear();
-                        tally.discard_rows_as_replay(out.len() as u64);
-                        tally.discard_events(events.len() as u64);
+                        tally.discard_rows_as_replay(out.len().saturating_sub(carried_rows) as u64);
+                        tally.discard_events(events.len().saturating_sub(carried_events) as u64);
                         events.clear();
                         order.reset(&events);
                         out.clear();
                         turn = 0;
+                        carried_rows = 0;
+                        carried_events = 0;
+                        reset = true;
                     }
                     tally.row();
                     order.prompt(&mut events);
@@ -1329,6 +1398,7 @@ fn parse_file_with_tally(
                 tally.agent_row();
                 tally.event();
                 events.push(Event {
+                    turn: out.last().map(|m| m.turn),
                     agent: "codex",
                     session: sess(),
                     ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
@@ -1396,6 +1466,7 @@ fn parse_file_with_tally(
                     .unwrap_or_default();
                 let (input, input_chars) = cap_str_with_chars(&query, EVENT_CAP);
                 events.push(Event {
+                    turn: out.last().map(|m| m.turn),
                     agent: "codex",
                     session: sess(),
                     ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
@@ -1501,20 +1572,56 @@ fn parse_file_with_tally(
     tally.skip_n(crate::intake::Skip::Meta, fast_meta);
     tally.skip_n(crate::intake::Skip::NonMessage, fast_non_message);
 
-    (
-        out.into_iter()
-            .map(|raw| {
-                let turn = raw.turn;
-                let mut message = raw.freeze();
-                if recap_turns.binary_search(&turn).is_ok() {
-                    message.who = "recap".into();
-                    message.model_source = "recap".into();
-                }
-                message
-            })
+    let last = out.last().map(|m| m.text.as_str()).unwrap_or("");
+    let consumed: std::collections::HashSet<_> = out.iter().map(|m| m.text.as_str()).collect();
+    submissions
+        .texts
+        .retain(|t| !consumed.contains(t.as_str()) || last.starts_with(t.as_str()));
+    submissions
+        .desktop
+        .retain(|(_, _, t)| !consumed.contains(t.as_str()) || last == t);
+    let mut keep: Vec<_> = pending.values().copied().collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let next = CodexState {
+        out: out.last().cloned().into_iter().collect(),
+        recap_turns: out
+            .last()
+            .filter(|m| recap_turns.contains(&m.turn))
+            .map(|m| vec![m.turn])
+            .unwrap_or_default(),
+        events: keep.iter().map(|i| events[*i].clone()).collect(),
+        order: order.checkpoint(&events, &keep),
+        pending: pending
+            .into_iter()
+            .map(|(id, i)| (id, keep.binary_search(&i).unwrap()))
             .collect(),
-        events,
-        crate::intake_batch::ReadOutcome::Complete,
+        turn,
+        project,
+        session,
+        first_meta_seen,
+        subagent,
+        internal_guardian,
+        current_model,
+        submissions,
+        ordinal: ordinal + data.lines().count(),
+        reset,
+    };
+    let messages = out
+        .into_iter()
+        .map(|raw| {
+            let turn = raw.turn;
+            let mut m = raw.freeze();
+            if recap_turns.contains(&turn) {
+                m.who = "recap".into();
+                m.model_source = "recap".into();
+            }
+            m
+        })
+        .collect();
+    (
+        (messages, events, crate::intake_batch::ReadOutcome::Complete),
+        next,
     )
 }
 

@@ -384,7 +384,11 @@ enum Command {
         port: u16,
     },
     #[command(name = "__work", hide = true)]
-    Work,
+    Work {
+        tasks: Vec<String>,
+    },
+    #[command(name = "__census", hide = true)]
+    Census,
     #[command(name = "__hook", hide = true)]
     Hook {
         agent: String,
@@ -440,6 +444,7 @@ impl Scope {
             since: self.since.as_deref().map(date).transpose()?,
             until: self.until.as_deref().map(date).transpose()?,
             no_side: self.no_side,
+            caller: None,
         })
     }
 }
@@ -455,14 +460,39 @@ fn compact(classic: bool) -> bool {
             .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty())),
     }
 }
-fn ready(no_auto: bool) -> Result<DataRoot> {
+type CensusTask = std::thread::JoinHandle<Result<agrep_core::freshness::Pending>>;
+fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
     let no_auto = no_auto || agrep_core::data::read_only();
     let root = DataRoot::discover()?;
     root.validate(!no_auto)?;
-    if !no_auto {
-        store::refresh(&root, false, false)?;
+    let census = if no_auto {
+        None
+    } else if !root.db().exists() {
+        store::refresh(&root, true, false)?;
+        semantic::initialize(&root)?;
+        None
+    } else {
+        let copy = root.clone();
+        Some(std::thread::spawn(move || {
+            agrep_core::freshness::pending(&copy)
+        }))
+    };
+    Ok((root, census))
+}
+fn finish_census(root: &DataRoot, census: Option<CensusTask>) -> Result<usize> {
+    let pending = if let Some(task) = census {
+        task.join()
+            .map_err(|_| anyhow::anyhow!("source census failed"))??
+            .changed_sources
+    } else {
+        0
+    };
+    if pending > 0 {
+        agrep_core::freshness::spawn(root, &std::env::current_exe()?)?;
+    } else {
+        semantic::schedule(root)?;
     }
-    Ok(root)
+    Ok(pending)
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -521,12 +551,14 @@ fn run(cli: Cli) -> Result<i32> {
             if result.changed_rows > 0 {
                 semantic::mark_index_changed(&root)?;
             }
-            semantic::schedule(&root)?;
+            semantic::initialize(&root)?;
+            cmd::work::after_index(&root, false)?;
             Ok(0)
         }
-        None | Some(Command::Status { .. }) => {
-            cmd::status::run(matches!(cli.command, Some(Command::Status { json: true })))
-        }
+        None | Some(Command::Status { .. }) => cmd::status::run(
+            matches!(cli.command, Some(Command::Status { json: true })),
+            cli.no_auto,
+        ),
         Some(Command::Set { values }) => cmd::set::run(values),
         Some(Command::Setup {
             yes,
@@ -562,7 +594,16 @@ fn run(cli: Cli) -> Result<i32> {
             yes,
         }),
         Some(Command::Restore { needle, to, force }) => cmd::restore::run(needle, to, force),
-        Some(Command::Work) => cmd::work::run(),
+        Some(Command::Work { tasks }) => cmd::work::run(&tasks),
+        Some(Command::Census) => {
+            let root = DataRoot::discover()?;
+            root.validate(false)?;
+            println!(
+                "{}",
+                agrep_core::json_output::to_string(&agrep_core::freshness::pending(&root)?)?
+            );
+            Ok(0)
+        }
         Some(Command::Hook { agent }) => {
             use std::io::Read;
             let mut input = String::new();
@@ -604,6 +645,7 @@ fn main() {
         "ui",
         "serve",
         "__work",
+        "__census",
         "__hook",
     ];
     let mut first_at = 1;

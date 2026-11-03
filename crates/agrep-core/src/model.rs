@@ -51,6 +51,7 @@ pub struct Message {
 /// The mutable form the adapters build while parsing one file (replies stream in as
 /// appends, models backfill). `freeze` converts to the shared form exactly once, when
 /// the parse is done - so the Arc fields never need in-place mutation.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RawMessage {
     pub agent: &'static str,
     pub project: String,
@@ -153,6 +154,8 @@ pub struct Event {
     pub session: String,
     /// Epoch milliseconds; 0 if unknown.
     pub ts: i64,
+    /// Source-native turn when the parser can attribute the call by record order.
+    pub turn: Option<u32>,
     /// "tool" | "control" | "subagent_start" | "subagent_result".
     pub kind: &'static str,
     /// Tool name ("Bash", "shell", "run_command") or subagent title/sender.
@@ -182,4 +185,127 @@ pub struct Event {
     /// The task-list facts a todo/plan/task call carried, as compact JSON kept whole past the
     /// display cap (`ingest::task_state`, `ingest::task_listing`); empty for every other call.
     pub state: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OwnedRawMessage {
+    agent: String,
+    project: String,
+    session: String,
+    ts: i64,
+    turn: u32,
+    text: String,
+    model: String,
+    reply: String,
+    reply_chars: usize,
+    reply_shape: ReplyShape,
+    side: bool,
+    parent: String,
+}
+impl TryFrom<OwnedRawMessage> for RawMessage {
+    type Error = String;
+    fn try_from(v: OwnedRawMessage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agent: match v.agent.as_str() {
+                "claude" => "claude",
+                "codex" => "codex",
+                "pi" => "pi",
+                "gemini" => "gemini",
+                "opencode" => "opencode",
+                "cursor" => "cursor",
+                "crush" => "crush",
+                "cline" => "cline",
+                "kimi" => "kimi",
+                "antigravity" => "antigravity",
+                _ => return Err("invalid stored agent".into()),
+            },
+            project: v.project,
+            session: v.session,
+            ts: v.ts,
+            turn: v.turn,
+            text: v.text,
+            model: v.model,
+            reply: v.reply,
+            reply_chars: v.reply_chars,
+            reply_shape: v.reply_shape,
+            side: v.side,
+            parent: v.parent,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OwnedEvent {
+    agent: String,
+    session: String,
+    ts: i64,
+    #[serde(default)]
+    turn: Option<u32>,
+    kind: String,
+    name: String,
+    input: String,
+    output: String,
+    input_chars: usize,
+    output_chars: usize,
+    output_bytes: usize,
+    ok: Option<bool>,
+    call_id: String,
+    child_session: String,
+    meta: String,
+    state: String,
+}
+impl TryFrom<OwnedEvent> for Event {
+    type Error = String;
+    fn try_from(v: OwnedEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agent: match v.agent.as_str() {
+                "claude" => "claude",
+                "codex" => "codex",
+                "pi" => "pi",
+                "gemini" => "gemini",
+                "opencode" => "opencode",
+                "cursor" => "cursor",
+                "crush" => "crush",
+                "cline" => "cline",
+                "kimi" => "kimi",
+                "antigravity" => "antigravity",
+                _ => return Err("invalid stored agent".into()),
+            },
+            session: v.session,
+            ts: v.ts,
+            turn: v.turn,
+            kind: match v.kind.as_str() {
+                "tool" => "tool",
+                "control" => "control",
+                "subagent_start" => "subagent_start",
+                "subagent_result" => "subagent_result",
+                _ => return Err("invalid stored kind".into()),
+            },
+            name: v.name,
+            input: v.input,
+            output: v.output,
+            input_chars: v.input_chars,
+            output_chars: v.output_chars,
+            output_bytes: v.output_bytes,
+            ok: v.ok,
+            call_id: v.call_id,
+            child_session: v.child_session,
+            meta: v.meta,
+            state: v.state,
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let owned = <OwnedRawMessage as serde::Deserialize>::deserialize(d)?;
+        owned.try_into().map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Event {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let owned = <OwnedEvent as serde::Deserialize>::deserialize(d)?;
+        owned.try_into().map_err(serde::de::Error::custom)
+    }
 }

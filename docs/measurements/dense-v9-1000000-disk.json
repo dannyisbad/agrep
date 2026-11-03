@@ -1,0 +1,9 @@
+{
+  "minimum_free_bytes": 9353904128,
+  "peak_data_bytes": 1538790457,
+  "other_worktree_bytes": 73955271,
+  "data_budget_bytes": 5850000000,
+  "elapsed_ms": 97222.39729099965,
+  "exit_code": 1,
+  "stop_reason": null
+}

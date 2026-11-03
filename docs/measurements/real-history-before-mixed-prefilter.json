@@ -1,0 +1,653 @@
+{
+  "index_bytes": 4639899661,
+  "requested_rows": 100000,
+  "source_bytes": 0,
+  "cases": [
+    {
+      "median_ms": 601253.6257079999,
+      "name": "first_index",
+      "args": [
+        "index"
+      ],
+      "samples": 1,
+      "min_ms": 601253.6257079999,
+      "max_ms": 601253.6257079999,
+      "exit_code_counts": {
+        "0": 1
+      },
+      "phases": {
+        "bounds_ms": 146054.070792,
+        "census_ms": 162.940834,
+        "changed_rows": 1483260,
+        "errors": 1,
+        "parse_ms": 11449.275,
+        "parsed": 10425,
+        "sources": 10425,
+        "stats_ms": 5382.355166,
+        "total_ms": 601138.210458,
+        "write_ms": 437310.914208
+      }
+    },
+    {
+      "median_ms": 169.213,
+      "name": "no_change_census",
+      "args": [
+        "index"
+      ],
+      "samples": 5,
+      "min_ms": 159.76295900000002,
+      "max_ms": 4745.870958,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {
+        "bounds_ms": 0.0,
+        "census_ms": 141.98775,
+        "changed_rows": 0,
+        "errors": 0,
+        "parse_ms": 0.0,
+        "parsed": 0,
+        "sources": 10425,
+        "stats_ms": 0.0,
+        "total_ms": 151.491375,
+        "write_ms": 0.0
+      }
+    },
+    {
+      "median_ms": 770.7391660000001,
+      "name": "release",
+      "args": [
+        "release workflow"
+      ],
+      "samples": 5,
+      "min_ms": 752.3266659999999,
+      "max_ms": 774.799625,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 1181.278625,
+      "name": "error",
+      "args": [
+        "error"
+      ],
+      "samples": 5,
+      "min_ms": 1150.275416,
+      "max_ms": 1680.660459,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 86004.995583,
+      "name": "natural",
+      "args": [
+        "how did the drafting go last run"
+      ],
+      "samples": 5,
+      "min_ms": 85629.700333,
+      "max_ms": 88196.607208,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 522.1703749999999,
+      "name": "flaky",
+      "args": [
+        "flaky windows cache"
+      ],
+      "samples": 5,
+      "min_ms": 503.703792,
+      "max_ms": 1276.145833,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 165.56925,
+      "name": "rare",
+      "args": [
+        "zzperfnever_7f91c44"
+      ],
+      "samples": 5,
+      "min_ms": 155.857625,
+      "max_ms": 169.193334,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 2505.843,
+      "name": "short",
+      "args": [
+        "hi"
+      ],
+      "samples": 5,
+      "min_ms": 2480.051125,
+      "max_ms": 2524.990708,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 319.280167,
+      "name": "regex",
+      "args": [
+        "-E",
+        "release.*workflow"
+      ],
+      "samples": 5,
+      "min_ms": 310.602375,
+      "max_ms": 328.681834,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 1920.879,
+      "name": "list",
+      "args": [
+        "release workflow",
+        "-l"
+      ],
+      "samples": 5,
+      "min_ms": 1908.7046249999999,
+      "max_ms": 1945.756459,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 747.099041,
+      "name": "json",
+      "args": [
+        "release workflow",
+        "--json"
+      ],
+      "samples": 5,
+      "min_ms": 727.900584,
+      "max_ms": 760.048542,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {},
+      "work": {
+        "blocks": 348,
+        "examined": 958
+      },
+      "completeness": {
+        "shown": 40,
+        "total": 273
+      }
+    },
+    {
+      "median_ms": 10381.600208,
+      "name": "count",
+      "args": [
+        "error",
+        "-c"
+      ],
+      "samples": 5,
+      "min_ms": 10348.435958,
+      "max_ms": 11150.716833,
+      "exit_code_counts": {
+        "0": 5
+      }
+    },
+    {
+      "median_ms": 297.940875,
+      "name": "rare_hit",
+      "args": [
+        "000d"
+      ],
+      "samples": 5,
+      "min_ms": 286.463042,
+      "max_ms": 306.264625,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 740.566875,
+      "name": "compact_release",
+      "args": [
+        "release workflow"
+      ],
+      "samples": 5,
+      "min_ms": 736.7307910000001,
+      "max_ms": 752.5631659999999,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 1150.468875,
+      "name": "compact_error",
+      "args": [
+        "error"
+      ],
+      "samples": 5,
+      "min_ms": 1131.278,
+      "max_ms": 1166.864458,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 106468.932583,
+      "name": "compact_natural",
+      "args": [
+        "how did the drafting go last run"
+      ],
+      "samples": 5,
+      "min_ms": 85624.784125,
+      "max_ms": 123107.005041,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 740.784667,
+      "name": "compact_flaky",
+      "args": [
+        "flaky windows cache"
+      ],
+      "samples": 5,
+      "min_ms": 726.5873750000001,
+      "max_ms": 757.865083,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 226.914958,
+      "name": "compact_rare",
+      "args": [
+        "zzperfnever_7f91c44"
+      ],
+      "samples": 5,
+      "min_ms": 221.499375,
+      "max_ms": 231.241166,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 378.20112500000005,
+      "name": "rare_hit_pi_filtered",
+      "args": [
+        "000d",
+        "--agent",
+        "pi",
+        "--since",
+        "90d"
+      ],
+      "samples": 5,
+      "min_ms": 368.829834,
+      "max_ms": 410.038292,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 597.186541,
+      "name": "release_filtered",
+      "args": [
+        "release workflow",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 576.264709,
+      "max_ms": 618.863666,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 416.945083,
+      "name": "error_filtered",
+      "args": [
+        "error",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 399.744083,
+      "max_ms": 506.055625,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 636.3355,
+      "name": "natural_filtered",
+      "args": [
+        "how did the drafting go last run",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 599.204917,
+      "max_ms": 674.7995,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 593.689417,
+      "name": "flaky_filtered",
+      "args": [
+        "flaky windows cache",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 553.181917,
+      "max_ms": 641.6518329999999,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 561.254083,
+      "name": "rare_filtered",
+      "args": [
+        "zzperfnever_7f91c44",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 494.465333,
+      "max_ms": 575.444125,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 421.996875,
+      "name": "short_filtered",
+      "args": [
+        "hi",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 408.15475000000004,
+      "max_ms": 438.750917,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 177.037791,
+      "name": "regex_filtered",
+      "args": [
+        "-E",
+        "release.*workflow",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 176.563333,
+      "max_ms": 183.299625,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 560.2196670000001,
+      "name": "list_filtered",
+      "args": [
+        "release workflow",
+        "-l",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 532.846166,
+      "max_ms": 576.999083,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 578.4113749999999,
+      "name": "json_filtered",
+      "args": [
+        "release workflow",
+        "--json",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 570.472791,
+      "max_ms": 600.142708,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {},
+      "work": {
+        "blocks": 4,
+        "examined": 4138
+      },
+      "completeness": {
+        "shown": 30,
+        "total": 30
+      }
+    },
+    {
+      "median_ms": 337.720292,
+      "name": "count_filtered",
+      "args": [
+        "error",
+        "-c",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 334.678959,
+      "max_ms": 349.819,
+      "exit_code_counts": {
+        "0": 5
+      }
+    },
+    {
+      "median_ms": 557.3062090000001,
+      "name": "rare_hit_filtered",
+      "args": [
+        "000d",
+        "--agent",
+        "codex",
+        "--since",
+        "14d"
+      ],
+      "samples": 5,
+      "min_ms": 504.964666,
+      "max_ms": 590.06625,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 793.7551659999999,
+      "name": "tool_error",
+      "args": [
+        "error",
+        "--who",
+        "tool",
+        "--json"
+      ],
+      "samples": 5,
+      "min_ms": 786.54975,
+      "max_ms": 828.816333,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {},
+      "work": {
+        "blocks": 105,
+        "examined": 6816
+      },
+      "completeness": {
+        "shown": 40,
+        "total": 6793
+      }
+    },
+    {
+      "median_ms": 1373.2626670000002,
+      "name": "all_error",
+      "samples": 5,
+      "min_ms": 1315.305875,
+      "max_ms": 1761.3960829999999,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {},
+      "work": {
+        "blocks": 40,
+        "examined": 1645
+      },
+      "completeness": {
+        "shown": 40,
+        "total": 1644
+      }
+    },
+    {
+      "median_ms": 8.457042,
+      "name": "recall",
+      "args": [
+        "recall",
+        "release workflow"
+      ],
+      "samples": 5,
+      "min_ms": 7.9774579999999995,
+      "max_ms": 9.76275,
+      "exit_code_counts": {
+        "2": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 7.710958000000001,
+      "name": "pack",
+      "args": [
+        "pack",
+        "release workflow",
+        "flaky windows cache"
+      ],
+      "samples": 5,
+      "min_ms": 7.569208,
+      "max_ms": 7.887665999999999,
+      "exit_code_counts": {
+        "2": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 7.3847499999999995,
+      "name": "chats",
+      "args": [
+        "chats"
+      ],
+      "samples": 5,
+      "min_ms": 7.202167,
+      "max_ms": 7.433166,
+      "exit_code_counts": {
+        "2": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 203.35737500000002,
+      "name": "status",
+      "args": [
+        "status"
+      ],
+      "samples": 5,
+      "min_ms": 194.617834,
+      "max_ms": 234.131125,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 6.9447909999999995,
+      "name": "around",
+      "samples": 5,
+      "min_ms": 6.599375,
+      "max_ms": 8.303125,
+      "exit_code_counts": {
+        "2": 5
+      },
+      "phases": {}
+    },
+    {
+      "median_ms": 6.547916,
+      "name": "version_control",
+      "args": [
+        "--version"
+      ],
+      "samples": 5,
+      "min_ms": 6.4047920000000005,
+      "max_ms": 6.892167000000001,
+      "exit_code_counts": {
+        "0": 5
+      },
+      "phases": {}
+    }
+  ],
+  "corpus": {
+    "prose": 130298,
+    "sessions": 7633,
+    "source_errors": 1,
+    "tools": 1068033
+  }
+}

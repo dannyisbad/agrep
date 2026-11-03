@@ -676,6 +676,7 @@ fn parse_session(
                         }
                         tally.event();
                         events.push(Event {
+                            turn: None,
                             agent: "crush",
                             session: session.to_string(),
                             ts: created_at,

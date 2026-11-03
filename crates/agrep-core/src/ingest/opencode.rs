@@ -638,6 +638,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
         };
         tally.event();
         events.push(Event {
+            turn: None,
             agent: "opencode",
             session: r.session_id,
             ts: r.p_ts,
@@ -685,6 +686,7 @@ fn collect_db(path: &std::path::Path) -> (Vec<Message>, Vec<Event>, ReadOutcome)
                     tally.agent_row();
                     tally.event();
                     events.push(Event {
+                        turn: None,
                         agent: "opencode",
                         session: parent,
                         ts,

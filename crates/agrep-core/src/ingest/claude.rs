@@ -402,6 +402,7 @@ fn push_task_notifications(
         }
         tally.event();
         events.push(Event {
+            turn: None,
             agent: "claude",
             session: session.to_string(),
             ts,
@@ -563,8 +564,9 @@ fn primary_project(
     paths: &[String],
     first_cwd: &str,
     fallback: &str,
+    votes: &mut HashMap<String, usize>,
 ) -> String {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut counts = std::mem::take(votes);
     for (c, n) in cwd_counts {
         if let Some(k) = project_root(c) {
             *counts.entry(k).or_insert(0) += n;
@@ -578,6 +580,7 @@ fn primary_project(
             }
         }
     }
+    *votes = counts.clone();
     // ties break on name so re-ingest is deterministic
     if let Some((k, _)) = counts
         .into_iter()
@@ -667,10 +670,6 @@ fn parse_file_with_tally(
     path: &Path,
     tally: std::sync::Arc<crate::intake::Tally>,
 ) -> (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome) {
-    // Child transcript lines carry the PARENT's sessionId; the file stem is the
-    // child identity and must not be overridden by it.
-    let mut side_parent = side_context(path);
-    let is_side = side_parent.is_some();
     let data = match crate::ingest::read_lossy(path) {
         Ok(d) => d,
         Err(e) => {
@@ -690,6 +689,53 @@ fn parse_file_with_tally(
             );
         }
     };
+    parse_data(path, tally, &data, None).0
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ClaudeState {
+    out: Vec<crate::model::RawMessage>,
+    recap_turns: Vec<u32>,
+    events: Vec<Event>,
+    order: crate::ingest::ReplyOrder,
+    pending: HashMap<String, usize>,
+    turn: u32,
+    first_cwd: String,
+    project_votes: HashMap<String, usize>,
+    side_parent: Option<String>,
+    ordinal: usize,
+}
+pub(crate) fn resume_parse(
+    path: &Path,
+    data: &str,
+    previous: Option<&str>,
+) -> anyhow::Result<(
+    Vec<Message>,
+    Vec<Event>,
+    crate::intake_batch::ReadOutcome,
+    String,
+)> {
+    let state = previous.map(serde_json::from_str).transpose()?;
+    let ((m, e, o), next) = parse_data(path, crate::intake::file("claude", path), data, state);
+    Ok((m, e, o, serde_json::to_string(&next)?))
+}
+fn parse_data(
+    path: &Path,
+    tally: std::sync::Arc<crate::intake::Tally>,
+    data: &str,
+    previous: Option<ClaudeState>,
+) -> (
+    (Vec<Message>, Vec<Event>, crate::intake_batch::ReadOutcome),
+    ClaudeState,
+) {
+    let resumed = previous.is_some();
+    let state = previous.unwrap_or_default();
+    let mut side_parent = if resumed {
+        state.side_parent.clone()
+    } else {
+        side_context(path)
+    };
+    let is_side = side_parent.is_some();
     if is_throwaway_path(path) {
         // Keep byte-for-byte parity with audit's binary `line.strip()` census:
         // ASCII-whitespace-only lines are blank; non-ASCII bytes remain records.
@@ -700,23 +746,28 @@ fn parse_file_with_tally(
         tally.seen_n(records);
         tally.skip_n(crate::intake::Skip::Throwaway, records);
         return (
-            Vec::new(),
-            Vec::new(),
-            crate::intake_batch::ReadOutcome::Complete,
+            (
+                Vec::new(),
+                Vec::new(),
+                crate::intake_batch::ReadOutcome::Complete,
+            ),
+            state,
         );
     }
     let file_session = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mut out: Vec<crate::model::RawMessage> = Vec::new();
-    let mut recap_turns = Vec::new();
-    let mut events: Vec<Event> = Vec::new();
-    let mut order = crate::ingest::ReplyOrder::new();
+    let mut out = state.out;
+    let mut recap_turns = state.recap_turns;
+    let mut events = state.events;
+    let mut order = state.order;
     // tool_use id -> index into `events`, so the later tool_result line can pair up.
-    let mut pending: HashMap<String, usize> = HashMap::new();
-    let mut turn = 0u32;
-    let mut first_cwd = String::new();
+    let mut pending = state.pending;
+    let mut turn = state.turn;
+    let ordinal = state.ordinal;
+    let mut project_votes = state.project_votes;
+    let mut first_cwd = state.first_cwd;
     let mut cwd_counts: HashMap<String, usize> = HashMap::new();
     let mut tool_paths: Vec<String> = Vec::new();
     // Cheap key probes choose which borrowed schema to parse; attribution still comes from JSON.
@@ -727,7 +778,7 @@ fn parse_file_with_tally(
     // A side file's parent is decided ONCE, before any row is emitted: the first inner
     // sessionId (the parent's indexed identity, preferred since a dir stem can drift),
     // else the dir stem. A parent that flips mid-file splits one child across two ids.
-    if is_side {
+    if is_side && !resumed {
         let f_sess = memmem::Finder::new(b"\"sessionId\":\"");
         if let Some(pid) = data
             .lines()
@@ -740,7 +791,8 @@ fn parse_file_with_tally(
         Some(id) if !is_side => id.to_string(),
         _ => file_session.clone(),
     };
-    for (record_ordinal, line) in data.lines().enumerate() {
+    for (offset, line) in data.lines().enumerate() {
+        let record_ordinal = ordinal + offset;
         if line.is_empty() {
             continue;
         }
@@ -862,6 +914,7 @@ fn parse_file_with_tally(
                                 let state = crate::ingest::task_state(&name, b.get("input"));
                                 tally.event();
                                 events.push(Event {
+                                    turn: out.last().map(|m| m.turn),
                                     agent: "claude",
                                     session: session.clone(),
                                     ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
@@ -888,6 +941,7 @@ fn parse_file_with_tally(
                         let (input, input_chars) = cap_str_with_chars(error, EVENT_CAP);
                         tally.event();
                         events.push(Event {
+                            turn: out.last().map(|m| m.turn),
                             agent: "claude",
                             session: session.clone(),
                             ts: parse_timestamp::rfc3339(l.timestamp.as_deref()),
@@ -1064,6 +1118,7 @@ fn parse_file_with_tally(
         &tool_paths,
         &first_cwd,
         &directory_project(path),
+        &mut project_votes,
     );
     for m in &mut out {
         m.project = project.clone();
@@ -1078,21 +1133,42 @@ fn parse_file_with_tally(
     } else {
         crate::intake_batch::ReadOutcome::Complete
     };
-    (
-        out.into_iter()
-            .map(|raw| {
-                let turn = raw.turn;
-                let mut message = raw.freeze();
-                if recap_turns.binary_search(&turn).is_ok() {
-                    message.who = "recap".into();
-                    message.model_source = "recap".into();
-                }
-                message
-            })
+
+    let mut keep: Vec<_> = pending.values().copied().collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let next = ClaudeState {
+        out: out.last().cloned().into_iter().collect(),
+        recap_turns: out
+            .last()
+            .filter(|m| recap_turns.contains(&m.turn))
+            .map(|m| vec![m.turn])
+            .unwrap_or_default(),
+        events: keep.iter().map(|i| events[*i].clone()).collect(),
+        order: order.checkpoint(&events, &keep),
+        pending: pending
+            .into_iter()
+            .map(|(id, i)| (id, keep.binary_search(&i).unwrap()))
             .collect(),
-        events,
-        read_outcome,
-    )
+        turn,
+        first_cwd,
+        project_votes,
+        side_parent,
+        ordinal: ordinal + data.lines().count(),
+    };
+    let messages = out
+        .into_iter()
+        .map(|raw| {
+            let turn = raw.turn;
+            let mut m = raw.freeze();
+            if recap_turns.contains(&turn) {
+                m.who = "recap".into();
+                m.model_source = "recap".into();
+            }
+            m
+        })
+        .collect();
+    ((messages, events, read_outcome), next)
 }
 
 /// Walk all real project dirs and collect the user's Claude messages + tool events.

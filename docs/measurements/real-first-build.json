@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "median_ms": 655267.071583,
+      "name": "first_index",
+      "args": [
+        "index"
+      ],
+      "samples": 1,
+      "min_ms": 655267.071583,
+      "max_ms": 655267.071583,
+      "exit_code_counts": {
+        "0": 1
+      },
+      "phases": {
+        "bounds_ms": 307737.95825,
+        "census_ms": 193.297208,
+        "changed_rows": 1481555,
+        "errors": 1,
+        "parse_ms": 14881.933667,
+        "parsed": 10413,
+        "sources": 10413,
+        "stats_ms": 8897.574083,
+        "total_ms": 655193.799208,
+        "write_ms": 322647.690292
+      }
+    }
+  ]
+}

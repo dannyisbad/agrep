@@ -168,8 +168,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             })
             .max(queries.len())
     };
-    let root = ready(no_auto)?;
-    semantic::schedule(&root)?;
+    let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let mut semantic_coverage = None;
     let mut semantic_ran = false;
@@ -289,6 +288,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                     .is_some_and(|who| who.split(',').any(|w| w == "tool")),
             filters: filters.clone(),
         };
+        let options = caller::options(&options, &caller, include_self, a.scope.no_self);
         let lane = if !semantic_failed
             && (a.semantic
                 || (!a.lexical
@@ -311,21 +311,11 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             caller::search(&c, &options, &caller, include_self, a.scope.no_self)?
         };
         let r = if let Some(lane) = lane {
-            match lane.and_then(|work| {
-                caller::scoped(&c, &caller, include_self, a.scope.no_self, || {
-                    semantic::finish(&c, work)
-                })
-            }) {
+            match lane.and_then(|work| semantic::finish(&c, work)) {
                 Ok(mut found) => {
                     semantic_ran = true;
                     semantic_coverage = Some(found.coverage);
-                    caller::filter_results(
-                        &c,
-                        &mut found.result,
-                        &caller,
-                        include_self,
-                        a.scope.no_self,
-                    )?;
+                    caller::decorate_semantic(&c, &mut found.result, &caller)?;
                     if a.semantic {
                         found.result
                     } else {
@@ -468,6 +458,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     if !a.json {
         agrep_core::coverage::disclose(&coverage);
     }
+    let pending_sources = crate::finish_census(&root, census)?;
     let checked = agrep_core::render::checked(no_auto);
     let exit = if blocks.is_empty() {
         if checked {
@@ -543,7 +534,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     }
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
     if a.json {
-        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(include_self,a.scope.no_self),"filter_coverage":coverage,"freshness":render::freshness(checked,0),"semantic_coverage":semantic_coverage});
+        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(include_self,a.scope.no_self),"filter_coverage":coverage,"freshness":render::freshness(checked,pending_sources),"semantic_coverage":semantic_coverage});
         if override_filters {
             value["filter_override"] = json!({"supplied":direct_filters,"reason":"direct-handle"});
         }

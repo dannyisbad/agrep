@@ -265,6 +265,7 @@ fn collect_mailbox(brain_dir: &Path, session: &str, evts: &mut Vec<Event>) -> bo
         tally.agent_row();
         tally.event();
         evts.push(Event {
+            turn: None,
             agent: "antigravity",
             session: session.to_string(),
             ts,
@@ -411,6 +412,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                     tally.event();
                     worked |= !crate::ingest::is_bookkeeping_tool(&name);
                     evts.push(Event {
+                        turn: None,
                         agent: "antigravity",
                         session: session.clone(),
                         ts: parse_timestamp::rfc3339(e.created_at.as_deref()),
@@ -448,6 +450,7 @@ fn parse_session(brain_dir: &Path) -> (Vec<Message>, Vec<Event>, bool) {
                         .map(|s| cap_str_with_chars(s, EVENT_CAP))
                         .unwrap_or_default();
                     evts.push(Event {
+                        turn: None,
                         agent: "antigravity",
                         session: session.clone(),
                         ts: parse_timestamp::rfc3339(e.created_at.as_deref()),

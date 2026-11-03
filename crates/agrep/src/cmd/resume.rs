@@ -24,9 +24,10 @@ pub fn run(
     if list && reference.is_some() {
         bail!("--list cannot be combined with a reference")
     }
-    let root = ready(no_auto)?;
+    let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let all = h::sessions(&c)?;
+    crate::finish_census(&root, census)?;
     let (mut selected, human) = if let Some(reference) = reference.as_ref() {
         h::resolve_indexed(&c, &all, reference)?
     } else {

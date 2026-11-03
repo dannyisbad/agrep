@@ -1,0 +1,9 @@
+{
+  "tests": 264,
+  "failed": 0,
+  "ignored": 0,
+  "test_targets": 14,
+  "privacy_clean": true,
+  "skip_policy_clean": true,
+  "licenses_match": true
+}

@@ -1,4 +1,4 @@
-use crate::{compact, ready, Search};
+use crate::{compact, finish_census, ready, Search};
 use agrep_core::{
     caller, hybrid,
     query::Options,
@@ -8,12 +8,25 @@ use agrep_core::{
 use anyhow::{bail, Result};
 use std::io::IsTerminal;
 pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
+    if s.coverage
+        && (s.json
+            || s.flat
+            || s.count
+            || s.count_by_tier
+            || s.chats
+            || s.semantic
+            || s.lexical
+            || s.regex
+            || s.word
+            || s.sort != "score")
+    {
+        bail!("--coverage requires a default keyword score query without machine output");
+    }
     if s.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
     }
-    let root = ready(no_auto)?;
-    semantic::schedule(&root)?;
+    let (root, census) = ready(no_auto)?;
     let c = store::reader(&root)?;
     let mut f = s.scope.filters()?;
     agrep_core::coverage::validate(&mut f)?;
@@ -59,6 +72,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         filters: f.clone(),
     };
     let include_self = s.scope.include_self || (s.scope.chat.is_some() && !s.scope.no_self);
+    let options = caller::options(&options, &caller, include_self, s.scope.no_self);
     let automatic = !s.semantic
         && !s.lexical
         && !s.regex
@@ -87,20 +101,10 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         caller::search(&c, &options, &caller, include_self, s.scope.no_self)?
     };
-    let (result, semantic_coverage) = if let Some(lane) = lane {
-        match lane.and_then(|work| {
-            caller::scoped(&c, &caller, include_self, s.scope.no_self, || {
-                semantic::finish(&c, work)
-            })
-        }) {
+    let (mut result, semantic_coverage) = if let Some(lane) = lane {
+        match lane.and_then(|work| semantic::finish(&c, work)) {
             Ok(mut found) => {
-                caller::filter_results(
-                    &c,
-                    &mut found.result,
-                    &caller,
-                    include_self,
-                    s.scope.no_self,
-                )?;
+                caller::decorate_semantic(&c, &mut found.result, &caller)?;
                 let result = if s.semantic {
                     found.result
                 } else {
@@ -183,6 +187,22 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         }
     }
     full_argv.extend(["--".into(), pattern.clone()]);
+    let coverage_hits = if s.coverage {
+        let mut recovered = agrep_core::query::coverage(&c, &options)?;
+        recovered.hits.retain(|h| {
+            !result.hits.iter().any(|old| {
+                old.agent == h.agent
+                    && old.session == h.session
+                    && old.turn == h.turn
+                    && old.who == h.who
+            })
+        });
+        Some(recovered)
+    } else {
+        None
+    };
+    let pending_sources = finish_census(&root, census)?;
+    result.pending_sources = pending_sources;
     let style = Style {
         json: s.json,
         flat: s.flat
@@ -206,9 +226,28 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             caller.metadata(s.scope.include_self, s.scope.no_self)
         },
         filter_coverage: coverage.clone(),
-        pending_sources: 0,
+        pending_sources,
     };
     render::emit_semantic(&result, &pattern, &f, &style, semantic_coverage.as_ref())?;
+    if let Some(recovered) = coverage_hits {
+        eprintln!(
+            "coverage lane (forced): {} additional rows",
+            recovered.hits.len()
+        );
+        agrep_core::surface::line("coverage recovery (partial term matches):")?;
+        if recovered.hits.is_empty() {
+            agrep_core::surface::line("no additional evidence")?;
+        }
+        for hit in recovered.hits {
+            agrep_core::surface::line(&format!(
+                "{} {} {}: {}",
+                hit.handle,
+                hit.agent,
+                hit.who,
+                agrep_core::surface::safe(&hit.snippet, false)
+            ))?;
+        }
+    }
     if !s.json {
         if let Some(coverage) = &semantic_coverage {
             if s.semantic || s.coverage || coverage.partial() {

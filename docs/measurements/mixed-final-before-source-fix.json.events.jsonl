@@ -1,0 +1,39 @@
+{"median_ms":11310.32925,"name":"first_index","args":["index"],"samples":1,"min_ms":11310.32925,"max_ms":11310.32925,"exit_code_counts":{"0":1},"phases":{"bounds_ms":1929.599709,"census_ms":5.387958,"changed_rows":100000,"errors":0,"parse_ms":161.548917,"parsed":588,"sources":588,"stats_ms":918.827958,"total_ms":11257.31975,"write_ms":7454.586209}}
+{"median_ms":14.001415999999999,"name":"no_change_census","args":["index"],"samples":5,"min_ms":13.713375,"max_ms":15.550708,"exit_code_counts":{"0":5},"phases":{"bounds_ms":0.0,"census_ms":4.579917,"changed_rows":0,"errors":0,"parse_ms":0.0,"parsed":0,"sources":588,"stats_ms":0.0,"total_ms":5.976209,"write_ms":0.0}}
+{"median_ms":49.6975,"name":"one_session_refresh","args":["index"],"samples":5,"min_ms":48.357166,"max_ms":55.6355,"exit_code_counts":{"0":5},"phases":{"bounds_ms":4.944541,"census_ms":4.656333,"changed_rows":1,"errors":0,"parse_ms":4.1962090000000005,"parsed":1,"sources":588,"stats_ms":11.938333,"total_ms":37.167166,"write_ms":4.958667}}
+{"median_ms":43.443000000000005,"name":"release","args":["release workflow"],"samples":5,"min_ms":42.675625000000004,"max_ms":45.051415999999996,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":23.11225,"name":"error","args":["error"],"samples":5,"min_ms":21.874375,"max_ms":24.0825,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":19.365541,"name":"natural","args":["how did the drafting go last run"],"samples":5,"min_ms":19.04925,"max_ms":21.925583,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":3531.205125,"name":"flaky","args":["flaky windows cache"],"samples":5,"min_ms":3489.281875,"max_ms":4022.3027079999997,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":18.354374999999997,"name":"rare","args":["zzperfnever_7f91c44"],"samples":5,"min_ms":16.502042000000003,"max_ms":21.213875,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":66.376458,"name":"short","args":["hi"],"samples":5,"min_ms":65.527542,"max_ms":70.24437499999999,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":401.01512499999995,"name":"regex","args":["-E","release.*workflow"],"samples":5,"min_ms":399.112542,"max_ms":420.75875,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":128.849334,"name":"list","args":["release workflow","-l"],"samples":5,"min_ms":126.29124999999999,"max_ms":129.911959,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":43.679084,"name":"json","args":["release workflow","--json"],"samples":5,"min_ms":42.495791999999994,"max_ms":45.478708,"exit_code_counts":{"0":5},"phases":{},"work":{"blocks":25,"examined":298},"completeness":{"shown":40,"total":298}}
+{"median_ms":5114.1675,"name":"count","args":["error","-c"],"samples":5,"min_ms":5003.87475,"max_ms":5299.3435,"exit_code_counts":{"0":5}}
+{"median_ms":20.125084,"name":"rare_hit","args":["000d"],"samples":5,"min_ms":19.776417000000002,"max_ms":22.006,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":43.702541999999994,"name":"compact_release","args":["release workflow"],"samples":5,"min_ms":42.996624999999995,"max_ms":44.759333,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":23.120167000000002,"name":"compact_error","args":["error"],"samples":5,"min_ms":21.245542,"max_ms":23.595209,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":2448.969834,"name":"compact_natural","args":["how did the drafting go last run"],"samples":5,"min_ms":2435.291959,"max_ms":2832.418708,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":3555.323583,"name":"compact_flaky","args":["flaky windows cache"],"samples":5,"min_ms":3479.510916,"max_ms":3929.3899579999998,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":18.306917,"name":"compact_rare","args":["zzperfnever_7f91c44"],"samples":5,"min_ms":17.238540999999998,"max_ms":21.2975,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":22.327541,"name":"rare_hit_pi_filtered","args":["000d","--agent","pi","--since","90d"],"samples":5,"min_ms":20.953958,"max_ms":27.580791,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":20.340291999999998,"name":"release_filtered","args":["release workflow","--agent","codex","--since","14d"],"samples":5,"min_ms":17.804667,"max_ms":26.301542,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":19.283166,"name":"error_filtered","args":["error","--agent","codex","--since","14d"],"samples":5,"min_ms":18.190583999999998,"max_ms":23.483541,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":21.604833,"name":"natural_filtered","args":["how did the drafting go last run","--agent","codex","--since","14d"],"samples":5,"min_ms":20.224958,"max_ms":40.745749999999994,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":17.847125,"name":"flaky_filtered","args":["flaky windows cache","--agent","codex","--since","14d"],"samples":5,"min_ms":17.094875,"max_ms":20.869125,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":16.458416,"name":"rare_filtered","args":["zzperfnever_7f91c44","--agent","codex","--since","14d"],"samples":5,"min_ms":15.515457999999999,"max_ms":16.978791,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":15.537291999999999,"name":"short_filtered","args":["hi","--agent","codex","--since","14d"],"samples":5,"min_ms":14.821375,"max_ms":21.241625,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":15.646166,"name":"regex_filtered","args":["-E","release.*workflow","--agent","codex","--since","14d"],"samples":5,"min_ms":15.035125,"max_ms":23.573292,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":16.523166,"name":"list_filtered","args":["release workflow","-l","--agent","codex","--since","14d"],"samples":5,"min_ms":15.798625,"max_ms":16.998208,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":15.695167,"name":"json_filtered","args":["release workflow","--json","--agent","codex","--since","14d"],"samples":5,"min_ms":14.963041,"max_ms":16.746042,"exit_code_counts":{"1":5},"phases":{},"work":{"blocks":4,"examined":0},"completeness":{"shown":0,"total":0}}
+{"median_ms":14.797666,"name":"count_filtered","args":["error","-c","--agent","codex","--since","14d"],"samples":5,"min_ms":14.486083,"max_ms":20.883083,"exit_code_counts":{"1":5}}
+{"median_ms":18.699167,"name":"rare_hit_filtered","args":["000d","--agent","codex","--since","14d"],"samples":5,"min_ms":15.448375,"max_ms":20.214208,"exit_code_counts":{"1":5},"phases":{}}
+{"median_ms":503.391084,"name":"tool_error","args":["error","--who","tool","--json"],"samples":5,"min_ms":495.244875,"max_ms":504.58704200000005,"exit_code_counts":{"0":5},"phases":{},"work":{"blocks":43,"examined":15253},"completeness":{"shown":40,"total":15253}}
+{"median_ms":23.336375,"name":"all_error","samples":5,"min_ms":22.611958,"max_ms":25.852625,"exit_code_counts":{"0":5},"phases":{},"work":{"blocks":3,"examined":769},"completeness":{"shown":40,"total":769}}
+{"median_ms":6.998749999999999,"name":"recall","args":["recall","release workflow"],"samples":5,"min_ms":6.567082999999999,"max_ms":7.263707999999999,"exit_code_counts":{"2":5},"phases":{}}
+{"median_ms":7.113208,"name":"pack","args":["pack","release workflow","flaky windows cache"],"samples":5,"min_ms":7.054917,"max_ms":7.2625,"exit_code_counts":{"2":5},"phases":{}}
+{"median_ms":7.335,"name":"chats","args":["chats"],"samples":5,"min_ms":6.534208,"max_ms":7.730583,"exit_code_counts":{"2":5},"phases":{}}
+{"median_ms":15.935457999999999,"name":"status","args":["status"],"samples":5,"min_ms":15.37025,"max_ms":16.408834000000002,"exit_code_counts":{"0":5},"phases":{}}
+{"median_ms":7.1145000000000005,"name":"around","samples":5,"min_ms":6.533334,"max_ms":7.428291,"exit_code_counts":{"2":5},"phases":{}}
+{"median_ms":7.096458,"name":"version_control","args":["--version"],"samples":5,"min_ms":6.679416,"max_ms":7.823625000000001,"exit_code_counts":{"0":5},"phases":{}}

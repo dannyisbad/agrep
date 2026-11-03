@@ -1,0 +1,4 @@
+{
+  "search_operators": 0,
+  "scan_operators": 0
+}

@@ -430,6 +430,7 @@ fn parse_task(dir: &Path, meta: Option<&TaskMeta>) -> DetailedRead {
                         }
                         tally.event();
                         events.push(Event {
+                            turn: None,
                             agent: "cline",
                             session: task_id.clone(),
                             ts,

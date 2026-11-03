@@ -473,6 +473,7 @@ fn emit_messages<'a>(
                         };
                         tally.event();
                         events.push(Event {
+                            turn: None,
                             agent: "gemini",
                             session: session.to_string(),
                             ts,
@@ -1899,8 +1900,7 @@ impl Projects {
             }
         }
         for path in paths {
-            use sha2::Digest;
-            let hash = format!("{:x}", sha2::Sha256::digest(path.as_bytes()));
+            let hash = crate::store::digest(&path);
             projects
                 .entry(hash)
                 .or_insert_with(|| crate::ingest::project_name(&path));

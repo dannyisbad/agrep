@@ -1,15 +1,22 @@
 use agrep_core::{data::DataRoot, diagnostics, render};
 use anyhow::Result;
-pub fn run(json: bool) -> Result<i32> {
+pub fn run(json: bool, no_auto: bool) -> Result<i32> {
     let root = DataRoot::discover()?;
     if root.path().join("FORMAT").exists()
         || root.path().is_dir() && std::fs::read_dir(root.path())?.next().is_some()
     {
         root.validate(false)?;
     }
-    let s = diagnostics::status(&root)?;
-    if s["index"]["state"] == "ready" {
-        agrep_core::semantic::schedule(&root)?;
+    let census = if root.db().exists() {
+        crate::ready(no_auto)?.1
+    } else {
+        None
+    };
+    let mut s = diagnostics::status(&root)?;
+    if root.db().exists() {
+        let pending = crate::finish_census(&root, census)?;
+        s["freshness"] = render::freshness(render::checked(no_auto), pending);
+        s["pending_sources"] = serde_json::json!(pending);
     }
     if json {
         println!("{}", agrep_core::json_output::to_string(&s)?)

@@ -798,6 +798,7 @@ fn tool_event(session: &str, bubble_id: &str, ts: i64, tf: &serde_json::Value) -
         _ => None,
     };
     Event {
+        turn: None,
         agent: "cursor",
         session: session.to_string(),
         ts,

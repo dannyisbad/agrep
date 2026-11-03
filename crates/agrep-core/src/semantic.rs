@@ -31,44 +31,10 @@ pub fn schedule(root: &DataRoot) -> Result<()> {
     {
         return Ok(());
     }
-    let Some(lock) = root.work_lock(false)? else {
-        return Ok(());
-    };
-    drop(lock);
-    let errors = crate::logging::open(root)?;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command
-        .arg("__work")
-        .env("AGREP_DATA_DIR", root.path())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(errors);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // A separate session has no controlling terminal and survives CLI exit.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getpriority(libc::PRIO_PROCESS, 0) < 10
-                    && libc::setpriority(libc::PRIO_PROCESS, 0, 10) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x00000008 | 0x00000200 | 0x00004000);
-    }
-    command.spawn()?;
+    crate::freshness::spawn(root, &std::env::current_exe()?)?;
     Ok(())
 }
+
 /// A single process holds work.lock, reuses weights, and commits every bounded batch.
 pub fn work(root: &DataRoot) -> Result<usize> {
     work_inner(root, false)
@@ -317,7 +283,9 @@ fn resolve_scan(
         })?;
         for row in rows {
             let (mut h, ordinal) = row?;
-            if !matches_filters(&h, o) {
+            if !matches_filters(&h, o)
+                || (o.filters.no_meta && crate::history_meta::is_meta(c, &h, &o.pattern)?)
+            {
                 continue;
             }
             let group = (
@@ -385,9 +353,11 @@ fn matches_filters(h: &Hit, o: &Options) -> bool {
     if f.who.is_none() && ["control", "synthetic", "recap", "harness"].contains(&h.who.as_str()) {
         return false;
     }
-    !f.agent
-        .as_ref()
-        .is_some_and(|s| !s.split(',').any(|a| a == h.agent))
+    query::caller_allows(f, h)
+        && !f
+            .agent
+            .as_ref()
+            .is_some_and(|s| !s.split(',').any(|a| a == h.agent))
         && !f
             .chat
             .as_ref()
@@ -591,10 +561,8 @@ mod tests {
         };
         let mut q = vec![0.; semantic_model::DIM];
         q[0] = 1.;
-        let result = crate::caller::scoped(&c, &caller, false, false, || {
-            search_vector(&r, &c, &options, false, &q)
-        })
-        .unwrap();
+        options = crate::caller::options(&options, &caller, false, false);
+        let result = search_vector(&r, &c, &options, false, &q).unwrap();
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].session, "session-1");
     }

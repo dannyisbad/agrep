@@ -139,12 +139,20 @@ pub struct Pass {
     pub messages: Vec<Message>,
     pub events: Vec<Event>,
 }
+#[derive(Default)]
 pub struct SourceBatch {
     pub key: String,
     pub agent: String,
     pub messages: Vec<Message>,
     pub events: Vec<Event>,
     pub error: Option<String>,
+    pub cursor: Option<Vec<u8>>,
+    pub nodes: Vec<crate::incremental::Node>,
+    pub append: bool,
+    pub reset_nodes: bool,
+    pub bytes_read: usize,
+    pub bytes_parsed: usize,
+    pub parse_ms: f64,
 }
 #[derive(Default)]
 pub struct IntakeBatch {
@@ -157,6 +165,8 @@ pub struct IntakeBatch {
     pub batches: Vec<SourceBatch>,
     pub issues: Vec<SourceReadIssue>,
     pub tokens: HashMap<String, String>,
+    pub cursors: HashMap<String, Vec<u8>>,
+    pub database: Option<PathBuf>,
 }
 impl IntakeBatch {
     pub fn preflight_source_paths(&self, root: &Path) -> Option<Vec<PathBuf>> {
@@ -214,6 +224,7 @@ impl IntakeBatch {
                 messages: m,
                 events: e,
                 error,
+                ..Default::default()
             });
         }
         Pass::default()
@@ -277,6 +288,7 @@ where
         .par_iter()
         .filter(|p| c.changed.contains(*p))
         .map(|path| {
+            let started = std::time::Instant::now();
             let meta = std::fs::metadata(path).ok();
             let mt = meta
                 .as_ref()
@@ -285,9 +297,35 @@ where
                 .unwrap_or(0);
             let len = meta.as_ref().map_or(0, |m| m.len());
             crate::intake::take_diagnostics();
+            let mut delta = None;
             let ((m, e, o), bad) = crate::intake::scoped(|| {
                 match crate::ingest::parse_guard::isolate(a, path, || {
-                    p(path, mt, len).into_parsed()
+                    if crate::incremental::supports(a, path) {
+                        match crate::incremental::parse(
+                            a,
+                            path,
+                            c.cursors
+                                .get(path.to_string_lossy().as_ref())
+                                .map(Vec::as_slice),
+                            c.database.as_deref(),
+                        ) {
+                            Ok(mut parsed) => {
+                                let rows = (
+                                    std::mem::take(&mut parsed.messages),
+                                    std::mem::take(&mut parsed.events),
+                                    Some(parsed.outcome),
+                                );
+                                delta = Some(parsed);
+                                rows
+                            }
+                            Err(e) => {
+                                crate::intake::diagnostic(format_args!("source parse failed: {e}"));
+                                (vec![], vec![], Some(ReadOutcome::Invalid))
+                            }
+                        }
+                    } else {
+                        p(path, mt, len).into_parsed()
+                    }
                 }) {
                     Ok(v) => v,
                     Err(_) => (vec![], vec![], Some(ReadOutcome::Invalid)),
@@ -305,13 +343,26 @@ where
             } else {
                 None
             };
-            SourceBatch {
+            let mut batch = SourceBatch {
                 key: path.to_string_lossy().into(),
                 agent: a.into(),
                 messages: m,
                 events: e,
                 error,
+                parse_ms: started.elapsed().as_secs_f64() * 1000.,
+                ..Default::default()
+            };
+            if batch.error.is_none() {
+                if let Some(delta) = delta {
+                    batch.cursor = Some(delta.cursor);
+                    batch.nodes = delta.nodes;
+                    batch.append = delta.append;
+                    batch.reset_nodes = delta.reset_nodes;
+                    batch.bytes_read = delta.bytes_read;
+                    batch.bytes_parsed = delta.bytes_parsed;
+                }
             }
+            batch
         })
         .collect();
     c.batches.extend(batches);

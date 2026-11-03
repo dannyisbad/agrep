@@ -5,10 +5,11 @@ pub fn run(port: u16, no_auto: bool) -> Result<i32> {
     start(port, no_auto, false)
 }
 pub(super) fn start(port: u16, no_auto: bool, open_browser: bool) -> Result<i32> {
-    let root = crate::ready(no_auto)?;
-    let server = Explorer::bind(root, port)?.with_refresh(move || {
-        crate::ready(no_auto)?;
-        Ok(())
+    let (root, census) = crate::ready(no_auto)?;
+    crate::finish_census(&root, census)?;
+    let server = Explorer::bind(root, port)?.with_freshness(move || {
+        let (root, census) = crate::ready(no_auto)?;
+        crate::finish_census(&root, census)
     });
     let signals = Signals::new()?;
     let url = server.url();

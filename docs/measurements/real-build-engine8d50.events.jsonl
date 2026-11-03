@@ -1,0 +1,1 @@
+{"median_ms":933622.122292,"name":"first_index","args":["index"],"samples":1,"min_ms":933622.122292,"max_ms":933622.122292,"exit_code_counts":{"0":1},"phases":{"bounds_ms":257100.121167,"census_ms":279.795167,"changed_rows":1482676,"errors":1,"parse_ms":18848.503999999997,"parsed":10418,"sources":10418,"stats_ms":6008.572042,"total_ms":933535.906958,"write_ms":650510.4949589999}}

@@ -118,7 +118,7 @@ impl DataRoot {
                 FileExt::unlock(&file)?;
                 Ok(false)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) if lock_contended(&error) => Ok(true),
             Err(error) => Err(error.into()),
         }
     }
@@ -143,7 +143,7 @@ impl DataRoot {
         } else {
             match f.try_lock_exclusive() {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) if lock_contended(&e) => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -210,5 +210,30 @@ pub fn exposed(path: &Path) -> Result<bool> {
     {
         let _ = path;
         Ok(false)
+    }
+}
+
+pub(crate) fn lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(
+            (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+            (Some(actual), Some(expected)) if actual == expected
+        )
+}
+
+#[cfg(test)]
+mod lock_errors {
+    #[test]
+    fn native_contention_is_distinct_from_other_io_failures() {
+        assert!(super::lock_contended(&fs2::lock_contended_error()));
+        assert!(super::lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!super::lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!super::lock_contended(&std::io::Error::other(
+            "unrelated failure"
+        )));
     }
 }

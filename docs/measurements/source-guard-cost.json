@@ -1,0 +1,10 @@
+{
+  "source_bytes": 268435456,
+  "guard_bytes": 8192,
+  "edge_guards_unchanged": 1,
+  "old_prefix_changed": 1,
+  "samples": 7,
+  "prefix_hash_median_ms": 261.27091699981975,
+  "prefix_hash_min_ms": 223.07987499971205,
+  "prefix_hash_max_ms": 398.7280829996962
+}

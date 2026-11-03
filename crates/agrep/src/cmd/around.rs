@@ -32,9 +32,10 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
         {
             bail!("--no-tools conflicts with --who tool")
         }
-        let root = ready(no_auto)?;
+        let (root, census) = ready(no_auto)?;
         let c = store::reader(&root)?;
         let w = evidence::load(&c, &Request::new(&a.session, a.turn, radius))?;
+        let pending_sources = crate::finish_census(&root, census)?;
         let text = evidence::render(
             &w,
             &Display {
@@ -44,6 +45,7 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
                 )?,
                 json: a.json,
                 checked: agrep_core::render::checked(no_auto),
+                pending_sources,
                 full: a.full,
                 max_chars: a.max_chars.unwrap_or(4000),
                 explicit_max_chars: a.max_chars.is_some(),

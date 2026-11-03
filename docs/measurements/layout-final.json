@@ -1,0 +1,110 @@
+[
+  {
+    "build_ms": 1785.531208,
+    "bytes": 64012288,
+    "queries": [
+      {
+        "count": 13998,
+        "median_ms": 1.647208,
+        "query": "error"
+      },
+      {
+        "count": 10749,
+        "median_ms": 7.940041999999999,
+        "query": "release AND workflow"
+      },
+      {
+        "count": 17593,
+        "median_ms": 0.39191699999999996,
+        "query": "ork"
+      },
+      {
+        "count": 0,
+        "median_ms": 0.008791,
+        "query": "hi"
+      }
+    ],
+    "layout": "trigram-full"
+  },
+  {
+    "build_ms": 769.364417,
+    "bytes": 27467776,
+    "queries": [
+      {
+        "count": 13998,
+        "median_ms": 0.869667,
+        "query": "error"
+      },
+      {
+        "count": 10749,
+        "median_ms": 3.0370000000000004,
+        "query": "release AND workflow"
+      },
+      {
+        "count": 17593,
+        "median_ms": 0.347125,
+        "query": "ork"
+      },
+      {
+        "count": 0,
+        "median_ms": 0.0077919999999999994,
+        "query": "hi"
+      }
+    ],
+    "layout": "trigram-none"
+  },
+  {
+    "build_ms": 339.61987500000004,
+    "bytes": 26431488,
+    "queries": [
+      {
+        "count": 13998,
+        "median_ms": 0.456125,
+        "query": "error"
+      },
+      {
+        "count": 10749,
+        "median_ms": 0.66975,
+        "query": "release AND workflow"
+      },
+      {
+        "count": 0,
+        "median_ms": 0.012875,
+        "query": "ork"
+      },
+      {
+        "count": 0,
+        "median_ms": 0.012417,
+        "query": "hi"
+      }
+    ],
+    "layout": "word-full"
+  },
+  {
+    "build_ms": 3668.749334,
+    "bytes": 130912256,
+    "queries": [
+      {
+        "count": 13998,
+        "median_ms": 2.504334,
+        "query": "error"
+      },
+      {
+        "count": 10749,
+        "median_ms": 15.062542,
+        "query": "release AND workflow"
+      },
+      {
+        "count": 17593,
+        "median_ms": 0.422708,
+        "query": "ork"
+      },
+      {
+        "count": 0,
+        "median_ms": 0.007292,
+        "query": "hi"
+      }
+    ],
+    "layout": "trigram-dual"
+  }
+]
