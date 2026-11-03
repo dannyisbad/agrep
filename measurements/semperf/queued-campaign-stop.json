@@ -1,0 +1,1 @@
+{"queued_child": 51058, "reason": "Stopped at the CPU load gate before starting a sample. Completed results and load-wait records retained. The process selector also matched its own control shell, ending that shell before diagnostics started; it did not affect another task."}

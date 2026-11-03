@@ -1,0 +1,33 @@
+{
+  "rust": {
+    "passed": 280,
+    "failed": 0,
+    "ignored": 0,
+    "suites": 20,
+    "profile": "release",
+    "all_targets": true
+  },
+  "python": {
+    "passed": 25,
+    "failed": 0,
+    "skipped": 0
+  },
+  "node": {
+    "passed": 6,
+    "failed": 0,
+    "skipped": 0
+  },
+  "clippy_deny_warnings": true,
+  "fmt": true,
+  "doc_tests": true,
+  "log_sha256": {
+    "rust-tests.log": "236d41fbcdde7ea9f55225e33e3316b6fd3d34ee728bb4a61a5c7332a4253812",
+    "doc-tests.log": "d3462e6d8c84b9fd3372ce1efa738b21101b679e76dc3da50166f57cd75cb389",
+    "clippy.log": "837669d0931b0fa45044edf2d2d4b9a2a648735edd048d844fc7b5ecac9ef9a0",
+    "python-tests-final.log": "92ed0dc422ff47d3500bab3b2f5b5ebe0b592cab6d23911842c656b1ceb75a42",
+    "node-tests.log": "6f2ba1c2dfd8c39782449ac9065914847b1435632a7baf5c50f6fe092a328f4c",
+    "licenses.log": "180c00181413a793b7ed5533e8767758671bd430e1754d905829a6b785046339"
+  },
+  "current_tree_and_index_privacy": true,
+  "history_privacy": "Known ancestor violation; unchanged gate, no history rewrite"
+}

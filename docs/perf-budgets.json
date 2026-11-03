@@ -27,7 +27,7 @@
     "keyword_p95_ms": "SPEC \u00a79 warm keyword p95 <=80 ms; 20 samples minimum, none discarded.",
     "navigation_ms": "SPEC \u00a79 around/chats/status <=40 ms warm.",
     "recall_ms": "SPEC \u00a79 recall <=250 ms warm; pack shares its retrieval/window budget.",
-    "census_ms": "SPEC \u00a79 no-change census <=15 ms, measured conservatively through full index command exit.",
+    "census_ms": "SPEC \u00a79 no-change census <=15 ms, measured through the full stat-census command exit.",
     "incremental_ms": "SPEC \u00a79 one-session incremental refresh <=50 ms through full index command exit.",
     "first_index_ms": "SPEC \u00a79 first full index of the owner's history (reference_rows visible rows, reference_text_bytes of indexed text) <=60 s. A synthetic workload gets 60000 x min(1, max(rows / reference_rows, text_bytes / reference_text_bytes)): with build cost linear in rows and indexed text, that is the longest an engine meeting the full-history target could take on it. Example: 100000 rows with 88600000 text bytes gives 60000 x 0.1 = 6000 ms. The 1000-row semantic workload has no build limit: fixed per-build costs dominate at that size, and builds are gated by the mixed and dense workloads.",
     "dense_index_ms": "The first_index_ms derivation with the 2x headroom SPEC \u00a79 requires of 2M-row workloads: 30000 x the same factor, which is 1 because 2M rows exceed reference_rows.",
@@ -36,6 +36,20 @@
     "hybrid_p50_ms": "SPEC \u00a79 warm agent hybrid p50 <=200 ms, with a labeled semantic row required. The CI semantic workload holds 1000 vectors, so this limit covers model load, query embedding, keyword retrieval, fusion and rendering; vector-scan cost at owner scale is measured on the 200000-reference semantic workload.",
     "hybrid_first_ms": "SPEC \u00a79 first hybrid query with the model installed <=1 s: a fresh CLI process after model installation and corpus embedding, with meaning results required.",
     "reference_rows": "Visible rows in the owner's full-history build: 130469 prose + 1071908 tool rows.",
-    "reference_text_bytes": "Indexed text in the owner's history: about 820 MB of tool text plus 66 MB of prose."
-  }
+    "reference_text_bytes": "Indexed text in the owner's history: about 820 MB of tool text plus 66 MB of prose.",
+    "semantic_cpu_rows_s": "SPEC \u00a75 bulk CPU floor for 200-token rows with the full 1024-token input window retained; this task additionally requires matching measured 0.4.9 on identical fixtures and thread counts.",
+    "semantic_metal_rows_s": "SPEC \u00a75 bulk Metal floor for 200-token rows; this task additionally requires matching measured 0.4.9 MLX on identical fixtures, without a shorter embedding window.",
+    "semantic_owner_p50_ms": "Owner semantic performance task: fresh-process semantic-only p50 at 200000 vector references, including normal freshness and process exit. A smaller vector fixture cannot satisfy this gate.",
+    "hybrid_owner_p50_ms": "SPEC section 9 and owner semantic performance task: fresh-process hybrid p50 at 200000 vector references, with keyword time reported separately. A smaller vector fixture cannot satisfy this gate.",
+    "semantic_owner_p95_ms": "Round-2 owner-scale CI request: apply the 120 ms semantic deadline to p95 as well as p50, with no tail slack or discarded samples.",
+    "hybrid_owner_p95_ms": "Owner-scale CI request: apply the SPEC section 9 200 ms hybrid deadline to p95 as well as p50, with no tail slack or discarded samples.",
+    "semantic_tail_outlier_multiple": "Round-2 owner task: attribute every sample whose wall latency exceeds two times its mode p50; this is an attribution trigger, not permission to discard samples."
+  },
+  "semantic_cpu_rows_s": 60,
+  "semantic_metal_rows_s": 600,
+  "semantic_owner_p50_ms": 120,
+  "hybrid_owner_p50_ms": 200,
+  "semantic_owner_p95_ms": 120,
+  "hybrid_owner_p95_ms": 200,
+  "semantic_tail_outlier_multiple": 2
 }

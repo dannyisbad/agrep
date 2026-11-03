@@ -1,0 +1,17 @@
+{
+  "context": "Direct __work smoke test; process sampled in Metal library construction before embedding during host contention. Raw stack was retained only in scratch.",
+  "samples": 812,
+  "observed_main_thread_path": [
+    "newLibraryWithSource",
+    "MTLCompilerScheduler::buildRequest",
+    "__DISPATCH_WAIT_FOR_QUEUE__",
+    "kevent_id"
+  ],
+  "observed_compiler_queue_path": [
+    "generateXPCBlock",
+    "xpc_connection_send_message_with_reply_sync",
+    "mach_msg2_trap"
+  ],
+  "conclusion": "Waiting for Metal compiler IPC, not CPU embedding or vector publication.",
+  "smoke_total_wall_s": 145.7413917920003
+}

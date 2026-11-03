@@ -1,0 +1,207 @@
+{
+  "redacted_files": [
+    {
+      "path": "docs/SEMANTIC-ROUND2.md",
+      "before_sha256": "9245a4c6d77b21d8e796e1f83e031f8b14fe89e78bc3ad9ca946b9bc8bcef8e8",
+      "after_sha256": "a2834908c34ede1e0e81680bae3ded537a69ac30eb6e5c1ae0352214e108308f"
+    },
+    {
+      "path": "measurements/semperf/build-projection-cli.log",
+      "before_sha256": "cac087bdec9268202bdb99feb4357234871495403fd22e65e96fb7504329fa94",
+      "after_sha256": "38660e6914f5ba8eabab694d0f6c818c40766c73ee77889619a9ad74e2ac9f9f"
+    },
+    {
+      "path": "measurements/semperf/build-projection.log",
+      "before_sha256": "af0e5ce2bad7163c27b64b95590cd630f6f7a15c1575a1b17b5249f2edca8e80",
+      "after_sha256": "d309f5e3b4ef48bc0b14ebf9e53bda40374931f588209b19380a1b1b8169a8f4"
+    },
+    {
+      "path": "measurements/semperf/build-release-final.log",
+      "before_sha256": "bdd3f3c887e4bd776a72221b4c1999ae80bbb3a5cc73bca39b05adc191488f77",
+      "after_sha256": "aed70734126392281f2144a9c38c22021722d16b1fce182ec257923311b96c9d"
+    },
+    {
+      "path": "measurements/semperf/clippy-final-projection.log",
+      "before_sha256": "dc61004399e97ee4637f280242144d5abec63133337624ed921bfa1ffd068477",
+      "after_sha256": "d529edb899b49b47bee91330fd7e68eae692c09c6d22357b3096d4c547c1b36f"
+    },
+    {
+      "path": "measurements/semperf/clippy-final.log",
+      "before_sha256": "1d47c7ddeccdff503157b67fd7a5fe9a4ebc0e7c35c7a51d52168a8fbb9a099a",
+      "after_sha256": "8c9b71d9f8f02abdadb297f039bbfd7ec9273b5970048f55498879e780968671"
+    },
+    {
+      "path": "measurements/semperf/clippy.log",
+      "before_sha256": "de97847e69d1430e44ba166adb24c8593a6afcb468eaa58306e0163653a779a9",
+      "after_sha256": "34af8ee82342906d1729a4631032c00953647c5a57dde5af4c0c5e4a2c47e18f"
+    },
+    {
+      "path": "measurements/semperf/early/build-after.log",
+      "before_sha256": "04a3d4b16276e44ee1157bd1cedc55676c2292326b551ace3bfc168f94cd3601",
+      "after_sha256": "63be8581aa35759c26f2f85bc68269b5075899d722307f4ba14e5f7efe51b338"
+    },
+    {
+      "path": "measurements/semperf/early/build-bucketing.log",
+      "before_sha256": "b377d8b8f18e8cee71d60d1eb4fa971bb2a983522d59cb89f4be9ce474e9315c",
+      "after_sha256": "2d63c86008f0d84cfbae37040aab21e6e023067aa27eb83f706005782b10f8a7"
+    },
+    {
+      "path": "measurements/semperf/early/build-cli-before.log",
+      "before_sha256": "eefb69c017acb88808c9b28b92634f856c2634053f767de712d6278f7cb0fe77",
+      "after_sha256": "bd3dc3c37f3f817515a9efce341b9c8199cf748f6f46f61dfa17f71c92d9fc53"
+    },
+    {
+      "path": "measurements/semperf/early/build-final.log",
+      "before_sha256": "1e87f2f6677ee66e12f1af92f3cea5d6621d60338b94460330cb9e09fce6dacb",
+      "after_sha256": "b82b296733c89093744ca50b586e486e6892160ce69e316d6ee2015d4cf2911e"
+    },
+    {
+      "path": "measurements/semperf/early/build-fused.log",
+      "before_sha256": "b14672105444e49721a8f63ddc95821b2c608393d82765becde10c6b52b1d831",
+      "after_sha256": "c16b72dbf8ef0815aa3023ec9b2e7b198722d4017fe2d9a1191c4bdef44fb4db"
+    },
+    {
+      "path": "measurements/semperf/early/build-fused2.log",
+      "before_sha256": "aae4df61a21c07dfcef4527687231c4fa6cc83d1d4886647363781dd078509a8",
+      "after_sha256": "449b4b4ea5aaf632a68817d19085c1ec8e89dc9a8a8917dabeedee7ac48d2c2a"
+    },
+    {
+      "path": "measurements/semperf/early/build-initial.log",
+      "before_sha256": "bec5fcb928b4bb29d61a416bc79c1713d2d0f02677a8c9faddf7b9b1e1cadcfd",
+      "after_sha256": "d2c9af0a2072424c75f678e3ff84493dff42d0c3e567687302e71cd1df759249"
+    },
+    {
+      "path": "measurements/semperf/early/build-profile.log",
+      "before_sha256": "51f52d615dde385d5ec90e035e304f86b90df94ba821cff538f95c25fdfe69a3",
+      "after_sha256": "6d1eabeb7414ff4e8180ecdb85feb7767e35030b61bb815c21158b8fabe74ac5"
+    },
+    {
+      "path": "measurements/semperf/early/matched-baselines.log",
+      "before_sha256": "0b1592d2656648986e81fea3b6b8a74eaca0206a393b0de3f14c3121d5a99c52",
+      "after_sha256": "1fad197b0c9a581db96a53884b52db692b2b447d8af2251a34a3a3e1dcbfdb28"
+    },
+    {
+      "path": "measurements/semperf/failed-reference-interpreter.jsonl",
+      "before_sha256": "2a0202013d3e656947a5f55c9f27f93df4990279b58d4386ae27c97a7d3eec74",
+      "after_sha256": "0bab563acb9f8e9e683be224887408ebbad49f5e59451846452cdd3592df6bd7"
+    },
+    {
+      "path": "measurements/semperf/failed-reference-interpreter.log",
+      "before_sha256": "182b14a8d166bb05d1b59e93fba6290d39deaa205bdef0fb5524cc2ecc398b02",
+      "after_sha256": "7b927c14e60de02586960069338161bdb223a485fcf9c7632450720730d995c0"
+    },
+    {
+      "path": "measurements/semperf/finish-exits.jsonl",
+      "before_sha256": "37d0a51d40ecd3aa6115430baca0b4ace4081b6f87c5be0334f12dc875607e16",
+      "after_sha256": "f732b45450bfa000810d8b04dca762416081fe66cf2afb66c97b36e49a730539"
+    },
+    {
+      "path": "measurements/semperf/loaded-query-before.jsonl",
+      "before_sha256": "863ff826b90fa93ee179a3fdadde4fe4abd9b9fd4379306ee65d00d2e99a9555",
+      "after_sha256": "0fe5ac0639ed0e84fa09bde02bb3c80e13b2ea068f95a683c3de05276dc0b8bc"
+    },
+    {
+      "path": "measurements/semperf/pre-restart-query-after.jsonl",
+      "before_sha256": "e89fb89bfccc68d6cb313d7d744ceb0eb70328a62fa9e5265a3732c66a05a322",
+      "after_sha256": "794780f1a3b5f14fd5e8e0a8f6a4c5873a5b08b6745302bfefbb1c0bc690b4b1"
+    },
+    {
+      "path": "measurements/semperf/pre-restart-query-before.jsonl",
+      "before_sha256": "6f0f0a01d0eefb66c039a9853d3dc3059b96753dfed2396777486aa8b108ccd9",
+      "after_sha256": "a7e2d0880eb9f8396fc6f5fd82110856b9fb5622942be6bffd93fca1e123b939"
+    },
+    {
+      "path": "measurements/semperf/profile-query-final-after.json",
+      "before_sha256": "bf9f2a3dfecd2fe9c86abb0747400fe150eaa6d17a8b93d921f4f93674ac0307",
+      "after_sha256": "21ff47a08c4c547620c7aa08380e65fb51ba1d098a596bd136edc9d905deb774"
+    },
+    {
+      "path": "measurements/semperf/profile-query-final-after.log",
+      "before_sha256": "cc9433e7f2c18f71d2f4728534271db81c7195d122520f29a5e7b41642ffd5a5",
+      "after_sha256": "58a1d6fd1cc54a48d3e0e3f54c85412e377cf2f5bb9978b92f849ef7c94a3477"
+    },
+    {
+      "path": "measurements/semperf/profile-query-final-before.json",
+      "before_sha256": "e8f2f401a515674cc80125e33b1e4521b92b5eca0eb5f9568100c2f370704780",
+      "after_sha256": "9b94c4e1c7603fafc736359c6bd3291046e36902aa78e713ab1199ecc8c13f08"
+    },
+    {
+      "path": "measurements/semperf/profile-query-final-before.log",
+      "before_sha256": "a8103ed1513233acd2c04c35e3384eb56cc770e68e8a5ca2daa3e030c35b49e2",
+      "after_sha256": "19f99928f59c06f0c1b3fbc3d238ec582d64ba6df06de5eb5b5fb8fbb48d269f"
+    },
+    {
+      "path": "measurements/semperf/publish-reference-geometry.log",
+      "before_sha256": "895d15ceac10f042b6136975cf87491b10c5048864d5bb00988d9ae4a98e8c01",
+      "after_sha256": "63632b6a51a45b333087339c13ab74b5dbe52b7b85aa2cee5970314ad626a2cb"
+    },
+    {
+      "path": "measurements/semperf/query-after.jsonl",
+      "before_sha256": "ab5b328dfa4e64fd5d18cab5a1bad866301cdeccaed68dabade878810bea8d9a",
+      "after_sha256": "deb785e476515586d6bca94fcfaa175affa80949b91b22857ed91df9536ee1fd"
+    },
+    {
+      "path": "measurements/semperf/query-before.jsonl",
+      "before_sha256": "56e13e5410dd2fe76253518169634d2ec623b2d109f68f8fb37808b3b7662431",
+      "after_sha256": "b27b197d740fd1fb834ec763bd2f2c3a249eda3026cd3df9e572af8ee9d57a25"
+    },
+    {
+      "path": "measurements/semperf/query-reference.jsonl",
+      "before_sha256": "9b92cbdd183862e13db92b78740f8f28326d05abf234557daf5ce92bee198b21",
+      "after_sha256": "1ca5e69316cbed6e3c528dde712f56770ca923fd85c48ad1f195da87bb5cf801"
+    },
+    {
+      "path": "measurements/semperf/reference-index-restored.log",
+      "before_sha256": "bd32e4053d38069b4aa7d5492132e354c1a14fd3e5155975a1b4fc84eae245e6",
+      "after_sha256": "f9a8657e171da03ad0bd9ce9b3ce3a40b9a0670c13af07964900cbd94dff477a"
+    },
+    {
+      "path": "measurements/semperf/reference-index.stdout",
+      "before_sha256": "55fa00a260d6be6440e9267c880dc6fce835d50b072f3522afb4913f4e5ac0ca",
+      "after_sha256": "8642c8bef2f7d7eb9a682393c124e1a466ab6df298ad87b2ac4a6f0dde137a31"
+    },
+    {
+      "path": "measurements/semperf/reference-interpreter.json",
+      "before_sha256": "ba83d397f58ced208aec754dfd6d15a0f32aab273e161d4636ff22909bce20d2",
+      "after_sha256": "5f74b0228b35088ead5bbcea973688c3fcb43cae606cd3409e5c6dae39966d31"
+    },
+    {
+      "path": "measurements/semperf/runners/final-bulk.py",
+      "before_sha256": "6b89ed89b169baf2951a783cbac20330ed8d7f53d311f999255ee8c86e41178e",
+      "after_sha256": "23f315894d0caef87d57f9d0e207c697585723f95c47f12d2b00b33219a3f8d4"
+    },
+    {
+      "path": "measurements/semperf/runners/final-cpu.py",
+      "before_sha256": "6b89ed89b169baf2951a783cbac20330ed8d7f53d311f999255ee8c86e41178e",
+      "after_sha256": "23f315894d0caef87d57f9d0e207c697585723f95c47f12d2b00b33219a3f8d4"
+    },
+    {
+      "path": "measurements/semperf/runners/finish.py",
+      "before_sha256": "1dcaf3520be1e8b20fab760094248e33c08bac46140f479756d4987edd8b3a4a",
+      "after_sha256": "d175b7b70444683d9e734a12f1a50a0ad37a2288e7598137bf3cb8a060278dc2"
+    },
+    {
+      "path": "measurements/semperf/tests-final-projection.log",
+      "before_sha256": "422ed6b1ce252abf40c545304b85599083a0c89930cfc939a31b127a4baf2660",
+      "after_sha256": "aaa4aaba2b31294cefd02de33b5647c0c80d1d577d172f0884e110d2adcdbcf2"
+    },
+    {
+      "path": "measurements/semperf/tests-final.log",
+      "before_sha256": "d80e4672de7b24d7741189284d3023cb219c87dfa28680b54e92b6f225d7e5c4",
+      "after_sha256": "48cf51798c731863822f8d8cd54cfcd01164d52069083660ec47fef294efd207"
+    },
+    {
+      "path": "measurements/semperf/tests-first.log",
+      "before_sha256": "21241711b7573d47a6cbead1d301671949764a07ec87cc3498bb6f99d4f3e5f6",
+      "after_sha256": "fa211226a51021b2644c2de6a411b289c2f4b1128a7ed6db7c67aad0c04005bc"
+    }
+  ],
+  "redaction": "Workstation home prefixes and personal tokens replaced with synthetic labels. Numerical timing samples preserved.",
+  "profile_parts": [
+    "profile-metal.jsonl",
+    "profile-metal-part2.jsonl",
+    "profile-metal-part3.jsonl"
+  ],
+  "profile_records": 6,
+  "history_rewritten": false
+}

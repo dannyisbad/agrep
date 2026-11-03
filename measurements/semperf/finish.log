@@ -1,0 +1,32 @@
+START postrestart-bulk
+END postrestart-bulk 0
+START quality-final-cpu
+END quality-final-cpu 0
+START quality-final-metal
+END quality-final-metal 0
+START profile-query-final-before
+END profile-query-final-before 0
+START profile-query-final-after
+END profile-query-final-after 0
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s3s1   926Gi    13Gi   4.8Gi    73%    486k   50M    1%   /
+
+START export-reference-geometry
+END export-reference-geometry 0
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s3s1   926Gi    13Gi   5.5Gi    70%    486k   57M    1%   /
+
+START fmt-final-projection
+END fmt-final-projection 0
+START clippy-final-projection
+END clippy-final-projection 0
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s3s1   926Gi    13Gi   5.1Gi    72%    486k   54M    1%   /
+
+START tests-final-projection
+END tests-final-projection 0
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s3s1   926Gi    13Gi   5.4Gi    71%    486k   57M    1%   /
+
+START publish-reference-geometry
+END publish-reference-geometry 1

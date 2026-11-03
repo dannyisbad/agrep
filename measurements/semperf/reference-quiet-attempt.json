@@ -1,0 +1,9 @@
+{
+  "samples_started": 0,
+  "stopped_queued_pids": [
+    56401,
+    56394
+  ],
+  "reason": "The shared host remained fully CPU-busy; the quiet-start attempt never launched a sample. Collect explicitly contended reference query context without using it for relative speedup or release acceptance. All acceptance budgets and the completed bulk/before/after query records remain unchanged.",
+  "uptime": "18:26  up  1:21, 1 user, load averages: 66.80 60.63 43.24"
+}

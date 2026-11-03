@@ -724,6 +724,43 @@ fn fts_block_limits_bound_sqlite_work_not_only_rendered_rows() {
 }
 
 #[test]
+fn unselective_agent_keeps_the_bounded_prose_access_path() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut work = Vec::new();
+    for count in [8192, 32768] {
+        let t = TempDir::new().unwrap();
+        let home = t.path().join("home");
+        let data = t.path().join("data");
+        transcript(&home, &vec!["deepold"; count]);
+        ok(cli(&home, &data, &["index"]));
+        let c = store::reader(&DataRoot::open(&data, false).unwrap()).unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let capture = steps.clone();
+        c.progress_handler(
+            100,
+            Some(move || {
+                capture.fetch_add(100, Ordering::Relaxed);
+                false
+            }),
+        );
+        let mut options = retrieval_options("deepold");
+        options.limit = 40;
+        options.filters.agent = Some("pi".into());
+        let result = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(result.hits.len(), 40);
+        assert_eq!(
+            result.hits.iter().map(|h| h.turn).collect::<Vec<_>>(),
+            (0..40).collect::<Vec<_>>()
+        );
+        work.push(steps.load(Ordering::Relaxed));
+    }
+    assert!(work[1] < work[0] * 2, "{work:?}");
+}
+
+#[test]
 fn sparse_old_matches_ignore_the_recency_of_unrelated_rows() {
     let mut work = Vec::new();
     for n in [2048, 8192] {
@@ -1836,7 +1873,12 @@ fn selective_tool_stream_keeps_exact_winners_across_tiers_and_folded_filters() {
     ok(cli(&home, &data, &["index"]));
     let root = DataRoot::open(&data, false).unwrap();
     let c = store::reader(&root).unwrap();
-    for pattern in ["needle uncommon", "uncommon needle"] {
+    for pattern in [
+        "needle uncommon",
+        "uncommon needle",
+        "ordinary result",
+        "result ordinary",
+    ] {
         let mut options = agrep_core::query::Options {
             pattern: pattern.into(),
             regex: false,
@@ -2019,6 +2061,85 @@ fn explicit_coverage_is_separate_and_identifiers_keep_grep_semantics() {
     assert!(String::from_utf8(output.stderr)
         .unwrap()
         .contains("coverage lane (forced)"));
+}
+
+#[test]
+fn a_full_prose_page_cannot_stop_tools_for_time_or_position_sort() {
+    use serde_json::json;
+    let t = TempDir::new().unwrap();
+    let home = t.path().join("home");
+    let data = t.path().join("data");
+    let base = home.join(".pi/agent/sessions/test");
+    write_records(
+        &base.join("prose.jsonl"),
+        &[
+            json!({"type":"session","id":"zzz","version":3,"cwd":"/work/test"}),
+            json!({"type":"message","id":"p","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"needle needle needle"}}),
+        ],
+        false,
+    );
+    write_records(
+        &base.join("tool.jsonl"),
+        &[
+            json!({"type":"session","id":"aaa","version":3,"cwd":"/work/test"}),
+            json!({"type":"message","id":"p","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"unrelated"}}),
+            json!({"type":"message","id":"c","parentId":"p","timestamp":"2025-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c","name":"shell","arguments":{"command":"inspect"}}]}}),
+            json!({"type":"message","id":"r","parentId":"c","timestamp":"2025-01-01T00:00:02Z","message":{"role":"toolResult","toolCallId":"c","content":"needle"}}),
+        ],
+        false,
+    );
+    ok(cli(&home, &data, &["index"]));
+    let root = DataRoot::open(&data, false).unwrap();
+    let c = store::reader(&root).unwrap();
+    let mut options = retrieval_options("needle");
+    options.tools = true;
+    options.limit = 1;
+    let ranked = agrep_core::query::search(&c, &options).unwrap();
+    assert_eq!(ranked.hits[0].who, "user");
+    assert!(ranked.hits[0].score > agrep_core::query::weight("tool"));
+    for sort in ["time", "position"] {
+        options.sort = sort.into();
+        let result = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(result.hits[0].who, "tool", "{sort}");
+    }
+}
+
+#[test]
+fn all_terms_bounds_stop_at_attainable_ascii_scores_and_keep_unicode_winners() {
+    for count in [2048, 8192] {
+        let t = TempDir::new().unwrap();
+        let home = t.path().join("home");
+        let data = t.path().join("data");
+        transcript(&home, &vec!["beta office"; count]);
+        ok(cli(&home, &data, &["index"]));
+        let root = DataRoot::open(&data, false).unwrap();
+        let c = store::reader(&root).unwrap();
+        let mut options = retrieval_options("office beta");
+        options.limit = 40;
+        let fast = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(fast.hits.len(), 40);
+        assert!(fast.examined <= 512, "{}", fast.examined);
+        options.exact = true;
+        let full = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(
+            fast.hits.iter().map(|h| &h.handle).collect::<Vec<_>>(),
+            full.hits.iter().map(|h| &h.handle).collect::<Vec<_>>()
+        );
+        drop(c);
+        let mut texts = vec!["beta office"; count];
+        texts[count - 1] = "beta oﬃce";
+        transcript(&home, &texts);
+        ok(cli(&home, &data, &["index"]));
+        let c = store::reader(&root).unwrap();
+        options.exact = false;
+        let fast = agrep_core::query::search(&c, &options).unwrap();
+        options.exact = true;
+        let full = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(
+            fast.hits.iter().map(|h| &h.handle).collect::<Vec<_>>(),
+            full.hits.iter().map(|h| &h.handle).collect::<Vec<_>>()
+        );
+    }
 }
 
 fn measured_query(

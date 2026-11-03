@@ -50,6 +50,50 @@ pub fn installed_at(path: &Path) -> bool {
             .is_ok_and(|m| m.is_file() && m.len() == *len)
     })
 }
+
+/// Start read-ahead before freshness and metadata work. The mapping owns no
+/// mutable data and is only a performance hint; normal load verification still
+/// decides which bytes may be used by inference.
+pub fn prefetch_query(root: &DataRoot) -> Option<memmap2::Mmap> {
+    #[cfg(unix)]
+    {
+        let _span = crate::semantic_profile::span("model_read_ahead");
+        let path = directory(root);
+        let source = stamps(&path, &FILES).ok()?;
+        let name = if conversion_matches(&path, &source) {
+            "weights-f32.safetensors"
+        } else {
+            "model.safetensors"
+        };
+        let file = File::open(path.join(name)).ok()?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        let mut residency = vec![0u8; map.len().div_ceil(page_size)];
+        // mincore only observes our mapping and writes one residency byte per
+        // page. Avoid the kernel's full read-ahead walk when pages are hot.
+        let known = unsafe {
+            libc::mincore(
+                map.as_ptr().cast_mut().cast(),
+                map.len(),
+                residency.as_mut_ptr().cast(),
+            ) == 0
+        };
+        let needed = !known || residency.iter().any(|r| r & 1 == 0);
+        if needed {
+            map.advise(memmap2::Advice::WillNeed).ok()?;
+        }
+        crate::semantic_profile::event(serde_json::json!({"model_read_ahead":{
+            "bytes":map.len(),"requested":needed,"resident_pages":residency.iter().filter(|r|**r&1!=0).count(),"pages":residency.len()
+        }}));
+        Some(map)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 /// Verify an installed artifact set, reusing only unchanged verified stamps.
 pub fn verify_installed(root: &DataRoot) -> Result<()> {
     verify_installed_at(&directory(root))
@@ -78,6 +122,107 @@ struct ArtifactStamp {
 struct Verified {
     revision: String,
     files: Vec<ArtifactStamp>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Converted {
+    version: u8,
+    source: Verified,
+    output: Verified,
+}
+
+fn conversion_matches(path: &Path, source: &Verified) -> bool {
+    let marker = path.join("converted.json");
+    if !marker.metadata().is_ok_and(|m| m.len() <= 8192) {
+        return false;
+    }
+    let Ok(bytes) = fs::read(marker) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<Converted>(&bytes) else {
+        return false;
+    };
+    let expected = [
+        "weights-f32.safetensors",
+        "weights-f16.safetensors",
+        "tokenizer-compact.json",
+    ];
+    if record.version != 1
+        || record.source != *source
+        || record
+            .output
+            .files
+            .iter()
+            .map(|s| s.name.as_str())
+            .ne(expected)
+    {
+        return false;
+    }
+    let files: Vec<_> = record
+        .output
+        .files
+        .iter()
+        .map(|s| (s.name.as_str(), s.bytes, s.sha256.as_str()))
+        .collect();
+    stamps(path, &files).is_ok_and(|now| now == record.output)
+}
+
+fn convert_weights(path: &Path) -> Result<()> {
+    let source = stamps(path, &FILES)?;
+    if conversion_matches(path, &source) {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    for (name, dtype) in [
+        ("weights-f32.safetensors", DType::F32),
+        ("weights-f16.safetensors", DType::F16),
+    ] {
+        let tensors = candle_core::safetensors::load(path.join("model.safetensors"), &Device::Cpu)?;
+        let tensors = tensors
+            .into_iter()
+            .map(|(k, v)| Ok((k, v.to_dtype(dtype)?)))
+            .collect::<candle_core::Result<std::collections::HashMap<_, _>>>()?;
+        let temp = path.join(format!("{name}.partial"));
+        candle_core::safetensors::save(&tensors, &temp)?;
+        File::open(&temp)?.sync_all()?;
+        fs::rename(temp, path.join(name))?;
+        files.push((
+            name,
+            path.join(name).metadata()?.len(),
+            digest(&path.join(name))?,
+        ));
+    }
+    let name = "tokenizer-compact.json";
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(path.join("tokenizer.json"))?)?;
+    let temp = path.join(format!("{name}.partial"));
+    let mut file = File::create(&temp)?;
+    file.write_all(&serde_json::to_vec(&json)?)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, path.join(name))?;
+    files.push((
+        name,
+        path.join(name).metadata()?.len(),
+        digest(&path.join(name))?,
+    ));
+    let tuples: Vec<_> = files.iter().map(|(n, b, h)| (*n, *b, h.as_str())).collect();
+    let output = stamps(path, &tuples)?;
+    if stamps(path, &FILES)? != source {
+        bail!("model changed during weight conversion");
+    }
+    let record = Converted {
+        version: 1,
+        source,
+        output,
+    };
+    let temp = path.join("converted.json.partial");
+    let mut file = File::create(&temp)?;
+    file.write_all(&serde_json::to_vec(&record)?)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, path.join("converted.json"))?;
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    Ok(())
 }
 fn stamps(path: &Path, files: &[(&str, u64, &str)]) -> Result<Verified> {
     let mut out = Vec::new();
@@ -158,10 +303,19 @@ fn record_verification(path: &Path, files: &[(&str, u64, &str)]) -> Result<()> {
     Ok(())
 }
 fn verify(path: &Path, size: u64, expected: &str) -> Result<()> {
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     if file.metadata()?.len() != size {
         bail!("incorrect model file size: {}", path.display());
     }
+    if digest_file(file)? != expected {
+        bail!("model SHA-256 mismatch: {}", path.display());
+    }
+    Ok(())
+}
+fn digest(path: &Path) -> Result<String> {
+    digest_file(File::open(path)?)
+}
+fn digest_file(mut file: File) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
     loop {
@@ -171,10 +325,7 @@ fn verify(path: &Path, size: u64, expected: &str) -> Result<()> {
         }
         hash.update(&buffer[..n]);
     }
-    if format!("{:x}", hash.finalize()) != expected {
-        bail!("model SHA-256 mismatch: {}", path.display());
-    }
-    Ok(())
+    Ok(format!("{:x}", hash.finalize()))
 }
 /// Only explicit setup, index --semantic and -s callers may invoke this function.
 /// Network failures preserve already verified files and never publish partial bytes.
@@ -244,6 +395,7 @@ pub fn provision_at(path: &Path) -> Result<()> {
         outcome?;
     }
     record_verification(path, &FILES)?;
+    convert_weights(path)?;
     Ok(())
 }
 
@@ -253,33 +405,109 @@ pub struct Embedder {
     device: Device,
     token_budget: usize,
     attention_budget: usize,
+    max_padding: usize,
+}
+fn batch_end(
+    ids: &[Vec<u32>],
+    order: &[usize],
+    start: usize,
+    token_budget: usize,
+    attention_budget: usize,
+    max_padding: usize,
+) -> usize {
+    let mut end = start + 1;
+    let mut real_tokens = ids[order[start]].len();
+    while end < order.len()
+        && (end - start + 1) * ids[order[end]].len() <= token_budget
+        && (end - start + 1) * ids[order[end]].len().pow(2) <= attention_budget
+        && (end - start + 1) * ids[order[end]].len() * (100 - max_padding)
+            <= (real_tokens + ids[order[end]].len()) * 100
+    {
+        real_tokens += ids[order[end]].len();
+        end += 1;
+    }
+    end
 }
 impl Embedder {
     pub fn load(path: &Path, device: Device) -> Result<Self> {
-        verify_installed_at(path)?;
-        let mut tok =
-            Tokenizer::from_file(path.join("tokenizer.json")).map_err(|e| anyhow!("{e}"))?;
-        tok.with_truncation(Some(TruncationParams {
-            max_length: 1024,
-            ..Default::default()
-        }))
-        .map_err(|e| anyhow!("{e}"))?;
-        tok.with_padding(None);
-        let config: Config = serde_json::from_slice(&fs::read(path.join("config.json"))?)?;
+        let _span = crate::semantic_profile::span("model_load");
+        let load_start = std::time::Instant::now();
+        let verified = cached_verification(path, &FILES);
+        {
+            let _span =
+                (!verified).then(|| crate::semantic_profile::span("model_hash_verification"));
+            verify_installed_at(path)?;
+        }
+        let verified_ms = load_start.elapsed().as_secs_f64() * 1000.;
+        let converted = conversion_matches(path, &stamps(path, &FILES)?);
+        crate::semantic_profile::event(serde_json::json!({"model_cache":{
+            "verified":verified,"converted":converted,"writes":0,"metal":device.is_metal()
+        }}));
         let dtype = if device.is_metal() {
             DType::F16
         } else {
             DType::F32
         };
-        // All three immutable artifacts were SHA-256 verified before mapping.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[path.join("model.safetensors")], dtype, &device)?
+        let (model, tok, weights_ms, tokenizer_ms) = std::thread::scope(|scope| -> Result<_> {
+            let tokenizer = scope.spawn(|| -> Result<_> {
+                let start = std::time::Instant::now();
+                let mut tok = Tokenizer::from_file(path.join(if converted {
+                    "tokenizer-compact.json"
+                } else {
+                    "tokenizer.json"
+                }))
+                .map_err(|e| anyhow!("{e}"))?;
+                tok.with_truncation(Some(TruncationParams {
+                    max_length: 1024,
+                    ..Default::default()
+                }))
+                .map_err(|e| anyhow!("{e}"))?;
+                tok.with_padding(None);
+                Ok((tok, start.elapsed().as_secs_f64() * 1000.))
+            });
+            let start = std::time::Instant::now();
+            let config: Config = serde_json::from_slice(&fs::read(path.join("config.json"))?)?;
+            // Verified source, or metadata-bound output of explicit provisioning.
+            let vb = unsafe {
+                let name = if converted {
+                    if dtype == DType::F16 {
+                        "weights-f16.safetensors"
+                    } else {
+                        "weights-f32.safetensors"
+                    }
+                } else {
+                    "model.safetensors"
+                };
+                VarBuilder::from_mmaped_safetensors(&[path.join(name)], dtype, &device)?
+            }
+            .rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_owned());
+            let model = ModernBert::load(vb, &config)?;
+            if crate::semantic_profile::enabled() {
+                device.synchronize()?;
+            }
+            let weights_ms = start.elapsed().as_secs_f64() * 1000.;
+            let (tok, tokenizer_ms) = tokenizer
+                .join()
+                .map_err(|_| anyhow!("tokenizer loading failed"))??;
+            Ok((model, tok, weights_ms, tokenizer_ms))
+        })?;
+        if crate::semantic_profile::timing_enabled() {
+            if crate::semantic_profile::enabled() {
+                device.synchronize()?;
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({"semantic_load":{"verify_ms":verified_ms,"tokenizer_ms":tokenizer_ms,"weights_ms":weights_ms,"total_ms":load_start.elapsed().as_secs_f64()*1000.}})
+            );
         }
-        .rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_owned());
-        let model = ModernBert::load(vb, &config)?;
-        // Wide short-row batches amortize dispatch and BLAS work; the quadratic
-        // attention cap keeps full-length rows at eight Metal / four CPU rows.
-        let token_budget = if device.is_metal() { 32768 } else { 16384 };
+        // Amortize matmuls in the bounded CPU pool and persistent Metal arena.
+        // The tensor fallback keeps its smaller Metal working set; the
+        // attention cap independently bounds long-row work.
+        let token_budget = if device.is_metal() && !model.uses_arena() {
+            1024
+        } else {
+            16384
+        };
         let attention_budget = if device.is_metal() {
             8 * 1024 * 1024
         } else {
@@ -291,6 +519,7 @@ impl Embedder {
             device,
             token_budget,
             attention_budget,
+            max_padding: 25,
         })
     }
     pub fn query(root: &DataRoot) -> Result<Self> {
@@ -325,25 +554,86 @@ impl Embedder {
             .get_ids()
             .to_vec())
     }
+    /// Scheduling-only sweep for the standalone performance harness.
+    pub fn with_batch_tokens(mut self, tokens: usize) -> Result<Self> {
+        if tokens == 0 {
+            bail!("batch token count must be positive");
+        }
+        self.token_budget = tokens;
+        Ok(self)
+    }
+    #[doc(hidden)]
+    pub fn with_max_padding(mut self, percent: usize) -> Result<Self> {
+        if percent > 25 {
+            bail!("padding experiment may only tighten the existing bound")
+        }
+        self.max_padding = percent;
+        Ok(self)
+    }
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let ids: Vec<_> = texts
-            .iter()
-            .map(|s| self.token_ids(s))
-            .collect::<Result<_>>()?;
+        if self.device.is_cpu()
+            && texts.len() >= 32
+            && std::env::var("AGREP_SEM_PARALLEL_BATCHES").map_or(true, |v| v == "1")
+        {
+            // Both streams use the same bounded Rayon pool. While one reaches
+            // a serial operation, the other can occupy an otherwise idle core.
+            // Stripe rows so a length-ordered source cannot leave one stream
+            // with all the long rows. Each stream still buckets by token count.
+            let even = texts.iter().step_by(2).collect::<Vec<_>>();
+            let odd = texts.iter().skip(1).step_by(2).collect::<Vec<_>>();
+            let (left, right) = rayon::join(|| self.embed_inner(&even), || self.embed_inner(&odd));
+            let mut left = left?.into_iter();
+            let mut right = right?.into_iter();
+            let output = (0..texts.len())
+                .map(|i| {
+                    if i % 2 == 0 {
+                        left.next().unwrap()
+                    } else {
+                        right.next().unwrap()
+                    }
+                })
+                .collect();
+            return Ok(output);
+        }
+        self.embed_inner(texts)
+    }
+    fn embed_inner(&self, texts: &[impl AsRef<str>]) -> Result<Vec<Vec<f32>>> {
+        let started = std::time::Instant::now();
+        let ids: Vec<_> = {
+            let _span = crate::semantic_profile::span("tokenize");
+            texts
+                .iter()
+                .map(|s| self.token_ids(s.as_ref()))
+                .collect::<Result<_>>()?
+        };
+        if crate::semantic_profile::enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"tokenize_ms":started.elapsed().as_secs_f64()*1000.,"rows":texts.len(),"tokens":ids.iter().map(Vec::len).sum::<usize>()})
+            );
+        }
         let mut order: Vec<_> = (0..texts.len()).collect();
         order.sort_by_key(|&i| ids[i].len());
         let mut out = vec![vec![]; texts.len()];
+        self.model.prepare_arena(self.token_budget.max(1024))?;
         let mut start = 0;
         while start < order.len() {
-            let mut end = start + 1;
-            while end < order.len()
-                && (end - start + 1) * ids[order[end]].len() <= self.token_budget
-                && (end - start + 1) * ids[order[end]].len().pow(2) <= self.attention_budget
-            {
-                end += 1;
-            }
+            let end = batch_end(
+                &ids,
+                &order,
+                start,
+                self.token_budget,
+                self.attention_budget,
+                self.max_padding,
+            );
             let batch = &order[start..end];
             let width = batch.iter().map(|&i| ids[i].len()).max().unwrap();
+            if crate::semantic_profile::enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"batch_rows":batch.len(),"padded_tokens":batch.len()*width,"tokens":batch.iter().map(|&i|ids[i].len()).sum::<usize>()})
+                );
+            }
             let mut padded = vec![50283u32; batch.len() * width];
             let mut mask = vec![0u32; padded.len()];
             for (j, &i) in batch.iter().enumerate() {
@@ -352,12 +642,17 @@ impl Embedder {
             }
             let xs = Tensor::from_vec(padded, (batch.len(), width), &self.device)?;
             let mask = Tensor::from_vec(mask, (batch.len(), width), &self.device)?;
-            let cls = self
-                .model
-                .forward(&xs, &mask)?
-                .i((.., 0, ..))?
-                .to_dtype(DType::F32)?
-                .to_vec2::<f32>()?;
+            let _span = crate::semantic_profile::span("query_inference");
+            let lengths = batch.iter().map(|i| ids[*i].len()).collect::<Vec<_>>();
+            let cls = if let Some(values) = self.model.arena_embeddings(&xs, &lengths)? {
+                values
+            } else {
+                self.model
+                    .forward(&xs, &mask, &lengths)?
+                    .i((.., 0, ..))?
+                    .to_dtype(DType::F32)?
+                    .to_vec2::<f32>()?
+            };
             for (&i, mut row) in batch.iter().zip(cls) {
                 let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if row.len() != DIM || !norm.is_finite() || norm <= 1e-12 {
@@ -432,6 +727,78 @@ fn strip_recap(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_ahead_is_optional_and_does_not_provision_a_missing_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(temp.path().join("data"), true).unwrap();
+        assert!(prefetch_query(&root).is_none());
+        assert!(!directory(&root).exists());
+    }
+    #[test]
+    fn batching_separates_long_rows_without_changing_the_window() {
+        let ids: Vec<_> = [8, 8, 32, 32, 1024, 1024]
+            .into_iter()
+            .map(|n| vec![1; n])
+            .collect();
+        let order: Vec<_> = (0..ids.len()).collect();
+        assert_eq!(batch_end(&ids, &order, 0, 16384, 4194304, 25), 2);
+        assert_eq!(batch_end(&ids, &order, 2, 16384, 4194304, 25), 4);
+        assert_eq!(batch_end(&ids, &order, 4, 16384, 4194304, 25), 6);
+        assert_eq!(batch_end(&ids, &order, 4, 1024, 4194304, 25), 5);
+    }
+    #[test]
+    fn tighter_padding_splits_lengths_and_keeps_full_rows() {
+        let ids = vec![vec![1; 10], vec![1; 14], vec![1; 1024]];
+        let order = vec![0, 1, 2];
+        assert_eq!(batch_end(&ids, &order, 0, 16384, 4194304, 25), 2);
+        assert_eq!(batch_end(&ids, &order, 0, 16384, 4194304, 5), 1);
+        assert_eq!(batch_end(&ids, &order, 2, 16384, 4194304, 5), 3);
+    }
+    #[test]
+    fn converted_cache_is_bound_to_all_sources_and_outputs() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("source"), b"abc").unwrap();
+        let inputs = [("source", 3, "source-hash")];
+        let outputs = [
+            ("weights-f32.safetensors", 3, "a"),
+            ("weights-f16.safetensors", 3, "b"),
+            ("tokenizer-compact.json", 3, "c"),
+        ];
+        for (name, _, _) in outputs {
+            fs::write(t.path().join(name), b"123").unwrap();
+        }
+        let record = Converted {
+            version: 1,
+            source: stamps(t.path(), &inputs).unwrap(),
+            output: stamps(t.path(), &outputs).unwrap(),
+        };
+        fs::write(
+            t.path().join("converted.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let source = stamps(t.path(), &inputs).unwrap();
+        assert!(conversion_matches(t.path(), &source));
+        fs::write(t.path().join("weights-f32.safetensors"), b"changed").unwrap();
+        assert!(!conversion_matches(t.path(), &source));
+        fs::write(t.path().join("weights-f32.safetensors"), b"123").unwrap();
+        let record = Converted {
+            version: 1,
+            source: stamps(t.path(), &inputs).unwrap(),
+            output: stamps(t.path(), &outputs).unwrap(),
+        };
+        fs::write(
+            t.path().join("converted.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(conversion_matches(t.path(), &source));
+        fs::write(t.path().join("source"), b"other").unwrap();
+        assert!(!conversion_matches(
+            t.path(),
+            &stamps(t.path(), &[("source", 5, "source-hash")]).unwrap()
+        ));
+    }
     #[test]
     fn reference_chunks() {
         assert_eq!(

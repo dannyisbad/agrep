@@ -154,7 +154,9 @@ impl PlanCache {
         if let Some(rows) = self.candidates.get(&key) {
             return Ok(Some(rows.clone()));
         }
-        let (sql, bind) = if let Some(ordinals) = ordinals {
+        let (sql, bind) = if let Some(ordinals) = ordinals.filter(|_| table == "prose") {
+            ("SELECT rowid FROM prose_fts WHERE prose_fts MATCH ? AND agrep_word_span(prose_fts,?,2147483647)".into(),vec![Value::Text(expression.into()),Value::Blob(ordinals.to_vec())])
+        } else if let Some(ordinals) = ordinals {
             (format!("SELECT f.rowid FROM tools_fts f LEFT JOIN tool_blocks b ON b.id=f.rowid/{BLOCK} WHERE tools_fts MATCH ? AND agrep_word_span(tools_fts,?,coalesce(b.max_gap,2147483647))"),vec![Value::Text(expression.into()),Value::Blob(ordinals.to_vec())])
         } else {
             (
@@ -467,8 +469,12 @@ impl Matcher {
                 }
         } else if self.partial {
             0.5 * found_weight / self.idf.iter().sum::<f64>().max(1.)
-        } else {
+        } else if text.is_ascii() {
             proximity_upper(&low, &self.terms, self.query_chars)
+        } else {
+            // Compatibility characters can expand under normalization. Their
+            // original spans may be tighter than the normalized ASCII span.
+            1.
         } * rec
             * weight(who);
         if cutoff.is_some_and(|(t, score, tied)| {
@@ -547,6 +553,31 @@ impl Matcher {
             };
         Ok(Some((tier, score, b.match_class.into())))
     }
+    // On ASCII rows, fully aligned distinct terms occupy disjoint spans with at
+    // least one separator. Any partial boundary has quality <= 0.5, making the
+    // all-terms tightness 0.5. This bounds both cases without scanning text.
+    fn all_terms_tightness(&self) -> f64 {
+        if self.terms.len() < 2
+            || self
+                .terms
+                .iter()
+                .flatten()
+                .any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_alphanumeric()))
+            || self.terms.iter().enumerate().any(|(i, variants)| {
+                self.terms[..i]
+                    .iter()
+                    .any(|prior| variants.iter().any(|v| prior.contains(v)))
+            })
+        {
+            return 1.;
+        }
+        let width: usize = self
+            .terms
+            .iter()
+            .map(|v| v.iter().map(String::len).min().unwrap_or(0))
+            .sum();
+        0.5 + 0.5 * (self.query_chars as f64 / (width + self.terms.len() - 1) as f64).min(1.)
+    }
     // Each alternative keeps its own upper count. Min across terms is a sound occurrence bound.
     fn phrase_bridges(&self) -> Vec<Vec<String>> {
         if self.phase != 1 || self.partial || self.explicit.is_some() {
@@ -614,9 +645,22 @@ impl Matcher {
         }
         let mut out = vec![];
         for group in groups {
-            if group.iter().any(|v| v.chars().count() < 3) {
-                // AND may omit a short-term clause and verify it on candidates;
-                // OR cannot omit one without losing its possible matches.
+            // A literal phrase cannot use a plural-only variant. In the other
+            // tiers a shorter substring already admits every containing variant.
+            let terms: Vec<_> = if self.phase == 1 && !self.partial && self.explicit.is_none() {
+                group.iter().take(1).collect()
+            } else {
+                group
+                    .iter()
+                    .filter(|term| {
+                        !group
+                            .iter()
+                            .any(|other| other.len() < term.len() && term.contains(other.as_str()))
+                    })
+                    .collect()
+            };
+            if terms.iter().any(|v| v.chars().count() < 3) {
+                // AND may omit a short clause; OR must retain its possible hits.
                 if self.partial {
                     return None;
                 }
@@ -624,7 +668,7 @@ impl Matcher {
             }
             out.push(format!(
                 "({})",
-                group
+                terms
                     .iter()
                     .map(|v| format!("\"{}\"", v.replace('"', "\"\"")))
                     .collect::<Vec<_>>()
@@ -667,15 +711,13 @@ impl Matcher {
                     .collect::<Vec<_>>()
                     .join(" OR ")
             ));
-            if !self.partial && !self.quick_count {
+            if !self.partial && !self.quick_count && clauses.len() == 2 {
                 break;
             }
         }
-        // The rarest term drives ordinary retrieval. Common terms are verified on
-        // those rows instead of building enormous word expansions in each block.
-        if !self.partial && !self.quick_count {
-            clauses.truncate(1);
-        }
+        // Intersect the two rarest required groups once; verify remaining terms
+        // on their candidates. This avoids reopening a broad single-term stream
+        // for each block in a long all-terms query.
         (!clauses.is_empty()).then(|| clauses.join(if self.partial { " OR " } else { " AND " }))
     }
     fn word_positions(&self) -> Option<(String, Vec<u8>)> {
@@ -734,6 +776,21 @@ impl Matcher {
                     .join(" OR ")
             ));
             for _ in words {
+                ordinals.extend((i as u32).to_le_bytes());
+            }
+        }
+        (clauses.len() >= 2).then(|| (clauses.join(" AND "), ordinals))
+    }
+    fn prose_positions(&self) -> Option<(String, Vec<u8>)> {
+        if self.phase != 1 || self.partial || self.explicit.is_some() {
+            return None;
+        }
+        let mut clauses = Vec::new();
+        let mut ordinals = Vec::new();
+        for (i, terms) in self.terms.iter().enumerate() {
+            let term = &terms[0];
+            if term.chars().count() >= 3 {
+                clauses.push(format!("\"{}\"", term.replace('"', "\"\"")));
                 ordinals.extend((i as u32).to_le_bytes());
             }
         }
@@ -914,6 +971,7 @@ fn block_bounds(
     };
     let grams = m.bound_grams();
     let bridges = m.phrase_bridges();
+    let all_terms_tightness = m.all_terms_tightness();
     let mut map: HashMap<String, HashMap<i64, store::Posting>> = HashMap::new();
     for g in grams
         .iter()
@@ -940,7 +998,7 @@ fn block_bounds(
         );
     }
     let mut q = c.prepare(&format!(
-        "SELECT id,max_ts,user_ts,weight,min_session,min_turn,max_gap FROM {metadata}"
+        "SELECT id,max_ts,user_ts,weight,min_session,min_turn,max_gap,all_ascii FROM {metadata}"
     ))?;
     let rows = q.query_map([], |r| {
         Ok((
@@ -951,11 +1009,12 @@ fn block_bounds(
             r.get::<_, String>(4)?,
             r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?,
+            r.get::<_, bool>(7)?,
         ))
     })?;
     let mut out = vec![];
     for r in rows {
-        let (id, ts, user_ts, w, min_session, min_turn, max_gap) = r?;
+        let (id, ts, user_ts, w, min_session, min_turn, max_gap, all_ascii) = r?;
         let global_clock = if m.explicit.is_some() {
             w * recency(ts, now).max(0.5)
         } else {
@@ -1040,7 +1099,9 @@ fn block_bounds(
                     })
             })
             .count();
-        let phrase_tightness = if bridges.is_empty() {
+        let phrase_tightness = if m.phase == 2 && all_ascii {
+            all_terms_tightness
+        } else if bridges.is_empty() {
             1.
         } else {
             let width: usize = m
@@ -1061,7 +1122,7 @@ fn block_bounds(
             if m.partial {
                 0.5 * rw * possible_weight / m.idf.iter().sum::<f64>().max(1.)
             } else if folded && m.phase == 2 {
-                0.7 * rw
+                0.7 * phrase_tightness * rw
             } else if folded {
                 (phrase_tightness * repetition * rw).max(0.7 * rw)
             } else {
@@ -1278,7 +1339,8 @@ fn count_tool_terms(
     ids.sort_unstable();
     let mut count = 0;
     for chunk in ids.chunks(512) {
-        let sql=format!("WITH ids(id) AS (VALUES {}) SELECT count(*) FROM ids CROSS JOIN tools p ON p.id=ids.id WHERE 1{scope}",vec!["(?)";chunk.len()].join(","));
+        let candidates = crate::tool_store::CANDIDATES_BY_ID;
+        let sql=format!("WITH ids(id) AS (VALUES {}) SELECT count(*) FROM ids CROSS JOIN {candidates} p ON p.id=ids.id WHERE 1{scope}",vec!["(?)";chunk.len()].join(","));
         let mut bind: Vec<_> = chunk.iter().copied().map(Value::Integer).collect();
         bind.extend_from_slice(values);
         count += c
@@ -1401,6 +1463,19 @@ fn search_pass(
     result.timings.plan_ms += started.elapsed().as_secs_f64() * 1000.;
     for table in tables {
         let plan_started = Instant::now();
+        if table == "tools"
+            && !o.chats
+            && !o.exact
+            && o.sort == "score"
+            && o.limit > 0
+            && result.hits.len() >= o.limit
+            && result.hits[o.limit - 1].tier == 0
+            && result.hits[o.limit - 1].score > weight("tool")
+        {
+            result.total_basis = "floor".into();
+            result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
+            continue;
+        }
         m.order_for(c, table, cache)?;
         if m.estimated == 0 {
             result.timings.plan_ms += plan_started.elapsed().as_secs_f64() * 1000.;
@@ -1479,9 +1554,13 @@ fn search_pass(
             && o.sort == "score"
             && m.terms.len() == 1
             && m.estimated != usize::MAX
-            && m.estimated.saturating_mul(4) >= lane_total;
+            && m.estimated
+                .saturating_mul(if table == "tools" { 8 } else { 4 })
+                >= lane_total;
         let span_plan = if table == "tools" && !common_scan {
             m.word_positions()
+        } else if table == "prose" {
+            m.prose_positions()
         } else {
             None
         };
@@ -1564,26 +1643,16 @@ fn search_pass(
         // bounds planner memory, not matches or result accuracy.
         let mut adaptive_prose = table == "prose" && bounded && !partial && m.terms.len() > 1;
         let mut ids = None;
-        if table == "tools" && bounded && (span_plan.is_some() || m.estimated <= 32_768) {
-            let rows: usize = c
-                .query_row(
-                    "SELECT CAST(value AS INTEGER) FROM state WHERE key=?",
-                    [format!("{table}_count")],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            if span_plan.is_some() || m.estimated.saturating_mul(8) <= rows {
-                if let Some(expression) = &fts {
-                    let tick = Instant::now();
-                    ids = cache.candidate_rows(
-                        c,
-                        table,
-                        expression,
-                        span_plan.as_ref().map(|(_, v)| v.as_slice()),
-                    )?;
-                    result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
-                }
+        if table == "tools" && bounded && m.estimated.saturating_mul(8) <= lane_total {
+            if let Some(expression) = &fts {
+                let tick = Instant::now();
+                ids = cache.candidate_rows(
+                    c,
+                    table,
+                    expression,
+                    span_plan.as_ref().map(|(_, v)| v.as_slice()),
+                )?;
+                result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
         }
         for (block_index, (block, bound, max_ts, min_session, min_turn, max_gap)) in
@@ -1629,7 +1698,12 @@ fn search_pass(
                 adaptive_prose = false;
                 if let Some(expression) = &fts {
                     let tick = Instant::now();
-                    ids = cache.candidate_rows(c, table, expression, None)?;
+                    ids = cache.candidate_rows(
+                        c,
+                        table,
+                        expression,
+                        span_plan.as_ref().map(|(_, v)| v.as_slice()),
+                    )?;
                     result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
                 }
             }
@@ -1640,25 +1714,34 @@ fn search_pass(
             result.blocks += 1;
             let mut bind = vec![];
             let uses_fts = !selective && fts.is_some() && ids.is_none();
+            let candidate_table = if table == "tools" && (uses_fts || ids.is_some() || bounded) {
+                crate::tool_store::CANDIDATES_BY_ID
+            } else {
+                table
+            };
             let from = if uses_fts {
                 bind.push(Value::Text(fts.clone().unwrap()));
                 format!(
-                    "{table}_fts f CROSS JOIN {table} p ON f.rowid=p.id WHERE {table}_fts MATCH ?"
+                    "{table}_fts f CROSS JOIN {candidate_table} p ON f.rowid=p.id WHERE {table}_fts MATCH ?"
                 )
-            } else if ids.is_some() {
+            } else if table == "prose" && (ids.is_some() || bounded) {
                 // The candidate IDs already establish the selective access path.
                 // An agent/time index here can rescan a large scope per block.
                 format!("{table} p NOT INDEXED WHERE 1")
             } else {
-                format!("{table} p WHERE 1")
+                format!("{candidate_table} p WHERE 1")
             };
             let mut sql=format!("SELECT p.id,p.session,p.agent,NULL,p.position,p.who,NULL,NULL,p.ts,NULL,NULL,NULL FROM {from}{scope}");
             bind.extend(values.clone());
             if uses_fts {
                 if let Some((_, ordinals)) = &span_plan {
-                    sql.push_str(" AND agrep_word_span(tools_fts,?,?)");
+                    sql.push_str(&format!(" AND agrep_word_span({table}_fts,?,?)"));
                     bind.push(Value::Blob(ordinals.clone()));
-                    bind.push(Value::Integer(max_gap));
+                    bind.push(Value::Integer(if table == "prose" {
+                        i64::from(i32::MAX)
+                    } else {
+                        max_gap
+                    }));
                 }
             }
             if let Some(ids) = block_ids {

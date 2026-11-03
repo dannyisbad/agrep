@@ -1,0 +1,14 @@
+{
+  "time": "2026-11-02T18:29:47.368517-05:00",
+  "removed_paths": [
+    "scratch",
+    "target",
+    "scripts/__pycache__",
+    "measurements/semperf/runners/__pycache__"
+  ],
+  "all_removed": true,
+  "scratch_kib_before": 1710464,
+  "raw_measurement_logs_preserved_verbatim": true,
+  "source_diff_check": "passed; raw tool logs retain their original trailing whitespace",
+  "df_after": "Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on\n/dev/disk3s3s1   926Gi    13Gi   168Gi     8%    486k  1.8G    0%   /\n"
+}

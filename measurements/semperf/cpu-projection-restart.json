@@ -1,0 +1,8 @@
+{
+  "reason": "Stop queued CPU runs to test the measured serial-projection bottleneck. Completed samples are retained in pre-projection files.",
+  "pids": [
+    73682,
+    66923
+  ],
+  "uptime": "23:59  up  3:51, 2 users, load averages: 14.27 19.32 29.68"
+}

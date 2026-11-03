@@ -137,8 +137,8 @@ CREATE TABLE IF NOT EXISTS parser_cursors(path TEXT PRIMARY KEY REFERENCES sourc
 CREATE TABLE IF NOT EXISTS parser_graph(source INTEGER NOT NULL,bucket INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(source,bucket)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS gram_postings(lane INTEGER NOT NULL,gram INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,gram)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS block_grams(lane INTEGER NOT NULL,block INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(lane,block)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS tool_blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL,all_ascii INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS tool_blocks(id INTEGER PRIMARY KEY,max_ts INTEGER NOT NULL,user_ts INTEGER,weight REAL NOT NULL,min_session TEXT NOT NULL,min_turn INTEGER NOT NULL,max_gap INTEGER NOT NULL,all_ascii INTEGER NOT NULL);
 ")?;
     crate::tool_store::schema(c)?;
     for table in ["prose", "tools"] {
@@ -1947,6 +1947,7 @@ struct BuiltBounds {
     min_turn: i64,
     grams: Vec<(String, GramStat)>,
     max_gap: usize,
+    all_ascii: bool,
 }
 #[derive(Clone, Copy, Debug, Default)]
 struct GramStat {
@@ -2031,6 +2032,7 @@ fn build_bounds(key: i64, rows: Vec<BoundRow>) -> Result<BuiltBounds> {
     let mut min_turn = i64::MAX;
     let mut texts = Vec::with_capacity(rows.len());
     let mut max_gap = 0;
+    let mut all_ascii = true;
     for (text, ts, who, session, turn) in rows {
         if min_session.is_empty() || session < min_session {
             min_session = session.clone();
@@ -2044,7 +2046,9 @@ fn build_bounds(key: i64, rows: Vec<BoundRow>) -> Result<BuiltBounds> {
         if who == "user" {
             user_ts = Some(user_ts.unwrap_or(0).max(ts));
         }
-        let text = normalize(&decode(table, text)?);
+        let decoded = decode(table, text)?;
+        all_ascii &= decoded.is_ascii();
+        let text = normalize(&decoded);
         max_gap = max_gap.max(crate::fts_span::gap_upper(&text));
         texts.push((text, ts, who));
     }
@@ -2059,6 +2063,7 @@ fn build_bounds(key: i64, rows: Vec<BoundRow>) -> Result<BuiltBounds> {
         min_turn,
         grams,
         max_gap,
+        all_ascii,
     })
 }
 /// Dense ASCII keys cover common keyword bounds; other text retains a
@@ -2339,7 +2344,7 @@ fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
             tx.execute(&format!("DELETE FROM {metadata} WHERE id=?"), [id])?;
             if b.min_turn != i64::MAX {
                 tx.prepare_cached(&format!(
-                    "INSERT INTO {metadata} VALUES(?1,?2,?3,?4,?5,?6,?7)"
+                    "INSERT INTO {metadata} VALUES(?1,?2,?3,?4,?5,?6,?7,?8)"
                 ))?
                 .execute(params![
                     id,
@@ -2348,7 +2353,8 @@ fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
                     b.weight,
                     b.min_session,
                     b.min_turn,
-                    b.max_gap as i64
+                    b.max_gap as i64,
+                    b.all_ascii
                 ])?;
             }
         }

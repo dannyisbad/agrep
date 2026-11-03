@@ -1,0 +1,39 @@
+{
+  "merge_commit": "1f94289e2e1887d69e361a16622661aaf3f818ac",
+  "parents": [
+    "0a57c3c3c79ee12dc61fe7ad88ed0c7a2dd9cba5",
+    "f0ea6030798fb3e03442182de67614a4055b1136"
+  ],
+  "reference_commit": "6eee19504119c9884aa2706709b9d75ce2c3276a",
+  "threads": 6,
+  "blas_threads": 1,
+  "nice": 10,
+  "bulk_process_samples_per_backend_fixture": 1,
+  "batches_per_process": 4,
+  "query_process_samples_per_mode": 20,
+  "discard_samples": false,
+  "load": [
+    84.10400390625,
+    71.43603515625,
+    64.75830078125
+  ],
+  "uptime": "21:16  up  4:11, 1 user, load averages: 84.10 71.44 64.76",
+  "sha256": {
+    "Cargo.lock": "c8aaaca72b237093855de9a5559233cefee34fbaeb7eab7f49bf483665285530",
+    "docs/perf-budgets.json": "d693733c01f63d9139925ed6407820bd28707ea9cc86597bf2aeb508d9fee083",
+    "target/release/agrep": "94f3cc6b71e540c433691c1a755c9162c3083bf1ba00d43af44565a6bedaa945",
+    "target/release/examples/semantic_eval": "f0b6a910fa3903dbab695ba7135f116f14705860bf9582b33df78e76ca8a57f1",
+    "target/release/examples/semantic_scale": "788397888240e98501a1f3baefc987581bb2ceda41f2f33cce663813027de6ec",
+    "fixtures/semantic-batch.json": "cd837aa907b23ccc8cffb9646e1e5127728327f6c6c5874dfeb27c4fbb8c1ef8",
+    "fixtures/semantic-mixed.json": "0f983aac5ed17b9b45c0eeacd3986afb5128d6a5fdf2e812850accd28c042409"
+  },
+  "machine": {
+    "system": "Darwin",
+    "release": "27.2.0",
+    "architecture": "arm64",
+    "cpu": "Apple M2 Max",
+    "logical_cpus": 12
+  },
+  "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "query_gate_exit": 1
+}

@@ -1,0 +1,13 @@
+=== indexing transcripts ===
+  [sessions] 4000 files: stat 2ms · parse+materialize 469ms (4000 changed, 0 siblings, 0 stat failures)
+  [sessions] 0 files: stat 1ms · parse+materialize 4ms (0 changed, 0 siblings, 0 stat failures)
+  [sessions] 0 files: stat 2ms · parse+materialize 3ms (0 changed, 0 siblings, 0 stat failures)
+  [sessions] 0 files: stat 1ms · parse+materialize 2ms (0 changed, 0 siblings, 0 stat failures)
+  [pi] 4000 parsed files: 204000 seen -> 200000 rows · 0 agent-side · 4000 skipped
+  indexed 200000 messages across 4000 sessions -> /Users/runner/.agrep-p8/w05-semperf/scratch/reference-scale/messages.jsonl (3084ms)
+  0 turns carry a model · 0 carry an agent reply -> /Users/runner/.agrep-p8/w05-semperf/scratch/reference-scale/replies.jsonl
+  0 session event streams -> /Users/runner/.agrep-p8/w05-semperf/scratch/reference-scale/events (0 rewritten, 0 events observed this run)
+  phases: source-check 149ms · load-cache 8ms · ingest+dedupe 576ms · stage-cache+content-sig 125ms · write-boundary-stats 1907ms · write-derived+source-validate 273ms · publish-markers 4ms · source-publish 1ms
+  next: `agrep setup` - teach your agents to search this history
+refreshing the search db …
+took 4.69s (index)

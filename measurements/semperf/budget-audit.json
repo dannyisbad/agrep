@@ -1,0 +1,9 @@
+{
+  "existing_numeric_budgets_unchanged": true,
+  "new_numeric_budgets": {
+    "semantic_cpu_rows_s": 60,
+    "semantic_metal_rows_s": 600,
+    "semantic_owner_p50_ms": 120,
+    "hybrid_owner_p50_ms": 200
+  }
+}

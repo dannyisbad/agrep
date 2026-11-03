@@ -1,0 +1,30 @@
+    Blocking waiting for file lock on build directory
+   Compiling agrep-core v0.5.0 (/Users/runner/.agrep-p8/w05-semperf/crates/agrep-core)
+error[E0603]: struct `MTLSize` is private
+  --> crates/agrep-core/src/semantic_metal.rs:50:35
+   |
+50 |         use candle_metal_kernels::MTLSize;
+   |                                   ^^^^^^^ private struct
+   |
+note: the struct `MTLSize` is defined here
+  --> /Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/candle-metal-kernels-0.9.2/src/lib.rs:19:82
+   |
+19 | use objc2_metal::{MTLCompileOptions, MTLMathFloatingPointFunctions, MTLMathMode, MTLSize};
+   |                                                                                  ^^^^^^^
+help: import `MTLSize` directly
+   |
+50 -         use candle_metal_kernels::MTLSize;
+50 +         use objc2_metal::generated::__MTLTypes::MTLSize;
+   |
+
+error[E0658]: use of unstable library feature `stdarch_neon_dotprod`
+  --> crates/agrep-core/src/semantic_q8.rs:64:20
+   |
+64 |             *sum = vdotq_s32(
+   |                    ^^^^^^^^^
+   |
+   = note: see issue #117224 <https://github.com/rust-lang/rust/issues/117224> for more information
+
+Some errors have detailed explanations: E0603, E0658.
+For more information about an error, try `rustc --explain E0603`.
+error: could not compile `agrep-core` (lib) due to 2 previous errors

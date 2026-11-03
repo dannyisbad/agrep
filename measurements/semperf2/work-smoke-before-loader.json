@@ -1,0 +1,119 @@
+{
+  "rows": 4,
+  "threads": 6,
+  "nice": 10,
+  "load_before": [
+    63.24365234375,
+    162.27001953125,
+    113.26220703125
+  ],
+  "uptime": "20:20  up  3:15, 1 user, load averages: 63.24 162.27 113.26",
+  "attempts": [
+    {
+      "exit": 0,
+      "wall_s": 145.7413917920003,
+      "phases": [
+        {
+          "model_cache": {
+            "converted": true,
+            "metal": true,
+            "verified": true,
+            "writes": 0
+          }
+        },
+        {
+          "semantic_load": {
+            "tokenizer_ms": 73.882166,
+            "total_ms": 138762.800709,
+            "verify_ms": 0.28425,
+            "weights_ms": 138762.280709
+          }
+        },
+        {
+          "cpu_ms": 96.87700000000001,
+          "input_blocks": 0,
+          "involuntary_switches": 437,
+          "major_faults": 297,
+          "minor_faults": 15570,
+          "output_blocks": 0,
+          "phase": "model_load",
+          "start_ms": 8.3e-05,
+          "thread": "ThreadId(1)",
+          "wall_ms": 138762.83025
+        },
+        {
+          "cpu_ms": 1.5509999999999877,
+          "input_blocks": 0,
+          "involuntary_switches": 0,
+          "major_faults": 1,
+          "minor_faults": 77,
+          "output_blocks": 0,
+          "phase": "tokenize",
+          "start_ms": 138766.275333,
+          "thread": "ThreadId(1)",
+          "wall_ms": 1.552709
+        },
+        {
+          "arena_reserve": {
+            "generation": 1,
+            "mask_buffers": 2,
+            "requested_bytes": 323059712,
+            "scratch_buffers": 10,
+            "tokens": 16384
+          }
+        },
+        {
+          "arena_batch": {
+            "reserved_tokens": 16384,
+            "rows": 2,
+            "sdpa": true,
+            "synchronized_profile": false,
+            "tokens": 106,
+            "workspace_generation": 1
+          }
+        },
+        {
+          "cpu_ms": 34.91,
+          "input_blocks": 0,
+          "involuntary_switches": 79,
+          "major_faults": 114,
+          "minor_faults": 610,
+          "output_blocks": 0,
+          "phase": "query_inference",
+          "start_ms": 138768.00787499998,
+          "thread": "ThreadId(1)",
+          "wall_ms": 6482.404167000001
+        },
+        {
+          "arena_batch": {
+            "reserved_tokens": 16384,
+            "rows": 2,
+            "sdpa": true,
+            "synchronized_profile": false,
+            "tokens": 166,
+            "workspace_generation": 1
+          }
+        },
+        {
+          "cpu_ms": 0.603999999999985,
+          "input_blocks": 0,
+          "involuntary_switches": 9,
+          "major_faults": 0,
+          "minor_faults": 2,
+          "output_blocks": 0,
+          "phase": "query_inference",
+          "start_ms": 145250.48262499998,
+          "thread": "ThreadId(1)",
+          "wall_ms": 16.226625000000002
+        }
+      ]
+    }
+  ],
+  "references": 4,
+  "pending": 0,
+  "load_after": [
+    167.1767578125,
+    173.4306640625,
+    125.69140625
+  ]
+}

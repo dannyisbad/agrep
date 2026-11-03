@@ -1,0 +1,33 @@
+{
+  "device": "cpu",
+  "binary_sha256": "3a0a2b15575b4d499db32bf97b76c8a934cf30e2f7bd8f46c69df83ab3aae733",
+  "load_before": [
+    36.00244140625,
+    44.51318359375,
+    66.02099609375
+  ],
+  "uptime": "20:50  up  3:45, 1 user, load averages: 36.00 44.51 66.02",
+  "exit": 0,
+  "load_after": [
+    36.162109375,
+    44.40478515625,
+    65.8564453125
+  ],
+  "ids_equal": true,
+  "load_s": 0.377399583,
+  "long_tail_recall_at_1": 1.0,
+  "minimum_cosine": 0.9999999999982052,
+  "recall_at_5": 1.0,
+  "reference_recall_at_1": 1.0,
+  "top5_agreement": 10,
+  "total_s": 4.704811708,
+  "window": 1024,
+  "cache": [
+    {
+      "converted": true,
+      "metal": false,
+      "verified": true,
+      "writes": 0
+    }
+  ]
+}

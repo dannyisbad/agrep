@@ -1,0 +1,12 @@
+{
+  "tests": 286,
+  "failed": 0,
+  "ignored": 0,
+  "fmt": true,
+  "clippy_warnings_denied": true,
+  "workspace_tests": true,
+  "licenses": true,
+  "privacy_worktree": true,
+  "privacy_index": true,
+  "semantic_budget_unit_tests": 4
+}

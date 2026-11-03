@@ -1,0 +1,17 @@
+{
+  "order": "device (Metal then CPU), fixture, round; rotate reference/before/after each round",
+  "rounds": 3,
+  "batches": 8,
+  "cpu_start_max_load": 12,
+  "keep_all_started_samples": true,
+  "cpu_epoch": "Repeat all CPU arms after externally triggered host restart, retaining the complete previous campaign under pre-restart names; same protocol and start-load threshold.",
+  "final_epoch": "Repeat all Metal and CPU arms after host restart on exact final binaries. Complete earlier epochs retained separately. No thresholds changed.",
+  "reference_query_exception": {
+    "context": "contended",
+    "load_gate": null,
+    "threads": 6,
+    "nice": 10,
+    "reason": "The host remained fully CPU-busy during the preserved quiet-start attempt. Collect context, without using it for matched-host latency or release acceptance claims.",
+    "acceptance_budgets_changed": false
+  }
+}

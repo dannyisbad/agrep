@@ -1,0 +1,14 @@
+{
+  "incoming": "f0ea6030",
+  "incoming_numeric_limits_preserved": true,
+  "owner_limits_preserved": {
+    "semantic_cpu_rows_s": 60,
+    "semantic_metal_rows_s": 600,
+    "semantic_owner_p50_ms": 120,
+    "hybrid_owner_p50_ms": 200,
+    "semantic_owner_p95_ms": 120,
+    "hybrid_owner_p95_ms": 200,
+    "semantic_tail_outlier_multiple": 2
+  },
+  "derivation": "Use incoming unscaled SPEC latency limits, max(row fraction, indexed-text fraction) for first build, and dense 2x headroom. Supersedes the obsolete source-scaled hybrid derivation; no owner limit is relaxed."
+}

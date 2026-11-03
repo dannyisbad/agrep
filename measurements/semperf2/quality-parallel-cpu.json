@@ -1,0 +1,32 @@
+{
+  "label": "parallel-cpu",
+  "load_before": [
+    69.5048828125,
+    67.23583984375,
+    54.91552734375
+  ],
+  "uptime": "19:31  up  2:26, 1 user, load averages: 69.50 67.24 54.92",
+  "exit": 0,
+  "load_after": [
+    69.5048828125,
+    67.23583984375,
+    54.91552734375
+  ],
+  "ids_equal": true,
+  "load_s": 0.446272459,
+  "long_tail_recall_at_1": 1.0,
+  "minimum_cosine": 0.9999999999979889,
+  "recall_at_5": 1.0,
+  "reference_recall_at_1": 1.0,
+  "top5_agreement": 10,
+  "total_s": 3.555178209,
+  "window": 1024,
+  "cache": [
+    {
+      "converted": true,
+      "metal": false,
+      "verified": true,
+      "writes": 0
+    }
+  ]
+}

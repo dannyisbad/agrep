@@ -161,13 +161,13 @@ is now known from retained reply metadata rather than reported as unknown. The
 structured recall hit also carries its verified handle and `self` bit. No old cache,
 page, model, owner, or runtime format is read.
 
-Known engine integration limit: foundation `events.body` omits timestamps and turn
-addresses for control events, and does not retain an input/output boundary inside
-multiline tool inputs. Tool rows are decoded from canonical indexed text (the first
-newline separates the normal input summary and output). To recover every structural
-control marker and unusual multiline-input preview without source reads, retain
-`ts`, assigned `turn`, and an input/output separator offset in event metadata. The
-surface has no query-path source parser.
+The event storage seam is additive: `events` retains `source`, `session`,
+`call_id`, and `body`, and now exposes `id`, `ts`, `position`, `visible`, and
+encoded `text` directly. `body` carries `ts`, `native_turn`, assigned `turn` and
+`position`, `visible`, `input_end`, and `output_start`. The offsets count Unicode
+scalar values; control events have timestamps and positions even without a tool
+row. Readers should use `store::decode` for encoded text and `tool_text::split`
+for the recorded boundary. The `tools` read columns remain unchanged.
 
 Validation and output comparison evidence: `measurements/surface/README.md`;
 `tests/surface.rs` and `tests/golden/pi-*.txt`. `scripts/compare-surface.py` is a

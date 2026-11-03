@@ -1,0 +1,175 @@
+{
+  "source_bytes": 118755475,
+  "copied_bytes": 118755475,
+  "build_ms": 2454.2119590005314,
+  "build_load_averages": [
+    [
+      27.37,
+      33.96,
+      56.34
+    ]
+  ],
+  "build_phases": {
+    "sources": 1,
+    "parsed": 1,
+    "changed_rows": 9237,
+    "errors": 0,
+    "census_ms": 0.456875,
+    "total_ms": 2401.071959,
+    "parse_ms": 1178.143125,
+    "write_ms": 913.036666,
+    "bounds_ms": 110.335167,
+    "stats_ms": 81.326125,
+    "resumed_sources": 0,
+    "bytes_read": 118755475,
+    "bytes_parsed": 118755475,
+    "adapter_parse_ms": {
+      "pi": 1178.014291
+    },
+    "adapter_source_parse_ms": {
+      "pi": 1177.996583
+    },
+    "adapter_sources": {
+      "pi": 1
+    },
+    "adapter_write_ms": {
+      "pi": 458.492125
+    },
+    "row_diff_ms": 297.792919,
+    "fts_ms": 371.68875,
+    "secondary_indexes_ms": 19.501291000000002,
+    "canonical_ms": 0.029,
+    "dictionary_ms": 62.830125,
+    "node_chunks_ms": 132.065917,
+    "commit_ms": 40.267125
+  },
+  "samples_ms": [
+    601.1594169995078,
+    567.2361249999085,
+    535.8865000016522,
+    541.6462500015768,
+    528.0134169988742,
+    561.4034589998482,
+    519.5348749984987
+  ],
+  "median_ms": 541.6462500015768,
+  "load_averages": [
+    [
+      26.94,
+      33.76,
+      56.14
+    ],
+    [
+      26.94,
+      33.76,
+      56.14
+    ],
+    [
+      26.94,
+      33.76,
+      56.14
+    ],
+    [
+      26.94,
+      33.76,
+      56.14
+    ],
+    [
+      26.94,
+      33.76,
+      56.14
+    ],
+    [
+      26.94,
+      33.76,
+      56.14
+    ],
+    [
+      26.94,
+      33.76,
+      56.14
+    ]
+  ],
+  "phases": {
+    "sources": {
+      "median": 1,
+      "max": 1
+    },
+    "parsed": {
+      "median": 1,
+      "max": 1
+    },
+    "changed_rows": {
+      "median": 2,
+      "max": 2
+    },
+    "errors": {
+      "median": 0,
+      "max": 0
+    },
+    "census_ms": {
+      "median": 0.672583,
+      "max": 5.080958
+    },
+    "total_ms": {
+      "median": 516.9952079999999,
+      "max": 570.314625
+    },
+    "parse_ms": {
+      "median": 456.578417,
+      "max": 498.979375
+    },
+    "write_ms": {
+      "median": 11.820542,
+      "max": 18.298042
+    },
+    "bounds_ms": {
+      "median": 37.127250000000004,
+      "max": 41.764917
+    },
+    "stats_ms": {
+      "median": 6.3222499999999995,
+      "max": 9.424625
+    },
+    "resumed_sources": {
+      "median": 1,
+      "max": 1
+    },
+    "bytes_read": {
+      "median": 118757025,
+      "max": 118758204
+    },
+    "bytes_parsed": {
+      "median": 393,
+      "max": 393
+    },
+    "row_diff_ms": {
+      "median": 0.728044,
+      "max": 1.364083
+    },
+    "fts_ms": {
+      "median": 0.082042,
+      "max": 0.373375
+    },
+    "secondary_indexes_ms": {
+      "median": 0.0,
+      "max": 0.0
+    },
+    "canonical_ms": {
+      "median": 0.023833,
+      "max": 0.334958
+    },
+    "dictionary_ms": {
+      "median": 0.012791,
+      "max": 0.035292
+    },
+    "node_chunks_ms": {
+      "median": 10.125791,
+      "max": 14.760083
+    },
+    "commit_ms": {
+      "median": 2.509167,
+      "max": 3.349833
+    }
+  }
+}

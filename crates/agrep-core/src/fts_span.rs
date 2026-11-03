@@ -201,6 +201,38 @@ mod tests {
 mod sqlite_tests {
     use super::*;
     #[test]
+    fn trigram_order_keeps_forward_separators_without_loading_text() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE VIRTUAL TABLE f USING fts5(text,content='',tokenize='trigram case_sensitive 1');").unwrap();
+        for (id, text) in [
+            (1, "alpha beta"),
+            (2, "alpha---beta"),
+            (3, "alphabeta"),
+            (4, "beta alpha"),
+            (5, "alpha café beta"),
+            (6, "AlPhA\nbeta"),
+        ] {
+            c.execute(
+                "INSERT INTO f(rowid,text) VALUES(?1,?2)",
+                rusqlite::params![id, crate::store::normalize(text)],
+            )
+            .unwrap();
+        }
+        install(&c).unwrap();
+        let plan: Vec<u8> = [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect();
+        let got: Vec<i64> = c
+            .prepare("SELECT rowid FROM f WHERE f MATCH ?1 AND agrep_word_span(f,?2,2147483647)")
+            .unwrap()
+            .query_map(rusqlite::params!["\"alpha\" AND \"beta\"", plan], |r| {
+                r.get(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(got, [1, 2, 3, 5, 6]);
+    }
+
+    #[test]
     fn auxiliary_rejects_impossible_word_positions_without_reading_content() {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE VIRTUAL TABLE f USING fts5(text,content='',tokenize='unicode61 remove_diacritics 0');CREATE TABLE gaps(id INTEGER PRIMARY KEY,n INTEGER);").unwrap();

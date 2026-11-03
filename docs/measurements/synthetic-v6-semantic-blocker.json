@@ -1,0 +1,30 @@
+{
+  "completed": false,
+  "exit_code": 1,
+  "reason": "Pinned model cache absent; downloads forbidden by task network constraint. No semantic query was timed.",
+  "completed_cases": [
+    {
+      "name": "first_index",
+      "median_ms": 151.618959,
+      "samples": 3
+    },
+    {
+      "name": "no_change_census",
+      "median_ms": 7.134708,
+      "p95_ms": 9.438042000000001,
+      "samples": 20
+    },
+    {
+      "name": "one_session_refresh",
+      "median_ms": 19.859458,
+      "p95_ms": 21.950834,
+      "samples": 20
+    },
+    {
+      "name": "search_changed_source",
+      "median_ms": 15.714625,
+      "p95_ms": 20.85275,
+      "samples": 20
+    }
+  ]
+}

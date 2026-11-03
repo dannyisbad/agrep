@@ -5,16 +5,16 @@ The engine work on `w05` keeps the columns of `sources`, `sessions`, `prose`, `t
 Additions for the other slices:
 
 - `Results.pending_sources: usize`: number of source fingerprints differing from the committed snapshot. The CLI fills this after its census; presentation owns how to show it.
-- `Filters.caller: Option<CallerFilter>`. CallerFilter has `agent`, `session`, `family`, `exclude_from_turn: Option<i64>`, and `exclude_family: bool`. Set a window start to exclude that session's positions at or after it. Set `exclude_family` for `--no-self`; leave both exclusions unset for `--self`. Returned rows in the caller session carry `Hit.self_marker`. Identity detection remains the presentation slice's job.
+- `Filters.caller: Option<CallerFilter>`. CallerFilter has `agent`, `session`, `family`, `exclude_from_turn: Option<i64>`, `exclude_family: bool`, and `excluded_sessions: Vec<String>`. The session list excludes live descendants before candidate selection. Set a window start to exclude that session's positions at or after it. Set `exclude_family` for `--no-self`; leave both exclusions unset for `--self`. Returned rows in the caller session carry `Hit.self_marker`. Identity detection remains the presentation slice's job.
 - `freshness::pending(&DataRoot) -> Result<Pending>` with `changed_sources` and `census_ms`. This stats inputs without parsing or taking a writer lock.
 - `freshness::spawn(&DataRoot, &Path) -> Result<bool>` launches the passed binary's detached `__work refresh` when the work lock is free.
-- `freshness::work(&DataRoot, &[String]) -> Result<()>`: holds `work.lock` for the task list; `refresh` takes `writer.lock`, refreshes, and exits. The semantic slice can add its task after refresh under the same work lock. `__work` accepts a task list, defaulting to `refresh`.
+- `cmd::work` owns the detached task list under `work.lock`; refresh takes `writer.lock`, followed by semantic work, reclamation, scheduled archive and the post-index hook. `__work` accepts a task list, defaulting to `refresh`.
 
 Normal reads build inline only when no index exists. Subsequent reads census, schedule work, and read the committed snapshot. Explicit `index` and `reindex` still refresh synchronously. `__census` is an internal full-process benchmark entry point, returning Pending JSON without scheduling work.
 
 Current internal storage uses positional trigrams for prose and positional words plus a trigram word dictionary for tools, over already normalized text, with compressed per-gram block postings. The external tables and text codec are unchanged. Exact literal counts use FTS without hydrating text when all terms are indexable. Coverage scoring weights terms using inverse document frequency from the least-common constituent trigram and uses conservative block bounds.
 
-Parser checkpoint additions: `Refresh.resumed_sources`, `bytes_read`, and `bytes_parsed`; private `parser_cursors` and `parser_nodes` tables. `Event.turn: Option<u32>` carries native ordering when known, avoiding timestamp-tie attribution. Existing event-table columns are unchanged.
+Parser checkpoint additions: `Refresh.resumed_sources`, `bytes_read`, and `bytes_parsed`; private `parser_cursors` and `parser_graph` tables. `Event.turn: Option<u32>` carries native ordering when known, avoiding timestamp-tie attribution. Existing event-table columns are unchanged.
 
 Append refresh parses only new JSONL bytes and carries the current row, pending calls, reply ordering, model and lineage. Pi branches replay persisted native entries instead of rereading the source. File identity/length/edge guards reject common rewrites; SHA-256 verification of the old prefix detects an arbitrary interior rewrite combined with growth. This exact verification reads prior bytes and is a known latency constraint, distinct from parsing.
 
@@ -49,3 +49,23 @@ Block posting keys pack lowercase ASCII letters and digits into integers. Other 
 Each private gram posting now carries its matching-row maximum timestamp and role weight. Query clock and tie-time ceilings therefore exclude unrelated rows in the same physical block. The postings codec changed and requires a fresh index (or the isolated diagnostic bounds rebuild); no compatibility reader was added. The matching-row metadata does not change any public table column.
 
 OS lock contention is recognized by the platform error returned by `fs2`, as well as `WouldBlock`. This covers Windows `ERROR_LOCK_VIOLATION`; lock files remain empty, and no reader accesses their locked byte range.
+
+Merged command additions:
+
+- `store::refresh_session(&DataRoot, agent, session)` refreshes only already indexed source paths for the caller. Other source stamps and global harness-policy state do not advance.
+- `events` additionally exposes `id`, `ts`, `position`, `visible`, and encoded `text`. Its prior four read columns remain. `body` also retains `visible`. The indexed `(session_key, position, ts)` access path avoids materializing unrelated event text.
+- `tool_text` formats and splits canonical tool text using the recorded Unicode-scalar boundary; all event readers share it.
+- Explorer `with_freshness` supplies the same pending-source count as terminal queries.
+
+The private block tables additionally store `all_ascii`, determined from original
+text before normalization. It permits an attainable all-terms span ceiling;
+Unicode blocks keep the universal bound. Prose phrase candidates use positional
+term order before canonical verification. These derived-table changes require a
+fresh index and do not change the stable row or result types.
+
+Bounded candidate retrieval uses the prose primary key and a private integer-ID
+projection of tool events. This prevents broad metadata indexes from being
+rescanned for each block; the stable `prose`, `tools`, and `events` read columns
+and the `query::search` signature are unchanged. The semantic merge adds a
+trigger-maintained reference count in private state; keyword readers do not
+scan the semantic reference table on startup.

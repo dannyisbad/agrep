@@ -23,6 +23,10 @@ fn selected_dot(_right: &[i8]) -> DotProduct {
         };
     }
     #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return dot_neon_dot_safe;
+    }
+    #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         return dot_neon_safe;
     }
@@ -42,6 +46,31 @@ fn dot_avx2_q8_safe(left: &[i8], right: &[i8]) -> i32 {
 #[cfg(target_arch = "aarch64")]
 fn dot_neon_safe(left: &[i8], right: &[i8]) -> i32 {
     unsafe { dot_neon(left, right) }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn dot_neon_dot_safe(left: &[i8], right: &[i8]) -> i32 {
+    unsafe { dot_neon_dot(left, right) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_neon_dot(left: &[i8], right: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    let mut sums = [vdupq_n_s32(0); 4];
+    let mut offset = 0;
+    while offset + 64 <= left.len() {
+        for (lane, sum) in sums.iter_mut().enumerate() {
+            let a = vld1q_s8(left.as_ptr().add(offset + lane * 16));
+            let b = vld1q_s8(right.as_ptr().add(offset + lane * 16));
+            // vdotq_s32 is still unstable in Rust 1.97. This is its single
+            // instruction, behind the same runtime dotprod feature check.
+            std::arch::asm!("sdot {sum:v}.4s, {a:v}.16b, {b:v}.16b",sum=inout(vreg)*sum,a=in(vreg)a,b=in(vreg)b,options(pure,nomem,nostack));
+        }
+        offset += 64;
+    }
+    let sum = vaddq_s32(vaddq_s32(sums[0], sums[1]), vaddq_s32(sums[2], sums[3]));
+    vaddvq_s32(sum) + dot_scalar(&left[offset..], &right[offset..])
 }
 
 #[cfg(target_arch = "x86_64")]

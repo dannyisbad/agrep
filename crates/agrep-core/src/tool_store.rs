@@ -10,8 +10,13 @@ use std::{
     io::{Read, Write},
 };
 
+// Candidate streams already carry IDs or a block range. Keep that access path
+// ahead of broad agent/session predicates, and do not join stored text here.
+pub(crate) const CANDIDATES_BY_ID: &str = "(SELECT e.tool_id AS id,s.agent,s.session,p.value AS project,'tool' AS who,m.value AS model,e.ts,e.position,e.visible FROM event_rows e INDEXED BY event_tool_id CROSS JOIN event_sessions s ON s.id=e.session_key LEFT JOIN symbols p ON p.id=e.project_key LEFT JOIN symbols m ON m.id=e.model_key WHERE e.active=1 AND e.blob IS NOT NULL)";
+
 pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS event_sessions(id INTEGER PRIMARY KEY,agent TEXT NOT NULL,session TEXT NOT NULL,UNIQUE(agent,session));
+CREATE INDEX IF NOT EXISTS event_sessions_session ON event_sessions(session);
 CREATE TABLE IF NOT EXISTS symbols(id INTEGER PRIMARY KEY,value TEXT NOT NULL UNIQUE);
 INSERT OR IGNORE INTO symbols VALUES(0,'');
 CREATE TABLE IF NOT EXISTS tool_blobs(id INTEGER PRIMARY KEY,digest BLOB NOT NULL UNIQUE,body BLOB NOT NULL);
@@ -22,7 +27,7 @@ CREATE TABLE IF NOT EXISTS event_rows(id INTEGER PRIMARY KEY,tool_id INTEGER NOT
 CREATE UNIQUE INDEX IF NOT EXISTS event_active_key ON event_rows(source,session_key,call_id) WHERE active=1;
 CREATE UNIQUE INDEX IF NOT EXISTS event_tool_id ON event_rows(tool_id) WHERE active=1;
 CREATE VIEW IF NOT EXISTS tools AS SELECT e.tool_id AS id,e.source,s.agent,s.session,p.value AS project,e.native_turn AS turn,'tool' AS who,m.value AS model,e.model_source,e.ts,b.body AS text,lower(hex(b.digest)) AS digest,e.call_id AS extra,e.position,e.visible FROM event_rows e JOIN event_sessions s ON s.id=e.session_key LEFT JOIN symbols p ON p.id=e.project_key LEFT JOIN symbols m ON m.id=e.model_key LEFT JOIN tool_blobs b ON b.id=e.blob WHERE e.blob IS NOT NULL AND e.active=1;
-CREATE VIEW IF NOT EXISTS events AS SELECT e.source,s.session,e.call_id,json_object('kind',k.value,'name',n.value,'input_chars',e.input_chars,'output_chars',e.output_chars,'output_bytes',e.output_bytes,'ok',CASE WHEN e.ok IS NULL THEN NULL ELSE json(CASE WHEN e.ok THEN 'true' ELSE 'false' END) END,'call_id',e.call_id,'child_session',e.child_session,'meta',e.meta,'state',e.state,'ts',e.ts,'native_turn',e.native_turn,'visible',e.visible,'turn',e.position,'position',e.position,'input_end',e.input_end,'output_start',e.output_start) AS body FROM event_rows e JOIN event_sessions s ON s.id=e.session_key JOIN symbols k ON k.id=e.kind_key JOIN symbols n ON n.id=e.name_key WHERE e.active=1;
+CREATE VIEW IF NOT EXISTS events AS SELECT e.source,s.session,e.call_id,json_object('kind',k.value,'name',n.value,'input_chars',e.input_chars,'output_chars',e.output_chars,'output_bytes',e.output_bytes,'ok',CASE WHEN e.ok IS NULL THEN NULL ELSE json(CASE WHEN e.ok THEN 'true' ELSE 'false' END) END,'call_id',e.call_id,'child_session',e.child_session,'meta',e.meta,'state',e.state,'ts',e.ts,'native_turn',e.native_turn,'visible',e.visible,'turn',e.position,'position',e.position,'input_end',e.input_end,'output_start',e.output_start) AS body,e.id,e.ts,e.position,e.visible,b.body AS text FROM event_rows e JOIN event_sessions s ON s.id=e.session_key JOIN symbols k ON k.id=e.kind_key JOIN symbols n ON n.id=e.name_key LEFT JOIN tool_blobs b ON b.id=e.blob WHERE e.active=1;
 CREATE TRIGGER IF NOT EXISTS tools_delete INSTEAD OF DELETE ON tools BEGIN UPDATE event_rows SET active=0 WHERE tool_id=old.id AND active=1; END;
 CREATE TRIGGER IF NOT EXISTS tools_visibility INSTEAD OF UPDATE OF visible,position ON tools BEGIN UPDATE event_rows SET visible=new.visible,position=new.position WHERE tool_id=old.id AND active=1; END;
 CREATE TRIGGER IF NOT EXISTS events_delete INSTEAD OF DELETE ON events BEGIN UPDATE event_rows SET active=0 WHERE source=old.source AND session_key IN (SELECT id FROM event_sessions WHERE session=old.session) AND call_id=old.call_id AND active=1; END;
@@ -51,6 +56,7 @@ pub(crate) fn collect(tx: &Transaction<'_>) -> Result<()> {
 pub(crate) fn indexes(c: &Connection, create: bool) -> Result<()> {
     for (name, columns, predicate) in [
         ("event_session", "session_key,native_turn", ""),
+        ("event_position", "session_key,position,ts", ""),
         ("event_time", "ts DESC", ""),
         ("event_project", "project_key,ts DESC", ""),
         ("event_native_turn", "source,session_key,native_turn", ""),
@@ -248,7 +254,7 @@ impl Writer {
         let tool_id = old.as_ref().map_or(physical_id, |v| v.tool_id);
         let end = separator.map(|n| n as i64);
         let start = separator.map(|n| if n == 0 { 0 } else { n as i64 + 1 });
-        let _physical_id: i64 = tx.prepare_cached("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,ok,child_session,meta,state,input_end,output_start,project_key,blob) VALUES(?19,?20,?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(source,session_key,call_id) WHERE active=1 DO UPDATE SET kind_key=excluded.kind_key,name_key=excluded.name_key,ts=excluded.ts,native_turn=excluded.native_turn,input_chars=excluded.input_chars,output_chars=excluded.output_chars,output_bytes=excluded.output_bytes,ok=excluded.ok,child_session=excluded.child_session,meta=excluded.meta,state=excluded.state,input_end=excluded.input_end,output_start=excluded.output_start,project_key=excluded.project_key,blob=excluded.blob RETURNING id")?.query_row(params![source,session,call_id,kind,name,e.ts,turn,e.input_chars as i64,e.output_chars as i64,e.output_bytes as i64,e.ok,e.child_session,e.meta,e.state,end,start,project,blob,physical_id,tool_id], |r|r.get(0))?;
+        tx.prepare_cached("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,ok,child_session,meta,state,input_end,output_start,project_key,blob) VALUES(?19,?20,?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(source,session_key,call_id) WHERE active=1 DO UPDATE SET kind_key=excluded.kind_key,name_key=excluded.name_key,ts=excluded.ts,native_turn=excluded.native_turn,input_chars=excluded.input_chars,output_chars=excluded.output_chars,output_bytes=excluded.output_bytes,ok=excluded.ok,child_session=excluded.child_session,meta=excluded.meta,state=excluded.state,input_end=excluded.input_end,output_start=excluded.output_start,project_key=excluded.project_key,blob=excluded.blob")?.execute(params![source,session,call_id,kind,name,e.ts,turn,e.input_chars as i64,e.output_chars as i64,e.output_bytes as i64,e.ok,e.child_session,e.meta,e.state,end,start,project,blob,physical_id,tool_id])?;
         let text_changed = old.as_ref().map_or(blob.is_some(), |v| v.blob != blob);
         let dirty = text_changed
             || old
@@ -262,5 +268,51 @@ impl Writer {
             has_text: blob.is_some(),
             dirty,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn bounded_tool_ids_do_not_rescan_an_unselective_agent() {
+        let mut work = Vec::new();
+        for count in [2048, 8192] {
+            let mut c = Connection::open_in_memory().unwrap();
+            c.execute_batch("CREATE TABLE state(key TEXT PRIMARY KEY,value TEXT);")
+                .unwrap();
+            schema(&c).unwrap();
+            let tx = c.transaction().unwrap();
+            tx.execute("INSERT INTO event_sessions VALUES(1,'pi','fixture')", [])
+                .unwrap();
+            for id in 1..=count {
+                tx.prepare_cached("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key,blob) VALUES(?1,?1,1,1,?1,0,0,0,0,0,0,0,0,'','','',0,1)").unwrap().execute([id]).unwrap();
+            }
+            tx.commit().unwrap();
+            let steps = Arc::new(AtomicUsize::new(0));
+            let capture = steps.clone();
+            c.progress_handler(
+                100,
+                Some(move || {
+                    capture.fetch_add(100, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let ids: Vec<i64> = c
+                .prepare(&format!("SELECT p.id FROM {CANDIDATES_BY_ID} p WHERE p.visible=1 AND p.agent='pi' AND p.id>=1 AND p.id<129"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(ids.len(), 128);
+            work.push(steps.load(Ordering::Relaxed));
+        }
+        assert!(work[1] < work[0] * 2, "{work:?}");
     }
 }

@@ -1,0 +1,43 @@
+[
+  {
+    "workload": "mixed-100k",
+    "rows": 100000,
+    "exit_code": 1,
+    "elapsed_ms": 68579.9915839998,
+    "budget_checked": true,
+    "completed": true,
+    "verified_samples": 763,
+    "failed_samples": 0,
+    "bytes_cleaned": 255802397
+  },
+  {
+    "workload": "dense-1m",
+    "rows": 1000000,
+    "exit_code": 0,
+    "elapsed_ms": 171284.16800000012,
+    "budget_checked": false,
+    "completed": true,
+    "verified_samples": 263,
+    "failed_samples": 0,
+    "bytes_cleaned": 1253980416
+  },
+  {
+    "workload": "dense-2m",
+    "rows": 2000000,
+    "exit_code": 1,
+    "elapsed_ms": 307657.16166700074,
+    "budget_checked": true,
+    "completed": true,
+    "verified_samples": 263,
+    "failed_samples": 0,
+    "bytes_cleaned": 2509869253
+  },
+  {
+    "workload": "semantic-1000",
+    "rows": 1000,
+    "exit_code": 1,
+    "elapsed_ms": 2627.9456249976647,
+    "budget_checked": true,
+    "completed": false
+  }
+]

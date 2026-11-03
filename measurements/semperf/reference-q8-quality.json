@@ -1,0 +1,13 @@
+{
+  "engine": "0.4.9 ONNX q8 CPU",
+  "minimum_cosine": 0.9617269184245711,
+  "ordered_top5_agreement": 3,
+  "uptime": "23:41  up  3:34, 2 users, load averages: 80.20 52.97 48.32",
+  "load": [
+    80.1953125,
+    52.96875,
+    48.3154296875
+  ],
+  "token_ids_equal": true,
+  "token_difference_rows": []
+}

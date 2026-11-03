@@ -1,0 +1,25 @@
+{
+  "label": "padding5",
+  "device": "cpu",
+  "load_before": [
+    51.25439453125,
+    31.689453125,
+    40.77783203125
+  ],
+  "uptime": "19:19  up  2:14, 1 user, load averages: 51.25 31.69 40.78",
+  "exit": 0,
+  "load_after": [
+    50.83349609375,
+    31.9267578125,
+    40.80810546875
+  ],
+  "ids_equal": true,
+  "load_s": 0.33416575,
+  "long_tail_recall_at_1": 1.0,
+  "minimum_cosine": 0.9999999999979889,
+  "recall_at_5": 1.0,
+  "reference_recall_at_1": 1.0,
+  "top5_agreement": 10,
+  "total_s": 4.357090208,
+  "window": 1024
+}

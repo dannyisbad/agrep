@@ -1,0 +1,12 @@
+{
+  "complete_all_refs_scan": false,
+  "reason": "Stopped the expensive complete traversal after proving a reachable ancestor still violates the unchanged gate. History rewrite is outside the authorized merge.",
+  "ancestor": "0a57c3c3",
+  "path": "measurements/semperf/clippy.log",
+  "blob": "57a06f285e25a1c0e82edeb1c83474c6b8afed08",
+  "findings": [
+    "non-synthetic user home path",
+    "personal-identity token"
+  ],
+  "history_rewritten": false
+}

@@ -1,0 +1,304 @@
+{
+  "cases": [
+    {
+      "name": "agent",
+      "samples": [
+        {
+          "version": "v4",
+          "repeat": 0,
+          "elapsed_ms": 7232.613916999981,
+          "load_averages": [
+            50.55,
+            69.83,
+            66.43
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 0,
+          "elapsed_ms": 370.1144580008986,
+          "load_averages": [
+            46.39,
+            68.29,
+            65.92
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 1,
+          "elapsed_ms": 200.7715409999946,
+          "load_averages": [
+            46.39,
+            68.29,
+            65.92
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 1,
+          "elapsed_ms": 5930.221500000698,
+          "load_averages": [
+            46.39,
+            68.29,
+            65.92
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 2,
+          "elapsed_ms": 6227.90220800016,
+          "load_averages": [
+            44.36,
+            67.5,
+            65.66
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 2,
+          "elapsed_ms": 217.280374999973,
+          "load_averages": [
+            42.25,
+            66.68,
+            65.38
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 3,
+          "elapsed_ms": 182.35658300000068,
+          "load_averages": [
+            42.25,
+            66.68,
+            65.38
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 3,
+          "elapsed_ms": 5479.416959000446,
+          "load_averages": [
+            42.25,
+            66.68,
+            65.38
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 4,
+          "elapsed_ms": 5348.361750000549,
+          "load_averages": [
+            40.06,
+            65.82,
+            65.08
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 4,
+          "elapsed_ms": 171.5758749996894,
+          "load_averages": [
+            37.98,
+            64.96,
+            64.78
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 5,
+          "elapsed_ms": 174.63500000121712,
+          "load_averages": [
+            37.98,
+            64.96,
+            64.78
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 5,
+          "elapsed_ms": 5298.330749999877,
+          "load_averages": [
+            37.98,
+            64.96,
+            64.78
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 6,
+          "elapsed_ms": 5358.179625000048,
+          "load_averages": [
+            34.89,
+            63.41,
+            64.23
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 6,
+          "elapsed_ms": 179.0210830004071,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        }
+      ],
+      "identical_winners": true,
+      "medians_ms": {
+        "v4": 5479.416959000446,
+        "v5": 182.35658300000068
+      }
+    },
+    {
+      "name": "since",
+      "samples": [
+        {
+          "version": "v4",
+          "repeat": 0,
+          "elapsed_ms": 180.7191670013708,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 0,
+          "elapsed_ms": 172.16437500064785,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 1,
+          "elapsed_ms": 159.23374999874795,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 1,
+          "elapsed_ms": 168.45295900020574,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 2,
+          "elapsed_ms": 174.6699590003118,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 2,
+          "elapsed_ms": 175.34366700056125,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 3,
+          "elapsed_ms": 171.3835829996242,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 3,
+          "elapsed_ms": 177.1929580008873,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 4,
+          "elapsed_ms": 165.61958300007973,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 4,
+          "elapsed_ms": 185.1694580000185,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 5,
+          "elapsed_ms": 183.71366599967587,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 5,
+          "elapsed_ms": 175.60383300042304,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v4",
+          "repeat": 6,
+          "elapsed_ms": 175.52204099956725,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        },
+        {
+          "version": "v5",
+          "repeat": 6,
+          "elapsed_ms": 177.81895799998892,
+          "load_averages": [
+            33.21,
+            62.59,
+            63.94
+          ]
+        }
+      ],
+      "identical_winners": true,
+      "medians_ms": {
+        "v4": 175.52204099956725,
+        "v5": 175.34366700056125
+      }
+    }
+  ]
+}

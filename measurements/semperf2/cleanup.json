@@ -1,0 +1,24 @@
+{
+  "removed": [
+    "scratch",
+    "target",
+    "bench/__pycache__",
+    "scripts/__pycache__"
+  ],
+  "allocated_bytes_before": {
+    "scratch": 1393401856,
+    "target": 1128001536,
+    "bench/__pycache__": 147456,
+    "scripts/__pycache__": 24576
+  },
+  "free_bytes_before": 184527888384,
+  "free_bytes_after": 186975363072,
+  "remaining_generated_roots": [],
+  "active_work_processes": [],
+  "load": [
+    25.90673828125,
+    29.7138671875,
+    49.47802734375
+  ],
+  "uptime": "20:57  up  3:52, 1 user, load averages: 25.91 29.71 49.48"
+}

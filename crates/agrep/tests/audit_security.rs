@@ -139,6 +139,16 @@ fn full_reindex_clears_vector_references_and_queues_every_visible_row() {
     let value: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(value.get("skipped_lock").is_none());
     let c = store::reader(&root).unwrap();
+    assert_eq!(agrep_core::semantic::coverage(&c).unwrap().embedded, 0);
+    assert_eq!(
+        c.query_row(
+            "SELECT CAST(value AS INTEGER) FROM state WHERE key='semantic_ref_count'",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        0
+    );
     for table in ["semantic_refs", "semantic_blocks", "semantic_chunks"] {
         assert_eq!(
             c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r

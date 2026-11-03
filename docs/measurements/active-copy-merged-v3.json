@@ -1,0 +1,175 @@
+{
+  "source_bytes": 47510194,
+  "copied_bytes": 47510194,
+  "build_ms": 1318.584833001296,
+  "build_load_averages": [
+    [
+      11.49,
+      20.74,
+      37.68
+    ]
+  ],
+  "build_phases": {
+    "sources": 1,
+    "parsed": 1,
+    "changed_rows": 6322,
+    "errors": 0,
+    "census_ms": 0.388125,
+    "total_ms": 1283.729583,
+    "parse_ms": 505.049458,
+    "write_ms": 598.031042,
+    "bounds_ms": 76.32745800000001,
+    "stats_ms": 40.894417000000004,
+    "resumed_sources": 0,
+    "bytes_read": 47510194,
+    "bytes_parsed": 47510194,
+    "adapter_parse_ms": {
+      "pi": 504.67816600000003
+    },
+    "adapter_source_parse_ms": {
+      "pi": 504.66037500000004
+    },
+    "adapter_sources": {
+      "pi": 1
+    },
+    "adapter_write_ms": {
+      "pi": 344.765542
+    },
+    "row_diff_ms": 208.720509,
+    "fts_ms": 196.1425,
+    "secondary_indexes_ms": 15.795459000000001,
+    "canonical_ms": 0.032291,
+    "dictionary_ms": 40.830458,
+    "node_chunks_ms": 118.784625,
+    "commit_ms": 25.438209
+  },
+  "samples_ms": [
+    303.78316700080177,
+    208.31470799930685,
+    204.6652909994009,
+    255.05770800009486,
+    280.92999999898893,
+    252.02533300034702,
+    291.58012500010955
+  ],
+  "median_ms": 255.05770800009486,
+  "load_averages": [
+    [
+      11.49,
+      20.74,
+      37.68
+    ],
+    [
+      11.49,
+      20.74,
+      37.68
+    ],
+    [
+      11.49,
+      20.74,
+      37.68
+    ],
+    [
+      11.29,
+      20.54,
+      37.51
+    ],
+    [
+      11.29,
+      20.54,
+      37.51
+    ],
+    [
+      11.29,
+      20.54,
+      37.51
+    ],
+    [
+      11.29,
+      20.54,
+      37.51
+    ]
+  ],
+  "phases": {
+    "sources": {
+      "median": 1,
+      "max": 1
+    },
+    "parsed": {
+      "median": 1,
+      "max": 1
+    },
+    "changed_rows": {
+      "median": 2,
+      "max": 2
+    },
+    "errors": {
+      "median": 0,
+      "max": 0
+    },
+    "census_ms": {
+      "median": 0.48987499999999995,
+      "max": 0.670333
+    },
+    "total_ms": {
+      "median": 234.559417,
+      "max": 283.144291
+    },
+    "parse_ms": {
+      "median": 154.325083,
+      "max": 239.99437500000002
+    },
+    "write_ms": {
+      "median": 6.0558749999999995,
+      "max": 6.909209000000001
+    },
+    "bounds_ms": {
+      "median": 27.083333,
+      "max": 62.674625
+    },
+    "stats_ms": {
+      "median": 5.580917,
+      "max": 10.652583
+    },
+    "resumed_sources": {
+      "median": 1,
+      "max": 1
+    },
+    "bytes_read": {
+      "median": 47511744,
+      "max": 47512923
+    },
+    "bytes_parsed": {
+      "median": 393,
+      "max": 393
+    },
+    "row_diff_ms": {
+      "median": 0.422127,
+      "max": 0.519501
+    },
+    "fts_ms": {
+      "median": 0.071958,
+      "max": 0.089875
+    },
+    "secondary_indexes_ms": {
+      "median": 0.0,
+      "max": 0.0
+    },
+    "canonical_ms": {
+      "median": 0.022166,
+      "max": 0.02575
+    },
+    "dictionary_ms": {
+      "median": 0.012292,
+      "max": 0.031333
+    },
+    "node_chunks_ms": {
+      "median": 4.963459,
+      "max": 5.6878329999999995
+    },
+    "commit_ms": {
+      "median": 1.530292,
+      "max": 2.887417
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "reason": "The unmodified legacy compact renderer uses ~semantic, while the new renderer uses meaning match. Adapt the result-presence check to the actual version; no timing/budget gate changed.",
+  "source": "integ/py/search.py::_compact_line",
+  "samples_started": 0,
+  "stopped_queued_pids": [
+    55320,
+    47545
+  ]
+}

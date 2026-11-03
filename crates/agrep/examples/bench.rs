@@ -41,6 +41,9 @@ struct Args {
     /// Install the model, drain this synthetic corpus, and measure hybrid startup.
     #[arg(long, conflicts_with_all = ["real", "dense"])]
     semantic: bool,
+    /// Reuse a pinned local model without network access; copied into the isolated data root.
+    #[arg(long, requires = "semantic")]
+    model_dir: Option<PathBuf>,
     #[arg(long)]
     real: bool,
     /// Re-measure an existing isolated real-history index after a code change.
@@ -57,7 +60,7 @@ struct Args {
     #[arg(long)]
     check: bool,
 }
-fn utterance(i: usize, tool: bool, dense: bool) -> String {
+fn utterance(i: usize, tool: bool, dense: bool, reply: bool) -> String {
     if dense {
         return match i % 9 {
             0 => format!("ticket {i:08} deepold ordinary historical explanation with a single aligned occurrence"),
@@ -133,15 +136,21 @@ fn utterance(i: usize, tool: bool, dense: bool) -> String {
     ];
     let target = if tool {
         match i % 20 {
-            0 => 4000,
-            1..=5 => 1500,
-            _ => 450,
+            0 => 3500,
+            1..=5 => 1300,
+            _ => 400,
+        }
+    } else if reply {
+        match i % 20 {
+            0 => 8000,
+            1..=5 => 4000,
+            _ => 1500,
         }
     } else {
         match i % 20 {
-            0 => 8000,
-            1..=5 => 800,
-            _ => 170,
+            0 => 1500,
+            1..=4 => 400,
+            _ => 150,
         }
     };
     let mut state = (i as u64 + 71) * 0x9e3779b1;
@@ -186,7 +195,7 @@ fn dense_expected(rows: usize, args: &[&str]) -> Result<(Vec<String>, usize)> {
         } else {
             0.175
                 * boundary
-                    .evaluate(&utterance(ordinal, false, true), None, true)?
+                    .evaluate(&utterance(ordinal, false, true, false), None, true)?
                     .factor
         };
     }
@@ -230,7 +239,7 @@ fn dense_expected(rows: usize, args: &[&str]) -> Result<(Vec<String>, usize)> {
             agrep_core::handles::mint(
                 &names[*sid],
                 *turn as i64,
-                &utterance(*i, false, true),
+                &utterance(*i, false, true, false),
                 &names,
             )
         })
@@ -245,7 +254,9 @@ fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)> {
     let mut at = 0;
     let mut text_bytes = 0u64;
     for sid in 0..sessions {
-        let codex = !dense && sid % 5 == 1;
+        // The measured history is overwhelmingly pi/OMP. A 20% prose-only
+        // Codex population distorted both the role mix and filter selectivity.
+        let codex = !dense && sid % 100 == 1;
         let file_base = if codex {
             home.join(".codex/sessions/bench")
         } else if !dense && sid % 10 != 0 {
@@ -286,7 +297,7 @@ fn generate(home: &Path, rows: usize, dense: bool) -> Result<(PathBuf, u64)> {
             let assistant = !dense && j % 80 == 1;
             let tool = !dense && j % 9 != 0 && !assistant;
             let id = format!("e{j}");
-            let text = utterance(at, tool, dense);
+            let text = utterance(at, tool, dense, assistant);
             text_bytes += text.len() as u64;
             if codex {
                 if !assistant {
@@ -515,7 +526,7 @@ fn layout(t: &Path) -> Result<Value> {
                 "INSERT INTO f VALUES(?1)"
             })?;
             for i in 0..20_000 {
-                let text = utterance(i, i % 9 != 0, false);
+                let text = utterance(i, i % 9 != 0, false, false);
                 if name == "trigram-dual" {
                     insert.execute(rusqlite::params![text, agrep_core::store::joined(&text)])?;
                 } else {
@@ -637,7 +648,7 @@ fn main() -> Result<()> {
         &home,
         &data,
         "no_change_census",
-        &["index"],
+        &["__census"],
         a.runs,
     )?);
     if let Some(path) = &last {
@@ -660,7 +671,7 @@ fn main() -> Result<()> {
         sorted.sort_by(f64::total_cmp);
         let median = sorted[sorted.len() / 2];
         eprintln!("one_session_refresh {median:.2} ms");
-        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
+        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"p95_ms":if sorted.len()>=20 { Some(sorted[(sorted.len()*95).div_ceil(100)-1]) }else{None},"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
         trace(&value)?;
         cases.push(value);
     }
@@ -696,6 +707,16 @@ fn main() -> Result<()> {
         cases.push(value);
     }
     if a.semantic {
+        if let Some(source) = &a.model_dir {
+            agrep_core::semantic_model::verify_installed_at(source)?;
+            let destination = data
+                .join("model")
+                .join(agrep_core::semantic_model::MODEL_ID);
+            fs::create_dir_all(&destination)?;
+            for (name, _, _) in agrep_core::semantic_model::FILES {
+                fs::copy(source.join(name), destination.join(name))?;
+            }
+        }
         for args in [
             vec!["setup", "--yes", "--no-teach", "--no-hook", "--no-archive"],
             vec!["__work"],
@@ -862,6 +883,18 @@ fn main() -> Result<()> {
         "classic",
     )?
     .2;
+    let reader = rusqlite::Connection::open_with_flags(
+        data.join("index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut roles: std::collections::BTreeMap<String, usize> = reader
+        .prepare("SELECT who,count(*) FROM prose WHERE visible=1 GROUP BY who")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    roles.insert(
+        "tool".into(),
+        corpus["tools"].as_u64().unwrap_or(0) as usize,
+    );
     let failures = if a.check {
         perf::check(&cases, a.dense, a.semantic, a.rows, text_bytes)
             .err()
@@ -869,7 +902,7 @@ fn main() -> Result<()> {
     } else {
         Vec::new()
     };
-    let report = json!({"corpus":corpus,"scope":"fresh process through full exit, no discarded warm-up, normal refresh, nice inherited","real_history":a.real,"reuse":a.reuse,"dense":a.dense,"requested_rows":a.rows,"source_bytes":source_bytes,"text_bytes":text_bytes,"index_bytes":bytes(&data),"cases":cases});
+    let report = json!({"corpus":corpus,"roles":roles,"scope":"fresh process through full exit, no discarded warm-up, normal refresh, nice inherited","real_history":a.real,"reuse":a.reuse,"dense":a.dense,"requested_rows":a.rows,"source_bytes":source_bytes,"text_bytes":text_bytes,"index_bytes":bytes(&data),"cases":cases});
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(p) = a.output {
         fs::write(p, serde_json::to_vec_pretty(&report)?)?;

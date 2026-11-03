@@ -1,0 +1,6 @@
+{
+  "before": 200000,
+  "after_upsert": 200000,
+  "after_delete": 199999,
+  "after_rollback": 200000
+}

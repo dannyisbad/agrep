@@ -1,0 +1,157 @@
+{
+  "device": "cpu",
+  "fixture_sha256": "0f983aac5ed17b9b45c0eeacd3986afb5128d6a5fdf2e812850accd28c042409",
+  "rows": 128,
+  "threads": 6,
+  "instrumented": true,
+  "uptime": "19:11  up  2:06, 1 user, load averages: 21.16 35.24 50.15",
+  "load_before": [
+    21.15869140625,
+    35.236328125,
+    50.1533203125
+  ],
+  "inference_ms": 1597.0742500003325,
+  "process_cpu_ms": 8488.452000000001,
+  "operations": {
+    "Gather": {
+      "calls": 70,
+      "wall_ms": 2.1699999999999977,
+      "cpu_ms": 0.0
+    },
+    "DequantizeLinear": {
+      "calls": 14,
+      "wall_ms": 0.7640000000000001,
+      "cpu_ms": 0.0
+    },
+    "LayerNormalization": {
+      "calls": 336,
+      "wall_ms": 150.70999999999998,
+      "cpu_ms": 0.0
+    },
+    "DynamicQuantizeLinear": {
+      "calls": 336,
+      "wall_ms": 22.382,
+      "cpu_ms": 0.0
+    },
+    "MatMulIntegerToFloat": {
+      "calls": 840,
+      "wall_ms": 505.5989999999995,
+      "cpu_ms": 0.0
+    },
+    "Reshape": {
+      "calls": 672,
+      "wall_ms": 6.300999999999965,
+      "cpu_ms": 0.0
+    },
+    "Split": {
+      "calls": 336,
+      "wall_ms": 21.51300000000001,
+      "cpu_ms": 0.0
+    },
+    "Neg": {
+      "calls": 336,
+      "wall_ms": 9.736000000000004,
+      "cpu_ms": 0.0
+    },
+    "Concat": {
+      "calls": 364,
+      "wall_ms": 21.947999999999993,
+      "cpu_ms": 0.0
+    },
+    "Shape": {
+      "calls": 28,
+      "wall_ms": 0.2760000000000001,
+      "cpu_ms": 0.0
+    },
+    "Unsqueeze": {
+      "calls": 168,
+      "wall_ms": 1.1069999999999998,
+      "cpu_ms": 0.0
+    },
+    "Slice": {
+      "calls": 56,
+      "wall_ms": 0.7560000000000004,
+      "cpu_ms": 0.0
+    },
+    "Mul": {
+      "calls": 854,
+      "wall_ms": 82.68100000000001,
+      "cpu_ms": 0.0
+    },
+    "Add": {
+      "calls": 658,
+      "wall_ms": 43.948999999999906,
+      "cpu_ms": 0.0
+    },
+    "Cast": {
+      "calls": 28,
+      "wall_ms": 0.31500000000000006,
+      "cpu_ms": 0.0
+    },
+    "Where": {
+      "calls": 28,
+      "wall_ms": 10.048,
+      "cpu_ms": 0.0
+    },
+    "Expand": {
+      "calls": 28,
+      "wall_ms": 3.572,
+      "cpu_ms": 0.0
+    },
+    "Tile": {
+      "calls": 14,
+      "wall_ms": 2.274,
+      "cpu_ms": 0.0
+    },
+    "MultiHeadAttention": {
+      "calls": 168,
+      "wall_ms": 287.53000000000014,
+      "cpu_ms": 0.0
+    },
+    "DynamicQuantizeMatMul": {
+      "calls": 336,
+      "wall_ms": 262.7459999999999,
+      "cpu_ms": 0.0
+    },
+    "Gelu": {
+      "calls": 168,
+      "wall_ms": 108.04299999999998,
+      "cpu_ms": 0.0
+    },
+    "Range": {
+      "calls": 14,
+      "wall_ms": 0.13900000000000004,
+      "cpu_ms": 0.0
+    },
+    "Sub": {
+      "calls": 28,
+      "wall_ms": 0.3640000000000001,
+      "cpu_ms": 0.0
+    },
+    "Abs": {
+      "calls": 14,
+      "wall_ms": 0.17400000000000004,
+      "cpu_ms": 0.0
+    },
+    "Greater": {
+      "calls": 14,
+      "wall_ms": 0.18700000000000006,
+      "cpu_ms": 0.0
+    },
+    "SkipLayerNormalization": {
+      "calls": 14,
+      "wall_ms": 5.778,
+      "cpu_ms": 0.0
+    },
+    "Identity": {
+      "calls": 14,
+      "wall_ms": 0.6659999999999999,
+      "cpu_ms": 0.0
+    }
+  },
+  "load_after": [
+    21.15869140625,
+    35.236328125,
+    50.1533203125
+  ]
+}

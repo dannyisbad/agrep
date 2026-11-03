@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           nice -n 10 cargo fmt --check
           nice -n 10 cargo clippy --workspace --all-targets -- -D warnings
-          nice -n 10 cargo test --workspace 2>&1 | tee rust-tests.log
+          nice -n 10 cargo test --workspace --no-fail-fast 2>&1 | tee rust-tests.log
       - name: Distribution contracts and skip policy
         shell: bash
         run: |
@@ -53,10 +53,13 @@ jobs:
           nice -n 10 cargo build --locked --release --workspace --bins --examples
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --rows 100000 --runs 20 --build-runs 3 --check --output mixed.json
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --semantic --data "$RUNNER_TEMP/agrep-semantic-data" --rows 1000 --runs 20 --build-runs 3 --check --output semantic.json
-          nice -n 10 "target/release/examples/semantic_eval$suffix" "$RUNNER_TEMP/agrep-semantic-data/model/granite-embedding-small-english-r2" cpu
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --dense --rows 2000000 --runs 20 --build-runs 3 --check --output dense.json
+          performance_status=0
+          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --rows 100000 --runs 20 --build-runs 3 --check --output mixed.json || performance_status=1
+          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --semantic --data "$RUNNER_TEMP/agrep-semantic-data" --rows 1000 --runs 20 --build-runs 3 --check --output semantic.json || performance_status=1
+          nice -n 10 "target/release/examples/semantic_eval$suffix" "$RUNNER_TEMP/agrep-semantic-data/model/granite-embedding-small-english-r2" cpu || performance_status=1
+          nice -n 10 python bench/semantic_owner.py --binary "target/release/agrep$suffix" --builder "target/release/examples/semantic_scale$suffix" --evaluator "target/release/examples/semantic_eval$suffix" --model "$RUNNER_TEMP/agrep-semantic-data/model/granite-embedding-small-english-r2" --runs 20 --output semantic.json.owner.json || performance_status=1
+          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --dense --rows 2000000 --runs 20 --build-runs 3 --check --output dense.json || performance_status=1
+          exit "$performance_status"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

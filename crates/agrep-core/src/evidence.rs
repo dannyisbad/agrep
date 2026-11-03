@@ -250,7 +250,7 @@ pub fn load_rows(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Vec<
     Ok(rows)
 }
 pub fn load_events(c: &Connection, session: &str, lo: i64, hi: i64) -> Result<Vec<Event>> {
-    let mut q=c.prepare("SELECT json_extract(e.body,'$.turn'),json_extract(e.body,'$.ts'),p.text,e.body FROM events e LEFT JOIN tools p ON p.source=e.source AND p.session=e.session AND p.extra=e.call_id AND p.visible=1 WHERE e.session=? AND coalesce(json_extract(e.body,'$.visible'),1)=1 AND json_extract(e.body,'$.turn') BETWEEN ? AND ? ORDER BY json_extract(e.body,'$.turn'),json_extract(e.body,'$.ts'),e.call_id")?;
+    let mut q=c.prepare("SELECT e.position,e.ts,e.text,e.body FROM events e WHERE e.visible=1 AND e.session=? AND e.position BETWEEN ? AND ? ORDER BY e.position,e.ts,e.call_id")?;
     let mut events = Vec::new();
     let mut seen = BTreeSet::new();
     for r in q.query_map(params![session, lo, hi], |r| {
@@ -607,5 +607,53 @@ fn prose_output(w: &Window, d: &Display, r: &Row, text: &str, omitted: usize) ->
         )
     } else {
         format!("{}: {text}{loss}\n", r.who)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::DataRoot;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn a_window_reads_controls_without_materializing_unrelated_tool_rows() {
+        let mut work = Vec::new();
+        for count in [2048, 8192] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = DataRoot::open(temp.path(), true).unwrap();
+            let mut c = store::writer(&root).unwrap();
+            let tx = c.transaction().unwrap();
+            tx.execute_batch("INSERT INTO sources VALUES('fixture','pi',0,0,'',NULL); INSERT INTO event_sessions VALUES(1,'pi','selected'),(2,'pi','unrelated'); INSERT INTO symbols VALUES(1,'tool'),(2,'shell'),(3,'control'),(4,'compaction');").unwrap();
+            tx.execute(
+                "INSERT INTO tool_blobs VALUES(1,X'01',?)",
+                [store::encode_tool("shell: needle").unwrap()],
+            )
+            .unwrap();
+            for id in 1..=count {
+                tx.execute("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,input_end,project_key,blob) VALUES(?1,?1,1,?2,?3,1,2,?1,?4,?4,6,0,0,'','','',13,0,1)", params![id, if id <= 2 {1} else {2}, id.to_string(), id-1]).unwrap();
+            }
+            tx.execute_batch("INSERT INTO event_rows(id,tool_id,source,session_key,call_id,kind_key,name_key,ts,native_turn,position,input_chars,output_chars,output_bytes,child_session,meta,state,project_key) VALUES(90000,90000,1,1,'control',3,4,7,1,1,0,0,0,'','','marker',0)").unwrap();
+            tx.commit().unwrap();
+            let operations = Arc::new(AtomicUsize::new(0));
+            let recorded = operations.clone();
+            c.progress_handler(
+                100,
+                Some(move || {
+                    recorded.fetch_add(100, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let events = load_events(&c, "selected", 0, 1).unwrap();
+            assert_eq!(events.len(), 3);
+            let control = events.iter().find(|e| e.kind == "control").unwrap();
+            assert_eq!((control.ts, control.turn), (7, 1));
+            assert_eq!(events.iter().filter(|e| e.input == "needle").count(), 2);
+            work.push(operations.load(Ordering::Relaxed));
+        }
+        assert!(work[1] <= work[0] * 2 + 100, "{work:?}");
     }
 }

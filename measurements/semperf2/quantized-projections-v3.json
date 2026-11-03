@@ -1,0 +1,595 @@
+{
+  "load_before": [
+    27.24951171875,
+    40.6201171875,
+    52.24072265625
+  ],
+  "uptime": "20:02  up  2:56, 1 user, load averages: 27.25 40.62 52.24",
+  "threads": 6,
+  "blas_threads": 1,
+  "exit": 0,
+  "load_after": [
+    32.05712890625,
+    41.18212890625,
+    52.302734375
+  ],
+  "format": "Candle Q8_0 blocks sharing one F16 scale per output channel",
+  "measurements": [
+    {
+      "in": 384,
+      "out": 1152,
+      "projection": "attn.Wqkv",
+      "rows": 16,
+      "samples": [
+        {
+          "ms": 0.424875,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 3.59575,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 5.763,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 0.397334,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 0.08241699999999999,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 1.6035419999999998,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 3.860417,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 0.461792,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 1152,
+      "projection": "attn.Wqkv",
+      "rows": 1000,
+      "samples": [
+        {
+          "ms": 1.6735840000000002,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 88.40108400000001,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 44.344,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 1.67925,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 2.993417,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 48.653915999999995,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 57.168,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 1.421042,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 1152,
+      "projection": "attn.Wqkv",
+      "rows": 4000,
+      "samples": [
+        {
+          "ms": 5.06775,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 492.88095799999996,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 163.837833,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 5.492917,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 3.296416,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 196.296125,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 746.161834,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 6.773000000000001,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 384,
+      "projection": "attn.Wo",
+      "rows": 16,
+      "samples": [
+        {
+          "ms": 0.07116600000000001,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 3.958875,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 7.146,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 0.052583,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 2.066875,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 24.261125,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 30.464917,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 0.211,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 384,
+      "projection": "attn.Wo",
+      "rows": 1000,
+      "samples": [
+        {
+          "ms": 2.635958,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 109.302625,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 47.322292000000004,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 1.454291,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 0.651167,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 21.705167,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 33.768708000000004,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 1.9685409999999999,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 384,
+      "projection": "attn.Wo",
+      "rows": 4000,
+      "samples": [
+        {
+          "ms": 5.461208,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 234.524833,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 366.99566599999997,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 1.756875,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 1.205125,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 111.016666,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 257.314958,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 7.57,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 3072,
+      "projection": "mlp.Wi",
+      "rows": 16,
+      "samples": [
+        {
+          "ms": 0.8988750000000001,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 6.642542000000001,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 6.978,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 1.036,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 0.570084,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 13.485667,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 1.615417,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 0.394708,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 3072,
+      "projection": "mlp.Wi",
+      "rows": 1000,
+      "samples": [
+        {
+          "ms": 3.499875,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 219.37733300000002,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 143.30616600000002,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 3.3111669999999997,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 2.5955000000000004,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 145.41804199999999,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 113.437625,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 3.178834,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 384,
+      "out": 3072,
+      "projection": "mlp.Wi",
+      "rows": 4000,
+      "samples": [
+        {
+          "ms": 13.599041,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 650.4813750000001,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 653.667125,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 8.211334,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 7.9065,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 849.9707920000001,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 775.643792,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 20.4915,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 1536,
+      "out": 384,
+      "projection": "mlp.Wo",
+      "rows": 16,
+      "samples": [
+        {
+          "ms": 0.195291,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 4.749292,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 3.059541,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 0.189,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 0.135375,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 3.0571669999999997,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 4.56025,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 0.24487499999999998,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 1536,
+      "out": 384,
+      "projection": "mlp.Wo",
+      "rows": 1000,
+      "samples": [
+        {
+          "ms": 5.907459,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 91.178792,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 120.37408300000001,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 2.405166,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 3.056458,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 156.786,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 103.373042,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 2.906167,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    },
+    {
+      "in": 1536,
+      "out": 384,
+      "projection": "mlp.Wo",
+      "rows": 4000,
+      "samples": [
+        {
+          "ms": 8.945666,
+          "q8": false,
+          "round": 0
+        },
+        {
+          "ms": 185.119791,
+          "q8": true,
+          "round": 0
+        },
+        {
+          "ms": 338.712542,
+          "q8": true,
+          "round": 1
+        },
+        {
+          "ms": 4.5552079999999995,
+          "q8": false,
+          "round": 1
+        },
+        {
+          "ms": 14.185708,
+          "q8": false,
+          "round": 2
+        },
+        {
+          "ms": 514.217666,
+          "q8": true,
+          "round": 2
+        },
+        {
+          "ms": 676.6834160000001,
+          "q8": true,
+          "round": 3
+        },
+        {
+          "ms": 5.723584000000001,
+          "q8": false,
+          "round": 3
+        }
+      ]
+    }
+  ]
+}

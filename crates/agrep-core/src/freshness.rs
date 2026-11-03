@@ -17,6 +17,19 @@ use std::{
     time::Instant,
 };
 
+// Eight stat workers avoided the contention of the machine-wide Rayon pool
+// in the real-history sweep; smaller machines retain their available width.
+static STAT_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(8),
+        )
+        .build()
+        .expect("source stat thread pool")
+});
+
 #[derive(Clone)]
 pub(crate) struct Directory {
     path: String,
@@ -96,63 +109,66 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
     let mut issues = Vec::new();
     while !queue.is_empty() {
         queue.retain(|(_, p)| seen.insert(p.clone()));
-        let batch: Vec<_> = queue
-            .par_iter()
-            .map(|(agent, path)| -> Result<Option<Directory>> {
-                let meta = match fs::symlink_metadata(path) {
-                    Ok(m) => m,
-                    Err(e) if registry::stat_proves_absent(path, &e) => return Ok(None),
-                    Err(e) => return Err(e.into()),
-                };
-                if registry::metadata_is_link(&meta) {
-                    return Ok(None);
-                }
-                let a = ADAPTERS.iter().find(|a| a.name() == *agent).unwrap();
-                if meta.is_file() {
-                    return Ok(Some(Directory {
+        let batch: Vec<_> = STAT_POOL.install(|| {
+            queue
+                .par_iter()
+                .map(|(agent, path)| -> Result<Option<Directory>> {
+                    let meta = match fs::symlink_metadata(path) {
+                        Ok(m) => m,
+                        Err(e) if registry::stat_proves_absent(path, &e) => return Ok(None),
+                        Err(e) => return Err(e.into()),
+                    };
+                    if registry::metadata_is_link(&meta) {
+                        return Ok(None);
+                    }
+                    let a = ADAPTERS.iter().find(|a| a.name() == *agent).unwrap();
+                    if meta.is_file() {
+                        return Ok(Some(Directory {
+                            path: path.to_string_lossy().into(),
+                            agent: (*agent).into(),
+                            mtime: mtime(&meta),
+                            dirs: Arc::default(),
+                            files: Arc::new(if a.freshness_content(path) {
+                                vec![String::new()]
+                            } else {
+                                vec![]
+                            }),
+                            dirty: true,
+                        }));
+                    }
+                    if !meta.is_dir() {
+                        return Ok(None);
+                    }
+                    if let Some(d) = cached
+                        .get(path.to_string_lossy().as_ref())
+                        .filter(|d| d.mtime == mtime(&meta))
+                    {
+                        return Ok(Some(d.clone()));
+                    }
+                    let mut d = Directory {
                         path: path.to_string_lossy().into(),
                         agent: (*agent).into(),
                         mtime: mtime(&meta),
                         dirs: Arc::default(),
-                        files: Arc::new(if a.freshness_content(path) {
-                            vec![String::new()]
-                        } else {
-                            vec![]
-                        }),
+                        files: Arc::default(),
                         dirty: true,
-                    }));
-                }
-                if !meta.is_dir() {
-                    return Ok(None);
-                }
-                if let Some(d) = cached
-                    .get(path.to_string_lossy().as_ref())
-                    .filter(|d| d.mtime == mtime(&meta))
-                {
-                    return Ok(Some(d.clone()));
-                }
-                let mut d = Directory {
-                    path: path.to_string_lossy().into(),
-                    agent: (*agent).into(),
-                    mtime: mtime(&meta),
-                    dirs: Arc::default(),
-                    files: Arc::default(),
-                    dirty: true,
-                };
-                for entry in fs::read_dir(path)? {
-                    let entry = entry?;
-                    let ty = entry.file_type()?;
-                    let p = entry.path();
-                    if ty.is_dir() {
-                        Arc::make_mut(&mut d.dirs).push(entry.file_name().to_string_lossy().into());
-                    } else if ty.is_file() && a.freshness_content(&p) {
-                        Arc::make_mut(&mut d.files)
-                            .push(entry.file_name().to_string_lossy().into());
+                    };
+                    for entry in fs::read_dir(path)? {
+                        let entry = entry?;
+                        let ty = entry.file_type()?;
+                        let p = entry.path();
+                        if ty.is_dir() {
+                            Arc::make_mut(&mut d.dirs)
+                                .push(entry.file_name().to_string_lossy().into());
+                        } else if ty.is_file() && a.freshness_content(&p) {
+                            Arc::make_mut(&mut d.files)
+                                .push(entry.file_name().to_string_lossy().into());
+                        }
                     }
-                }
-                Ok(Some(d))
-            })
-            .collect();
+                    Ok(Some(d))
+                })
+                .collect()
+        });
         let inputs = std::mem::take(&mut queue);
         // Each result carries its agent; failures retain a named root error below.
         for ((agent, path), result) in inputs.into_iter().zip(batch) {
@@ -199,10 +215,12 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
     }
     let listing_ms = started.elapsed().as_secs_f64() * 1000.;
     let stat_start = Instant::now();
-    let mut stamps: Vec<_> = files
-        .par_iter()
-        .filter_map(|(a, p)| store::stamp_present(a, p))
-        .collect();
+    let mut stamps: Vec<_> = STAT_POOL.install(|| {
+        files
+            .par_iter()
+            .filter_map(|(a, p)| store::stamp_present(a, p))
+            .collect()
+    });
     let stat_ms = stat_start.elapsed().as_secs_f64() * 1000.;
     // Directory errors must not license deletion of an unseen subtree.
     stamps.extend(issues);
@@ -314,6 +332,7 @@ pub fn spawn(root: &DataRoot, binary: &Path) -> Result<bool> {
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
     drop(guard);
-    cmd.spawn()?;
+    let child = cmd.spawn()?;
+    crate::semantic_profile::event(serde_json::json!({"worker_started":{"pid":child.id()}}));
     Ok(true)
 }

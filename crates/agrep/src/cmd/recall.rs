@@ -25,15 +25,10 @@ fn drop_context(blocks: &mut [Block]) -> bool {
             block.window.rows.remove(index);
             return true;
         }
-        if let Some(index) = block
-            .window
-            .events
-            .iter()
-            .position(|event| !block.hit_turns.contains(&event.turn))
-        {
-            block.window.events.remove(index);
-            return true;
-        }
+        // JSON renders events only at retained prose turns; human output renders
+        // their availability count. Deleting the other events one at a time
+        // cannot trim that text and used to rebuild large windows thousands of
+        // times before the message cap was applied.
     }
     false
 }
@@ -89,10 +84,16 @@ fn block_text(b: &Block, cap: usize, color: bool) -> String {
     if b.hit.who == "tool" {
         text += &format!("       {}\n", surface::safe(&b.hit.snippet, false));
     }
-    if !b.window.events.is_empty() {
+    let visible_events = b
+        .window
+        .events
+        .iter()
+        .filter(|event| b.window.rows.iter().any(|row| row.turn == event.turn))
+        .count();
+    if visible_events > 0 {
         text += &format!(
             "       [+{} tool calls - agrep around {target} {} -C {} --tool-output 200]\n",
-            b.window.events.len(),
+            visible_events,
             b.window.center,
             b.window
                 .rows
@@ -635,4 +636,68 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         }
     }
     Ok(exit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invisible_tool_context_does_not_delay_the_message_cap() {
+        let event = evidence::Event {
+            turn: 1,
+            ts: 1,
+            name: "shell".into(),
+            kind: "tool".into(),
+            input: "unused context".into(),
+            output: String::new(),
+            input_chars: 14,
+            output_chars: 0,
+            output_bytes: Some(0),
+            ok: Some(true),
+            identity: "event".into(),
+            text: String::new(),
+            raw: json!({}),
+        };
+        let mut block = Block {
+            hit_turns: BTreeSet::from([0]),
+            hit: Hit {
+                session: "fixture".into(),
+                ..Default::default()
+            },
+            window: Window {
+                target: "fixture".into(),
+                session: "fixture".into(),
+                agent: "pi".into(),
+                project: String::new(),
+                title: String::new(),
+                family: "fixture".into(),
+                side: false,
+                center: 0,
+                radius: Some(2),
+                latest: false,
+                first: 0,
+                last: 2,
+                rows: vec![Row {
+                    session: "fixture".into(),
+                    turn: 0,
+                    who: "user".into(),
+                    ts: 0,
+                    text: "retained evidence".into(),
+                    model: String::new(),
+                    model_source: String::new(),
+                    source: 1,
+                    source_chars: 17,
+                }],
+                events: vec![event; 4096],
+                notes: vec![],
+                claim: None,
+            },
+        };
+        let before = block_value(&block, 64);
+        assert!(!drop_context(std::slice::from_mut(&mut block)));
+        assert_eq!(block.window.events.len(), 4096);
+        assert_eq!(block_value(&block, 64), before);
+        assert!(!block_text(&block, 64, false).contains("4096 tool calls"));
+    }
 }

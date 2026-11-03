@@ -29,7 +29,8 @@ fn main() -> Result<()> {
     let vectors: Vec<Vec<f32>> = serde_json::from_value(data["vectors"].clone())?;
     for start in (0..count).step_by(50) {
         let session = format!("fixture-{:05}", start / 50);
-        let mut file = fs::File::create(source.join(format!("{session}.jsonl")))?;
+        let mut file =
+            std::io::BufWriter::new(fs::File::create(source.join(format!("{session}.jsonl")))?);
         writeln!(
             file,
             "{}",
@@ -43,6 +44,7 @@ fn main() -> Result<()> {
                 serde_json::json!({"type":"message","id":format!("m{i}"),"parentId":if i==start{None}else{Some(format!("m{}",i-1))},"timestamp":"2026-10-29T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":text}],"timestamp":"2026-10-29T10:01:00Z"}})
             )?;
         }
+        file.flush()?;
     }
     let refresh = store::refresh(&root, true, false)?;
     semantic::initialize(&root)?;

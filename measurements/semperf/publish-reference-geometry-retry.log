@@ -1,0 +1,1 @@
+{"rows": 200000, "seconds": 8.637596624999787, "coverage": {"complete": true, "indexed": 200000, "order": "newest-first", "pending": 0, "total": 200000}, "lane": "metal", "model": "onnx-community/granite-embedding-small-english-r2-ONNX@1dc7835ba0cb/granite-small-r2-q8:seq1024:lane-mlx-fp16-metal"}

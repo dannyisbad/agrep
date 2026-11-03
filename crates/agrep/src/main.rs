@@ -474,7 +474,10 @@ fn ready(no_auto: bool) -> Result<(DataRoot, Option<CensusTask>)> {
     } else {
         let copy = root.clone();
         Some(std::thread::spawn(move || {
-            agrep_core::freshness::pending(&copy)
+            let _span = agrep_core::semantic_profile::span("freshness");
+            let pending = agrep_core::freshness::pending(&copy)?;
+            agrep_core::semantic_profile::event(serde_json::json!({"freshness":pending}));
+            Ok(pending)
         }))
     };
     Ok((root, census))

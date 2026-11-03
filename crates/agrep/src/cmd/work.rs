@@ -3,6 +3,7 @@ use super::super::*;
 const TASKS: &[&str] = &["refresh", "semantic", "reclaim", "archive", "post_index"];
 
 pub(crate) fn run(tasks: &[String]) -> Result<i32> {
+    semantic::configure_background()?;
     let root = DataRoot::discover()?;
     if !root.path().exists() {
         return Ok(0);

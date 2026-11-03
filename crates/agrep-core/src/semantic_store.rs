@@ -43,9 +43,16 @@ pub fn initialize_wait(root: &DataRoot) -> Result<()> {
     initialize_with(root, true)
 }
 fn initialize_with(root: &DataRoot, blocking: bool) -> Result<()> {
-    if has_schema(&store::reader(root)?)? {
+    let reader = store::reader(root)?;
+    let counted = reader.query_row(
+        "SELECT EXISTS(SELECT 1 FROM state WHERE key='semantic_ref_count')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if has_schema(&reader)? && counted {
         return Ok(());
     }
+    drop(reader);
     let Some(_lock) = root.lock(blocking)? else {
         return Ok(());
     };
@@ -59,6 +66,11 @@ CREATE INDEX IF NOT EXISTS semantic_refs_content ON semantic_refs(content_key);
 CREATE TABLE IF NOT EXISTS semantic_blocks(name TEXT PRIMARY KEY,rows INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS semantic_chunks(content_key TEXT NOT NULL,ordinal INTEGER NOT NULL,block TEXT NOT NULL,slot INTEGER NOT NULL,PRIMARY KEY(content_key,ordinal)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS semantic_chunks_location ON semantic_chunks(block,slot);
+INSERT OR IGNORE INTO state SELECT 'semantic_ref_count',COUNT(*) FROM semantic_refs;
+CREATE TRIGGER IF NOT EXISTS semantic_ref_insert AFTER INSERT ON semantic_refs BEGIN
+UPDATE state SET value=CAST(value AS INTEGER)+1 WHERE key='semantic_ref_count'; END;
+CREATE TRIGGER IF NOT EXISTS semantic_ref_delete AFTER DELETE ON semantic_refs BEGIN
+UPDATE state SET value=CAST(value AS INTEGER)-1 WHERE key='semantic_ref_count'; END;
 CREATE TRIGGER IF NOT EXISTS semantic_insert AFTER INSERT ON prose WHEN new.visible=1 BEGIN
 INSERT OR REPLACE INTO semantic_queue VALUES(new.id,new.digest,new.ts); END;
 CREATE TRIGGER IF NOT EXISTS semantic_update AFTER UPDATE OF text,digest,visible,who,agent ON prose BEGIN
@@ -89,7 +101,11 @@ pub fn coverage(c: &Connection) -> Result<Coverage> {
         |r| r.get(0),
     )?;
     let embedded = if has_schema(c)? {
-        c.query_row("SELECT COUNT(*) FROM semantic_refs", [], |r| r.get(0))?
+        c.query_row(
+            "SELECT CAST(value AS INTEGER) FROM state WHERE key='semantic_ref_count'",
+            [],
+            |r| r.get(0),
+        )?
     } else {
         0
     };
@@ -234,7 +250,7 @@ pub fn publish(
     }
     let mut attached = 0;
     for p in pending {
-        attached+=tx.execute("INSERT OR REPLACE INTO semantic_refs SELECT id,digest,?1 FROM prose WHERE id=?2 AND digest=?3 AND visible=1 AND (CASE WHEN agent='pi' AND who='recap' THEN 'recap:' ELSE 'text:' END)||digest=?1",params![p.key,p.id,p.digest])?;
+        attached+=tx.execute("INSERT INTO semantic_refs SELECT id,digest,?1 FROM prose WHERE id=?2 AND digest=?3 AND visible=1 AND (CASE WHEN agent='pi' AND who='recap' THEN 'recap:' ELSE 'text:' END)||digest=?1 ON CONFLICT(row_id) DO UPDATE SET digest=excluded.digest,content_key=excluded.content_key",params![p.key,p.id,p.digest])?;
         tx.execute(
             "DELETE FROM semantic_queue WHERE row_id=?1 AND digest=?2 AND EXISTS(SELECT 1 FROM prose WHERE id=?1 AND (CASE WHEN agent='pi' AND who='recap' THEN 'recap:' ELSE 'text:' END)||digest=?3)",
             params![p.id, p.digest, p.key],
@@ -280,35 +296,62 @@ impl Block {
     }
 }
 pub fn blocks(root: &DataRoot, c: &Connection) -> Result<Vec<Block>> {
+    use rayon::prelude::*;
     if !has_schema(c)? {
         return Ok(vec![]);
     }
     let mut s = c.prepare("SELECT name,rows FROM semantic_blocks ORDER BY name")?;
-    let values = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))?;
-    let mut out = vec![];
-    for value in values {
-        let (name, rows) = value?;
-        if name.len() != 70
-            || !name.ends_with(".q8f16")
-            || !name[..64].bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            bail!("invalid semantic block name");
-        }
-        let f = File::open(root.path().join("vectors").join(&name))
-            .context("read semantic vector block")?;
-        if f.metadata()?.len() as usize != rows * (DIM * 3 + 4) {
-            bail!("invalid semantic vector block length");
-        }
-        // Published blocks are immutable and remain valid while any SQLite reader uses them.
-        let map = unsafe { memmap2::MmapOptions::new().map(&f)? };
-        out.push(Block { name, map, rows });
-    }
-    Ok(out)
+    let values: Vec<_> = s
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    values
+        .into_par_iter()
+        .map(|(name, rows)| {
+            if name.len() != 70
+                || !name.ends_with(".q8f16")
+                || !name[..64].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("invalid semantic block name");
+            }
+            let f = File::open(root.path().join("vectors").join(&name))
+                .context("read semantic vector block")?;
+            if f.metadata()?.len() as usize != rows * (DIM * 3 + 4) {
+                bail!("invalid semantic vector block length");
+            }
+            // Published blocks are immutable and remain valid while any SQLite reader uses them.
+            let map = unsafe { memmap2::MmapOptions::new().map(&f)? };
+            #[cfg(unix)]
+            let _ = map.advise(memmap2::Advice::WillNeed);
+            Ok(Block { name, map, rows })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parallel_block_mapping_preserves_order_and_validates_paths() {
+        let (_t, r) = root();
+        fs::create_dir_all(r.path().join("vectors")).unwrap();
+        let c = store::writer(&r).unwrap();
+        for letter in ['b', 'a'] {
+            let name = format!("{}.q8f16", letter.to_string().repeat(64));
+            fs::write(r.path().join("vectors").join(&name), vec![0; DIM * 3 + 4]).unwrap();
+            c.execute("INSERT INTO semantic_blocks VALUES(?,1)", [name])
+                .unwrap();
+        }
+        let mapped = blocks(&r, &c).unwrap();
+        assert!(mapped[0].name.starts_with('a'));
+        assert!(mapped[1].name.starts_with('b'));
+        c.execute("INSERT INTO semantic_blocks VALUES('../invalid',1)", [])
+            .unwrap();
+        assert!(blocks(&r, &c)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalid semantic block name"));
+    }
     fn root() -> (tempfile::TempDir, DataRoot) {
         let t = tempfile::tempdir().unwrap();
         let root = DataRoot::open(t.path().join("data"), true).unwrap();
@@ -381,6 +424,42 @@ mod tests {
             .unwrap()
             .execute("DELETE FROM prose", [])
             .unwrap();
+        assert_eq!(coverage(&store::reader(&r).unwrap()).unwrap().embedded, 0);
+    }
+    #[test]
+    fn reference_count_is_transactional_and_upserts_do_not_double_count() {
+        let (_t, r) = root();
+        row(&r, "old");
+        let pending = batch(&store::reader(&r).unwrap(), 8).unwrap();
+        let mut vector = vec![0.; DIM];
+        vector[0] = 1.;
+        let new = vec![(pending[0].key.clone(), 0)];
+        publish(&r, &pending, &new, std::slice::from_ref(&vector)).unwrap();
+        publish(&r, &pending, &new, std::slice::from_ref(&vector)).unwrap();
+        initialize(&r).unwrap();
+        let snapshot = store::reader(&r).unwrap();
+        assert_eq!(coverage(&snapshot).unwrap().embedded, 1);
+        let mut writer = store::writer(&r).unwrap();
+        {
+            let tx = writer.transaction().unwrap();
+            tx.execute("DELETE FROM semantic_refs", []).unwrap();
+            assert_eq!(coverage(&tx).unwrap().embedded, 0);
+            tx.rollback().unwrap();
+        }
+        assert_eq!(coverage(&store::reader(&r).unwrap()).unwrap().embedded, 1);
+        writer
+            .execute(
+                "UPDATE prose SET text=?,digest=? WHERE id=1",
+                params![b"new".as_slice(), store::digest("new")],
+            )
+            .unwrap();
+        assert_eq!(coverage(&store::reader(&r).unwrap()).unwrap().embedded, 0);
+        assert_eq!(coverage(&snapshot).unwrap().embedded, 1);
+        drop(snapshot);
+        let pending = batch(&store::reader(&r).unwrap(), 8).unwrap();
+        publish(&r, &pending, &[(pending[0].key.clone(), 0)], &[vector]).unwrap();
+        assert_eq!(coverage(&store::reader(&r).unwrap()).unwrap().embedded, 1);
+        writer.execute("DELETE FROM prose WHERE id=1", []).unwrap();
         assert_eq!(coverage(&store::reader(&r).unwrap()).unwrap().embedded, 0);
     }
 }

@@ -1,0 +1,14 @@
+{
+  "config.json": {
+    "bytes": 1315,
+    "sha256": "154518e6452854eb11123ce433d165f2773437aa0f36935d2204249b2c327198"
+  },
+  "tokenizer.json": {
+    "bytes": 3583228,
+    "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+  },
+  "model.safetensors": {
+    "bytes": 95332048,
+    "sha256": "dcbfaf2ee50d358763cbc0c08e5b045ecbf6aeb02dc0e86ffb910029bf9ebb5f"
+  }
+}

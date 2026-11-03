@@ -1,0 +1,16 @@
+    Blocking waiting for file lock on build directory
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle v1.0.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-parse v1.0.0
+   Compiling colorchoice v1.0.5
+   Compiling agrep-core v0.5.0 (/Users/runner/.agrep-p8/w05-semperf/crates/agrep-core)
+   Compiling clap_lex v1.1.0
+   Compiling anstream v1.0.0
+   Compiling strsim v0.11.1
+   Compiling clap_derive v4.6.1
+   Compiling clap_builder v4.6.0
+   Compiling clap v4.6.1
+   Compiling agrep v0.5.0 (/Users/runner/.agrep-p8/w05-semperf/crates/agrep)
+    Finished `release` profile [optimized] target(s) in 2m 31s

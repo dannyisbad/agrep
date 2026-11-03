@@ -49,9 +49,17 @@ pub mod pages;
 pub mod process;
 pub mod recovery;
 pub mod semantic;
+#[cfg(target_os = "macos")]
+mod semantic_arena;
+mod semantic_attention;
+mod semantic_attention_metal;
 mod semantic_bert;
+mod semantic_metal;
 pub mod semantic_model;
+mod semantic_norm;
 mod semantic_policy;
+#[doc(hidden)]
+pub mod semantic_profile;
 mod semantic_store;
 pub mod surface;
 pub mod terminal;

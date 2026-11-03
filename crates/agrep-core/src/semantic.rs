@@ -16,6 +16,43 @@ pub struct SearchResults {
     pub result: Results,
     pub coverage: Coverage,
 }
+
+fn background_thread_count(logical: usize, requested: Option<usize>) -> usize {
+    let cap = (logical / 2).max(1);
+    requested.unwrap_or(cap).clamp(1, cap)
+}
+
+/// Called at the start of the dedicated __work process, before any thread pool
+/// or BLAS initialization. Parallel heads use Rayon; BLAS stays single-threaded
+/// so nested parallelism cannot multiply the CPU allowance.
+pub fn configure_background() -> Result<()> {
+    let logical = std::thread::available_parallelism().map_or(1, usize::from);
+    let requested = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let threads = background_thread_count(logical, requested);
+    std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+    std::env::set_var("VECLIB_MAXIMUM_THREADS", "1");
+    std::env::set_var("TOKENIZERS_PARALLELISM", "false");
+    #[cfg(unix)]
+    unsafe {
+        if libc::getpriority(libc::PRIO_PROCESS, 0) < 10
+            && libc::setpriority(libc::PRIO_PROCESS, 0, 10) < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
+        };
+        if SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
 /// Spawn only for a prepared model. Automatic hybrid never downloads anything.
 pub fn schedule(root: &DataRoot) -> Result<()> {
     if crate::data::read_only() {
@@ -25,10 +62,12 @@ pub fn schedule(root: &DataRoot) -> Result<()> {
     if embeddings {
         initialize(root)?;
     }
-    if !(root.config()?.archive.enabled
-        || (embeddings && semantic_store::pending(&store::reader(root)?)?)
-        || post_index_pending(root)?)
-    {
+    let embedding_pending = embeddings && semantic_store::pending(&store::reader(root)?)?;
+    let maintenance_pending = post_index_pending(root)?;
+    crate::semantic_profile::event(serde_json::json!({"work_state":{
+        "embedding_pending":embedding_pending,"maintenance_pending":maintenance_pending
+    }}));
+    if !(root.config()?.archive.enabled || embedding_pending || maintenance_pending) {
         return Ok(());
     }
     crate::freshness::spawn(root, &std::env::current_exe()?)?;
@@ -101,19 +140,37 @@ struct VectorScan {
 }
 impl VectorScan {
     fn new(blocks: Vec<semantic_store::Block>, vector: Vec<f32>) -> Result<Self> {
+        let _span = crate::semantic_profile::span("vector_scan_and_sort");
+        use rayon::prelude::*;
+        let started = std::time::Instant::now();
         let (q, scale) = semantic_store::quantize(&vector)?;
         let total_rows = blocks.iter().map(|b| b.rows).sum();
-        let mut candidates = Vec::new();
-        for (b, block) in blocks.iter().enumerate() {
-            candidates.extend(
-                block
-                    .candidates(&q, scale, semantic_policy::FLOOR as f32)
-                    .into_iter()
-                    .map(|(slot, upper)| (b, slot, upper)),
+        let mut candidates: Vec<_> = {
+            let _span = crate::semantic_profile::span("vector_scan");
+            blocks
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(b, block)| {
+                    block
+                        .candidates(&q, scale, semantic_policy::FLOOR as f32)
+                        .into_iter()
+                        .map(move |(slot, upper)| (b, slot, upper))
+                })
+                .collect()
+        };
+        let scan_ms = started.elapsed().as_secs_f64() * 1000.;
+        {
+            let _span = crate::semantic_profile::span("vector_sort");
+            candidates.par_sort_unstable_by(|a, b| {
+                b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1))
+            });
+        }
+        if crate::semantic_profile::timing_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"scan_ms":scan_ms,"candidate_sort_ms":started.elapsed().as_secs_f64()*1000.-scan_ms,"candidates":candidates.len(),"vectors":total_rows})
             );
         }
-        candidates
-            .sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
         Ok(Self {
             blocks,
             vector,
@@ -136,6 +193,7 @@ pub fn begin(
     o: &Options,
     family_diverse: bool,
 ) -> Result<QueryWork> {
+    let started = std::time::Instant::now();
     if !installed(root) {
         bail!("semantic model not installed: run agrep setup");
     }
@@ -143,11 +201,23 @@ pub fn begin(
         bail!("semantic query requires natural language; use --lexical for identifiers");
     }
     // This first read pins the same WAL snapshot used by the lexical query.
-    let coverage = coverage(c)?;
+    let coverage = {
+        let _span = crate::semantic_profile::span("semantic_coverage");
+        coverage(c)?
+    };
     let lane = if coverage.embedded == 0 {
         None
     } else {
-        let blocks = semantic_store::blocks(root, c)?;
+        let blocks = {
+            let _span = crate::semantic_profile::span("vector_block_open");
+            semantic_store::blocks(root, c)?
+        };
+        if crate::semantic_profile::timing_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"coverage_and_blocks_ms":started.elapsed().as_secs_f64()*1000.})
+            );
+        }
         let root = root.clone();
         let pattern = o.pattern.clone();
         Some(crate::logging::spawn_semantic(move || {
@@ -205,6 +275,9 @@ fn resolve_scan(
     family_diverse: bool,
     scan: VectorScan,
 ) -> Result<Results> {
+    let _span = crate::semantic_profile::span("vector_refine");
+    let started = std::time::Instant::now();
+    let mut refined = 0usize;
     let VectorScan {
         blocks,
         vector,
@@ -244,6 +317,7 @@ fn resolve_scan(
             break;
         }
         let score = blocks[block].exact_score(slot, &vector);
+        refined += 1;
         if (score as f64) < semantic_policy::FLOOR {
             continue;
         }
@@ -326,6 +400,12 @@ fn resolve_scan(
             hits.sort_by(compare);
             hits.truncate(want + 1);
         }
+    }
+    if crate::semantic_profile::timing_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"refine_resolve_ms":started.elapsed().as_secs_f64()*1000.,"refined":refined})
+        );
     }
     result.total = matched_groups.len();
     hits.truncate(want);
@@ -453,9 +533,15 @@ pub fn post_index(root: &DataRoot) -> Result<()> {
         store::writer(root)?.execute("DELETE FROM state WHERE key='post_index_pending'", [])?;
     }
     #[cfg(windows)]
-    let status = std::process::Command::new("cmd")
-        .args(["/C", &command])
-        .status()?;
+    let status = {
+        use std::os::windows::process::CommandExt;
+        // std quotes arguments for the C runtime, escaping inner quotes in a form cmd.exe does
+        // not parse; /S makes cmd strip exactly the outer quotes, so the line arrives verbatim.
+        std::process::Command::new("cmd")
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""))
+            .status()?
+    };
     #[cfg(not(windows))]
     let status = std::process::Command::new("sh")
         .args(["-c", &command])
@@ -468,6 +554,18 @@ pub fn post_index(root: &DataRoot) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_cpu_allowance_never_exceeds_half_the_machine() {
+        for logical in [1, 2, 3, 6, 12, 64] {
+            let cap = (logical / 2).max(1);
+            for requested in [None, Some(0), Some(1), Some(6), Some(256)] {
+                let actual = super::background_thread_count(logical, requested);
+                assert!((1..=cap).contains(&actual));
+            }
+        }
+        assert_eq!(super::background_thread_count(12, Some(3)), 3);
+        assert_eq!(super::background_thread_count(12, Some(64)), 6);
+    }
     use super::*;
     fn setup() -> (tempfile::TempDir, DataRoot, Options) {
         let t = tempfile::tempdir().unwrap();

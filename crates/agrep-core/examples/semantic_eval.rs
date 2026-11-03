@@ -10,6 +10,10 @@ fn main() -> Result<()> {
     let path = args
         .get(1)
         .context("usage: semantic_eval MODEL_DIR cpu|metal [batch]")?;
+    if args.get(2).is_some_and(|s| s == "provision") {
+        agrep_core::semantic_model::provision_at(Path::new(path))?;
+        return Ok(());
+    }
     let device = match args.get(2).map(String::as_str).unwrap_or("cpu") {
         "metal" => Device::new_metal(0)?,
         "cpu" => Device::Cpu,
@@ -19,10 +23,28 @@ fn main() -> Result<()> {
     let mut model = Embedder::load(Path::new(path), device)?;
     let window: usize = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(1024);
     model = model.with_token_limit(window)?;
+    if let Some(tokens) = args.get(7) {
+        model = model.with_batch_tokens(tokens.parse()?)?;
+    }
+    if let Some(percent) = args.get(8) {
+        model = model.with_max_padding(percent.parse()?)?;
+    }
     let load_s = started.elapsed().as_secs_f64();
+    if args.get(3).is_some_and(|s| s == "query") {
+        let tick = Instant::now();
+        let vectors = model.embed(&["where is the connection pool timeout configured?".into()])?;
+        println!(
+            "{}",
+            json!({"load_s":load_s,"inference_s":tick.elapsed().as_secs_f64(),"dimensions":vectors[0].len()})
+        );
+        return Ok(());
+    }
     if args.get(3).is_some_and(|s| s == "batch") {
-        let batch: Vec<String> =
-            serde_json::from_str(include_str!("../../../fixtures/semantic-batch.json"))?;
+        let batch: Vec<String> = if let Some(path) = args.get(6) {
+            serde_json::from_slice(&std::fs::read(path)?)?
+        } else {
+            serde_json::from_str(include_str!("../../../fixtures/semantic-batch.json"))?
+        };
         let batches: usize = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(16);
         if batches == 0 {
             bail!("batch count must be positive");
@@ -66,6 +88,24 @@ fn main() -> Result<()> {
             .sum();
         let norm = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
         minimum = minimum.min(dot / (norm(v) * norm(&expected[i])));
+    }
+    // An odd bulk input exercises the two CPU streams' final unmatched row.
+    // Compare against the independent oracle, including the repeated last row.
+    let mut odd_texts = texts.clone();
+    odd_texts.push(texts[0].clone());
+    let odd_vectors = model.embed(&odd_texts)?;
+    if odd_vectors.len() != odd_texts.len() {
+        bail!("odd batch dropped a row")
+    }
+    for (i, v) in odd_vectors.iter().enumerate() {
+        let oracle = &expected[if i == texts.len() { 0 } else { i }];
+        let dot: f64 = v
+            .iter()
+            .zip(oracle)
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum();
+        let norm = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        minimum = minimum.min(dot / (norm(v) * norm(oracle)));
     }
     let mut recall = 0;
     let mut agree = 0;

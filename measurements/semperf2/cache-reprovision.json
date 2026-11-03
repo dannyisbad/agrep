@@ -1,0 +1,16 @@
+{
+  "event": "reprovision_after_reference_hardlinks",
+  "load_before": [
+    99.84521484375,
+    64.16064453125,
+    50.51611328125
+  ],
+  "uptime": "19:27  up  2:22, 1 user, load averages: 99.85 64.16 50.52",
+  "exit": 0,
+  "wall_s": 2.089315915998668,
+  "load_after": [
+    98.3359375,
+    64.43994140625,
+    50.6943359375
+  ]
+}

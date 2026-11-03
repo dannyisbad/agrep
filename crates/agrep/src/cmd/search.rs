@@ -8,6 +8,10 @@ use agrep_core::{
 use anyhow::{bail, Result};
 use std::io::IsTerminal;
 pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
+    let _query_span = agrep_core::semantic_profile::span("query_total");
+    let query_start = std::time::Instant::now();
+    let timing = agrep_core::semantic_profile::timing_enabled();
+    let pattern = s.pattern.join(" ");
     if s.coverage
         && (s.json
             || s.flat
@@ -26,7 +30,30 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
     }
-    let (root, census) = ready(no_auto)?;
+    let _model_read_ahead = if s.semantic
+        || (!s.lexical
+            && !s.regex
+            && !s.word
+            && !s.count
+            && !s.count_by_tier
+            && !s.coverage
+            && s.sort == "score"
+            && compact(s.classic)
+            && semantic::eligible(&pattern))
+    {
+        let root = agrep_core::data::DataRoot::discover()?;
+        if s.semantic || root.config()?.embeddings != "off" {
+            agrep_core::semantic_model::prefetch_query(&root)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (root, census) = {
+        let _span = agrep_core::semantic_profile::span("freshness_prepare");
+        ready(no_auto)?
+    };
     let c = store::reader(&root)?;
     let mut f = s.scope.filters()?;
     agrep_core::coverage::validate(&mut f)?;
@@ -38,7 +65,6 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         }
         f.chat = Some(candidates[0].clone());
     }
-    let pattern = s.pattern.join(" ");
     let identity = caller::Identity::detect();
     if !s.json && !s.scope.include_self && (s.scope.no_self || identity.agent_context) {
         identity.disclose(s.scope.no_self);
@@ -86,6 +112,12 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         && root.config()?.embeddings != "off"
         && semantic::eligible(&pattern)
         && semantic::installed(&root);
+    if timing {
+        eprintln!(
+            "{}",
+            serde_json::json!({"query_prepare_ms":query_start.elapsed().as_secs_f64()*1000.})
+        );
+    }
     let lane = if s.semantic || automatic {
         Some(semantic::begin(
             &root,
@@ -96,10 +128,17 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         None
     };
+    let keyword_start = std::time::Instant::now();
     let keyword = if s.semantic {
         Default::default()
     } else {
+        let _span = agrep_core::semantic_profile::span("keyword");
         caller::search(&c, &options, &caller, include_self, s.scope.no_self)?
+    };
+    let mut keyword_ms = if s.semantic {
+        0.
+    } else {
+        keyword_start.elapsed().as_secs_f64() * 1000.
     };
     let (mut result, semantic_coverage) = if let Some(lane) = lane {
         match lane.and_then(|work| semantic::finish(&c, work)) {
@@ -121,7 +160,12 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             Err(error) => {
                 agrep_core::logging::semantic_failure(&root, &error);
                 let fallback = if s.semantic {
-                    caller::search(&c, &options, &caller, include_self, s.scope.no_self)?
+                    let tick = std::time::Instant::now();
+                    let _span = agrep_core::semantic_profile::span("keyword_fallback");
+                    let result =
+                        caller::search(&c, &options, &caller, include_self, s.scope.no_self)?;
+                    keyword_ms += tick.elapsed().as_secs_f64() * 1000.;
+                    result
                 } else {
                     keyword
                 };
@@ -138,6 +182,9 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
             },
         )
     };
+    if timing {
+        eprintln!("{}", serde_json::json!({"keyword_ms":keyword_ms}));
+    }
     let compact = compact(s.classic);
     let mut full_argv = vec![
         "agrep".to_string(),
@@ -201,7 +248,10 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     } else {
         None
     };
-    let pending_sources = finish_census(&root, census)?;
+    let pending_sources = {
+        let _span = agrep_core::semantic_profile::span("freshness_join");
+        finish_census(&root, census)?
+    };
     result.pending_sources = pending_sources;
     let style = Style {
         json: s.json,
@@ -228,7 +278,10 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         filter_coverage: coverage.clone(),
         pending_sources,
     };
-    render::emit_semantic(&result, &pattern, &f, &style, semantic_coverage.as_ref())?;
+    {
+        let _span = agrep_core::semantic_profile::span("render");
+        render::emit_semantic(&result, &pattern, &f, &style, semantic_coverage.as_ref())?;
+    }
     if let Some(recovered) = coverage_hits {
         eprintln!(
             "coverage lane (forced): {} additional rows",

@@ -1,0 +1,8 @@
+{
+  "rows": 200000,
+  "dimension": 384,
+  "exported_f16_bytes": 153600000,
+  "exported_f16_sha256": "38df0899baca1da49fcf57ace3f7e85005261955271e701e61bacd6ce6db7aa0",
+  "source": "Original semantic_scale fixture F16 vectors, joined through semantic_refs/content keys",
+  "reference_manifest": "reference-vector-manifest.json"
+}

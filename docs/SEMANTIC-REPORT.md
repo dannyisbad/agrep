@@ -1,5 +1,7 @@
 # Semantic slice report
 
+The later performance investigation and current measurements are in [SEMANTIC-PERFORMANCE.md](SEMANTIC-PERFORMANCE.md). This file retains the original slice results.
+
 The semantic lane is implemented in process with pinned Candle 0.9.2, verified model provisioning, content-keyed immutable q8/F16 blocks, transactional references and an embedding queue, detached queue draining, semantic-only search and parallel compact-profile hybrid search. No earlier agrep data or process format is read.
 
 **Performance acceptance remains open.** The measured fixed budgets have not all been achieved. The rows below are observed results, not relaxed limits or projections.

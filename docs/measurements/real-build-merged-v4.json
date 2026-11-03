@@ -1,0 +1,53 @@
+{
+  "build_ms": 271585.878124999,
+  "exit_code": 0,
+  "load_averages": [
+    [
+      35.87,
+      47.94,
+      70.03
+    ]
+  ],
+  "phases": {
+    "sources": 10493,
+    "parsed": 10493,
+    "changed_rows": 1496205,
+    "errors": 1,
+    "census_ms": 578.198417,
+    "total_ms": 271085.188334,
+    "parse_ms": 51825.942166,
+    "write_ms": 200689.53737499999,
+    "bounds_ms": 10173.280083,
+    "stats_ms": 7559.005040999999,
+    "resumed_sources": 0,
+    "bytes_read": 24093154125,
+    "bytes_parsed": 24093154125,
+    "adapter_parse_ms": {
+      "claude": 51813.664709000004,
+      "codex": 51808.072625,
+      "pi": 51818.6135
+    },
+    "adapter_source_parse_ms": {
+      "claude": 565.0364550000002,
+      "codex": 2526.238919,
+      "pi": 400592.6471429979
+    },
+    "adapter_sources": {
+      "claude": 46,
+      "codex": 32,
+      "pi": 10415
+    },
+    "adapter_write_ms": {
+      "claude": 130.344459,
+      "codex": 323.204708,
+      "pi": 123612.194375
+    },
+    "row_diff_ms": 49844.911824,
+    "fts_ms": 52824.974167,
+    "secondary_indexes_ms": 4811.999,
+    "canonical_ms": 14911.789459,
+    "dictionary_ms": 4030.8778749999997,
+    "node_chunks_ms": 60882.79982500004,
+    "commit_ms": 173.403375
+  }
+}
