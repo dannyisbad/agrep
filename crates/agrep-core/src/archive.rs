@@ -1,12 +1,11 @@
 //! Native-source archives: transactional catalog, immutable SHA-256 gzip chunks.
 use crate::{
     data::{self, DataRoot},
-    ingest::registry::{Adapter, ADAPTERS},
+    ingest::registry::{path_eq, relative_path, Adapter, ADAPTERS},
     safe_fs,
 };
 use anyhow::{bail, Context, Result};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,7 +71,7 @@ fn now() -> i64 {
         .as_millis() as i64
 }
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::store::hex_digest(Sha256::digest(bytes))
 }
 fn valid_hash(s: &str) -> bool {
     s.len() == 64
@@ -95,9 +94,9 @@ impl Archive {
             .truncate(false)
             .open(dir.join("archive.lock"))?;
         if blocking {
-            lock.lock_exclusive()?;
-        } else if let Err(e) = lock.try_lock_exclusive() {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+            lock.lock()?;
+        } else if let Err(e) = lock.try_lock() {
+            if matches!(e, std::fs::TryLockError::WouldBlock) {
                 return Ok(None);
             }
             return Err(e.into());
@@ -236,11 +235,7 @@ fn walk(
                 let entry = entry?;
                 let ty = entry.file_type()?;
                 if ty.is_dir() || ty.is_file() {
-                    let rel = entry
-                        .path()
-                        .strip_prefix(root)
-                        .unwrap_or(&entry.path())
-                        .to_path_buf();
+                    let rel = relative_path(&entry.path(), root).unwrap_or_else(|| entry.path());
                     if adapter.name() == "opencode"
                         && ty.is_dir()
                         && rel.components().count() == 1
@@ -268,7 +263,7 @@ fn walk(
     }
 }
 fn archive_content(adapter: &dyn Adapter, root: &Path, path: &Path) -> bool {
-    let rel = path.strip_prefix(root).unwrap_or(path);
+    let rel = relative_path(path, root).unwrap_or_else(|| path.to_path_buf());
     if adapter.name() == "opencode" && path.extension().is_some_and(|x| x == "json") {
         return rel
             .components()
@@ -293,8 +288,11 @@ pub fn discover() -> (Vec<Source>, Vec<String>) {
             walk(*adapter, &root, &root, &mut out, &mut failures);
         }
     }
+    #[cfg(windows)]
+    out.sort_by_cached_key(|s| crate::ingest::registry::logical_path_key(&s.path));
+    #[cfg(not(windows))]
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out.dedup_by(|a, b| a.path == b.path);
+    out.dedup_by(|a, b| path_eq(&a.path, &b.path));
     (out, failures)
 }
 
@@ -454,7 +452,7 @@ fn capture_one(
         stats.unchanged += 1;
         return Ok(());
     }
-    let sha = format!("{:x}", digest.finalize());
+    let sha = crate::store::hex_digest(digest.finalize());
     if previous.as_ref().is_some_and(|(_, _, old)| old == &sha) {
         archive.db.execute(
             "UPDATE versions SET fingerprint=? WHERE id=?",
@@ -464,12 +462,9 @@ fn capture_one(
         return Ok(());
     }
     let home = crate::ingest::home();
-    let home_relative = source
-        .path
-        .strip_prefix(&home)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    let tail = if source.path == source.root {
+    let home_relative =
+        relative_path(&source.path, &home).map(|p| p.to_string_lossy().into_owned());
+    let tail = if path_eq(&source.path, &source.root) {
         source
             .path
             .file_name()
@@ -477,9 +472,8 @@ fn capture_one(
             .to_string_lossy()
             .into_owned()
     } else {
-        source
-            .path
-            .strip_prefix(&source.root)?
+        relative_path(&source.path, &source.root)
+            .context("source is outside archive root")?
             .to_string_lossy()
             .into_owned()
     };
@@ -626,8 +620,8 @@ fn destination(record: &Record, to: Option<&Path>) -> Result<PathBuf> {
         .any(|a| {
             a.archive_content(&current)
                 && a.archive_roots().iter().any(|r| {
-                    current == *r
-                        || current.strip_prefix(r).is_ok_and(|p| {
+                    path_eq(&current, r)
+                        || relative_path(&current, r).is_some_and(|p| {
                             p.components().all(|c| matches!(c, Component::Normal(_)))
                         })
                 })
@@ -661,7 +655,7 @@ fn restore_one(a: &Archive, r: &Record, dst: &Path, force: bool) -> Result<()> {
         size += bytes.len() as u64;
         temp.write_all(&bytes)?;
     }
-    if size != r.size || format!("{:x}", digest.finalize()) != r.sha {
+    if size != r.size || crate::store::hex_digest(digest.finalize()) != r.sha {
         bail!("archive aggregate hash mismatch")
     }
     temp.as_file().sync_all()?;

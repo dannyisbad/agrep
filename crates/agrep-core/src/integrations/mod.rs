@@ -1,4 +1,5 @@
 //! Consent-driven integrations. Enrollment describes only objects this install wrote.
+use crate::ingest::registry::path_eq;
 use crate::{data::DataRoot, safe_fs};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -198,14 +199,15 @@ pub fn install_block(target: &Target) -> Result<Installed> {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::store::hex_digest(Sha256::digest(bytes))
 }
 fn install_file(path: PathBuf, bytes: &[u8], previous: &[Installed]) -> Result<Installed> {
     let directories = missing_directories(&path);
     let old = safe_fs::read_optional(&path)?;
     if let Some(ref b) = old {
         let owned = previous.iter().any(|i| {
-            i.path == path && matches!(&i.kind, Kind::File { sha256 } if *sha256 == hash(b))
+            path_eq(&i.path, &path)
+                && matches!(&i.kind, Kind::File { sha256 } if *sha256 == hash(b))
         });
         if b != bytes && !owned {
             bail!("file has user edits: {}", path.display())
@@ -396,7 +398,7 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
         match result {
             Ok(mut item) => {
                 if let Some(old) = previous.iter().find(|i| {
-                    i.path == item.path
+                    path_eq(&i.path, &item.path)
                         && std::mem::discriminant(&i.kind) == std::mem::discriminant(&item.kind)
                 }) {
                     item.created = old.created;
@@ -415,7 +417,7 @@ pub fn install(root: &DataRoot, teach: bool, hooks: bool) -> Result<Vec<String>>
                     }
                 }
                 config.enrollment.retain(|i| {
-                    !(i.path == item.path
+                    !(path_eq(&i.path, &item.path)
                         && std::mem::discriminant(&i.kind) == std::mem::discriminant(&item.kind))
                 });
                 config.enrollment.push(item);
@@ -539,7 +541,11 @@ pub fn remove(root: &DataRoot) -> Result<Vec<String>> {
         }
     }
     for target in known {
-        if !config.enrollment.iter().any(|i| i.path == target.path) {
+        if !config
+            .enrollment
+            .iter()
+            .any(|i| path_eq(&i.path, &target.path))
+        {
             if let Err(e) = remove_block(&target.path, "", target.skill, false) {
                 errors.push(format!("{}: {e:#}", target.path.display()));
             }
@@ -631,7 +637,7 @@ pub fn repair(root: &DataRoot) -> Result<Vec<String>> {
                 Kind::Block { skill, .. } => {
                     let name = targets
                         .iter()
-                        .find(|t| t.path == item.path)
+                        .find(|t| path_eq(&t.path, &item.path))
                         .map(|t| t.name.clone())
                         .unwrap_or_default();
                     install_block(&Target {

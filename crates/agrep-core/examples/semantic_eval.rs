@@ -15,7 +15,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let device = match args.get(2).map(String::as_str).unwrap_or("cpu") {
-        "metal" => Device::new_metal(0)?,
+        "metal" => agrep_core::semantic_device::metal_device()
+            .context("a capable Metal GPU is required")?,
         "cpu" => Device::Cpu,
         _ => bail!("expected cpu or metal"),
     };

@@ -211,7 +211,7 @@ pub fn publish(
         }
     }
     use sha2::{Digest, Sha256};
-    let name = format!("{:x}.q8f16", Sha256::digest(&bytes));
+    let name = format!("{}.q8f16", crate::store::hex_digest(Sha256::digest(&bytes)));
     if !new.is_empty() {
         let dir = root.path().join("vectors");
         fs::create_dir_all(&dir)?;

@@ -533,15 +533,22 @@ fn registry_archives_every_agent_and_auxiliary_native_files() {
     }
     f.ok(&["archive"]);
     let db = Connection::open(f.data.join("archive/catalog.db")).unwrap();
+    let archived: Vec<String> = db
+        .prepare("SELECT home_relative FROM versions WHERE home_relative IS NOT NULL")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
     for p in files {
-        let count: i64 = db
-            .query_row(
-                "SELECT count(*) FROM versions WHERE home_relative=?",
-                [p],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "{p}");
+        assert_eq!(
+            archived
+                .iter()
+                .filter(|actual| Path::new(actual) == Path::new(p))
+                .count(),
+            1,
+            "{p}"
+        );
     }
     let count: i64 = db
         .query_row("SELECT count(DISTINCT agent) FROM versions", [], |r| {
@@ -728,20 +735,54 @@ fn archive_operations_wait_for_concurrent_capture() {
         .read(true)
         .open(dir.join("archive.lock"))
         .unwrap();
-    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    lock.lock().unwrap();
     let contender = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(dir.join("archive.lock"))
         .unwrap();
-    assert_eq!(
-        fs2::FileExt::try_lock_exclusive(&contender)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-    fs2::FileExt::unlock(&lock).unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    lock.unlock().unwrap();
     let out = f.ok(&["archive"]);
     assert!(!String::from_utf8_lossy(&out.stdout).contains("busy"));
-    fs2::FileExt::try_lock_exclusive(&contender).unwrap();
+    contender.try_lock().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn setup_reuses_enrollment_across_windows_path_spellings() {
+    let f = Fixture::new();
+    for name in [".claude", ".codex", ".pi/agent", ".omp/agent"] {
+        fs::create_dir_all(f.home.join(name)).unwrap();
+    }
+    f.ok(&["setup", "--yes", "--no-semantic", "--no-archive"]);
+    let root = DataRoot(f.data.clone());
+    let mut config = root.config().unwrap();
+    let original = config.enrollment.clone();
+    assert!(!original.is_empty());
+    for item in &mut config.enrollment {
+        item.path = PathBuf::from(
+            item.path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_uppercase(),
+        );
+    }
+    root.save_config(&config).unwrap();
+    f.ok(&["setup", "--yes", "--no-semantic", "--no-archive"]);
+    let current = root.config().unwrap();
+    assert_eq!(current.enrollment.len(), original.len());
+    for item in &original {
+        let updated = current
+            .enrollment
+            .iter()
+            .find(|other| agrep_core::ingest::registry::path_eq(&other.path, &item.path))
+            .unwrap();
+        assert_eq!(updated.created, item.created);
+    }
+    f.ok(&["remove"]);
+    assert!(root.config().unwrap().enrollment.is_empty());
 }

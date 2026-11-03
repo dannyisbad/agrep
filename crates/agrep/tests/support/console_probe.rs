@@ -14,6 +14,7 @@ extern "system" {
         add: i32,
     ) -> i32;
     fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, millis: u32) -> u32;
 }
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -32,6 +33,12 @@ fn main() {
         unsafe { GetConsoleMode(input.as_raw_handle(), &mut before) },
         0
     );
+    let mut output_before = 0;
+    assert_ne!(
+        unsafe { GetConsoleMode(output.as_raw_handle(), &mut output_before) },
+        0
+    );
+    let output_check = output.try_clone().unwrap();
     let command = &args[2];
     let control: u32 = args[3].parse().unwrap();
     let mut cmd = Command::new(&args[1]);
@@ -49,6 +56,9 @@ fn main() {
     if command == "serve" || command == "ui" {
         cmd.args(["--port", "0"]);
     }
+    // The foreground command must opt back in even when its parent ignores
+    // Ctrl-C (this attribute is inherited, unlike handler registrations).
+    assert_ne!(unsafe { SetConsoleCtrlHandler(None, 1) }, 0);
     let mut child = cmd.spawn().unwrap();
     let ready = if command == "board" {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -58,13 +68,19 @@ fn main() {
                 unsafe { GetConsoleMode(input.as_raw_handle(), &mut mode) },
                 0
             );
-            if mode != before {
+            // Wait for fully configured signal-preserving raw mode, not the
+            // transient mode set inside crossterm::enable_raw_mode.
+            if mode & 1 != 0 && mode & 6 == 0 {
                 break true;
             }
             if Instant::now() > deadline {
                 break false;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(
+                unsafe { WaitForSingleObject(child.as_raw_handle(), 10) },
+                0x102,
+                "command exited before ready"
+            );
         }
     } else {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -81,29 +97,30 @@ fn main() {
         let _ = child.wait();
         panic!("command did not become ready");
     }
-    // Set ignore only after spawning: the child must retain normal Ctrl-C delivery.
-    assert_ne!(unsafe { SetConsoleCtrlHandler(None, 1) }, 0);
     assert_ne!(
         unsafe { GenerateConsoleCtrlEvent(control, if control == 0 { 0 } else { child.id() }) },
         0
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break s;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("console control event did not exit command");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    if unsafe { WaitForSingleObject(child.as_raw_handle(), 10_000) } != 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("console control event did not exit command");
+    }
+    let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(if control == 0 { 130 } else { 3 }));
     let mut after = 0;
     assert_ne!(
         unsafe { GetConsoleMode(input.as_raw_handle(), &mut after) },
         0
     );
-    assert_eq!(before, after, "console mode was not restored");
+    assert_eq!(before, after, "console input mode was not restored");
+    let mut output_after = 0;
+    assert_ne!(
+        unsafe { GetConsoleMode(output_check.as_raw_handle(), &mut output_after) },
+        0
+    );
+    assert_eq!(
+        output_before, output_after,
+        "console output mode was not restored"
+    );
 }

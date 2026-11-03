@@ -1,0 +1,11 @@
+{
+  "completed": false,
+  "exit_code": 1,
+  "reason": "The existing pinned model cache is unavailable; network access beyond crates.io is prohibited. No semantic query was run.",
+  "completed_cases": [
+    "first_index",
+    "no_change_census",
+    "one_session_refresh",
+    "search_changed_source"
+  ]
+}

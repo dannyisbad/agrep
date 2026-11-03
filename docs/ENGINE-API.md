@@ -69,3 +69,25 @@ rescanned for each block; the stable `prose`, `tools`, and `events` read columns
 and the `query::search` signature are unchanged. The semantic merge adds a
 trigger-maintained reference count in private state; keyword readers do not
 scan the semantic reference table on startup.
+
+V7 keeps the reader tables, `Filters`/`Options`/`Hit`/`Results`, and retrieval
+function signatures unchanged. `freshness::Pending` adds
+`listed_directories`, `cached_directories`, and `stat_files` counters. These
+are diagnostic counts and do not change the meaning of `pending_sources`.
+
+The private cursor replaces its single prefix hash with `prefix_chunks`, a
+sequence of SHA-256 digests for 1 MiB chunks. Every prior byte is verified using
+parallel positional reads; the final partial chunk is reused when advancing
+the cursor. An older private cursor falls back to full parsing. Digest handle
+bytes and their encoding are unchanged by the sha2 0.11 dependency update.
+
+Private storage adds `tool_blobs.ascii` and `bound_updates(id)`. The first lets
+positional tool queries use a row-specific ASCII span bound. The second tracks
+existing prose row updates/deletes so append-only block updates can merge
+maxima without reading unchanged text. Both remain internal; `tools`/`events`
+view columns and `store::decode` retain their contract. The DEFLATE encoder is
+unchanged; the lossless decoder implementation now uses zlib-rs.
+
+Opt-in profiling includes process entry/exit timestamps, `cli_parse`,
+`reader_open`, `reader_pragmas`, and `reader_schema` spans, and aggregate query
+phase counters. Normal commands do not force the diagnostic schema read.

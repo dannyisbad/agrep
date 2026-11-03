@@ -4,6 +4,7 @@ The product is one executable. Python and JavaScript only deliver and execute
 it; development scripts under `bench/` are not installed runtime code.
 
 ```sh
+export CARGO_BUILD_JOBS=6
 nice -n 10 cargo fmt --check
 nice -n 10 cargo clippy --workspace --all-targets -- -D warnings
 nice -n 10 cargo test --workspace
@@ -15,8 +16,12 @@ nice -n 10 python bench/third_party_licenses.py --check
 ```
 
 All fixture histories and data roots are temporary. No test needs a user's real
-agent stores. `bench/test-skips.json` is the sole skip policy; it lists compile-time platform exclusions with reasons and permits no runtime
-skips. The launcher tests exercise POSIX signal behavior on
+agent stores. `bench/test-skips.json` is the sole skip policy. It lists platform exclusions
+with reasons. The only runtime exclusion is the exact registered guard that
+acquires a capable Metal device at the start of four GPU-only tests. Hosted
+macOS runners have no capable GPU: the Apple-silicon VM has no Metal device,
+and the Intel runner lacks the complete kernel feature set. CPU fallback and
+device-selection tests run on every platform. No other runtime skips are allowed. The launcher tests exercise POSIX signal behavior on
 POSIX and common argv, stdio and exit behavior on every platform.
 
 ## Performance
@@ -83,6 +88,27 @@ The cache is version-, platform- and hash-specific under
 Only a pushed `v*` tag starts `release.yml`; identity validation requires the tag
 to exactly match Cargo, Python and npm versions. Never tag or publish without
 the owner's authorization. Ordinary branch CI cannot publish.
+
+Before every release, run this required local check on a capable Apple-silicon
+Mac, in addition to hosted CI:
+
+```sh
+CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p agrep-core --lib semantic_ -- --nocapture
+```
+
+Confirm that all four GPU tests actually execute, each printing `Metal GPU:`
+with the local device name, and pass: `persistent_workspace_reuses_buffers_and_reads_new_inputs`,
+`simdgroup_attention_matches_masked_f16_attention_with_strided_values`,
+`fused_geglu_preserves_candle_f16_values`, and `residual_norm_matches_metal`.
+A passing run without four GPU lines does not satisfy this release check.
+The same run must pass the portable device-selection and CPU-fallback tests.
+Local validation on 2026-11-02: Apple M2 Max; all four GPU tests printed that
+device name and passed, and the semantic-filtered run passed all 33 tests with
+zero failures or ignored tests.
+The selector requires Apple7-or-newer features (SIMD reductions and matrix
+multiply, nonuniform dispatch, 64-bit integer math), unified memory, sufficient
+threadgroup limits, and compatible compiled pipelines, including 32-lane attention.
+See [Apple's feature tables](https://developer.apple.com/metal/feature-sets/).
 
 1. Run the full reusable CI gates and build all six binaries. Linux builds use
    pinned manylinux_2_28 images; auditwheel must prove the claimed ABI policy.

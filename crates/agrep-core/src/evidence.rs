@@ -629,7 +629,7 @@ mod tests {
             let tx = c.transaction().unwrap();
             tx.execute_batch("INSERT INTO sources VALUES('fixture','pi',0,0,'',NULL); INSERT INTO event_sessions VALUES(1,'pi','selected'),(2,'pi','unrelated'); INSERT INTO symbols VALUES(1,'tool'),(2,'shell'),(3,'control'),(4,'compaction');").unwrap();
             tx.execute(
-                "INSERT INTO tool_blobs VALUES(1,X'01',?)",
+                "INSERT INTO tool_blobs(id,digest,body) VALUES(1,X'01',?)",
                 [store::encode_tool("shell: needle").unwrap()],
             )
             .unwrap();

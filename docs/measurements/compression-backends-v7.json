@@ -1,0 +1,200 @@
+{
+  "samples": [
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 129.78979199999998,
+      "encode_ms": 135.481084,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 0,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 32.203042,
+      "encode_ms": 124.368542,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 0,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 35.429750000000006,
+      "encode_ms": 78.802708,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 1,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 111.226375,
+      "encode_ms": 110.06537499999999,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 1,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 59.77025,
+      "encode_ms": 99.63974999999999,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 2,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 35.951792000000005,
+      "encode_ms": 75.02250000000001,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 2,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 25.855458000000002,
+      "encode_ms": 111.208208,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 3,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 50.215999999999994,
+      "encode_ms": 89.483875,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 3,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 189.806542,
+      "encode_ms": 106.195125,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 4,
+      "load_averages": [
+        16.58349609375,
+        14.83837890625,
+        15.67236328125
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 27.664541,
+      "encode_ms": 83.691875,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 4,
+      "load_averages": [
+        17.73779296875,
+        15.1064453125,
+        15.76171875
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 35.353583,
+      "encode_ms": 97.74033299999999,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 5,
+      "load_averages": [
+        17.73779296875,
+        15.1064453125,
+        15.76171875
+      ]
+    },
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 99.23925,
+      "encode_ms": 87.749,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 5,
+      "load_averages": [
+        17.73779296875,
+        15.1064453125,
+        15.76171875
+      ]
+    },
+    {
+      "compressed_bytes": 2263125,
+      "decode_ms": 68.36191699999999,
+      "encode_ms": 113.58512499999999,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "miniz",
+      "repeat": 6,
+      "load_averages": [
+        17.73779296875,
+        15.1064453125,
+        15.76171875
+      ]
+    },
+    {
+      "compressed_bytes": 2725674,
+      "decode_ms": 27.753584,
+      "encode_ms": 75.700958,
+      "rows": 5000,
+      "text_bytes": 4169659,
+      "backend": "fast",
+      "repeat": 6,
+      "load_averages": [
+        17.73779296875,
+        15.1064453125,
+        15.76171875
+      ]
+    }
+  ]
+}

@@ -162,6 +162,15 @@ fn alias_resolution_uses_source_metadata_and_safe_followups() {
     ok(&t, &["index"]);
     let out = ok(&t, &["around", p.to_str().unwrap(), "0"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("alpha needle"));
+    #[cfg(windows)]
+    for spelling in [
+        p.to_string_lossy().replace('\\', "/"),
+        p.to_string_lossy().replace('/', "\\"),
+        p.to_string_lossy().to_uppercase(),
+    ] {
+        let out = ok(&t, &["around", &spelling, "0"]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("alpha needle"));
+    }
     let c = agrep_core::store::writer(&DataRoot(t.path().join("data"))).unwrap();
     c.execute("INSERT INTO sessions(agent,id,project,cwd,parent,family,side,title,first_ts,last_ts) VALUES('pi','sameprefix-session-two','/work/project','','','sameprefix-session-two',0,'',0,0)",[]).unwrap();
     let w = agrep_core::evidence::load(

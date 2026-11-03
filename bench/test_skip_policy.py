@@ -48,6 +48,30 @@ class SkipPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate([], self.root)
 
+    def test_only_registered_initial_metal_capability_guard_is_accepted(self):
+        guard = 'let Some(device) = crate::semantic_device::metal_device() else { return; };'
+        source = '#[cfg(target_os="macos")] #[test] fn probe() { ' + guard + ' assert!(device.is_metal()); }'
+        self.reject_rust(source)
+        self.policy['platform_inapplicable'] = [{
+            'test': 'crates/probe.rs::probe',
+            'gates': ['cfg(target_os=LITERAL)', 'capability(semantic_device::metal_device)'],
+            'reason': 'The hosted platform has no GPU with the required features.',
+        }]
+        self.save()
+        validate([], self.root)
+        for altered in (
+            source.replace('metal_device()', 'other_device()'),
+            source.replace(guard, 'if crate::semantic_device::metal_device().is_none() { return; }'),
+            source.replace(guard, guard + ' if true { return; }'),
+            source.replace(guard, 'assert!(true); ' + guard),
+            source.replace('else { return; }', 'else { let ignored = 1; return; }'),
+            source.replace('target_os="macos"', 'target_os="windows"').replace(guard, ''),
+        ):
+            self.reject_rust(altered)
+        self.policy['platform_inapplicable'][0]['gates'] = ['cfg(target_os=LITERAL)']
+        self.save()
+        self.reject_rust(source)
+
     def test_todo_skip_and_expected_failure_source_markers(self):
         for source in ('test.todo("later");', 'test("later", {todo:true}, () => {});', 'test("later", t => t.skip());', 'test("later", {skip:"reason"}, () => {});', 'test("later", {"todo":true}, () => {});'):
             (self.root / 'npm/test_probe.js').write_text(source)

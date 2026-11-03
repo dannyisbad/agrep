@@ -135,6 +135,11 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         let _span = agrep_core::semantic_profile::span("keyword");
         caller::search(&c, &options, &caller, include_self, s.scope.no_self)?
     };
+    if timing {
+        agrep_core::semantic_profile::event(serde_json::json!({
+            "retrieval":keyword.timings,"examined":keyword.examined,"blocks":keyword.blocks
+        }));
+    }
     let mut keyword_ms = if s.semantic {
         0.
     } else {

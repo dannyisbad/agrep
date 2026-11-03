@@ -168,7 +168,14 @@ mod tests {
     use candle_core::{DType, IndexOp};
     #[test]
     fn simdgroup_attention_matches_masked_f16_attention_with_strided_values() {
-        let device = Device::new_metal(0).unwrap();
+        let Some(device) = crate::semantic_device::metal_device() else {
+            return;
+        };
+        use objc2_metal::MTLDevice;
+        eprintln!(
+            "Metal GPU: {}",
+            device.as_metal_device().unwrap().device().as_ref().name()
+        );
         let attention = Attention::new(&device).unwrap().unwrap();
         for (seq, width) in [(7, 32), (33, 32), (200, 32), (1024, 32), (33, 64)] {
             let packed = Tensor::from_vec(

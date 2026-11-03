@@ -2,24 +2,24 @@
 //! The two read views retain the public row columns used by command readers.
 use crate::model::Event;
 use anyhow::{Context, Result};
-use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use flate2::{write::ZlibEncoder, Compression};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    io::{Read, Write},
+    io::Write,
 };
 
 // Candidate streams already carry IDs or a block range. Keep that access path
 // ahead of broad agent/session predicates, and do not join stored text here.
-pub(crate) const CANDIDATES_BY_ID: &str = "(SELECT e.tool_id AS id,s.agent,s.session,p.value AS project,'tool' AS who,m.value AS model,e.ts,e.position,e.visible FROM event_rows e INDEXED BY event_tool_id CROSS JOIN event_sessions s ON s.id=e.session_key LEFT JOIN symbols p ON p.id=e.project_key LEFT JOIN symbols m ON m.id=e.model_key WHERE e.active=1 AND e.blob IS NOT NULL)";
+pub(crate) const CANDIDATES_BY_ID: &str = "(SELECT e.tool_id AS id,s.agent,s.session,p.value AS project,'tool' AS who,m.value AS model,e.ts,e.position,e.visible,e.blob FROM event_rows e INDEXED BY event_tool_id CROSS JOIN event_sessions s ON s.id=e.session_key LEFT JOIN symbols p ON p.id=e.project_key LEFT JOIN symbols m ON m.id=e.model_key WHERE e.active=1 AND e.blob IS NOT NULL)";
 
 pub(crate) fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS event_sessions(id INTEGER PRIMARY KEY,agent TEXT NOT NULL,session TEXT NOT NULL,UNIQUE(agent,session));
 CREATE INDEX IF NOT EXISTS event_sessions_session ON event_sessions(session);
 CREATE TABLE IF NOT EXISTS symbols(id INTEGER PRIMARY KEY,value TEXT NOT NULL UNIQUE);
 INSERT OR IGNORE INTO symbols VALUES(0,'');
-CREATE TABLE IF NOT EXISTS tool_blobs(id INTEGER PRIMARY KEY,digest BLOB NOT NULL UNIQUE,body BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS tool_blobs(id INTEGER PRIMARY KEY,digest BLOB NOT NULL UNIQUE,ascii INTEGER NOT NULL DEFAULT 0,body BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS tool_blob_sources(source INTEGER NOT NULL,blob INTEGER NOT NULL,PRIMARY KEY(source,blob)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS tool_blob_sources_blob ON tool_blob_sources(blob);
 CREATE TABLE IF NOT EXISTS blob_gc(id INTEGER PRIMARY KEY);
@@ -91,11 +91,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<String> {
     let (&codec, body) = bytes.split_first().context("missing tool text codec")?;
     let out = match codec {
         0 => lz4_flex::decompress_size_prepended(body)?,
-        1 => {
-            let mut out = Vec::new();
-            ZlibDecoder::new(body).read_to_end(&mut out)?;
-            out
-        }
+        1 => crate::compression::inflate(body)?,
         _ => anyhow::bail!("unknown tool text codec"),
     };
     Ok(String::from_utf8(out)?)
@@ -171,8 +167,12 @@ impl Writer {
                 id
             } else {
                 let encoded = encode(text)?;
-                tx.prepare_cached("INSERT INTO tool_blobs(digest,body) VALUES(?1,?2) RETURNING id")?
-                    .query_row(params![key.as_slice(), encoded], |r| r.get(0))?
+                tx.prepare_cached(
+                    "INSERT INTO tool_blobs(digest,ascii,body) VALUES(?1,?2,?3) RETURNING id",
+                )?
+                .query_row(params![key.as_slice(), text.is_ascii(), encoded], |r| {
+                    r.get(0)
+                })?
             };
             self.blobs.insert(key, id);
             id

@@ -130,6 +130,11 @@ pub fn recency(ts: i64, now: i64) -> f64 {
     2f64.powf(-((now - ts).max(0) as f64) / (14. * 86400000.))
 }
 type CandidateGroups = std::sync::Arc<HashMap<i64, Vec<i64>>>;
+struct CoverageBounds {
+    candidates: CandidateGroups,
+    rows: HashMap<i64, f64>,
+    blocks: HashMap<i64, f64>,
+}
 #[derive(Default)]
 struct PlanCache {
     words: HashMap<String, Option<Vec<(String, usize)>>>,
@@ -138,8 +143,101 @@ struct PlanCache {
     rejected_candidates: HashSet<String>,
     coverage_idf: Option<Vec<f64>>,
     coverage_all: bool,
+    selective_scopes: HashMap<String, bool>,
 }
 impl PlanCache {
+    fn coverage_bounds(
+        &mut self,
+        c: &Connection,
+        m: &Matcher,
+        lane_total: usize,
+    ) -> Result<Option<CoverageBounds>> {
+        let mut groups = Vec::new();
+        for variants in &m.terms {
+            let mut estimate = 0usize;
+            let mut terms = Vec::new();
+            for term in variants {
+                if variants
+                    .iter()
+                    .any(|other| other.len() < term.len() && term.contains(other.as_str()))
+                {
+                    continue;
+                }
+                let chars: Vec<_> = term.chars().collect();
+                if chars.len() < 3 {
+                    estimate = usize::MAX;
+                    break;
+                }
+                let mut df = usize::MAX;
+                for gram in chars.windows(3) {
+                    let gram: String = gram.iter().collect();
+                    let n = c
+                        .query_row("SELECT doc FROM prose_terms WHERE term=?", [&gram], |r| {
+                            r.get::<_, usize>(0)
+                        })
+                        .optional()?
+                        .unwrap_or(0);
+                    df = df.min(n);
+                }
+                estimate = estimate.saturating_add(df);
+                terms.push(format!("\"{}\"", term.replace('"', "\"\"")));
+            }
+            // Common and short terms remain unknown (possibly present) in the
+            // upper bound; never enumerate their corpus-wide postings.
+            groups.push(
+                if estimate > 65_536 || estimate.saturating_mul(2) > lane_total {
+                    None
+                } else {
+                    self.candidate_rows(
+                        c,
+                        "prose",
+                        &format!("text : ({})", terms.join(" OR ")),
+                        None,
+                    )?
+                },
+            );
+        }
+        let Some(selected) = m.coverage_term.and_then(|i| groups[i].as_ref()) else {
+            return Ok(None);
+        };
+        let contains = |group: &CandidateGroups, block: i64, id: i64| {
+            group
+                .get(&block)
+                .is_some_and(|ids| ids.binary_search(&id).is_ok())
+        };
+        let total = m.idf.iter().sum::<f64>().max(1.);
+        let mut candidates = HashMap::new();
+        let mut rows = HashMap::new();
+        let mut blocks = HashMap::new();
+        for (&block, ids) in selected.iter() {
+            for &id in ids {
+                if m.coverage_excluded
+                    .iter()
+                    .any(|&i| groups[i].as_ref().is_some_and(|g| contains(g, block, id)))
+                {
+                    continue;
+                }
+                let weight = groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.as_ref().is_none_or(|g| contains(g, block, id)))
+                    .map(|(i, _)| m.idf[i])
+                    .sum::<f64>();
+                if weight < m.minimum_coverage * total {
+                    continue;
+                }
+                candidates.entry(block).or_insert_with(Vec::new).push(id);
+                rows.insert(id, weight);
+                let upper = blocks.entry(block).or_insert(0.0_f64);
+                *upper = upper.max(weight);
+            }
+        }
+        Ok(Some(CoverageBounds {
+            candidates: std::sync::Arc::new(candidates),
+            rows,
+            blocks,
+        }))
+    }
     fn candidate_rows(
         &mut self,
         c: &Connection,
@@ -157,7 +255,7 @@ impl PlanCache {
         let (sql, bind) = if let Some(ordinals) = ordinals.filter(|_| table == "prose") {
             ("SELECT rowid FROM prose_fts WHERE prose_fts MATCH ? AND agrep_word_span(prose_fts,?,2147483647)".into(),vec![Value::Text(expression.into()),Value::Blob(ordinals.to_vec())])
         } else if let Some(ordinals) = ordinals {
-            (format!("SELECT f.rowid FROM tools_fts f LEFT JOIN tool_blocks b ON b.id=f.rowid/{BLOCK} WHERE tools_fts MATCH ? AND agrep_word_span(tools_fts,?,coalesce(b.max_gap,2147483647))"),vec![Value::Text(expression.into()),Value::Blob(ordinals.to_vec())])
+            (format!("SELECT f.rowid FROM tools_fts f LEFT JOIN tool_blocks b ON b.id=f.rowid/{BLOCK} LEFT JOIN event_rows e INDEXED BY event_tool_id ON e.tool_id=f.rowid AND e.active=1 LEFT JOIN tool_blobs t ON t.id=e.blob WHERE tools_fts MATCH ? AND agrep_word_span(tools_fts,?,CASE WHEN t.ascii THEN 0 ELSE coalesce(b.max_gap,2147483647) END)"),vec![Value::Text(expression.into()),Value::Blob(ordinals.to_vec())])
         } else {
             (
                 format!("SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH ?"),
@@ -178,6 +276,9 @@ impl PlanCache {
                 return Ok(None);
             }
             by_block.entry(id / BLOCK).or_default().push(id);
+        }
+        for ids in by_block.values_mut() {
+            ids.sort_unstable();
         }
         let rows = std::sync::Arc::new(by_block);
         self.candidates.insert(key, rows.clone());
@@ -963,6 +1064,7 @@ fn block_bounds(
     folded: bool,
     table: &str,
     cache: &mut PlanCache,
+    coverage: Option<&CoverageBounds>,
 ) -> Result<Vec<BlockBound>> {
     let (lane, metadata) = if table == "tools" {
         (1, "tool_blocks")
@@ -1079,6 +1181,12 @@ fn block_bounds(
         if n == 0 || !selected_possible {
             continue;
         }
+        if let Some(coverage) = coverage {
+            let Some(weight) = coverage.blocks.get(&id) else {
+                continue;
+            };
+            possible_weight = *weight;
+        }
         // All-terms scores have no repetition penalty. Their finite ceiling
         // must therefore use one, independently of the phrase occurrence cap.
         let repetition = if m.explicit.is_some() || m.phase == 2 {
@@ -1120,7 +1228,7 @@ fn block_bounds(
         out.push((
             id,
             if m.partial {
-                0.5 * rw * possible_weight / m.idf.iter().sum::<f64>().max(1.)
+                rw * (0.5 * possible_weight / m.idf.iter().sum::<f64>().max(1.))
             } else if folded && m.phase == 2 {
                 0.7 * phrase_tightness * rw
             } else if folded {
@@ -1439,8 +1547,8 @@ fn search_pass(
     });
     result.tools_excluded = !o.tools && o.filters.who.as_deref() != Some("tool");
 
-    let (scope, values) = sql_filters(&o.filters, "p", c)?;
-    let scope = format!(" AND p.visible=1{scope}");
+    let (filter_scope, values) = sql_filters(&o.filters, "p", c)?;
+    let scope = format!(" AND p.visible=1{filter_scope}");
     let only_tools = o.filters.who.as_deref() == Some("tool");
     let include_tools = o.tools
         && o.filters
@@ -1579,14 +1687,22 @@ fn search_pass(
             || o.filters.model.is_some()
             || o.filters.project.is_some()
             || o.filters.until.is_some();
-        let selective = if has_scope {
+        let selective = if let Some(&selective) = cache.selective_scopes.get(table) {
+            selective
+        } else if has_scope {
             let limit = 4096usize.max((lane_total / 16).min(65_536));
+            // Invisible rows may conservatively make a scope look larger, but
+            // cannot exclude a result. Leaving visibility out lets ordinary
+            // agent/time probes use their covering indexes instead of fetching
+            // thousands of prose records past their text payload.
             let sql = format!(
-                "SELECT count(*) FROM (SELECT 1 FROM {table} p WHERE 1{scope} LIMIT {})",
+                "SELECT count(*) FROM (SELECT 1 FROM {table} p WHERE 1{filter_scope} LIMIT {})",
                 limit + 1
             );
             let count: usize = c.query_row(&sql, params_from_iter(values.clone()), |r| r.get(0))?;
-            count <= limit
+            let selective = count <= limit;
+            cache.selective_scopes.insert(table.into(), selective);
+            selective
         } else {
             false
         };
@@ -1595,8 +1711,9 @@ fn search_pass(
             && !o.exact
             && o.limit > 0
             && matches!(o.sort.as_str(), "score" | "time");
+        let mut coverage = None;
         let mut blocks = if bounded {
-            block_bounds(c, &m, now, o.chats, table, cache)?
+            block_bounds(c, &m, now, o.chats, table, cache, coverage.as_ref())?
         } else {
             vec![(
                 -1,
@@ -1655,9 +1772,27 @@ fn search_pass(
                 result.timings.sqlite_ms += tick.elapsed().as_secs_f64() * 1000.;
             }
         }
-        for (block_index, (block, bound, max_ts, min_session, min_turn, max_gap)) in
-            blocks.into_iter().enumerate()
-        {
+        let mut remaining = blocks.into_iter();
+        let mut visited = HashSet::new();
+        let mut coverage_tried = false;
+        while let Some((block, bound, max_ts, min_session, min_turn, max_gap)) = remaining.next() {
+            let block_index = visited.len();
+            if bounded && partial && table == "prose" && !coverage_tried && block_index >= 4 {
+                coverage_tried = true;
+                let tick = Instant::now();
+                coverage = cache.coverage_bounds(c, &m, lane_total)?;
+                if let Some(coverage) = &coverage {
+                    let mut replacement =
+                        block_bounds(c, &m, now, o.chats, table, cache, Some(coverage))?;
+                    replacement.retain(|entry| !visited.contains(&entry.0));
+                    remaining = replacement.into_iter();
+                    ids = Some(coverage.candidates.clone());
+                    result.timings.plan_ms += tick.elapsed().as_secs_f64() * 1000.;
+                    continue;
+                }
+                result.timings.plan_ms += tick.elapsed().as_secs_f64() * 1000.;
+            }
+            visited.insert(block);
             let fts = fts.clone();
             if bounded && result.hits.len() >= o.limit {
                 let last = &result.hits[o.limit - 1];
@@ -1735,7 +1870,11 @@ fn search_pass(
             bind.extend(values.clone());
             if uses_fts {
                 if let Some((_, ordinals)) = &span_plan {
-                    sql.push_str(&format!(" AND agrep_word_span({table}_fts,?,?)"));
+                    sql.push_str(&if table == "tools" {
+                        " AND agrep_word_span(tools_fts,?,CASE WHEN (SELECT ascii FROM tool_blobs WHERE id=p.blob) THEN 0 ELSE ? END)".into()
+                    } else {
+                        format!(" AND agrep_word_span({table}_fts,?,?)")
+                    });
                     bind.push(Value::Blob(ordinals.clone()));
                     bind.push(Value::Integer(if table == "prose" {
                         i64::from(i32::MAX)
@@ -1760,6 +1899,17 @@ fn search_pass(
                     Value::Integer(block * BLOCK),
                     Value::Integer((block + 1) * BLOCK),
                 ]);
+            }
+            if bounded && !o.chats && o.sort == "score" && result.hits.len() >= o.limit {
+                let last = &result.hits[o.limit - 1];
+                if bound <= last.score {
+                    // At the block's best possible score, an older row cannot
+                    // win the deterministic tie. Keep equal timestamps for
+                    // the session/position tie breakers below.
+                    sql.push_str(" AND p.ts>=?");
+                    bind.push(Value::Integer(last.ts));
+                    result.total_basis = "floor".into();
+                }
             }
             let sql_started = Instant::now();
             let mut stmt = c.prepare_cached(&sql)?;
@@ -1788,7 +1938,20 @@ fn search_pass(
                             recency(ts, now).max(if who == "user" { 0.35 } else { 0. })
                         };
                     if partial {
-                        ceiling *= 0.5;
+                        if let Some(coverage) = &coverage {
+                            ceiling *= 0.5
+                                * coverage
+                                    .rows
+                                    .get(&r.get::<_, i64>(0)?)
+                                    .copied()
+                                    .unwrap_or_else(|| m.idf.iter().sum::<f64>())
+                                / m.idf.iter().sum::<f64>().max(1.);
+                        } else {
+                            ceiling *= 0.5;
+                        }
+                    }
+                    if bounded && !o.chats {
+                        ceiling = ceiling.min(bound);
                     }
                     if o.chats && tier == 1 {
                         ceiling *= 0.7;
@@ -1891,6 +2054,23 @@ fn search_pass(
                 }
                 let session: String = r.get(1)?;
                 let turn = r.get(4)?;
+                if !meta_marker && !o.chats && o.limit > 0 && result.hits.len() >= o.limit {
+                    let ranked = Hit {
+                        session: session.clone(),
+                        turn,
+                        who: who.clone(),
+                        ts,
+                        score,
+                        tier,
+                        rowid: r.get(0)?,
+                        ..Default::default()
+                    };
+                    if compare(&ranked, &result.hits[o.limit - 1], &o.sort, false).is_ge() {
+                        // Matching/counting is already complete. Display joins,
+                        // digests and snippets are only needed for page winners.
+                        continue;
+                    }
+                }
                 let digest = content_digest(&text);
                 // Ranking needs only identity, role and time. Fetch display
                 // metadata after matching so losing candidates do not join

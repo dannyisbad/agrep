@@ -1,0 +1,660 @@
+{
+  "cases": [
+    {
+      "name": "release",
+      "samples": [
+        {
+          "version": "before",
+          "repeat": 0,
+          "elapsed_ms": 1168.9572079994832,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 0,
+          "elapsed_ms": 526.2831250001909,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 1,
+          "elapsed_ms": 285.09929200299666,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 1,
+          "elapsed_ms": 315.6153749987425,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 2,
+          "elapsed_ms": 231.57150000042748,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 2,
+          "elapsed_ms": 346.77408399875276,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 3,
+          "elapsed_ms": 369.04158299876144,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 3,
+          "elapsed_ms": 235.21199999959208,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 4,
+          "elapsed_ms": 246.25620799997705,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 4,
+          "elapsed_ms": 251.68937499984168,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 5,
+          "elapsed_ms": 240.45679200207815,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 5,
+          "elapsed_ms": 287.61149999991176,
+          "load_averages": [
+            33.5244140625,
+            25.63330078125,
+            26.4365234375
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 6,
+          "elapsed_ms": 241.56766699888976,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 6,
+          "elapsed_ms": 246.07820800156333,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        }
+      ],
+      "identical_handles": true,
+      "medians_ms": {
+        "before": 246.25620799997705,
+        "after": 285.09929200299666
+      }
+    },
+    {
+      "name": "natural",
+      "samples": [
+        {
+          "version": "before",
+          "repeat": 0,
+          "elapsed_ms": 1263.7587080025696,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 0,
+          "elapsed_ms": 356.1351670032309,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 1,
+          "elapsed_ms": 308.6983329994837,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 1,
+          "elapsed_ms": 338.520042001619,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 2,
+          "elapsed_ms": 363.51037500207894,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 2,
+          "elapsed_ms": 306.31958300000406,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 3,
+          "elapsed_ms": 323.73116700182436,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 3,
+          "elapsed_ms": 271.54916699873866,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 4,
+          "elapsed_ms": 283.4106660011457,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 4,
+          "elapsed_ms": 310.99287499819184,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 5,
+          "elapsed_ms": 347.68274999805726,
+          "load_averages": [
+            33.56201171875,
+            25.77197265625,
+            26.48046875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 5,
+          "elapsed_ms": 299.8770420017536,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 6,
+          "elapsed_ms": 280.0929160002852,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 6,
+          "elapsed_ms": 249.4937090013991,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        }
+      ],
+      "identical_handles": true,
+      "medians_ms": {
+        "before": 299.8770420017536,
+        "after": 310.99287499819184
+      }
+    },
+    {
+      "name": "error",
+      "samples": [
+        {
+          "version": "before",
+          "repeat": 0,
+          "elapsed_ms": 153.1320419999247,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 0,
+          "elapsed_ms": 49.760792000597576,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 1,
+          "elapsed_ms": 50.818750001781154,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 1,
+          "elapsed_ms": 47.61575000156881,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 2,
+          "elapsed_ms": 44.51133300244692,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 2,
+          "elapsed_ms": 65.62508299975889,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 3,
+          "elapsed_ms": 48.48366700025508,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 3,
+          "elapsed_ms": 59.776665999379475,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 4,
+          "elapsed_ms": 85.13187499920605,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 4,
+          "elapsed_ms": 52.59899999873596,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 5,
+          "elapsed_ms": 55.184500000905246,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 5,
+          "elapsed_ms": 52.25425000026007,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 6,
+          "elapsed_ms": 50.756208001985215,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 6,
+          "elapsed_ms": 41.63704199891072,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        }
+      ],
+      "identical_handles": true,
+      "medians_ms": {
+        "before": 52.25425000026007,
+        "after": 50.818750001781154
+      }
+    },
+    {
+      "name": "flaky",
+      "samples": [
+        {
+          "version": "before",
+          "repeat": 0,
+          "elapsed_ms": 133.89354099854245,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 0,
+          "elapsed_ms": 59.829832996911136,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 1,
+          "elapsed_ms": 46.564208998461254,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 1,
+          "elapsed_ms": 45.022042002528906,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 2,
+          "elapsed_ms": 47.328208998806076,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 2,
+          "elapsed_ms": 49.0421670001524,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 3,
+          "elapsed_ms": 45.00920799910091,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 3,
+          "elapsed_ms": 53.971458997693844,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 4,
+          "elapsed_ms": 42.41662500135135,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 4,
+          "elapsed_ms": 44.91362500266405,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 5,
+          "elapsed_ms": 42.02058400187525,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 5,
+          "elapsed_ms": 52.70666700016591,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "before",
+          "repeat": 6,
+          "elapsed_ms": 59.75662500350154,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        },
+        {
+          "version": "after",
+          "repeat": 6,
+          "elapsed_ms": 46.1364170005254,
+          "load_averages": [
+            34.4775390625,
+            26.0908203125,
+            26.5888671875
+          ],
+          "exit_code": 0
+        }
+      ],
+      "identical_handles": true,
+      "medians_ms": {
+        "before": 52.70666700016591,
+        "after": 46.1364170005254
+      }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "tests": 291,
+  "failed": 0,
+  "ignored": 0,
+  "fmt": true,
+  "clippy": true
+}

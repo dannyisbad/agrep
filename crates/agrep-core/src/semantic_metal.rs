@@ -97,7 +97,14 @@ mod tests {
     use candle_core::{DType, Tensor, D};
     #[test]
     fn fused_geglu_preserves_candle_f16_values() {
-        let device = Device::new_metal(0).unwrap();
+        let Some(device) = crate::semantic_device::metal_device() else {
+            return;
+        };
+        use objc2_metal::MTLDevice;
+        eprintln!(
+            "Metal GPU: {}",
+            device.as_metal_device().unwrap().device().as_ref().name()
+        );
         let op = Geglu::new(&device).unwrap().unwrap();
         let input = Tensor::from_vec(
             (0..8192)

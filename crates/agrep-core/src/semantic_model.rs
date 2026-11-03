@@ -325,7 +325,7 @@ fn digest_file(mut file: File) -> Result<String> {
         }
         hash.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(crate::store::hex_digest(hash.finalize()))
 }
 /// Only explicit setup, index --semantic and -s callers may invoke this function.
 /// Network failures preserve already verified files and never publish partial bytes.
@@ -349,7 +349,7 @@ pub fn provision_at(path: &Path) -> Result<()> {
         .create(true)
         .truncate(false)
         .open(path.join("download.lock"))?;
-    fs2::FileExt::lock_exclusive(&lock)?;
+    lock.lock()?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -526,11 +526,10 @@ impl Embedder {
         Self::load(&directory(root), Device::Cpu)
     }
     pub fn background(root: &DataRoot) -> Result<Self> {
-        #[cfg(target_os = "macos")]
-        if let Ok(device) = Device::new_metal(0) {
-            return Self::load(&directory(root), device);
-        }
-        Self::query(root)
+        Self::load(
+            &directory(root),
+            crate::semantic_device::background_device(),
+        )
     }
     /// Experimental window comparison for the standalone quality/performance harness.
     /// Product callers use the fixed 1024-token contract from `load`.
@@ -825,7 +824,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("weights");
         fs::write(&p, b"abc").unwrap();
-        let sha = format!("{:x}", Sha256::digest(b"abc"));
+        let sha = crate::store::digest("abc");
         let files = [("weights", 3, sha.as_str())];
         assert!(!cached_verification(t.path(), &files));
         record_verification(t.path(), &files).unwrap();
@@ -845,8 +844,8 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("x");
         fs::write(&p, b"ok").unwrap();
-        verify(&p, 2, &format!("{:x}", Sha256::digest(b"ok"))).unwrap();
-        assert!(verify(&p, 2, &format!("{:x}", Sha256::digest(b"no"))).is_err());
+        verify(&p, 2, &crate::store::digest("ok")).unwrap();
+        assert!(verify(&p, 2, &crate::store::digest("no")).is_err());
         assert!(verify(&p, 3, "").is_err());
     }
 }

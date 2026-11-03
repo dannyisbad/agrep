@@ -526,7 +526,14 @@ mod tests {
     use super::*;
     #[test]
     fn persistent_workspace_reuses_buffers_and_reads_new_inputs() {
-        let device = Device::new_metal(0).unwrap();
+        let Some(device) = crate::semantic_device::metal_device() else {
+            return;
+        };
+        use objc2_metal::MTLDevice;
+        eprintln!(
+            "Metal GPU: {}",
+            device.as_metal_device().unwrap().device().as_ref().name()
+        );
         let d = 32;
         let intermediate = 64;
         let tensor = |dims: (usize, usize)| Tensor::zeros(dims, DType::F16, &device).unwrap();

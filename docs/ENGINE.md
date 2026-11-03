@@ -1,5 +1,195 @@
 # 0.5.0 keyword engine
 
+## V7: measured retrieval, append and build changes
+
+This is a measured checkpoint, **not SPEC §9 acceptance**. All real-history cases that succeeded in 0.4.9 remain faster than that release, but the unchanged keyword, census, append, first-build and dense limits still fail. The index is **2,365,624,320 bytes (2.366 GB)**, below the 2.5 GB storage limit. Measurements include every sample and load; no outlier was removed. The real source snapshot grew from 10,629 to 10,657 sources between V6 and V7.
+
+### Full-process real history
+
+Each median below is seven fresh processes, with ordinary concurrent census and detached refresh enabled. Load is the componentwise median of the 1/5/15-minute readings. 0.4.9 did not record load; its `rare` case exited 2 and is not a successful-search comparison. V6 loads remain in the preceding checkpoint and [V6 report](measurements/real-query-merged-v6-fresh.json). [V7 samples](measurements/real-query-merged-final7-fresh.json) retain timings, exits, all loads and the baseline arguments.
+
+| Case | 0.4.9 ms | V6 ms | V7 ms | V7 load 1 / 5 / 15 |
+|---|---:|---:|---:|---|
+| release | 457.09 | 196.53 | 186.01 | 14.86 / 26.12 / 27.43 |
+| error | 347.78 | 81.06 | 43.74 | 14.86 / 26.12 / 27.43 |
+| natural | 270.82 | 227.09 | 206.91 | 14.86 / 26.12 / 27.43 |
+| flaky | 220.43 | 66.45 | 42.23 | 14.23 / 25.80 / 27.31 |
+| rare | 269.63 | 85.18 | 42.61 | 14.23 / 25.80 / 27.31 |
+| short | 408.58 | 166.14 | 145.61 | 14.23 / 25.80 / 27.31 |
+| regex | 309.89 | 67.13 | 45.60 | 14.23 / 25.80 / 27.31 |
+| list | 862.46 | 337.60 | 326.63 | 14.23 / 25.80 / 27.31 |
+| json | 505.40 | 216.07 | 182.46 | 13.41 / 25.44 / 27.17 |
+| count | 462.77 | 99.99 | 57.00 | 13.41 / 25.44 / 27.17 |
+| rare_hit | 174.93 | 60.23 | 40.90 | 13.41 / 25.44 / 27.17 |
+| rare_hit_pi_filtered | 173.82 | 84.64 | 42.48 | 12.58 / 25.07 / 27.03 |
+| short_filtered | 2734.58 | 83.35 | 131.32 | 14.56 / 25.08 / 27.01 |
+| compact_release | 508.09 | 214.43 | 193.39 | 13.41 / 25.44 / 27.17 |
+| compact_error | 347.83 | 70.80 | 43.62 | 13.41 / 25.44 / 27.17 |
+| compact_natural | 362.40 | 281.58 | 210.78 | 13.41 / 25.44 / 27.17 |
+| compact_flaky | 293.81 | 122.14 | 42.38 | 12.58 / 25.07 / 27.03 |
+
+| Other command | V6 ms | V7 ms | V7 load 1 / 5 / 15 |
+|---|---:|---:|---|
+| no_change_census | 59.22 | 38.98 | 14.86 / 26.12 / 27.43 |
+| tool_error | 148.07 | 98.54 | 17.80 / 25.58 / 27.17 |
+| recall | 452.46 | 465.86 | 17.49 / 25.38 / 27.09 |
+| pack | 384.71 | 408.75 | 17.45 / 25.25 / 27.03 |
+| chats | 89.20 | 60.11 | 17.45 / 25.25 / 27.03 |
+| status | 84.29 | 55.02 | 17.45 / 25.25 / 27.03 |
+| around | 91.26 | 50.02 | 17.45 / 25.25 / 27.03 |
+| version_control | 10.80 | 8.51 | 17.45 / 25.25 / 27.03 |
+
+The filtered-short regression (83.35 → 131.32 ms) is retained. The count meets the requested 400 ms ubiquitous-count target, but not CI’s stricter common 40 ms keyword threshold. Navigation remains above its 40 ms deadline.
+
+### Where the command time goes
+
+Timing is opt-in (`AGREP_QUERY_TIMING`); the schema-read probe deliberately materializes the schema only while profiling. The normal benchmark above does not enable it. Profiles use the same frozen binary and hold `work.lock` to exclude detached writes. They include concurrent census and record foreground/background phases separately. Median components overlap or come from different samples and must not be summed as an exact critical path.
+
+| Release phase, ms | Same real index, V6 | Same real index, V7 | 100k mixed, V7 |
+|---|---:|---:|---:|
+| Full process | 197.75 | 197.17 | 46.34 |
+| Exec to main | 10.51 | 8.42 | 7.94 |
+| CLI parse | 0.25 | 0.25 | 0.24 |
+| Reader open | 0.21 | 0.19 | 0.17 |
+| Reader pragmas | 0.03 | 0.03 | 0.02 |
+| Schema read | 2.02 | 1.94 | 1.62 |
+| plan_ms | 9.85 | 8.56 | 0.59 |
+| sqlite_ms | 145.67 | 151.13 | 11.52 |
+| hydrate_ms | 3.76 | 3.20 | 2.86 |
+| score_ms | 13.56 | 12.80 | 16.77 |
+| Wait after retrieval for census | 0.12 | 0.13 | 0.06 |
+| Render | 0.11 | 0.12 | 0.10 |
+| Exit after main | 1.20 | 1.18 | 0.94 |
+| Load 1 / 5 / 15 | 17.45 / 25.25 / 27.03 | 16.59 / 24.81 / 26.86 | 19.27 / 23.78 / 25.62 |
+
+[Same-index V6](measurements/process-real-same-before.json), [V7 real](measurements/process-real-final7.json), and [V7 100k](measurements/process-mixed-final7-mixed.json) show no release-query critical-path reduction on the same real snapshot: 197.75 → 197.17 ms. The broad tool posting queries dominate. On this machine, process entry/exit plus reader setup are about 12 ms, rather than the 126–159 ms entire commands reported on hosted runners. The 100k natural case is 238.74 ms: planning 3.68, SQLite 64.83, hydration 30.41 and scoring 123.40 ms. Its cost comes from repeated candidate verification on that corpus, not a fixed startup charge. Hosted-runner stage attribution remains unmeasured here.
+
+Census runs concurrently from `ready()`, before retrieval begins, and is joined after retrieval. The final real release profile relisted **zero** directories, reused **2,846** directory listings and statted **10,658** files. Its last census took 29.22 ms, including 8.17 ms directory checks, 12.54 ms file stats and 7.36 ms comparison; release waited only 0.13 ms after retrieval. The full census-only command is 38.98 ms versus V6’s 59.22 ms, still above 15 ms.
+
+Two measured alternatives were rejected: [relative-parent `fstatat`](measurements/census-paired-7c.json) worsened paired medians 57.90 → 84.99 ms; macOS bulk metadata enumeration took 42.89 ms at its best tested width. [Plain syscall sweeps](measurements/stat-workers-v7.json) over 13,504 paths took 40.63/26.90/18.03/13.69/13.23/13.41 ms with 1/2/4/8/12/16 workers. The best syscall-only time almost consumes the entire 15 ms process budget before startup, cached-directory decoding or comparison. Meeting 15 ms needs an OS change-journal or a persistent trusted metadata snapshot with invalidation, not another wider stat pool. Neither weakening of complete census is shipped. [Bulk samples](measurements/bulk-stat-v7.json) retain every run and load.
+
+### Retrieval changes and remaining bottlenecks
+
+- Metadata selectivity probes conservatively count invisible rows too, allowing covering agent/time indexes, and reuse their result across query tiers. Broad `pi` scopes remain broad; no selectivity is invented.
+- Coverage scoring can load selective prose term-presence lists after four unsuccessful blocks. Their per-row IDF sums tighten block maxima without an OR scan of common/short terms. Unknown terms keep their full upper bound. Allocation limits switch plans to the complete block cursor; they never truncate results. Unicode and exhaustive-result regressions cover this path.
+- Existing admissible block ceilings now apply before row hydration. Equal-score blocks restrict older timestamps before text fetch; page losers skip metadata joins and snippet/handle construction after exact scoring. Counts observed by that plan are preserved, with floor totals when enumeration stops.
+- Tool phrase position checks use the row’s ASCII flag instead of a block’s unrelated Unicode gap. The decoder uses zlib-rs, retaining miniz compression to keep the storage ratio. On 5,000 sampled rows / 4.17 MB text, decoder medians were 99.20 → 32.20 ms. The alternative encoder enlarged those blobs from 2.263 to 2.726 MB and was rejected. [Codec samples](measurements/compression-backends-v7.json).
+
+A global tool-phrase candidate buffer was also rejected: paired seven-process release/natural medians worsened 246.26/299.88 → 285.10/310.99 ms with identical winners. [All pairs](measurements/tool-stream-paired-final7.json) are retained. The final binary keeps the existing small-selective-stream plan.
+
+The remaining broad-phrase cost is FTS cursor work in multiple physical blocks; single short terms spend most of their time scanning/scoring text. The next required change is a positional posting iterator that exposes row-level span/boundary ceilings and skips entire lower-scoring blocks before opening their SQL cursors. It must preserve tier ordering, Unicode conservative bounds and exact deterministic ties. Merely buffering the full broad stream is disproved above.
+
+| Query-only case | Plan ms | SQLite ms | Hydrate ms | Score ms | Rows / blocks |
+|---|---:|---:|---:|---:|---:|
+| release | 9.54 | 207.42 | 2.44 | 9.99 | 455 / 68 |
+| error | 1.32 | 5.11 | 1.16 | 6.41 | 370 / 23 |
+| natural | 20.63 | 191.02 | 4.23 | 15.95 | 391 / 158 |
+| natural_prose | 4.89 | 14.20 | 1.71 | 63.51 | 220 / 74 |
+| short | 1.15 | 11.39 | 3.23 | 103.87 | 2325 / 38 |
+| regex | 1.60 | 12.61 | 2.52 | 2.17 | 913 / 77 |
+| rare_hit_pi_filtered | 14.07 | 2.97 | 0.49 | 0.26 | 58 / 29 |
+| tool_error | 5.55 | 3.76 | 39.26 | 11.91 | 6842 / 31 |
+
+[Seven-process query-only profiles](measurements/final7-query-phases.json) preserve load and every timing. These omit concurrent census and rendering and do not replace end-to-end budgets.
+
+### Tails, including the owner-scale keyword component
+
+All twenty ordinary full-history samples per case are retained in [the tail report](measurements/keyword-tails-final7.json). No plain-query sample exceeds twice its case median. [Tail attribution](measurements/tail-attribution-final7.json) retains each case’s slowest observation and every owner-component observation above twice its mode median.
+
+| Case | V7 process p50 / p95 ms | Keyword p50 / p95 ms | Load 1 / 5 / 15 |
+|---|---:|---:|---|
+| release | 204.51 / 220.04 | 189.75 / 207.39 | 19.62 / 25.10 / 26.93 |
+| error | 43.96 / 59.78 | 29.46 / 37.77 | 19.62 / 25.10 / 26.93 |
+| natural | 225.64 / 236.80 | 213.84 / 224.70 | 18.45 / 24.77 / 26.80 |
+| short | 148.35 / 156.66 | 135.15 / 143.17 | 17.53 / 24.47 / 26.68 |
+| json | 212.68 / 244.53 | 196.42 / 230.65 | 17.53 / 24.47 / 26.68 |
+| compact_natural | 216.54 / 228.91 | 201.56 / 212.08 | 17.25 / 24.30 / 26.61 |
+
+On the identical 200k-reference owner-shaped fixture, interleaved V6/V7 keyword-component processes changed **171.14/403.49 → 114.66/246.55 ms p50/p95**; the keyword stage changed **148.24/384.16 → 94.28/225.67 ms**. All twenty paired pages have identical handles. This is **not a new hybrid acceptance run**: the pinned model cache was removed by the semantic campaign, no replacement cache was found, and network beyond crates.io is prohibited. [Paired component samples](measurements/owner-keyword-final7.json).
+
+The original actual-model hybrid run’s six >2×-median samples (query IDs 1, 5 and 8, twice each) spend 1.13–1.90 s in keyword retrieval, with 1.26–1.89 s process-wide CPU and only 1–2 ms waiting for census. They implicate candidate/scoring work, not a census barrier. The semantic-only startup outlier is retained separately. [Every original outlier](measurements/owner-tail-attribution-before.json) records phase timing, load, faults and context switches.
+
+V7’s three >2×-median component outliers are samples 1/11 (query ID 1) and 15 (query ID 5): 246.55/299.58/230.11 ms process, 225.67/280.17/214.95 ms keyword, 222.6/266.9/218.3 ms process CPU during that phase. These again arise inside retrieval. Counts are process-wide and include concurrent census; they are not exclusive CPU attribution. The reduced tail is evidence for the coverage/row-bound changes, but a model-enabled end-to-end rerun is still required.
+
+### Append guarantee and first build
+
+Append cursors now retain 1 MiB SHA-256 chunk digests. Positional reads verify **every byte of the previously indexed prefix**, in parallel, before accepting an append. The last partial chunk is reused for the new checkpoint. Arbitrary interior edits, edits spanning chunk edges, replacement, truncation and format change force full parsing; the regression suite includes interior/chunk-boundary modifications. This preserves cryptographic full-prefix rewrite detection, not an edge-only heuristic. Old private cursor encodings fall back to full parsing. SHA-256 uses the same digest algorithm via sha2 0.11’s ARM implementation.
+
+| Copied source size | V6 append ms | V7 append ms | V7 parse/verify ms | V7 bounds ms | V7 load 1 / 5 / 15 |
+|---|---:|---:|---:|---:|---|
+| 119,046,533 B | 437.56 | 52.14 | 18.47 | 0.80 | 37.52 / 27.99 / 27.26 |
+| 199,454,501 B | 668.59 | 87.47 | 37.79 | 0.83 | 33.69 / 27.48 / 27.09 |
+
+[All seven interleaved append pairs](measurements/append-paired-final7.json) assert identical stored rows. Only 381 appended bytes are parsed. New-row-only prose blocks merge postings/maxima instead of re-reading their previous 512 texts; existing row changes/deletes rebuild the block. Full-bound-image tests cover text and metadata updates. The larger copy still misses 50 ms: exact prefix verification is size-dependent. Buffer reuse can reduce allocation, but removing that dependence while retaining exact arbitrary rewrite detection requires a trusted change journal or an append-only source guarantee.
+
+The fresh full build took **165,301.52 ms** (V6 172,680.87 ms), load **20.19 / 33.90 / 29.90** versus V6 **38.35 / 55.82 / 58.73**. These are different live snapshots and loads; the overall difference is not an isolated speedup. It read 24,377,009,647 bytes, stored 1,512,184 changed rows and recorded one parse error. [Build report](measurements/real-build-merged-final7.json).
+
+| Build phase | V6 ms | V7 ms |
+|---|---:|---:|
+| Parallel parse wall | 30,665.32 | 26,251.95 |
+| Writes, enclosing | 123,721.76 | 123,276.45 |
+| Row/event/blob writes | 31,049.67 | 33,744.69 |
+| FTS | 40,609.54 | 32,057.70 |
+| Graph persistence | 28,824.67 | 31,906.22 |
+| Canonical reconciliation | 8,629.18 | 7,776.69 |
+| Dictionary | 3,594.41 | 3,427.42 |
+| Secondary indexes | 3,169.71 | 2,965.53 |
+| Bounds | 9,806.32 | 8,339.14 |
+| Statistics | 7,462.01 | 6,187.51 |
+| Commit | 209.87 | 445.21 |
+
+| Adapter | Sources | Summed parse work ms | Source-write loop ms |
+|---|---:|---:|---:|
+| claude | 46 | 309.65 | 67.44 |
+| codex | 88 | 1,679.34 | 287.63 |
+| pi | 10523 | 177,062.17 | 76,660.84 |
+
+FTS decode/normalization now runs in a bounded two-batch pipeline beside the sole SQLite writer, and inserts bind borrowed values. Native node bodies move as parsed values rather than serialize/reparse at the write boundary. Graph compression already runs in parallel per source. These changes leave **123 s in writes**, including 33.7 s row/event/blob work and 31.9 s graph persistence. The 60 s requirement is therefore not met. Next: prepare typed event/blob/graph batches concurrently across sources before the SQLite write boundary, assign stable references once, and combine inserts; preserve one atomic publication transaction. Merely parallelizing FTS preprocessing cannot remove the remaining serial source loop.
+
+| Object group | V6 bytes | V7 bytes |
+|---|---:|---:|
+| Tool text + digest key | 532,316,160 | 535,056,384 |
+| Events + lookup tables/indexes | 437,833,728 | 439,537,664 |
+| Parser state + graph | 369,311,744 | 371,875,840 |
+| Gram postings + block keys | 139,915,264 | 140,607,488 |
+| Prose FTS | 192,094,208 | 193,757,184 |
+| Tool FTS | 314,011,648 | 315,936,768 |
+
+[Per-object storage](measurements/real-storage-merged-final7.json) accounts for every object. The tool layout remains positional words with complete substring dictionary expansion and canonical verification for edge cases; no tool-output truncation or dropped history is used to reach 2.366 GB. The earlier measured full-trigram projection remains above the entire product size budget.
+
+### Synthetic gates and validation
+
+The mixed and dense campaigns retain twenty fresh processes per warm case and three independent first builds. Every hand-built warm case now emits a finite `p95_ms`, including `one_session_refresh` and changed-source search, even outside the minimum twenty-sample gate. No budget was changed. The dense corpus still has older sparse matches, boundary/possessive/interior variants, varied timestamps and an independent exact top-40 oracle for all ten query shapes.
+
+| Workload | Build median ms | Census ms | Append ms | Result oracles | Strict gate |
+|---|---:|---:|---:|---|---|
+| [mixed-100k](measurements/synthetic-final7-mixed-100k.json) | 7575.35 | 23.04 | 36.42 | 763 valid / 0 invalid | failed |
+| [dense-1m](measurements/synthetic-final7-dense-1m.json) | 39930.71 | 15.49 | 39.31 | 263 valid / 0 invalid | diagnostic 1M |
+| [dense-2m](measurements/synthetic-final7-dense-2m.json) | 77563.40 | 23.98 | 61.71 | 263 valid / 0 invalid | failed |
+
+| Dense shape | V6 2M p50 / p95 ms | V7 1M p50 / p95 ms | V7 2M p50 / p95 ms |
+|---|---:|---:|---:|
+| old_dense | 81.66 / 87.03 | 55.55 / 57.63 | 58.22 / 60.66 |
+| old_dense_no_auto | 77.29 / 78.32 | 52.98 / 54.73 | 56.99 / 58.62 |
+| old_dense_word | 35.69 / 55.64 | 26.55 / 30.63 | 31.25 / 35.40 |
+| old_dense_regex | 45.36 / 58.05 | 23.19 / 26.47 | 26.35 / 30.17 |
+| old_dense_time | 49.52 / 56.65 | 32.85 / 37.85 | 35.53 / 37.29 |
+| old_dense_agent | 187.50 / 194.95 | 58.94 / 61.64 | 63.13 / 67.48 |
+| old_dense_project | 94.68 / 98.50 | 46.26 / 50.44 | 76.86 / 81.29 |
+| old_dense_since | 187.12 / 194.68 | 58.28 / 63.44 | 62.65 / 66.73 |
+| old_dense_phrase | 120.15 / 124.24 | 92.17 / 96.29 | 98.58 / 102.28 |
+| old_dense_count | 118.45 / 120.44 | 65.02 / 67.49 | 120.45 / 123.77 |
+
+Primary-case median loads were 25.57 / 26.14 / 26.60 (mixed), 14.43 / 21.58 / 24.63 (1M), and 13.50 / 15.83 / 21.11 (2M); each linked report retains the load for every sample. The primary 2M dense case improved from 81.66/87.03 to 58.22/60.66 ms, but fails the 20/40 ms headroom gate. On the same 2M index, seven interleaved query-only probes isolate the code change: 74.16 → 51.75 ms for the primary query, 170.76 → 55.07 ms for its agent filter, 112.62 → 89.36 ms for the phrase and 113.70 → 114.94 ms for exact count. [All probe samples](measurements/dense-query-phases-final7.json) include plan, candidate, hydration, scoring and load. This does not excuse the failed full-process gate. The primary query still visits 119 blocks and hydrates 41,268 rows (previously 60,927). The phrase hydrates only 653 rows but spends 74.59 ms in SQLite; exact count spends 107.39 ms in SQLite and hydrates none. The remaining bound/SQL traversal and exact-count work require the posting-iterator change described above.
+
+The semantic-1000 campaign completed first index, census, append and changed-source query cases, then stopped at missing-model validation before any semantic search. Its [partial samples](measurements/synthetic-final7-semantic-1000-partial.json.events.jsonl) and [blocker](measurements/synthetic-final7-semantic-blocker.json) are retained. This is an incomplete gate, not a skipped test or a pass.
+
+Formatting, workspace/all-target Clippy with warnings denied, and all **291 workspace tests** pass (zero failures, zero ignored). License validation, the test-skip policy and the worktree privacy scan pass. [Validation results](measurements/final7-validation.json). Native Windows/Linux execution is not claimed from this macOS run; their existing conditional imports, byte-range-lock handling and empty lock-file policy are preserved.
+
+The reader table columns and retrieval signatures remain stable. `freshness::Pending` adds only the diagnostic counts `listed_directories`, `cached_directories` and `stat_files`; private cursor/codec/bound tables are described in [ENGINE-API.md](ENGINE-API.md). Event timestamps, assigned turn/position and input/output offsets remain available to the merged readers.
+
+All committed real-history evidence is aggregate-only. Raw observations stay under ignored `scratch/`. The real-history index, copied active sessions, owner-shaped fixture, synthetic databases and codec/stat probes have been removed. Recorded cleanup totals **7.607 GB** of logical files across successive runs. Final allocated usage is **3.610 GB target + 0.248 GB scratch**; guarded peak was **4.909 GB**, below 6 GB. Minimum observed free space was **177.115 GB**, with no disk-guard interruption and no scratch database left. [Disk accounting](measurements/final7-cleanup.json). No real agent store or config was modified, and no default/old agrep data root was used. Nothing was pushed.
+
 ## Merged V6 acceptance and measurements
 
 The keyword changes are committed in `faa81ed7`; `e244c937` merges the semantic work through `23e83e94`. The Windows hook quoting correction is included. This is a measured checkpoint, **not performance acceptance**. Unchanged SPEC and CI limits still fail where listed below. Formatting, Clippy with warnings denied, all **286 workspace tests**, license validation and the repository privacy audit pass. No tests are ignored. Native Linux and Windows execution is not claimed from this macOS run.

@@ -17,7 +17,6 @@ fn cli(home: &Path, data: &Path, args: &[&str], env: &[(&str, &str)]) -> Output 
         .env("AGREP_DATA_DIR", data)
         .env("AGREP_CALLER_PUBLICATION_DIR", home.join("empty-callers"))
         .env("AGREP_PROFILE", "classic")
-        .env("TZ", "UTC")
         .args(args);
     for (k, v) in env {
         cmd.env(k, v);
@@ -68,12 +67,20 @@ fn fixture_search_golden_modes() {
         ("probe", vec!["recall", "retry", "--lexical", "--probe"]),
     ] {
         let o = ok(cli(&h, &d, &args, &[]));
+        let expected = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/pi-{name}.txt")),
+        )
+        .unwrap();
+        // Chrono uses the Windows system timezone, regardless of TZ. Keep the
+        // golden's UTC instant but render it in the same local zone as the CLI.
+        let local = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
         assert_eq!(
             String::from_utf8(o.stdout).unwrap(),
-            fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/pi-{name}.txt"))
-            )
-            .unwrap(),
+            expected.replace("2026-01-02 03:04", &local),
             "{name}"
         );
     }

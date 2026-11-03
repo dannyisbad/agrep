@@ -8,6 +8,12 @@ from release_identity import ROOT
 
 TOKEN = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|(?:br|r)(\#*)"[\s\S]*?"\1|b?"(?:\\[\s\S]|[^"\\])*"|b?\'(?:\\.|[^\'\\])\'|[A-Za-z_][A-Za-z_0-9]*|[^\s]')
 
+# The sole runtime exclusion: at the start of a registered GPU-only test,
+# acquire through the product capability check or return without assertions.
+METAL_GATE = 'capability(semantic_device::metal_device)'
+METAL_GUARD = re.findall(r'[A-Za-z_][A-Za-z_0-9]*|[^\s]',
+    'let Some(device) = crate::semantic_device::metal_device() else { return; };')
+
 
 def scan_rust(text, inherited=()):
     tokens = []
@@ -69,6 +75,9 @@ def scan_rust(text, inherited=()):
                     elif 'test' in attrs:
                         body_gates = []
                         k = j + 1
+                        if tokens[k:k + len(METAL_GUARD)] == METAL_GUARD:
+                            full[key] = list(dict.fromkeys((*gates, METAL_GATE)))
+                            k += len(METAL_GUARD)
                         while k < stop:
                             a = attribute(k, stop)
                             if a:

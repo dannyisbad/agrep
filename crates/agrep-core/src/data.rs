@@ -1,6 +1,5 @@
 //! The sole data format and kernel-owned writer locks.
 use anyhow::{bail, Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -34,7 +33,7 @@ impl Default for Config {
 pub struct WriterLock(File);
 impl Drop for WriterLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 impl DataRoot {
@@ -113,12 +112,12 @@ impl DataRoot {
             return Ok(false);
         }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => {
-                FileExt::unlock(&file)?;
+                file.unlock()?;
                 Ok(false)
             }
-            Err(error) if lock_contended(&error) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
             Err(error) => Err(error.into()),
         }
     }
@@ -139,11 +138,11 @@ impl DataRoot {
             .truncate(false)
             .open(self.0.join(name))?;
         if blocking {
-            f.lock_exclusive()?
+            f.lock()?
         } else {
-            match f.try_lock_exclusive() {
+            match f.try_lock() {
                 Ok(()) => {}
-                Err(e) if lock_contended(&e) => return Ok(None),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -213,27 +212,28 @@ pub fn exposed(path: &Path) -> Result<bool> {
     }
 }
 
-pub(crate) fn lock_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || matches!(
-            (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
-            (Some(actual), Some(expected)) if actual == expected
-        )
-}
-
 #[cfg(test)]
-mod lock_errors {
+mod lock_tests {
+    use super::*;
+
     #[test]
-    fn native_contention_is_distinct_from_other_io_failures() {
-        assert!(super::lock_contended(&fs2::lock_contended_error()));
-        assert!(super::lock_contended(&std::io::Error::from(
-            std::io::ErrorKind::WouldBlock
-        )));
-        assert!(!super::lock_contended(&std::io::Error::from(
-            std::io::ErrorKind::PermissionDenied
-        )));
-        assert!(!super::lock_contended(&std::io::Error::other(
-            "unrelated failure"
-        )));
+    fn named_locks_distinguish_contention_and_release_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(temp.path(), true).unwrap();
+        assert!(!root.writer_active().unwrap());
+        let writer = root.lock(false).unwrap().unwrap();
+        assert!(root.writer_active().unwrap());
+        assert!(root.lock(false).unwrap().is_none());
+        let work = root.work_lock(false).unwrap().unwrap();
+        assert!(root.work_lock(false).unwrap().is_none());
+        drop(writer);
+        assert!(!root.writer_active().unwrap());
+        assert!(root.lock(false).unwrap().is_some());
+        drop(work);
+        assert!(root.work_lock(false).unwrap().is_some());
+        // An actual IO failure must not be mistaken for contention.
+        fs::remove_file(root.path().join("work.lock")).unwrap();
+        fs::create_dir(root.path().join("work.lock")).unwrap();
+        assert!(root.work_lock(false).is_err());
     }
 }

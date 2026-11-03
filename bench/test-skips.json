@@ -101,9 +101,10 @@
     {
       "test": "crates/agrep-core/src/semantic_attention_metal.rs::tests::simdgroup_attention_matches_masked_f16_attention_with_strided_values",
       "gates": [
-        "cfg(all(test,target_os=LITERAL))"
+        "cfg(all(test,target_os=LITERAL))",
+        "capability(semantic_device::metal_device)"
       ],
-      "reason": "Runs the Metal F16 attention kernel; CPU attention has separate portable coverage."
+      "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
     },
     {
       "test": "crates/agrep-core/src/semantic_bert.rs::tests::vector_exponential_geglu_preserves_erf_values",
@@ -115,24 +116,34 @@
     {
       "test": "crates/agrep-core/src/semantic_metal.rs::tests::fused_geglu_preserves_candle_f16_values",
       "gates": [
-        "cfg(all(test,target_os=LITERAL))"
+        "cfg(all(test,target_os=LITERAL))",
+        "capability(semantic_device::metal_device)"
       ],
-      "reason": "Runs the Metal F16 GeGLU kernel; CPU GeGLU has separate portable coverage."
+      "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
     },
     {
       "test": "crates/agrep-core/src/semantic_norm.rs::tests::residual_norm_matches_metal",
       "gates": [
-        "cfg(target_os=LITERAL)"
+        "cfg(target_os=LITERAL)",
+        "capability(semantic_device::metal_device)"
       ],
-      "reason": "Runs the Metal F16 residual normalization kernel; CPU residual normalization is tested separately."
+      "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
     },
     {
       "test": "crates/agrep-core/src/semantic_arena.rs::tests::persistent_workspace_reuses_buffers_and_reads_new_inputs",
       "gates": [
         "cfg(target_os=LITERAL)",
-        "cfg(all(test,target_os=LITERAL))"
+        "cfg(all(test,target_os=LITERAL))",
+        "capability(semantic_device::metal_device)"
       ],
-      "reason": "Runs a persistent Metal workspace and its GPU kernels; requires a Metal device on macOS."
+      "reason": "Requires an Apple7-or-newer integrated Metal GPU with the complete semantic kernel capability set. Hosted macOS runners have no capable GPU (Apple-silicon VM: no device; Intel VM: unsupported family/features). The product capability check gates this test; portable CPU fallback tests always run, and all four GPU tests are required locally before release."
+    },
+    {
+      "test": "crates/agrep/tests/integrations_archive.rs::setup_reuses_enrollment_across_windows_path_spellings",
+      "gates": [
+        "cfg(windows)"
+      ],
+      "reason": "Exercises Windows case-insensitive native path identity while reinstalling and removing integrations; the general setup/remove tests run on every platform."
     }
   ],
   "partial_assertions": [
@@ -209,7 +220,14 @@
         "cfg(target_os=LITERAL)"
       ],
       "reason": "The portable CPU GeGLU assertions run everywhere; the expected-error bound accounts for the macOS system erf implementation."
+    },
+    {
+      "test": "crates/agrep/tests/review_fixes.rs::alias_resolution_uses_source_metadata_and_safe_followups",
+      "gates": [
+        "cfg(windows)"
+      ],
+      "reason": "Windows additionally checks mixed separators and case-insensitive native path aliases; the indexed-path and source-metadata assertions run on every platform."
     }
   ],
-  "reason": "Only these exact compile-time platform gates are permitted. No runtime skips or ignored tests."
+  "reason": "Only these exact platform gates are permitted. The sole runtime exclusion is the registered Metal capability guard at the start of a GPU-only test; no ignored tests or other runtime skips."
 }

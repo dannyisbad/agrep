@@ -2142,6 +2142,114 @@ fn all_terms_bounds_stop_at_attainable_ascii_scores_and_keep_unicode_winners() {
     }
 }
 
+#[test]
+fn coverage_bounds_use_terms_in_the_same_row_and_preserve_unicode() {
+    let t = TempDir::new().unwrap();
+    let home = t.path().join("home");
+    let data = t.path().join("data");
+    let mut texts: Vec<_> = (0..8192)
+        .map(|i| {
+            if i % 2 == 0 {
+                "amber common"
+            } else {
+                "gamma common"
+            }
+        })
+        .collect();
+    texts[0] = "ａｍｂｅｒ common";
+    transcript(&home, &texts);
+    ok(cli(&home, &data, &["index"]));
+    let root = DataRoot::open(&data, false).unwrap();
+    let c = store::reader(&root).unwrap();
+    for pattern in ["how amber gamma", "how amber gamma common"] {
+        let mut options = retrieval_options(pattern);
+        options.content = true;
+        options.limit = 40;
+        let fast = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(fast.hits.len(), 40);
+        assert!(fast.examined <= 1024, "{pattern}: {}", fast.examined);
+        options.exact = true;
+        let full = agrep_core::query::search(&c, &options).unwrap();
+        assert_eq!(
+            fast.hits.iter().map(|h| &h.handle).collect::<Vec<_>>(),
+            full.hits.iter().map(|h| &h.handle).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn appended_block_bounds_equal_a_complete_rebuild() {
+    fn bounds(root: &DataRoot) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let c = store::reader(root).unwrap();
+        [
+            "SELECT * FROM blocks ORDER BY id",
+            "SELECT * FROM block_grams ORDER BY lane,block",
+            "SELECT * FROM gram_postings ORDER BY lane,gram",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let mut q = c.prepare(sql).unwrap();
+            let columns = q.column_count();
+            q.query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        })
+        .collect()
+    }
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    let path = transcript(&home, &vec!["old marker"; 600]);
+    ok(cli(&home, &data, &["index"]));
+    write_records(
+        &path,
+        &[
+            serde_json::json!({"type":"message","id":"m600","parentId":"m599","timestamp":"2099-01-01T00:00:00Z","message":{"role":"user","content":"new needle needle βeta"}}),
+        ],
+        true,
+    );
+    ok(cli(&home, &data, &["index"]));
+    let root = DataRoot::open(&data, false).unwrap();
+    let incremental = bounds(&root);
+    store::rebuild_bounds(&root).unwrap();
+    assert_eq!(incremental, bounds(&root));
+    // A metadata-only edit of an old row must invalidate the append merge too.
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("2026-10-29T12:00:01Z", "2099-02-01T00:00:00Z");
+    fs::write(&path, text).unwrap();
+    ok(cli(&home, &data, &["index"]));
+    let incremental = bounds(&root);
+    store::rebuild_bounds(&root).unwrap();
+    assert_eq!(incremental, bounds(&root));
+}
+
+#[test]
+fn old_single_occurrences_use_the_block_ceiling_before_hydration() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    let path = transcript(&home, &vec!["deepold explanation"; 8192]);
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("2026-10-29", "2024-01-01");
+    fs::write(path, text).unwrap();
+    ok(cli(&home, &data, &["index"]));
+    let root = DataRoot::open(&data, false).unwrap();
+    let c = store::reader(&root).unwrap();
+    let mut options = retrieval_options("deepold");
+    options.limit = 40;
+    let fast = agrep_core::query::search(&c, &options).unwrap();
+    assert!(fast.examined <= 50, "{}", fast.examined);
+    options.exact = true;
+    let full = agrep_core::query::search(&c, &options).unwrap();
+    assert_eq!(
+        fast.hits.iter().map(|h| &h.handle).collect::<Vec<_>>(),
+        full.hits.iter().map(|h| &h.handle).collect::<Vec<_>>()
+    );
+}
+
 fn measured_query(
     data: &std::path::Path,
     pattern: &str,

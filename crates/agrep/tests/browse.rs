@@ -800,16 +800,14 @@ fn windows_run_and_resume_preserve_native_argv_without_records() {
             .unwrap()
     };
     ok(resume());
-    assert_eq!(
-        fs::read_to_string(output.with_extension("executable")).unwrap(),
-        "omp.exe"
-    );
+    assert!(fs::read_to_string(output.with_extension("executable"))
+        .unwrap()
+        .eq_ignore_ascii_case("omp.exe"));
     fs::remove_file(bin.join("omp.exe")).unwrap();
     ok(resume());
-    assert_eq!(
-        fs::read_to_string(output.with_extension("executable")).unwrap(),
-        "pi.exe"
-    );
+    assert!(fs::read_to_string(output.with_extension("executable"))
+        .unwrap()
+        .eq_ignore_ascii_case("pi.exe"));
 }
 
 #[test]

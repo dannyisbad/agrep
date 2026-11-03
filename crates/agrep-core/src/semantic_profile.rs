@@ -1,4 +1,4 @@
-//! Opt-in synchronized diagnostics, never used for throughput/latency samples.
+//! Opt-in synchronized diagnostics, separate from uninstrumented acceptance samples.
 use candle_core::Device;
 use std::{sync::OnceLock, time::Instant};
 
@@ -87,6 +87,18 @@ impl Drop for Span {
 pub fn event(value: serde_json::Value) {
     if timing_enabled() {
         eprintln!("{value}");
+    }
+}
+
+/// Wall-clock endpoints let a parent measure exec and exit separately from
+/// in-process phases. They carry no process, source or query identifiers.
+pub fn process_endpoint(name: &'static str) {
+    if timing_enabled() {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        event(serde_json::json!({name: ns.min(u128::from(u64::MAX)) as u64}));
     }
 }
 

@@ -45,6 +45,9 @@ pub(crate) struct Census {
     removed: Vec<String>,
     listing_ms: f64,
     stat_ms: f64,
+    listed_directories: usize,
+    cached_directories: usize,
+    stat_files: usize,
 }
 #[derive(Default, Debug, Serialize)]
 pub struct Pending {
@@ -54,6 +57,9 @@ pub struct Pending {
     pub listing_ms: f64,
     pub stat_ms: f64,
     pub comparison_ms: f64,
+    pub listed_directories: usize,
+    pub cached_directories: usize,
+    pub stat_files: usize,
 }
 fn encode_names(names: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -107,6 +113,8 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut issues = Vec::new();
+    let listings = std::sync::atomic::AtomicUsize::new(0);
+    let cache_hits = std::sync::atomic::AtomicUsize::new(0);
     while !queue.is_empty() {
         queue.retain(|(_, p)| seen.insert(p.clone()));
         let batch: Vec<_> = STAT_POOL.install(|| {
@@ -143,6 +151,7 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
                         .get(path.to_string_lossy().as_ref())
                         .filter(|d| d.mtime == mtime(&meta))
                     {
+                        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Ok(Some(d.clone()));
                     }
                     let mut d = Directory {
@@ -153,6 +162,7 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
                         files: Arc::default(),
                         dirty: true,
                     };
+                    listings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     for entry in fs::read_dir(path)? {
                         let entry = entry?;
                         let ty = entry.file_type()?;
@@ -215,10 +225,11 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
     }
     let listing_ms = started.elapsed().as_secs_f64() * 1000.;
     let stat_start = Instant::now();
+    let stat_files = files.len();
     let mut stamps: Vec<_> = STAT_POOL.install(|| {
         files
             .par_iter()
-            .filter_map(|(a, p)| store::stamp_present(a, p))
+            .filter_map(|(a, path)| store::stamp_present(a, path))
             .collect()
     });
     let stat_ms = stat_start.elapsed().as_secs_f64() * 1000.;
@@ -239,6 +250,9 @@ pub(crate) fn scan(c: &Connection, force: bool) -> Result<Census> {
         removed,
         listing_ms,
         stat_ms,
+        listed_directories: listings.into_inner(),
+        cached_directories: cache_hits.into_inner(),
+        stat_files,
     })
 }
 pub(crate) fn save(tx: &Transaction<'_>, census: &Census) -> Result<()> {
@@ -296,6 +310,9 @@ pub fn pending(root: &DataRoot) -> Result<Pending> {
         listing_ms: census.listing_ms,
         stat_ms: census.stat_ms,
         comparison_ms: (census_ms - read_ms - census.listing_ms - census.stat_ms).max(0.),
+        listed_directories: census.listed_directories,
+        cached_directories: census.cached_directories,
+        stat_files: census.stat_files,
     })
 }
 /// Spawn only an eligible one-shot worker. Kernel locks arbitrate concurrent spawns.

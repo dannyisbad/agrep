@@ -487,7 +487,7 @@ fn case(
     sorted.sort_by(f64::total_cmp);
     let median = sorted[sorted.len() / 2];
     eprintln!("{name:24} {median:10.2} ms  rc={:?}", codes);
-    let value = json!({"name":name,"args":args,"median_ms":median,"p95_ms":if runs>=20{Some(sorted[(runs*95).div_ceil(100)-1])}else{None},"samples_ms":times,"exit_codes":codes,"verified_results":verified,"load_averages":loads,"oracle_expected_handles":expected.as_ref().map(|e|&e.0),"oracle_expected_count":expected.as_ref().map(|e|e.1),"evidence":evidence});
+    let value = json!({"name":name,"args":args,"median_ms":median,"p95_ms":sorted[(runs*95).div_ceil(100)-1],"samples_ms":times,"exit_codes":codes,"verified_results":verified,"load_averages":loads,"oracle_expected_handles":expected.as_ref().map(|e|&e.0),"oracle_expected_count":expected.as_ref().map(|e|e.1),"evidence":evidence});
     trace(&value)?;
     Ok(value)
 }
@@ -671,7 +671,7 @@ fn main() -> Result<()> {
         sorted.sort_by(f64::total_cmp);
         let median = sorted[sorted.len() / 2];
         eprintln!("one_session_refresh {median:.2} ms");
-        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"p95_ms":if sorted.len()>=20 { Some(sorted[(sorted.len()*95).div_ceil(100)-1]) }else{None},"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
+        let value = json!({"name":"one_session_refresh","args":["index"],"median_ms":median,"p95_ms":sorted[(sorted.len()*95).div_ceil(100)-1],"samples_ms":times,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"evidence":trials.last().unwrap().2});
         trace(&value)?;
         cases.push(value);
     }
@@ -702,7 +702,7 @@ fn main() -> Result<()> {
         let mut times: Vec<_> = trials.iter().map(|t| t.0).collect();
         let samples = times.clone();
         times.sort_by(f64::total_cmp);
-        let value = json!({"name":"search_changed_source","median_ms":times[times.len()/2],"p95_ms":if times.len()>=20 { Some(times[(times.len()*95).div_ceil(100)-1]) }else{None},"samples_ms":samples,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":trials.iter().map(|t|perf::valid_result("json", &t.2)).collect::<Vec<_>>()});
+        let value = json!({"name":"search_changed_source","median_ms":times[times.len()/2],"p95_ms":times[(times.len()*95).div_ceil(100)-1],"samples_ms":samples,"load_averages":trials.iter().map(|t|t.2["bench_load_averages"].clone()).collect::<Vec<_>>(),"exit_codes":trials.iter().map(|t|t.1).collect::<Vec<_>>(),"verified_results":trials.iter().map(|t|perf::valid_result("json", &t.2)).collect::<Vec<_>>()});
         trace(&value)?;
         cases.push(value);
     }

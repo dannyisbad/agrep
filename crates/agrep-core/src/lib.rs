@@ -2,6 +2,7 @@
 pub mod archive;
 pub mod boundary_rank;
 pub mod boundary_stats;
+mod compression;
 pub mod data;
 pub mod ingest;
 pub mod intake;
@@ -54,6 +55,7 @@ mod semantic_arena;
 mod semantic_attention;
 mod semantic_attention_metal;
 mod semantic_bert;
+pub mod semantic_device;
 mod semantic_metal;
 pub mod semantic_model;
 mod semantic_norm;

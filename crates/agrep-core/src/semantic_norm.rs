@@ -215,6 +215,14 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn residual_norm_matches_metal() {
-        compare(Device::new_metal(0).unwrap(), 0.004)
+        let Some(device) = crate::semantic_device::metal_device() else {
+            return;
+        };
+        use objc2_metal::MTLDevice;
+        eprintln!(
+            "Metal GPU: {}",
+            device.as_metal_device().unwrap().device().as_ref().name()
+        );
+        compare(device, 0.004)
     }
 }

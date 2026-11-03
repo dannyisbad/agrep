@@ -22,7 +22,7 @@ struct Cursor {
     records: usize,
     identity: String,
     state: String,
-    prefix_hash: Vec<u8>,
+    prefix_chunks: Vec<[u8; 32]>,
     header: String,
     leaf: Option<String>,
 }
@@ -30,7 +30,7 @@ pub struct Node {
     pub id: String,
     pub parent: Option<String>,
     pub ordinal: usize,
-    pub body: Vec<u8>,
+    pub body: serde_json::Value,
 }
 pub struct Parsed {
     pub messages: Vec<Message>,
@@ -43,6 +43,72 @@ pub struct Parsed {
     pub bytes_read: usize,
     pub bytes_parsed: usize,
 }
+const CHECKPOINT_CHUNK: usize = 1024 * 1024;
+
+fn chunk_hashes(bytes: &[u8]) -> Vec<[u8; 32]> {
+    bytes
+        .par_chunks(CHECKPOINT_CHUNK)
+        .map(|chunk| Sha256::digest(chunk).into())
+        .collect()
+}
+
+fn read_at(file: &std::fs::File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(file, bytes, offset)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(file, bytes, offset)?;
+        #[cfg(not(any(unix, windows)))]
+        let n = {
+            let _ = (file, offset);
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        offset += n as u64;
+        bytes = &mut bytes[n..];
+    }
+    Ok(())
+}
+
+/// Verify every prior byte. Independent chunk digests permit parallel reads and
+/// hashing; the final partial chunk is returned for the next checkpoint.
+fn verify_chunks(file: &std::fs::File, cursor: &Cursor) -> Result<(bool, Vec<u8>)> {
+    anyhow::ensure!(
+        cursor.prefix_chunks.len() == (cursor.offset as usize).div_ceil(CHECKPOINT_CHUNK),
+        "invalid prefix checkpoint"
+    );
+    let checked: Vec<_> = cursor
+        .prefix_chunks
+        .par_iter()
+        .enumerate()
+        .map(|(i, expected)| -> Result<_> {
+            let offset = i * CHECKPOINT_CHUNK;
+            let length = (cursor.offset as usize - offset).min(CHECKPOINT_CHUNK);
+            let mut bytes = vec![0; length];
+            read_at(file, &mut bytes, offset as u64)?;
+            let valid = <[u8; 32]>::from(Sha256::digest(&bytes)) == *expected;
+            Ok((
+                valid,
+                if length < CHECKPOINT_CHUNK {
+                    bytes
+                } else {
+                    Vec::new()
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let valid = checked.iter().all(|(valid, _)| *valid);
+    Ok((
+        valid,
+        checked
+            .into_iter()
+            .last()
+            .map(|(_, tail)| tail)
+            .unwrap_or_default(),
+    ))
+}
 /// Packed native graph pages use DEFLATE; row text uses its independent codec.
 pub fn pack_node(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = flate2::write::ZlibEncoder::new(b"G2".to_vec(), flate2::Compression::new(1));
@@ -53,10 +119,7 @@ pub fn unpack_node(bytes: &[u8]) -> Result<Vec<u8>> {
     let input = bytes
         .strip_prefix(b"G2")
         .context("invalid native entry codec")?;
-    let mut decoder = flate2::read::ZlibDecoder::new(input);
-    let mut output = Vec::new();
-    decoder.read_to_end(&mut output)?;
-    Ok(output)
+    crate::compression::inflate(input)
 }
 #[derive(Debug, PartialEq)]
 struct GraphNode {
@@ -68,6 +131,38 @@ struct GraphNode {
 #[cfg(test)]
 mod graph_codec_tests {
     use super::*;
+    #[test]
+    fn chunk_checkpoints_detect_edits_at_every_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let original = vec![b'x'; 3 * CHECKPOINT_CHUNK + 17];
+        std::fs::write(&path, &original).unwrap();
+        let cursor = Cursor {
+            offset: original.len() as u64,
+            records: 0,
+            identity: String::new(),
+            state: String::new(),
+            prefix_chunks: chunk_hashes(&original),
+            header: String::new(),
+            leaf: None,
+        };
+        let file = std::fs::File::open(&path).unwrap();
+        let (valid, tail) = verify_chunks(&file, &cursor).unwrap();
+        assert!(valid);
+        assert_eq!(tail, vec![b'x'; 17]);
+        for at in [
+            0,
+            CHECKPOINT_CHUNK - 1,
+            CHECKPOINT_CHUNK,
+            2 * CHECKPOINT_CHUNK + 1,
+            original.len() - 1,
+        ] {
+            let mut changed = original.clone();
+            changed[at] = b'y';
+            std::fs::write(&path, changed).unwrap();
+            assert!(!verify_chunks(&file, &cursor).unwrap().0, "edit at {at}");
+        }
+    }
     #[test]
     fn packed_graph_preserves_hex_and_named_identifiers() {
         let mut nodes = Graph::new();
@@ -436,7 +531,7 @@ fn event_blob(
 pub(crate) fn save_nodes(
     tx: &Transaction<'_>,
     source: i64,
-    nodes: &[Node],
+    nodes: Vec<Node>,
     reset: bool,
     session: Option<(&str, &str)>,
     events: &[Event],
@@ -500,7 +595,7 @@ pub(crate) fn save_nodes(
         Ok(blob)
     };
     for node in nodes {
-        let mut record: serde_json::Value = serde_json::from_slice(&node.body)?;
+        let mut record = node.body;
         let call = record["message"]["toolCallId"]
             .as_str()
             .unwrap_or(&node.id)
@@ -662,30 +757,21 @@ pub fn parse(
         .and_then(|b| serde_json::from_slice(&b).ok());
     let mut bytes_read = 0;
     if let Some(c) = &old {
-        // The full-prefix digest below also verifies both edges. Persisting
-        // source fragments duplicated many megabytes without adding protection.
+        // Every prior chunk is checked below; identity/length only reject an
+        // obviously replaced or truncated source before doing that work.
         let valid = c.identity == id && meta.len() >= c.offset;
         if !valid {
             old = None;
         }
     }
-    let mut hash = Sha256::new();
+    let mut partial_chunk = Vec::new();
     if let Some(cursor) = &old {
-        file.seek(SeekFrom::Start(0))?;
-        let mut left = cursor.offset;
-        let mut buffer = vec![0; 65536];
-        while left > 0 {
-            let n = file.read(&mut buffer[..(left.min(65536) as usize)])?;
-            if n == 0 {
-                anyhow::bail!("source truncated during prefix verification")
-            }
-            hash.update(&buffer[..n]);
-            left -= n as u64;
-            bytes_read += n;
-        }
-        if hash.clone().finalize().as_slice() != cursor.prefix_hash {
+        let (valid, tail) = verify_chunks(&file, cursor)?;
+        bytes_read += cursor.offset as usize;
+        if valid {
+            partial_chunk = tail;
+        } else {
             old = None;
-            hash = Sha256::new();
         }
     }
     let start = old.as_ref().map_or(0, |c| c.offset);
@@ -704,7 +790,14 @@ pub fn parse(
     } else {
         tail_start
     };
-    hash.update(&bytes[..complete]);
+    let prefix_chunks = if let Some(cursor) = &old {
+        let mut chunks = cursor.prefix_chunks[..cursor.offset as usize / CHECKPOINT_CHUNK].to_vec();
+        partial_chunk.extend_from_slice(&bytes[..complete]);
+        chunks.extend(chunk_hashes(&partial_chunk));
+        chunks
+    } else {
+        chunk_hashes(&bytes[..complete])
+    };
     let mut data = String::from_utf8_lossy(&bytes[..complete]).into_owned();
     drop(bytes);
     let records = old.as_ref().map_or(0, |c| c.records) + data.lines().count();
@@ -740,7 +833,7 @@ pub fn parse(
                     id: entry.into(),
                     parent,
                     ordinal,
-                    body: encoded.as_bytes().to_vec(),
+                    body: value,
                 });
             }
             normalized.push_str(&encoded);
@@ -770,7 +863,7 @@ pub fn parse(
                     break;
                 }
                 let (parent, body) = if let Some(n) = fresh.get(id.as_str()) {
-                    (n.parent.clone(), n.body.clone())
+                    (n.parent.clone(), serde_json::to_vec(&n.body)?)
                 } else {
                     let key = bucket(&id);
                     if let std::collections::hash_map::Entry::Vacant(e) = graphs.entry(key) {
@@ -824,7 +917,7 @@ pub fn parse(
         records,
         identity: id,
         state: state.to_string(),
-        prefix_hash: hash.finalize().to_vec(),
+        prefix_chunks,
         header,
         leaf,
     };

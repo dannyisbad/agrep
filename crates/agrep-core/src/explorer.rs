@@ -736,10 +736,9 @@ mod boundary_tests {
             Ok(())
         });
         let s = &server.state;
-        use sha2::{Digest, Sha256};
         let legacy = format!(
-            "agrep_ui_{:x}",
-            Sha256::digest(format!("{}\0{}", s.root.path().display(), s.port).as_bytes())
+            "agrep_ui_{}",
+            crate::store::digest(&format!("{}\0{}", s.root.path().display(), s.port))
         )[..21]
             .to_owned();
         let request = request(&format!(

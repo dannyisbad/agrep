@@ -86,12 +86,24 @@ impl Drop for WriteTimer {
     }
 }
 pub fn reader(root: &DataRoot) -> Result<Connection> {
-    let c = Connection::open_with_flags(
-        root.db(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    register_functions(&c)?;
-    c.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+    let c = {
+        let _span = crate::semantic_profile::span("reader_open");
+        Connection::open_with_flags(
+            root.db(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?
+    };
+    {
+        let _span = crate::semantic_profile::span("reader_pragmas");
+        register_functions(&c)?;
+        c.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+    }
+    if crate::semantic_profile::timing_enabled() {
+        // Force the otherwise lazy schema read into its own diagnostic phase.
+        // Ordinary commands still load it with their first real statement.
+        let _span = crate::semantic_profile::span("reader_schema");
+        let _statement = c.prepare("SELECT path FROM sources LIMIT 0")?;
+    }
     Ok(c)
 }
 pub fn writer(root: &DataRoot) -> Result<Connection> {
@@ -168,6 +180,9 @@ CREATE TRIGGER IF NOT EXISTS {table}_count_visibility AFTER UPDATE OF visible ON
         ))?;
     }
     crate::row_stats::schema(c)?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS bound_updates(id INTEGER PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS prose_bound_update AFTER UPDATE ON prose BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;
+CREATE TRIGGER IF NOT EXISTS prose_bound_delete BEFORE DELETE ON prose BEGIN INSERT OR IGNORE INTO bound_updates VALUES(old.id); END;")?;
     crate::prose_index::schema(c)?;
     crate::tool_index::schema(c)?;
     Ok(())
@@ -194,9 +209,12 @@ fn search_indexes(c: &Connection, create: bool) -> Result<()> {
     crate::tool_store::indexes(c, create)
 }
 pub fn digest(text: &str) -> String {
+    hex_digest(Sha256::digest(text.as_bytes()))
+}
+pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
-    for byte in Sha256::digest(text.as_bytes()) {
+    for &byte in bytes.as_ref() {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 15) as usize] as char);
     }
@@ -680,6 +698,15 @@ fn refresh_inner(
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
     }
+    let append_from = if first {
+        None
+    } else {
+        Some(
+            tx.query_row("SELECT coalesce(max(id),0) FROM prose", [], |r| {
+                r.get::<_, i64>(0)
+            })?,
+        )
+    };
     let mut dirty = BTreeSet::new();
     let mut canonical_sessions = HashSet::new();
     let mut fast_sessions = HashSet::new();
@@ -794,7 +821,7 @@ fn refresh_inner(
                 crate::incremental::save_nodes(
                     &tx,
                     source,
-                    &s.nodes,
+                    std::mem::take(&mut s.nodes),
                     s.reset_nodes,
                     session,
                     &s.events,
@@ -861,7 +888,8 @@ fn refresh_inner(
     info.dictionary_ms = phase.elapsed().as_secs_f64() * 1000.;
     info.write_ms = write_start.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
-    update_blocks(&tx, &dirty)?;
+    update_blocks(&tx, &dirty, append_from)?;
+    tx.execute("DELETE FROM bound_updates", [])?;
     info.bounds_ms = phase.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
     resolve_families(&tx, &canonical_sessions)?;
@@ -907,8 +935,33 @@ fn refresh_inner(
     drop(lock);
     Ok(info)
 }
+type FtsInput = Vec<(i64, Vec<u8>)>;
+type FtsPrepared = Vec<(i64, String)>;
+fn read_fts_batch(rows: &mut rusqlite::Rows<'_>) -> Result<FtsInput> {
+    let mut input = Vec::with_capacity(1024);
+    for _ in 0..1024 {
+        let Some(row) = rows.next()? else { break };
+        input.push((row.get(0)?, row.get(1)?));
+    }
+    Ok(input)
+}
+fn prepare_fts_batch(table: &str, input: FtsInput) -> Result<FtsPrepared> {
+    input
+        .into_par_iter()
+        .map(|(id, bytes)| {
+            let text = normalize(&decode(table, bytes)?);
+            Ok((
+                id,
+                if table == "tools" {
+                    crate::tool_index::index_text(&text).into_owned()
+                } else {
+                    text
+                },
+            ))
+        })
+        .collect()
+}
 fn build_fts(tx: &Transaction<'_>) -> Result<()> {
-    use rusqlite::types::Value;
     let _timer = WriteTimer::new(true);
     for table in ["prose", "tools"] {
         tx.execute_batch(&format!("INSERT INTO {table}_fts({table}_fts,rank) VALUES('automerge',0);INSERT INTO {table}_fts({table}_fts,rank) VALUES('crisismerge',64);INSERT INTO {table}_fts({table}_fts,rank) VALUES('hashsize',16777216);"))?;
@@ -916,40 +969,70 @@ fn build_fts(tx: &Transaction<'_>) -> Result<()> {
             "SELECT id,text FROM {table} WHERE visible=1 ORDER BY id"
         ))?;
         let mut rows = source.query([])?;
-        loop {
-            let mut input = Vec::with_capacity(1024);
-            for _ in 0..1024 {
-                let Some(row) = rows.next()? else { break };
-                input.push((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?));
-            }
-            if input.is_empty() {
-                break;
-            }
-            let values: Vec<Vec<Value>> = input
-                .into_par_iter()
-                .map(|(id, bytes)| -> Result<_> {
-                    let text = normalize(&decode(table, bytes)?);
-                    Ok(vec![
-                        Value::Integer(id),
-                        Value::Text(if table == "tools" {
-                            crate::tool_index::index_text(&text).into_owned()
+        // SQLite remains exclusively on this thread. Two bounded batches let
+        // decode/normalization overlap inserts, without a second writer or an
+        // unbounded copy of the corpus.
+        std::thread::scope(|scope| -> Result<()> {
+            let (send, input) = std::sync::mpsc::sync_channel::<FtsInput>(1);
+            let (output, receive) = std::sync::mpsc::sync_channel::<Result<FtsPrepared>>(1);
+            let worker = scope.spawn(move || {
+                while let Ok(batch) = input.recv() {
+                    let prepared = prepare_fts_batch(table, batch);
+                    let failed = prepared.is_err();
+                    if output.send(prepared).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+            let result = (|| -> Result<()> {
+                let mut queued = 0;
+                let mut ended = false;
+                for _ in 0..2 {
+                    let batch = read_fts_batch(&mut rows)?;
+                    if batch.is_empty() {
+                        ended = true;
+                        break;
+                    }
+                    send.send(batch)
+                        .map_err(|_| anyhow::anyhow!("FTS preparation ended"))?;
+                    queued += 1;
+                }
+                while queued > 0 {
+                    let prepared = receive
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("FTS preparation ended"))??;
+                    queued -= 1;
+                    if !ended {
+                        let batch = read_fts_batch(&mut rows)?;
+                        if batch.is_empty() {
+                            ended = true;
                         } else {
-                            text
-                        }),
-                    ])
-                })
-                .collect::<Result<_>>()?;
-            for batch in values.chunks(64) {
-                let fields = "rowid,text";
-                let placeholders = "(?,?)";
-                let sql = format!(
-                    "INSERT INTO {table}_fts({fields}) VALUES {}",
-                    vec![placeholders; batch.len()].join(",")
-                );
-                tx.prepare_cached(&sql)?
-                    .execute(rusqlite::params_from_iter(batch.iter().flatten()))?;
-            }
-        }
+                            send.send(batch)
+                                .map_err(|_| anyhow::anyhow!("FTS preparation ended"))?;
+                            queued += 1;
+                        }
+                    }
+                    for batch in prepared.chunks(64) {
+                        let sql = format!(
+                            "INSERT INTO {table}_fts(rowid,text) VALUES {}",
+                            vec!["(?,?)"; batch.len()].join(",")
+                        );
+                        let bind = batch.iter().flat_map(|(id, text)| {
+                            [id as &dyn rusqlite::ToSql, text as &dyn rusqlite::ToSql]
+                        });
+                        tx.prepare_cached(&sql)?
+                            .execute(rusqlite::params_from_iter(bind))?;
+                    }
+                }
+                Ok(())
+            })();
+            drop(send);
+            drop(receive);
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("FTS preparation panicked"))?;
+            result
+        })?;
         tx.execute(
             &format!("INSERT INTO {table}_fts({table}_fts) VALUES('optimize')"),
             [],
@@ -1948,6 +2031,7 @@ struct BuiltBounds {
     grams: Vec<(String, GramStat)>,
     max_gap: usize,
     all_ascii: bool,
+    append: bool,
 }
 #[derive(Clone, Copy, Debug, Default)]
 struct GramStat {
@@ -2064,6 +2148,7 @@ fn build_bounds(key: i64, rows: Vec<BoundRow>) -> Result<BuiltBounds> {
         grams,
         max_gap,
         all_ascii,
+        append: false,
     })
 }
 /// Dense ASCII keys cover common keyword bounds; other text retains a
@@ -2248,7 +2333,11 @@ fn write_posting(tx: &Transaction<'_>, lane: i64, gram: &str, rows: &[Posting]) 
     Ok(())
 }
 
-fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
+fn update_blocks(
+    tx: &Transaction<'_>,
+    blocks: &BTreeSet<i64>,
+    append_from: Option<i64>,
+) -> Result<()> {
     let first: bool = !tx.query_row("SELECT EXISTS(SELECT 1 FROM gram_postings)", [], |r| {
         r.get::<_, bool>(0)
     })?;
@@ -2262,15 +2351,32 @@ fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
             } else {
                 ("prose", key)
             };
-            let rows=tx.prepare_cached(&format!("SELECT text,ts,who,session,position FROM {table} WHERE visible=1 AND id>=?1 AND id<?2"))?.query_map(params![block*BLOCK,(block+1)*BLOCK],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<Vec<BoundRow>>>()?;
-            input.push((key, rows));
+            let append = if let Some(floor) = append_from.filter(|_| key >= 0 && !first) {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM blocks WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM bound_updates WHERE id>=?2 AND id<?3 AND id<=?4)",params![block,block*BLOCK,(block+1)*BLOCK,floor],|r|r.get::<_,bool>(0))?
+            } else {
+                false
+            };
+            let lo = if append {
+                (block * BLOCK).max(append_from.unwrap() + 1)
+            } else {
+                block * BLOCK
+            };
+            let rows=tx.prepare_cached(&format!("SELECT text,ts,who,session,position FROM {table} WHERE visible=1 AND id>=?1 AND id<?2"))?.query_map(params![lo,(block+1)*BLOCK],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<Vec<BoundRow>>>()?;
+            input.push((key, rows, append));
         }
         let built: Vec<_> = input
             .into_par_iter()
-            .map(|(key, rows)| build_bounds(key, rows))
+            .map(|(key, rows, append)| {
+                let mut b = build_bounds(key, rows)?;
+                b.append = append;
+                Ok::<_, anyhow::Error>(b)
+            })
             .collect();
         for b in built {
-            let b = b?;
+            let mut b = b?;
+            if b.append && b.min_turn == i64::MAX {
+                continue;
+            }
             let (lane, metadata, id) = if b.key < 0 {
                 (1, "tool_blocks", -1 - b.key)
             } else {
@@ -2289,7 +2395,11 @@ fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
                 vec![]
             };
             let new: HashMap<_, _> = b.grams.iter().cloned().collect();
-            let grams: HashSet<_> = old.into_iter().chain(new.keys().cloned()).collect();
+            let grams: HashSet<_> = if b.append {
+                new.keys().cloned().collect()
+            } else {
+                old.iter().cloned().chain(new.keys().cloned()).collect()
+            };
             for gram in grams {
                 let key = (lane, gram);
                 if !changed.contains_key(&key) {
@@ -2315,11 +2425,24 @@ fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
                 match rows.binary_search_by_key(&(id as u32), |p| p.block) {
                     Ok(i) => {
                         if let Some(tf) = new.get(&key.1) {
+                            let prior = rows[i];
                             rows[i] = Posting {
                                 block: id as u32,
-                                frequency: tf.frequency,
-                                max_ts: tf.max_ts,
-                                weight: tf.weight,
+                                frequency: if b.append {
+                                    prior.frequency.max(tf.frequency)
+                                } else {
+                                    tf.frequency
+                                },
+                                max_ts: if b.append {
+                                    prior.max_ts.max(tf.max_ts)
+                                } else {
+                                    tf.max_ts
+                                },
+                                weight: if b.append {
+                                    prior.weight.max(tf.weight)
+                                } else {
+                                    tf.weight
+                                },
                             }
                         } else {
                             rows.remove(i);
@@ -2338,6 +2461,25 @@ fn update_blocks(tx: &Transaction<'_>, blocks: &BTreeSet<i64>) -> Result<()> {
                             );
                         }
                     }
+                }
+            }
+            if b.append {
+                for gram in old {
+                    if !new.contains_key(&gram) {
+                        b.grams.push((gram, GramStat::default()));
+                    }
+                }
+                let (ts,user_ts,weight,session,turn,gap,ascii): (i64,Option<i64>,f64,String,i64,i64,bool) = tx.query_row("SELECT max_ts,user_ts,weight,min_session,min_turn,max_gap,all_ascii FROM blocks WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+                b.max_ts = b.max_ts.max(ts);
+                b.user_ts = b.user_ts.max(user_ts);
+                b.weight = b.weight.max(weight);
+                b.max_gap = b.max_gap.max(gap as usize);
+                b.all_ascii &= ascii;
+                if session < b.min_session {
+                    b.min_session = session;
+                    b.min_turn = turn;
+                } else if session == b.min_session {
+                    b.min_turn = b.min_turn.min(turn);
                 }
             }
             tx.prepare_cached("INSERT INTO block_grams VALUES(?1,?2,?3) ON CONFLICT(lane,block) DO UPDATE SET body=excluded.body")?.execute(params![lane,id,pack_grams(&b.grams)])?;
@@ -2735,7 +2877,7 @@ pub fn rebuild_bounds(root: &DataRoot) -> Result<usize> {
         }
     }
     tx.execute_batch("DELETE FROM gram_postings; DELETE FROM block_grams; DELETE FROM blocks; DELETE FROM tool_blocks;")?;
-    update_blocks(&tx, &blocks)?;
+    update_blocks(&tx, &blocks, None)?;
     tx.commit()?;
     Ok(blocks.len())
 }

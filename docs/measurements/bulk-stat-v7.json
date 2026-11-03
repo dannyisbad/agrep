@@ -1,0 +1,256 @@
+{
+  "samples": [
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 55.99,
+      "repeat": 0,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 41.75,
+      "repeat": 0,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 41.222,
+      "repeat": 0,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 60.303,
+      "repeat": 1,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 43.62,
+      "repeat": 1,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 41.221,
+      "repeat": 1,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 55.533,
+      "repeat": 2,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 47.035,
+      "repeat": 2,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 43.662,
+      "repeat": 2,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 61.909,
+      "repeat": 3,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 47.515,
+      "repeat": 3,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 42.891,
+      "repeat": 3,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 58.118,
+      "repeat": 4,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 49.772,
+      "repeat": 4,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 45.131,
+      "repeat": 4,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 63.161,
+      "repeat": 5,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 47.308,
+      "repeat": 5,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 45.161,
+      "repeat": 5,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 4,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 68.767,
+      "repeat": 6,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 8,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 46.684,
+      "repeat": 6,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    },
+    {
+      "workers": 12,
+      "paths": 2846,
+      "errors": 0,
+      "stat_ms": 42.607,
+      "repeat": 6,
+      "load_averages": [
+        15.01513671875,
+        22.333984375,
+        25.69091796875
+      ]
+    }
+  ]
+}

@@ -621,6 +621,8 @@ fn run(cli: Cli) -> Result<i32> {
     }
 }
 fn main() {
+    agrep_core::semantic_profile::process_endpoint("process_entry_ns");
+    let parse_span = agrep_core::semantic_profile::span("cli_parse");
     let mut args: Vec<_> = std::env::args_os().collect();
     let commands = [
         "search",
@@ -678,6 +680,7 @@ fn main() {
             ) =>
         {
             let _ = error.print();
+            agrep_core::semantic_profile::process_endpoint("process_exit_ns");
             std::process::exit(0);
         }
         Err(error) => {
@@ -686,13 +689,23 @@ fn main() {
                 "{}",
                 render::safe(text.lines().next().unwrap_or("invalid arguments"))
             );
+            agrep_core::semantic_profile::process_endpoint("process_exit_ns");
             std::process::exit(2);
         }
     };
-    match run(cli) {
-        Ok(code) => std::process::exit(code),
+    drop(parse_span);
+    let result = {
+        let _span = agrep_core::semantic_profile::span("command");
+        run(cli)
+    };
+    match result {
+        Ok(code) => {
+            agrep_core::semantic_profile::process_endpoint("process_exit_ns");
+            std::process::exit(code)
+        }
         Err(e) => {
             eprintln!("agrep: {}", render::safe(&format!("{e:#}")));
+            agrep_core::semantic_profile::process_endpoint("process_exit_ns");
             std::process::exit(2)
         }
     }

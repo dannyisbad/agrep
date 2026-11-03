@@ -131,7 +131,7 @@ pub fn turn_count(c: &Connection, s: &Session) -> Result<i64> {
 }
 pub fn project_matches(label: &str, query: &str) -> bool {
     let label = label.replace('\\', "/").to_lowercase();
-    let query = query.to_lowercase();
+    let query = query.replace('\\', "/").to_lowercase();
     let leaf = label.rsplit('/').next().unwrap_or(&label);
     if query.contains(['*', '?', '[']) {
         globset::GlobBuilder::new(&query)
@@ -296,10 +296,16 @@ pub fn resolve_indexed<'a>(
         ))
     })? {
         let (path, agent, session) = row?;
-        if path == reference
-            || crate::ingest::registry::session_alias(&agent, std::path::Path::new(&path), &session)
-                .as_deref()
-                == Some(identity.as_str())
+        if crate::ingest::registry::path_eq(
+            std::path::Path::new(&path),
+            std::path::Path::new(reference),
+        ) || crate::ingest::registry::session_alias(
+            &agent,
+            std::path::Path::new(&path),
+            &session,
+        )
+        .as_deref()
+            == Some(identity.as_str())
         {
             aliases.insert((agent, session));
         }
@@ -312,5 +318,23 @@ pub fn resolve_indexed<'a>(
         Ok(matched)
     } else {
         Ok((found, false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn project_filters_accept_both_separator_spellings() {
+        for label in [r"C:\Work\Project", "C:/Work/Project"] {
+            for query in [
+                r"c:\work\project",
+                "c:/work/project",
+                r"C:\Work\*",
+                "project",
+            ] {
+                assert!(super::project_matches(label, query), "{label}: {query}");
+            }
+            assert!(!super::project_matches(label, r"C:\Other\Project"));
+        }
     }
 }

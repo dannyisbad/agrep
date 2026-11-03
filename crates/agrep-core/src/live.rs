@@ -959,7 +959,9 @@ mod horizon_tests {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("history.jsonl");
         fs::write(&p, "not valid JSON").unwrap();
-        fs::File::open(&p)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();

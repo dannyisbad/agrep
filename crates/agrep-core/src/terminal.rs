@@ -68,6 +68,11 @@ impl Signals {
         #[cfg(windows)]
         {
             CONSOLE_SIGNAL.store(0, Ordering::SeqCst);
+            // A parent (or CREATE_NEW_PROCESS_GROUP) may have disabled Ctrl-C
+            // inheritance. A foreground agrep command owns its signal handling.
+            if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
+                return Err(io::Error::last_os_error().into());
+            }
             if unsafe {
                 windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(console_signal), 1)
             } == 0
@@ -120,16 +125,42 @@ impl Drop for Signals {
 
 pub struct Screen {
     active: bool,
+    #[cfg(windows)]
+    console_modes: Option<(u32, u32)>,
 }
 impl Screen {
     pub fn enter() -> Result<Self> {
-        let mut screen = Self { active: false };
+        let mut screen = Self {
+            active: false,
+            #[cfg(windows)]
+            console_modes: None,
+        };
         screen.activate()?;
         Ok(screen)
     }
     fn activate(&mut self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            self.console_modes = Some((
+                console_mode(STD_INPUT_HANDLE)?,
+                console_mode(STD_OUTPUT_HANDLE)?,
+            ));
+        }
         terminal::enable_raw_mode()?;
         self.active = true;
+        // Raw mode disables ENABLE_PROCESSED_INPUT. Keep console Ctrl-C
+        // delivery enabled, just as ISIG remains enabled on POSIX.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE};
+            let result = console_mode(STD_INPUT_HANDLE)
+                .and_then(|mode| set_console_mode(STD_INPUT_HANDLE, mode | ENABLE_PROCESSED_INPUT));
+            if let Err(error) = result {
+                self.restore();
+                return Err(error.into());
+            }
+        }
         // Keep terminal-generated job-control and quit signals in raw mode.
         #[cfg(unix)]
         unsafe {
@@ -164,6 +195,7 @@ impl Screen {
         unsafe {
             libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
         }
+        #[cfg(not(windows))]
         let _ = terminal::disable_raw_mode();
         #[cfg(unix)]
         unsafe {
@@ -174,6 +206,12 @@ impl Screen {
             Duration::from_secs(5),
             None,
         );
+        #[cfg(windows)]
+        if let Some((input, output)) = self.console_modes.take() {
+            use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            let _ = set_console_mode(STD_INPUT_HANDLE, input);
+            let _ = set_console_mode(STD_OUTPUT_HANDLE, output);
+        }
     }
     pub fn signal(&mut self, signals: &Signals) -> Result<Option<i32>> {
         let signal = signals.pending();
@@ -312,6 +350,26 @@ pub fn output_is_closed() -> bool {
         false
     }
 }
+#[cfg(windows)]
+fn console_mode(kind: u32) -> io::Result<u32> {
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle};
+    let mut mode = 0;
+    if unsafe { GetConsoleMode(GetStdHandle(kind), &mut mode) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(mode)
+    }
+}
+#[cfg(windows)]
+fn set_console_mode(kind: u32, mode: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode};
+    if unsafe { SetConsoleMode(GetStdHandle(kind), mode) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
