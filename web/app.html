@@ -712,8 +712,11 @@
       if (cursor < source.length) target.append(document.createTextNode(source.slice(cursor)));
     }
 
+    let authorization = "";
     async function request(path, options = {}) {
-      const response = await fetch(path, { credentials: "same-origin", ...options });
+      const headers = new Headers(options.headers);
+      if (authorization) headers.set("Authorization", `Bearer ${authorization}`);
+      const response = await fetch(path, { ...options, headers, credentials: "omit", mode: "same-origin" });
       if (response.status === 204) return null;
       const payload = await response.json().catch(() => ({ error: "invalid explorer response" }));
       if (!response.ok) throw new Error(payload.error || `request failed (${response.status})`);
@@ -1607,10 +1610,11 @@
       const bootstrap = hash.get("bootstrap");
       try {
         if (bootstrap) {
-          await request("/auth", {
+          const auth = await request("/auth", {
             method: "POST",
             headers: { "X-Agrep-Bootstrap": bootstrap }
           });
+          authorization = auth.token;
           history.replaceState(null, "", location.pathname);
         }
         const [status, chats] = await Promise.all([

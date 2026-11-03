@@ -79,7 +79,7 @@ pub fn packet(c: &Connection, caller: &Caller, boundary_ms: Option<i64>) -> Resu
             .last()
             .map(|r| json!(["agrep", "around", r["handle"].as_str().unwrap(), "-C", "2"]));
         let value = json!({"kind":"agrep-postcompact","schema_version":1,"status":if output.is_empty(){"empty"}else{"recovered"},"authority":authority(),"selection":{"caller_session":caller.session,"family_root":caller.root,"family_resolved":true,"scope":"root-only","boundary_turn":boundary,"previous_boundary_turn":previous,"boundary_basis":"indexed_structural_recap","window_fallbacks":fallbacks,"window_source":"caller","tools":"excluded","delegated_sessions":"excluded","project":project,"agent":caller.agent,"model":chosen.last().map(|r|&r.model),"model_source":chosen.last().map(|r|&r.model_source)},"coverage":{"family":"complete","boundary":"complete","eligible_root_blocks":eligible,"shown_root_blocks":shown,"budget_bytes":8000,"json_budget_bytes":16000,"budget_truncated":shown<eligible||omitted>0,"render_omitted_bytes":omitted,"source_truncated_rows":chosen.iter().filter(|r|r.source_chars>r.text.chars().count()).count(),"source_truncation_state":"recorded"},"rows":output,"omissions":{"root_blocks":eligible-shown,"tools":"policy_excluded","delegated_sessions":"policy_excluded"},"next":{"around_argv":next},"implicit_widening":false});
-        if serde_json::to_vec(&value)?.len() < 16000 && human(&value).len() < 8000 {
+        if crate::json_output::to_string(&value)?.len() < 16000 && human(&value).len() < 8000 {
             return Ok(value);
         }
         let Some(oldest) = chosen.first().map(|r| r.turn) else {
@@ -94,7 +94,7 @@ pub fn packet(c: &Connection, caller: &Caller, boundary_ms: Option<i64>) -> Resu
 pub fn human(packet: &Value) -> String {
     let s = &packet["selection"];
     let cv = &packet["coverage"];
-    let mut lines=vec!["postcompact: supplement to the visible compact summary; newer visible user text wins".to_owned(),format!("caller @{} · root @{} · {} · project {} (orientation only)",s["caller_session"].as_str().unwrap_or(""),s["family_root"].as_str().unwrap_or(""),s["agent"].as_str().unwrap_or(""),s["project"].as_str().unwrap_or("")),format!("boundary turn {} (structural recap) · root-only · tools and delegated sessions excluded",s["boundary_turn"]),String::new(),"── recent root/main tail · newest blocks selected, chronological render ──".into()];
+    let mut lines=vec!["postcompact: supplement to the visible compact summary; newer visible user text wins".to_owned(),format!("caller @{} · root @{} · {} · project {} (orientation only)",surface::safe(s["caller_session"].as_str().unwrap_or(""),false),surface::safe(s["family_root"].as_str().unwrap_or(""),false),surface::safe(s["agent"].as_str().unwrap_or(""),false),surface::safe(s["project"].as_str().unwrap_or(""),false)),format!("boundary turn {} (structural recap) · root-only · tools and delegated sessions excluded",s["boundary_turn"]),String::new(),"── recent root/main tail · newest blocks selected, chronological render ──".into()];
     for r in packet["rows"].as_array().unwrap() {
         lines.push(format!(
             "{} {} {}: {}",

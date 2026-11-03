@@ -59,6 +59,12 @@ pub fn choose_executable(agent: &str, preferred: Option<&str>) -> Result<Option<
     }
 }
 pub fn resume_args(s: &Session) -> Result<Vec<OsString>> {
+    if !crate::handles::plain(&s.id) {
+        bail!("invalid session id for native resume");
+    }
+    if !Path::new(&s.cwd).is_absolute() {
+        bail!("session working directory must be absolute");
+    }
     let (_, flag) = capability(&s.agent)?;
     let mut args = vec![];
     if s.agent == "opencode" {

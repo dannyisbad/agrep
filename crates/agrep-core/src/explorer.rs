@@ -8,7 +8,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -88,7 +87,9 @@ impl Response {
     fn json(code: u16, body: Value) -> Self {
         Self {
             code,
-            body: body.to_string().into_bytes(),
+            body: crate::json_output::to_string(&body)
+                .expect("serializing JSON value")
+                .into_bytes(),
             headers: vec![(
                 "Content-Type".into(),
                 "application/json; charset=utf-8".into(),
@@ -97,6 +98,44 @@ impl Response {
     }
     fn error(code: u16, msg: &str) -> Self {
         Self::json(code, json!({"error":msg}))
+    }
+    fn from_error(error: &anyhow::Error) -> Self {
+        use rusqlite::ErrorCode;
+        let (code, kind, message) = if let Some(rusqlite::Error::SqliteFailure(e, _)) =
+            error.downcast_ref::<rusqlite::Error>()
+        {
+            match e.code {
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => (
+                    503,
+                    "storage-unavailable",
+                    "database temporarily unavailable".to_owned(),
+                ),
+                ErrorCode::PermissionDenied | ErrorCode::ReadOnly => {
+                    (403, "permission-denied", format!("{error:#}"))
+                }
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                    (500, "invalid-database", format!("{error:#}"))
+                }
+                ErrorCode::CannotOpen => (503, "database-open", format!("{error:#}")),
+                _ => (500, "database-error", format!("{error:#}")),
+            }
+        } else if let Some(e) = error.downcast_ref::<std::io::Error>() {
+            match e.kind() {
+                std::io::ErrorKind::NotFound => (404, "not-found", format!("{error:#}")),
+                std::io::ErrorKind::PermissionDenied => {
+                    (403, "permission-denied", format!("{error:#}"))
+                }
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => (
+                    503,
+                    "source-unavailable",
+                    "source temporarily unavailable".to_owned(),
+                ),
+                _ => (500, "io-error", format!("{error:#}")),
+            }
+        } else {
+            (500, "request-failed", format!("{error:#}"))
+        };
+        Self::json(code, json!({"error":message,"error_kind":kind}))
     }
     fn write(&self, stream: &mut TcpStream) -> std::io::Result<()> {
         let status = match self.code {
@@ -107,7 +146,9 @@ impl Response {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            408 => "Request Timeout",
             413 => "Payload Too Large",
+            500 => "Internal Server Error",
             _ => "Service Unavailable",
         };
         write!(stream,"HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\n",self.code,status,self.body.len())?;
@@ -118,6 +159,30 @@ impl Response {
         stream.write_all(&self.body)
     }
 }
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HEADER_LIMIT: usize = 16_384;
+fn read_headers(
+    mut read: impl FnMut(&mut [u8], Duration) -> std::io::Result<usize>,
+    mut remaining: impl FnMut() -> Duration,
+) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut byte = [0; 1];
+    while raw.len() < HEADER_LIMIT {
+        let budget = remaining();
+        if budget.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        if read(&mut byte, budget)? == 0 {
+            break;
+        }
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(raw)
+}
+
 pub struct Explorer {
     listener: TcpListener,
     state: Arc<State>,
@@ -127,7 +192,6 @@ struct State {
     port: u16,
     auth: String,
     bootstrap: Mutex<String>,
-    cookie: String,
     live: Mutex<Option<Service>>,
     freshen: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
@@ -137,8 +201,6 @@ impl Explorer {
             .context("explorer could not bind to loopback")?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
-        let digest = Sha256::digest(format!("{}\0{port}", root.path().display()).as_bytes());
-        let cookie = format!("agrep_ui_{:x}", digest)[..21].to_owned();
         Ok(Self {
             listener,
             state: Arc::new(State {
@@ -146,7 +208,6 @@ impl Explorer {
                 port,
                 auth: token()?,
                 bootstrap: Mutex::new(token()?),
-                cookie,
                 live: Mutex::new(None),
                 freshen: None,
             }),
@@ -202,23 +263,45 @@ impl Explorer {
     }
 }
 impl State {
-    fn connection(&self, mut stream: TcpStream) -> Result<()> {
+    fn connection(&self, stream: TcpStream) -> Result<()> {
+        self.connection_with_progress(stream, || {})
+    }
+    fn connection_with_progress(
+        &self,
+        mut stream: TcpStream,
+        mut progress: impl FnMut(),
+    ) -> Result<()> {
         // macOS accepted sockets inherit O_NONBLOCK from the listener.
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        let mut raw = Vec::new();
-        let mut byte = [0; 1];
-        while raw.len() < 16384 {
-            if stream.read(&mut byte)? == 0 {
+        let deadline = std::time::Instant::now() + HEADER_TIMEOUT;
+        let raw = match read_headers(
+            |byte, budget| {
+                stream.set_read_timeout(Some(budget))?;
+                let n = stream.read(byte)?;
+                if n > 0 {
+                    progress();
+                }
+                Ok(n)
+            },
+            || deadline.saturating_duration_since(std::time::Instant::now()),
+        ) {
+            Ok(raw) => raw,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Response::error(408, "request header deadline exceeded").write(&mut stream)?;
                 return Ok(());
             }
-            raw.push(byte[0]);
-            if raw.ends_with(b"\r\n\r\n") {
-                break;
-            }
+            Err(e) => return Err(e.into()),
+        };
+        if raw.is_empty() {
+            return Ok(());
         }
-        let response = if raw.len() >= 16384 {
+        let response = if raw.len() >= HEADER_LIMIT {
             Response::error(413, "request headers are too large")
         } else {
             match std::str::from_utf8(&raw).ok().and_then(|s| request(s).ok()) {
@@ -271,17 +354,7 @@ impl State {
                 return Response::error(403, "explorer link is invalid or already used");
             }
             expected.clear();
-            return Response {
-                code: 204,
-                body: vec![],
-                headers: vec![(
-                    "Set-Cookie".into(),
-                    format!(
-                        "{}={}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict",
-                        self.cookie, self.auth
-                    ),
-                )],
-            };
+            return Response::json(200, json!({"token":self.auth}));
         }
         if r.method != "GET" {
             return Response::error(405, "the explorer is read-only");
@@ -296,17 +369,17 @@ impl State {
                 .replacen("<script>", &format!("<script nonce=\"{nonce}\">"), 1);
             return Response{code:200,body:html.into_bytes(),headers:vec![("Content-Type".into(),"text/html; charset=utf-8".into()),("Content-Security-Policy".into(),format!("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"))]};
         }
-        let authorized = r.headers.get("cookie").is_some_and(|s| {
-            s.split(';')
-                .filter_map(|s| s.trim().split_once('='))
-                .any(|(k, v)| k == self.cookie && equal(v, &self.auth))
-        });
+        let authorized = r
+            .headers
+            .get("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|value| equal(value, &self.auth));
         if !authorized {
             return Response::error(401, "open a fresh explorer link with `agrep ui`");
         }
         match self.api(r) {
             Ok(response) => response,
-            Err(_) => Response::error(503, "could not read a complete index snapshot"),
+            Err(error) => Response::from_error(&error),
         }
     }
     fn api(&self, r: &Request) -> Result<Response> {
@@ -465,11 +538,16 @@ mod tests {
         let headers=format!("Origin: http://127.0.0.1:{port}\r\nX-Agrep-Bootstrap: {bootstrap}\r\nContent-Length: 0\r\n");
         assert_eq!(s.route(&req(port, "POST", "/auth", "")).code, 403);
         let r = s.route(&req(port, "POST", "/auth", &headers));
-        assert_eq!(r.code, 204);
-        assert!(r.headers[0].1.contains("HttpOnly; SameSite=Strict"));
+        assert_eq!(r.code, 200);
+        let body: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["token"], s.auth);
+        assert!(!r
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie")));
         assert_eq!(s.route(&req(port, "POST", "/auth", &headers)).code, 403);
         assert_eq!(s.route(&req(port, "POST", "/delete", &headers)).code, 405);
-        let headers = format!("Cookie: {}={}\r\n", s.cookie, s.auth);
+        let headers = format!("Authorization: Bearer {}\r\n", s.auth);
         assert_eq!(s.route(&req(port, "GET", "/unknown", &headers)).code, 404);
         assert!(!server.url().contains(&bootstrap));
     }
@@ -481,7 +559,7 @@ mod tests {
         c.execute_batch("INSERT INTO sessions VALUES('pi','session-one','demo','/work/demo','','session-one',0,'Title',1,100);INSERT INTO prose(source,agent,session,project,turn,who,model,model_source,ts,text,digest,extra,position,visible) VALUES(1,'pi','session-one','demo',0,'user','model','',1,X'68656c6c6f','x','',0,1);").unwrap();
         let server = Explorer::bind(root, 0).unwrap();
         let s = &server.state;
-        let headers = format!("Cookie: {}={}\r\n", s.cookie, s.auth);
+        let headers = format!("Authorization: Bearer {}\r\n", s.auth);
         let p = server.port();
         let status = s.route(&req(p, "GET", "/api/status", &headers));
         assert_eq!(status.code, 200);
@@ -560,8 +638,8 @@ mod freshness_tests {
         });
         let s = &server.state;
         let r = request(&format!(
-            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}={}\r\n\r\n",
-            s.port, s.cookie, s.auth
+            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n\r\n",
+            s.port, s.auth
         ))
         .unwrap();
         assert_eq!(s.route(&r).code, 200);
@@ -583,16 +661,22 @@ mod socket_tests {
         stream.set_nonblocking(true).unwrap();
         let state = server.state.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        client.write_all(b"G").unwrap();
         let worker = std::thread::spawn(move || {
-            tx.send(state.connection(stream)).unwrap();
+            let mut announced = false;
+            tx.send(state.connection_with_progress(stream, || {
+                if !announced {
+                    ready_tx.send(()).unwrap();
+                    announced = true;
+                }
+            }))
+            .unwrap();
         });
-        assert!(
-            rx.recv_timeout(Duration::from_millis(30)).is_err(),
-            "connection must wait for request bytes"
-        );
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         write!(
             client,
-            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            "ET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
             server.port()
         )
         .unwrap();
@@ -601,5 +685,87 @@ mod socket_tests {
         assert!(response.starts_with("HTTP/1.1 200"));
         rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
         worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn cookie_alone_never_authorizes_or_refreshes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(temp.path(), true).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let server = Explorer::bind(root, 0).unwrap().with_refresh(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let s = &server.state;
+        use sha2::{Digest, Sha256};
+        let legacy = format!(
+            "agrep_ui_{:x}",
+            Sha256::digest(format!("{}\0{}", s.root.path().display(), s.port).as_bytes())
+        )[..21]
+            .to_owned();
+        let request = request(&format!(
+            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}={}\r\n\r\n",
+            s.port, legacy, s.auth
+        ))
+        .unwrap();
+        assert_eq!(s.route(&request).code, 401);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn refreshing_preserves_error_class_and_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(temp.path(), true).unwrap();
+        let server = Explorer::bind(root, 0).unwrap().with_refresh(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot read fixture transcript",
+            )
+            .into())
+        });
+        let s = &server.state;
+        let r = request(&format!(
+            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n\r\n",
+            s.port, s.auth
+        ))
+        .unwrap();
+        let response = s.route(&r);
+        assert_eq!(response.code, 403);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error_kind"], "permission-denied");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot read fixture transcript"));
+        let error = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("malformed database".into()),
+        ));
+        assert_eq!(Response::from_error(&error).code, 500);
+    }
+    #[test]
+    fn progress_does_not_reset_the_header_deadline() {
+        let mut budgets = vec![];
+        let mut remaining = [
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            Duration::ZERO,
+        ]
+        .into_iter();
+        let error = read_headers(
+            |byte, budget| {
+                budgets.push(budget);
+                byte[0] = b'G';
+                Ok(1)
+            },
+            || remaining.next().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(budgets, [Duration::from_secs(10), Duration::from_secs(3)]);
     }
 }

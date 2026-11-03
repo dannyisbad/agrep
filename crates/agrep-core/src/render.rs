@@ -188,13 +188,13 @@ pub fn emit_semantic(
         if r.hits.is_empty() {
             meta["hits"] = json!([])
         }
-        out += &format!("{meta}\n");
+        out += &format!("{}\n", crate::json_output::to_string(&meta)?);
         for h in &r.hits {
             let mut value = hit_value(h);
             if s.caller_unknown {
                 value["self"] = Value::Null;
             }
-            out += &format!("{value}\n");
+            out += &format!("{}\n", crate::json_output::to_string(&value)?);
         }
     } else if s.flat {
         for h in &r.hits {

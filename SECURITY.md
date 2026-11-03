@@ -12,15 +12,23 @@ practical; confirmed issues are coordinated privately until a fixed release is a
 
 ## Local-data threat model
 
-agrep indexes private agent transcripts on the user's machine. The corpus and model inputs
-remain local, but the index is sensitive plaintext and should be protected like the source
-transcripts. The default data directory is private to the current OS user. `AGREP_DATA_DIR`
-may point elsewhere; `agrep doctor` warns when a POSIX directory is group/world-readable.
+agrep indexes private agent transcripts locally. The index and source archives can
+contain secrets and should be protected like the original conversations. On POSIX,
+agrep creates its data root, archive, model and log directories with mode 0700 and
+tightens an existing owned root when it validates FORMAT. `agrep doctor` reports
+remaining group/world permission exposure. Filesystem ACLs and account security
+remain the operating system's responsibility.
 
-Transcript text is untrusted. Human terminal renderers quote control and bidirectional
-format characters; JSON modes preserve content through JSON escaping. Store adapters and
-archive restore paths must remain confined to their documented roots.
+Transcript text is untrusted. One shared human-output sanitizer neutralizes control
+characters and bidirectional/format characters, including in evidence headers.
+JSON output escapes these characters while preserving their decoded values.
 
-Downloaded `agrep-rs` executables are version-matched and SHA-256 verified before they are
-installed. Missing or invalid checksums fail closed unless the user explicitly sets
-`AGREP_ALLOW_UNVERIFIED_BINARY=1`, which is intended only for a trusted custom mirror.
+Model downloads use pinned revisions, lengths and SHA-256 digests. Status and doctor
+verify model integrity using the same verified-file stamps as model loading.
+An installed model failure is disclosed and logged; optional meaning retrieval still
+returns the available keyword results.
+
+The npm launcher verifies the selected binary's SHA-256 checksum and fails closed
+when the checksum is missing or wrong. There is no unverified-binary override.
+Native resume refuses unsafe session identifiers and relative working directories.
+Archive restore destinations remain restricted and checked for path traversal.

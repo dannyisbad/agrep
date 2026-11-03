@@ -50,6 +50,22 @@ pub fn installed_at(path: &Path) -> bool {
             .is_ok_and(|m| m.is_file() && m.len() == *len)
     })
 }
+/// Verify an installed artifact set, reusing only unchanged verified stamps.
+pub fn verify_installed(root: &DataRoot) -> Result<()> {
+    verify_installed_at(&directory(root))
+}
+pub fn verify_installed_at(path: &Path) -> Result<()> {
+    if !cached_verification(path, &FILES) {
+        let before = stamps(path, &FILES)?;
+        for (name, size, hash) in FILES {
+            verify(&path.join(name), size, hash)?;
+        }
+        if before != stamps(path, &FILES)? {
+            bail!("model changed during SHA-256 verification");
+        }
+    }
+    Ok(())
+}
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct ArtifactStamp {
     name: String,
@@ -169,7 +185,13 @@ pub fn provision(root: &DataRoot) -> Result<()> {
     provision_at(&directory(root))
 }
 pub fn provision_at(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+    crate::data::private_dir(path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|s| s == "model"))
+    {
+        crate::data::private_dir(parent)?;
+    }
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -234,11 +256,7 @@ pub struct Embedder {
 }
 impl Embedder {
     pub fn load(path: &Path, device: Device) -> Result<Self> {
-        if !cached_verification(path, &FILES) {
-            for (name, size, hash) in FILES {
-                verify(&path.join(name), size, hash)?;
-            }
-        }
+        verify_installed_at(path)?;
         let mut tok =
             Tokenizer::from_file(path.join("tokenizer.json")).map_err(|e| anyhow!("{e}"))?;
         tok.with_truncation(Some(TruncationParams {

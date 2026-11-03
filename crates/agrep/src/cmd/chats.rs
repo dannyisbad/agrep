@@ -25,6 +25,9 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         bail!("--since must be before --until")
     }
     let pattern = args.pattern.join(" ");
+    if args.pattern.len() == 1 && pattern.starts_with('@') && pattern.contains(':') {
+        agrep_core::handles::parse(&pattern)?;
+    }
     let identity = if args.pattern.len() == 1 {
         h::identity(&pattern).ok()
     } else {
@@ -118,7 +121,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
         if selected.is_empty() {
             meta["hits"] = json!([]);
         }
-        println!("{meta}");
+        println!("{}", agrep_core::json_output::to_string(&meta)?);
     }
     for s in &selected {
         let latest = h::latest(&c, s)?;
@@ -142,7 +145,7 @@ pub fn run(args: Chats, no_auto: bool, color: &str) -> Result<i32> {
                 row["match_ts"] = json!(hit.ts);
                 row["match_handle"] = json!(hit.handle);
             }
-            println!("{row}");
+            println!("{}", agrep_core::json_output::to_string(&row)?);
         } else {
             println!(
                 "{} {} {} {} {}t{}  {}{} · agrep around {}",

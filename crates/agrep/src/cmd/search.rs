@@ -114,8 +114,15 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
                 };
                 (result, Some(found.coverage))
             }
-            Err(e) if s.semantic => return Err(e),
-            Err(_) => (keyword, None),
+            Err(error) => {
+                agrep_core::logging::semantic_failure(&root, &error);
+                let fallback = if s.semantic {
+                    caller::search(&c, &options, &caller, include_self, s.scope.no_self)?
+                } else {
+                    keyword
+                };
+                (fallback, None)
+            }
         }
     } else {
         (
@@ -185,7 +192,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
         count: s.count,
         tiers: s.count_by_tier,
         chats: s.chats,
-        semantic: s.semantic,
+        semantic: s.semantic && semantic_coverage.is_some(),
         checked: agrep_core::render::checked(no_auto),
         full_argv,
         color: color == "always" || (color == "auto" && std::io::stdout().is_terminal()),
@@ -225,7 +232,7 @@ pub(crate) fn run(s: Search, no_auto: bool, color: &str) -> Result<i32> {
     }
     Ok(if result.total != 0 {
         0
-    } else if !style.checked && !s.semantic {
+    } else if !style.checked && !style.semantic {
         2
     } else {
         1

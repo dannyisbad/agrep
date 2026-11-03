@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 pub use semantic_model::{installed, provision};
 pub use semantic_policy::eligible;
-pub use semantic_store::{coverage, initialize, reclaim, Coverage};
+pub use semantic_store::{coverage, initialize, reclaim, reset, Coverage};
 use std::collections::HashSet;
 
 pub struct SearchResults {
@@ -35,18 +35,7 @@ pub fn schedule(root: &DataRoot) -> Result<()> {
         return Ok(());
     };
     drop(lock);
-    let logs = root.path().join("log");
-    std::fs::create_dir_all(&logs)?;
-    let log = logs.join("agrep.log");
-    if log.metadata().is_ok_and(|m| m.len() > 1024 * 1024) {
-        let old = logs.join("agrep.log.1");
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(&log, &old)?;
-    }
-    let errors = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)?;
+    let errors = crate::logging::open(root)?;
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .arg("__work")
@@ -195,11 +184,11 @@ pub fn begin(
         let blocks = semantic_store::blocks(root, c)?;
         let root = root.clone();
         let pattern = o.pattern.clone();
-        Some(std::thread::spawn(move || {
+        Some(crate::logging::spawn_semantic(move || {
             let model = Embedder::query(&root)?;
             let vector = model.embed(&[pattern])?.remove(0);
             VectorScan::new(blocks, vector)
-        }))
+        })?)
     };
     Ok(QueryWork {
         coverage,
@@ -210,9 +199,7 @@ pub fn begin(
 }
 pub fn finish(c: &Connection, work: QueryWork) -> Result<SearchResults> {
     let mut result = if let Some(lane) = work.lane {
-        let scan = lane
-            .join()
-            .map_err(|_| anyhow::anyhow!("semantic query failed"))??;
+        let scan = lane.join().map_err(crate::logging::panic_error)??;
         resolve_scan(c, &work.options, work.family_diverse, scan)?
     } else {
         let mut r = Results::default();
@@ -546,6 +533,18 @@ mod tests {
         v[0] = 1.;
         let refs: Vec<_> = p.iter().map(|p| (p.key.clone(), 0)).collect();
         semantic_store::publish(r, &p, &refs, &vec![v; p.len()]).unwrap();
+    }
+    #[test]
+    fn query_panic_keeps_its_cause_in_the_error_channel() {
+        let (_t, root, options) = setup();
+        let work = QueryWork {
+            coverage: Coverage::default(),
+            options,
+            family_diverse: false,
+            lane: Some(crate::logging::spawn_semantic(|| panic!("test inference panic")).unwrap()),
+        };
+        let error = finish(&store::reader(&root).unwrap(), work).err().unwrap();
+        assert!(format!("{error:#}").contains("test inference panic"));
     }
     #[test]
     fn semantic_filters_family_diversity_and_handles() {

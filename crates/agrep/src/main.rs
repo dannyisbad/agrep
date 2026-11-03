@@ -509,11 +509,14 @@ fn run(cli: Cli) -> Result<i32> {
         }) => cmd::audit::run(agent, json, strict, full),
         Some(Command::Why { reference, json }) => cmd::why::run(reference, json),
         Some(Command::Index { full, semantic }) => cmd::index::run(full, semantic),
-        Some(Command::Reindex { .. }) => {
+        Some(Command::Reindex { full }) => {
             let root = DataRoot::discover()?;
             root.validate(true)?;
             let result = store::reindex(&root)?;
-            println!("{}", serde_json::to_string(&result)?);
+            agrep_core::surface::line(&agrep_core::surface::refresh_json(&result)?)?;
+            if full {
+                semantic::reset(&root)?;
+            }
             agrep_core::coverage::initialize(&root)?;
             if result.changed_rows > 0 {
                 semantic::mark_index_changed(&root)?;

@@ -19,7 +19,10 @@ impl Output<'_> {
         let json_output = self.json;
         let v = json!({"version":1,"reference":reference,"verdict":verdict,"exit":exit,"summary":summary,"candidates":&candidates,"evidence":&evidence,"next_action":next_action});
         if json_output {
-            println!("{v}")
+            println!(
+                "{}",
+                agrep_core::json_output::to_string(&v).expect("serializing JSON value")
+            )
         } else {
             println!("{}: {}", verdict, render::safe(summary));
             if let Some(action) = next_action {

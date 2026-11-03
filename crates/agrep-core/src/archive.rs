@@ -86,7 +86,8 @@ impl Archive {
             bail!("data directory is read-only")
         }
         let dir = root.path().join("archive");
-        fs::create_dir_all(dir.join("blobs"))?;
+        data::private_dir(&dir)?;
+        data::private_dir(&dir.join("blobs"))?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -303,11 +304,7 @@ fn open_source(path: &Path) -> Result<File> {
     }
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
+    crate::ingest::registry::secure_read_options(&mut options);
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         bail!("source is not a regular file")
@@ -806,4 +803,47 @@ pub fn status(root: &DataRoot) -> Result<serde_json::Value> {
     Ok(
         serde_json::json!({"enabled":policy.enabled,"keep":policy.keep,"files":files,"versions":versions,"stored_bytes":stored,"source_bytes":size,"last_capture":last,"failures":errors}),
     )
+}
+
+#[cfg(test)]
+mod source_open_tests {
+    use super::*;
+    #[cfg(unix)]
+    fn assert_source_flags(file: &File) {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "a source swapped for a FIFO must not block open"
+        );
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("source.fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(open_source(&fifo)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+    }
+    #[cfg(not(unix))]
+    fn assert_source_flags(file: &File) {
+        assert!(file.metadata().unwrap().is_file());
+        let mut read_only = file;
+        assert!(read_only.write_all(b"must remain read only").is_err());
+    }
+    #[test]
+    fn source_open_is_nonblocking_and_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        fs::write(&path, b"fixture").unwrap();
+        let mut file = open_source(&path).unwrap();
+        assert_source_flags(&file);
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "fixture");
+    }
 }

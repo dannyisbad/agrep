@@ -12,7 +12,7 @@ pub fn run(json: bool) -> Result<i32> {
         agrep_core::semantic::schedule(&root)?;
     }
     if json {
-        println!("{s}")
+        println!("{}", agrep_core::json_output::to_string(&s)?)
     } else {
         println!(
             "agrep {} · {}",
@@ -38,7 +38,12 @@ pub fn run(json: bool) -> Result<i32> {
             );
         }
         println!("FORMAT: {}", s["format"].as_str().unwrap_or("unreadable"));
-        if s["semantic"]["model_present"] == true {
+        if let Some(error) = s["semantic"]["integrity_error"].as_str() {
+            println!(
+                "semantic model failed verification: {}",
+                render::safe(error)
+            );
+        } else if s["semantic"]["model_present"] == true {
             println!(
                 "semantic {}/{} rows · backlog {}",
                 s["semantic"]["indexed_rows"],
@@ -58,6 +63,12 @@ pub fn run(json: bool) -> Result<i32> {
                     );
                 }
             }
+        }
+        for path in s["permissions"]["exposed"].as_array().into_iter().flatten() {
+            println!(
+                "directory permissions expose local data: {}",
+                render::safe(path.as_str().unwrap_or(""))
+            );
         }
         for item in s["integrations"].as_array().into_iter().flatten() {
             println!(

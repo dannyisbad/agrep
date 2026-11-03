@@ -8,6 +8,14 @@ pub fn write(value: &str) -> Result<()> {
         other => Ok(other?),
     }
 }
+/// Public indexing statistics omit internal lock coordination.
+pub fn refresh_json(refresh: &crate::store::Refresh) -> Result<String> {
+    let mut value = serde_json::to_value(refresh)?;
+    if let Some(fields) = value.as_object_mut() {
+        fields.shift_remove("skipped_lock");
+    }
+    Ok(crate::json_output::to_string(&value)?)
+}
 pub fn line(value: &str) -> Result<()> {
     write(&format!("{value}\n"))
 }
@@ -27,12 +35,21 @@ pub fn clip(value: &str, bytes: usize) -> String {
         format!("{}…", prefix(value, bytes - 3))
     }
 }
+pub fn is_terminal_format(char: char) -> bool {
+    matches!(char as u32,
+        0x00ad | 0x0600..=0x0605 | 0x061c | 0x06dd | 0x070f |
+        0x0890..=0x0891 | 0x08e2 | 0x180e | 0x200b..=0x200f |
+        0x2028..=0x202e | 0x2060..=0x2064 | 0x2066..=0x206f | 0xfeff |
+        0xfff9..=0xfffb | 0x110bd | 0x110cd | 0x13430..=0x1343f |
+        0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a | 0xe0001 |
+        0xe0020..=0xe007f)
+}
+
 pub fn safe(value: &str, multiline: bool) -> String {
     value
         .chars()
         .map(|c| {
-            if (c.is_control() && !(multiline && (c == '\n' || c == '\t')))
-                || matches!(c, '\u{2028}' | '\u{2029}')
+            if (c.is_control() && !(multiline && (c == '\n' || c == '\t'))) || is_terminal_format(c)
             {
                 ' '
             } else {
@@ -84,6 +101,17 @@ pub fn timestamp(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_sanitizer_neutralizes_controls_and_bidi_formats() {
+        for c in [
+            '\u{7f}', '\u{85}', '\u{9b}', '\u{202e}', '\u{2066}', '\u{200b}', '\u{feff}',
+        ] {
+            let input = format!("before{c}after");
+            assert_eq!(safe(&input, false), "before after");
+            assert_eq!(crate::ingest::terminal_safe(&input), safe(&input, false));
+        }
+        assert_eq!(safe("a\nb\tc", true), "a\nb\tc");
+    }
     #[test]
     fn bytes_and_terminal() {
         assert_eq!(prefix("é🙂a", 5), "é");

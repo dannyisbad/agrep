@@ -10,7 +10,7 @@ use std::{
 };
 fn line(v: &Value) -> Result<()> {
     let mut out = io::stdout().lock();
-    serde_json::to_writer(&mut out, v)?;
+    agrep_core::json_output::to_writer(&mut out, v)?;
     writeln!(out)?;
     out.flush()?;
     Ok(())

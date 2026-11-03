@@ -154,38 +154,56 @@ pub fn check(
             "one_session_refresh" => "incremental_ms",
             "recall" | "pack" => "recall_ms",
             "around" | "chats" | "status" => "navigation_ms",
-            "old_dense" | "old_dense_no_auto" => "dense_p50_ms",
+            "old_dense" | "old_dense_no_auto" => "keyword_p50_ms",
             _ => "keyword_p50_ms",
         };
-        measure(
-            name,
-            "median",
-            case["median_ms"].as_f64(),
-            &budgets,
-            key,
-            if name == "first_index" {
-                index_scale
-            } else {
-                1.0
-            },
-            &mut failures,
-        );
-        if key == "keyword_p50_ms" || key == "dense_p50_ms" {
-            let tail = if dense {
-                "dense_p95_ms"
-            } else {
-                "keyword_p95_ms"
-            };
-            if samples.unwrap().len() < 20 {
-                failures.push(format!("{name}: p95 requires at least 20 samples"));
+        let scale = if name == "first_index" {
+            index_scale
+        } else if dense {
+            0.5
+        } else {
+            1.0
+        };
+        let mut observed: Vec<f64> = samples
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        observed.sort_by(f64::total_cmp);
+        let median = case["median_ms"]
+            .as_f64()
+            .map(|summary| summary.max(observed[observed.len() / 2]));
+        measure(name, "median", median, &budgets, key, scale, &mut failures);
+        if matches!(name, "first_index" | "compact_first_hybrid") {
+            for (index, value) in samples.unwrap().iter().enumerate() {
+                measure(
+                    name,
+                    &format!("sample {index}"),
+                    value.as_f64(),
+                    &budgets,
+                    key,
+                    scale,
+                    &mut failures,
+                );
             }
+        } else {
+            let tail = if key == "keyword_p50_ms" {
+                "keyword_p95_ms"
+            } else {
+                key
+            };
+            let measured_tail = observed[(observed.len() * 95).div_ceil(100) - 1];
+            // Neither a forged summary nor a forged sample list may hide a slow tail.
+            let tail_value = case["p95_ms"]
+                .as_f64()
+                .map(|summary| summary.max(measured_tail));
             measure(
                 name,
                 "p95",
-                case["p95_ms"].as_f64(),
+                tail_value,
                 &budgets,
                 tail,
-                1.0,
+                scale,
                 &mut failures,
             );
         }

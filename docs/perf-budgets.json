@@ -22,7 +22,7 @@
     "windows-11-arm": "Same limits on hosted arm64 Windows, including process startup."
   },
   "reasons": {
-    "latency_scope": "Every latency limit below is the SPEC \u00a79 number, applied unscaled on every synthetic workload. Per-call cost is dominated by process start, database open and bounded top-k work rather than corpus size, so a smaller corpus gets no smaller limit, and passing on a small corpus is not evidence for the full history, which is measured separately on the owner's history. The 2M-row dense workload carries the 2x headroom SPEC \u00a79 requires of 2M-row workloads on hosted runners.",
+    "latency_scope": "Every latency limit below is the SPEC \u00a79 number, applied unscaled on every synthetic workload. Per-call cost is dominated by process start, database open and bounded top-k work rather than corpus size, so a smaller corpus gets no smaller limit, and passing on a small corpus is not evidence for the full history, which is measured separately on the owner's history. The 2M-row dense workload carries the 2x headroom SPEC \u00a79 requires of 2M-row workloads on hosted runners. Every dense-workload latency applies a factor of 0.5 to its ordinary limit, for both median and p95; first_index uses dense_index_ms and the written size factor. All other warm cases gate both median and p95 against their published limit; every first-index sample must pass.",
     "keyword_p50_ms": "SPEC \u00a79 warm keyword p50 <=40 ms; all search shapes, including counts and compact rendering, finish the full process.",
     "keyword_p95_ms": "SPEC \u00a79 warm keyword p95 <=80 ms; 20 samples minimum, none discarded.",
     "navigation_ms": "SPEC \u00a79 around/chats/status <=40 ms warm.",

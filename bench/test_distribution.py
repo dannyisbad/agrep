@@ -115,11 +115,20 @@ class DistributionTests(unittest.TestCase):
     def test_build_remaps_spaces_without_losing_existing_flags(self):
         env = build_environment(self.root / 'source with spaces', {
             'RUSTFLAGS': '-C opt-level=3', 'CARGO_HOME': '/home/private-builder/cargo home'
-        })
+        }, 'x86_64-unknown-linux-gnu')
         flags = env['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
         self.assertEqual(flags[:2], ['-C', 'opt-level=3'])
         self.assertIn('--remap-path-prefix=/home/private-builder/cargo home=/build', flags)
         self.assertNotIn('RUSTFLAGS', env)
+
+    def test_build_keeps_the_targets_config_rustflags(self):
+        (self.root / '.cargo').mkdir()
+        shutil.copy2(ROOT / '.cargo/config.toml', self.root / '.cargo/config.toml')
+        arm = build_environment(self.root, {'RUSTFLAGS': '-C opt-level=3'},
+                                'aarch64-unknown-linux-gnu')['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
+        self.assertEqual(arm[:4], ['-C', 'target-feature=+fp16', '-C', 'opt-level=3'])
+        mac = build_environment(self.root, {}, 'aarch64-apple-darwin')['CARGO_ENCODED_RUSTFLAGS']
+        self.assertNotIn('fp16', mac)
 
     def test_privacy_rejects_builder_paths_and_secrets(self):
         with self.assertRaises(InvalidBinary):

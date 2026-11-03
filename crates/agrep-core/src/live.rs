@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -28,6 +28,45 @@ pub const EVENT_TYPES: &[&str] = &[
     "subagent_result",
 ];
 pub const WINDOW_MS: i64 = 90_000;
+const LINE_CAP: usize = 1024 * 1024;
+const JSON_CAP: usize = 4 * 1024 * 1024;
+
+struct BoundedLine {
+    body: Vec<u8>,
+    bytes: u64,
+    complete: bool,
+    oversized: bool,
+}
+fn bounded_line(reader: &mut impl BufRead, discarding: bool) -> std::io::Result<BoundedLine> {
+    let mut line = BoundedLine {
+        body: Vec::new(),
+        bytes: 0,
+        complete: false,
+        oversized: discarding,
+    };
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(line);
+        }
+        let length = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(available.len(), |n| n + 1);
+        line.complete = available[length - 1] == b'\n';
+        line.bytes += length as u64;
+        if !line.oversized && line.body.len().saturating_add(length) <= LINE_CAP {
+            line.body.extend_from_slice(&available[..length]);
+        } else {
+            line.oversized = true;
+            line.body.clear();
+        }
+        reader.consume(length);
+        if line.complete {
+            return Ok(line);
+        }
+    }
+}
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -158,6 +197,9 @@ impl Snapshot {
 #[derive(Clone, Default)]
 pub(crate) struct Source {
     offset: u64,
+    skipped_records: u64,
+    discarding_line: bool,
+    oversized_json: bool,
     identity: String,
     pub meta: journal::Meta,
     pub seen: HashMap<String, String>,
@@ -284,6 +326,9 @@ impl Watcher {
             } else {
                 self.journal(&agent, &path, &mut source, sink)
             };
+            if source.skipped_records > 0 {
+                self.error(&agent, &path, format!("skipped {} oversized live record(s); limits: {LINE_CAP} bytes per line, {JSON_CAP} bytes per JSON file", source.skipped_records));
+            }
             self.sources.insert(path.clone(), source);
             if let Err(e) = result {
                 if e.downcast_ref::<SinkError>().is_some() {
@@ -509,33 +554,58 @@ impl Watcher {
             };
             source.meta = journal::Meta::from_path(agent, path);
             if path.extension().is_some_and(|e| e == "jsonl") {
-                let mut head = BufReader::new(&file);
-                let mut line = String::new();
+                let mut head = BufReader::new(&file).take(meta.len());
                 for _ in 0..12 {
-                    line.clear();
-                    if head.read_line(&mut line)? == 0 {
+                    let line = bounded_line(&mut head, false)?;
+                    if line.bytes == 0 {
                         break;
                     }
-                    if let Ok(row) = serde_json::from_str(&line) {
+                    if line.oversized {
+                        source.skipped_records += 1;
+                    } else if let Ok(row) = serde_json::from_slice(&line.body) {
                         source.meta.header(agent, &row);
+                    }
+                    if !line.complete {
+                        break;
                     }
                 }
                 if meta.len() > 65_536 {
                     source.offset = meta.len() - 65_536;
                     let mut reader = BufReader::new(&file);
                     reader.seek(SeekFrom::Start(source.offset))?;
-                    let mut line = Vec::new();
-                    source.offset += reader.read_until(b'\n', &mut line)? as u64;
+                    let mut reader = reader.take(meta.len().saturating_sub(source.offset));
+                    let line = bounded_line(&mut reader, true)?;
+                    source.offset += line.bytes;
+                    source.discarding_line = !line.complete;
                 }
             }
         }
         if path.extension().is_some_and(|e| e == "json") {
+            if meta.len() > JSON_CAP as u64 {
+                if !source.oversized_json {
+                    source.skipped_records += 1;
+                }
+                source.oversized_json = true;
+                source.offset = meta.len();
+                return Ok(());
+            }
             if source.offset == meta.len() {
                 return Ok(());
             }
             let mut reader = BufReader::new(&file);
             reader.seek(SeekFrom::Start(0))?;
-            let row: Value = serde_json::from_reader(reader)?;
+            let mut bytes = Vec::new();
+            reader.take(JSON_CAP as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > JSON_CAP {
+                if !source.oversized_json {
+                    source.skipped_records += 1;
+                }
+                source.oversized_json = true;
+                source.offset = meta.len();
+                return Ok(());
+            }
+            source.oversized_json = false;
+            let row: Value = serde_json::from_slice(&bytes)?;
             let sender = text(&row["sender"]);
             if sender.contains("/task-") {
                 self.emit(json!({"agent":agent,"session":source.meta.session,"type":"subagent_result","ts":now(),"name":row["renderDetails"]["messageTitle"].as_str().unwrap_or(sender),"output":cap(text(&row["content"]),400)}),sink)?;
@@ -545,14 +615,28 @@ impl Watcher {
         }
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(source.offset))?;
+        let mut reader = reader.take(meta.len().saturating_sub(source.offset));
         loop {
-            let mut line = Vec::new();
-            let n = reader.read_until(b'\n', &mut line)?;
-            if n == 0 || !line.ends_with(b"\n") {
+            let line = bounded_line(&mut reader, source.discarding_line)?;
+            if line.bytes == 0 {
                 break;
             }
-            if !line.iter().all(u8::is_ascii_whitespace) {
-                let row: Value = serde_json::from_slice(&line)
+            if line.oversized {
+                if !source.discarding_line {
+                    source.skipped_records += 1;
+                }
+                source.discarding_line = !line.complete;
+                source.offset += line.bytes;
+                if !line.complete {
+                    break;
+                }
+                continue;
+            }
+            if !line.complete {
+                break;
+            }
+            if !line.body.iter().all(u8::is_ascii_whitespace) {
+                let row: Value = serde_json::from_slice(&line.body)
                     .with_context(|| format!("invalid JSON at byte {}", source.offset))?;
                 let mut parsed_meta = source.meta.clone();
                 let events = journal::parse(agent, &mut parsed_meta, &row);
@@ -561,7 +645,7 @@ impl Watcher {
                 }
                 source.meta = parsed_meta;
             }
-            source.offset += n as u64;
+            source.offset += line.bytes;
         }
         Ok(())
     }
@@ -946,5 +1030,83 @@ mod decay_tests {
         let first = database_fingerprint(&p);
         fs::write(t.path().join("store.db-wal"), "committed change").unwrap();
         assert_ne!(first, database_fingerprint(&p));
+    }
+}
+
+#[cfg(test)]
+mod read_limit_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn oversized_append_is_skipped_once_and_following_events_survive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"sessionId\":\"example\",\"message\":{\"content\":\"first\"}}\n",
+        )
+        .unwrap();
+        let mut watcher = Watcher::new();
+        watcher.booting = false;
+        let mut source = Source::default();
+        watcher
+            .journal("claude", &path, &mut source, &mut |_| Ok(()))
+            .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![b'x'; LINE_CAP + 1]).unwrap();
+        watcher
+            .journal("claude", &path, &mut source, &mut |_| {
+                panic!("oversized record emitted")
+            })
+            .unwrap();
+        assert!(source.discarding_line);
+        assert_eq!(source.skipped_records, 1);
+        assert_eq!(source.offset, fs::metadata(&path).unwrap().len());
+        file.write_all(b"end\n").unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"user","sessionId":"example","message":{"content":"after"}})
+        )
+        .unwrap();
+        let mut events = vec![];
+        watcher
+            .journal("claude", &path, &mut source, &mut |e| {
+                events.push(e.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["text"], "after");
+        assert_eq!(source.skipped_records, 1);
+        assert!(!source.discarding_line);
+    }
+    #[test]
+    fn header_and_json_file_sizes_are_bounded() {
+        let bytes = vec![b'x'; LINE_CAP + 1];
+        let line = bounded_line(&mut std::io::Cursor::new(&bytes), false).unwrap();
+        assert!(line.oversized);
+        assert!(line.body.len() <= LINE_CAP);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("session/.system_generated/messages/child.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            json!({"sender":"agent/task-review","content":"x".repeat(JSON_CAP)}).to_string(),
+        )
+        .unwrap();
+        let mut watcher = Watcher::new();
+        watcher.booting = false;
+        let mut source = Source::default();
+        for _ in 0..2 {
+            watcher
+                .journal("antigravity", &path, &mut source, &mut |_| {
+                    panic!("oversized JSON emitted")
+                })
+                .unwrap();
+        }
+        assert_eq!(source.skipped_records, 1);
     }
 }

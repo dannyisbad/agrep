@@ -296,9 +296,9 @@ pub fn run(args: Summary, no_auto: bool, color: &str) -> Result<i32> {
         if rows.is_empty() {
             meta["hits"] = json!([])
         }
-        println!("{meta}");
+        println!("{}", agrep_core::json_output::to_string(&meta)?);
         for row in &rows {
-            println!("{row}");
+            println!("{}", agrep_core::json_output::to_string(&row)?);
         }
     } else {
         for row in &rows {

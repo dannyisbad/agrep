@@ -68,7 +68,12 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
             }
         }
     }
-    let semantic = if deep && !no_semantic {
+    if s["permissions"]["private"] == false {
+        checks.push(json!({"check":"directory_permissions","state":"failed","detail":s["permissions"]["exposed"]}));
+    }
+    let semantic = if s["semantic"]["integrity_error"].is_string() {
+        "failed"
+    } else if deep && !no_semantic {
         if s["semantic"]["model_present"] == true {
             "present"
         } else {
@@ -77,7 +82,7 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
     } else {
         "not_checked"
     };
-    checks.push(json!({"check":"semantic_model","state":semantic}));
+    checks.push(json!({"check":"semantic_model","state":semantic,"detail":s["semantic"]["integrity_error"]}));
     let integration_errors = s["integrations"].as_array().is_some_and(|entries| {
         entries
             .iter()
@@ -98,7 +103,7 @@ pub fn run(deep: bool, fix: bool, no_semantic: bool, json_output: bool) -> Resul
     };
     let v = json!({"version":1,"status":&s,"checks":&checks,"repairs":&repaired,"exit":exit});
     if json_output {
-        println!("{v}")
+        println!("{}", agrep_core::json_output::to_string(&v)?)
     } else {
         println!(
             "doctor: {}",

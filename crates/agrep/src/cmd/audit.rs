@@ -230,7 +230,7 @@ pub fn run(agents: Vec<String>, json_output: bool, strict: bool, full: bool) -> 
     };
     let v = json!({"version":1,"full":full,"strict":strict,"agents":agents,"counts":counts,"discovered_sources":live.iter().filter(|s|selected(&s.agent)).count(),"expected_rows":if full{Some(expected.values().sum::<usize>())}else{None},"status":if !errors.is_empty(){"incomplete"}else if !gaps.is_empty(){"gaps"}else{"clean"},"gaps":gaps.len(),"gap_details":gaps,"problem_count":errors.len(),"problems":errors,"exit_code":exit,"index_path":root.db()});
     if json_output {
-        println!("{v}")
+        println!("{}", agrep_core::json_output::to_string(&v)?)
     } else {
         println!(
             "audit: {} sources · {} prose rows · {} tool rows · {} gaps · {} errors",

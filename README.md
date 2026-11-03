@@ -33,7 +33,7 @@ keywords only, or `-s` for meaning search. `agrep --help` lists the rest.
 `agrep setup` adds instructions and compaction hooks for supported agents,
 with consent. Agents learn to find previous solutions and open the source before
 citing it. `agrep remove` removes agrep's integrations, preserving your other
-instructions. Meaning search downloads its model once; keyword search works
+instructions. `agrep setup` downloads and verifies the meaning-search model once; keyword search works
 without it.
 
 The index and configuration live in:
@@ -56,5 +56,4 @@ After saving any archives you want, you can delete the old 0.4 data under
 `~/Library/Application Support/agrep` (macOS), `~/.local/share/agrep` (Linux),
 or `%LOCALAPPDATA%\agrep` (Windows); retain the `0.5` subdirectory.
 
-[Command port status](docs/PORTING.md) · [Output contracts](docs/OUTPUT_CONTRACTS.md)
-· [Development and release](docs/DISTRIBUTION.md)
+[Output contracts](docs/OUTPUT_CONTRACTS.md) · [Development and release](docs/DISTRIBUTION.md)

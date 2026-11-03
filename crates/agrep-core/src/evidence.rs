@@ -148,8 +148,6 @@ pub fn load(c: &Connection, request: &Request) -> Result<Window> {
                 }
                 match holders.len(){0=>bail!("result handle no longer names the cited content; rerun the search for a current handle"),1=>{center=holders[0];notes.push(json!({"kind":"content_moved","requested":requested,"served":center,"note":format!("handle content moved: turn {requested} → {center} (session was renumbered)")}));},_=>bail!("handle content is ambiguous in session {}: turns {}; rerun the search for a current handle",handles::target(&session,&[]),holders.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))}
             }
-        } else {
-            notes.push(json!({"kind":"handle_unverified","note":"handle has no content digest; addressed turn is unverified"}));
         }
     }
     let (lo, hi) = request
@@ -444,7 +442,7 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
             v
         };
         let all: Vec<_> = w.rows.iter().collect();
-        let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_some(){"bounded_inclusive"}else{"root_prose"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if w.claim.as_ref().is_some_and(|c|c.event.is_some()){"tool"}else if w.claim.as_ref().is_some_and(|c|c.digest.is_none()){"unbound"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":w.events.len(),"shown":events.len(),"hidden":w.events.len()-events.len()},"prose":{"available_by_role":counts(&all),"shown_by_role":counts(&rows),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":rows.iter().filter(|r|r.source_chars>r.text.chars().count()).count(),"source_truncated_events":events.iter().filter(|e|e.input_chars>e.input.chars().count()||e.output_chars>e.output.chars().count()).count()},"expansion_argv":expansion}});
+        let mut meta = json!({"kind":"agrep-meta","scope":{"policy":if d.full{"forensic"}else if w.claim.is_some(){"bounded_inclusive"}else{"root_prose"},"session":w.session,"selected_session_role":if w.side{"delegated"}else{"root_main"},"selected_record_role":if w.claim.is_none(){"none"}else if w.claim.as_ref().is_some_and(|c|c.event.is_some()){"tool"}else{"prose_turn_inclusive"},"center_turn":w.center,"radius":w.radius.unwrap_or((w.center-w.first).max(w.last-w.center)),"bounds":{"first_indexed_turn":w.first,"last_indexed_turn":w.last},"selection_order":if w.radius.is_none(){"whole_chat"}else if w.latest{"newest_tail"}else{"requested_center"},"render_order":"chronological","family_widened":false,"project_or_folder_ranked":false,"counts_state":"exact","tools":{"mode":tool_mode,"available":w.events.len(),"shown":events.len(),"hidden":w.events.len()-events.len()},"prose":{"available_by_role":counts(&all),"shown_by_role":counts(&rows),"hidden":w.rows.len()-rows.len()},"adoption":if w.side{"unresolved"}else{"root_main"},"truncation":{"message_cap_chars":if row_cap==0{None}else{Some(row_cap)},"message_cap_state":if d.full{"forensic_uncapped"}else if row_cap==0{"explicit_uncapped"}else{"bounded"},"render_truncated_rows":truncated,"source_truncated_agent_rows":rows.iter().filter(|r|r.source_chars>r.text.chars().count()).count(),"source_truncated_events":events.iter().filter(|e|e.input_chars>e.input.chars().count()||e.output_chars>e.output.chars().count()).count()},"expansion_argv":expansion}});
         meta["self_exclusion"] = d.caller.metadata(true, false);
         meta["self_exclusion"]["reason"] = json!("chat-filter");
         if !d.checked {
@@ -453,11 +451,12 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
         if !w.notes.is_empty() {
             meta["served"] = json!({"served_as_requested":false,"divergences":w.notes});
         }
-        out += &format!("{meta}\n");
+        out += &format!("{}\n", crate::json_output::to_string(&meta)?);
     } else {
         let head = [target.as_str(), &w.agent, &w.project]
             .into_iter()
             .filter(|s| !s.is_empty())
+            .map(|s| surface::safe(s, false))
             .collect::<Vec<_>>()
             .join(" · ");
         let lo = w.rows.first().map(|r| r.turn).unwrap_or(w.center);
@@ -533,7 +532,7 @@ pub fn render(w: &Window, d: &Display) -> Result<String> {
                 if d.tool_output > 0 {
                     v["output"] = json!(e.output.chars().take(d.tool_output).collect::<String>())
                 }
-                out += &format!("{v}\n");
+                out += &format!("{}\n", crate::json_output::to_string(&v)?);
             } else {
                 let input = surface::clip(
                     &surface::safe(preview.as_deref().unwrap_or(&e.input), false),
@@ -591,7 +590,10 @@ fn prose_output(w: &Window, d: &Display, r: &Row, text: &str, omitted: usize) ->
             v["reply_chars"] = json!(r.source_chars);
             v["reply_truncated"] = json!(r.source_chars > r.text.chars().count())
         }
-        return format!("{v}\n");
+        return format!(
+            "{}\n",
+            crate::json_output::to_string(&v).expect("serializing JSON value")
+        );
     }
     let loss = if r.source_chars > r.text.chars().count() {
         format!(

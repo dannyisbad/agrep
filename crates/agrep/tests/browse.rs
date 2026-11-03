@@ -784,6 +784,32 @@ fn windows_run_and_resume_preserve_native_argv_without_records() {
         .map(|b| String::from_utf8(b.to_vec()).unwrap())
         .collect();
     assert_eq!(&fields[1..fields.len() - 1], ["-r", "root-alpha-0001"]);
+    fs::copy(bin.join("codex.exe"), bin.join("omp.exe")).unwrap();
+    let c = store::writer(&DataRoot(t.path().join("data"))).unwrap();
+    c.execute("UPDATE sources SET path=?1 WHERE rowid=(SELECT source FROM prose WHERE session='root-alpha-0001' LIMIT 1)", [r"C:\fixture\.omp\agent\sessions\root-alpha-0001.jsonl"]).unwrap();
+    drop(c);
+    let resume = || {
+        Command::new(support::binary())
+            .env_clear()
+            .env("AGREP_HOME", t.path().join("home"))
+            .env("AGREP_DATA_DIR", t.path().join("data"))
+            .env("PATH", &bin)
+            .env("OUTPUT", &output)
+            .args(["resume", "--no-auto", "root-alpha-0001"])
+            .output()
+            .unwrap()
+    };
+    ok(resume());
+    assert_eq!(
+        fs::read_to_string(output.with_extension("executable")).unwrap(),
+        "omp.exe"
+    );
+    fs::remove_file(bin.join("omp.exe")).unwrap();
+    ok(resume());
+    assert_eq!(
+        fs::read_to_string(output.with_extension("executable")).unwrap(),
+        "pi.exe"
+    );
 }
 
 #[test]

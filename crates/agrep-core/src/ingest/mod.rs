@@ -1404,28 +1404,9 @@ pub fn task_listing(output: &str) -> String {
     serde_json::json!({ "listing": output }).to_string()
 }
 
-fn is_terminal_format(char: char) -> bool {
-    matches!(char as u32,
-        0x00ad | 0x0600..=0x0605 | 0x061c | 0x06dd | 0x070f |
-        0x0890..=0x0891 | 0x08e2 | 0x180e | 0x200b..=0x200f |
-        0x2028..=0x202e | 0x2060..=0x2064 | 0x2066..=0x206f | 0xfeff |
-        0xfff9..=0xfffb | 0x110bd | 0x110cd | 0x13430..=0x1343f |
-        0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a | 0xe0001 |
-        0xe0020..=0xe007f)
-}
-
-/// Escape terminal controls in store-derived diagnostics.
+/// The canonical human-output sanitizer is shared with search and evidence output.
 pub fn terminal_safe(value: impl std::fmt::Display) -> String {
-    let mut out = String::new();
-    for char in value.to_string().chars() {
-        if char.is_control() || is_terminal_format(char) {
-            use std::fmt::Write;
-            write!(&mut out, "\\u{:04x}", char as u32).expect("writing to a String cannot fail");
-        } else {
-            out.push(char);
-        }
-    }
-    out
+    crate::surface::safe(&value.to_string(), false)
 }
 
 /// Report a source that could not join this generation without letting store-derived paths or

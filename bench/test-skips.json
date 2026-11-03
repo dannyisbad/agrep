@@ -33,7 +33,7 @@
       "gates": [
         "cfg(unix)"
       ],
-      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+      "reason": "Requires a POSIX controlling PTY to exercise interactive consent. Portable rebuild publication is tested on Windows; Windows interactive consent is not covered by this fixture."
     },
     {
       "test": "crates/agrep/tests/browse.rs::run_hands_the_terminal_to_an_interactive_child",
@@ -47,7 +47,7 @@
       "gates": [
         "cfg(unix)"
       ],
-      "reason": "Uses POSIX PTYs, termios, signals or executable shell fixtures; Windows console behavior is covered separately."
+      "reason": "POSIX shell fixture; windows_run_and_resume_preserve_native_argv_without_records verifies the same omp preference and pi fallback using compiled Windows executables."
     },
     {
       "test": "crates/agrep/tests/live.rs::pty::paste_is_inert_and_terminal_restored",
@@ -90,15 +90,81 @@
         "cfg(windows)"
       ],
       "reason": "Exercises native Windows consoles/processes; POSIX behavior is covered separately."
+    },
+    {
+      "test": "crates/agrep/tests/audit_security.rs::owned_directories_are_private_and_exposure_is_reported",
+      "gates": [
+        "cfg(unix)"
+      ],
+      "reason": "Checks POSIX mode bits; Windows has no POSIX directory modes."
     }
   ],
   "partial_assertions": [
     {
+      "test": "crates/agrep/tests/integrations_archive.rs::source_links_are_skipped_restore_is_strict_and_instruction_links_work",
+      "gates": [
+        "cfg(unix)",
+        "cfg(windows)"
+      ],
+      "reason": "Uses each platform\u2019s symlink API; the same source, restore, and instruction assertions run on both."
+    },
+    {
+      "test": "crates/agrep/tests/review_fixes.rs::post_index_hook_runs_after_changed_rows_and_only_once",
+      "gates": [
+        "cfg!(windows)"
+      ],
+      "reason": "Selects native shell syntax and expected newline bytes; all platforms run every assertion."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_relays_termination_and_drains_descendants",
+      "gates": [
+        "return"
+      ],
+      "reason": "Returns an IO error inside the child pre-exec closure; the test itself never returns early."
+    },
+    {
+      "test": "crates/agrep/tests/browse.rs::run_hands_the_terminal_to_an_interactive_child",
+      "gates": [
+        "return"
+      ],
+      "reason": "Returns an IO error inside the child pre-exec closure; the test itself never returns early."
+    },
+    {
       "test": "crates/agrep/tests/live.rs::ready_precedes_delta_and_filters_events",
+      "gates": [
+        "cfg(unix)",
+        "cfg(windows)"
+      ],
+      "reason": "Uses the native termination signal for each platform; both branches assert the exit."
+    },
+    {
+      "test": "crates/agrep/tests/live.rs::pty::ui_serves_while_browser_opener_is_running",
+      "gates": [
+        "cfg!(target_os=LITERAL)"
+      ],
+      "reason": "Chooses the platform opener executable name; assertions are shared."
+    },
+    {
+      "test": "crates/agrep-core/src/caller.rs::tests::process_publication_rejects_recycled_identity",
       "gates": [
         "cfg(unix)"
       ],
-      "reason": "POSIX signal exit assertion; native_console_ctrl_c_and_break_restore_modes tests Windows control events."
+      "reason": "POSIX-only permission mutation assertion; process identity checks run on every platform."
+    },
+    {
+      "test": "crates/agrep-core/src/process.rs::tests::native_scan_finds_owned_child_and_session",
+      "gates": [
+        "cfg(unix)",
+        "cfg(windows)"
+      ],
+      "reason": "Uses the native owned-child fixture on each platform; process and session assertions run on both."
+    },
+    {
+      "test": "crates/agrep/tests/audit_security.rs::ordinary_index_spawns_and_drains_detached_work",
+      "gates": [
+        "cfg!(windows)"
+      ],
+      "reason": "Chooses native shell redirection syntax; every platform checks detached work completion."
     }
   ],
   "reason": "Only these exact compile-time platform gates are permitted. No runtime skips or ignored tests."

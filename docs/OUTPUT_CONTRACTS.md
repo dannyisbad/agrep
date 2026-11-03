@@ -1,8 +1,6 @@
 # agrep 0.5 output contracts
 
-This page defines the retained public interface. [PORTING.md](PORTING.md)
-records which commands are implemented in the current source tree. A scaffold
-returning exit 2 is not an implementation of a successful empty result.
+This page defines the public command interface and output formats.
 
 ## Process and framing
 
@@ -41,11 +39,10 @@ pages do not suggest more results. `--more` reads frozen rows, rather than silen
 rerunning a query against a changed corpus. The old hidden `--deeper` interface
 is removed.
 
-Normal commands answer from a committed snapshot. The required engine integration
-performs a stat-only source census and schedules changed files for background
-refresh; query-path parsing is pending removal. `--no-auto` suppresses automatic
-freshness work; metadata must not call that a freshly checked result. A parse failure keeps the last-good rows and is
-reported with its source by status/doctor.
+Normal commands check source files and answer from a committed snapshot.
+`--no-auto` suppresses automatic freshness work and marks freshness unchecked.
+A parse failure keeps the last-good rows and is reported with its source by
+status/doctor.
 
 Caller context excludes the calling agent's current window by default when
 identified; older same-session evidence is labeled `~self`. `--self` includes
@@ -64,8 +61,6 @@ report that as a verified zero match.
 Only vectors belonging to the exact current text can supply a meaning hit.
 Coverage is a number, such as `semantic 164499/173524 rows`. A completed
 semantic-only miss with partial coverage exits 1 and states the coverage.
-No output contract exposes a resident process, build owner, generation takeover,
-publication proof or sentinel. Those mechanisms do not exist in 0.5.
 
 ## Handles and around
 
@@ -136,3 +131,15 @@ show model/coverage information without obsolete process coordination states.
 Setup/remove preserve text outside their owned instruction blocks and remove
 only enrolled integrations or recognizable agrep blocks. Archive restore checks
 content and requires explicit `--force` to replace an existing file.
+
+## Explicit rebuilds and optional meaning failures
+
+`reindex --full` rebuilds derived rows, invalidates every vector reference and
+queues visible rows for embedding. Index/reindex JSON contains public statistics,
+without internal lock-coordination fields.
+
+Only a missing model quietly disables automatic meaning retrieval. Any failure
+from an installed model is disclosed once on stderr and written to the diagnostic
+log; keyword results are returned even for an explicit `-s` request. Recall/pack
+JSON marks that semantic attempt as failed. `status` and `doctor` verify installed
+model files against their pinned hashes and unchanged verification stamps.

@@ -36,7 +36,7 @@ pub fn run(values: Vec<String>) -> Result<i32> {
                 bail!("embeddings must be auto/off")
             };
             c.embeddings = val.clone();
-            "off blocks model downloads and background builds"
+            "off disables model downloads and meaning search"
         }
         "post_index" => {
             c.post_index = if val == "off" {

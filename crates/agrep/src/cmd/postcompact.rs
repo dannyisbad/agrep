@@ -41,7 +41,7 @@ pub(crate) fn run(a: Postcompact, no_auto: bool) -> Result<i32> {
             0
         };
         if a.json {
-            surface::line(&packet.to_string())?
+            surface::line(&agrep_core::json_output::to_string(&packet)?)?
         } else {
             surface::write(&recovery::human(&packet))?
         }
@@ -51,7 +51,10 @@ pub(crate) fn run(a: Postcompact, no_auto: bool) -> Result<i32> {
         Ok(code) => Ok(code),
         Err(e) => {
             if a.json {
-                surface::line(&recovery::failure("unavailable", &format!("{e:#}")).to_string())?
+                surface::line(&agrep_core::json_output::to_string(&recovery::failure(
+                    "unavailable",
+                    &format!("{e:#}"),
+                ))?)?
             } else {
                 eprintln!("postcompact unavailable: {e:#}")
             }

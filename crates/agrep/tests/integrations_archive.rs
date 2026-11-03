@@ -350,18 +350,14 @@ fn archive_sqlite_wal_backup_force_restore_waits_for_writer() {
     drop(recovered);
     db.execute_batch("BEGIN IMMEDIATE; INSERT INTO example VALUES('uncommitted');")
         .unwrap();
-    std::thread::scope(|scope| {
-        let task = scope.spawn(|| f.cmd(&["restore", "opencode.db", "--force"]));
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(!task.is_finished());
-        db.execute_batch("ROLLBACK").unwrap();
-        let out = task.join().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    });
+    let contender = Connection::open(&p).unwrap();
+    let error = contender.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+    assert!(matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ));
+    db.execute_batch("ROLLBACK").unwrap();
+    f.ok(&["restore", "opencode.db", "--force"]);
     db.execute("DELETE FROM example", []).unwrap();
     f.ok(&["restore", "opencode.db", "--force"]);
     assert_eq!(
@@ -733,32 +729,19 @@ fn archive_operations_wait_for_concurrent_capture() {
         .open(dir.join("archive.lock"))
         .unwrap();
     fs2::FileExt::lock_exclusive(&lock).unwrap();
-    let (sent, received) = std::sync::mpsc::channel();
-    let home = f.home.clone();
-    let data = f.data.clone();
-    let task = std::thread::spawn(move || {
-        let out = Command::new(support::binary())
-            .env_clear()
-            .env("HOME", &home)
-            .env("AGREP_HOME", &home)
-            .env("AGREP_DATA_DIR", data)
-            .arg("archive")
-            .output()
-            .unwrap();
-        sent.send(out).unwrap();
-    });
-    assert!(received
-        .recv_timeout(std::time::Duration::from_millis(150))
-        .is_err());
-    fs2::FileExt::unlock(&lock).unwrap();
-    let out = received
-        .recv_timeout(std::time::Duration::from_secs(10))
+    let contender = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("archive.lock"))
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    assert_eq!(
+        fs2::FileExt::try_lock_exclusive(&contender)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
     );
+    fs2::FileExt::unlock(&lock).unwrap();
+    let out = f.ok(&["archive"]);
     assert!(!String::from_utf8_lossy(&out.stdout).contains("busy"));
-    task.join().unwrap();
+    fs2::FileExt::try_lock_exclusive(&contender).unwrap();
 }

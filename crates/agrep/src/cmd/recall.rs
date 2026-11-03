@@ -127,6 +127,12 @@ fn block_value(b: &Block, cap: usize) -> Value {
     json!({"session":b.window.session,"turn":b.window.center,"ts":b.hit.ts,"agent":b.window.agent,"project":b.window.project,"score":b.hit.score,"sem_score":if b.hit.matched=="semantic"{Some(b.hit.score)}else{None},"score_kind":null,"matched":b.hit.matched,"handle":b.hit.handle,"self":b.hit.self_marker,"window":rows})
 }
 pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i32> {
+    if a.query
+        .iter()
+        .any(|s| s.starts_with('@') && s.contains(':') && handles::parse(s).is_err())
+    {
+        bail!("invalid result handle");
+    }
     if a.semantic && !semantic::installed(&agrep_core::data::DataRoot::discover()?) {
         eprintln!("semantic model not installed: run agrep setup");
         return Ok(2);
@@ -167,6 +173,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     let c = store::reader(&root)?;
     let mut semantic_coverage = None;
     let mut semantic_ran = false;
+    let mut semantic_failed = false;
     let include_self = a.scope.include_self || (a.scope.chat.is_some() && !a.scope.no_self);
     let identity = Identity::detect();
     if !a.json && !a.scope.include_self && (a.scope.no_self || identity.agent_context) {
@@ -282,11 +289,12 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                     .is_some_and(|who| who.split(',').any(|w| w == "tool")),
             filters: filters.clone(),
         };
-        let lane = if a.semantic
-            || (!a.lexical
-                && semantic::eligible(query)
-                && semantic::installed(&root)
-                && root.config()?.embeddings != "off")
+        let lane = if !semantic_failed
+            && (a.semantic
+                || (!a.lexical
+                    && semantic::eligible(query)
+                    && semantic::installed(&root)
+                    && root.config()?.embeddings != "off"))
         {
             Some(semantic::begin(
                 &root,
@@ -297,7 +305,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
         } else {
             None
         };
-        let keyword = if a.semantic {
+        let keyword = if a.semantic && !semantic_failed {
             Default::default()
         } else {
             caller::search(&c, &options, &caller, include_self, a.scope.no_self)?
@@ -334,8 +342,15 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
                         )
                     }
                 }
-                Err(e) if a.semantic => return Err(e),
-                Err(_) => keyword,
+                Err(error) => {
+                    agrep_core::logging::semantic_failure(&root, &error);
+                    semantic_failed = true;
+                    if a.semantic {
+                        caller::search(&c, &options, &caller, include_self, a.scope.no_self)?
+                    } else {
+                        keyword
+                    }
+                }
             }
         } else {
             keyword
@@ -528,7 +543,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
     }
     let color = color == "always" || (color == "auto" && std::io::stdout().is_terminal());
     if a.json {
-        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(include_self,a.scope.no_self),"filter_coverage":coverage,"freshness":render::freshness(checked,0),"semantic_coverage":semantic_coverage});
+        let mut value = json!({"query":if pack{json!(queries)}else{json!(queries[0])},"engine":"sqlite","hits":[],"semantic_status":{"state":if semantic_failed{"failed"}else if semantic_ran{"complete"}else{"not-run"},"reason":if semantic_failed{Some("retrieval-failed")}else if semantic_ran{None}else{Some(if a.lexical{"--lexical"}else if !semantic::installed(&root){"model-not-installed"}else{"query-ineligible"})}},"self_exclusion":caller.metadata(include_self,a.scope.no_self),"filter_coverage":coverage,"freshness":render::freshness(checked,0),"semantic_coverage":semantic_coverage});
         if override_filters {
             value["filter_override"] = json!({"supplied":direct_filters,"reason":"direct-handle"});
         }
@@ -542,7 +557,7 @@ pub(crate) fn run(a: Recall, pack: bool, no_auto: bool, color: &str) -> Result<i
             if !omitted.is_empty() {
                 value["omitted_hits"] = json!(omitted)
             }
-            let text = value.to_string() + "\n";
+            let text = agrep_core::json_output::to_string(&value)? + "\n";
             if a.budget == 0 || text.len() <= a.budget {
                 surface::write(&text)?;
                 break;

@@ -6,5 +6,7 @@ fn main() {
         bytes.extend_from_slice(arg.as_bytes());
         bytes.push(0);
     }
-    std::fs::write(std::env::var_os("OUTPUT").unwrap(), bytes).unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("OUTPUT").unwrap());
+    std::fs::write(&output, bytes).unwrap();
+    std::fs::write(output.with_extension("executable"), std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().as_bytes()).unwrap();
 }

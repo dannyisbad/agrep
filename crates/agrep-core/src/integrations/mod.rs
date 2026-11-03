@@ -221,15 +221,88 @@ fn install_file(path: PathBuf, bytes: &[u8], previous: &[Installed]) -> Result<I
         directories,
     })
 }
+// Replace only the top-level hooks value. Other user JSON stays byte-for-byte.
 fn render_json(value: &Value, old: &[u8]) -> Result<Vec<u8>> {
-    let raw = format!("{}\n", serde_json::to_string_pretty(value)?);
-    Ok(if old.windows(2).any(|p| p == b"\r\n") {
-        raw.replace('\n', "\r\n")
-    } else {
-        raw
+    use serde::Serialize;
+    let raw = std::str::from_utf8(old)?;
+    if raw.trim().is_empty() {
+        return Ok((serde_json::to_string_pretty(value)? + "\n").into_bytes());
     }
-    .into_bytes())
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(raw)?;
+    let span = |v: &serde_json::value::RawValue| {
+        let start = v.get().as_ptr() as usize - raw.as_ptr() as usize;
+        start..start + v.get().len()
+    };
+    let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let indent = raw
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            trimmed
+                .starts_with('"')
+                .then_some(&line[..line.len() - trimmed.len()])
+        })
+        .unwrap_or("  ");
+    let render = |hooks: &Value| -> Result<String> {
+        if !raw.contains('\n') {
+            return Ok(serde_json::to_string(hooks)?);
+        }
+        let mut bytes = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(
+            &mut bytes,
+            serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes()),
+        );
+        hooks.serialize(&mut serializer)?;
+        Ok(String::from_utf8(bytes)?.replace('\n', &format!("{eol}{indent}")))
+    };
+    let mut result = raw.to_owned();
+    match (fields.get("hooks"), value.get("hooks")) {
+        (Some(previous), Some(hooks)) => {
+            result.replace_range(span(previous), &render(hooks)?);
+        }
+        (Some(previous), None) => {
+            let current = span(previous);
+            let previous_end = fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "hooks")
+                .map(|(_, v)| span(v).end)
+                .filter(|end| *end < current.start)
+                .max();
+            let start = previous_end.unwrap_or_else(|| raw.find('{').unwrap() + 1);
+            let mut end = current.end;
+            if previous_end.is_none() {
+                let tail = &raw[end..];
+                if let Some(comma) = tail.find(',').filter(|i| tail[..*i].trim().is_empty()) {
+                    end += comma + 1;
+                }
+            }
+            result.replace_range(start..end, "");
+        }
+        (None, Some(hooks)) => {
+            let last = fields.values().map(|v| span(v).end).max();
+            let start = last.unwrap_or_else(|| raw.find('{').unwrap() + 1);
+            let gap = if raw.contains('\n') {
+                format!("{eol}{indent}")
+            } else {
+                String::new()
+            };
+            result.insert_str(
+                start,
+                &format!(
+                    "{}{gap}\"hooks\": {}",
+                    if last.is_some() { "," } else { "" },
+                    render(hooks)?
+                ),
+            );
+        }
+        (None, None) => {}
+    }
+    serde_json::from_str::<Value>(&result)?;
+    Ok(result.into_bytes())
 }
+
 fn install_hook(path: PathBuf, event: &str, entry: Value) -> Result<Installed> {
     let directories = missing_directories(&path);
     let old = safe_fs::read_optional(&path)?;
@@ -434,11 +507,11 @@ fn remove_one(item: &Installed) -> Result<()> {
                 if let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) {
                     entries.retain(|e| e != entry);
                     if entries.is_empty() {
-                        hooks.remove(event);
+                        hooks.shift_remove(event);
                     }
                 }
                 if hooks.is_empty() {
-                    value.as_object_mut().unwrap().remove("hooks");
+                    value.as_object_mut().unwrap().shift_remove("hooks");
                 }
             }
             if item.created && value == json!({}) {
@@ -572,6 +645,9 @@ pub fn repair(root: &DataRoot) -> Result<Vec<String>> {
                     install_hook(item.path.clone(), event, entry.clone())?;
                 }
                 Kind::File { .. } => {
+                    if safe_fs::read_optional(&item.path)?.is_some() {
+                        bail!("file has user edits: {}", item.path.display());
+                    }
                     let bytes = match item.path.file_name().and_then(|v| v.to_str()) {
                         Some("agrep-postcompact.ts") => {
                             include_bytes!("pi_postcompact.ts").as_slice()

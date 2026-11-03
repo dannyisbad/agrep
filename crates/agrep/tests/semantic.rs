@@ -128,7 +128,10 @@ fn optional_model_failure_keeps_a_completed_keyword_answer() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("database migration failure"));
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("semantic"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("semantic search failed"));
+    assert!(fs::read_to_string(t.path().join("data/log/agrep.log"))
+        .unwrap()
+        .contains("SHA-256 mismatch"));
 }
 
 #[test]

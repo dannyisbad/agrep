@@ -71,6 +71,17 @@ INSERT OR IGNORE INTO semantic_queue SELECT id,digest,ts FROM prose WHERE visibl
 COMMIT;")?;
     Ok(())
 }
+/// Invalidate all derived vectors after an explicitly requested full rebuild.
+pub fn reset(root: &DataRoot) -> Result<()> {
+    let _work = root.work_lock(true)?;
+    initialize_wait(root)?;
+    let _lock = root.lock(true)?;
+    let mut c = store::writer(root)?;
+    let tx = c.transaction()?;
+    tx.execute_batch("DELETE FROM semantic_refs; DELETE FROM semantic_chunks; DELETE FROM semantic_blocks; DELETE FROM semantic_queue; INSERT INTO semantic_queue SELECT id,digest,ts FROM prose WHERE visible=1;")?;
+    tx.commit()?;
+    Ok(())
+}
 pub fn coverage(c: &Connection) -> Result<Coverage> {
     let total = c.query_row(
         "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM state WHERE key='prose_count'),0)",

@@ -207,3 +207,65 @@ fn benchmark_verifies_nonterminal_tsv_hit_rows() {
     assert!(!perf::flat_hit("session\tpi\tdemo\tnot-a-turn\tuser\ttext"));
     assert!(!perf::flat_hit("session\tpi\tdemo\t2\tuser\t"));
 }
+
+#[test]
+fn every_dense_latency_has_twofold_headroom() {
+    for (name, key, limit) in [
+        ("no_change_census", "median_ms", budget("census_ms") / 2.0),
+        ("no_change_census", "p95_ms", budget("census_ms") / 2.0),
+        (
+            "one_session_refresh",
+            "median_ms",
+            budget("incremental_ms") / 2.0,
+        ),
+        (
+            "one_session_refresh",
+            "p95_ms",
+            budget("incremental_ms") / 2.0,
+        ),
+        (
+            "search_changed_source",
+            "median_ms",
+            budget("keyword_p50_ms") / 2.0,
+        ),
+        (
+            "search_changed_source",
+            "p95_ms",
+            budget("keyword_p95_ms") / 2.0,
+        ),
+        (
+            "version_control",
+            "median_ms",
+            budget("keyword_p50_ms") / 2.0,
+        ),
+        ("version_control", "p95_ms", budget("keyword_p95_ms") / 2.0),
+    ] {
+        let mut c = case(name);
+        c[key] = json!(limit + 0.1);
+        assert!(
+            errors(&[c], true, false, 2_000_000, 886_000_000).contains(name),
+            "{name} {key}"
+        );
+    }
+}
+#[test]
+fn every_warm_case_checks_its_tail_and_each_first_index_is_bounded() {
+    for (name, limit) in [
+        ("around", budget("navigation_ms")),
+        ("recall", budget("recall_ms")),
+        ("compact_warm_hybrid", budget("hybrid_p50_ms")),
+    ] {
+        let mut c = case(name);
+        c["p95_ms"] = json!(limit + 1.0);
+        assert!(errors(&[c], false, false, 100_000, 886_000_000).contains(&format!("{name} p95")));
+    }
+    let mut c = case("first_index");
+    c["samples_ms"][1] = json!(budget("first_index_ms") + 1.0);
+    assert!(errors(&[c], false, false, 100_000, 886_000_000).contains("first_index sample"));
+}
+#[test]
+fn raw_samples_cannot_hide_behind_an_understated_summary() {
+    let mut c = case("release");
+    c["samples_ms"] = json!(vec![budget("keyword_p50_ms") + 1.0; 20]);
+    assert!(errors(&[c], false, false, 100_000, 886_000_000).contains("release median"));
+}

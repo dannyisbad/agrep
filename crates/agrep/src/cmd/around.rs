@@ -65,7 +65,9 @@ pub(crate) fn run(mut a: Around, no_auto: bool, color: &str) -> Result<i32> {
     })();
     match result {
         Err(e) if a.json => {
-            surface::line(&serde_json::json!({"kind":"agrep-meta","error":{"code":"window-unavailable","reason":format!("{e:#}")}}).to_string())?;
+            surface::line(&agrep_core::json_output::to_string(
+                &serde_json::json!({"kind":"agrep-meta","error":{"code":"window-unavailable","reason":format!("{e:#}")}}),
+            )?)?;
             Ok(2)
         }
         other => other,

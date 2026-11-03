@@ -98,7 +98,7 @@ pub fn mint_full(session: &str, turn: i64, text: &str) -> String {
 }
 pub fn parse(value: &str) -> Result<Claim> {
     let re = regex::Regex::new(
-        r"^@?(~[A-Za-z0-9_-]{2,1024}|[A-Za-z0-9][A-Za-z0-9._-]{2,127}):([0-9]{1,19})(?:\.([0-9a-f]{4})(?:~([0-9a-f]{24}):([0-9]{1,7})-([0-9]{1,7}))?)?$",
+        r"^@?(~[A-Za-z0-9_-]{2,1024}|[A-Za-z0-9][A-Za-z0-9._-]{2,127}):([0-9]{1,19})\.([0-9a-f]{4})(?:~([0-9a-f]{24}):([0-9]{1,7})-([0-9]{1,7}))?$",
     )?;
     let c = re.captures(value.trim()).context("invalid result handle")?;
     let session = if let Some(token) = c[1].strip_prefix('~') {
@@ -128,6 +128,9 @@ pub fn is_handle(value: &str) -> bool {
     parse(value).is_ok_and(|c| value.starts_with('@') || c.digest.is_some())
 }
 pub fn normalize(value: &str) -> Result<String> {
+    if value.trim().starts_with('@') && value.contains(':') {
+        return Ok(parse(value)?.session);
+    }
     let value = value.trim().trim_start_matches('@');
     if value.len() > 4096 || value.is_empty() {
         bail!("invalid session id")
@@ -180,6 +183,7 @@ mod tests {
         assert_eq!(claim.digest, Some(crate::query::content_digest("café")));
         assert!(parse("@abc:2.1234~0123456789abcdef01234567:4-3").is_err());
         assert!(!is_handle("abc:2"));
-        assert!(is_handle("@abc:2"));
+        assert!(!is_handle("@abc:2"));
+        assert!(parse("@abc:2").is_err());
     }
 }

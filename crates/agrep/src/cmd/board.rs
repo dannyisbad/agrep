@@ -48,7 +48,7 @@ fn board(a: crate::Board) -> Result<i32> {
         let snap = watcher.snapshot(Duration::from_secs_f64(o.wait));
         let (value, rc) = board::machine(&snap, &o);
         if o.json {
-            serde_json::to_writer(io::stdout().lock(), &value)?;
+            agrep_core::json_output::to_writer(io::stdout().lock(), &value)?;
             writeln!(io::stdout().lock())?;
         } else {
             let (w, h) = Screen::size();

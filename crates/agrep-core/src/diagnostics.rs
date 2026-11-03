@@ -53,12 +53,26 @@ pub fn status(root: &DataRoot) -> Result<Value> {
     if format != "valid" {
         return Ok(out);
     }
+    let mut exposed = Vec::new();
+    for path in std::iter::once(root.path().to_path_buf())
+        .chain(["archive", "model", "log"].map(|name| root.path().join(name)))
+        .chain(std::iter::once(crate::semantic_model::directory(root)))
+    {
+        if path.is_dir() && crate::data::exposed(&path)? {
+            exposed.push(path);
+        }
+    }
+    out["permissions"] = json!({"private":exposed.is_empty(),"exposed":exposed});
     let config = root.config()?;
     out["integrations"] = json!(integrations(&config)?);
     out["archive"]["enabled"] = json!(config.archive.enabled);
     if !root.db().exists() {
         if root.path().join("index.building.db").exists() {
-            out["index"]["state"] = json!("first build in progress");
+            out["index"]["state"] = json!(if root.writer_active()? {
+                "first build in progress"
+            } else {
+                "first build interrupted"
+            });
         }
         return Ok(out);
     }
@@ -104,7 +118,14 @@ pub fn status(root: &DataRoot) -> Result<Value> {
     let coverage = crate::semantic::coverage(&c)?;
     let model = crate::semantic_model::directory(root);
     let present = crate::semantic::installed(root);
-    out["semantic"] = json!({"model_present":present,"model_path":model,"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded)});
+    let integrity = if present {
+        crate::semantic_model::verify_installed(root)
+            .err()
+            .map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
+    out["semantic"] = json!({"model_present":present&&integrity.is_none(),"model_installed":present,"integrity_error":integrity,"model_path":model,"indexed_rows":coverage.embedded,"total_rows":coverage.total,"backlog":coverage.total.saturating_sub(coverage.embedded)});
     out["disk_bytes"] = json!(disk_bytes(&root.0)?);
     Ok(out)
 }

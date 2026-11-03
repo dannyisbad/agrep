@@ -66,7 +66,16 @@ impl DataRoot {
     }
     pub fn validate(&self, initialize: bool) -> Result<()> {
         match fs::read(self.0.join("FORMAT")) {
-            Ok(v) if v == FORMAT => return Ok(()),
+            Ok(v) if v == FORMAT => {
+                private_dir(&self.0)?;
+                for name in ["archive", "model", "log"] {
+                    let path = self.0.join(name);
+                    if path.is_dir() {
+                        private_dir(&path)?;
+                    }
+                }
+                return Ok(());
+            }
             Ok(_) => bail!("unsupported data format: {}", self.0.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("data root: {}", self.0.display())),
@@ -77,7 +86,7 @@ impl DataRoot {
         if !initialize || read_only() {
             bail!("index does not exist: {}", self.0.display())
         }
-        fs::create_dir_all(&self.0)?;
+        private_dir(&self.0)?;
         // create_new makes racing initializers converge without replacing a marker.
         match OpenOptions::new()
             .write(true)
@@ -97,6 +106,21 @@ impl DataRoot {
             Err(e) => return Err(e.into()),
         }
         Ok(())
+    }
+    pub fn writer_active(&self) -> Result<bool> {
+        let path = self.0.join("writer.lock");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                FileExt::unlock(&file)?;
+                Ok(false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error.into()),
+        }
     }
     pub fn lock(&self, blocking: bool) -> Result<Option<WriterLock>> {
         self.lock_named("writer.lock", blocking)
@@ -153,4 +177,38 @@ impl DataRoot {
 pub fn read_only() -> bool {
     std::env::var("AGREP_DATA_READONLY")
         .is_ok_and(|v| !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "off"))
+}
+
+/// Create only the requested directory tree; tighten an existing owned directory.
+pub fn private_dir(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path)?;
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+/// Inspect permissions without mutating a root that diagnostics may need to report.
+pub fn exposed(path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::metadata(path)?.permissions().mode() & 0o077 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
 }

@@ -13,15 +13,15 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: '1.97.0'
           components: rustfmt, clippy
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
       - name: Isolate all source discovery and derived data
@@ -54,9 +54,10 @@ jobs:
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
           nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --rows 100000 --runs 20 --build-runs 3 --check --output mixed.json
-          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --semantic --rows 1000 --runs 20 --build-runs 3 --check --output semantic.json
+          nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --semantic --data "$RUNNER_TEMP/agrep-semantic-data" --rows 1000 --runs 20 --build-runs 3 --check --output semantic.json
+          nice -n 10 "target/release/examples/semantic_eval$suffix" "$RUNNER_TEMP/agrep-semantic-data/model/granite-embedding-small-english-r2" cpu
           nice -n 10 "target/release/examples/bench$suffix" --binary "target/release/agrep$suffix" --dense --rows 2000000 --runs 20 --build-runs 3 --check --output dense.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: evidence-${{ matrix.os }}
@@ -68,10 +69,10 @@ jobs:
   privacy-history:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - run: python bench/validate_repo_privacy.py --index --all-refs
